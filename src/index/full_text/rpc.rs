@@ -101,8 +101,7 @@ impl Service for InvertedIndexRPCService {
 
             let stats = self
                 .indexer
-                .get_field_stats(req.schema_id, req.field_id)
-                .await;
+                .get_field_stats(req.schema_id, req.field_id);
 
             Ok(InvertedSearchResponse {
                 hits,
@@ -120,8 +119,7 @@ impl Service for InvertedIndexRPCService {
         async move {
             let stats = self
                 .indexer
-                .get_field_stats(req.schema_id, req.field_id)
-                .await;
+                .get_field_stats(req.schema_id, req.field_id);
 
             Ok(FieldStatsResponse {
                 doc_count: stats.doc_count,

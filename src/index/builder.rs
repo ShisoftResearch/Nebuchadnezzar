@@ -132,8 +132,8 @@ impl IndexMeta {
                 if let Some(indexer) = indexers.fulltext_indexer() {
                     // Write posting lists to Chunk (synchronous)
                     indexer.add_document(meta)?;
-                    // Update stats cache (async)
-                    indexer.update_stats_for_add(meta).await;
+                    // Update stats cache (lock-free, sync)
+                    indexer.update_stats_for_add(meta);
                 } else {
                     return Err(IndexError::Other(
                         "Inverted indexer not available".to_string(),
@@ -170,7 +170,7 @@ impl IndexMeta {
             }
             &IndexMeta::FullText(ref meta) => {
                 if let Some(indexer) = indexers.fulltext_indexer() {
-                    indexer.remove_document(meta).await?;
+                    indexer.remove_document(meta)?;
                 } else {
                     return Err(IndexError::Other(
                         "Inverted indexer not available".to_string(),

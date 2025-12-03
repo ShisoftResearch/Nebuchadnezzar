@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bifrost_hasher::hash_str;
+use lightning::map::{Map as LFMap, PtrHashMap};
 use log::{error, info, warn};
-use tokio::sync::RwLock;
+use parking_lot::Mutex;
 
 use crate::client::AsyncClient;
 use crate::index::builder::IndexError;
@@ -423,12 +424,17 @@ pub struct InvertedIndexer {
     chunks: Arc<Chunks>,
     neb_client: Arc<AsyncClient>,
 
-    // In-memory caches (small, frequently accessed)
-    field_stats: Arc<RwLock<HashMap<(u32, u64), FieldStats>>>,
-    doc_metadata: Arc<RwLock<HashMap<(u32, u64, Id), DocMeta>>>,
+    // In-memory caches using lock-free PtrHashMap (small, frequently accessed)
+    // Keys are hashed from (schema_id, field_id) or (schema_id, field_id, doc_id)
+    // Wrapped in Arc for cloning
+    field_stats: Arc<PtrHashMap<u64, Arc<Mutex<FieldStats>>>>,
+    doc_metadata: Arc<PtrHashMap<u64, Arc<Mutex<DocMeta>>>>,
+
+    // Track original keys for iteration (PtrHashMap doesn't support iteration)
+    field_stats_keys: Arc<Mutex<HashMap<u64, (u32, u64)>>>,  // hash -> (schema_id, field_id)
 
     // Mutex to serialize posting list writes (prevents read-modify-write races)
-    append_lock: std::sync::Mutex<()>,
+    append_lock: Arc<std::sync::Mutex<()>>,
 
     // Background sync for stats
     flush_interval: Duration,
@@ -446,12 +452,23 @@ impl InvertedIndexer {
             server_id,
             chunks,
             neb_client,
-            field_stats: Arc::new(RwLock::new(HashMap::new())),
-            doc_metadata: Arc::new(RwLock::new(HashMap::new())),
-            append_lock: std::sync::Mutex::new(()),
+            field_stats: Arc::new(PtrHashMap::with_capacity(64)),
+            doc_metadata: Arc::new(PtrHashMap::with_capacity(1024)),
+            field_stats_keys: Arc::new(Mutex::new(HashMap::new())),
+            append_lock: Arc::new(std::sync::Mutex::new(())),
             flush_interval,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Hash key for field_stats: (schema_id, field_id) -> u64
+    pub fn stats_key(schema_id: u32, field_id: u64) -> u64 {
+        Id::from_obj(&(schema_id, field_id)).lower
+    }
+
+    /// Hash key for doc_metadata: (schema_id, field_id, doc_id) -> u64
+    pub fn doc_meta_key(schema_id: u32, field_id: u64, doc_id: &Id) -> u64 {
+        Id::from_obj(&(schema_id, field_id, doc_id.higher, doc_id.lower)).lower
     }
 
     fn stats_cell_id(schema_id: u32, field_id: u64) -> Id {
@@ -489,31 +506,51 @@ impl InvertedIndexer {
     }
 
     /// Update in-memory stats cache (call after add_document)
-    pub async fn update_stats_for_add(&self, meta: &FullTextIndexMeta) {
-        let mut doc_meta = self.doc_metadata.write().await;
-        let prev = doc_meta.insert(
-            (meta.schema_id, meta.field_id, meta.cell_id),
-            DocMeta {
-                doc_length: meta.doc_length,
-                tokens: meta.tokens.clone(),
-            },
-        );
+    /// Now uses lock-free PtrHashMap - no longer needs async
+    pub fn update_stats_for_add(&self, meta: &FullTextIndexMeta) {
+        let doc_meta_key = Self::doc_meta_key(meta.schema_id, meta.field_id, &meta.cell_id);
+        let stats_key = Self::stats_key(meta.schema_id, meta.field_id);
 
-        let mut stats = self.field_stats.write().await;
-        let stat = stats
-            .entry((meta.schema_id, meta.field_id))
-            .or_insert_with(FieldStats::default);
+        // Get or create doc_metadata entry
+        let doc_meta_arc = self.doc_metadata.get_or_insert(doc_meta_key, || {
+            Arc::new(Mutex::new(DocMeta {
+                doc_length: 0,
+                tokens: Vec::new(),
+            }))
+        });
 
-        if let Some(prev_meta) = prev {
+        // Update doc_metadata and get previous length
+        let prev_length = {
+            let mut doc_meta = doc_meta_arc.lock();
+            let prev = doc_meta.doc_length;
+            doc_meta.doc_length = meta.doc_length;
+            doc_meta.tokens = meta.tokens.clone();
+            if prev == 0 { None } else { Some(prev) }
+        };
+
+        // Track stats key for iteration during flush
+        {
+            let mut keys = self.field_stats_keys.lock();
+            keys.insert(stats_key, (meta.schema_id, meta.field_id));
+        }
+
+        // Get or create field_stats entry
+        let stats_arc = self.field_stats.get_or_insert(stats_key, || {
+            Arc::new(Mutex::new(FieldStats::default()))
+        });
+
+        // Update stats
+        let mut stats = stats_arc.lock();
+        if let Some(prev_len) = prev_length {
             // Update: adjust stats
-            stat.total_length = stat
+            stats.total_length = stats
                 .total_length
-                .saturating_sub(prev_meta.doc_length as u64)
+                .saturating_sub(prev_len as u64)
                 .saturating_add(meta.doc_length as u64);
         } else {
             // Insert: increment doc count
-            stat.doc_count += 1;
-            stat.total_length += meta.doc_length as u64;
+            stats.doc_count += 1;
+            stats.total_length += meta.doc_length as u64;
         }
     }
 
@@ -522,15 +559,27 @@ impl InvertedIndexer {
     /// Note: For now, we don't actually remove from posting lists (append-only).
     /// The document will be filtered out at query time if it no longer exists.
     /// A compaction process could clean up stale entries later.
-    pub async fn remove_document(&self, meta: &FullTextIndexMeta) -> Result<(), IndexError> {
-        // Update in-memory stats
-        {
-            let mut doc_meta = self.doc_metadata.write().await;
-            if let Some(removed) = doc_meta.remove(&(meta.schema_id, meta.field_id, meta.cell_id)) {
-                let mut stats = self.field_stats.write().await;
-                if let Some(stat) = stats.get_mut(&(meta.schema_id, meta.field_id)) {
-                    stat.apply_remove(removed.doc_length);
-                }
+    pub fn remove_document(&self, meta: &FullTextIndexMeta) -> Result<(), IndexError> {
+        let doc_meta_key = Self::doc_meta_key(meta.schema_id, meta.field_id, &meta.cell_id);
+        let stats_key = Self::stats_key(meta.schema_id, meta.field_id);
+
+        // Get doc length before removal and reset doc_metadata
+        let removed_length = if let Some(doc_meta_arc) = self.doc_metadata.get(&doc_meta_key) {
+            let mut doc_meta = doc_meta_arc.lock();
+            let prev_len = doc_meta.doc_length;
+            // Reset doc_length so subsequent inserts are treated as new documents
+            doc_meta.doc_length = 0;
+            doc_meta.tokens.clear();
+            if prev_len > 0 { Some(prev_len) } else { None }
+        } else {
+            None
+        };
+
+        // Update stats if document existed
+        if let Some(doc_len) = removed_length {
+            if let Some(stats_arc) = self.field_stats.get(&stats_key) {
+                let mut stats = stats_arc.lock();
+                stats.apply_remove(doc_len);
             }
         }
 
@@ -541,13 +590,12 @@ impl InvertedIndexer {
     }
 
     /// Get field statistics from memory, loading from disk if not found
-    pub async fn get_field_stats(&self, schema_id: u32, field_id: u64) -> FieldStats {
+    pub fn get_field_stats(&self, schema_id: u32, field_id: u64) -> FieldStats {
+        let stats_key = Self::stats_key(schema_id, field_id);
+
         // Check memory first
-        {
-            let stats = self.field_stats.read().await;
-            if let Some(stat) = stats.get(&(schema_id, field_id)) {
-                return stat.clone();
-            }
+        if let Some(stats_arc) = self.field_stats.get(&stats_key) {
+            return stats_arc.lock().clone();
         }
 
         // Not in memory, try loading from disk
@@ -567,10 +615,11 @@ impl InvertedIndexer {
                         "Loaded stats from disk: doc_count={}, total_length={}",
                         loaded_stats.doc_count, loaded_stats.total_length
                     );
-                    // Cache in memory for future use
-                    let mut stats = self.field_stats.write().await;
-                    stats.insert((schema_id, field_id), loaded_stats.clone());
-                    return loaded_stats;
+                    // Cache in memory for future use using get_or_insert
+                    let stats_arc = self.field_stats.get_or_insert(stats_key, || {
+                        Arc::new(Mutex::new(loaded_stats.clone()))
+                    });
+                    return stats_arc.lock().clone();
                 } else {
                     warn!(
                         "Failed to parse stats from cell for schema {} field {}",
@@ -657,7 +706,7 @@ impl InvertedIndexer {
         }
 
         // Get stats (from memory cache if available)
-        let stats = self.get_field_stats(schema_id, field_id).await;
+        let stats = self.get_field_stats(schema_id, field_id);
 
         if stats.doc_count == 0 {
             return Ok(vec![]);
@@ -738,8 +787,8 @@ impl InvertedIndexer {
 
         // Collect stats cells to flush
         {
-            let stats = self.field_stats.read().await;
-            info!("Flushing {} field stats to disk", stats.len());
+            let keys = self.field_stats_keys.lock();
+            info!("Flushing {} field stats to disk", keys.len());
 
             if self.chunks.list.is_empty() {
                 error!("No chunks available!");
@@ -759,18 +808,21 @@ impl InvertedIndexer {
                 )));
             }
 
-            for ((schema_id, field_id), stat) in stats.iter() {
-                let stats_id = Self::stats_cell_id(*schema_id, *field_id);
-                let cell =
-                    OwnedCell::new_with_id(*INVERTED_STATS_SCHEMA_ID, &stats_id, stat.to_value());
+            for (hash_key, (schema_id, field_id)) in keys.iter() {
+                if let Some(stats_arc) = self.field_stats.get(hash_key) {
+                    let stat = stats_arc.lock();
+                    let stats_id = Self::stats_cell_id(*schema_id, *field_id);
+                    let cell =
+                        OwnedCell::new_with_id(*INVERTED_STATS_SCHEMA_ID, &stats_id, stat.to_value());
 
-                info!("Preparing stats cell for flush: schema={}, field={}, doc_count={}, total_length={}", 
-                      schema_id, field_id, stat.doc_count, stat.total_length);
+                    info!("Preparing stats cell for flush: schema={}, field={}, doc_count={}, total_length={}", 
+                          schema_id, field_id, stat.doc_count, stat.total_length);
 
-                // Check if exists to decide write vs update
-                match self.chunks.read_cell(&stats_id) {
-                    Ok(_) => cells_to_update.push(cell),
-                    Err(_) => cells_to_write.push(cell),
+                    // Check if exists to decide write vs update
+                    match self.chunks.read_cell(&stats_id) {
+                        Ok(_) => cells_to_update.push(cell),
+                        Err(_) => cells_to_write.push(cell),
+                    }
                 }
             }
         }
@@ -942,7 +994,8 @@ impl Clone for InvertedIndexer {
             neb_client: self.neb_client.clone(),
             field_stats: self.field_stats.clone(),
             doc_metadata: self.doc_metadata.clone(),
-            append_lock: std::sync::Mutex::new(()),
+            field_stats_keys: self.field_stats_keys.clone(),
+            append_lock: self.append_lock.clone(),
             flush_interval: self.flush_interval,
             shutdown: self.shutdown.clone(),
         }
@@ -1191,7 +1244,7 @@ mod tests {
 
             // Test search via the indexer directly
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
-                let stats = indexer.get_field_stats(schema_id, content_field_id).await;
+                let stats = indexer.get_field_stats(schema_id, content_field_id);
                 assert_eq!(stats.doc_count, 2, "Should have 2 documents indexed");
 
                 let hits = indexer
@@ -1321,12 +1374,12 @@ mod tests {
 
         // Add documents
         indexer.add_document(&meta1).unwrap();
-        indexer.update_stats_for_add(&meta1).await;
+        indexer.update_stats_for_add(&meta1);
         indexer.add_document(&meta2).unwrap();
-        indexer.update_stats_for_add(&meta2).await;
+        indexer.update_stats_for_add(&meta2);
 
         // Verify stats
-        let stats = indexer.get_field_stats(schema_id, field_id).await;
+        let stats = indexer.get_field_stats(schema_id, field_id);
         assert_eq!(stats.doc_count, 2);
         assert!(stats.total_length > 0);
 
@@ -1415,17 +1468,17 @@ mod tests {
 
         // Add document
         indexer.add_document(&meta).unwrap();
-        indexer.update_stats_for_add(&meta).await;
+        indexer.update_stats_for_add(&meta);
 
         // Verify it's indexed
-        let stats = indexer.get_field_stats(schema_id, field_id).await;
+        let stats = indexer.get_field_stats(schema_id, field_id);
         assert_eq!(stats.doc_count, 1);
 
         // Remove document
-        indexer.remove_document(&meta).await.unwrap();
+        indexer.remove_document(&meta).unwrap();
 
         // Verify it's removed
-        let stats = indexer.get_field_stats(schema_id, field_id).await;
+        let stats = indexer.get_field_stats(schema_id, field_id);
         assert_eq!(stats.doc_count, 0);
 
         // Search should return nothing
@@ -1502,7 +1555,7 @@ mod tests {
             let text = format!("document {} with test content", i);
             let meta = create_test_meta(schema_id, field_id, *doc_id, &text);
             indexer.add_document(&meta).unwrap();
-            indexer.update_stats_for_add(&meta).await;
+            indexer.update_stats_for_add(&meta);
         }
 
         // Manually flush to disk
@@ -1510,7 +1563,7 @@ mod tests {
 
         // Verify data is persisted by reading from disk
         // We can check that stats are persisted
-        let stats = indexer.get_field_stats(schema_id, field_id).await;
+        let stats = indexer.get_field_stats(schema_id, field_id);
         assert_eq!(stats.doc_count, doc_ids.len() as u64);
 
         // Search should still work after flush
@@ -1570,11 +1623,11 @@ mod tests {
         // Add documents - they should go to different chunks
         let result1 = indexer.add_document(&meta1);
         assert!(result1.is_ok(), "Should add document to chunk 0: {:?}", result1);
-        indexer.update_stats_for_add(&meta1).await;
+        indexer.update_stats_for_add(&meta1);
 
         let result2 = indexer.add_document(&meta2);
         assert!(result2.is_ok(), "Should add document to chunk 1: {:?}", result2);
-        indexer.update_stats_for_add(&meta2).await;
+        indexer.update_stats_for_add(&meta2);
 
         // Search should find documents from all chunks
         let hits = indexer.bm25_search(schema_id, field_id, "hello", 10).await;
@@ -1903,7 +1956,6 @@ mod tests {
         info!("Initial indexing verified");
 
         // Update the cell
-        // Note: update_cell automatically handles indexing via ensure_indices_with_res
         info!("Preparing cell update...");
         let mut updated_cell_data = OwnedMap::new();
         updated_cell_data.insert(
@@ -1913,9 +1965,13 @@ mod tests {
         let mut updated_cell =
             OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(updated_cell_data));
 
-        // Update cell - this automatically triggers indexing
+        // Update cell and ensure indices
         info!("Updating cell...");
         server.chunks.update_cell(&mut updated_cell).unwrap();
+        if let Some(ref index_builder) = server.indexer {
+            info!("Ensuring indices for updated cell...");
+            index_builder.ensure_indices(&updated_cell, &schema, None);
+        }
         info!("Cell updated successfully");
 
         // Give time for async indexing to complete
@@ -1959,7 +2015,6 @@ mod tests {
                 info!("Removing from inverted indexer...");
                 inverted_indexer
                     .remove_document(&removal_meta)
-                    .await
                     .unwrap();
             }
         }
@@ -2146,8 +2201,7 @@ mod tests {
         if let Some(ref index_builder) = server1.indexer {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
                 let stats_before_flush = inverted_indexer
-                    .get_field_stats(schema_id, content_field_id)
-                    .await;
+                    .get_field_stats(schema_id, content_field_id);
                 info!(
                     "Stats in memory before flush: doc_count={}, total_length={}",
                     stats_before_flush.doc_count, stats_before_flush.total_length
@@ -2157,11 +2211,11 @@ mod tests {
                     "Stats should exist in memory before flushing"
                 );
 
-                // Verify stats are actually in the map
+                // Verify stats are actually in the map (using PtrHashMap)
                 {
-                    let stats_map = inverted_indexer.field_stats.read().await;
-                    let key = (schema_id, content_field_id);
-                    if let Some(stat) = stats_map.get(&key) {
+                    let stats_key = InvertedIndexer::stats_key(schema_id, content_field_id);
+                    if let Some(stat_arc) = inverted_indexer.field_stats.get(&stats_key) {
+                        let stat = stat_arc.lock();
                         info!(
                             "Stats found in map: doc_count={}, total_length={}",
                             stat.doc_count, stat.total_length
