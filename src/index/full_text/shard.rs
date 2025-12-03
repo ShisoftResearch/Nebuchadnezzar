@@ -433,8 +433,9 @@ pub struct InvertedIndexer {
     // Track original keys for iteration (PtrHashMap doesn't support iteration)
     field_stats_keys: Arc<Mutex<HashMap<u64, (u32, u64)>>>,  // hash -> (schema_id, field_id)
 
-    // Mutex to serialize posting list writes (prevents read-modify-write races)
-    append_lock: Arc<std::sync::Mutex<()>>,
+    // Per-chunk locks to serialize posting list writes (prevents read-modify-write races)
+    // One lock per chunk allows concurrent writes to different chunks
+    append_locks: Arc<Vec<std::sync::Mutex<()>>>,
 
     // Background sync for stats
     flush_interval: Duration,
@@ -448,6 +449,12 @@ impl InvertedIndexer {
         neb_client: Arc<AsyncClient>,
         flush_interval: Duration,
     ) -> Self {
+        // Create one lock per chunk for fine-grained concurrency
+        let num_chunks = chunks.list.len().max(1);
+        let append_locks: Vec<std::sync::Mutex<()>> = (0..num_chunks)
+            .map(|_| std::sync::Mutex::new(()))
+            .collect();
+
         Self {
             server_id,
             chunks,
@@ -455,7 +462,7 @@ impl InvertedIndexer {
             field_stats: Arc::new(PtrHashMap::with_capacity(64)),
             doc_metadata: Arc::new(PtrHashMap::with_capacity(1024)),
             field_stats_keys: Arc::new(Mutex::new(HashMap::new())),
-            append_lock: Arc::new(std::sync::Mutex::new(())),
+            append_locks: Arc::new(append_locks),
             flush_interval,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -484,14 +491,15 @@ impl InvertedIndexer {
     /// Writes posting lists to the SAME Chunk as the document (based on partition).
     /// This ensures data locality - document and its term postings are co-located.
     pub fn add_document(&self, meta: &FullTextIndexMeta) -> Result<(), IndexError> {
-        // Serialize posting list writes to prevent read-modify-write races
-        let _lock = self.append_lock.lock().map_err(|e| {
-            IndexError::Other(format!("Failed to acquire append lock: {:?}", e))
-        })?;
-
         // Get the Chunk for this document based on its partition
         let partition = meta.cell_id.higher;
         let chunk_index = (partition as usize) % self.chunks.list.len();
+
+        // Lock only this chunk's append lock (allows concurrent writes to different chunks)
+        let _lock = self.append_locks[chunk_index].lock().map_err(|e| {
+            IndexError::Other(format!("Failed to acquire append lock for chunk {}: {:?}", chunk_index, e))
+        })?;
+
         let chunk = &self.chunks.list[chunk_index];
 
         // Update posting lists in this Chunk (write directly, no caching)
@@ -885,10 +893,6 @@ impl InvertedIndexer {
         field_id: Option<u64>,
         term_hashes: Option<Vec<u64>>,
     ) -> Result<(usize, usize), IndexError> {
-        let _lock = self.append_lock.lock().map_err(|e| {
-            IndexError::Other(format!("Failed to acquire append lock for GC: {:?}", e))
-        })?;
-
         let mut total_scanned = 0usize;
         let mut total_removed = 0usize;
 
@@ -914,6 +918,7 @@ impl InvertedIndexer {
     }
 
     /// GC a single posting list for a specific term
+    /// Locks each chunk individually as it processes to allow concurrent GC on different chunks
     fn gc_posting_list(
         &self,
         schema_id: u32,
@@ -925,6 +930,11 @@ impl InvertedIndexer {
         let mut total_removed = 0usize;
 
         for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
+            // Lock only this chunk during GC
+            let _lock = self.append_locks[chunk_index].lock().map_err(|e| {
+                IndexError::Other(format!("Failed to acquire append lock for GC on chunk {}: {:?}", chunk_index, e))
+            })?;
+
             let head_id = seg_list.head_segment_id(chunk_index as u64);
             
             // Read the current posting list
@@ -940,6 +950,8 @@ impl InvertedIndexer {
                         new_segment.cell_version = segment.cell_version;
                         new_segment.next = segment.next;
                         
+                        let mut chunk_removed = 0usize;
+                        
                         // Filter entries: keep only those with matching version
                         for (doc_id, version, tf, doc_len) in segment.iter() {
                             total_scanned += 1;
@@ -952,18 +964,20 @@ impl InvertedIndexer {
                                         new_segment.add(doc_id, version, tf, doc_len);
                                     } else {
                                         // Version mismatch, remove (don't add to new segment)
-                                        total_removed += 1;
+                                        chunk_removed += 1;
                                     }
                                 }
                                 Err(_) => {
                                     // Document doesn't exist, remove entry
-                                    total_removed += 1;
+                                    chunk_removed += 1;
                                 }
                             }
                         }
                         
-                        // Write back the cleaned segment if anything was removed
-                        if total_removed > 0 {
+                        total_removed += chunk_removed;
+                        
+                        // Write back the cleaned segment if anything was removed from this chunk
+                        if chunk_removed > 0 {
                             let mut new_cell = new_segment.to_cell(&head_id);
                             chunk.upsert_cell(&mut new_cell).map_err(|e| {
                                 IndexError::Other(format!("Failed to write GC'd segment: {:?}", e))
@@ -995,7 +1009,7 @@ impl Clone for InvertedIndexer {
             field_stats: self.field_stats.clone(),
             doc_metadata: self.doc_metadata.clone(),
             field_stats_keys: self.field_stats_keys.clone(),
-            append_lock: self.append_lock.clone(),
+            append_locks: self.append_locks.clone(),
             flush_interval: self.flush_interval,
             shutdown: self.shutdown.clone(),
         }
