@@ -12,7 +12,7 @@ use crate::{
     client::{client_by_server_name, AsyncClient},
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
-        fulltext::BM25Hit,
+        full_text::BM25Hit,
         hash::get_hash_id_from_value,
         ranged::{
             client::cursor::ClientCursor,

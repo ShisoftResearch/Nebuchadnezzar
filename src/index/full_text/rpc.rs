@@ -10,7 +10,7 @@ use futures::future::BoxFuture;
 use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::{hybrid::HybridInvertedIndexer, BM25Hit};
+use super::{shard::InvertedIndexer, BM25Hit};
 use crate::ram::types::Id;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_INVERTED_INDEX_RPC_SERVICE) as u64;
@@ -69,11 +69,11 @@ pub struct TermPostingsResponse {
 
 /// RPC service for inverted index operations
 pub struct InvertedIndexRPCService {
-    indexer: Arc<HybridInvertedIndexer>,
+    indexer: Arc<InvertedIndexer>,
 }
 
 impl InvertedIndexRPCService {
-    pub fn new(indexer: Arc<HybridInvertedIndexer>) -> Arc<Self> {
+    pub fn new(indexer: Arc<InvertedIndexer>) -> Arc<Self> {
         Arc::new(Self { indexer })
     }
 }

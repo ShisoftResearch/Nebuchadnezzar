@@ -4,7 +4,7 @@ use super::{EntryKey, Feature, IndexerClients};
 use crate::client::transaction::TxnError;
 use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
-use crate::index::fulltext::{
+use crate::index::full_text::{
     build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
 use crate::index::vector::MetricEncoding;

@@ -3,7 +3,7 @@ mod macros;
 #[macro_use]
 pub mod builder;
 pub mod entry;
-pub mod fulltext;
+pub mod full_text;
 pub mod hash;
 pub mod ranged;
 pub mod vector;
@@ -25,8 +25,8 @@ use futures::Future;
 use hash::{hash_index_schema, HashedIndexClient};
 
 use crate::client::AsyncClient;
-use crate::index::fulltext::hybrid::HybridInvertedIndexer;
-use crate::index::fulltext::{
+use crate::index::full_text::shard::InvertedIndexer;
+use crate::index::full_text::{
     inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit,
 };
 use crate::index::vector::VectorIndexClient;
@@ -44,7 +44,7 @@ pub struct IndexerClients {
     pub ranged_client: Arc<RangedIndexerClient>,
     pub hashed_client: Arc<HashedIndexClient>,
     pub vector_client: Arc<VectorIndexClient>,
-    fulltext_indexer: OnceLock<Arc<HybridInvertedIndexer>>,
+    fulltext_indexer: OnceLock<Arc<InvertedIndexer>>,
     // Store initialization parameters for lazy initialization
     server_id: u64,
     pub(crate) neb_client: Arc<AsyncClient>,
@@ -72,7 +72,7 @@ impl IndexerClients {
 
     /// Initialize the inverted indexer with chunks (called once after chunks creation)
     pub fn initialize_inverted_indexer(&self, chunks: &Arc<Chunks>) {
-        let inverted_indexer = Arc::new(HybridInvertedIndexer::new(
+        let inverted_indexer = Arc::new(InvertedIndexer::new(
             self.server_id,
             self.conshash.clone(),
             chunks.clone(),
@@ -86,7 +86,7 @@ impl IndexerClients {
     }
 
     /// Get the inverted indexer if initialized
-    pub fn fulltext_indexer(&self) -> Option<&Arc<HybridInvertedIndexer>> {
+    pub fn fulltext_indexer(&self) -> Option<&Arc<InvertedIndexer>> {
         self.fulltext_indexer.get()
     }
 

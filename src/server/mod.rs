@@ -185,10 +185,10 @@ impl NebServer {
         if opts.index_enabled {
             meta_rc
                 .schemas
-                .new_schema(crate::index::fulltext::hybrid::inverted_segment_schema());
+                .new_schema(crate::index::full_text::shard::inverted_segment_schema());
             meta_rc
                 .schemas
-                .new_schema(crate::index::fulltext::inverted_stats_schema());
+                .new_schema(crate::index::full_text::inverted_stats_schema());
             debug!("Registered inverted index schemas before recovery");
         }
 
@@ -577,7 +577,7 @@ pub async fn init_inverted_index_rpc_service(
 ) {
     if let Some(ref index_builder) = neb_server.indexer {
         if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
-            use crate::index::fulltext::rpc::InvertedIndexRPCService;
+            use crate::index::full_text::rpc::InvertedIndexRPCService;
             let service = InvertedIndexRPCService::new(inverted_indexer.clone());
             rpc_server.register_service(&service).await;
             info!("Registered inverted index RPC service");

@@ -402,7 +402,7 @@ impl PostingSegment {
 }
 
 /// Hybrid inverted indexer with transactional append and flush
-pub struct HybridInvertedIndexer {
+pub struct InvertedIndexer {
     server_id: u64,
     conshash: Arc<ConsistentHashing>,
     chunks: Arc<Chunks>,
@@ -418,7 +418,7 @@ pub struct HybridInvertedIndexer {
     shutdown: Arc<AtomicBool>,
 }
 
-impl HybridInvertedIndexer {
+impl InvertedIndexer {
     pub fn new(
         server_id: u64,
         conshash: Arc<ConsistentHashing>,
@@ -906,7 +906,7 @@ impl HybridInvertedIndexer {
     }
 }
 
-impl Clone for HybridInvertedIndexer {
+impl Clone for InvertedIndexer {
     fn clone(&self) -> Self {
         Self {
             server_id: self.server_id,
@@ -944,7 +944,7 @@ mod tests {
     fn create_test_chunks() -> Arc<Chunks> {
         let schemas = LocalSchemasCache::new_local("");
         schemas.new_schema(inverted_segment_schema());
-        schemas.new_schema(crate::index::fulltext::inverted_stats_schema());
+        schemas.new_schema(crate::index::full_text::inverted_stats_schema());
 
         Chunks::new(
             1,
@@ -964,7 +964,7 @@ mod tests {
         doc_id: Id,
         text: &str,
     ) -> FullTextIndexMeta {
-        crate::index::fulltext::build_index_meta(
+        crate::index::full_text::build_index_meta(
             doc_id,
             schema_id,
             field_id,
@@ -1550,7 +1550,7 @@ mod tests {
         // Now create a wrong indexer with a different server_id to test ownership check
         // We'll create a new indexer with a wrong server_id using the same chunks and client
         let wrong_server_id = server.server_id + 999; // A server_id that doesn't exist
-        let wrong_indexer = HybridInvertedIndexer::new(
+        let wrong_indexer = InvertedIndexer::new(
             wrong_server_id,
             server.consh.clone(),
             server.chunks.clone(),
@@ -1708,7 +1708,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Use the coordinator for distributed search
-        use crate::index::fulltext::coordinator::DistributedInvertedIndexCoordinator;
+        use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
@@ -1874,7 +1874,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Use the coordinator for distributed search
-        use crate::index::fulltext::coordinator::DistributedInvertedIndexCoordinator;
+        use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
@@ -2057,7 +2057,7 @@ mod tests {
         server1
             .meta
             .schemas
-            .new_schema(crate::index::fulltext::inverted_stats_schema());
+            .new_schema(crate::index::full_text::inverted_stats_schema());
 
         // Find owned document IDs (skip unit ID)
         info!("Finding owned document IDs...");
@@ -2227,7 +2227,7 @@ mod tests {
         );
 
         // Verify stats cell ID before archiving
-        let stats_id = HybridInvertedIndexer::stats_cell_id(schema_id, content_field_id);
+        let stats_id = InvertedIndexer::stats_cell_id(schema_id, content_field_id);
         info!("Stats cell ID to recover: {:?}", stats_id);
         info!(
             "Stats cell partition: {}, hash: {}",
@@ -2283,7 +2283,7 @@ mod tests {
 
         // Verify indices work before recovery
         info!("Verifying indices before recovery...");
-        use crate::index::fulltext::coordinator::DistributedInvertedIndexCoordinator;
+        use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
         let coordinator1 = DistributedInvertedIndexCoordinator::new(
             server1.consh.clone(),
             server1.member_pool.clone(),
@@ -2351,7 +2351,7 @@ mod tests {
         server2
             .meta
             .schemas
-            .new_schema(crate::index::fulltext::inverted_stats_schema());
+            .new_schema(crate::index::full_text::inverted_stats_schema());
 
         // Give recovery time to complete
         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -2390,7 +2390,7 @@ mod tests {
             );
 
             // Try to manually verify if stats cell exists after recovery
-            let stats_id = HybridInvertedIndexer::stats_cell_id(schema_id, content_field_id);
+            let stats_id = InvertedIndexer::stats_cell_id(schema_id, content_field_id);
             match server2.chunks.read_cell(&stats_id) {
                 Ok(cell) => {
                     info!("Stats cell found after recovery: {:?}", stats_id);
@@ -2538,7 +2538,7 @@ mod tests {
         server1
             .meta
             .schemas
-            .new_schema(crate::index::fulltext::inverted_stats_schema());
+            .new_schema(crate::index::full_text::inverted_stats_schema());
 
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
@@ -2623,11 +2623,11 @@ mod tests {
         server2
             .meta
             .schemas
-            .new_schema(crate::index::fulltext::inverted_stats_schema());
+            .new_schema(crate::index::full_text::inverted_stats_schema());
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
         // Verify recovered documents
-        use crate::index::fulltext::coordinator::DistributedInvertedIndexCoordinator;
+        use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
         let coordinator2 = DistributedInvertedIndexCoordinator::new(
             server2.consh.clone(),
             server2.member_pool.clone(),

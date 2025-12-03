@@ -12,7 +12,7 @@ use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue, SharedVal
 
 // Submodules
 pub mod coordinator;
-pub mod hybrid;
+pub mod shard;
 pub mod rpc;
 
 // ============================================================================

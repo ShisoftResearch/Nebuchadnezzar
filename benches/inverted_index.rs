@@ -11,8 +11,9 @@ use bifrost_hasher::hash_str;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 #[cfg(not(debug_assertions))]
 use lightning::map::{Map, PtrHashMap as LFHashMap};
-use neb::index::fulltext::hybrid::HybridInvertedIndexer;
-use neb::index::fulltext::{build_index_meta, FullTextIndexMeta};
+use neb::client::AsyncClient;
+use neb::index::full_text::shard::InvertedIndexer;
+use neb::index::full_text::{build_index_meta, FullTextIndexMeta};
 use neb::ram::chunk::Chunks;
 use neb::ram::schema::LocalSchemasCache;
 use neb::ram::types::{Id, OwnedValue};
@@ -95,9 +96,9 @@ fn create_test_chunks() -> Arc<Chunks> {
     let schemas = LocalSchemasCache::new_local("");
     register_schema(
         &schemas,
-        neb::index::fulltext::hybrid::inverted_segment_schema(),
+        neb::index::full_text::shard::inverted_segment_schema(),
     );
-    register_schema(&schemas, neb::index::fulltext::inverted_stats_schema());
+    register_schema(&schemas, neb::index::full_text::inverted_stats_schema());
 
     Chunks::new(
         1,
@@ -115,11 +116,11 @@ async fn setup_test_conshash(
     server_addr: &str,
     group_name: &str,
     conshash_id: u64,
-) -> (Arc<ConsistentHashing>, Arc<RaftClient>, u64) {
+) -> (Arc<ConsistentHashing>, Arc<RaftClient>, Arc<AsyncClient>, u64) {
     let temp_dir = TempDir::new().unwrap();
     let raft_path = temp_dir.path().join("raft");
 
-    let rpc_server = Server::new(&server_addr.to_string());
+    let rpc_server = Arc::new(Server::new(&server_addr.to_string()));
     let storage = raft::Storage::DISK(DiskOptions {
         path: raft_path.to_str().unwrap().to_string(),
         take_snapshots: false,
@@ -169,10 +170,17 @@ async fn setup_test_conshash(
         .unwrap();
     conshash.init_table().await.unwrap();
 
+    // Create AsyncClient
+    let neb_client = Arc::new(
+        AsyncClient::new(&rpc_server, &membership_client, &vec![server_addr.to_string()], group_name)
+            .await
+            .unwrap(),
+    );
+
     // Get the server_id for this address
     let server_id = conshash.get_server_id(hash_str(server_addr)).unwrap_or(1);
 
-    (conshash, raft_client, server_id)
+    (conshash, raft_client, neb_client, server_id)
 }
 
 // Helper to create test document metadata
@@ -210,19 +218,19 @@ fn bench_indexing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
     // Set up infrastructure outside benchmark loop
-    let (chunks, conshash, server_id, schema_id, field_id) = rt.block_on(async {
+    let (chunks, conshash, neb_client, server_id, schema_id, field_id) = rt.block_on(async {
         let chunks = create_test_chunks();
         let server_addr = "127.0.0.1:29400";
         let group_name = "bench_indexing";
         let conshash_id = 3000u64;
 
-        let (conshash, _raft_client, server_id) =
+        let (conshash, _raft_client, neb_client, server_id) =
             setup_test_conshash(server_addr, group_name, conshash_id).await;
 
         let schema_id = 100u32;
         let field_id = hash_str("content") as u64;
 
-        (chunks, conshash, server_id, schema_id, field_id)
+        (chunks, conshash, neb_client, server_id, schema_id, field_id)
     });
 
     let mut group = c.benchmark_group("indexing");
@@ -232,10 +240,11 @@ fn bench_indexing(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(doc_count), doc_count, |b, _| {
             b.to_async(&rt).iter(|| async {
-                let indexer = HybridInvertedIndexer::new(
+                let indexer = InvertedIndexer::new(
                     server_id,
                     conshash.clone(),
                     chunks.clone(),
+                    neb_client.clone(),
                     Duration::from_secs(60), // Long flush interval for pure indexing benchmark
                 );
 
@@ -264,7 +273,7 @@ fn bench_search(c: &mut Criterion) {
         let group_name = "bench_search";
         let conshash_id = 3001u64;
 
-        let (conshash, _raft_client, server_id) =
+        let (conshash, _raft_client, neb_client, server_id) =
             setup_test_conshash(server_addr, group_name, conshash_id).await;
 
         let schema_id = 100u32;
@@ -276,10 +285,11 @@ fn bench_search(c: &mut Criterion) {
 
         for doc_count in [10, 100, 1000, 5000].iter() {
             let doc_ids = find_owned_doc_ids(&conshash, server_id, *doc_count);
-            let indexer = HybridInvertedIndexer::new(
+            let indexer = InvertedIndexer::new(
                 server_id,
                 conshash.clone(),
                 chunks.clone(),
+                neb_client.clone(),
                 Duration::from_secs(60),
             );
 
@@ -338,19 +348,19 @@ fn bench_concurrent_indexing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
     // Set up infrastructure outside benchmark loop
-    let (chunks, conshash, server_id, schema_id, field_id) = rt.block_on(async {
+    let (chunks, conshash, neb_client, server_id, schema_id, field_id) = rt.block_on(async {
         let chunks = create_test_chunks();
         let server_addr = "127.0.0.1:29402";
         let group_name = "bench_concurrent";
         let conshash_id = 3002u64;
 
-        let (conshash, _raft_client, server_id) =
+        let (conshash, _raft_client, neb_client, server_id) =
             setup_test_conshash(server_addr, group_name, conshash_id).await;
 
         let schema_id = 100u32;
         let field_id = hash_str("content") as u64;
 
-        (chunks, conshash, server_id, schema_id, field_id)
+        (chunks, conshash, neb_client, server_id, schema_id, field_id)
     });
 
     let mut group = c.benchmark_group("concurrent_indexing");
@@ -363,10 +373,11 @@ fn bench_concurrent_indexing(c: &mut Criterion) {
             concurrent_docs,
             |b, _| {
                 b.to_async(&rt).iter(|| async {
-                    let indexer = Arc::new(HybridInvertedIndexer::new(
+                    let indexer = Arc::new(InvertedIndexer::new(
                         server_id,
                         conshash.clone(),
                         chunks.clone(),
+                        neb_client.clone(),
                         Duration::from_secs(60),
                     ));
 
@@ -407,7 +418,7 @@ fn bench_search_limit(c: &mut Criterion) {
         let group_name = "bench_search_limit";
         let conshash_id = 3003u64;
 
-        let (conshash, _raft_client, server_id) =
+        let (conshash, _raft_client, neb_client, server_id) =
             setup_test_conshash(server_addr, group_name, conshash_id).await;
 
         let schema_id = 100u32;
@@ -415,10 +426,11 @@ fn bench_search_limit(c: &mut Criterion) {
 
         // Pre-populate with 1000 documents
         let doc_ids = find_owned_doc_ids(&conshash, server_id, 1000);
-        let indexer = HybridInvertedIndexer::new(
+        let indexer = InvertedIndexer::new(
             server_id,
             conshash.clone(),
             chunks.clone(),
+            neb_client.clone(),
             Duration::from_secs(60),
         );
 
