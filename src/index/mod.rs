@@ -74,7 +74,6 @@ impl IndexerClients {
     pub fn initialize_inverted_indexer(&self, chunks: &Arc<Chunks>) {
         let inverted_indexer = Arc::new(InvertedIndexer::new(
             self.server_id,
-            self.conshash.clone(),
             chunks.clone(),
             self.neb_client.clone(),
             Duration::from_secs(30), // Flush every 30 seconds

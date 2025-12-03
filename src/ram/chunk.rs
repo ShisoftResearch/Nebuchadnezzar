@@ -566,7 +566,7 @@ impl Chunk {
         header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
     }
 
-    fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
+    pub fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
         SharedCell::from_chunk_raw(self.location_for_read(hash)?, self).map(|(c, _)| c)
     }
 
@@ -716,7 +716,7 @@ impl Chunk {
         Ok(cell.header)
     }
 
-    fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+    pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
         let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;

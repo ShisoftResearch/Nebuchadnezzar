@@ -138,8 +138,7 @@ impl Service for InvertedIndexRPCService {
         async move {
             let postings = self
                 .indexer
-                .get_term_postings(req.schema_id, req.field_id, req.term_hash)
-                .await;
+                .get_term_postings(req.schema_id, req.field_id, req.term_hash);
 
             Ok(TermPostingsResponse { postings })
         }

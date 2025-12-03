@@ -130,7 +130,10 @@ impl IndexMeta {
             }
             &IndexMeta::FullText(ref meta) => {
                 if let Some(indexer) = indexers.fulltext_indexer() {
-                    indexer.add_document(meta).await?;
+                    // Write posting lists to Chunk (synchronous)
+                    indexer.add_document(meta)?;
+                    // Update stats cache (async)
+                    indexer.update_stats_for_add(meta).await;
                 } else {
                     return Err(IndexError::Other(
                         "Inverted indexer not available".to_string(),
@@ -408,6 +411,7 @@ where
                             let owned_value = value.to_owned_value();
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
+                                cell.header().version,
                                 schema.id,
                                 *field_id,
                                 owned_value,
@@ -429,6 +433,7 @@ where
                             let owned_value = value.to_owned_value();
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
+                                cell.header().version,
                                 schema.id,
                                 *field_id,
                                 owned_value,

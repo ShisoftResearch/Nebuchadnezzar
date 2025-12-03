@@ -187,6 +187,7 @@ async fn setup_test_conshash(
 fn create_test_meta(schema_id: u32, field_id: u64, doc_id: Id, text: &str) -> FullTextIndexMeta {
     build_index_meta(
         doc_id,
+        1, // version
         schema_id,
         field_id,
         OwnedValue::String(text.to_string()),
@@ -242,7 +243,6 @@ fn bench_indexing(c: &mut Criterion) {
             b.to_async(&rt).iter(|| async {
                 let indexer = InvertedIndexer::new(
                     server_id,
-                    conshash.clone(),
                     chunks.clone(),
                     neb_client.clone(),
                     Duration::from_secs(60), // Long flush interval for pure indexing benchmark
@@ -251,7 +251,7 @@ fn bench_indexing(c: &mut Criterion) {
                 for (i, doc_id) in doc_ids.iter().enumerate() {
                     let text = SAMPLE_TEXTS[i % SAMPLE_TEXTS.len()];
                     let meta = create_test_meta(schema_id, field_id, *doc_id, text);
-                    indexer.add_document(&meta).await.unwrap();
+                    indexer.add_document(&meta).unwrap();
                 }
 
                 black_box(&indexer);
@@ -287,7 +287,6 @@ fn bench_search(c: &mut Criterion) {
             let doc_ids = find_owned_doc_ids(&conshash, server_id, *doc_count);
             let indexer = InvertedIndexer::new(
                 server_id,
-                conshash.clone(),
                 chunks.clone(),
                 neb_client.clone(),
                 Duration::from_secs(60),
@@ -297,7 +296,7 @@ fn bench_search(c: &mut Criterion) {
             for (i, doc_id) in doc_ids.iter().enumerate() {
                 let text = SAMPLE_TEXTS[i % SAMPLE_TEXTS.len()];
                 let meta = create_test_meta(schema_id, field_id, *doc_id, text);
-                indexer.add_document(&meta).await.unwrap();
+                indexer.add_document(&meta).unwrap();
             }
 
             indexers.push(indexer);
@@ -375,7 +374,6 @@ fn bench_concurrent_indexing(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| async {
                     let indexer = Arc::new(InvertedIndexer::new(
                         server_id,
-                        conshash.clone(),
                         chunks.clone(),
                         neb_client.clone(),
                         Duration::from_secs(60),
@@ -389,7 +387,7 @@ fn bench_concurrent_indexing(c: &mut Criterion) {
                         let meta = create_test_meta(schema_id, field_id, *doc_id, text);
 
                         handles.push(tokio::spawn(async move {
-                            indexer_clone.add_document(&meta).await.unwrap();
+                            indexer_clone.add_document(&meta).unwrap();
                         }));
                     }
 
@@ -428,7 +426,6 @@ fn bench_search_limit(c: &mut Criterion) {
         let doc_ids = find_owned_doc_ids(&conshash, server_id, 1000);
         let indexer = InvertedIndexer::new(
             server_id,
-            conshash.clone(),
             chunks.clone(),
             neb_client.clone(),
             Duration::from_secs(60),
@@ -437,7 +434,7 @@ fn bench_search_limit(c: &mut Criterion) {
         for (i, doc_id) in doc_ids.iter().enumerate() {
             let text = SAMPLE_TEXTS[i % SAMPLE_TEXTS.len()];
             let meta = create_test_meta(schema_id, field_id, *doc_id, text);
-            indexer.add_document(&meta).await.unwrap();
+            indexer.add_document(&meta).unwrap();
         }
 
         (indexer, schema_id, field_id)

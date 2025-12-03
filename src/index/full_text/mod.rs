@@ -67,6 +67,7 @@ pub struct TokenStat {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct FullTextIndexMeta {
     pub cell_id: Id,
+    pub version: u64,  // Cell version for filtering stale entries
     pub schema_id: u32,
     pub field_id: u64,
     pub doc_length: u32,
@@ -148,6 +149,7 @@ pub fn inverted_doc_schema() -> Schema {
 
 pub fn build_index_meta(
     cell_id: Id,
+    version: u64,
     schema_id: u32,
     field_id: u64,
     value: OwnedValue,
@@ -196,6 +198,7 @@ pub fn build_index_meta(
 
     Some(FullTextIndexMeta {
         cell_id,
+        version,
         schema_id,
         field_id,
         doc_length,
