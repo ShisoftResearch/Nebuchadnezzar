@@ -200,27 +200,25 @@ impl SegmentedPostingList {
             PostingSegment::new()
         };
 
-        // If head is full, create new head and link it
+        // If head is full, prepend: move old head content to overflow cell, reset head with new posting
         if segment.is_full() {
-            // Pass the current segment to avoid re-locking the head cell (would deadlock)
-            let new_head_id =
-                self.segment_id(partition, self.next_segment_index(chunk, partition, Some(&segment))?);
-            let mut new_segment = PostingSegment::new();
-            new_segment.next = Some(head_id);
-            new_segment.add(doc_id, version, tf, doc_len);
-
-            // Write new head to this Chunk
-            let mut new_cell = new_segment.to_cell(&new_head_id);
+            // Generate unique ID for overflow segment using random nonce
+            let overflow_id = self.random_segment_id(partition);
+            
+            // Move current head content (with its chain) to overflow cell
+            let mut overflow_cell = segment.to_cell(&overflow_id);
             chunk
-                .upsert_cell(&mut new_cell)
-                .map_err(|e| IndexError::Other(format!("Failed to write segment: {:?}", e)))?;
+                .upsert_cell(&mut overflow_cell)
+                .map_err(|e| IndexError::Other(format!("Failed to write overflow segment: {:?}", e)))?;
 
-            // Update old head's next pointer
-            segment.next = Some(new_head_id);
-            let mut old_cell = segment.to_cell(&head_id);
+            // Reset head with new posting, pointing to overflow
+            let mut new_head = PostingSegment::new();
+            new_head.add(doc_id, version, tf, doc_len);
+            new_head.next = Some(overflow_id);
+            let mut head_cell = new_head.to_cell(&head_id);
             head_guard
-                .upsert_cell(&mut old_cell)
-                .map_err(|e| IndexError::Other(format!("Failed to update segment: {:?}", e)))?;
+                .upsert_cell(&mut head_cell)
+                .map_err(|e| IndexError::Other(format!("Failed to update head segment: {:?}", e)))?;
         } else {
             // Append to existing head
             segment.add(doc_id, version, tf, doc_len);
@@ -232,42 +230,18 @@ impl SegmentedPostingList {
         Ok(())
     }
 
-    /// Get next segment index by traversing the linked list in this Chunk
-    /// If head_segment is provided, use it instead of reading from the chunk (avoids deadlock
-    /// when caller already holds lock on head)
-    fn next_segment_index(
-        &self,
-        chunk: &Chunk,
-        partition: u64,
-        head_segment: Option<&PostingSegment>,
-    ) -> Result<u32, IndexError> {
-        // If head segment is provided, start from its next pointer (count starts at 1)
-        // Otherwise, start from head (count starts at 0)
-        let (mut current_id, mut segment_count) = if let Some(head) = head_segment {
-            (head.next, 1u32)
-        } else {
-            (Some(self.head_segment_id(partition)), 0u32)
-        };
-
-        while let Some(seg_id) = current_id {
-            match chunk.read_cell(seg_id.lower) {
-                Ok(cell) => {
-                    let owned_cell = OwnedCell {
-                        header: cell.header().clone(),
-                        data: cell.data().owned(),
-                    };
-                    if let Some(segment) = PostingSegment::from_cell(&owned_cell) {
-                        current_id = segment.next;
-                        segment_count += 1;
-                    } else {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        Ok(segment_count)
+    /// Generate a random segment ID for overflow segments
+    /// Uses timestamp + random bits to ensure uniqueness without traversing the chain
+    fn random_segment_id(&self, partition: u64) -> Id {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        // Combine with term hash and a random component for uniqueness
+        let random_component: u64 = rand::random();
+        let lower = Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, timestamp, random_component)).lower;
+        Id::new(partition, lower)
     }
 
     /// Iterate through all postings in this Chunk's posting list for this term
