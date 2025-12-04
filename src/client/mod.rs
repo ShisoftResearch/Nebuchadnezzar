@@ -34,7 +34,7 @@ pub mod fulltext;
 pub mod ranged;
 pub mod transaction;
 
-pub use fulltext::{FulltextClient, SearchHit};
+pub use fulltext::{FullTextClient, SearchHit};
 pub use ranged::{RangedClient, RangedCursor, ScanOrder};
 
 #[derive(Debug)]
@@ -425,15 +425,15 @@ impl AsyncClient {
 
     /// Get a full-text search client
     ///
-    /// Returns a `FulltextClient` that can be used for distributed full-text search.
+    /// Returns a `FullTextClient` that can be used for distributed full-text search.
     ///
     /// # Example
     /// ```ignore
-    /// let ft_client = client.fulltext();
-    /// let hits = ft_client.search(schema_id, field_id, "rust programming", 10).await?;
+    /// let ft = client.full_text();
+    /// let hits = ft.search(schema_id, field_id, "rust programming", 10).await?;
     /// ```
-    pub fn fulltext(&self) -> FulltextClient {
-        FulltextClient::new(self.conshash.clone())
+    pub fn full_text(&self) -> FullTextClient {
+        FullTextClient::new(self.conshash.clone())
     }
 
     /// Get a ranged index query client

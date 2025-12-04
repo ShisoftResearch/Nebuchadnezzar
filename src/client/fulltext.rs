@@ -18,8 +18,8 @@ use crate::index::full_text::BM25Hit;
 ///
 /// # Example
 /// ```ignore
-/// // Get fulltext client from AsyncClient
-/// let ft = client.fulltext();
+/// // Get full-text client from AsyncClient
+/// let ft = client.full_text();
 ///
 /// // Search by schema and field IDs
 /// let hits = ft.search(schema_id, field_id, "rust programming", 10).await?;
@@ -33,13 +33,13 @@ use crate::index::full_text::BM25Hit;
 ///     let doc = client.read_cell(hit.id).await?;
 /// }
 /// ```
-pub struct FulltextClient {
+pub struct FullTextClient {
     conshash: Arc<ConsistentHashing>,
     client_pool: Arc<ClientPool>,
 }
 
-impl FulltextClient {
-    /// Create a new fulltext client
+impl FullTextClient {
+    /// Create a new full-text client
     pub fn new(conshash: Arc<ConsistentHashing>) -> Self {
         Self {
             conshash,
