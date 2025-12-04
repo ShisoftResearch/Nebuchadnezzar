@@ -30,7 +30,10 @@ static TRANSACTION_MAX_RETRY: u32 = 1000;
 
 #[cfg(test)]
 mod tests;
+pub mod fulltext;
 pub mod transaction;
+
+pub use fulltext::{FulltextClient, SearchHit};
 
 #[derive(Debug)]
 pub enum NebClientError {
@@ -416,6 +419,19 @@ impl AsyncClient {
     }
     pub async fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
         self.schema_client.get_all().await
+    }
+
+    /// Get a full-text search client
+    ///
+    /// Returns a `FulltextClient` that can be used for distributed full-text search.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let ft_client = client.fulltext();
+    /// let hits = ft_client.search(schema_id, field_id, "rust programming", 10).await?;
+    /// ```
+    pub fn fulltext(&self) -> FulltextClient {
+        FulltextClient::new(self.conshash.clone())
     }
 }
 
