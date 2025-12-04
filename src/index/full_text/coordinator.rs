@@ -408,3 +408,429 @@ impl Default for CoordinatorBuilder {
         Self::new()
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ram::cell::OwnedCell;
+    use crate::ram::types::{Map, OwnedMap, OwnedValue};
+    use bifrost_hasher::hash_str;
+    use log::info;
+    use std::time::Duration;
+
+    /// Test coordinator logic for aggregating results from multiple shards
+    ///
+    /// NOTE: True multi-node cluster testing requires separate processes with shared
+    /// Raft state, which is complex in unit tests. This test verifies the coordinator's
+    /// aggregation logic works correctly by:
+    /// 1. Using two independent servers (simulating shards)
+    /// 2. Each server indexes its own documents
+    /// 3. We manually aggregate using both coordinators to verify the logic
+    ///
+    /// For full integration testing of distributed search across a real cluster,
+    /// use integration tests with multiple processes.
+    #[tokio::test]
+    async fn test_coordinator_aggregation_logic() {
+        let _ = env_logger::try_init();
+
+        info!("Starting coordinator aggregation logic test");
+
+        // Create two independent servers (simulating separate shards)
+        // NOTE: In a real cluster, these would share Raft state and see each other
+        info!("Creating shard 1...");
+        let shard1 = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+            },
+            "127.0.0.1:29511",
+            "shard1_group",
+            async |_| {},
+        )
+        .await;
+
+        info!("Creating shard 2...");
+        let shard2 = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+            },
+            "127.0.0.1:29512",
+            "shard2_group",
+            async |_| {},
+        )
+        .await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Create schema
+        let schema_id = 502u32;
+        let content_field = "content";
+        let content_field_id = hash_str(content_field);
+
+        let fields =
+            crate::ram::schema::Field::new_schema(vec![crate::ram::schema::Field::new_indexed(
+                content_field,
+                dovahkiin::types::Type::String,
+                vec![crate::ram::schema::IndexType::Fulltext],
+            )]);
+
+        let schema = crate::ram::schema::Schema::new_with_id(
+            schema_id,
+            "aggregation_test_schema",
+            None,
+            fields,
+            false,
+            false,
+        );
+
+        shard1.meta.schemas.new_schema(schema.clone());
+        shard2.meta.schemas.new_schema(schema.clone());
+
+        // Find documents owned by each shard
+        let mut shard1_docs = Vec::new();
+        let mut shard2_docs = Vec::new();
+        for i in 0..1000 {
+            let test_id = Id::new(i, i);
+            if shard1
+                .consh
+                .get_server_id(test_id.higher)
+                .map(|sid| sid == shard1.server_id)
+                .unwrap_or(false)
+                && shard1_docs.len() < 2
+            {
+                shard1_docs.push(test_id);
+            }
+            if shard2
+                .consh
+                .get_server_id(test_id.higher)
+                .map(|sid| sid == shard2.server_id)
+                .unwrap_or(false)
+                && shard2_docs.len() < 2
+            {
+                shard2_docs.push(test_id);
+            }
+            if shard1_docs.len() >= 2 && shard2_docs.len() >= 2 {
+                break;
+            }
+        }
+
+        assert!(shard1_docs.len() >= 2, "Need docs for shard1");
+        assert!(shard2_docs.len() >= 2, "Need docs for shard2");
+
+        // Index documents on shard1: "rust programming", "database systems"
+        let mut cell1_data = OwnedMap::new();
+        cell1_data.insert(
+            content_field,
+            OwnedValue::String("rust programming language guide".to_string()),
+        );
+        let mut cell1 =
+            OwnedCell::new_with_id(schema_id, &shard1_docs[0], OwnedValue::Map(cell1_data));
+
+        let mut cell2_data = OwnedMap::new();
+        cell2_data.insert(
+            content_field,
+            OwnedValue::String("database storage systems".to_string()),
+        );
+        let mut cell2 =
+            OwnedCell::new_with_id(schema_id, &shard1_docs[1], OwnedValue::Map(cell2_data));
+
+        shard1.chunks.write_cell(&mut cell1).unwrap();
+        shard1.chunks.write_cell(&mut cell2).unwrap();
+        if let Some(ref ib) = shard1.indexer {
+            ib.ensure_indices(&cell1, &schema, None);
+            ib.ensure_indices(&cell2, &schema, None);
+        }
+
+        // Index documents on shard2: "rust async tokio", "search architecture"
+        let mut cell3_data = OwnedMap::new();
+        cell3_data.insert(
+            content_field,
+            OwnedValue::String("rust async programming tokio".to_string()),
+        );
+        let mut cell3 =
+            OwnedCell::new_with_id(schema_id, &shard2_docs[0], OwnedValue::Map(cell3_data));
+
+        let mut cell4_data = OwnedMap::new();
+        cell4_data.insert(
+            content_field,
+            OwnedValue::String("search engine architecture".to_string()),
+        );
+        let mut cell4 =
+            OwnedCell::new_with_id(schema_id, &shard2_docs[1], OwnedValue::Map(cell4_data));
+
+        shard2.chunks.write_cell(&mut cell3).unwrap();
+        shard2.chunks.write_cell(&mut cell4).unwrap();
+        if let Some(ref ib) = shard2.indexer {
+            ib.ensure_indices(&cell3, &schema, None);
+            ib.ensure_indices(&cell4, &schema, None);
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Test 1: Coordinator on shard1 finds its local documents
+        info!("Testing shard1 coordinator...");
+        let coord1 = DistributedInvertedIndexCoordinator::new(
+            shard1.consh.clone(),
+            shard1.member_pool.clone(),
+        );
+
+        let stats1 = coord1
+            .get_global_stats(schema_id, content_field_id)
+            .await
+            .unwrap();
+        info!("Shard1 stats: doc_count={}", stats1.doc_count);
+        assert_eq!(stats1.doc_count, 2, "Shard1 should have 2 documents");
+
+        let hits1 = coord1
+            .distributed_search(schema_id, content_field_id, "rust", 10, false)
+            .await
+            .unwrap()
+            .unwrap();
+        info!("Shard1 'rust' hits: {}", hits1.len());
+        assert_eq!(hits1.len(), 1, "Shard1 should find 1 'rust' document");
+        assert_eq!(hits1[0].id, shard1_docs[0]);
+
+        // Test 2: Coordinator on shard2 finds its local documents
+        info!("Testing shard2 coordinator...");
+        let coord2 = DistributedInvertedIndexCoordinator::new(
+            shard2.consh.clone(),
+            shard2.member_pool.clone(),
+        );
+
+        let stats2 = coord2
+            .get_global_stats(schema_id, content_field_id)
+            .await
+            .unwrap();
+        info!("Shard2 stats: doc_count={}", stats2.doc_count);
+        assert_eq!(stats2.doc_count, 2, "Shard2 should have 2 documents");
+
+        let hits2 = coord2
+            .distributed_search(schema_id, content_field_id, "rust", 10, false)
+            .await
+            .unwrap()
+            .unwrap();
+        info!("Shard2 'rust' hits: {}", hits2.len());
+        assert_eq!(hits2.len(), 1, "Shard2 should find 1 'rust' document");
+        assert_eq!(hits2[0].id, shard2_docs[0]);
+
+        // Test 3: Verify merge_hits logic works correctly
+        // Create hits with explicitly different IDs to test aggregation
+        let test_hit1 = BM25Hit {
+            id: Id::new(1000, 1),
+            score: 1.5,
+        };
+        let test_hit2 = BM25Hit {
+            id: Id::new(1000, 2),
+            score: 2.0,
+        };
+        let test_hit3 = BM25Hit {
+            id: Id::new(1000, 1), // Duplicate of hit1
+            score: 0.5,
+        };
+        let combined_hits = vec![test_hit1, test_hit2, test_hit3];
+        let merged = coord1.merge_hits(combined_hits, 10);
+        assert_eq!(merged.len(), 2, "Merged results should have 2 unique documents");
+        // Score for id (1000,1) should be 1.5 + 0.5 = 2.0
+        let hit_1_1 = merged.iter().find(|h| h.id == Id::new(1000, 1)).unwrap();
+        assert!((hit_1_1.score - 2.0).abs() < 0.001, "Scores should be aggregated");
+
+        // Test 4: Verify stats aggregation logic
+        let global_doc_count = stats1.doc_count + stats2.doc_count;
+        let global_total_length = stats1.total_length + stats2.total_length;
+        assert_eq!(global_doc_count, 4, "Combined should have 4 documents");
+        info!(
+            "Combined stats: doc_count={}, total_length={}",
+            global_doc_count, global_total_length
+        );
+
+        // Test 5: Each shard finds its unique content
+        let db_hits = coord1
+            .distributed_search(schema_id, content_field_id, "database", 10, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db_hits.len(), 1, "Should find 'database' on shard1");
+        assert_eq!(db_hits[0].id, shard1_docs[1]);
+
+        let search_hits = coord2
+            .distributed_search(schema_id, content_field_id, "search engine", 10, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(search_hits.len(), 1, "Should find 'search engine' on shard2");
+        assert_eq!(search_hits[0].id, shard2_docs[1]);
+
+        info!("Coordinator aggregation logic test passed!");
+    }
+
+    /// Test that coordinator handles single-server clusters correctly
+    #[tokio::test]
+    async fn test_distributed_search_single_shard() {
+        let _ = env_logger::try_init();
+
+        info!("Starting single-shard distributed search test");
+
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+            },
+            "127.0.0.1:29503",
+            "single_shard_test",
+            async |_| {},
+        )
+        .await;
+
+        let schema_id = 501u32;
+        let content_field = "content";
+        let content_field_id = hash_str(content_field);
+
+        let fields =
+            crate::ram::schema::Field::new_schema(vec![crate::ram::schema::Field::new_indexed(
+                content_field,
+                dovahkiin::types::Type::String,
+                vec![crate::ram::schema::IndexType::Fulltext],
+            )]);
+
+        let schema = crate::ram::schema::Schema::new_with_id(
+            schema_id,
+            "single_shard_test_schema",
+            None,
+            fields,
+            false,
+            false,
+        );
+
+        server.meta.schemas.new_schema(schema.clone());
+
+        // Find owned document
+        let mut doc_id = None;
+        for i in 0..1000 {
+            let test_id = Id::new(i, i);
+            if server
+                .consh
+                .get_server_id(test_id.higher)
+                .map(|sid| sid == server.server_id)
+                .unwrap_or(false)
+            {
+                doc_id = Some(test_id);
+                break;
+            }
+        }
+        let doc_id = doc_id.expect("Should find owned document");
+
+        // Create and index document
+        let mut cell_data = OwnedMap::new();
+        cell_data.insert(
+            content_field,
+            OwnedValue::String("hello world from single shard".to_string()),
+        );
+        let mut cell =
+            OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+
+        server.chunks.write_cell(&mut cell).unwrap();
+        if let Some(ref index_builder) = server.indexer {
+            index_builder.ensure_indices(&cell, &schema, None);
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Create coordinator
+        let coordinator = DistributedInvertedIndexCoordinator::new(
+            server.consh.clone(),
+            server.member_pool.clone(),
+        );
+
+        // Search
+        let hits_result = coordinator
+            .distributed_search(schema_id, content_field_id, "hello world", 10, false)
+            .await
+            .unwrap();
+        let hits = hits_result.unwrap();
+
+        assert!(!hits.is_empty(), "Should find document");
+        assert_eq!(hits[0].id, doc_id);
+
+        info!("Single-shard distributed search test passed!");
+    }
+
+    /// Test empty query handling
+    #[tokio::test]
+    async fn test_distributed_search_empty_query() {
+        let _ = env_logger::try_init();
+
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+            },
+            "127.0.0.1:29504",
+            "empty_query_test",
+            async |_| {},
+        )
+        .await;
+
+        let coordinator = DistributedInvertedIndexCoordinator::new(
+            server.consh.clone(),
+            server.member_pool.clone(),
+        );
+
+        // Empty query should return empty results
+        let hits_result = coordinator
+            .distributed_search(100, 1, "", 10, false)
+            .await
+            .unwrap();
+        let hits = hits_result.unwrap();
+        assert!(hits.is_empty(), "Empty query should return empty results");
+
+        // Whitespace-only query should return empty results
+        let hits_result = coordinator
+            .distributed_search(100, 1, "   ", 10, false)
+            .await
+            .unwrap();
+        let hits = hits_result.unwrap();
+        assert!(
+            hits.is_empty(),
+            "Whitespace query should return empty results"
+        );
+
+        info!("Empty query test passed!");
+    }
+}
