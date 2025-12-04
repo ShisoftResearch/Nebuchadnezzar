@@ -202,7 +202,11 @@ fn build_partitation_statistics(
         // Use the address directly from entries() instead of re-locking with location_for_read
         // This avoids deadlocks when multiple threads try to lock cells in parallel
         // For statistics, slightly stale data is acceptable
-        if addr == 0 {
+        
+        // Validate address before using it - entries() may return stale/invalid addresses
+        // Check: not null, 8-byte aligned, and within valid x86-64 address range
+        if addr == 0 || addr % 8 != 0 || addr > 0x0000_FFFF_FFFF_FFFF {
+            trace!("Skipping invalid address 0x{:x} for cell {}", addr, hash);
             continue;
         }
         let loc = addr;
