@@ -14,6 +14,7 @@ use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue, SharedVal
 pub mod coordinator;
 pub mod rpc;
 pub mod shard;
+pub mod tokenizer;
 
 // ============================================================================
 // Constants and Configuration
@@ -21,7 +22,6 @@ pub mod shard;
 
 pub const BM25_K1: f32 = 1.5;
 pub const BM25_B: f32 = 0.75;
-const MIN_TOKEN_LEN: usize = 2;
 
 const INVERTED_INDEX_SCHEMA: &str = "INVERTED_INDEX_SCHEMA";
 const INVERTED_STATS_SCHEMA: &str = "INVERTED_STATS_SCHEMA";
@@ -157,18 +157,12 @@ pub fn build_index_meta(
     let mut term_counts: HashMap<u64, u32> = HashMap::new();
     let mut doc_length: u32 = 0;
 
+    // Use the new tokenizer with stop words, stemming, and CJK support
     let mut record_tokens = |text: &str| {
-        for raw in text.split(|c: char| !c.is_alphanumeric()) {
-            if raw.len() < MIN_TOKEN_LEN {
-                continue;
-            }
-            let token = raw.to_lowercase();
-            if token.len() < MIN_TOKEN_LEN {
-                continue;
-            }
-            doc_length = doc_length.saturating_add(1);
-            let hash = hash_str(&token);
-            *term_counts.entry(hash).or_insert(0) += 1;
+        let token_freqs = tokenizer::tokenize_with_freq(text);
+        for (hash, freq) in token_freqs {
+            doc_length = doc_length.saturating_add(freq);
+            *term_counts.entry(hash).or_insert(0) += freq;
         }
     };
 
@@ -211,19 +205,8 @@ pub fn build_index_meta(
 // ============================================================================
 
 pub(crate) fn tokenize_query(query: &str) -> Vec<u64> {
-    let mut seen = HashMap::new();
-    for raw in query.split(|c: char| !c.is_alphanumeric()) {
-        if raw.len() < MIN_TOKEN_LEN {
-            continue;
-        }
-        let norm = raw.to_lowercase();
-        if norm.len() < MIN_TOKEN_LEN {
-            continue;
-        }
-        let hash = hash_str(&norm);
-        seen.entry(hash).or_insert(0u32);
-    }
-    seen.into_iter().map(|(hash, _)| hash).collect()
+    // Use the new tokenizer with stop words, stemming, and CJK support
+    tokenizer::tokenize(query)
 }
 
 pub(crate) fn compute_idf(doc_count: u64, df: u64) -> f32 {

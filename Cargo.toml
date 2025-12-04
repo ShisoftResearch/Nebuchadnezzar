@@ -44,6 +44,12 @@ ndarray = "0.16.1"
 crc32fast = "*"
 lz4_flex = { version = "0.12", default-features = false }
 
+# Full-text search tokenization
+unicode-normalization = "0.1"
+rust-stemmers = "1.2"
+jieba-rs = "0.7"
+lindera = { version = "0.30", features = ["ipadic"] }
+
 [features]
 # Enable zero-overhead page fault tracking via mprotect/SIGSEGV
 # When disabled (default), segments are marked as referenced directly during reads
