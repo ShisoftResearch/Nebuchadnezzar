@@ -286,8 +286,7 @@ impl Segment {
         // can try again.
         self.last_no_progress_clean_generation
             .store(0, Ordering::Relaxed);
-        self.dead_bytes_generation
-            .fetch_add(1, Ordering::Relaxed);
+        self.dead_bytes_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Mark this segment as cleaned without reclaiming space for the current generation.
@@ -311,7 +310,11 @@ impl Segment {
     #[inline]
     pub fn cleaned_without_progress(&self) -> bool {
         let gen = self.dead_bytes_generation.load(Ordering::Relaxed);
-        gen > 0 && gen == self.last_no_progress_clean_generation.load(Ordering::Relaxed)
+        gen > 0
+            && gen
+                == self
+                    .last_no_progress_clean_generation
+                    .load(Ordering::Relaxed)
     }
 
     // dead space plus tombstone spaces

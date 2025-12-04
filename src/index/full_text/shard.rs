@@ -25,7 +25,7 @@ use super::{
 // The version allows filtering stale entries and garbage collection
 const INVERTED_SEGMENT_SCHEMA: &str = "INVERTED_SEGMENT_V2";
 const SEGMENT_DOC_IDS_FIELD: &str = "doc_ids";
-const SEGMENT_VERSIONS_FIELD: &str = "versions";  // Cell version for each entry
+const SEGMENT_VERSIONS_FIELD: &str = "versions"; // Cell version for each entry
 const SEGMENT_TERM_FREQS_FIELD: &str = "term_freqs";
 const SEGMENT_DOC_LENGTHS_FIELD: &str = "doc_lengths";
 const SEGMENT_NEXT_FIELD: &str = "_next";
@@ -141,9 +141,9 @@ struct DocMeta {
 use crate::ram::chunk::Chunk;
 
 /// Segmented posting list for persistent storage (per-Chunk)
-/// 
+///
 /// Each Chunk has its own posting lists for terms in documents stored in that Chunk.
-/// The posting list ID has higher=0 (local-only, not globally routed) and 
+/// The posting list ID has higher=0 (local-only, not globally routed) and
 /// lower=hash(schema, field, term, segment).
 struct SegmentedPostingList {
     schema_id: u32,
@@ -167,7 +167,8 @@ impl SegmentedPostingList {
     fn segment_id(&self, partition: u64, segment_idx: u32) -> Id {
         // higher = partition (matches document partition for proper recovery)
         // lower = hash of (schema_id, field_id, term_hash, segment_idx)
-        let lower = Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, segment_idx)).lower;
+        let lower =
+            Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, segment_idx)).lower;
         Id::new(partition, lower)
     }
 
@@ -191,20 +192,18 @@ impl SegmentedPostingList {
         let head_hash = head_id.lower;
 
         // Try to read existing head segment from this Chunk
-        let mut segment = match chunk.read_cell(head_hash) {
-            Ok(cell) => {
-                let owned_cell = OwnedCell {
-                    header: cell.header().clone(),
-                    data: cell.data().owned(),
-                };
-                PostingSegment::from_cell(&owned_cell).unwrap_or_else(PostingSegment::new)
-            }
-            Err(_) => PostingSegment::new(),
+        let mut head_guard = chunk.lock_or_insert_cell(head_hash);
+        let mut segment = if !head_guard.is_unassigned() {
+            let owned_cell = head_guard.read_cell_owned().map_err(|e| IndexError::Other(format!("Failed to read head segment: {:?}", e)))?;
+            PostingSegment::from_cell(&owned_cell).ok_or_else(|| IndexError::Other("Failed to parse head segment".to_string()))?
+        } else {
+            PostingSegment::new()
         };
 
         // If head is full, create new head and link it
         if segment.is_full() {
-            let new_head_id = self.segment_id(partition, self.next_segment_index(chunk, partition)?);
+            let new_head_id =
+                self.segment_id(partition, self.next_segment_index(chunk, partition)?);
             let mut new_segment = PostingSegment::new();
             new_segment.next = Some(head_id);
             new_segment.add(doc_id, version, tf, doc_len);
@@ -218,18 +217,17 @@ impl SegmentedPostingList {
             // Update old head's next pointer
             segment.next = Some(new_head_id);
             let mut old_cell = segment.to_cell(&head_id);
-            chunk
+            head_guard
                 .upsert_cell(&mut old_cell)
                 .map_err(|e| IndexError::Other(format!("Failed to update segment: {:?}", e)))?;
         } else {
             // Append to existing head
             segment.add(doc_id, version, tf, doc_len);
             let mut cell = segment.to_cell(&head_id);
-            chunk
+            head_guard
                 .upsert_cell(&mut cell)
                 .map_err(|e| IndexError::Other(format!("Failed to update segment: {:?}", e)))?;
         }
-
         Ok(())
     }
 
@@ -262,7 +260,11 @@ impl SegmentedPostingList {
     /// Iterate through all postings in this Chunk's posting list for this term
     /// Returns: (doc_id, version, term_freq, doc_length)
     /// chunk_index: used to identify posting lists stored in this chunk
-    fn iterate(&self, chunk: &Chunk, chunk_index: u64) -> Result<Vec<(Id, u64, u32, u32)>, IndexError> {
+    fn iterate(
+        &self,
+        chunk: &Chunk,
+        chunk_index: u64,
+    ) -> Result<Vec<(Id, u64, u32, u32)>, IndexError> {
         let mut all_postings = Vec::new();
         let mut current_id = Some(self.head_segment_id(chunk_index));
 
@@ -294,10 +296,10 @@ impl SegmentedPostingList {
 struct PostingSegment {
     next: Option<Id>,
     doc_ids: Vec<Id>,
-    versions: Vec<u64>,     // Cell version when entry was created
+    versions: Vec<u64>, // Cell version when entry was created
     term_freqs: Vec<u32>,
     doc_lengths: Vec<u32>,
-    cell_version: u64,      // Previous cell version (for proper version incrementing)
+    cell_version: u64, // Previous cell version (for proper version incrementing)
 }
 
 impl PostingSegment {
@@ -308,7 +310,7 @@ impl PostingSegment {
             versions: Vec::new(),
             term_freqs: Vec::new(),
             doc_lengths: Vec::new(),
-            cell_version: 0,  // Will be set when reading from cell
+            cell_version: 0, // Will be set when reading from cell
         }
     }
 
@@ -330,7 +332,7 @@ impl PostingSegment {
 
         let data = cell.data();
         let mut segment = Self::new();
-        
+
         // Capture the cell's version so we can continue incrementing from it
         segment.cell_version = cell.header().version;
 
@@ -343,7 +345,8 @@ impl PostingSegment {
         if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = &data[*SEGMENT_DOC_IDS_FIELD_ID] {
             segment.doc_ids = ids.clone();
         }
-        if let OwnedValue::PrimArray(OwnedPrimArray::U64(vers)) = &data[*SEGMENT_VERSIONS_FIELD_ID] {
+        if let OwnedValue::PrimArray(OwnedPrimArray::U64(vers)) = &data[*SEGMENT_VERSIONS_FIELD_ID]
+        {
             segment.versions = vers.clone();
         }
         if let OwnedValue::PrimArray(OwnedPrimArray::U32(tfs)) = &data[*SEGMENT_TERM_FREQS_FIELD_ID]
@@ -391,8 +394,9 @@ impl PostingSegment {
         );
 
         // Create cell with the previous version so upsert increments correctly
-        let mut cell = OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data));
-        cell.header.version = self.cell_version;  // Set to previous version; upsert will increment
+        let mut cell =
+            OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data));
+        cell.header.version = self.cell_version; // Set to previous version; upsert will increment
         cell
     }
 
@@ -409,14 +413,14 @@ impl PostingSegment {
 }
 
 /// Per-Chunk inverted indexer
-/// 
+///
 /// Each Chunk has its own posting lists for terms in documents stored in that Chunk.
 /// This provides data locality and scalability - no need to iterate global term lists.
-/// 
+///
 /// Caches (small, per-server):
 /// - field_stats: doc_count, total_length per (schema, field)
 /// - doc_metadata: doc_length per document (needed for BM25)
-/// 
+///
 /// NOT cached (read from Chunk storage):
 /// - posting_lists: term → doc_ids (can be huge)
 pub struct InvertedIndexer {
@@ -431,11 +435,7 @@ pub struct InvertedIndexer {
     doc_metadata: Arc<PtrHashMap<u64, Arc<Mutex<DocMeta>>>>,
 
     // Track original keys for iteration (PtrHashMap doesn't support iteration)
-    field_stats_keys: Arc<Mutex<HashMap<u64, (u32, u64)>>>,  // hash -> (schema_id, field_id)
-
-    // Per-chunk locks to serialize posting list writes (prevents read-modify-write races)
-    // One lock per chunk allows concurrent writes to different chunks
-    append_locks: Arc<Vec<std::sync::Mutex<()>>>,
+    field_stats_keys: Arc<Mutex<HashMap<u64, (u32, u64)>>>, // hash -> (schema_id, field_id)
 
     // Background sync for stats
     flush_interval: Duration,
@@ -451,9 +451,8 @@ impl InvertedIndexer {
     ) -> Self {
         // Create one lock per chunk for fine-grained concurrency
         let num_chunks = chunks.list.len().max(1);
-        let append_locks: Vec<std::sync::Mutex<()>> = (0..num_chunks)
-            .map(|_| std::sync::Mutex::new(()))
-            .collect();
+        let append_locks: Vec<std::sync::Mutex<()>> =
+            (0..num_chunks).map(|_| std::sync::Mutex::new(())).collect();
 
         Self {
             server_id,
@@ -462,7 +461,6 @@ impl InvertedIndexer {
             field_stats: Arc::new(PtrHashMap::with_capacity(64)),
             doc_metadata: Arc::new(PtrHashMap::with_capacity(1024)),
             field_stats_keys: Arc::new(Mutex::new(HashMap::new())),
-            append_locks: Arc::new(append_locks),
             flush_interval,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -487,7 +485,7 @@ impl InvertedIndexer {
     }
 
     /// Add a document to the index
-    /// 
+    ///
     /// Writes posting lists to the SAME Chunk as the document (based on partition).
     /// This ensures data locality - document and its term postings are co-located.
     pub fn add_document(&self, meta: &FullTextIndexMeta) -> Result<(), IndexError> {
@@ -495,19 +493,22 @@ impl InvertedIndexer {
         let partition = meta.cell_id.higher;
         let chunk_index = (partition as usize) % self.chunks.list.len();
 
-        // Lock only this chunk's append lock (allows concurrent writes to different chunks)
-        let _lock = self.append_locks[chunk_index].lock().map_err(|e| {
-            IndexError::Other(format!("Failed to acquire append lock for chunk {}: {:?}", chunk_index, e))
-        })?;
-
         let chunk = &self.chunks.list[chunk_index];
 
         // Update posting lists in this Chunk (write directly, no caching)
         // Each entry includes the cell version for filtering stale entries
         // Use chunk_index as the partition for posting list IDs (for proper recovery)
         for token in &meta.tokens {
-            let seg_list = SegmentedPostingList::new(meta.schema_id, meta.field_id, token.term_hash);
-            seg_list.append(chunk, chunk_index as u64, meta.cell_id, meta.version, token.term_freq, meta.doc_length)?;
+            let seg_list =
+                SegmentedPostingList::new(meta.schema_id, meta.field_id, token.term_hash);
+            seg_list.append(
+                chunk,
+                chunk_index as u64,
+                meta.cell_id,
+                meta.version,
+                token.term_freq,
+                meta.doc_length,
+            )?;
         }
 
         Ok(())
@@ -533,7 +534,11 @@ impl InvertedIndexer {
             let prev = doc_meta.doc_length;
             doc_meta.doc_length = meta.doc_length;
             doc_meta.tokens = meta.tokens.clone();
-            if prev == 0 { None } else { Some(prev) }
+            if prev == 0 {
+                None
+            } else {
+                Some(prev)
+            }
         };
 
         // Track stats key for iteration during flush
@@ -543,9 +548,9 @@ impl InvertedIndexer {
         }
 
         // Get or create field_stats entry
-        let stats_arc = self.field_stats.get_or_insert(stats_key, || {
-            Arc::new(Mutex::new(FieldStats::default()))
-        });
+        let stats_arc = self
+            .field_stats
+            .get_or_insert(stats_key, || Arc::new(Mutex::new(FieldStats::default())));
 
         // Update stats
         let mut stats = stats_arc.lock();
@@ -563,7 +568,7 @@ impl InvertedIndexer {
     }
 
     /// Remove a document from the index
-    /// 
+    ///
     /// Note: For now, we don't actually remove from posting lists (append-only).
     /// The document will be filtered out at query time if it no longer exists.
     /// A compaction process could clean up stale entries later.
@@ -578,7 +583,11 @@ impl InvertedIndexer {
             // Reset doc_length so subsequent inserts are treated as new documents
             doc_meta.doc_length = 0;
             doc_meta.tokens.clear();
-            if prev_len > 0 { Some(prev_len) } else { None }
+            if prev_len > 0 {
+                Some(prev_len)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -624,9 +633,9 @@ impl InvertedIndexer {
                         loaded_stats.doc_count, loaded_stats.total_length
                     );
                     // Cache in memory for future use using get_or_insert
-                    let stats_arc = self.field_stats.get_or_insert(stats_key, || {
-                        Arc::new(Mutex::new(loaded_stats.clone()))
-                    });
+                    let stats_arc = self
+                        .field_stats
+                        .get_or_insert(stats_key, || Arc::new(Mutex::new(loaded_stats.clone())));
                     return stats_arc.lock().clone();
                 } else {
                     warn!(
@@ -657,7 +666,7 @@ impl InvertedIndexer {
     ) -> Vec<(Id, u32, u32)> {
         let mut all_postings = Vec::new();
         let seg_list = SegmentedPostingList::new(schema_id, field_id, term_hash);
-        
+
         // Iterate all Chunks and collect postings from each
         for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
             if let Ok(postings) = seg_list.iterate(chunk, chunk_index as u64) {
@@ -666,7 +675,7 @@ impl InvertedIndexer {
                 }
             }
         }
-        
+
         all_postings
     }
 
@@ -679,21 +688,21 @@ impl InvertedIndexer {
     ) -> Vec<(Id, u64, u32, u32)> {
         let mut all_postings = Vec::new();
         let seg_list = SegmentedPostingList::new(schema_id, field_id, term_hash);
-        
+
         for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
             if let Ok(postings) = seg_list.iterate(chunk, chunk_index as u64) {
                 all_postings.extend(postings);
             }
         }
-        
+
         all_postings
     }
 
     /// Search using BM25 by iterating ALL Chunks on this server
-    /// 
+    ///
     /// Each Chunk has its own posting lists for terms in documents stored in that Chunk.
     /// We iterate all Chunks, read posting lists from each, and aggregate BM25 scores.
-    /// 
+    ///
     /// Note: Version is stored with each entry for future garbage collection,
     /// but not filtered at query time for performance. Stale entries may appear
     /// in results until GC runs.
@@ -726,7 +735,7 @@ impl InvertedIndexer {
         // For each query term, iterate ALL Chunks and collect postings
         for term_hash in query_terms {
             let seg_list = SegmentedPostingList::new(schema_id, field_id, term_hash);
-            
+
             // Collect postings from all Chunks
             let mut all_postings = Vec::new();
             for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
@@ -786,7 +795,7 @@ impl InvertedIndexer {
     }
 
     /// Flush in-memory stats to disk using transactions
-    /// 
+    ///
     /// Note: Posting lists are written directly to Chunks during add_document,
     /// so we only need to flush the stats cache here.
     pub(crate) async fn flush_to_disk(&self) -> Result<(), IndexError> {
@@ -820,8 +829,11 @@ impl InvertedIndexer {
                 if let Some(stats_arc) = self.field_stats.get(hash_key) {
                     let stat = stats_arc.lock();
                     let stats_id = Self::stats_cell_id(*schema_id, *field_id);
-                    let cell =
-                        OwnedCell::new_with_id(*INVERTED_STATS_SCHEMA_ID, &stats_id, stat.to_value());
+                    let cell = OwnedCell::new_with_id(
+                        *INVERTED_STATS_SCHEMA_ID,
+                        &stats_id,
+                        stat.to_value(),
+                    );
 
                     info!("Preparing stats cell for flush: schema={}, field={}, doc_count={}, total_length={}", 
                           schema_id, field_id, stat.doc_count, stat.total_length);
@@ -877,15 +889,15 @@ impl InvertedIndexer {
     }
 
     /// Garbage collect stale posting entries
-    /// 
+    ///
     /// Scans posting lists and removes entries where the stored version doesn't match
     /// the current cell version (indicating the document was updated or removed).
-    /// 
+    ///
     /// Parameters:
     /// - `schema_id`: Schema to GC (or all if None)
     /// - `field_id`: Field to GC (or all if None)  
     /// - `term_hashes`: Specific terms to GC (or scan all if None - expensive!)
-    /// 
+    ///
     /// Returns: (entries_scanned, entries_removed)
     pub fn garbage_collect(
         &self,
@@ -900,7 +912,7 @@ impl InvertedIndexer {
         if let Some(hashes) = term_hashes {
             let sid = schema_id.unwrap_or(0);
             let fid = field_id.unwrap_or(0);
-            
+
             for term_hash in hashes {
                 let (scanned, removed) = self.gc_posting_list(sid, fid, term_hash)?;
                 total_scanned += scanned;
@@ -930,32 +942,25 @@ impl InvertedIndexer {
         let mut total_removed = 0usize;
 
         for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
-            // Lock only this chunk during GC
-            let _lock = self.append_locks[chunk_index].lock().map_err(|e| {
-                IndexError::Other(format!("Failed to acquire append lock for GC on chunk {}: {:?}", chunk_index, e))
-            })?;
-
             let head_id = seg_list.head_segment_id(chunk_index as u64);
-            
+            let mut head_guard = match chunk.lock_cell_for_write(head_id.lower, true) {
+                Ok(guard) => guard,
+                Err(_) => continue,
+            };
             // Read the current posting list
-            match chunk.read_cell(head_id.lower) {
+            match head_guard.read_cell_owned() {
                 Ok(cell) => {
-                    let owned_cell = OwnedCell {
-                        header: cell.header().clone(),
-                        data: cell.data().owned(),
-                    };
-                    
-                    if let Some(segment) = PostingSegment::from_cell(&owned_cell) {
+                    if let Some(segment) = PostingSegment::from_cell(&cell) {
                         let mut new_segment = PostingSegment::new();
                         new_segment.cell_version = segment.cell_version;
                         new_segment.next = segment.next;
-                        
+
                         let mut chunk_removed = 0usize;
-                        
+
                         // Filter entries: keep only those with matching version
                         for (doc_id, version, tf, doc_len) in segment.iter() {
                             total_scanned += 1;
-                            
+
                             // Check if this entry's version matches current cell version
                             match chunk.head_cell(doc_id.lower) {
                                 Ok(doc_header) => {
@@ -973,13 +978,13 @@ impl InvertedIndexer {
                                 }
                             }
                         }
-                        
+
                         total_removed += chunk_removed;
-                        
+
                         // Write back the cleaned segment if anything was removed from this chunk
                         if chunk_removed > 0 {
                             let mut new_cell = new_segment.to_cell(&head_id);
-                            chunk.upsert_cell(&mut new_cell).map_err(|e| {
+                            head_guard.update_cell(&mut new_cell).map_err(|e| {
                                 IndexError::Other(format!("Failed to write GC'd segment: {:?}", e))
                             })?;
                         }
@@ -1009,7 +1014,6 @@ impl Clone for InvertedIndexer {
             field_stats: self.field_stats.clone(),
             doc_metadata: self.doc_metadata.clone(),
             field_stats_keys: self.field_stats_keys.clone(),
-            append_locks: self.append_locks.clone(),
             flush_interval: self.flush_interval,
             shutdown: self.shutdown.clone(),
         }
@@ -1019,7 +1023,6 @@ impl Clone for InvertedIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::builder::IndexMeta;
     use crate::ram::schema::LocalSchemasCache;
     use crate::server::ServerMeta;
     use bifrost::conshash::weights::Weights;
@@ -1636,18 +1639,30 @@ mod tests {
 
         // Add documents - they should go to different chunks
         let result1 = indexer.add_document(&meta1);
-        assert!(result1.is_ok(), "Should add document to chunk 0: {:?}", result1);
+        assert!(
+            result1.is_ok(),
+            "Should add document to chunk 0: {:?}",
+            result1
+        );
         indexer.update_stats_for_add(&meta1);
 
         let result2 = indexer.add_document(&meta2);
-        assert!(result2.is_ok(), "Should add document to chunk 1: {:?}", result2);
+        assert!(
+            result2.is_ok(),
+            "Should add document to chunk 1: {:?}",
+            result2
+        );
         indexer.update_stats_for_add(&meta2);
 
         // Search should find documents from all chunks
         let hits = indexer.bm25_search(schema_id, field_id, "hello", 10).await;
         assert!(hits.is_ok(), "Search should succeed");
         let hits = hits.unwrap();
-        assert_eq!(hits.len(), 2, "Should find both documents containing 'hello'");
+        assert_eq!(
+            hits.len(),
+            2,
+            "Should find both documents containing 'hello'"
+        );
 
         info!("Per-chunk indexing test passed");
     }
@@ -2027,9 +2042,7 @@ mod tests {
                     "updated content about rust",
                 );
                 info!("Removing from inverted indexer...");
-                inverted_indexer
-                    .remove_document(&removal_meta)
-                    .unwrap();
+                inverted_indexer.remove_document(&removal_meta).unwrap();
             }
         }
 
@@ -2214,8 +2227,8 @@ mod tests {
         info!("Verifying stats exist in memory before flushing...");
         if let Some(ref index_builder) = server1.indexer {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
-                let stats_before_flush = inverted_indexer
-                    .get_field_stats(schema_id, content_field_id);
+                let stats_before_flush =
+                    inverted_indexer.get_field_stats(schema_id, content_field_id);
                 info!(
                     "Stats in memory before flush: doc_count={}, total_length={}",
                     stats_before_flush.doc_count, stats_before_flush.total_length

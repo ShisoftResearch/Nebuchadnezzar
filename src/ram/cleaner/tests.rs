@@ -252,9 +252,7 @@ fn compact_marks_no_progress_and_skips_segment() {
 
     // Artificially mark the segment as fragmented without actually removing cells.
     let fake_dead = victim_seg.used_spaces() / 2 + 1;
-    victim_seg
-        .dead_space
-        .store(fake_dead, Ordering::Relaxed);
+    victim_seg.dead_space.store(fake_dead, Ordering::Relaxed);
     victim_seg.note_dead_bytes_change();
 
     let initial_candidates = chunk.segs_for_compact_cleaner();
@@ -264,7 +262,10 @@ fn compact_marks_no_progress_and_skips_segment() {
     );
 
     let reclaimed = compact::CompactCleaner::clean_segment(chunk, &victim_seg);
-    assert_eq!(reclaimed, 0, "no space should be reclaimed without dead cells");
+    assert_eq!(
+        reclaimed, 0,
+        "no space should be reclaimed without dead cells"
+    );
     assert!(
         victim_seg.cleaned_without_progress(),
         "segment should record a no-progress clean"
@@ -280,7 +281,9 @@ fn compact_marks_no_progress_and_skips_segment() {
     chunk.mark_dead_entry_with_size(victim_seg.addr, 8, &victim_seg);
     let refreshed_candidates = chunk.segs_for_compact_cleaner();
     assert!(
-        refreshed_candidates.iter().any(|seg| seg.id == victim_seg.id),
+        refreshed_candidates
+            .iter()
+            .any(|seg| seg.id == victim_seg.id),
         "new dead bytes should make segment eligible for compaction again"
     );
 }

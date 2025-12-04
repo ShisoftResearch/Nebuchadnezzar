@@ -116,7 +116,12 @@ async fn setup_test_conshash(
     server_addr: &str,
     group_name: &str,
     conshash_id: u64,
-) -> (Arc<ConsistentHashing>, Arc<RaftClient>, Arc<AsyncClient>, u64) {
+) -> (
+    Arc<ConsistentHashing>,
+    Arc<RaftClient>,
+    Arc<AsyncClient>,
+    u64,
+) {
     let temp_dir = TempDir::new().unwrap();
     let raft_path = temp_dir.path().join("raft");
 
@@ -172,9 +177,14 @@ async fn setup_test_conshash(
 
     // Create AsyncClient
     let neb_client = Arc::new(
-        AsyncClient::new(&rpc_server, &membership_client, &vec![server_addr.to_string()], group_name)
-            .await
-            .unwrap(),
+        AsyncClient::new(
+            &rpc_server,
+            &membership_client,
+            &vec![server_addr.to_string()],
+            group_name,
+        )
+        .await
+        .unwrap(),
     );
 
     // Get the server_id for this address

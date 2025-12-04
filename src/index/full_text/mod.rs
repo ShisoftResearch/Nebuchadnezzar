@@ -12,8 +12,8 @@ use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue, SharedVal
 
 // Submodules
 pub mod coordinator;
-pub mod shard;
 pub mod rpc;
+pub mod shard;
 
 // ============================================================================
 // Constants and Configuration
@@ -67,7 +67,7 @@ pub struct TokenStat {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct FullTextIndexMeta {
     pub cell_id: Id,
-    pub version: u64,  // Cell version for filtering stale entries
+    pub version: u64, // Cell version for filtering stale entries
     pub schema_id: u32,
     pub field_id: u64,
     pub doc_length: u32,

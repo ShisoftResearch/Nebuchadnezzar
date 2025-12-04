@@ -99,9 +99,7 @@ impl Service for InvertedIndexRPCService {
                 .await
                 .map_err(|e| InvertedIndexError::SearchError(format!("{:?}", e)))?;
 
-            let stats = self
-                .indexer
-                .get_field_stats(req.schema_id, req.field_id);
+            let stats = self.indexer.get_field_stats(req.schema_id, req.field_id);
 
             Ok(InvertedSearchResponse {
                 hits,
@@ -117,9 +115,7 @@ impl Service for InvertedIndexRPCService {
         req: FieldStatsRequest,
     ) -> BoxFuture<'_, Result<FieldStatsResponse, InvertedIndexError>> {
         async move {
-            let stats = self
-                .indexer
-                .get_field_stats(req.schema_id, req.field_id);
+            let stats = self.indexer.get_field_stats(req.schema_id, req.field_id);
 
             Ok(FieldStatsResponse {
                 doc_count: stats.doc_count,
@@ -134,9 +130,9 @@ impl Service for InvertedIndexRPCService {
         req: TermPostingsRequest,
     ) -> BoxFuture<'_, Result<TermPostingsResponse, InvertedIndexError>> {
         async move {
-            let postings = self
-                .indexer
-                .get_term_postings(req.schema_id, req.field_id, req.term_hash);
+            let postings =
+                self.indexer
+                    .get_term_postings(req.schema_id, req.field_id, req.term_hash);
 
             Ok(TermPostingsResponse { postings })
         }

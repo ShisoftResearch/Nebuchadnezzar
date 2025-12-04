@@ -562,6 +562,11 @@ impl Chunk {
         }
     }
 
+    pub fn lock_or_insert_cell(&self, hash: u64) -> CellGuard<'_> {
+        let guard = self.cell_index.lock_or_insert(hash as usize, 0);
+        CellGuard::new(guard, self)
+    }
+
     pub(crate) fn head_cell(&self, hash: u64) -> Result<CellHeader, ReadError> {
         header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
     }
@@ -1230,6 +1235,22 @@ impl Chunk {
     fn refresh_statistics(&self) {
         self.statistics.refresh_from_chunk(self)
     }
+
+    pub fn lock_cell_for_read(&self, hash: u64) -> Result<CellGuard<'_>, ReadError> {
+        let guard = self.location_for_read(hash)?;
+        Ok(CellGuard::new(guard, self))
+    }
+
+    pub fn lock_cell_for_write(
+        &self,
+        hash: u64,
+        has_read: bool,
+    ) -> Result<CellGuard<'_>, ReadError> {
+        let guard = self
+            .location_for_write(hash, has_read)
+            .ok_or(ReadError::CellDoesNotExisted)?;
+        Ok(CellGuard::new(guard, self))
+    }
 }
 
 pub struct PendingEntry {
@@ -1540,5 +1561,76 @@ impl Chunks {
                 merge_statistics(all_stats).map(|s| Arc::new(s))
             })
             .unwrap()
+    }
+
+    pub fn lock_cell_for_read(&self, key: &Id) -> Result<CellGuard<'_>, ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.lock_cell_for_read(hash);
+    }
+    pub fn lock_cell_for_write(
+        &self,
+        key: &Id,
+        has_read: bool,
+    ) -> Result<CellGuard<'_>, ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.lock_cell_for_write(hash, has_read);
+    }
+}
+
+pub struct CellGuard<'a> {
+    guard: WordMutexGuard<'a>,
+    chunk: &'a Chunk,
+}
+
+impl<'a> CellGuard<'a> {
+    pub fn new(guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Self {
+        Self { guard, chunk }
+    }
+
+    pub fn head_cell(&self) -> Result<CellHeader, ReadError> {
+        header_from_chunk_raw(*self.guard).map(|pair| pair.0)
+    }
+
+    pub fn read_cell_owned(&self) -> Result<OwnedCell, ReadError> {
+        let (data, _) = SharedCellData::from_chunk_raw(*self.guard, self.chunk)?;
+        Ok(data.to_owned())
+    }
+
+    pub fn is_unassigned(&self) -> bool {
+        *self.guard == 0
+    }
+
+    pub fn update_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+        let old_cell_loc = *self.guard;
+        let (new_cell_loc, schema) = self.chunk.write_cell_to_chunk(cell)?;
+        let old_indices = self.chunk.old_index_res(&self.guard, &*schema)?;
+        *self.guard = new_cell_loc;
+        self.chunk.ensure_indices_with_res(cell, old_indices, &*schema);
+        self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
+        self.chunk.refresh_statistics();
+        Ok(cell.header)
+    }
+
+    /// Upsert a cell - updates if the guard points to an existing cell, inserts if empty.
+    /// This is useful when you have a guard from `try_insert_locked` which may point to
+    /// an empty slot (insert case) or an existing cell (update case).
+    pub fn upsert_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+        let old_cell_loc = *self.guard;
+        let (new_cell_loc, schema) = self.chunk.write_cell_to_chunk(cell)?;
+
+        if old_cell_loc != 0 {
+            // Update case - cell already exists
+            let old_indices = self.chunk.old_index_res(&self.guard, &*schema)?;
+            *self.guard = new_cell_loc;
+            self.chunk.ensure_indices_with_res(cell, old_indices, &*schema);
+            self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
+        } else {
+            // Insert case - new cell
+            *self.guard = new_cell_loc;
+            self.chunk.ensure_indices(cell, None, &*schema);
+        }
+
+        self.chunk.refresh_statistics();
+        Ok(cell.header)
     }
 }
