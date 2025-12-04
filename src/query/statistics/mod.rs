@@ -198,18 +198,19 @@ fn build_partitation_statistics(
     let mut counts = HashMap::new();
     let mut exact_accumlators = HashMap::new();
     let partitation_size = partitation.len();
-    for (hash, _addr) in partitation {
-        let loc = if let Ok(ptr) = chunk.location_for_read(hash as u64) {
-            ptr
-        } else {
-            trace!("Cannot obtain cell lock {} for statistics", hash);
+    for (hash, addr) in partitation {
+        // Use the address directly from entries() instead of re-locking with location_for_read
+        // This avoids deadlocks when multiple threads try to lock cells in parallel
+        // For statistics, slightly stale data is acceptable
+        if addr == 0 {
             continue;
-        };
-        match header_from_chunk_raw(*loc) {
+        }
+        let loc = addr;
+        match header_from_chunk_raw(loc) {
             Ok((header, _)) => {
-                let (entry_hdr, _) = Entry::decode_from(*loc, |_, _| ());
+                let (entry_hdr, _) = Entry::decode_from(loc, |_, _| ());
                 let cell_size = entry_hdr.content_length as usize;
-                let cell_seg = chunk.allocator.id_by_addr(*loc);
+                let cell_seg = chunk.allocator.id_by_addr(loc);
                 let schema_id = header.schema;
                 if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
                     // Filter out fields that only have Fulltext or Vector indices
@@ -227,7 +228,7 @@ fn build_partitation_statistics(
                     if !fields.is_empty() {
                         trace!("Schema {} has fields {:?}", schema_id, fields);
                         if let Ok((partial_cell, _)) =
-                            select_from_chunk_raw(*loc, chunk, fields.as_slice(), true)
+                            select_from_chunk_raw(loc, chunk, fields.as_slice(), true)
                         {
                             let field_array = match partial_cell {
                                 SharedValue::Array(arr) => arr,
