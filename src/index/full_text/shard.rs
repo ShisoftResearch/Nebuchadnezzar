@@ -202,8 +202,9 @@ impl SegmentedPostingList {
 
         // If head is full, create new head and link it
         if segment.is_full() {
+            // Pass the current segment to avoid re-locking the head cell (would deadlock)
             let new_head_id =
-                self.segment_id(partition, self.next_segment_index(chunk, partition)?);
+                self.segment_id(partition, self.next_segment_index(chunk, partition, Some(&segment))?);
             let mut new_segment = PostingSegment::new();
             new_segment.next = Some(head_id);
             new_segment.add(doc_id, version, tf, doc_len);
@@ -232,9 +233,21 @@ impl SegmentedPostingList {
     }
 
     /// Get next segment index by traversing the linked list in this Chunk
-    fn next_segment_index(&self, chunk: &Chunk, partition: u64) -> Result<u32, IndexError> {
-        let mut current_id = Some(self.head_segment_id(partition));
-        let mut segment_count = 0u32;
+    /// If head_segment is provided, use it instead of reading from the chunk (avoids deadlock
+    /// when caller already holds lock on head)
+    fn next_segment_index(
+        &self,
+        chunk: &Chunk,
+        partition: u64,
+        head_segment: Option<&PostingSegment>,
+    ) -> Result<u32, IndexError> {
+        // If head segment is provided, start from its next pointer (count starts at 1)
+        // Otherwise, start from head (count starts at 0)
+        let (mut current_id, mut segment_count) = if let Some(head) = head_segment {
+            (head.next, 1u32)
+        } else {
+            (Some(self.head_segment_id(partition)), 0u32)
+        };
 
         while let Some(seg_id) = current_id {
             match chunk.read_cell(seg_id.lower) {
