@@ -1639,6 +1639,152 @@ mod tests {
         info!("Basic functionality tests passed");
     }
 
+    /// Test that multi-term queries rank documents with more matching terms higher
+    #[tokio::test]
+    async fn test_multi_term_ranking() {
+        let _ = env_logger::try_init();
+        info!("Starting multi-term ranking test");
+
+        let server_addr = "127.0.0.1:5720";
+        let group_name = "multi_term_test_group";
+
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+            },
+            server_addr,
+            group_name,
+            async |_| {},
+        )
+        .await;
+
+        let schema_id = 600u32;
+        let content_field = "content";
+        let content_field_id = hash_str(content_field) as u64;
+
+        let fields =
+            crate::ram::schema::Field::new_schema(vec![crate::ram::schema::Field::new_indexed(
+                content_field,
+                dovahkiin::types::Type::String,
+                vec![crate::ram::schema::IndexType::Fulltext],
+            )]);
+
+        let schema = crate::ram::schema::Schema::new_with_id(
+            schema_id,
+            "multi_term_test_schema",
+            None,
+            fields,
+            false,
+            false,
+        );
+
+        server.meta.schemas.new_schema(schema.clone());
+
+        // Find owned document IDs
+        let mut owned_doc_ids = Vec::new();
+        for i in 0..10000 {
+            let test_id = Id::new(i, i);
+            if server
+                .consh
+                .get_server_id(test_id.higher)
+                .map(|sid| sid == server.server_id)
+                .unwrap_or(false)
+            {
+                owned_doc_ids.push(test_id);
+                if owned_doc_ids.len() >= 4 {
+                    break;
+                }
+            }
+        }
+
+        assert!(owned_doc_ids.len() >= 4, "Need at least 4 owned documents");
+        info!("Found {} owned documents", owned_doc_ids.len());
+
+        // Create documents with varying term coverage:
+        // Doc 0: contains "rust" only (1 term)
+        // Doc 1: contains "programming" only (1 term)
+        // Doc 2: contains "rust programming" (2 terms)
+        // Doc 3: contains "rust programming language" (3 terms if we search for all 3)
+        let texts = vec![
+            "rust is great",                           // 1 matching term
+            "programming is fun",                      // 1 matching term
+            "rust programming tutorial",               // 2 matching terms
+            "rust programming language guide",         // 2 matching terms (same as doc2 for query "rust programming")
+        ];
+
+        for (i, doc_id) in owned_doc_ids.iter().enumerate() {
+            let mut cell_data = OwnedMap::new();
+            cell_data.insert(content_field, OwnedValue::String(texts[i].to_string()));
+            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+
+            server.chunks.write_cell(&mut cell).unwrap();
+
+            if let Some(ref index_builder) = server.indexer {
+                index_builder.ensure_indices(&cell, &schema, None);
+            }
+        }
+
+        // Wait for indexing
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Search for "rust programming" - docs with both terms should rank higher
+        if let Some(ref index_builder) = server.indexer {
+            if let Some(indexer) = index_builder.clients.fulltext_indexer() {
+                let hits = indexer
+                    .bm25_search(schema_id, content_field_id, "rust programming", 10)
+                    .await
+                    .unwrap();
+
+                info!("Search results for 'rust programming':");
+                for (i, hit) in hits.iter().enumerate() {
+                    info!("  {}: doc {:?} score {:.4}", i + 1, hit.id, hit.score);
+                }
+
+                assert!(hits.len() >= 4, "Should find at least 4 documents");
+
+                // The top results should be docs with both terms (doc2 and doc3)
+                // They should have higher scores than docs with single terms
+                let top_two_ids: Vec<Id> = hits.iter().take(2).map(|h| h.id).collect();
+                let doc2_id = owned_doc_ids[2];
+                let doc3_id = owned_doc_ids[3];
+
+                // At least one of the top 2 should be doc2 or doc3 (both have "rust" and "programming")
+                assert!(
+                    top_two_ids.contains(&doc2_id) || top_two_ids.contains(&doc3_id),
+                    "Documents with both query terms should rank in top 2. Top 2: {:?}, expected: {:?} or {:?}",
+                    top_two_ids, doc2_id, doc3_id
+                );
+
+                // Verify that docs with 2 terms have higher scores than docs with 1 term
+                let single_term_doc = owned_doc_ids[0]; // "rust is great"
+                let multi_term_doc = owned_doc_ids[2];  // "rust programming tutorial"
+
+                let single_score = hits.iter().find(|h| h.id == single_term_doc).map(|h| h.score);
+                let multi_score = hits.iter().find(|h| h.id == multi_term_doc).map(|h| h.score);
+
+                if let (Some(single), Some(multi)) = (single_score, multi_score) {
+                    info!("Single term doc score: {:.4}, Multi term doc score: {:.4}", single, multi);
+                    assert!(
+                        multi > single,
+                        "Document with 2 matching terms ({:.4}) should score higher than document with 1 term ({:.4})",
+                        multi, single
+                    );
+                }
+
+                info!("Multi-term ranking test passed!");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_add_and_search_document() {
         let _ = env_logger::try_init();
