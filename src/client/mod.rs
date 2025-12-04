@@ -31,9 +31,11 @@ static TRANSACTION_MAX_RETRY: u32 = 1000;
 #[cfg(test)]
 mod tests;
 pub mod fulltext;
+pub mod ranged;
 pub mod transaction;
 
 pub use fulltext::{FulltextClient, SearchHit};
+pub use ranged::{RangedClient, RangedCursor, ScanOrder};
 
 #[derive(Debug)]
 pub enum NebClientError {
@@ -432,6 +434,25 @@ impl AsyncClient {
     /// ```
     pub fn fulltext(&self) -> FulltextClient {
         FulltextClient::new(self.conshash.clone())
+    }
+
+    /// Get a ranged index query client
+    ///
+    /// Returns a `RangedClient` that can be used for distributed range queries.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let ranged = client.ranged();
+    /// 
+    /// // Scan all documents in a schema
+    /// if let Some(mut cursor) = ranged.scan_schema(schema_id, 100).await? {
+    ///     while let Some(id) = cursor.next().await? {
+    ///         let doc = client.read_cell(id).await?;
+    ///     }
+    /// }
+    /// ```
+    pub fn ranged(&self) -> RangedClient {
+        RangedClient::new(self.conshash.clone(), self.raft_client.clone())
     }
 }
 
