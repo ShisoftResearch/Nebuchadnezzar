@@ -18,6 +18,7 @@ use crate::ram::{
     chunk::Chunk,
     clock::now,
     entry::Entry,
+    schema::IndexType,
 };
 
 #[derive(Debug, Default)]
@@ -211,7 +212,18 @@ fn build_partitation_statistics(
                 let cell_seg = chunk.allocator.id_by_addr(*loc);
                 let schema_id = header.schema;
                 if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
-                    let fields = schema.index_fields.keys().cloned().collect_vec();
+                    // Filter out fields that only have Fulltext or Vector indices
+                    // as these don't support feature() for histogram building
+                    let fields: Vec<u64> = schema
+                        .index_fields
+                        .iter()
+                        .filter(|(_, indices)| {
+                            indices.iter().any(|idx| {
+                                matches!(idx, IndexType::Ranged | IndexType::Hashed | IndexType::Statistics)
+                            })
+                        })
+                        .map(|(field_id, _)| *field_id)
+                        .collect();
                     if !fields.is_empty() {
                         trace!("Schema {} has fields {:?}", schema_id, fields);
                         if let Ok((partial_cell, _)) =
