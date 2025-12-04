@@ -193,11 +193,13 @@ impl SegmentedPostingList {
 
         // Try to read existing head segment from this Chunk
         let mut head_guard = chunk.lock_or_insert_cell(head_hash);
-        let mut segment = if !head_guard.is_unassigned() {
+        let (mut segment, head_version) = if !head_guard.is_unassigned() {
             let owned_cell = head_guard.read_cell_owned().map_err(|e| IndexError::Other(format!("Failed to read head segment: {:?}", e)))?;
-            PostingSegment::from_cell(&owned_cell).ok_or_else(|| IndexError::Other("Failed to parse head segment".to_string()))?
+            let version = owned_cell.header().version;
+            let seg = PostingSegment::from_cell(&owned_cell).ok_or_else(|| IndexError::Other("Failed to parse head segment".to_string()))?;
+            (seg, version)
         } else {
-            PostingSegment::new()
+            (PostingSegment::new(), 0)
         };
 
         // If head is full, prepend: move old head content to overflow cell, reset head with new posting
@@ -205,24 +207,24 @@ impl SegmentedPostingList {
             // Generate unique ID for overflow segment using random nonce
             let overflow_id = self.random_segment_id(partition);
             
-            // Move current head content (with its chain) to overflow cell
+            // Move current head content (with its chain) to NEW overflow cell (version starts at 0)
             let mut overflow_cell = segment.to_cell(&overflow_id);
             chunk
                 .upsert_cell(&mut overflow_cell)
                 .map_err(|e| IndexError::Other(format!("Failed to write overflow segment: {:?}", e)))?;
 
-            // Reset head with new posting, pointing to overflow
+            // Update head with new posting, pointing to overflow (preserve version for increment)
             let mut new_head = PostingSegment::new();
             new_head.add(doc_id, version, tf, doc_len);
             new_head.next = Some(overflow_id);
-            let mut head_cell = new_head.to_cell(&head_id);
+            let mut head_cell = new_head.to_cell_with_version(&head_id, head_version);
             head_guard
                 .upsert_cell(&mut head_cell)
                 .map_err(|e| IndexError::Other(format!("Failed to update head segment: {:?}", e)))?;
         } else {
-            // Append to existing head
+            // Append to existing head (preserve version for increment)
             segment.add(doc_id, version, tf, doc_len);
-            let mut cell = segment.to_cell(&head_id);
+            let mut cell = segment.to_cell_with_version(&head_id, head_version);
             head_guard
                 .upsert_cell(&mut cell)
                 .map_err(|e| IndexError::Other(format!("Failed to update segment: {:?}", e)))?;
@@ -286,7 +288,6 @@ struct PostingSegment {
     versions: Vec<u64>, // Cell version when entry was created
     term_freqs: Vec<u32>,
     doc_lengths: Vec<u32>,
-    cell_version: u64, // Previous cell version (for proper version incrementing)
 }
 
 impl PostingSegment {
@@ -297,7 +298,6 @@ impl PostingSegment {
             versions: Vec::new(),
             term_freqs: Vec::new(),
             doc_lengths: Vec::new(),
-            cell_version: 0, // Will be set when reading from cell
         }
     }
 
@@ -319,9 +319,6 @@ impl PostingSegment {
 
         let data = cell.data();
         let mut segment = Self::new();
-
-        // Capture the cell's version so we can continue incrementing from it
-        segment.cell_version = cell.header().version;
 
         // Read next pointer
         if let OwnedValue::Id(id) = &data[*SEGMENT_NEXT_FIELD_ID] {
@@ -380,10 +377,40 @@ impl PostingSegment {
             OwnedValue::PrimArray(OwnedPrimArray::U32(self.doc_lengths.clone())),
         );
 
-        // Create cell with the previous version so upsert increments correctly
-        let mut cell =
-            OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data));
-        cell.header.version = self.cell_version; // Set to previous version; upsert will increment
+        // Create cell with version 0 - storage layer will increment to 1 on write
+        OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data))
+    }
+
+    /// Convert to cell for updating an existing cell (preserves version for proper incrementing)
+    fn to_cell_with_version(&self, id: &Id, current_version: u64) -> OwnedCell {
+        let mut data = OwnedMap::new();
+
+        if let Some(next_id) = self.next {
+            data.insert_key_id(*SEGMENT_NEXT_FIELD_ID, OwnedValue::Id(next_id));
+        } else {
+            data.insert_key_id(*SEGMENT_NEXT_FIELD_ID, OwnedValue::Id(Id::unit_id()));
+        }
+
+        data.insert_key_id(
+            *SEGMENT_DOC_IDS_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::Id(self.doc_ids.clone())),
+        );
+        data.insert_key_id(
+            *SEGMENT_VERSIONS_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::U64(self.versions.clone())),
+        );
+        data.insert_key_id(
+            *SEGMENT_TERM_FREQS_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::U32(self.term_freqs.clone())),
+        );
+        data.insert_key_id(
+            *SEGMENT_DOC_LENGTHS_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::U32(self.doc_lengths.clone())),
+        );
+
+        // Preserve current version so storage layer increments correctly
+        let mut cell = OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data));
+        cell.header.version = current_version;
         cell
     }
 
@@ -937,9 +964,9 @@ impl InvertedIndexer {
             // Read the current posting list
             match head_guard.read_cell_owned() {
                 Ok(cell) => {
+                    let cell_version = cell.header().version;
                     if let Some(segment) = PostingSegment::from_cell(&cell) {
                         let mut new_segment = PostingSegment::new();
-                        new_segment.cell_version = segment.cell_version;
                         new_segment.next = segment.next;
 
                         let mut chunk_removed = 0usize;
@@ -970,7 +997,8 @@ impl InvertedIndexer {
 
                         // Write back the cleaned segment if anything was removed from this chunk
                         if chunk_removed > 0 {
-                            let mut new_cell = new_segment.to_cell(&head_id);
+                            // Preserve cell version for proper incrementing
+                            let mut new_cell = new_segment.to_cell_with_version(&head_id, cell_version);
                             head_guard.update_cell(&mut new_cell).map_err(|e| {
                                 IndexError::Other(format!("Failed to write GC'd segment: {:?}", e))
                             })?;
