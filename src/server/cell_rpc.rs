@@ -30,6 +30,7 @@ service! {
     rpc upsert_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc remove_cell(key: Id) -> Result<(), WriteError>;
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
+    rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
     rpc post_schema_add(schema_id: u32) -> Result<(), String>;
     rpc post_schema_delete(schema: u32) -> Result<(), String>;
@@ -100,6 +101,9 @@ impl Service for NebRPCService {
     }
     fn compare_version_and_update_cell(&self, key: Id, version: u64, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(self.server.chunks.compare_version_and_update_cell(&key, version, &mut cell))
+    }
+    fn compare_version_and_set_field(&self, key: Id, version: u64, field: u64, value: OwnedValue) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        self.with_indices_ensured(self.server.chunks.compare_version_and_set_field(&key, version, field, value))
     }
     fn count(&self) -> BoxFuture<'_, u64> {
         future::ready(self.server.chunks.count() as u64).boxed()

@@ -6,6 +6,7 @@ use bifrost::raft::state_machine::master::ExecError;
 use bifrost::rpc::{
     RPCClient, RPCError, Server as RPCServer, ServiceClientWithId, DEFAULT_CLIENT_POOL,
 };
+use dovahkiin::types::OwnedValue;
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
@@ -215,6 +216,10 @@ impl AsyncClient {
     pub async fn compare_version_and_update_cell(&self, id: Id, version: u64, cell: OwnedCell) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         client.compare_version_and_update_cell(id, version, cell).await
+    }
+    pub async fn compare_version_and_set_field(&self, id: Id, version: u64, field: u64, value: OwnedValue) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        client.compare_version_and_set_field(id, version, field, value).await
     }
     pub async fn transaction<'a, TFN, TR, RF>(&self, func: TFN) -> Result<TR, TxnError>
     where
