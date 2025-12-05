@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;
 
+use crate::index::embedding::EmbeddingModel;
 use crate::index::vector::MetricEncoding;
 use crate::ram::io::align_address;
 use crate::server::NebServer;
@@ -43,12 +44,15 @@ pub struct Schema {
     pub is_scannable: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum IndexType {
     Ranged,
     Hashed,
     Vector(MetricEncoding),
     Fulltext,
+    /// Embedding index with configurable model.
+    /// The model name is interpreted by the embedding implementation (e.g., Morpheus).
+    Embedding(EmbeddingModel),
     Statistics,
 }
 
@@ -542,19 +546,34 @@ impl<O, T: ?Sized> Deref for ReadingRef<O, T> {
 pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Result<(), String> {
     for (field, indices) in &schema.index_fields {
         for index in indices {
-            if let IndexType::Vector(_metric_encoding) = index {
-                let field_id = *field;
-                let schema_id = schema.id;
-                if let Some(indexer) = &neb_server.indexer {
-                    let _ = indexer
-                        .clients
-                        .vector_client
-                        .new_index(schema_id, field_id)
-                        .await
-                        .map_err(|e| format!("Error creating vector index: {:?}", e))?;
-                } else {
-                    return Err(format!("Indexing not enabled"));
+            let field_id = *field;
+            let schema_id = schema.id;
+            match index {
+                IndexType::Vector(_metric_encoding) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .vector_client
+                            .new_index(schema_id, field_id)
+                            .await
+                            .map_err(|e| format!("Error creating vector index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
                 }
+                IndexType::Embedding(model) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .embedding_client
+                            .new_index(schema_id, field_id, model)
+                            .await
+                            .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -567,19 +586,34 @@ pub async fn post_schema_delete(
 ) -> Result<(), String> {
     for (field, indices) in &schema.index_fields {
         for index in indices {
-            if let IndexType::Vector(_metric_encoding) = index {
-                let field_id = *field;
-                let schema_id = schema.id;
-                if let Some(indexer) = &neb_server.indexer {
-                    let _ = indexer
-                        .clients
-                        .vector_client
-                        .delete_index(schema_id, field_id)
-                        .await
-                        .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
-                } else {
-                    return Err(format!("Indexing not enabled"));
+            let field_id = *field;
+            let schema_id = schema.id;
+            match index {
+                IndexType::Vector(_metric_encoding) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .vector_client
+                            .delete_index(schema_id, field_id)
+                            .await
+                            .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
                 }
+                IndexType::Embedding(_model) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .embedding_client
+                            .delete_index(schema_id, field_id)
+                            .await
+                            .map_err(|e| format!("Error deleting embedding index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
+                }
+                _ => {}
             }
         }
     }

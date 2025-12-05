@@ -1251,6 +1251,24 @@ impl Chunk {
             .ok_or(ReadError::CellDoesNotExisted)?;
         Ok(CellGuard::new(guard, self))
     }
+
+    pub fn compare_version_and_update_cell(&self, hash: u64, version: u64, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+        let mut guard = self.location_for_write(hash, false).ok_or(WriteError::CellDoesNotExisted)?;
+        let cell_location = *guard;
+        let old_cell_header = header_from_chunk_raw(cell_location).map_err(WriteError::ReadError)?.0;
+        if old_cell_header.version == version {
+            cell.header.version = version; // update version to the latest version
+            let (cell_loc, schema) = self.write_cell_to_chunk(cell)?;
+            let old_indices = self.old_index_res(&guard, &*schema)?;
+            self.ensure_indices_with_res(cell, old_indices, &*schema);
+            *guard = cell_loc;
+            drop(guard);
+            self.mark_dead_entry_with_cell(cell_location, cell);
+            self.refresh_statistics();
+            return Ok(cell.header)
+        }
+        return Err(WriteError::CellVersionMismatch);
+    }
 }
 
 pub struct PendingEntry {
@@ -1574,6 +1592,11 @@ impl Chunks {
     ) -> Result<CellGuard<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.lock_cell_for_write(hash, has_read);
+    }
+
+    pub fn compare_version_and_update_cell(&self, key: &Id, version: u64, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.compare_version_and_update_cell(hash, version, cell);
     }
 }
 

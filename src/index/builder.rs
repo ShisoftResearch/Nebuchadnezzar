@@ -4,6 +4,7 @@ use super::{EntryKey, Feature, IndexerClients};
 use crate::client::transaction::TxnError;
 use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
+use crate::index::embedding::EmbeddingModel;
 use crate::index::full_text::{
     build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
@@ -26,8 +27,47 @@ use std::hash::{Hash, Hasher};
 use std::{cell::RefCell, sync::Arc};
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::ram::types::OwnedPrimArray;
+
 // Constant representing an unset/empty feature
 const UNSETTLED: Feature = [0u8; 8];
+
+/// Build embedding index metadata from a cell value.
+/// Extracts text content from String or String array values.
+fn build_embedding_index_meta(
+    cell_id: Id,
+    schema_id: u32,
+    field_id: u64,
+    model: EmbeddingModel,
+    value: crate::ram::types::OwnedValue,
+) -> Option<EmbeddingIndexMeta> {
+    let text = match value {
+        crate::ram::types::OwnedValue::String(s) => {
+            if s.is_empty() {
+                return None;
+            }
+            s
+        }
+        crate::ram::types::OwnedValue::PrimArray(OwnedPrimArray::String(items)) => {
+            // Concatenate all strings with space separator for embedding
+            let joined = items.join(" ");
+            if joined.is_empty() {
+                return None;
+            }
+            joined
+        }
+        crate::ram::types::OwnedValue::Null => return None,
+        _ => return None, // Only text types are supported for embedding
+    };
+
+    Some(EmbeddingIndexMeta {
+        cell_id,
+        schema_id,
+        field_id,
+        model,
+        text,
+    })
+}
 
 // Define index rules
 // Index can be applied on scala value and scala arrays for both Ranged and Hashed
@@ -56,6 +96,28 @@ pub struct VectorIndexMeta {
     metric_encoding: MetricEncoding,
 }
 
+/// Metadata for embedding index operations.
+/// Contains the text content to be embedded by the external indexer.
+#[derive(Debug)]
+pub struct EmbeddingIndexMeta {
+    pub cell_id: Id,
+    pub schema_id: u32,
+    pub field_id: u64,
+    pub model: EmbeddingModel,
+    pub text: String,
+}
+
+// Implement Hash manually for EmbeddingIndexMeta to ensure consistent hashing
+impl Hash for EmbeddingIndexMeta {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.cell_id.hash(state);
+        self.schema_id.hash(state);
+        self.field_id.hash(state);
+        self.model.hash(state);
+        self.text.hash(state);
+    }
+}
+
 // Enum containing all possible index metadata types
 #[derive(Hash, Debug)]
 pub enum IndexMeta {
@@ -63,6 +125,7 @@ pub enum IndexMeta {
     Hashed(HashedIndexMeta),
     Vector(VectorIndexMeta),
     FullText(FullTextIndexMeta),
+    Embedding(EmbeddingIndexMeta),
 }
 
 // Enum for different types of index components
@@ -140,6 +203,12 @@ impl IndexMeta {
                     ));
                 }
             }
+            &IndexMeta::Embedding(ref meta) => {
+                indexers
+                    .embedding_client
+                    .insert(&meta.cell_id, meta.schema_id, meta.field_id, &meta.model, &meta.text)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -176,6 +245,12 @@ impl IndexMeta {
                         "Inverted indexer not available".to_string(),
                     ));
                 }
+            }
+            &IndexMeta::Embedding(ref meta) => {
+                indexers
+                    .embedding_client
+                    .remove(&meta.cell_id, meta.schema_id, meta.field_id)
+                    .await?;
             }
         }
         Ok(())
@@ -419,6 +494,18 @@ where
                                 metas.push(IndexMeta::FullText(meta));
                             }
                         }
+                        &IndexType::Embedding(ref model) => {
+                            let owned_value = value.to_owned_value();
+                            if let Some(meta) = build_embedding_index_meta(
+                                cell.id(),
+                                schema.id,
+                                *field_id,
+                                model.clone(),
+                                owned_value,
+                            ) {
+                                metas.push(IndexMeta::Embedding(meta));
+                            }
+                        }
                         &IndexType::Statistics => {}
                     }
                 }
@@ -439,6 +526,18 @@ where
                                 owned_value,
                             ) {
                                 metas.push(IndexMeta::FullText(meta));
+                            }
+                        }
+                        &IndexType::Embedding(ref model) => {
+                            let owned_value = value.to_owned_value();
+                            if let Some(meta) = build_embedding_index_meta(
+                                cell.id(),
+                                schema.id,
+                                *field_id,
+                                model.clone(),
+                                owned_value,
+                            ) {
+                                metas.push(IndexMeta::Embedding(meta));
                             }
                         }
                         &IndexType::Statistics => {}

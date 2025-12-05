@@ -1,6 +1,6 @@
-// Nebuchadnezzar does not provide a vector indexer itself, it requires and external implementation.
+// Nebuchadnezzar does not provide a vector indexer itself, it requires an external implementation.
 // This module provides a trait and a default implementation that can be used to create a vector indexer.
-
+//
 // By default, the implementation is Morpheus, it sets the index core to its implementation,
 // Nebuchadnezzar will use it to index vectors.
 
@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 
 use dovahkiin::types::Id;
 use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 
 use crate::index::builder::IndexError;
 
@@ -16,7 +17,7 @@ pub const NO_VECTOR_CORE_ERROR: &str =
     "Vector indexer core is not set. Should call `set_vector_index_core` to set it.";
 
 /// Encodings to allow metric serialization and conversion.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum MetricEncoding {
     L2,
     Cosine,
@@ -24,7 +25,38 @@ pub enum MetricEncoding {
     Chebyshev,
 }
 
+/// Result of a vector similarity search
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorHit {
+    /// The document/cell ID
+    pub id: Id,
+    /// Distance or similarity score (interpretation depends on metric)
+    /// - For L2/Manhattan/Chebyshev: lower is more similar (distance)
+    /// - For Cosine: higher is more similar (similarity, typically 0.0 to 1.0)
+    pub score: f32,
+}
+
+/// Core trait for vector index implementations.
+///
+/// Implementations should handle:
+/// - Vector storage and indexing (e.g., HNSW, IVF-PQ)
+/// - Approximate nearest neighbor search
+///
+/// The vector data is read from the cell during insert operations.
+/// The implementation is responsible for:
+/// 1. Reading the vector field from the cell
+/// 2. Storing the vector with appropriate indexing structures
+/// 3. Performing similarity search when queried
 pub trait VectorIndexerCore: Send + Sync {
+    /// Insert a vector into the index.
+    ///
+    /// The implementation should read the vector data from the cell.
+    ///
+    /// # Arguments
+    /// * `cell_id` - The ID of the cell containing the vector
+    /// * `schema_id` - Schema ID for namespace isolation
+    /// * `field_id` - Field ID containing the vector data
+    /// * `metric_encoding` - Distance metric to use for this vector
     fn insert(
         &self,
         cell_id: &Id,
@@ -32,6 +64,13 @@ pub trait VectorIndexerCore: Send + Sync {
         field_id: u64,
         metric_encoding: MetricEncoding,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
+
+    /// Remove a vector from the index.
+    ///
+    /// # Arguments
+    /// * `cell_id` - The ID of the cell/document to remove
+    /// * `schema_id` - Schema ID for namespace isolation
+    /// * `field_id` - Field ID being indexed
     fn remove(
         &self,
         cell_id: &Id,
@@ -39,10 +78,48 @@ pub trait VectorIndexerCore: Send + Sync {
         field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
+    /// Search for similar vectors using a query vector.
+    ///
+    /// Performs approximate nearest neighbor search.
+    ///
+    /// # Arguments
+    /// * `schema_id` - Schema ID for namespace isolation
+    /// * `field_id` - Field ID to search within
+    /// * `query_vector` - The query vector to find neighbors for
+    /// * `limit` - Maximum number of results to return
+    fn search(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>>;
+
+    /// Create a new vector index for a schema/field combination.
+    ///
+    /// Called when a new schema with vector index is created.
     fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>>;
+
+    /// Delete a vector index for a schema/field combination.
+    ///
+    /// Called when a schema with vector index is deleted.
     fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>>;
 }
 
+/// Client for vector index operations.
+///
+/// This client wraps a `VectorIndexerCore` implementation and provides
+/// a convenient interface for vector index operations.
+///
+/// # Example
+/// ```ignore
+/// // In Morpheus or another implementation:
+/// let client = VectorIndexClient::new();
+/// client.set_vector_index_core(MyVectorCore::new());
+///
+/// // Search for similar vectors
+/// let hits = client.search(schema_id, field_id, &query_vec, 10).await?;
+/// ```
 pub struct VectorIndexClient {
     vector_core: OnceLock<Arc<dyn VectorIndexerCore>>,
 }
@@ -54,19 +131,29 @@ impl VectorIndexClient {
         }
     }
 
+    /// Set the vector index core implementation.
+    ///
+    /// This should be called once during initialization, typically by Morpheus.
+    /// Returns true if the core was set successfully, false if already set.
     pub fn set_vector_index_core<C: VectorIndexerCore + 'static>(&self, core: C) -> bool {
         let res = self.vector_core.set(Arc::new(core));
         return res.is_ok();
     }
 
+    /// Get the vector index core.
+    ///
+    /// # Panics
+    /// Panics if the core has not been set via `set_vector_index_core`.
     pub fn get_vector_index_core(&self) -> &Arc<dyn VectorIndexerCore> {
         self.vector_core.get().expect(NO_VECTOR_CORE_ERROR)
     }
 
+    /// Check if the vector index core has been set.
     pub fn is_vector_index_core_set(&self) -> bool {
         self.vector_core.get().is_some()
     }
 
+    /// Insert a vector into the index.
     pub fn insert<'a>(
         &'a self,
         cell_id: &Id,
@@ -78,6 +165,7 @@ impl VectorIndexClient {
             .insert(cell_id, schema_id, field_id, metric_encoding)
     }
 
+    /// Remove a vector from the index.
     pub fn remove<'a>(
         &'a self,
         cell_id: &Id,
@@ -88,14 +176,30 @@ impl VectorIndexClient {
             .remove(cell_id, schema_id, field_id)
     }
 
-    pub fn new_index(
-        &self,
+    /// Search for similar vectors.
+    ///
+    /// # Arguments
+    /// * `schema_id` - Schema ID for namespace isolation
+    /// * `field_id` - Field ID to search within
+    /// * `query_vector` - The query vector (f32 slice)
+    /// * `limit` - Maximum number of results to return
+    pub fn search<'a>(
+        &'a self,
         schema_id: u32,
         field_id: u64,
-    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        query_vector: &'a [f32],
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<VectorHit>, IndexError>> {
+        self.get_vector_index_core()
+            .search(schema_id, field_id, query_vector, limit)
+    }
+
+    /// Create a new vector index.
+    pub fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_vector_index_core().new_index(schema_id, field_id)
     }
 
+    /// Delete a vector index.
     pub fn delete_index(
         &self,
         schema_id: u32,
@@ -103,5 +207,11 @@ impl VectorIndexClient {
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_vector_index_core()
             .delete_index(schema_id, field_id)
+    }
+}
+
+impl Default for VectorIndexClient {
+    fn default() -> Self {
+        Self::new()
     }
 }

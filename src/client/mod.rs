@@ -30,12 +30,16 @@ static TRANSACTION_MAX_RETRY: u32 = 1000;
 
 #[cfg(test)]
 mod tests;
+pub mod embedding;
 pub mod fulltext;
 pub mod ranged;
 pub mod transaction;
+pub mod vector;
 
+pub use embedding::{EmbeddingClient, SemanticHit};
 pub use fulltext::{FullTextClient, SearchHit};
 pub use ranged::{RangedClient, RangedCursor, ScanOrder};
+pub use vector::{SimilarityHit, VectorClient};
 
 #[derive(Debug)]
 pub enum NebClientError {
@@ -207,6 +211,10 @@ impl AsyncClient {
             sum += res?;
         }
         Ok(sum)
+    }
+    pub async fn compare_version_and_update_cell(&self, id: Id, version: u64, cell: OwnedCell) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        client.compare_version_and_update_cell(id, version, cell).await
     }
     pub async fn transaction<'a, TFN, TR, RF>(&self, func: TFN) -> Result<TR, TxnError>
     where

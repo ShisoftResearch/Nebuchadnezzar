@@ -2,6 +2,7 @@
 mod macros;
 #[macro_use]
 pub mod builder;
+pub mod embedding;
 pub mod entry;
 pub mod full_text;
 pub mod hash;
@@ -25,6 +26,7 @@ use futures::Future;
 use hash::{hash_index_schema, HashedIndexClient};
 
 use crate::client::AsyncClient;
+use crate::index::embedding::EmbeddingIndexClient;
 use crate::index::full_text::shard::InvertedIndexer;
 use crate::index::full_text::{
     inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit,
@@ -44,6 +46,7 @@ pub struct IndexerClients {
     pub ranged_client: Arc<RangedIndexerClient>,
     pub hashed_client: Arc<HashedIndexClient>,
     pub vector_client: Arc<VectorIndexClient>,
+    pub embedding_client: Arc<EmbeddingIndexClient>,
     fulltext_indexer: OnceLock<Arc<InvertedIndexer>>,
     // Store initialization parameters for lazy initialization
     server_id: u64,
@@ -63,6 +66,7 @@ impl IndexerClients {
             ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
+            embedding_client: Arc::new(EmbeddingIndexClient::new()),
             fulltext_indexer: OnceLock::new(),
             server_id,
             neb_client: neb_client.clone(),
@@ -100,6 +104,7 @@ impl IndexerClients {
             ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
+            embedding_client: Arc::new(EmbeddingIndexClient::new()),
             fulltext_indexer: OnceLock::new(), // Empty, won't be initialized
             server_id,
             neb_client: neb_client.clone(),

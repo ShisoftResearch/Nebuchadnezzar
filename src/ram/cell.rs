@@ -44,6 +44,7 @@ pub enum WriteError {
     DeletionPredictionFailed,
     NetworkingError,
     DataMismatchSchema(Field, OwnedValue),
+    CellVersionMismatch,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
