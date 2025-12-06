@@ -389,10 +389,24 @@ impl LocalSchemasCache {
     pub fn get(&self, id: &u32) -> Option<SchemaRef> {
         self.map.get(id)
     }
-    pub fn new_schema(&self, schema: Schema) {
+    pub fn debug_only_new_schema(&self, schema: Schema) {
         if !cfg!(debug_assertions) {
             panic!("for debug only");
         }
+        let m = &self.map;
+        m.new_schema(schema)
+    }
+
+    /// Register an internal/system schema locally (allowed in release builds)
+    /// 
+    /// Use this for system schemas that must be registered before recovery
+    /// (e.g., inverted index schemas). For user schemas, use the client API.
+    ///
+    /// **Important**: Internal schemas must have fixed, deterministic IDs 
+    /// (e.g., using `Schema::new_with_id()` with hash-based IDs) so that
+    /// all nodes in the cluster independently register identical schemas
+    /// without requiring raft consensus. Each node calls this during startup.
+    pub fn register_internal_schema(&self, schema: Schema) {
         let m = &self.map;
         m.new_schema(schema)
     }

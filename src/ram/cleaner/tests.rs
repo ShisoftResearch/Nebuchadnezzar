@@ -38,7 +38,7 @@ pub fn full_clean_cycle() {
     let _ = env_logger::try_init();
     let schema = Schema::new("cleaner_test", None, default_fields(), false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema);
+    schemas.debug_only_new_schema(schema);
     let chunks = Chunks::new(
         1,                    // single chunk
         MAX_SEGMENT_SIZE * 3, // chunk three segments
@@ -221,7 +221,7 @@ fn compact_marks_no_progress_and_skips_segment() {
     let _ = env_logger::try_init();
     let schema = Schema::new("cleaner_skip_test", None, default_fields(), false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema);
+    schemas.debug_only_new_schema(schema);
     let chunks = Chunks::new(
         1,
         MAX_SEGMENT_SIZE * 3,

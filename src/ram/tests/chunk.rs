@@ -38,7 +38,7 @@ pub fn cell_rw() {
     );
     let mut data = OwnedValue::Map(data_map);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -160,7 +160,7 @@ pub fn simple_cell_rw() {
     let schema = Schema::new("simple", None, fields, false, true);
     let data = OwnedValue::U64(128);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -191,7 +191,7 @@ pub fn array_dyn_map() {
     ]);
     let schema = Schema::new("array_dyn_map", None, fields, false, true);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
     let chunks = Chunks::new(
         1,
         CHUNK_SIZE,
@@ -223,7 +223,7 @@ pub fn complex_cell_sel_read() {
     let fields = complex_fields();
     let schema = Schema::new("complex", None, fields, false, true);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
     let chunks = Chunks::new(
         1,
         CHUNK_SIZE,
@@ -453,7 +453,7 @@ pub fn test_unified_chunk_address_space() {
     let fields = default_fields();
     let schema = Schema::new("test", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunk_count = 4;
     let total_size = CHUNK_SIZE * chunk_count;
@@ -571,7 +571,7 @@ fn test_wal_cleanup_after_archive() {
     let fields = default_fields();
     let schema = Schema::new("test_wal", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -682,7 +682,7 @@ fn test_wal_file_handle_properly_closed() {
     let fields = default_fields();
     let schema = Schema::new("test_handle", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -767,7 +767,7 @@ fn test_multiple_segments_wal_cleanup() {
     let fields = default_fields();
     let schema = Schema::new("test_multi", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -904,7 +904,7 @@ fn test_archive_idempotency() {
     let fields = default_fields();
     let schema = Schema::new("test_idempotent", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -987,7 +987,7 @@ fn test_multiple_segments_in_chunk() {
     let fields = default_fields();
     let schema = Schema::new("test_multi_seg", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     // Use a chunk size that can hold multiple segments
     // SEGMENT_SIZE is 8MB, each cell is ~50KB, so 160 cells = 8MB
@@ -1107,7 +1107,7 @@ fn test_concurrent_segment_allocation_and_cleanup() {
     let fields = default_fields();
     let schema = Schema::new("test_race", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunk_size = CHUNK_SIZE * 16; // 128MB to accommodate many segments
     let chunks = StdArc::new(Chunks::new(
@@ -1234,7 +1234,7 @@ fn setup_test_chunks() -> (Arc<Chunks>, Schema) {
     let fields = default_fields();
     let schema = Schema::new("test", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
     let chunks = Chunks::new(
         1,
         CHUNK_SIZE,

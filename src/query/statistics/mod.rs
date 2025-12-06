@@ -552,7 +552,7 @@ mod tests {
         let fields = default_fields();
         let schema = Schema::new("dummy", None, fields, false, true);
         let schemas = LocalSchemasCache::new_local("");
-        schemas.new_schema(schema.clone());
+        schemas.debug_only_new_schema(schema.clone());
         let schema_id = schema.id;
         let chunks = Chunks::new(
             1,

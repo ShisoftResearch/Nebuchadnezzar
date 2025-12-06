@@ -22,7 +22,7 @@ fn test_string_array_basic() {
 
     let schema = Schema::new("basic_string_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -67,7 +67,7 @@ fn test_string_array_utf8() {
 
     let schema = Schema::new("utf8_string_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -117,7 +117,7 @@ fn test_string_array_empty() {
 
     let schema = Schema::new("empty_string_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -158,7 +158,7 @@ fn test_string_array_long_strings() {
 
     let schema = Schema::new("long_string_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -205,7 +205,7 @@ fn test_string_array_mixed() {
 
     let schema = Schema::new("mixed_string_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -259,7 +259,7 @@ fn test_string_array_with_other_fields() {
 
     let schema = Schema::new("string_array_with_fields", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -308,7 +308,7 @@ fn test_string_array_vector_size() {
 
     let schema = Schema::new("vector_string_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -355,7 +355,7 @@ fn test_string_array_single_element() {
 
     let schema = Schema::new("single_element_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -396,7 +396,7 @@ fn test_string_array_with_empty_strings() {
 
     let schema = Schema::new("empty_strings_in_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -453,7 +453,7 @@ fn test_string_array_in_nested_map() {
 
     let schema = Schema::new("nested_string_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -506,7 +506,7 @@ fn test_string_array_large_size() {
 
     let schema = Schema::new("large_string_array", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,

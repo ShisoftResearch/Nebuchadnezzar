@@ -20,7 +20,7 @@ pub fn cell_rw() {
         name: String::from("Jack")
     };
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-    chunk.meta.schemas.new_schema(schema.clone());
+    chunk.meta.schemas.debug_only_new_schema(schema.clone());
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,

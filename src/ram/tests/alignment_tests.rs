@@ -93,7 +93,7 @@ async fn test_cell_location_alignment_after_write() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     println!("Writing 100 cells and checking alignment of stored addresses");
 
@@ -166,7 +166,7 @@ async fn test_cell_location_alignment_after_update() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     println!("Testing alignment through updates");
 
@@ -262,7 +262,7 @@ async fn test_varying_size_alignment() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     println!("Testing alignment with dramatically varying cell sizes");
 
@@ -446,7 +446,7 @@ async fn test_alignment_after_multiple_segments() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     println!("Testing alignment across multiple segment allocations");
 

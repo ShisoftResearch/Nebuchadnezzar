@@ -45,7 +45,7 @@ fn test_write_throughput_with_wal_and_backup() {
     let fields = default_fields();
     let schema = Schema::new("throughput_test", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let meta = Arc::new(ServerMeta { schemas });
 

@@ -37,7 +37,7 @@ pub async fn workspace_wr() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_id = txn.begin().await.unwrap().unwrap();
     let mut data_map = OwnedMap::new();
@@ -180,7 +180,7 @@ pub async fn data_site_wr() {
         true,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_id = txn.begin().await.unwrap().unwrap();
     let mut data_map = OwnedMap::new();
@@ -280,7 +280,7 @@ pub async fn multi_transaction() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_1_id = txn.begin().await.unwrap().unwrap();
     let txn_2_id = txn.begin().await.unwrap().unwrap();
@@ -389,7 +389,7 @@ pub async fn smoke_rw() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let mut data_map_1 = OwnedMap::new();
     data_map_1.insert(&String::from("id"), OwnedValue::I64(100));

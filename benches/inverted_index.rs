@@ -43,7 +43,7 @@ fn register_schema(schemas: &LocalSchemasCache, schema: neb::ram::schema::Schema
     #[cfg(debug_assertions)]
     {
         // In debug mode, use the public API
-        schemas.new_schema(schema);
+        schemas.debug_only_new_schema(schema);
         return;
     }
 

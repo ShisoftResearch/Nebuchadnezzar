@@ -59,7 +59,7 @@ fn test_eviction_on_memory_overflow() {
     let fields = default_fields();
     let schema = Schema::new("test_overflow", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("/tmp/neb_test_overflow_schema");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     // Create temp directories for this test
     let backup_dir = "/tmp/neb_test_overflow_bk";
@@ -239,7 +239,7 @@ fn test_cold_segment_promotion() {
     let fields = default_fields();
     let schema = Schema::new("test_promotion", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local("/tmp/neb_test_promotion_schema");
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let backup_dir = "/tmp/neb_test_promotion_bk";
     let wal_dir = "/tmp/neb_test_promotion_wal";
@@ -411,7 +411,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         schema.is_dynamic,
         schema.is_scannable,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     info!("Server started, schema created");
 
@@ -759,7 +759,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
         schema.is_dynamic,
         schema.is_scannable,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Initialize 2000 cells (reduced from 10000 for faster test)
     info!("Initializing 2000 cells");
@@ -971,7 +971,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
         false,
     );
 
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Initialize cells in batches (single-threaded setup)
     info!("Initializing 10,000 cells directly");
@@ -1256,7 +1256,7 @@ async fn test_direct_writes_with_tiered_memory() {
         false,
     );
 
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Start cleaner (this triggers eviction/promotion automatically)
     use crate::ram::cleaner::Cleaner;

@@ -504,8 +504,8 @@ mod tests {
             false,
         );
 
-        shard1.meta.schemas.new_schema(schema.clone());
-        shard2.meta.schemas.new_schema(schema.clone());
+        shard1.meta.schemas.debug_only_new_schema(schema.clone());
+        shard2.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Find documents owned by each shard
         let mut shard1_docs = Vec::new();
@@ -730,7 +730,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Find owned document
         let mut doc_id = None;

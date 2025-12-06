@@ -1760,7 +1760,7 @@ mod tests {
         ]);
         let schema = Schema::new("test_schema", None, fields, false, false);
         let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
-        schemas.new_schema(schema);
+        schemas.debug_only_new_schema(schema);
         let meta = Arc::new(crate::server::ServerMeta { schemas });
 
         let cell_id = Id {
@@ -1871,7 +1871,7 @@ mod tests {
         ]);
         let schema = Schema::new("test_schema", None, fields, false, false);
         let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
-        schemas.new_schema(schema);
+        schemas.debug_only_new_schema(schema);
         let meta = Arc::new(crate::server::ServerMeta { schemas });
 
         let chunks = Chunks::new(1, 32 * 1024 * 1024, meta.clone(), None, None, None, None);
@@ -2001,7 +2001,7 @@ mod tests {
             false,
             false,
         );
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         let txn = transactions::new_async_client(&server_addr).await.unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
@@ -2072,7 +2072,7 @@ mod tests {
         )
         .await;
 
-        server2.meta.schemas.new_schema(schema.clone());
+        server2.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Cell should NOT exist after rollback
         let cell_read_result = server2.chunks.read_cell(&cell_id);
@@ -2458,7 +2458,7 @@ mod tests {
             false,
             false,
         );
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         let txn = transactions::new_async_client(&server_addr).await.unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
@@ -2523,7 +2523,7 @@ mod tests {
         // Wait for Raft to stabilize after recovery restart
         sleep(Duration::from_millis(500)).await;
 
-        server2.meta.schemas.new_schema(schema.clone());
+        server2.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Cell should still exist after recovery (committed transaction)
         let read_cell = server2.chunks.read_cell(&cell_id).unwrap();

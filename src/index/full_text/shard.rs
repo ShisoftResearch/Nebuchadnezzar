@@ -1055,8 +1055,8 @@ mod tests {
     // Helper to create test chunks
     fn create_test_chunks() -> Arc<Chunks> {
         let schemas = LocalSchemasCache::new_local("");
-        schemas.new_schema(inverted_segment_schema());
-        schemas.new_schema(crate::index::full_text::inverted_stats_schema());
+        schemas.debug_only_new_schema(inverted_segment_schema());
+        schemas.debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
         Chunks::new(
             1,
@@ -1225,7 +1225,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
@@ -1346,7 +1346,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Find many owned document IDs for concurrent testing
         let mut owned_doc_ids = Vec::new();
@@ -1497,7 +1497,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Find many owned document IDs - enough to cause segment overflow
         // SEGMENT_SIZE is 1000, so we need > 1000 docs with the same term
@@ -1687,7 +1687,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
@@ -2181,7 +2181,7 @@ mod tests {
         );
 
         // Register schema
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Create test documents with text content
         let doc1_id = Id::new(1, 1);
@@ -2395,7 +2395,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.new_schema(schema.clone());
+        server.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Find an owned document ID
         info!("Finding owned document ID...");
@@ -2604,14 +2604,14 @@ mod tests {
             false,
         );
 
-        server1.meta.schemas.new_schema(schema.clone());
+        server1.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Register inverted index schemas BEFORE flushing (needed for flush operations)
-        server1.meta.schemas.new_schema(inverted_segment_schema());
+        server1.meta.schemas.debug_only_new_schema(inverted_segment_schema());
         server1
             .meta
             .schemas
-            .new_schema(crate::index::full_text::inverted_stats_schema());
+            .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
         // Find owned document IDs (skip unit ID)
         info!("Finding owned document IDs...");
@@ -2899,12 +2899,12 @@ mod tests {
 
         info!("Server 2 created with recovery, registering schemas...");
         // Re-register schemas (needed for recovery)
-        server2.meta.schemas.new_schema(schema.clone());
-        server2.meta.schemas.new_schema(inverted_segment_schema());
+        server2.meta.schemas.debug_only_new_schema(schema.clone());
+        server2.meta.schemas.debug_only_new_schema(inverted_segment_schema());
         server2
             .meta
             .schemas
-            .new_schema(crate::index::full_text::inverted_stats_schema());
+            .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
         // Give recovery time to complete
         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -3084,14 +3084,14 @@ mod tests {
             false,
         );
 
-        server1.meta.schemas.new_schema(schema.clone());
+        server1.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Register inverted index schemas
-        server1.meta.schemas.new_schema(inverted_segment_schema());
+        server1.meta.schemas.debug_only_new_schema(inverted_segment_schema());
         server1
             .meta
             .schemas
-            .new_schema(crate::index::full_text::inverted_stats_schema());
+            .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
@@ -3171,12 +3171,12 @@ mod tests {
         )
         .await;
 
-        server2.meta.schemas.new_schema(schema.clone());
-        server2.meta.schemas.new_schema(inverted_segment_schema());
+        server2.meta.schemas.debug_only_new_schema(schema.clone());
+        server2.meta.schemas.debug_only_new_schema(inverted_segment_schema());
         server2
             .meta
             .schemas
-            .new_schema(crate::index::full_text::inverted_stats_schema());
+            .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
         // Verify recovered documents

@@ -977,7 +977,7 @@ mod tests {
     fn setup_test_schema() -> LocalSchemasCache {
         let schema = Schema::new("recovery_test", None, default_fields(), false, false);
         let schemas = LocalSchemasCache::new_local("");
-        schemas.new_schema(schema);
+        schemas.debug_only_new_schema(schema);
         schemas
     }
 

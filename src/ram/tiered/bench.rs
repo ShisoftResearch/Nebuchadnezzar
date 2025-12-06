@@ -168,7 +168,7 @@ fn bench_hot_segment_reads() {
     let fields = default_fields();
     let schema = Schema::new("bench_hot", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local(schema_dir);
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -273,7 +273,7 @@ fn bench_cold_segment_reads() {
     let fields = default_fields();
     let schema = Schema::new("bench_cold", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local(schema_dir);
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -421,7 +421,7 @@ fn bench_mixed_uniform() {
     let fields = default_fields();
     let schema = Schema::new("bench_mixed_uniform", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local(schema_dir);
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,
@@ -561,7 +561,7 @@ fn bench_mixed_zipf() {
     let fields = default_fields();
     let schema = Schema::new("bench_mixed_zipf", None, fields, false, false);
     let schemas = LocalSchemasCache::new_local(schema_dir);
-    schemas.new_schema(schema.clone());
+    schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
         1,

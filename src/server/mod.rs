@@ -182,13 +182,15 @@ impl NebServer {
         // Note: chunks will be recreated with index_builder below
         // If indexing is enabled, register inverted index schemas BEFORE recovery
         // These schemas are needed for recovery to recognize inverted index cells
+        // Note: These internal schemas have fixed, hash-based IDs so all nodes
+        // register identical schemas independently without raft consensus
         if opts.index_enabled {
             meta_rc
                 .schemas
-                .new_schema(crate::index::full_text::shard::inverted_segment_schema());
+                .register_internal_schema(crate::index::full_text::shard::inverted_segment_schema());
             meta_rc
                 .schemas
-                .new_schema(crate::index::full_text::inverted_stats_schema());
+                .register_internal_schema(crate::index::full_text::inverted_stats_schema());
             debug!("Registered inverted index schemas before recovery");
         }
 

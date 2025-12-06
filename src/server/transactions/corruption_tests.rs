@@ -44,7 +44,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -155,7 +155,7 @@ async fn test_varying_size_concurrent_updates() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -254,7 +254,7 @@ async fn test_multi_cell_concurrent_transactions() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Create multiple cells
     let cell_count = 20;
@@ -356,7 +356,7 @@ async fn test_rapid_commit_sequence() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -442,7 +442,7 @@ async fn test_interleaved_prepare_commit() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Create multiple cells
     let cell_count = 10;
@@ -544,7 +544,7 @@ async fn test_maximum_concurrency_stress() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -654,7 +654,7 @@ async fn test_wikidata_import_scenario() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     println!("Starting wikidata import scenario test");
     println!("This test mimics high-concurrency batch imports");
@@ -783,7 +783,7 @@ async fn test_update_cell_by_stress() {
         false,
         false,
     );
-    server.meta.schemas.new_schema(schema.clone());
+    server.meta.schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
