@@ -221,6 +221,10 @@ impl AsyncClient {
         let client = self.locate_plain_server(id).await?;
         client.compare_version_and_set_field(id, version, field, value).await
     }
+    pub async fn head_cell(&self, id: Id) -> Result<Result<CellHeader, ReadError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        client.head_cell(id).await
+    }
     pub async fn transaction<'a, TFN, TR, RF>(&self, func: TFN) -> Result<TR, TxnError>
     where
         TFN: Fn(&'static Transaction) -> RF + 'a,
