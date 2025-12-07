@@ -5,6 +5,7 @@ use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
 use bifrost::utils;
 use bifrost_hasher::hash_str;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub static SM_ID_PREFIX: &'static str = "NEB_SCHEMAS_SM";
@@ -23,6 +24,10 @@ pub struct SchemasSM {
     map: SchemasMap,
     id_count: u32,
     sm_id: u64,
+    /// Flag to track if we're currently recovering from snapshots/logs
+    /// Callbacks should be skipped during recovery to avoid trying to
+    /// notify services that may not be initialized yet
+    recovering: Arc<AtomicBool>,
 }
 
 raft_state_machine! {
@@ -60,23 +65,37 @@ impl StateMachineCmds for SchemasSM {
         }
     }
     fn new_schema(&mut self, schema: Schema) -> BoxFuture<'_, Result<(), NewSchemaError>> {
+        let is_recovering = self.recovering.load(Ordering::Relaxed);
         async move {
             self.map.new_schema(schema.clone())?;
-            self.callback
-                .notify(commands::on_schema_added::new(), schema)
-                .await
-                .map_err(|e| NewSchemaError::NotifyError(e))?;
+            // Skip callbacks during recovery to avoid notifying services
+            // that haven't been initialized yet
+            if !is_recovering {
+                self.callback
+                    .notify(commands::on_schema_added::new(), schema)
+                    .await
+                    .map_err(|e| NewSchemaError::NotifyError(e))?;
+            } else {
+                trace!("Skipping on_schema_added callback during recovery for schema: {}", schema.name);
+            }
             Ok(())
         }
         .boxed()
     }
     fn del_schema(&mut self, name: String) -> BoxFuture<'_, Result<(), DelSchemaError>> {
+        let is_recovering = self.recovering.load(Ordering::Relaxed);
         async move {
             self.map.del_schema(&name)?;
-            self.callback
-                .notify(commands::on_schema_deleted::new(), name)
-                .await
-                .map_err(|e| DelSchemaError::NotifyError(e))?;
+            // Skip callbacks during recovery to avoid notifying services
+            // that haven't been initialized yet
+            if !is_recovering {
+                self.callback
+                    .notify(commands::on_schema_deleted::new(), name.clone())
+                    .await
+                    .map_err(|e| DelSchemaError::NotifyError(e))?;
+            } else {
+                trace!("Skipping on_schema_deleted callback during recovery for schema: {}", name);
+            }
             Ok(())
         }
         .boxed()
@@ -138,19 +157,36 @@ impl StateMachineCtl for SchemasSM {
 }
 
 impl SchemasSM {
-    pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
+    /// Create a new state machine with a shared recovery flag
+    /// The flag should be set to false after server initialization completes
+    pub async fn new_with_recovery_flag<'a>(
+        group: &'a str,
+        raft_service: &Arc<RaftService>,
+        recovering: Arc<AtomicBool>,
+    ) -> SchemasSM {
         let sm_id = generate_sm_id(group);
         trace!(
-            "Creating SchemasSM for group '{}' with SM ID: {}",
+            "Creating SchemasSM for group '{}' with SM ID: {} (recovery mode: {})",
             group,
-            sm_id
+            sm_id,
+            recovering.load(Ordering::Relaxed)
         );
         SchemasSM {
             callback: SMCallback::new(sm_id, raft_service.clone()).await,
             map: SchemasMap::new(),
             id_count: 0,
             sm_id,
+            recovering,
         }
+    }
+    
+    /// Create a new state machine (legacy method, defaults to not recovering)
+    pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
+        Self::new_with_recovery_flag(
+            group,
+            raft_service,
+            Arc::new(AtomicBool::new(false)),
+        ).await
     }
 }
 

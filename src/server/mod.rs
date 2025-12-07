@@ -387,12 +387,20 @@ impl NebServer {
             service_id: raft::DEFAULT_SERVICE_ID,
         });
 
+        // Create recovery flag - will be set to false after all services are initialized
+        // This prevents callbacks from being sent during Raft recovery
+        let recovering_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
         // Register state machines BEFORE starting Raft so WAL replay can apply to them
         // This is critical: any SM registered after start() won't receive replayed WAL entries
-        debug!("Registering state machines before Raft start for WAL replay");
+        debug!("Registering state machines before Raft start for WAL replay (recovery mode)");
         raft_service
             .register_state_machine(Box::new(
-                schema_sm::SchemasSM::new(group_name, &raft_service).await,
+                schema_sm::SchemasSM::new_with_recovery_flag(
+                    group_name,
+                    &raft_service,
+                    recovering_flag.clone(),
+                ).await,
             ))
             .await;
         Weights::new_with_id(CONS_HASH_ID, &raft_service).await;
@@ -412,6 +420,11 @@ impl NebServer {
 
         debug!("RPC server created, starting Raft service (will replay WAL to registered SMs)");
         raft::RaftService::start(&raft_service, true).await;
+        
+        // Clear recovery flag after Raft recovery completes
+        // Future schema operations should now send callbacks normally
+        recovering_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        debug!("Raft recovery complete, schema callbacks enabled for Neb SchemasSM");
 
         // Check if we have existing Raft state on disk
         let has_existing_state = has_existing_raft_state(&opts.raft_storage);
