@@ -270,9 +270,13 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize, type_id: u8) -> SharedValue<'v
             return SharedValue::Array(arr);
         } else {
             // Primitive array
-            *ptr = align_address_with_ty(Type::from_id(base_type), *ptr);
+            let base_ty = Type::from_id(base_type);
+            if base_ty == Type::NA {
+                panic!("Invalid base_type {} encountered while reading primitive array at ptr {:#x}", base_type, *ptr);
+            }
+            *ptr = align_address_with_ty(base_ty, *ptr);
             if let Some(prim_arr) =
-                types::get_shared_prim_array_val(Type::from_id(base_type), *len as usize, ptr)
+                types::get_shared_prim_array_val(base_ty, *len as usize, ptr)
             {
                 // ptr have been moved by `get_shared_prim_array_val`
                 return SharedValue::PrimArray(prim_arr);
@@ -319,10 +323,15 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize, type_id: u8) -> SharedValue<'v
             fields: field_names,
             map,
         });
-    } else if type_id == NULL_PLACEHOLDER {
+    } else if type_id == NULL_PLACEHOLDER || type_id == Type::Null.id() {
+        // Some older/foreign writers used the raw null type id (0) instead of the placeholder
+        // value; treat both as null instead of panicking on an unknown type id.
         return SharedValue::Null;
     } else {
         let ty = Type::from_id(type_id);
+        if ty == Type::NA {
+            panic!("Invalid type_id {} encountered while reading dynamic value at ptr {:#x}", type_id, *ptr);
+        }
         *ptr = align_address_with_ty(ty, *ptr);
         let value = types::get_shared_val(ty, *ptr);
         *ptr += types::get_size(ty, *ptr);
@@ -387,7 +396,31 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
                 }
             }
         }
-        return SharedValue::Array(res);
+        if res.len() == fields.len() {
+            return SharedValue::Array(res);
+        }
     }
-    SharedValue::Null
+    // Fallback: read the full value and pull out requested keys (covers dynamic-only fields)
+    let full = read_by_schema(ptr, schema);
+    if let SharedValue::Map(ref map) = full {
+        let selected = fields
+            .iter()
+            .map(|fid| map.get_by_key_id(*fid).clone())
+            .collect();
+        return SharedValue::Array(selected);
+    }
+    full
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_dynamic_value_accepts_raw_null_type_id() {
+        let mut ptr = 0usize;
+        let val = read_dynamic_value(&mut ptr, Type::Null.id());
+        assert!(matches!(val, SharedValue::Null));
+        assert_eq!(ptr, 0);
+    }
 }

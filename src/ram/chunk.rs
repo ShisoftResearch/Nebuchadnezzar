@@ -1621,10 +1621,16 @@ impl<'a> CellGuard<'a> {
     }
 
     pub fn head_cell(&self) -> Result<CellHeader, ReadError> {
+        if self.is_unassigned() {
+            return Err(ReadError::CellDoesNotExisted);
+        }
         header_from_chunk_raw(*self.guard).map(|pair| pair.0)
     }
 
     pub fn read_cell_owned(&self) -> Result<OwnedCell, ReadError> {
+        if self.is_unassigned() {
+            return Err(ReadError::CellDoesNotExisted);
+        }
         let (data, _) = SharedCellData::from_chunk_raw(*self.guard, self.chunk)?;
         Ok(data.to_owned())
     }
@@ -1635,6 +1641,9 @@ impl<'a> CellGuard<'a> {
 
     pub fn update_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let old_cell_loc = *self.guard;
+        if self.is_unassigned() {
+            return Err(WriteError::CellDoesNotExisted);
+        }
         let (new_cell_loc, schema) = self.chunk.write_cell_to_chunk(cell)?;
         let old_indices = self.chunk.old_index_res(&self.guard, &*schema)?;
         *self.guard = new_cell_loc;

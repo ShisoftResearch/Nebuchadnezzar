@@ -315,6 +315,10 @@ fn plan_write_dynamic_value<'a>(
     value: &'a OwnedValue,
     ins: &mut WriteInstructions<'a>,
 ) -> Result<(), WriteError> {
+    // Null dynamic values carry no payload; we've already written the type marker.
+    if matches!(value, OwnedValue::Null | OwnedValue::NA) {
+        return Ok(());
+    }
     if let &OwnedValue::Map(m) = &value {
         return plan_write_dynamic_map(
             offset,
@@ -393,5 +397,19 @@ pub fn execute_plan(ptr: usize, instructions: &WriteInstructions) {
         let target_addr = ptr + ins.offset;
         trace!("Executing instruction {:?} at base {}", ins, ptr);
         types::set_val(ins.data_type, ins.val.val_ref(), target_addr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_null_value_emits_no_instructions() {
+        let mut offset = 0usize;
+        let mut ins = WriteInstructions::new();
+        plan_write_dynamic_value(&mut offset, &OwnedValue::Null, &mut ins).unwrap();
+        assert_eq!(offset, 0);
+        assert!(ins.inner.is_empty());
     }
 }
