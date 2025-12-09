@@ -808,13 +808,12 @@ impl InvertedIndexer {
         });
     }
 
-    /// Flush in-memory stats to disk using transactions
+    /// Flush in-memory stats to disk using upsert operations
     ///
     /// Note: Posting lists are written directly to Chunks during add_document,
     /// so we only need to flush the stats cache here.
     pub(crate) async fn flush_to_disk(&self) -> Result<(), IndexError> {
-        let mut cells_to_write = Vec::new();
-        let mut cells_to_update = Vec::new();
+        let mut cells_to_flush = Vec::new();
 
         // Collect stats cells to flush
         {
@@ -849,56 +848,55 @@ impl InvertedIndexer {
                         stat.to_value(),
                     );
 
-                    info!("Preparing stats cell for flush: schema={}, field={}, doc_count={}, total_length={}", 
+                    info!("Preparing stats cell for flush: schema={}, field={}, doc_count={}, total_length={}",
                           schema_id, field_id, stat.doc_count, stat.total_length);
 
-                    // Check if exists to decide write vs update
-                    match self.chunks.read_cell(&stats_id) {
-                        Ok(_) => cells_to_update.push(cell),
-                        Err(_) => cells_to_write.push(cell),
-                    }
+                    cells_to_flush.push(cell);
                 }
             }
         }
 
-        if cells_to_write.is_empty() && cells_to_update.is_empty() {
+        if cells_to_flush.is_empty() {
             info!("No cells to flush");
             return Ok(());
         }
 
-        info!(
-            "Flushing {} writes and {} updates in transaction",
-            cells_to_write.len(),
-            cells_to_update.len()
-        );
+        info!("Flushing {} stats cells using upsert", cells_to_flush.len());
 
-        // Execute transaction to atomically flush all changes
-        let neb_client = self.neb_client.clone();
-        let result = neb_client
-            .transaction(move |txn| {
-                let cells_to_write = cells_to_write.clone();
-                let cells_to_update = cells_to_update.clone();
-                async move {
-                    for cell in cells_to_write {
-                        txn.write(cell).await?;
-                    }
-                    for cell in cells_to_update {
-                        txn.update(cell).await?;
-                    }
-                    Ok(())
+        // Use upsert to write or update cells individually (no transaction needed)
+        // Each stats cell is independent, so we don't need atomicity across all cells
+        let mut success_count = 0;
+        let mut error_count = 0;
+
+        for cell in cells_to_flush {
+            match self.neb_client.upsert_cell(cell.clone()).await {
+                Ok(Ok(_)) => {
+                    success_count += 1;
                 }
-            })
-            .await;
+                Ok(Err(e)) => {
+                    error!("Failed to upsert stats cell {:?}: {:?}", cell.id(), e);
+                    error_count += 1;
+                }
+                Err(e) => {
+                    error!("RPC error while upserting stats cell {:?}: {:?}", cell.id(), e);
+                    error_count += 1;
+                }
+            }
+        }
 
-        if let Err(e) = result {
-            error!("Transaction flush failed: {:?}", e);
+        if error_count > 0 {
+            warn!(
+                "Flush completed with {} successes and {} errors",
+                success_count, error_count
+            );
             return Err(IndexError::Other(format!(
-                "Transaction flush failed: {:?}",
-                e
+                "Flush had {} errors out of {} cells",
+                error_count,
+                success_count + error_count
             )));
         }
 
-        info!("Successfully flushed all cells in transaction");
+        info!("Successfully flushed {} cells", success_count);
         Ok(())
     }
 
