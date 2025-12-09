@@ -1,7 +1,6 @@
 use super::hash::get_hash_id;
 // Import required dependencies
 use super::{EntryKey, Feature, IndexerClients};
-use crate::client::transaction::TxnError;
 use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
 use crate::index::embedding::EmbeddingModel;
@@ -9,7 +8,7 @@ use crate::index::full_text::{
     build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
 use crate::index::vector::MetricEncoding;
-use crate::ram::cell::{OwnedCell, SharedCell};
+use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
 use crate::ram::types::Id;
 use crate::ram::{
     cell::Cell,
@@ -137,7 +136,7 @@ pub enum IndexComps {
 
 #[derive(Debug)]
 pub enum IndexError {
-    TxnError(TxnError),
+    WriteError(WriteError),
     RPCError(RPCError),
     Other(String),
 }
@@ -178,7 +177,7 @@ impl IndexMeta {
                     .hashed_client
                     .insert(&meta.hash_id, &meta.cell_id)
                     .await
-                    .map_err(|e| IndexError::TxnError(e))?;
+                    .map_err(|e| IndexError::WriteError(e))?;
             }
             &IndexMeta::Vector(ref meta) => {
                 indexers
@@ -224,12 +223,12 @@ impl IndexMeta {
                     .map_err(|e| IndexError::RPCError(e))?;
             }
             &IndexMeta::Hashed(ref meta) => {
-                let _ = indexers
+                indexers
                     .hashed_client
                     .indexer
                     .remove_index(&meta.cell_id, &meta.hash_id)
                     .await
-                    .map_err(|e| IndexError::TxnError(e))?;
+                    .map_err(|e| IndexError::WriteError(e))?;
             }
             &IndexMeta::Vector(ref meta) => {
                 indexers

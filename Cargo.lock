@@ -250,7 +250,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 [[package]]
 name = "bifrost"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#65a732eea6961628cace3f285573517eebdbd263"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#b8ceeb005d607b9a7eb718ea58cea75c97e07c1a"
 dependencies = [
  "async-std",
  "bifrost_hasher",
@@ -280,7 +280,7 @@ dependencies = [
 [[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#65a732eea6961628cace3f285573517eebdbd263"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#b8ceeb005d607b9a7eb718ea58cea75c97e07c1a"
 dependencies = [
  "twox-hash",
 ]
@@ -288,7 +288,7 @@ dependencies = [
 [[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#65a732eea6961628cace3f285573517eebdbd263"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#b8ceeb005d607b9a7eb718ea58cea75c97e07c1a"
 dependencies = [
  "bifrost_hasher",
  "quote",
@@ -298,7 +298,7 @@ dependencies = [
 [[package]]
 name = "bifrost_proc_macro"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#65a732eea6961628cace3f285573517eebdbd263"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#b8ceeb005d607b9a7eb718ea58cea75c97e07c1a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -385,9 +385,9 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.2.48"
+version = "1.2.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c481bdbf0ed3b892f6f806287d72acd515b352a4ec27a208489b8c1bc839633a"
+checksum = "90583009037521a116abf44494efecd645ba48b6622457080f080b85544e2215"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1717,9 +1717,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69d83b0086dc8ecf3ce9ae2874b2d1290252e2a30720bea58a5c6639b0092873"
+checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
  "wasi",
@@ -2423,9 +2423,9 @@ dependencies = [
 
 [[package]]
 name = "simd-adler32"
-version = "0.3.7"
+version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d66dc143e6b11c1eddc06d5c423cfc97062865baf299914ab64caa38182078fe"
+checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "siphasher"
