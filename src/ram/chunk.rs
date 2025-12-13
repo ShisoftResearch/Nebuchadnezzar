@@ -20,6 +20,7 @@ use lightning::map::{Map, WordMap, WordMutexGuard};
 use lightning::spin_hint::Backoff;
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -792,25 +793,25 @@ impl Chunk {
 
     fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<OwnedCell, WriteError>
     where
-        U: FnOnce(&SharedCell) -> Option<OwnedCell>,
+        U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
     {
         if let Some(cell_guard) = self.location_for_write(hash, true) {
-            let old_loc = *cell_guard;
+            let mut cell_guard = CellGuard::new(cell_guard, self);
+            let old_loc = *cell_guard.guard;
+            // #[cfg(debug_assertions)]
+            // {
+            //     if old_loc != 0 {
+            //         self.assert_address_aligned_for_read(old_loc, "update_cell_by(old)", hash);
+            //         if old_loc % 8 != 0 {
+            //             return Err(WriteError::ReadError(ReadError::ExecError(format!(
+            //                 "Corrupted cell location: 0x{:x}",
+            //                 old_loc
+            //             ))));
+            //         }
+            //     }
+            // }
 
-            #[cfg(debug_assertions)]
-            {
-                if old_loc != 0 {
-                    self.assert_address_aligned_for_read(old_loc, "update_cell_by(old)", hash);
-                    if old_loc % 8 != 0 {
-                        return Err(WriteError::ReadError(ReadError::ExecError(format!(
-                            "Corrupted cell location: 0x{:x}",
-                            old_loc
-                        ))));
-                    }
-                }
-            }
-
-            match SharedCell::from_chunk_raw(cell_guard, self) {
+            match SharedCellData::from_chunk_raw(*cell_guard, self) {
                 Ok((cell, schema)) => {
                     let old_indices = self
                         .index_builder
@@ -834,7 +835,7 @@ impl Chunk {
                         #[cfg(debug_assertions)]
                         self.assert_address_aligned_for_write(new_cell_loc, "update_cell_by", hash);
 
-                        *cell.into_guard() = new_cell_loc;
+                        **cell_guard.word_mutex_guard() = new_cell_loc;
                         if let Some(indexer) = &self.index_builder {
                             indexer.ensure_indices(&new_cell, &*schema, old_indices);
                         }
@@ -1532,7 +1533,7 @@ impl Chunks {
     }
     pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<OwnedCell, WriteError>
     where
-        U: FnOnce(&SharedCell) -> Option<OwnedCell>,
+        U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
     {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);
@@ -1611,13 +1612,25 @@ impl Chunks {
 }
 
 pub struct CellGuard<'a> {
+    segment: Option<AArc<Segment>>,
     guard: WordMutexGuard<'a>,
     chunk: &'a Chunk,
 }
 
 impl<'a> CellGuard<'a> {
     pub fn new(guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Self {
-        Self { guard, chunk }
+        let mut segment = None;
+        if *guard != 0 {
+            segment = chunk.locate_segment(*guard);
+            if let Some(segment) = &segment {
+                if segment.is_cold() {
+                    use crate::ram::tiered::promotion::promote_segment;
+                    promote_segment(segment);
+                }
+                segment.references.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Self { guard, chunk, segment }
     }
 
     pub fn head_cell(&self) -> Result<CellHeader, ReadError> {
@@ -1633,6 +1646,13 @@ impl<'a> CellGuard<'a> {
         }
         let (data, _) = SharedCellData::from_chunk_raw(*self.guard, self.chunk)?;
         Ok(data.to_owned())
+    }
+
+    pub fn read_cell_shared(&self) -> Result<SharedCellData<'_>, ReadError> {
+        if self.is_unassigned() {
+            return Err(ReadError::CellDoesNotExisted);
+        }
+        SharedCellData::from_chunk_raw(*self.guard, self.chunk).map(|(data, _)| data)
     }
 
     pub fn is_unassigned(&self) -> bool {
@@ -1674,5 +1694,24 @@ impl<'a> CellGuard<'a> {
 
         self.chunk.refresh_statistics();
         Ok(cell.header)
+    }
+
+    pub fn word_mutex_guard(&mut self) -> &mut WordMutexGuard<'a> {
+        &mut self.guard
+    }
+}
+
+impl<'a> Drop for CellGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(segment) = &self.segment {
+            segment.references.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl<'a> Deref for CellGuard<'a> {
+    type Target = usize;
+    fn deref(&self) -> &Self::Target {
+        &*self.guard
     }
 }
