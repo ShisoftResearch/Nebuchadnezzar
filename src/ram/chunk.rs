@@ -1254,24 +1254,39 @@ impl Chunk {
         Ok(CellGuard::new(guard, self))
     }
 
-    pub fn compare_version_and_update_cell(&self, hash: u64, version: u64, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let mut guard = self.lock_cell_for_write(hash, false).map_err(WriteError::ReadError)?;
+    pub fn compare_version_and_update_cell(
+        &self,
+        hash: u64,
+        version: u64,
+        cell: &mut OwnedCell,
+    ) -> Result<CellHeader, WriteError> {
+        let mut guard = self
+            .lock_cell_for_write(hash, false)
+            .map_err(WriteError::ReadError)?;
         let cell_header = guard.head_cell().map_err(WriteError::ReadError)?;
         if cell_header.version == version {
             cell.header.version = version; // update version to the latest version
             guard.update_cell(cell)?;
-            return Ok(cell.header)
+            return Ok(cell.header);
         }
         return Err(WriteError::CellVersionMismatch);
     }
 
-    pub fn compare_version_and_set_field(&self, hash: u64, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError> {
-        let mut guard = self.lock_cell_for_write(hash, false).map_err(WriteError::ReadError)?;
+    pub fn compare_version_and_set_field(
+        &self,
+        hash: u64,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> Result<CellHeader, WriteError> {
+        let mut guard = self
+            .lock_cell_for_write(hash, false)
+            .map_err(WriteError::ReadError)?;
         let mut cell = guard.read_cell_owned().map_err(WriteError::ReadError)?;
         if cell.header.version == version {
             cell.data[field] = value;
             guard.update_cell(&mut cell)?;
-            return Ok(cell.header)
+            return Ok(cell.header);
         }
         return Err(WriteError::CellVersionMismatch);
     }
@@ -1451,6 +1466,7 @@ impl Chunks {
             let config = crate::ram::recovery::RecoveryConfig {
                 num_chunks: count,
                 chunk_size,
+                max_threads: None, // Use default (number of CPU cores)
             };
 
             match crate::ram::recovery::recover_chunks(
@@ -1600,12 +1616,23 @@ impl Chunks {
         return chunk.lock_cell_for_write(hash, has_read);
     }
 
-    pub fn compare_version_and_update_cell(&self, key: &Id, version: u64, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+    pub fn compare_version_and_update_cell(
+        &self,
+        key: &Id,
+        version: u64,
+        cell: &mut OwnedCell,
+    ) -> Result<CellHeader, WriteError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.compare_version_and_update_cell(hash, version, cell);
     }
 
-    pub fn compare_version_and_set_field(&self, key: &Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError> {
+    pub fn compare_version_and_set_field(
+        &self,
+        key: &Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> Result<CellHeader, WriteError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.compare_version_and_set_field(hash, version, field, value);
     }
@@ -1630,7 +1657,11 @@ impl<'a> CellGuard<'a> {
                 segment.references.fetch_add(1, Ordering::Relaxed);
             }
         }
-        Self { guard, chunk, segment }
+        Self {
+            guard,
+            chunk,
+            segment,
+        }
     }
 
     pub fn head_cell(&self) -> Result<CellHeader, ReadError> {
@@ -1667,7 +1698,8 @@ impl<'a> CellGuard<'a> {
         let (new_cell_loc, schema) = self.chunk.write_cell_to_chunk(cell)?;
         let old_indices = self.chunk.old_index_res(&self.guard, &*schema)?;
         *self.guard = new_cell_loc;
-        self.chunk.ensure_indices_with_res(cell, old_indices, &*schema);
+        self.chunk
+            .ensure_indices_with_res(cell, old_indices, &*schema);
         self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
         self.chunk.refresh_statistics();
         Ok(cell.header)
@@ -1684,7 +1716,8 @@ impl<'a> CellGuard<'a> {
             // Update case - cell already exists
             let old_indices = self.chunk.old_index_res(&self.guard, &*schema)?;
             *self.guard = new_cell_loc;
-            self.chunk.ensure_indices_with_res(cell, old_indices, &*schema);
+            self.chunk
+                .ensure_indices_with_res(cell, old_indices, &*schema);
             self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
         } else {
             // Insert case - new cell

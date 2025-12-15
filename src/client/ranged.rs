@@ -9,11 +9,11 @@ use bifrost::conshash::ConsistentHashing;
 use bifrost::raft::client::RaftClient;
 use bifrost::rpc::RPCError;
 
+use crate::index::entry::EntryKey;
 use crate::index::ranged::client::cursor::ClientCursor;
 use crate::index::ranged::client::RangedIndexerClient;
 use crate::index::ranged::lsm::btree::Ordering;
 use crate::index::ranged::lsm::service::{Range, RangeTerm};
-use crate::index::entry::EntryKey;
 use crate::index::Feature;
 use crate::ram::types::Id;
 
@@ -130,11 +130,15 @@ impl RangedClient {
         buffer_size: u16,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let start = match start_feature {
-            Some(f) => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema_id, field_id, f)),
+            Some(f) => {
+                RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema_id, field_id, f))
+            }
             None => RangeTerm::Open,
         };
         let end = match end_feature {
-            Some(f) => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema_id, field_id, f)),
+            Some(f) => {
+                RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema_id, field_id, f))
+            }
             None => RangeTerm::Open,
         };
 
@@ -181,7 +185,9 @@ impl RangedClient {
     }
 
     /// Get statistics for all trees
-    pub async fn stats(&self) -> Result<Vec<crate::index::ranged::lsm::service::LSMTreeStat>, RPCError> {
+    pub async fn stats(
+        &self,
+    ) -> Result<Vec<crate::index::ranged::lsm::service::LSMTreeStat>, RPCError> {
         self.inner.tree_stats().await
     }
 
@@ -233,4 +239,3 @@ impl RangedCursor {
         self.inner.pos
     }
 }
-

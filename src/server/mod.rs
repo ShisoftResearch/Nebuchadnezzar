@@ -400,7 +400,8 @@ impl NebServer {
                     group_name,
                     &raft_service,
                     recovering_flag.clone(),
-                ).await,
+                )
+                .await,
             ))
             .await;
         Weights::new_with_id(CONS_HASH_ID, &raft_service).await;
@@ -420,7 +421,7 @@ impl NebServer {
 
         debug!("RPC server created, starting Raft service (will replay WAL to registered SMs)");
         raft::RaftService::start(&raft_service, true).await;
-        
+
         // Clear recovery flag after Raft recovery completes
         // Future schema operations should now send callbacks normally
         recovering_flag.store(false, std::sync::atomic::Ordering::Relaxed);

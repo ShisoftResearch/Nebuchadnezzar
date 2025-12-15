@@ -56,12 +56,21 @@ impl HashIndexer {
                         let new_value = OwnedValue::PrimArray(OwnedPrimArray::Id(ids.clone()));
 
                         // Use compare-and-swap to update the field atomically
-                        match self.neb_client
-                            .compare_version_and_set_field(*index_id, version, *HASH_INDEX_FIELD_ID, new_value)
+                        match self
+                            .neb_client
+                            .compare_version_and_set_field(
+                                *index_id,
+                                version,
+                                *HASH_INDEX_FIELD_ID,
+                                new_value,
+                            )
                             .await
                         {
                             Ok(Ok(_)) => {
-                                debug!("Successfully added cell {:?} to index {:?}", cell_id, index_id);
+                                debug!(
+                                    "Successfully added cell {:?} to index {:?}",
+                                    cell_id, index_id
+                                );
                                 return Ok(());
                             }
                             Ok(Err(WriteError::CellVersionMismatch)) => {
@@ -93,7 +102,10 @@ impl HashIndexer {
 
                     match self.neb_client.write_cell(cell).await {
                         Ok(Ok(_)) => {
-                            debug!("Created new index cell {:?} with cell_id {:?}", index_id, cell_id);
+                            debug!(
+                                "Created new index cell {:?} with cell_id {:?}",
+                                index_id, cell_id
+                            );
                             return Ok(());
                         }
                         Ok(Err(WriteError::CellAlreadyExisted)) => {
@@ -109,15 +121,14 @@ impl HashIndexer {
             }
         }
 
-        warn!("Max CAS retries exceeded for add_index({:?}, {:?})", cell_id, index_id);
+        warn!(
+            "Max CAS retries exceeded for add_index({:?}, {:?})",
+            cell_id, index_id
+        );
         Err(WriteError::CellVersionMismatch)
     }
 
-    pub async fn remove_index(
-        &self,
-        cell_id: &Id,
-        index_id: &Id,
-    ) -> Result<(), WriteError> {
+    pub async fn remove_index(&self, cell_id: &Id, index_id: &Id) -> Result<(), WriteError> {
         debug!(
             "Attempting to remove index for cell_id: {:?}, index_id: {:?}",
             cell_id, index_id
@@ -135,7 +146,10 @@ impl HashIndexer {
                     if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = ids_val {
                         // Check if cell_id is in the array
                         if !ids.contains(cell_id) {
-                            debug!("Cell {:?} not in index {:?}, nothing to remove", cell_id, index_id);
+                            debug!(
+                                "Cell {:?} not in index {:?}, nothing to remove",
+                                cell_id, index_id
+                            );
                             return Ok(());
                         }
 
@@ -160,12 +174,21 @@ impl HashIndexer {
                             // Update the field with the new array (without the removed cell_id)
                             let new_value = OwnedValue::PrimArray(OwnedPrimArray::Id(ids.clone()));
 
-                            match self.neb_client
-                                .compare_version_and_set_field(*index_id, version, *HASH_INDEX_FIELD_ID, new_value)
+                            match self
+                                .neb_client
+                                .compare_version_and_set_field(
+                                    *index_id,
+                                    version,
+                                    *HASH_INDEX_FIELD_ID,
+                                    new_value,
+                                )
                                 .await
                             {
                                 Ok(Ok(_)) => {
-                                    debug!("Successfully removed cell {:?} from index {:?}", cell_id, index_id);
+                                    debug!(
+                                        "Successfully removed cell {:?} from index {:?}",
+                                        cell_id, index_id
+                                    );
                                     return Ok(());
                                 }
                                 Ok(Err(WriteError::CellVersionMismatch)) => {
@@ -184,7 +207,10 @@ impl HashIndexer {
                     }
                 }
                 Ok(Err(ReadError::CellDoesNotExisted)) => {
-                    debug!("Index cell {:?} does not exist, nothing to remove", index_id);
+                    debug!(
+                        "Index cell {:?} does not exist, nothing to remove",
+                        index_id
+                    );
                     return Ok(());
                 }
                 Ok(Err(e)) => return Err(WriteError::ReadError(e)),
@@ -192,7 +218,10 @@ impl HashIndexer {
             }
         }
 
-        warn!("Max CAS retries exceeded for remove_index({:?}, {:?})", cell_id, index_id);
+        warn!(
+            "Max CAS retries exceeded for remove_index({:?}, {:?})",
+            cell_id, index_id
+        );
         Err(WriteError::CellVersionMismatch)
     }
 
@@ -326,9 +355,14 @@ mod tests {
         .await;
 
         let client = Arc::new(
-            AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group)
-                .await
-                .unwrap(),
+            AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                &server_group,
+            )
+            .await
+            .unwrap(),
         );
 
         // Initialize hash index schema
@@ -472,7 +506,10 @@ mod tests {
 
         // Remove from non-existent index (should succeed silently)
         let result = indexer.remove_index(&cell_id, &index_id).await;
-        assert!(result.is_ok(), "Remove from non-existent index should succeed");
+        assert!(
+            result.is_ok(),
+            "Remove from non-existent index should succeed"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

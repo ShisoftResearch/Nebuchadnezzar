@@ -104,4 +104,3 @@ impl VectorClient {
 ///
 /// Re-exported from `crate::index::vector::VectorHit` for convenience.
 pub use crate::index::vector::VectorHit as SimilarityHit;
-

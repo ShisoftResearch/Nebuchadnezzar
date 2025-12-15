@@ -76,7 +76,10 @@ impl StateMachineCmds for SchemasSM {
                     .await
                     .map_err(|e| NewSchemaError::NotifyError(e))?;
             } else {
-                trace!("Skipping on_schema_added callback during recovery for schema: {}", schema.name);
+                trace!(
+                    "Skipping on_schema_added callback during recovery for schema: {}",
+                    schema.name
+                );
             }
             Ok(())
         }
@@ -94,7 +97,10 @@ impl StateMachineCmds for SchemasSM {
                     .await
                     .map_err(|e| DelSchemaError::NotifyError(e))?;
             } else {
-                trace!("Skipping on_schema_deleted callback during recovery for schema: {}", name);
+                trace!(
+                    "Skipping on_schema_deleted callback during recovery for schema: {}",
+                    name
+                );
             }
             Ok(())
         }
@@ -179,14 +185,10 @@ impl SchemasSM {
             recovering,
         }
     }
-    
+
     /// Create a new state machine (legacy method, defaults to not recovering)
     pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
-        Self::new_with_recovery_flag(
-            group,
-            raft_service,
-            Arc::new(AtomicBool::new(false)),
-        ).await
+        Self::new_with_recovery_flag(group, raft_service, Arc::new(AtomicBool::new(false))).await
     }
 }
 

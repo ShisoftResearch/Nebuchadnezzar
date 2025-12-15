@@ -202,7 +202,7 @@ fn build_partitation_statistics(
         // Use the address directly from entries() instead of re-locking with location_for_read
         // This avoids deadlocks when multiple threads try to lock cells in parallel
         // For statistics, slightly stale data is acceptable
-        
+
         // Validate address before using it - entries() may return stale/invalid addresses
         // Check: not null, 8-byte aligned, and within valid x86-64 address range
         if addr == 0 || addr % 8 != 0 || addr > 0x0000_FFFF_FFFF_FFFF {
@@ -224,7 +224,10 @@ fn build_partitation_statistics(
                         .iter()
                         .filter(|(_, indices)| {
                             indices.iter().any(|idx| {
-                                matches!(idx, IndexType::Ranged | IndexType::Hashed | IndexType::Statistics)
+                                matches!(
+                                    idx,
+                                    IndexType::Ranged | IndexType::Hashed | IndexType::Statistics
+                                )
                             })
                         })
                         .map(|(field_id, _)| *field_id)

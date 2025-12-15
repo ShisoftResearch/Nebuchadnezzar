@@ -205,7 +205,13 @@ impl IndexMeta {
             &IndexMeta::Embedding(ref meta) => {
                 indexers
                     .embedding_client
-                    .insert(&meta.cell_id, meta.schema_id, meta.field_id, &meta.model, &meta.text)
+                    .insert(
+                        &meta.cell_id,
+                        meta.schema_id,
+                        meta.field_id,
+                        &meta.model,
+                        &meta.text,
+                    )
                     .await?;
             }
         }

@@ -309,4 +309,3 @@ impl Default for EmbeddingIndexClient {
         Self::new()
     }
 }
-

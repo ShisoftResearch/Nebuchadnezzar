@@ -29,11 +29,11 @@ use self::transaction::*;
 
 static TRANSACTION_MAX_RETRY: u32 = 1000;
 
-#[cfg(test)]
-mod tests;
 pub mod embedding;
 pub mod fulltext;
 pub mod ranged;
+#[cfg(test)]
+mod tests;
 pub mod transaction;
 pub mod vector;
 
@@ -213,13 +213,28 @@ impl AsyncClient {
         }
         Ok(sum)
     }
-    pub async fn compare_version_and_update_cell(&self, id: Id, version: u64, cell: OwnedCell) -> Result<Result<CellHeader, WriteError>, RPCError> {
+    pub async fn compare_version_and_update_cell(
+        &self,
+        id: Id,
+        version: u64,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
-        client.compare_version_and_update_cell(id, version, cell).await
+        client
+            .compare_version_and_update_cell(id, version, cell)
+            .await
     }
-    pub async fn compare_version_and_set_field(&self, id: Id, version: u64, field: u64, value: OwnedValue) -> Result<Result<CellHeader, WriteError>, RPCError> {
+    pub async fn compare_version_and_set_field(
+        &self,
+        id: Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
-        client.compare_version_and_set_field(id, version, field, value).await
+        client
+            .compare_version_and_set_field(id, version, field, value)
+            .await
     }
     pub async fn head_cell(&self, id: Id) -> Result<Result<CellHeader, ReadError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
@@ -460,7 +475,7 @@ impl AsyncClient {
     /// # Example
     /// ```ignore
     /// let ranged = client.ranged();
-    /// 
+    ///
     /// // Scan all documents in a schema
     /// if let Some(mut cursor) = ranged.scan_schema(schema_id, 100).await? {
     ///     while let Some(id) = cursor.next().await? {

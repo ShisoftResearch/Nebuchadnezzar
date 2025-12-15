@@ -650,10 +650,17 @@ mod tests {
         };
         let combined_hits = vec![test_hit1, test_hit2, test_hit3];
         let merged = coord1.merge_hits(combined_hits, 10);
-        assert_eq!(merged.len(), 2, "Merged results should have 2 unique documents");
+        assert_eq!(
+            merged.len(),
+            2,
+            "Merged results should have 2 unique documents"
+        );
         // Score for id (1000,1) should be 1.5 + 0.5 = 2.0
         let hit_1_1 = merged.iter().find(|h| h.id == Id::new(1000, 1)).unwrap();
-        assert!((hit_1_1.score - 2.0).abs() < 0.001, "Scores should be aggregated");
+        assert!(
+            (hit_1_1.score - 2.0).abs() < 0.001,
+            "Scores should be aggregated"
+        );
 
         // Test 4: Verify stats aggregation logic
         let global_doc_count = stats1.doc_count + stats2.doc_count;
@@ -678,7 +685,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(search_hits.len(), 1, "Should find 'search engine' on shard2");
+        assert_eq!(
+            search_hits.len(),
+            1,
+            "Should find 'search engine' on shard2"
+        );
         assert_eq!(search_hits[0].id, shard2_docs[1]);
 
         info!("Coordinator aggregation logic test passed!");
@@ -754,8 +765,7 @@ mod tests {
             content_field,
             OwnedValue::String("hello world from single shard".to_string()),
         );
-        let mut cell =
-            OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+        let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
         server.chunks.write_cell(&mut cell).unwrap();
         if let Some(ref index_builder) = server.indexer {

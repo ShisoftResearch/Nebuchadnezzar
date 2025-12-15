@@ -195,7 +195,11 @@ impl VectorIndexClient {
     }
 
     /// Create a new vector index.
-    pub fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>> {
+    pub fn new_index(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_vector_index_core().new_index(schema_id, field_id)
     }
 

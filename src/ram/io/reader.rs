@@ -272,12 +272,13 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize, type_id: u8) -> SharedValue<'v
             // Primitive array
             let base_ty = Type::from_id(base_type);
             if base_ty == Type::NA {
-                panic!("Invalid base_type {} encountered while reading primitive array at ptr {:#x}", base_type, *ptr);
+                panic!(
+                    "Invalid base_type {} encountered while reading primitive array at ptr {:#x}",
+                    base_type, *ptr
+                );
             }
             *ptr = align_address_with_ty(base_ty, *ptr);
-            if let Some(prim_arr) =
-                types::get_shared_prim_array_val(base_ty, *len as usize, ptr)
-            {
+            if let Some(prim_arr) = types::get_shared_prim_array_val(base_ty, *len as usize, ptr) {
                 // ptr have been moved by `get_shared_prim_array_val`
                 return SharedValue::PrimArray(prim_arr);
             } else {
@@ -330,7 +331,10 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize, type_id: u8) -> SharedValue<'v
     } else {
         let ty = Type::from_id(type_id);
         if ty == Type::NA {
-            panic!("Invalid type_id {} encountered while reading dynamic value at ptr {:#x}", type_id, *ptr);
+            panic!(
+                "Invalid type_id {} encountered while reading dynamic value at ptr {:#x}",
+                type_id, *ptr
+            );
         }
         *ptr = align_address_with_ty(ty, *ptr);
         let value = types::get_shared_val(ty, *ptr);

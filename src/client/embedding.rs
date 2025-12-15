@@ -125,4 +125,3 @@ pub use crate::index::embedding::EmbeddingHit as SemanticHit;
 ///
 /// Re-exported from `crate::index::embedding::EmbeddingModelInfo` for convenience.
 pub use crate::index::embedding::EmbeddingModelInfo as ModelInfo;
-

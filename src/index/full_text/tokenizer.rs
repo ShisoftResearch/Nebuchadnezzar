@@ -128,23 +128,23 @@ lazy_static! {
     };
 
     /// English stemmer (Porter algorithm)
-    static ref STEMMER_EN: rust_stemmers::Stemmer = 
+    static ref STEMMER_EN: rust_stemmers::Stemmer =
         rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::English);
 
     /// German stemmer
-    static ref STEMMER_DE: rust_stemmers::Stemmer = 
+    static ref STEMMER_DE: rust_stemmers::Stemmer =
         rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::German);
 
     /// French stemmer
-    static ref STEMMER_FR: rust_stemmers::Stemmer = 
+    static ref STEMMER_FR: rust_stemmers::Stemmer =
         rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::French);
 
     /// Spanish stemmer
-    static ref STEMMER_ES: rust_stemmers::Stemmer = 
+    static ref STEMMER_ES: rust_stemmers::Stemmer =
         rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::Spanish);
 
     /// Italian stemmer
-    static ref STEMMER_IT: rust_stemmers::Stemmer = 
+    static ref STEMMER_IT: rust_stemmers::Stemmer =
         rust_stemmers::Stemmer::create(rust_stemmers::Algorithm::Italian);
 
     /// Jieba tokenizer for Chinese

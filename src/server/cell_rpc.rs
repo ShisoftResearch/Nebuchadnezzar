@@ -103,11 +103,30 @@ impl Service for NebRPCService {
     fn upsert_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(self.server.chunks.upsert_cell(&mut cell))
     }
-    fn compare_version_and_update_cell(&self, key: Id, version: u64, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.server.chunks.compare_version_and_update_cell(&key, version, &mut cell))
+    fn compare_version_and_update_cell(
+        &self,
+        key: Id,
+        version: u64,
+        mut cell: OwnedCell,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        self.with_indices_ensured(
+            self.server
+                .chunks
+                .compare_version_and_update_cell(&key, version, &mut cell),
+        )
     }
-    fn compare_version_and_set_field(&self, key: Id, version: u64, field: u64, value: OwnedValue) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.server.chunks.compare_version_and_set_field(&key, version, field, value))
+    fn compare_version_and_set_field(
+        &self,
+        key: Id,
+        version: u64,
+        field: u64,
+        value: OwnedValue,
+    ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        self.with_indices_ensured(
+            self.server
+                .chunks
+                .compare_version_and_set_field(&key, version, field, value),
+        )
     }
     fn count(&self) -> BoxFuture<'_, u64> {
         future::ready(self.server.chunks.count() as u64).boxed()

@@ -194,9 +194,12 @@ impl SegmentedPostingList {
         // Try to read existing head segment from this Chunk
         let mut head_guard = chunk.lock_or_insert_cell(head_hash);
         let (mut segment, head_version) = if !head_guard.is_unassigned() {
-            let owned_cell = head_guard.read_cell_owned().map_err(|e| IndexError::Other(format!("Failed to read head segment: {:?}", e)))?;
+            let owned_cell = head_guard
+                .read_cell_owned()
+                .map_err(|e| IndexError::Other(format!("Failed to read head segment: {:?}", e)))?;
             let version = owned_cell.header().version;
-            let seg = PostingSegment::from_cell(&owned_cell).ok_or_else(|| IndexError::Other("Failed to parse head segment".to_string()))?;
+            let seg = PostingSegment::from_cell(&owned_cell)
+                .ok_or_else(|| IndexError::Other("Failed to parse head segment".to_string()))?;
             (seg, version)
         } else {
             (PostingSegment::new(), 0)
@@ -206,21 +209,21 @@ impl SegmentedPostingList {
         if segment.is_full() {
             // Generate unique ID for overflow segment using random nonce
             let overflow_id = self.random_segment_id(partition);
-            
+
             // Move current head content (with its chain) to NEW overflow cell (version starts at 0)
             let mut overflow_cell = segment.to_cell(&overflow_id);
-            chunk
-                .upsert_cell(&mut overflow_cell)
-                .map_err(|e| IndexError::Other(format!("Failed to write overflow segment: {:?}", e)))?;
+            chunk.upsert_cell(&mut overflow_cell).map_err(|e| {
+                IndexError::Other(format!("Failed to write overflow segment: {:?}", e))
+            })?;
 
             // Update head with new posting, pointing to overflow (preserve version for increment)
             let mut new_head = PostingSegment::new();
             new_head.add(doc_id, version, tf, doc_len);
             new_head.next = Some(overflow_id);
             let mut head_cell = new_head.to_cell_with_version(&head_id, head_version);
-            head_guard
-                .upsert_cell(&mut head_cell)
-                .map_err(|e| IndexError::Other(format!("Failed to update head segment: {:?}", e)))?;
+            head_guard.upsert_cell(&mut head_cell).map_err(|e| {
+                IndexError::Other(format!("Failed to update head segment: {:?}", e))
+            })?;
         } else {
             // Append to existing head (preserve version for increment)
             segment.add(doc_id, version, tf, doc_len);
@@ -242,7 +245,14 @@ impl SegmentedPostingList {
             .as_nanos() as u64;
         // Combine with term hash and a random component for uniqueness
         let random_component: u64 = rand::random();
-        let lower = Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, timestamp, random_component)).lower;
+        let lower = Id::from_obj(&(
+            self.schema_id,
+            self.field_id,
+            self.term_hash,
+            timestamp,
+            random_component,
+        ))
+        .lower;
         Id::new(partition, lower)
     }
 
@@ -409,7 +419,8 @@ impl PostingSegment {
         );
 
         // Preserve current version so storage layer increments correctly
-        let mut cell = OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data));
+        let mut cell =
+            OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data));
         cell.header.version = current_version;
         cell
     }
@@ -878,7 +889,11 @@ impl InvertedIndexer {
                     error_count += 1;
                 }
                 Err(e) => {
-                    error!("RPC error while upserting stats cell {:?}: {:?}", cell.id(), e);
+                    error!(
+                        "RPC error while upserting stats cell {:?}: {:?}",
+                        cell.id(),
+                        e
+                    );
                     error_count += 1;
                 }
             }
@@ -996,7 +1011,8 @@ impl InvertedIndexer {
                         // Write back the cleaned segment if anything was removed from this chunk
                         if chunk_removed > 0 {
                             // Preserve cell version for proper incrementing
-                            let mut new_cell = new_segment.to_cell_with_version(&head_id, cell_version);
+                            let mut new_cell =
+                                new_segment.to_cell_with_version(&head_id, cell_version);
                             head_guard.update_cell(&mut new_cell).map_err(|e| {
                                 IndexError::Other(format!("Failed to write GC'd segment: {:?}", e))
                             })?;
@@ -1364,7 +1380,10 @@ mod tests {
         }
 
         let num_docs = owned_doc_ids.len();
-        assert!(num_docs >= 10, "Need at least 10 owned documents for concurrent test");
+        assert!(
+            num_docs >= 10,
+            "Need at least 10 owned documents for concurrent test"
+        );
         info!("Found {} owned documents for concurrent test", num_docs);
 
         // All documents will contain the same common term "concurrent"
@@ -1388,7 +1407,8 @@ mod tests {
                         i
                     )),
                 );
-                let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+                let mut cell =
+                    OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
                 // Write cell
                 server_clone.chunks.write_cell(&mut cell).unwrap();
@@ -1431,18 +1451,27 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(
-                    hits.len(), num_docs,
+                    hits.len(),
+                    num_docs,
                     "Should find all {} documents with 'concurrent', found {}",
-                    num_docs, hits.len()
+                    num_docs,
+                    hits.len()
                 );
 
                 // Verify all indexed IDs are in the results
                 let hit_ids: std::collections::HashSet<Id> = hits.iter().map(|h| h.id).collect();
                 for id in &indexed_ids {
-                    assert!(hit_ids.contains(id), "Document {:?} should be in search results", id);
+                    assert!(
+                        hit_ids.contains(id),
+                        "Document {:?} should be in search results",
+                        id
+                    );
                 }
 
-                info!("Concurrent indexing test passed: all {} documents found", num_docs);
+                info!(
+                    "Concurrent indexing test passed: all {} documents found",
+                    num_docs
+                );
             }
         }
     }
@@ -1517,7 +1546,10 @@ mod tests {
         }
 
         let num_docs = owned_doc_ids.len();
-        assert!(num_docs >= 100, "Need at least 100 owned documents for overflow test");
+        assert!(
+            num_docs >= 100,
+            "Need at least 100 owned documents for overflow test"
+        );
         info!("Found {} owned documents for overflow test", num_docs);
 
         let server_arc = Arc::new(server);
@@ -1530,7 +1562,7 @@ mod tests {
         for wave in 0..(num_docs / wave_size) {
             let start_idx = wave * wave_size;
             let end_idx = std::cmp::min(start_idx + wave_size, num_docs);
-            
+
             let mut handles = Vec::new();
             for i in start_idx..end_idx {
                 let server_clone = server_arc.clone();
@@ -1544,7 +1576,8 @@ mod tests {
                         content_field,
                         OwnedValue::String(format!("overflow stress test document {}", i)),
                     );
-                    let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+                    let mut cell =
+                        OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
                     server_clone.chunks.write_cell(&mut cell).unwrap();
 
@@ -1574,17 +1607,21 @@ mod tests {
         if let Some(ref index_builder) = server_arc.indexer {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let stats = indexer.get_field_stats(schema_id, content_field_id);
-                info!("Stats: doc_count={}, total_length={}", stats.doc_count, stats.total_length);
-                
+                info!(
+                    "Stats: doc_count={}, total_length={}",
+                    stats.doc_count, stats.total_length
+                );
+
                 // Search for the common term
                 let hits = indexer
                     .bm25_search(schema_id, content_field_id, "overflow", 500)
                     .await
                     .unwrap();
-                
+
                 info!(
                     "Found {} documents with 'overflow' (expected {})",
-                    hits.len(), all_indexed.len()
+                    hits.len(),
+                    all_indexed.len()
                 );
 
                 // With concurrent indexing, some may not be found due to timing
@@ -1592,7 +1629,8 @@ mod tests {
                 assert!(
                     hits.len() >= all_indexed.len() * 80 / 100,
                     "Should find at least 80% of documents, found {} out of {}",
-                    hits.len(), all_indexed.len()
+                    hits.len(),
+                    all_indexed.len()
                 );
 
                 info!("Concurrent overflow test passed!");
@@ -1713,10 +1751,10 @@ mod tests {
         // Doc 2: contains "rust programming" (2 terms)
         // Doc 3: contains "rust programming language" (3 terms if we search for all 3)
         let texts = vec![
-            "rust is great",                           // 1 matching term
-            "programming is fun",                      // 1 matching term
-            "rust programming tutorial",               // 2 matching terms
-            "rust programming language guide",         // 2 matching terms (same as doc2 for query "rust programming")
+            "rust is great",                   // 1 matching term
+            "programming is fun",              // 1 matching term
+            "rust programming tutorial",       // 2 matching terms
+            "rust programming language guide", // 2 matching terms (same as doc2 for query "rust programming")
         ];
 
         for (i, doc_id) in owned_doc_ids.iter().enumerate() {
@@ -1764,13 +1802,22 @@ mod tests {
 
                 // Verify that docs with 2 terms have higher scores than docs with 1 term
                 let single_term_doc = owned_doc_ids[0]; // "rust is great"
-                let multi_term_doc = owned_doc_ids[2];  // "rust programming tutorial"
+                let multi_term_doc = owned_doc_ids[2]; // "rust programming tutorial"
 
-                let single_score = hits.iter().find(|h| h.id == single_term_doc).map(|h| h.score);
-                let multi_score = hits.iter().find(|h| h.id == multi_term_doc).map(|h| h.score);
+                let single_score = hits
+                    .iter()
+                    .find(|h| h.id == single_term_doc)
+                    .map(|h| h.score);
+                let multi_score = hits
+                    .iter()
+                    .find(|h| h.id == multi_term_doc)
+                    .map(|h| h.score);
 
                 if let (Some(single), Some(multi)) = (single_score, multi_score) {
-                    info!("Single term doc score: {:.4}, Multi term doc score: {:.4}", single, multi);
+                    info!(
+                        "Single term doc score: {:.4}, Multi term doc score: {:.4}",
+                        single, multi
+                    );
                     assert!(
                         multi > single,
                         "Document with 2 matching terms ({:.4}) should score higher than document with 1 term ({:.4})",
@@ -2605,7 +2652,10 @@ mod tests {
         server1.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Register inverted index schemas BEFORE flushing (needed for flush operations)
-        server1.meta.schemas.debug_only_new_schema(inverted_segment_schema());
+        server1
+            .meta
+            .schemas
+            .debug_only_new_schema(inverted_segment_schema());
         server1
             .meta
             .schemas
@@ -2898,7 +2948,10 @@ mod tests {
         info!("Server 2 created with recovery, registering schemas...");
         // Re-register schemas (needed for recovery)
         server2.meta.schemas.debug_only_new_schema(schema.clone());
-        server2.meta.schemas.debug_only_new_schema(inverted_segment_schema());
+        server2
+            .meta
+            .schemas
+            .debug_only_new_schema(inverted_segment_schema());
         server2
             .meta
             .schemas
@@ -3085,7 +3138,10 @@ mod tests {
         server1.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Register inverted index schemas
-        server1.meta.schemas.debug_only_new_schema(inverted_segment_schema());
+        server1
+            .meta
+            .schemas
+            .debug_only_new_schema(inverted_segment_schema());
         server1
             .meta
             .schemas
@@ -3170,7 +3226,10 @@ mod tests {
         .await;
 
         server2.meta.schemas.debug_only_new_schema(schema.clone());
-        server2.meta.schemas.debug_only_new_schema(inverted_segment_schema());
+        server2
+            .meta
+            .schemas
+            .debug_only_new_schema(inverted_segment_schema());
         server2
             .meta
             .schemas
