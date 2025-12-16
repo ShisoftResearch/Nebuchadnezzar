@@ -685,22 +685,11 @@ impl Chunk {
 
     fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
-        // Write first, lock second to avoid deadlock with cleaner
-        let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
-
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                self.validate_cell_location(new_cell_loc, &format!("update_cell(hash={})", hash)),
-                "Attempting to store invalid cell location 0x{:x} in cell index for hash {} (update)",
-                new_cell_loc,
-                hash
-            );
-        }
-
         if let Some(mut guard) = self.location_for_write(hash, false) {
             let cell_location = *guard;
-
+            let cell_version = cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
+            cell.header.version = cell_version;
+            let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
             #[cfg(debug_assertions)]
             {
                 if cell_location != 0 {
@@ -717,6 +706,7 @@ impl Chunk {
             self.refresh_statistics();
         } else {
             // Optimistic update will remove the new inserted one
+            let (new_cell_loc, _schema) = self.write_cell_to_chunk(cell)?;
             self.mark_dead_entry_with_cell(new_cell_loc, cell);
             return Err(WriteError::CellDoesNotExisted);
         }
@@ -787,19 +777,6 @@ impl Chunk {
         if let Some(cell_guard) = self.location_for_write(hash, true) {
             let mut cell_guard = CellGuard::new(cell_guard, self);
             let old_loc = *cell_guard.guard;
-            // #[cfg(debug_assertions)]
-            // {
-            //     if old_loc != 0 {
-            //         self.assert_address_aligned_for_read(old_loc, "update_cell_by(old)", hash);
-            //         if old_loc % 8 != 0 {
-            //             return Err(WriteError::ReadError(ReadError::ExecError(format!(
-            //                 "Corrupted cell location: 0x{:x}",
-            //                 old_loc
-            //             ))));
-            //         }
-            //     }
-            // }
-
             match SharedCellData::from_chunk_raw(*cell_guard, self) {
                 Ok((cell, schema)) => {
                     let old_indices = self
@@ -819,6 +796,7 @@ impl Chunk {
 
                     let new_cell = update(&cell);
                     if let Some(mut new_cell) = new_cell {
+                        new_cell.header.version = cell.header.version;
                         let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
 
                         #[cfg(debug_assertions)]
@@ -1631,11 +1609,13 @@ pub struct CellGuard<'a> {
     segment: Option<AArc<Segment>>,
     guard: WordMutexGuard<'a>,
     chunk: &'a Chunk,
+    version: u64,
 }
 
 impl<'a> CellGuard<'a> {
     pub fn new(guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Self {
         let mut segment = None;
+        let mut version = 0;
         if *guard != 0 {
             segment = chunk.locate_segment(*guard);
             if let Some(segment) = &segment {
@@ -1645,41 +1625,56 @@ impl<'a> CellGuard<'a> {
                 }
                 segment.references.fetch_add(1, Ordering::Relaxed);
             }
+            version = cell_version_from_chunk_raw(*guard).unwrap();
         }
         Self {
             guard,
             chunk,
             segment,
+            version,
         }
     }
 
-    pub fn head_cell(&self) -> Result<CellHeader, ReadError> {
+    fn update_version(&mut self, version: u64) {
+        if self.version < version {
+            self.version = version;
+        }
+    }
+
+    pub fn head_cell(&mut self) -> Result<CellHeader, ReadError> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        header_from_chunk_raw(*self.guard).map(|pair| pair.0)
+        let (header, _) = header_from_chunk_raw(*self.guard)?;
+        self.update_version(header.version);
+        Ok(header)
     }
 
-    pub fn cell_version(&self) -> Result<u64, ReadError> {
+    pub fn cell_version(&mut self) -> Result<u64, ReadError> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        cell_version_from_chunk_raw(*self.guard)
+        let version = cell_version_from_chunk_raw(*self.guard)?;
+        self.update_version(version);
+        Ok(version)
     }
 
-    pub fn read_cell_owned(&self) -> Result<OwnedCell, ReadError> {
+    pub fn read_cell_owned(&mut self) -> Result<OwnedCell, ReadError> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
         let (data, _) = SharedCellData::from_chunk_raw(*self.guard, self.chunk)?;
+        self.update_version(data.header.version);
         Ok(data.to_owned())
     }
 
-    pub fn read_cell_shared(&self) -> Result<SharedCellData<'_>, ReadError> {
+    pub fn read_cell_shared(&mut self) -> Result<SharedCellData<'_>, ReadError> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        SharedCellData::from_chunk_raw(*self.guard, self.chunk).map(|(data, _)| data)
+        let (data, _) = SharedCellData::from_chunk_raw(*self.guard, self.chunk)?;
+        self.update_version(data.header.version);
+        Ok(data)
     }
 
     pub fn is_unassigned(&self) -> bool {
@@ -1688,6 +1683,9 @@ impl<'a> CellGuard<'a> {
 
     pub fn update_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let old_cell_loc = *self.guard;
+        if cell.header.version < self.version {
+            cell.header.version = self.version;
+        }
         if self.is_unassigned() {
             return Err(WriteError::CellDoesNotExisted);
         }
@@ -1706,6 +1704,9 @@ impl<'a> CellGuard<'a> {
     /// an empty slot (insert case) or an existing cell (update case).
     pub fn upsert_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let old_cell_loc = *self.guard;
+        if cell.header.version < self.version {
+            cell.header.version = self.version;
+        }
         let (new_cell_loc, schema) = self.chunk.write_cell_to_chunk(cell)?;
 
         if old_cell_loc != 0 {
