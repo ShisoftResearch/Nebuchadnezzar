@@ -143,6 +143,38 @@ pub async fn init_conshash(
 }
 
 impl NebServer {
+    /// Gracefully shutdown the server, flushing all data to disk
+    pub async fn shutdown(&self) {
+        info!("Starting graceful server shutdown");
+        
+        // Step 1: Flush LSM trees if ranged indexer is enabled
+        // This ensures enumeration indices are persisted before backup creation
+        info!("Flushing LSM trees before shutdown");
+        if let Ok(lsm_client) = self.get_lsm_tree_service().await {
+            let _ = lsm_client.flush_all().await;
+            info!("LSM trees flushed successfully");
+        } else {
+            debug!("LSM tree service not available (likely not enabled)");
+        }
+        
+        // Step 2: Shutdown Raft (triggers backup creation)
+        info!("Shutting down Raft service (will create backups)");
+        let _ = self.raft_service.shutdown().await;
+        
+        // Step 3: Shutdown RPC server
+        info!("Shutting down RPC server");
+        let _ = self.rpc.shutdown().await;
+        
+        info!("Server shutdown complete");
+    }
+    
+    /// Get LSM tree service client
+    async fn get_lsm_tree_service(&self) -> Result<Arc<ranged::lsm::service::AsyncServiceClient>, bifrost::rpc::RPCError> {
+        // Use a dummy ID to locate the local LSM tree service via consistent hashing
+        let dummy_id = Id::new(0, 1);
+        ranged::lsm::service::locate_tree_server_from_conshash(&dummy_id, &self.consh).await
+    }
+
     pub async fn new(
         opts: &ServerOptions,
         server_addr: &String,

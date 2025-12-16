@@ -980,10 +980,9 @@ mod test {
         drop(idx_client);
         drop(client);
         
-        // Proper shutdown sequence
-        println!("Shutting down Raft and RPC services...");
-        server.raft_service.shutdown().await;
-        server.rpc.shutdown().await;
+        // Use NebServer::shutdown() which handles LSM tree flushing and graceful shutdown
+        println!("Shutting down server gracefully...");
+        server.shutdown().await;
         drop(server);
 
         // Create new server instance (recovery) - use same address
