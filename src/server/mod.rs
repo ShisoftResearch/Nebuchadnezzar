@@ -566,6 +566,31 @@ impl NebServer {
     }
 }
 
+/// Automatic shutdown on Drop
+/// 
+/// When NebServer is dropped (goes out of scope or process exits),
+/// this ensures graceful shutdown with LSM tree flushing and backup creation.
+/// 
+/// Note: This uses a blocking wait on the async shutdown. In production,
+/// it's still better to call shutdown() explicitly before dropping to handle
+/// errors properly, but this provides a safety net for forgotten cleanup.
+impl Drop for NebServer {
+    fn drop(&mut self) {
+        info!("NebServer: Drop called, initiating automatic shutdown");
+        
+        // Use futures::executor::block_on to run the async shutdown synchronously
+        // This ensures:
+        // 1. LSM trees are flushed (enumeration indices persisted)
+        // 2. Raft creates backups (cell data persisted)
+        // 3. RPC server is properly shut down
+        futures::executor::block_on(async {
+            self.shutdown().await;
+        });
+        
+        info!("NebServer: Drop completed");
+    }
+}
+
 pub async fn rpc_client_by_id(id: &Id, neb: &Arc<NebServer>) -> Result<Arc<RPCClient>, RPCError> {
     let server_id = neb.get_server_id_by_id(id).unwrap();
     let neb = neb.clone();
