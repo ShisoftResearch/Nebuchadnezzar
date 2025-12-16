@@ -95,6 +95,7 @@ service! {
     rpc seek(id: Id, range: Range, pattern: &Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
+    rpc flush_all();
 }
 
 service_with_id!(LSMTreeService, DEFAULT_SERVICE_ID);
@@ -329,6 +330,13 @@ impl Service for LSMTreeService {
         })
     }
 
+    fn flush_all(&self) -> BoxFuture<'_, ()> {
+        async move {
+            self.flush_all_trees().await;
+        }
+        .boxed()
+    }
+    
     fn stat(&self, id: Id) -> BoxFuture<'_, OpResult<LSMTreeStat>> {
         future::ready(if let Some(tree) = self.trees.get(&id) {
             OpResult::Successful(LSMTreeStat {
@@ -365,6 +373,26 @@ impl LSMTreeService {
             trees: trees_map,
         }
     }
+    
+    /// Flush all trees to disk - called during shutdown
+    pub async fn flush_all_trees(&self) {
+        info!("Flushing all LSM trees to disk before shutdown");
+        for (tree_id, dist_tree) in self.trees.entries() {
+            let tree = &dist_tree.tree;
+            let count_before = tree.count();
+            info!("Flushing tree {:?} with {} items", tree_id, count_before);
+            
+            // Force merge regardless of whether oversized
+            tree.force_merge_levels().await;
+            
+            // Mark migration to update the tree cell with new head IDs
+            tree.mark_migration(&tree_id, None, &self.client).await;
+        }
+        
+        // Wait for all external node writes to complete
+        super::btree::storage::wait_until_updated().await;
+        info!("All LSM trees flushed to disk");
+    }
 
     pub fn start_tree_balancer(
         trees_map: &Arc<HashMap<Id, Arc<DistLSMTree>>>,
@@ -380,7 +408,17 @@ impl LSMTreeService {
                 let mut fast_mode = false;
                 for (_, dist_tree) in trees_map.entries() {
                     let tree = &dist_tree.tree;
-                    fast_mode = tree.merge_levels().await | fast_mode;
+                    let merged = tree.merge_levels().await;
+                    fast_mode = merged | fast_mode;
+                    
+                    // If merge happened, wait for external nodes to be written, then update the tree cell
+                    if merged {
+                        // Wait for all external B+tree nodes to be written to storage
+                        storage::wait_until_updated().await;
+                        // Now update the cell with the new head IDs
+                        tree.mark_migration(&dist_tree.id, None, &client).await;
+                    }
+                    
                     if tree.oversized() {
                         info!("LSM Tree oversized {:?}, start migration", dist_tree.id);
                         // Tree oversized, need to migrate

@@ -644,7 +644,7 @@ where
                 let cell_id = cell.id();
                 trace!("Updating node cell {:?}", cell_id);
                 match neb.upsert_cell(cell).await {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_header)) => {}
                     Ok(Err(e)) => {
                         warn!("Cell node update error for {:?}, error: {:?}", cell_id, e);
                     }

@@ -187,7 +187,19 @@ impl MasterTreeSM {
     pub async fn try_initialize(&mut self) -> bool {
         // Don't initialize if tree already has data (recovered from disk)
         if !self.tree.is_empty() {
-            info!("MasterTreeSM already has data, skipping initialization");
+            info!("MasterTreeSM already has data, loading recovered trees");
+            // Load all recovered trees into the LSMTreeService
+            let tree_entries: Vec<_> = self.tree.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            for i in 0..tree_entries.len() {
+                let (lower, placement) = &tree_entries[i];
+                let upper = if i + 1 < tree_entries.len() {
+                    tree_entries[i + 1].0.clone()
+                } else {
+                    max_entry_key()
+                };
+                info!("Loading recovered tree {:?} with boundary [{:?}, {:?})", placement.id, lower, upper);
+                self.load_sub_tree(placement.id, lower, &upper, placement.epoch).await;
+            }
             return true;
         }
 

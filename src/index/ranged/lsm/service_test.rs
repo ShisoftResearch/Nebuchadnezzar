@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod test {
-    use super::*;
     use crate::index::entry::EntryKey;
     use crate::index::{Feature, FEATURE_SIZE};
     use crate::ram::types::Id;
@@ -226,7 +225,7 @@ mod test {
         
         // Try seeking directly to value 50
         let key50_seek = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(50));
-        let mut cursor50 = tree.seek(&key50_seek, Ordering::Forward);
+        let cursor50 = tree.seek(&key50_seek, Ordering::Forward);
         println!("Seek to value 50, current: {:?}", cursor50.current().map(|k| {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&k.as_slice()[8..16]);
@@ -399,6 +398,619 @@ mod test {
         // Should have 51 items (0 to 50)
         assert_eq!(collected.len(), 51, "Should collect 51 items, got {} items: {:?}", collected.len(), collected);
         assert_eq!(collected, (0..=50).collect::<Vec<_>>(), "Should have values 0 to 50, got: {:?}", collected);
+    }
+
+    /// Test that range queries work correctly after LSM tree recovery from persistent storage.
+    /// 
+    /// Key requirements for recovery:
+    /// 1. Create both page_schema and LSM_TREE_SCHEMA
+    /// 2. Start the external node writeback background task
+    /// 3. Merge data from memory to disk trees
+    /// 4. Update the LSM tree cell with new head IDs after merge
+    /// 5. Wait for async persistence to complete
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_range_query_survives_recovery() {
+        use crate::server::*;
+        use crate::client;
+        use crate::index::ranged::lsm::tree::{LSMTree, LSM_TREE_SCHEMA};
+        use crate::index::ranged::lsm::service::{Range, RangeTerm};
+        use crate::index::ranged::lsm::btree::{Ordering, page_schema};
+        use crate::index::ranged::trees::Cursor;
+        use std::sync::Arc;
+
+        let _ = env_logger::try_init();
+        let server_group = "lsm-range-recovery";
+        let server_addr = String::from("127.0.0.1:5610");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await;
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Create the schemas required for LSM tree storage
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .new_schema_with_id(LSM_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // CRITICAL: Start the background task that writes external nodes to storage
+        use crate::index::ranged::lsm::btree::storage;
+        storage::start_external_nodes_write_back(&client);
+
+        let lsm_tree_id = Id::new(999, 999);
+        let schema_id = 1;
+        let field = 200;
+        
+        // Create LSM tree and insert test data
+        let tree = LSMTree::create(&client, &lsm_tree_id).await;
+        
+        // Insert keys with feature values 10..=100
+        for i in 10..=100 {
+            let key = create_entry_key(schema_id, field, i, Id::new(2, i));
+            tree.insert(&key);
+        }
+
+        println!("=== Tree state after insertion ===");
+        println!("Tree count: {}", tree.count());
+        println!("Tree ideal_capacity: {}", tree.ideal_capacity());
+        println!("Tree oversized: {}", tree.oversized());
+
+        // Helper function to perform range query and collect results
+        let collect_range = |tree: &LSMTree, start: u64, end: u64| -> Vec<u64> {
+            let start_key = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(start));
+            let max_id = Id::new(u64::MAX, u64::MAX);
+            let end_key = EntryKey::from_props(&max_id, &u64_to_feature(end), field, schema_id);
+            
+            let range = Range {
+                start: RangeTerm::Inclusive(start_key.clone()),
+                end: RangeTerm::Inclusive(end_key.clone()),
+                ordering: Ordering::Forward,
+            };
+            
+            let entry = range.key();
+            let mut tree_cursor = tree.seek(&entry, Ordering::Forward);
+            let mut collected = Vec::new();
+            
+            while let Some(key) = tree_cursor.next() {
+                let feature_value = {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&key.as_slice()[8..16]);
+                    u64::from_be_bytes(bytes)
+                };
+                
+                // Check start condition
+                if key.prefix_lt(&start_key) {
+                    continue;
+                }
+                
+                // Check end condition
+                if key.prefix_gt(&end_key) {
+                    break;
+                }
+                
+                collected.push(feature_value);
+            }
+            
+            collected
+        };
+        
+        // Test various range queries before recovery
+        println!("=== Testing range queries BEFORE recovery ===");
+        
+        // Query 1: [10, 20] inclusive
+        let results_1_before = collect_range(&tree, 10, 20);
+        println!("Range [10, 20]: {} items", results_1_before.len());
+        assert_eq!(results_1_before.len(), 11, "Should have 11 items for range [10, 20]");
+        assert_eq!(results_1_before, (10..=20).collect::<Vec<_>>());
+        
+        // Query 2: [50, 60] inclusive
+        let results_2_before = collect_range(&tree, 50, 60);
+        println!("Range [50, 60]: {} items", results_2_before.len());
+        assert_eq!(results_2_before.len(), 11, "Should have 11 items for range [50, 60]");
+        assert_eq!(results_2_before, (50..=60).collect::<Vec<_>>());
+        
+        // Query 3: [90, 100] inclusive (boundary test)
+        let results_3_before = collect_range(&tree, 90, 100);
+        println!("Range [90, 100]: {} items", results_3_before.len());
+        assert_eq!(results_3_before.len(), 11, "Should have 11 items for range [90, 100]");
+        assert_eq!(results_3_before, (90..=100).collect::<Vec<_>>());
+        
+        // Query 4: Full range [10, 100]
+        let results_4_before = collect_range(&tree, 10, 100);
+        println!("Range [10, 100]: {} items", results_4_before.len());
+        assert_eq!(results_4_before.len(), 91, "Should have 91 items for range [10, 100]");
+        
+        // Force merge to persist to disk
+        println!("=== Forcing tree merge to persist data ===");
+        let merged = tree.merge_levels().await;
+        println!("Merge result: {}", merged);
+        println!("Tree count after merge: {}", tree.count());
+        
+        // Give time for async writes to complete and merge multiple times to ensure all data is on disk
+        for i in 0..5 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            let merged_again = tree.merge_levels().await;
+            println!("Additional merge {} result: {}, count: {}", i, merged_again, tree.count());
+        }
+        
+        // Update the LSM tree cell with the current head IDs (critical for recovery!)
+        println!("=== Updating LSM tree cell with new head IDs ===");
+        println!("Disk trees head IDs: {:?}", 
+                tree.disk_trees.iter().map(|t| t.head_id()).collect::<Vec<_>>());
+        tree.mark_migration(&lsm_tree_id, None, &client).await;
+        println!("LSM tree cell updated");
+        
+        // Wait for cell update to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        
+        // Verify the cell was updated by reading it back
+        use crate::index::ranged::lsm::tree::{LSM_TREE_LEVELS_HASH};
+        let verify_cell = client.read_cell(lsm_tree_id).await.unwrap().unwrap();
+        let stored_tree_ids = &verify_cell.data[*LSM_TREE_LEVELS_HASH]
+            .prim_array()
+            .unwrap()
+            .id()
+            .unwrap();
+        println!("Stored tree IDs in cell: {:?}", stored_tree_ids);
+        
+        // Drop the tree to simulate server restart
+        drop(tree);
+        
+        println!("=== Recovering LSM tree from storage ===");
+        
+        // Recover the tree
+        let recovered_tree = LSMTree::recover(&client, &lsm_tree_id).await;
+        
+        println!("=== Recovered tree state ===");
+        println!("Recovered tree count: {}", recovered_tree.count());
+        println!("Recovered tree ideal_capacity: {}", recovered_tree.ideal_capacity());
+        println!("Recovered tree oversized: {}", recovered_tree.oversized());
+        
+        println!("=== Testing range queries AFTER recovery ===");
+        
+        // Repeat the same queries and verify results match
+        let results_1_after = collect_range(&recovered_tree, 10, 20);
+        println!("Range [10, 20] after recovery: {} items", results_1_after.len());
+        assert_eq!(results_1_after, results_1_before, 
+                   "Range [10, 20] results should match after recovery");
+        
+        let results_2_after = collect_range(&recovered_tree, 50, 60);
+        println!("Range [50, 60] after recovery: {} items", results_2_after.len());
+        assert_eq!(results_2_after, results_2_before, 
+                   "Range [50, 60] results should match after recovery");
+        
+        let results_3_after = collect_range(&recovered_tree, 90, 100);
+        println!("Range [90, 100] after recovery: {} items", results_3_after.len());
+        assert_eq!(results_3_after, results_3_before, 
+                   "Range [90, 100] results should match after recovery");
+        
+        let results_4_after = collect_range(&recovered_tree, 10, 100);
+        println!("Range [10, 100] after recovery: {} items", results_4_after.len());
+        assert_eq!(results_4_after, results_4_before, 
+                   "Full range [10, 100] results should match after recovery");
+        
+        println!("=== All recovery tests passed! ===");
+    }
+
+    /// Test that backward range queries work correctly after LSM tree recovery.
+    /// This validates that the B+tree bidirectional links are preserved through recovery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_range_query_backward_survives_recovery() {
+        use crate::server::*;
+        use crate::client;
+        use crate::index::ranged::lsm::tree::{LSMTree, LSM_TREE_SCHEMA};
+        use crate::index::ranged::lsm::service::{Range, RangeTerm};
+        use crate::index::ranged::lsm::btree::{Ordering, page_schema};
+        use crate::index::ranged::trees::Cursor;
+        use std::sync::Arc;
+
+        let _ = env_logger::try_init();
+        let server_group = "lsm-range-backward-recovery";
+        let server_addr = String::from("127.0.0.1:5611");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await;
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Create the schemas required for LSM tree storage
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .new_schema_with_id(LSM_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // CRITICAL: Start the background task that writes external nodes to storage
+        use crate::index::ranged::lsm::btree::storage;
+        storage::start_external_nodes_write_back(&client);
+
+        let lsm_tree_id = Id::new(888, 888);
+        let schema_id = 1;
+        let field = 300;
+        
+        // Create LSM tree and insert test data
+        let tree = LSMTree::create(&client, &lsm_tree_id).await;
+        
+        // Insert keys with feature values 10..=100 (91 items to ensure oversized mem tree)
+        for i in 10..=100 {
+            let key = create_entry_key(schema_id, field, i, Id::new(3, i));
+            tree.insert(&key);
+        }
+
+        println!("=== Tree state after insertion ===");
+        println!("Tree count: {}", tree.count());
+        println!("Tree ideal_capacity: {}", tree.ideal_capacity());
+
+        // Helper function to perform backward range query
+        let collect_range_backward = |tree: &LSMTree, start: u64, end: u64| -> Vec<u64> {
+            let start_key = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(start));
+            let max_id = Id::new(u64::MAX, u64::MAX);
+            let end_key = EntryKey::from_props(&max_id, &u64_to_feature(end), field, schema_id);
+            
+            let range = Range {
+                start: RangeTerm::Inclusive(start_key.clone()),
+                end: RangeTerm::Inclusive(end_key.clone()),
+                ordering: Ordering::Backward,
+            };
+            
+            let entry = range.key();
+            let mut tree_cursor = tree.seek(&entry, Ordering::Backward);
+            let mut collected = Vec::new();
+            
+            while let Some(key) = tree_cursor.next() {
+                let feature_value = {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&key.as_slice()[8..16]);
+                    u64::from_be_bytes(bytes)
+                };
+                
+                // Check end condition (for backward, check end first)
+                if key.prefix_gt(&end_key) {
+                    continue;
+                }
+                
+                // Check start condition
+                if key.prefix_lt(&start_key) {
+                    break;
+                }
+                
+                collected.push(feature_value);
+            }
+            
+            collected
+        };
+        
+        println!("=== Testing BACKWARD range queries BEFORE recovery ===");
+        
+        // Query 1: [30, 40] backward
+        let results_1_before = collect_range_backward(&tree, 30, 40);
+        println!("Backward range [30, 40]: {} items", results_1_before.len());
+        assert_eq!(results_1_before.len(), 11, "Should have 11 items");
+        // Backward should return in descending order
+        let expected: Vec<u64> = (30..=40).rev().collect();
+        assert_eq!(results_1_before, expected);
+        
+        // Query 2: [70, 80] backward (boundary test)
+        let results_2_before = collect_range_backward(&tree, 70, 80);
+        println!("Backward range [70, 80]: {} items", results_2_before.len());
+        assert_eq!(results_2_before.len(), 11, "Should have 11 items");
+        let expected: Vec<u64> = (70..=80).rev().collect();
+        assert_eq!(results_2_before, expected);
+        
+        println!("=== Forcing tree merge and recovering ===");
+        tree.merge_levels().await;
+        println!("Tree count after first merge: {}", tree.count());
+        
+        // Give time for async writes to complete and merge multiple times to ensure all data is on disk
+        for _ in 0..5 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            tree.merge_levels().await;
+        }
+        println!("Tree count after additional merges: {}", tree.count());
+        
+        // Update the LSM tree cell with the current head IDs (critical for recovery!)
+        tree.mark_migration(&lsm_tree_id, None, &client).await;
+        
+        // Wait for writeback to complete - longer wait for test isolation
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        
+        drop(tree);
+        
+        println!("=== Recovering tree ===");
+        let recovered_tree = LSMTree::recover(&client, &lsm_tree_id).await;
+        println!("Recovered tree count: {}", recovered_tree.count());
+        
+        println!("=== Testing BACKWARD range queries AFTER recovery ===");
+        
+        let results_1_after = collect_range_backward(&recovered_tree, 30, 40);
+        println!("Backward range [30, 40] after recovery: {} items", results_1_after.len());
+        assert_eq!(results_1_after, results_1_before, 
+                   "Backward range results should match after recovery");
+        
+        let results_2_after = collect_range_backward(&recovered_tree, 70, 80);
+        println!("Backward range [70, 80] after recovery: {} items", results_2_after.len());
+        assert_eq!(results_2_after, results_2_before, 
+                   "Backward range results should match after recovery");
+        
+        println!("=== Backward range recovery tests passed! ===");
+    }
+
+    /// End-to-end test: Range index survives recovery using schema-level API
+    /// 
+    /// Tests the complete flow:
+    /// 1. Define schema with ranged index
+    /// 2. Insert cells with indexed values
+    /// 3. Query using range_index_scan
+    /// 4. Simulate server restart by dropping and recreating server
+    /// 5. Query again and verify results match
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_e2e_range_index_recovery_with_schema() {
+        use crate::server::*;
+        use crate::ram::schema::{Schema, Field, IndexType};
+        use crate::ram::types::Type;
+        use crate::ram::cell::OwnedCell;
+        use crate::query::data_client::{ValueRange, ValueRangeTerm};
+        use crate::index::ranged::lsm::btree::Ordering;
+        use dovahkiin::{expr::serde::Expr, types::*};
+        use bifrost_hasher::hash_str;
+
+        let _ = env_logger::try_init();
+        let server_group = "e2e-range-recovery";
+        let server_addr = String::from("127.0.0.1:5620");
+        
+        const PRICE_FIELD: &'static str = "price";
+        const NAME_FIELD: &'static str = "name";
+        const QUANTITY_FIELD: &'static str = "quantity";
+        
+        // Create temporary directories for persistent storage
+        let test_dir = std::env::temp_dir().join("neb_e2e_range_recovery_test");
+        let backup_dir = test_dir.join("backup");
+        let wal_dir = test_dir.join("wal");
+        let undo_dir = test_dir.join("undo");
+        let raft_dir = test_dir.join("raft");
+        
+        // Clean up any existing test data
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        std::fs::create_dir_all(&undo_dir).unwrap();
+        std::fs::create_dir_all(&raft_dir).unwrap();
+        
+        println!("=== Using storage directories ===");
+        println!("Backup: {:?}", backup_dir);
+        println!("WAL: {:?}", wal_dir);
+        println!("Undo: {:?}", undo_dir);
+        println!("Raft: {:?}", raft_dir);
+        
+        // Create initial server with ranged indexer and persistent storage
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: Some(backup_dir.to_str().unwrap().to_string()),
+                wal_storage: Some(wal_dir.to_str().unwrap().to_string()),
+                undo_log_storage: Some(undo_dir.to_str().unwrap().to_string()),
+                raft_storage: Some(raft_dir.to_str().unwrap().to_string()),
+                index_enabled: true,  // Enable indexing
+                services: vec![Service::Cell, Service::Query, Service::RangedIndexer],
+                enable_recovery: false,  // First start, no recovery
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await;
+
+        // Define schema with ranged index on price field
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(PRICE_FIELD, Type::U64, vec![IndexType::Ranged]),
+            Field::new_unindexed(NAME_FIELD, Type::String),
+            Field::new_unindexed(QUANTITY_FIELD, Type::U32),
+        ]);
+        
+        let schema_id = 300;
+        let schema = Schema::new_with_id(
+            schema_id,
+            "products",
+            None,
+            fields,
+            false,
+            true,  // Scannable
+        );
+
+        let client = server.data_client(&vec![server_addr.clone()]).await.unwrap();
+        client.new_schema_with_id(schema.clone()).await.unwrap().unwrap();
+
+        println!("=== Inserting test data ===");
+        // Insert products with prices ranging from 10 to 100
+        for _i in 10..=100 {
+            let id = Id::new(2, _i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[PRICE_FIELD] = OwnedValue::U64(_i);
+            value[NAME_FIELD] = OwnedValue::String(format!("Product {}", _i));
+            value[QUANTITY_FIELD] = OwnedValue::U32((_i * 5) as u32);
+            
+            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+
+        println!("Inserted 91 products");
+
+        // Helper function to query a price range and collect results
+        async fn query_price_range(
+            idx_client: &crate::query::data_client::IndexedDataClient,
+            schema_id: u32,
+            min: u64,
+            max: u64,
+        ) -> Vec<u64> {
+            let field_id = hash_str(PRICE_FIELD);
+            let val_range = ValueRange {
+                start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(min).shared()),
+                end: ValueRangeTerm::inclusive_from(&OwnedValue::U64(max).shared()),
+            };
+            
+            let mut cursor = idx_client
+                .range_index_scan(
+                    schema_id,
+                    field_id,
+                    val_range,
+                    vec![],
+                    Expr::nothing(),
+                    Expr::nothing(),
+                    Ordering::Forward,
+                )
+                .await
+                .unwrap();
+
+            let mut prices = vec![];
+            while let Ok(Some(cell)) = cursor.next().await {
+                if let OwnedValue::U64(price) = &cell.data[PRICE_FIELD] {
+                    prices.push(*price);
+                }
+            }
+            prices
+        }
+
+        println!("=== Testing range queries BEFORE recovery ===");
+        let idx_client = server.indexed_data_client();
+        
+        // Test query 1: [20, 30]
+        let results_1_before = query_price_range(&idx_client, schema_id, 20, 30).await;
+        println!("Range [20, 30]: {} items", results_1_before.len());
+        assert_eq!(results_1_before.len(), 11, "Should have 11 items");
+        assert_eq!(results_1_before, (20..=30).collect::<Vec<_>>());
+        
+        // Test query 2: [50, 60]
+        let results_2_before = query_price_range(&idx_client, schema_id, 50, 60).await;
+        println!("Range [50, 60]: {} items", results_2_before.len());
+        assert_eq!(results_2_before.len(), 11, "Should have 11 items");
+        
+        // Test query 3: [85, 95]
+        let results_3_before = query_price_range(&idx_client, schema_id, 85, 95).await;
+        println!("Range [85, 95]: {} items", results_3_before.len());
+        assert_eq!(results_3_before.len(), 11, "Should have 11 items");
+
+        // Proper server shutdown to simulate restart
+        println!("=== Simulating server restart ===");
+        drop(idx_client);
+        drop(client);
+        
+        // Proper shutdown sequence
+        println!("Shutting down Raft and RPC services...");
+        server.raft_service.shutdown().await;
+        server.rpc.shutdown().await;
+        drop(server);
+
+        // Create new server instance (recovery) - use same address
+        println!("=== Starting new server (recovery) ===");
+        println!("Recovery server will use address: {}", server_addr);
+        let server_recovered = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: Some(backup_dir.to_str().unwrap().to_string()),
+                wal_storage: Some(wal_dir.to_str().unwrap().to_string()),
+                undo_log_storage: Some(undo_dir.to_str().unwrap().to_string()),
+                raft_storage: Some(raft_dir.to_str().unwrap().to_string()),
+                index_enabled: true,
+                services: vec![Service::Cell, Service::Query, Service::RangedIndexer],
+                enable_recovery: true,  // Enable recovery from persistent storage
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await;
+
+        // Re-register the schema after recovery (schemas are recovered from Raft but need to be loaded into cache)
+        println!("Re-registering schema...");
+        server_recovered.meta.schemas.debug_only_new_schema(schema.clone());
+
+        println!("=== Testing range queries AFTER recovery ===");
+        let idx_client_recovered = server_recovered.indexed_data_client();
+        
+        // Repeat the same queries
+        println!("Attempting first query after recovery...");
+        let results_1_after = query_price_range(&idx_client_recovered, schema_id, 20, 30).await;
+        println!("Range [20, 30] after recovery: {} items - SUCCESS!", results_1_after.len());
+        assert_eq!(results_1_after, results_1_before, 
+                   "Range [20, 30] should match after recovery");
+        
+        let results_2_after = query_price_range(&idx_client_recovered, schema_id, 50, 60).await;
+        println!("Range [50, 60] after recovery: {} items", results_2_after.len());
+        assert_eq!(results_2_after, results_2_before, 
+                   "Range [50, 60] should match after recovery");
+        
+        let results_3_after = query_price_range(&idx_client_recovered, schema_id, 85, 95).await;
+        println!("Range [85, 95] after recovery: {} items", results_3_after.len());
+        assert_eq!(results_3_after, results_3_before, 
+                   "Range [85, 95] should match after recovery");
+
+        println!("=== End-to-end recovery test passed! ===");
+        
+        // Cleanup
+        drop(server_recovered);
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }
 

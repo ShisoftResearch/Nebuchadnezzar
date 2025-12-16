@@ -143,6 +143,7 @@ where
             let next_id = page.next_id;
             let prev_id = page.prev_id;
             let mut node = page.node;
+            
             at_end = next_id.is_unit_id();
             if at_end {
                 node.next = NodeCellRef::new_none::<KS, PS>();

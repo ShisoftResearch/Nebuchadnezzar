@@ -83,6 +83,7 @@ impl LSMTree {
 
     pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: &Id) -> Self {
         info!("Recovering LSM tree {:?}", lsm_tree_id);
+        
         let deletion_ref = Arc::new(LFHashSet::with_capacity(16));
         let cell = neb_client.read_cell(*lsm_tree_id).await.unwrap().unwrap();
         let trees = &cell.data[*LSM_TREE_LEVELS_HASH]
@@ -92,11 +93,14 @@ impl LSMTree {
             .unwrap();
         let tree_0_id = &trees[0usize];
         let tree_1_id = &trees[1usize];
+        
         info!("Record shows trees {:?}", trees);
         debug!("Recovering level 0 tree {:?}", tree_0_id);
         let tree_0 = Level0Tree::from_head_id(tree_0_id, neb_client, &deletion_ref, 0).await;
+        
         debug!("Recovering level 1 tree {:?}", tree_1_id);
         let tree_1 = Level1Tree::from_head_id(tree_1_id, neb_client, &deletion_ref, 1).await;
+        
         Self {
             mem_tree: Atomic::new(Box::new(LevelMTree::new(&deletion_ref))),
             trans_mem_tree: Atomic::null(),
@@ -128,14 +132,25 @@ impl LSMTree {
     }
 
     pub async fn merge_levels(&self) -> bool {
+        self.merge_levels_internal(false).await
+    }
+    
+    pub async fn force_merge_levels(&self) -> bool {
+        self.merge_levels_internal(true).await
+    }
+    
+    async fn merge_levels_internal(&self, force: bool) -> bool {
         let mut merged = false;
         let mut deleted = StdHashSet::new();
         {
             let guard = crossbeam_epoch::pin();
             let mem_tree_ptr = self.mem_tree.load(Acquire, &guard);
             let mem_tree = unsafe { mem_tree_ptr.as_ref().unwrap() };
-            if mem_tree.oversized() {
-                info!("Memory tree oversized, moving everything to disk tree");
+            let mem_count = mem_tree.count();
+            let should_merge = force || mem_tree.oversized();
+            
+            if should_merge && mem_count > 0 {
+                info!("Memory tree has {} items, moving everything to disk tree", mem_count);
                 // Memory tree oversized
                 // Will construct a new tree and swap the old one to trans_mem_tree for query and move all
                 // keys in old tree to disk tree level 0
@@ -156,6 +171,7 @@ impl LSMTree {
                 trace!("Memory tree not oversized");
             }
         }
+
         storage::wait_until_updated().await;
         for i in 0..self.disk_trees.len() - 1 {
             let level = i + 1;

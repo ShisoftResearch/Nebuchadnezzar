@@ -439,6 +439,13 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
     return header;
 }
 
+pub fn cell_version_from_entry_content_addr(addr: usize) -> u64 {
+    let mut cursor = addr_to_header_cursor(addr);
+    let version = cursor.read_u64::<Endian>().unwrap();
+    release_cursor(cursor);
+    version
+}
+
 pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
     if ptr == 0 {
         return Err(ReadError::CellIdIsUnitId);
@@ -446,6 +453,14 @@ pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadErro
     let addr = Entry::content_pos(ptr);
     let header = cell_header_from_entry_content_addr(addr);
     Ok((header, addr + CELL_HEADER_SIZE))
+}
+
+pub fn cell_version_from_chunk_raw(ptr: usize) -> Result<u64, ReadError> {
+    if ptr == 0 {
+        return Err(ReadError::CellIdIsUnitId);
+    }
+    let addr = Entry::content_pos(ptr);
+    Ok(cell_version_from_entry_content_addr(addr))
 }
 
 pub fn minimal_header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {

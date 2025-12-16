@@ -725,24 +725,13 @@ impl Chunk {
 
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
-        // Write first, lock second to avoid deadlock with cleaner
-        let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
-
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                self.validate_cell_location(new_cell_loc, &format!("upsert_cell(hash={})", hash)),
-                "Attempting to store invalid cell location 0x{:x} in cell index for hash {} (upsert)",
-                new_cell_loc,
-                hash
-            );
-        }
-
         loop {
             if let Some(mut guard) = self.location_for_write(hash, false) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
-
+                let cell_version = cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
+                cell.header.version = cell_version;
+                let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
                 #[cfg(debug_assertions)]
                 {
                     if cell_location != 0 {
@@ -770,7 +759,7 @@ impl Chunk {
                 if let Some(mut guard) = reservation {
                     // New cell
                     trace!("Cell {} does not exists, will insert for upsert", hash);
-
+                    let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
                     #[cfg(debug_assertions)]
                     self.assert_address_aligned_for_write(
                         new_cell_loc,
@@ -1263,8 +1252,8 @@ impl Chunk {
         let mut guard = self
             .lock_cell_for_write(hash, false)
             .map_err(WriteError::ReadError)?;
-        let cell_header = guard.head_cell().map_err(WriteError::ReadError)?;
-        if cell_header.version == version {
+        let cell_version = guard.cell_version().map_err(WriteError::ReadError)?;
+        if cell_version == version {
             cell.header.version = version; // update version to the latest version
             guard.update_cell(cell)?;
             return Ok(cell.header);
@@ -1669,6 +1658,13 @@ impl<'a> CellGuard<'a> {
             return Err(ReadError::CellDoesNotExisted);
         }
         header_from_chunk_raw(*self.guard).map(|pair| pair.0)
+    }
+
+    pub fn cell_version(&self) -> Result<u64, ReadError> {
+        if self.is_unassigned() {
+            return Err(ReadError::CellDoesNotExisted);
+        }
+        cell_version_from_chunk_raw(*self.guard)
     }
 
     pub fn read_cell_owned(&self) -> Result<OwnedCell, ReadError> {
