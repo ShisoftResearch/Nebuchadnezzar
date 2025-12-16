@@ -948,6 +948,33 @@ mod test {
         println!("Range [85, 95]: {} items", results_3_before.len());
         assert_eq!(results_3_before.len(), 11, "Should have 11 items");
 
+        // Test scan_all before recovery
+        println!("=== Testing scan_all BEFORE recovery ===");
+        let mut scan_cursor_before = idx_client
+            .scan_all(
+                schema_id,
+                vec![],
+                Expr::nothing(),
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+        
+        let mut all_prices_before = Vec::new();
+        let mut all_ids_before = Vec::new();
+        while let Ok(Some(cell)) = scan_cursor_before.next().await {
+            if let OwnedValue::U64(price) = &cell.data[PRICE_FIELD] {
+                all_prices_before.push(*price);
+                all_ids_before.push(cell.id());
+            }
+        }
+        all_prices_before.sort();
+        println!("scan_all before recovery: {} items", all_prices_before.len());
+        assert_eq!(all_prices_before.len(), 91, "Should have 91 items before recovery");
+        assert_eq!(all_prices_before, (10..=100).collect::<Vec<_>>(), 
+                   "All prices from 10 to 100 should be present");
+
         // Proper server shutdown to simulate restart
         println!("=== Simulating server restart ===");
         drop(idx_client);
@@ -1004,6 +1031,39 @@ mod test {
         println!("Range [85, 95] after recovery: {} items", results_3_after.len());
         assert_eq!(results_3_after, results_3_before, 
                    "Range [85, 95] should match after recovery");
+
+        // Test scan_all after recovery
+        println!("=== Testing scan_all AFTER recovery ===");
+        let mut scan_cursor_after = idx_client_recovered
+            .scan_all(
+                schema_id,
+                vec![],
+                Expr::nothing(),
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+        
+        let mut all_prices_after = Vec::new();
+        let mut all_ids_after = Vec::new();
+        while let Ok(Some(cell)) = scan_cursor_after.next().await {
+            if let OwnedValue::U64(price) = &cell.data[PRICE_FIELD] {
+                all_prices_after.push(*price);
+                all_ids_after.push(cell.id());
+            }
+        }
+        all_prices_after.sort();
+        println!("scan_all after recovery: {} items", all_prices_after.len());
+        assert_eq!(all_prices_after.len(), 91, "Should have 91 items after recovery");
+        assert_eq!(all_prices_after, (10..=100).collect::<Vec<_>>(), 
+                   "All prices from 10 to 100 should be present after recovery");
+        
+        // Verify IDs match (order may differ, so sort them)
+        all_ids_before.sort();
+        all_ids_after.sort();
+        assert_eq!(all_ids_before, all_ids_after, 
+                   "All IDs should match after recovery");
 
         println!("=== End-to-end recovery test passed! ===");
         

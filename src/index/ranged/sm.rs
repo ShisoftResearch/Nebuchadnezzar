@@ -165,6 +165,7 @@ impl MasterTreeSM {
         conshash: &Arc<ConsistentHashing>,
         persistence_path: Option<PathBuf>,
     ) -> Self {
+        info!("[RANGED INDEX RECOVERY] Creating MasterTreeSM with persistence_path={:?}", persistence_path);
         let mut sm = Self {
             tree: BTreeMap::new(),
             raft_svr: raft_svr.clone(),
@@ -173,12 +174,15 @@ impl MasterTreeSM {
         };
 
         // Try to recover from disk if persistence path is provided
-        if let Some(path) = persistence_path {
-            if let Err(e) = sm.recover_from_disk(&path) {
-                info!("No existing tree state or failed to recover: {:?}", e);
+        if let Some(ref path) = persistence_path {
+            info!("[RANGED INDEX RECOVERY] Attempting recovery from persistence path: {:?}", path);
+            if let Err(e) = sm.recover_from_disk(path) {
+                info!("[RANGED INDEX RECOVERY] No existing tree state or failed to recover: {:?}", e);
             } else {
-                info!("Successfully recovered MasterTreeSM from disk");
+                info!("[RANGED INDEX RECOVERY] Successfully recovered MasterTreeSM from disk with {} tree entries", sm.tree.len());
             }
+        } else {
+            info!("[RANGED INDEX RECOVERY] No persistence path provided, starting with empty tree");
         }
 
         sm
@@ -187,7 +191,7 @@ impl MasterTreeSM {
     pub async fn try_initialize(&mut self) -> bool {
         // Don't initialize if tree already has data (recovered from disk)
         if !self.tree.is_empty() {
-            info!("MasterTreeSM already has data, loading recovered trees");
+            info!("[RANGED INDEX RECOVERY] MasterTreeSM already has data from disk recovery, loading {} recovered trees", self.tree.len());
             // Load all recovered trees into the LSMTreeService
             let tree_entries: Vec<_> = self.tree.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             for i in 0..tree_entries.len() {
@@ -197,9 +201,12 @@ impl MasterTreeSM {
                 } else {
                     max_entry_key()
                 };
-                info!("Loading recovered tree {:?} with boundary [{:?}, {:?})", placement.id, lower, upper);
+                info!("[RANGED INDEX RECOVERY] Loading recovered tree {}/{}: tree_id={:?}, boundary=[{:?}, {:?}), epoch={}",
+                      i + 1, tree_entries.len(), placement.id, lower, upper, placement.epoch);
                 self.load_sub_tree(placement.id, lower, &upper, placement.epoch).await;
+                info!("[RANGED INDEX RECOVERY] Completed loading tree {}/{}", i + 1, tree_entries.len());
             }
+            info!("[RANGED INDEX RECOVERY] All {} recovered trees loaded successfully", tree_entries.len());
             return true;
         }
 
@@ -268,7 +275,9 @@ impl MasterTreeSM {
     }
 
     fn recover_from_disk(&mut self, path: &Path) -> io::Result<()> {
+        info!("[RANGED INDEX RECOVERY] Attempting to recover MasterTreeSM from disk: {:?}", path);
         if !path.exists() {
+            info!("[RANGED INDEX RECOVERY] Tree persistence file not found at {:?}", path);
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "Tree persistence file not found",
@@ -279,8 +288,10 @@ impl MasterTreeSM {
         let mut reader = BufReader::new(file);
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer)?;
+        info!("[RANGED INDEX RECOVERY] Read {} bytes from persistence file", buffer.len());
 
         if buffer.is_empty() {
+            info!("[RANGED INDEX RECOVERY] Persistence file is empty");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Empty persistence file",
@@ -289,26 +300,32 @@ impl MasterTreeSM {
 
         let entries: Vec<(EntryKey, TreePlacement)> = utils::serde::deserialize(&buffer)
             .ok_or_else(|| {
+                error!("[RANGED INDEX RECOVERY] Failed to deserialize tree data");
                 io::Error::new(io::ErrorKind::InvalidData, "Failed to deserialize tree")
             })?;
 
         // Convert Vec back to BTreeMap
         self.tree = entries.into_iter().collect();
-        info!("Recovered tree with {} entries", self.tree.len());
+        info!("[RANGED INDEX RECOVERY] Successfully recovered tree with {} entries", self.tree.len());
+        for (key, placement) in &self.tree {
+            info!("[RANGED INDEX RECOVERY]   Tree entry: key={:?}, tree_id={:?}, epoch={}", key, placement.id, placement.epoch);
+        }
 
         Ok(())
     }
     async fn load_sub_tree(&mut self, id: Id, lower: &EntryKey, upper: &EntryKey, epoch: u64) {
         if self.raft_svr.is_leader() {
             // Only the leader can initiate the request to load the sub tree
-            info!("Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}", id, lower, upper);
+            info!("[RANGED INDEX RECOVERY] Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}, epoch={}", id, lower, upper, epoch);
             let client = self.locate_tree_server(&id).await.unwrap();
-            debug!("Located {:?} at server {:?}", id, client.server_id());
+            info!("[RANGED INDEX RECOVERY] Located tree {:?} at server {:?}", id, client.server_id());
             client
                 .load_tree(id, Boundary::new(lower.clone(), upper.clone()), epoch)
                 .await
                 .unwrap();
-            debug!("Tree loaded for {:?}", id);
+            info!("[RANGED INDEX RECOVERY] Successfully loaded tree {:?} into LSM service", id);
+        } else {
+            info!("[RANGED INDEX RECOVERY] Not leader, skipping load_sub_tree for {:?}", id);
         }
     }
 

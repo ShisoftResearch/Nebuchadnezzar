@@ -82,10 +82,25 @@ impl LSMTree {
     }
 
     pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: &Id) -> Self {
-        info!("Recovering LSM tree {:?}", lsm_tree_id);
-        
+        info!("[LSM TREE RECOVERY] Starting recovery for LSM tree {:?}", lsm_tree_id);
+
         let deletion_ref = Arc::new(LFHashSet::with_capacity(16));
-        let cell = neb_client.read_cell(*lsm_tree_id).await.unwrap().unwrap();
+        info!("[LSM TREE RECOVERY] Attempting to read LSM tree root cell {:?}", lsm_tree_id);
+        let cell = match neb_client.read_cell(*lsm_tree_id).await {
+            Ok(Ok(cell)) => {
+                info!("[LSM TREE RECOVERY] Successfully read LSM tree root cell {:?}", lsm_tree_id);
+                cell
+            }
+            Ok(Err(e)) => {
+                error!("[LSM TREE RECOVERY] Failed to read LSM tree root cell {:?}: {:?}", lsm_tree_id, e);
+                panic!("LSM tree root cell not found");
+            }
+            Err(e) => {
+                error!("[LSM TREE RECOVERY] RPC error reading LSM tree root cell {:?}: {:?}", lsm_tree_id, e);
+                panic!("RPC error reading LSM tree root cell");
+            }
+        };
+
         let trees = &cell.data[*LSM_TREE_LEVELS_HASH]
             .prim_array()
             .unwrap()
@@ -93,13 +108,15 @@ impl LSMTree {
             .unwrap();
         let tree_0_id = &trees[0usize];
         let tree_1_id = &trees[1usize];
-        
-        info!("Record shows trees {:?}", trees);
-        debug!("Recovering level 0 tree {:?}", tree_0_id);
+
+        info!("[LSM TREE RECOVERY] LSM tree root cell contains level trees: [level_0={:?}, level_1={:?}]", tree_0_id, tree_1_id);
+        info!("[LSM TREE RECOVERY] Recovering level 0 B-tree from head {:?}", tree_0_id);
         let tree_0 = Level0Tree::from_head_id(tree_0_id, neb_client, &deletion_ref, 0).await;
-        
-        debug!("Recovering level 1 tree {:?}", tree_1_id);
+        info!("[LSM TREE RECOVERY] Level 0 B-tree recovered with {} keys", tree_0.count());
+
+        info!("[LSM TREE RECOVERY] Recovering level 1 B-tree from head {:?}", tree_1_id);
         let tree_1 = Level1Tree::from_head_id(tree_1_id, neb_client, &deletion_ref, 1).await;
+        info!("[LSM TREE RECOVERY] Level 1 B-tree recovered with {} keys", tree_1.count());
         
         Self {
             mem_tree: Atomic::new(Box::new(LevelMTree::new(&deletion_ref))),

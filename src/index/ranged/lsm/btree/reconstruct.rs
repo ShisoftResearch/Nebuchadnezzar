@@ -130,7 +130,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    info!("Reconstructing level tree from head {:?}", head_id);
+    info!("[B-TREE RECONSTRUCTION] Starting reconstruction of level {} tree from head cell {:?}", level, head_id);
     let mut len = 0;
     let (root, height) = {
         let mut constructor = TreeConstructor::<KS, PS>::new();
@@ -166,12 +166,12 @@ where
         }
         (constructor.root(), constructor.levels())
     };
-    info!("Reconstruct tree {:?} completed", head_id);
+    info!("[B-TREE RECONSTRUCTION] Completed reconstruction of tree {:?} at level {} with {} keys, height {}", head_id, level, len, height);
     let tree = BPlusTree::from_root(root, head_id, len, height, deletion);
-    debug!("Verifying reconstruction at {}", level);
+    debug!("[B-TREE RECONSTRUCTION] Verifying reconstruction at level {}", level);
     // debug_assert!(verification::tree_has_no_empty_node(&tree));
     debug_assert!(verification::is_tree_in_order(&tree, level));
-    debug!("Reconstruction verification completed at {}", level);
+    debug!("[B-TREE RECONSTRUCTION] Reconstruction verification completed at level {}", level);
     tree
 }
 
