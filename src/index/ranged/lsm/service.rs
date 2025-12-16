@@ -176,15 +176,76 @@ impl Service for LSMTreeService {
             let mut buffer = Vec::with_capacity(buffer_size);
             let mut num_collected = 0;
             let pattern = pattern.as_ref().map(|p| (p.as_slice(), p.len()));
+            // Process current() first to avoid skipping first element
+            if let Some(key) = tree_cursor.current() {
+                let key = key.clone();
+                if let Some((patt_key, patt_len)) = pattern {
+                    if &key.as_slice()[..patt_len] != patt_key {
+                        return OpResult::Successful(ServBlock { buffer, next: None });
+                    }
+                }
+                let key_id = key.id();
+                let feature_val = {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(&key.as_slice()[8..16]);
+                    u64::from_be_bytes(bytes)
+                };
+                let mut should_add = true;
+                match ordering {
+                    Ordering::Forward => {
+                        match &range.start {
+                            RangeTerm::Inclusive(k) => {
+                                if key.prefix_lt(k) { should_add = false; }
+                            }
+                            RangeTerm::Exclusive(k) => {
+                                if key.prefix_le(k) { should_add = false; }
+                            }
+                            RangeTerm::Open => {}
+                        }
+                        if should_add {
+                            match &range.end {
+                                RangeTerm::Inclusive(k) => {
+                                    if key.prefix_gt(k) { should_add = false; }
+                                }
+                                RangeTerm::Exclusive(k) => {
+                                    if key.prefix_ge(k) { should_add = false; }
+                                }
+                                RangeTerm::Open => {}
+                            }
+                        }
+                    }
+                    Ordering::Backward => {
+                        match &range.end {
+                            RangeTerm::Inclusive(k) => {
+                                if key.prefix_gt(k) { should_add = false; }
+                            }
+                            RangeTerm::Exclusive(k) => {
+                                if key.prefix_ge(k) { should_add = false; }
+                            }
+                            RangeTerm::Open => {}
+                        }
+                        if should_add {
+                            match &range.start {
+                                RangeTerm::Inclusive(k) => {
+                                    if key.prefix_lt(k) { should_add = false; }
+                                }
+                                RangeTerm::Exclusive(k) => {
+                                    if key.prefix_le(k) { should_add = false; }
+                                }
+                                RangeTerm::Open => {}
+                            }
+                        }
+                    }
+                }
+                if should_add {
+                    buffer.push(key_id);
+                    num_collected += 1;
+                }
+            }
             while num_collected < buffer_size {
                 if let Some(key) = tree_cursor.next() {
                     if let Some((patt_key, patt_len)) = pattern {
                         if &key.as_slice()[..patt_len] != patt_key {
-                            // Pattern unmatch
-                            debug!(
-                                "Pattern unmatch for key {:?}, expect {:?}, break cursor.",
-                                key, patt_key
-                            );
                             break;
                         }
                     }
@@ -198,12 +259,12 @@ impl Service for LSMTreeService {
                         Ordering::Forward => {
                             match &range.start {
                                 RangeTerm::Inclusive(k) => {
-                                    if &key < k {
+                                    if key.prefix_lt(k) {
                                         continue;
                                     }
                                 }
                                 RangeTerm::Exclusive(k) => {
-                                    if &key <= k {
+                                    if key.prefix_le(k) {
                                         continue;
                                     }
                                 }
@@ -211,14 +272,12 @@ impl Service for LSMTreeService {
                             }
                             match &range.end {
                                 RangeTerm::Inclusive(k) => {
-                                    if &key > k {
-                                        debug!("Seek terminated due to inclusive end condition {:?} > {:?}", key, k);
+                                    if key.prefix_gt(k) {
                                         break;
                                     }
                                 }
                                 RangeTerm::Exclusive(k) => {
-                                    if &key >= k {
-                                        debug!("Seek terminated due to exclusive end condition {:?} >= {:?}", key, k);
+                                    if key.prefix_ge(k) {
                                         break;
                                     }
                                 }
@@ -228,12 +287,12 @@ impl Service for LSMTreeService {
                         Ordering::Backward => {
                             match &range.end {
                                 RangeTerm::Inclusive(k) => {
-                                    if &key > k {
+                                    if key.prefix_gt(k) {
                                         continue;
                                     }
                                 }
                                 RangeTerm::Exclusive(k) => {
-                                    if &key >= k {
+                                    if key.prefix_ge(k) {
                                         continue;
                                     }
                                 }
@@ -241,14 +300,12 @@ impl Service for LSMTreeService {
                             }
                             match &range.start {
                                 RangeTerm::Inclusive(k) => {
-                                    if &key < k {
-                                        debug!("Seek terminated due to inclusive start condition {:?} > {:?}", key, k);
+                                    if key.prefix_lt(k) {
                                         break;
                                     }
                                 }
                                 RangeTerm::Exclusive(k) => {
-                                    if &key <= k {
-                                        debug!("Seek terminated due to exclusive start condition {:?} > {:?}", key, k);
+                                    if key.prefix_le(k) {
                                         break;
                                     }
                                 }

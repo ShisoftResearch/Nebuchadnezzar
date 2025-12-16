@@ -107,6 +107,35 @@ impl EntryKey {
         key.set_id(id);
         key
     }
+
+    /// Compare two EntryKeys by their prefix (schema + field + feature), ignoring the ID part.
+    /// This is useful for range queries where we want to compare by feature value regardless of ID.
+    pub fn cmp_prefix(&self, other: &EntryKey) -> cmp::Ordering {
+        // Compare schema (4 bytes) + field (4 bytes) + feature (8 bytes) = 16 bytes
+        // ID is at the end (16 bytes), so we compare slice[0..16] vs slice[0..16]
+        let prefix_len = KEY_SIZE - ID_SIZE;
+        self.slice[..prefix_len].cmp(&other.slice[..prefix_len])
+    }
+
+    /// Check if this key's prefix (schema + field + feature) is greater than the other's.
+    pub fn prefix_gt(&self, other: &EntryKey) -> bool {
+        self.cmp_prefix(other) == cmp::Ordering::Greater
+    }
+
+    /// Check if this key's prefix (schema + field + feature) is greater than or equal to the other's.
+    pub fn prefix_ge(&self, other: &EntryKey) -> bool {
+        matches!(self.cmp_prefix(other), cmp::Ordering::Greater | cmp::Ordering::Equal)
+    }
+
+    /// Check if this key's prefix (schema + field + feature) is less than the other's.
+    pub fn prefix_lt(&self, other: &EntryKey) -> bool {
+        self.cmp_prefix(other) == cmp::Ordering::Less
+    }
+
+    /// Check if this key's prefix (schema + field + feature) is less than or equal to the other's.
+    pub fn prefix_le(&self, other: &EntryKey) -> bool {
+        matches!(self.cmp_prefix(other), cmp::Ordering::Less | cmp::Ordering::Equal)
+    }
 }
 
 impl Default for EntryKey {

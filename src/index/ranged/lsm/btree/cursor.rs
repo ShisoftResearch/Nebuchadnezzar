@@ -72,14 +72,24 @@ where
                         Ordering::Forward => {
                             if page.is_empty() || self.index + 1 >= page.len() {
                                 let next_node_ref = page.right_ref().unwrap();
+                                if next_node_ref.is_default() {
+                                    // No next page, return current item (last item) then stop
+                                    let mut other_current = None;
+                                    mem::swap(&mut self.current, &mut other_current);
+                                    self.page = None;
+                                    return Some(other_current);
+                                }
                                 return read_node(
                                     next_node_ref,
                                     |next_node: &NodeReadHandler<KS, PS>| {
                                         let mut other_current;
                                         if next_node.is_none() {
+                                            // Return the current item (last item in the tree) before stopping
+                                            // After this, current will be None
+                                            other_current = None;
+                                            mem::swap(&mut self.current, &mut other_current);
                                             self.page = None;
-                                            self.current = None;
-                                            return Some(None);
+                                            return Some(other_current);
                                         } else if next_node.is_empty() {
                                             return None;
                                         } else if next_node.is_ext() {
@@ -102,14 +112,24 @@ where
                         Ordering::Backward => {
                             if page.is_empty() || self.index == 0 {
                                 let prev_node_ref = page.left_ref().unwrap();
+                                if prev_node_ref.is_default() {
+                                    // No prev page, return current item (first item in reverse) then stop
+                                    let mut other_current = None;
+                                    mem::swap(&mut self.current, &mut other_current);
+                                    self.page = None;
+                                    return Some(other_current);
+                                }
                                 return read_node(
                                     prev_node_ref,
                                     |prev_node: &NodeReadHandler<KS, PS>| {
                                         let mut other_current;
                                         if prev_node.is_none() {
+                                            // Return the current item (last item in backward traversal) before stopping
+                                            // After this, current will be None
+                                            other_current = None;
+                                            mem::swap(&mut self.current, &mut other_current);
                                             self.page = None;
-                                            self.current = None;
-                                            return Some(None);
+                                            return Some(other_current);
                                         } else if prev_node.is_empty() {
                                             return None;
                                         } else if prev_node.is_ext() {

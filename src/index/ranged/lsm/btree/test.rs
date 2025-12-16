@@ -77,9 +77,9 @@ fn init() {
 
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
     let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
-    let mut last_key = cursor.current().unwrap().clone();
-    while cursor.next().is_some() {
-        let current = cursor.current().unwrap();
+    let mut last_key = cursor.next().unwrap(); // Get first item
+    while let Some(current_key) = cursor.next() {
+        let current = &current_key;
         if &last_key > current {
             dump_tree(tree, "error_insert_dump.json");
             panic!(
@@ -87,7 +87,7 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
                 last_key, current, key
             );
         }
-        last_key = current.clone();
+        last_key = current_key;
     }
 }
 
@@ -148,8 +148,12 @@ fn crd() {
                     Id::new(1, i).to_binary()
                 );
             }
-            assert_eq!(cursor.next().is_some(), i + 1 < num);
+            // next() returns current and advances
+            assert!(cursor.next().is_some(), "next() should return Some for valid position {}", i);
         }
+        // Cursor should be exhausted after iterating all items
+        assert!(cursor.next().is_none(), "cursor should be exhausted");
+        
         debug!("Forward scanning for sequence verification");
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         for i in 0..num {
@@ -157,8 +161,11 @@ fn crd() {
             debug!("Expecting id {:?}", expected);
             let id = cursor.current().unwrap().id();
             assert_eq!(id, expected);
-            assert_eq!(cursor.next().is_some(), i + 1 < num);
+            // next() returns current and advances
+            assert!(cursor.next().is_some(), "next() should return Some for valid position {}", i);
         }
+        // Cursor should be exhausted
+        assert!(cursor.next().is_none(), "cursor should be exhausted");
         assert!(cursor.current().is_none());
     }
 
@@ -172,8 +179,11 @@ fn crd() {
             debug!("Expecting id {:?}", expected);
             let id = cursor.current().unwrap().id();
             assert_eq!(id, expected, "{}", i);
-            assert_eq!(cursor.next().is_some(), i > 0);
+            // next() returns current and advances
+            assert!(cursor.next().is_some(), "next() should return Some for valid position {}", i);
         }
+        // Cursor should be exhausted
+        assert!(cursor.next().is_none(), "cursor should be exhausted");
         assert!(cursor.current().is_none());
     }
 
@@ -227,8 +237,11 @@ pub fn alternative_insertion_pattern() {
             let id = Id::new(1, j);
             let key = EntryKey::from_id(&id);
             assert_eq!(cursor.current(), Some(&key));
-            assert_eq!(cursor.next().is_some(), j != num - 1);
+            // next() returns current and advances, so it's always Some for valid positions
+            assert!(cursor.next().is_some(), "next() should return Some for position {}", j);
         }
+        // After iterating through all items, cursor should be exhausted
+        assert!(cursor.next().is_none(), "cursor should be exhausted after iterating all items");
     }
 }
 
@@ -286,8 +299,11 @@ fn parallel() {
                     let id = Id::new(1, j);
                     let key = EntryKey::from_id(&id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                    assert_eq!(cursor.next().is_some(), j != num - 1, "{}/{}", i, j);
+                    // next() returns current and advances
+                    assert!(cursor.next().is_some(), "next() should return Some for position {}/{}", i, j);
                 }
+                // Cursor should be exhausted after iterating all items
+                assert!(cursor.next().is_none(), "cursor should be exhausted after scanning from {}", i);
             }
         }
         {
@@ -299,8 +315,11 @@ fn parallel() {
                     let id = Id::new(1, j);
                     let key = EntryKey::from_id(&id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                    assert_eq!(cursor.next().is_some(), j != 0, "{}/{}", i, j);
+                    // next() returns current and advances
+                    assert!(cursor.next().is_some(), "next() should return Some for position {}/{}", i, j);
                 }
+                // Cursor should be exhausted after iterating all items
+                assert!(cursor.next().is_none(), "cursor should be exhausted after scanning backward to {}", i);
             }
         }
     });
@@ -377,7 +396,8 @@ async fn level_merge() {
             let key1 = EntryKey::from_id(&id1);
             let mut key1_cur = tree_2.seek(&key1, Ordering::Forward);
             assert_eq!(key1_cur.current().unwrap(), &key1);
-            assert_eq!(key1_cur.next().is_some(), i as usize != merged);
+            // next() returns current (key1) and advances to key2
+            assert!(key1_cur.next().is_some(), "next() should return key1");
             assert_eq!(key1_cur.current().unwrap(), &key2);
             assert_ne!(tree_1.seek(&key1, Ordering::Forward).current(), Some(&key1));
         }
