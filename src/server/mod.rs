@@ -182,6 +182,10 @@ impl NebServer {
             info!("Waiting for B-tree nodes write-back to complete...");
             crate::index::ranged::lsm::btree::storage::wait_until_updated().await;
             info!("B-tree nodes write-back completed");
+            
+            // Reset write-back state for potential restart within same process
+            // This is critical for test scenarios where server is restarted multiple times
+            crate::index::ranged::lsm::btree::storage::reset_write_back_state().await;
         } else {
             debug!("LSM tree service not available (likely not enabled)");
         }

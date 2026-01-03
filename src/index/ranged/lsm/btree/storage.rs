@@ -1,20 +1,39 @@
 use super::external;
 use crate::client;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-static mut WB_STARTED: bool = false;
 lazy_static! {
     // Initialize to MAX to indicate "nothing processed yet"
     // This prevents the race where counter=1, progress=0 looks like "operation 0 done"
     pub static ref CHANGE_PROGRESS: AtomicUsize = AtomicUsize::new(usize::MAX);
+    // Flag to indicate whether the write-back task is running
+    static ref WB_STARTED: AtomicBool = AtomicBool::new(false);
+    // Flag to signal the write-back task to stop
+    static ref WB_SHOULD_STOP: AtomicBool = AtomicBool::new(false);
 }
 
 pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
+    // Check if already started using atomic compare-exchange
+    if WB_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+        // Already started, nothing to do
+        return;
+    }
+    
+    // Reset the stop flag
+    WB_SHOULD_STOP.store(false, Ordering::SeqCst);
+    
     let client = client.clone();
     tokio::spawn(async move {
+        debug!("B-tree write-back task started");
         loop {
+            // Check if we should stop
+            if WB_SHOULD_STOP.load(Ordering::SeqCst) {
+                debug!("B-tree write-back task stopping");
+                break;
+            }
+            
             while let Some((id, changing)) = external::CHANGED_NODES.pop() {
                 match changing {
                     external::ChangingNode::Modified(modified) => {
@@ -25,20 +44,52 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
                     }
                 }
                 CHANGE_PROGRESS.store(id, Ordering::Release);
+                
+                // Check if we should stop between operations
+                if WB_SHOULD_STOP.load(Ordering::SeqCst) {
+                    debug!("B-tree write-back task stopping (mid-operation)");
+                    break;
+                }
             }
+            
+            if WB_SHOULD_STOP.load(Ordering::SeqCst) {
+                break;
+            }
+            
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        debug!("B-tree write-back task stopped");
     });
-    unsafe {
-        WB_STARTED = true;
-    }
+}
+
+/// Reset write-back state for server restart
+/// This should be called during server shutdown after wait_until_updated()
+pub async fn reset_write_back_state() {
+    // Signal the task to stop
+    WB_SHOULD_STOP.store(true, Ordering::SeqCst);
+    
+    // Wait briefly to allow the old task to see the stop signal and exit
+    // The task checks every 500ms, so wait a bit longer
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    
+    // Reset the started flag so a new task can be started on restart
+    WB_STARTED.store(false, Ordering::SeqCst);
+    
+    // Reset progress to initial state
+    CHANGE_PROGRESS.store(usize::MAX, Ordering::SeqCst);
+    
+    // Reset the counter
+    external::CHANGE_COUNTER.store(0, Ordering::SeqCst);
+    
+    // Drain any remaining items from the queue (they should already be processed)
+    while external::CHANGED_NODES.pop().is_some() {}
+    
+    debug!("B-tree write-back state reset");
 }
 
 pub async fn wait_until_updated() {
-    unsafe {
-        if !WB_STARTED {
-            return;
-        }
+    if !WB_STARTED.load(Ordering::Acquire) {
+        return;
     }
     let counter = external::CHANGE_COUNTER.load(Ordering::Acquire);
     if counter == 0 {
