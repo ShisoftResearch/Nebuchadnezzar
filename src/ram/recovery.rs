@@ -512,20 +512,36 @@ fn phase2a_allocate_segments(
                         ));
                     }
 
-                    // Allocate segment with original seq_id
-                    let segment = chunk
-                        .allocator
-                        .alloc_seg_with_seq_id(file_info.seq_id, &chunk.file_manager)
-                        .ok_or_else(|| {
-                            error!(
-                                "Failed to allocate segment for chunk {} during recovery",
-                                file_info.chunk_id
-                            );
-                            io::Error::new(
-                                io::ErrorKind::OutOfMemory,
-                                "Cannot allocate segment during recovery",
-                            )
-                        })?;
+                    // Check if a segment with the same ID already exists (e.g., bootstrap segment)
+                    // If so, we reuse it instead of allocating a new one to preserve address consistency
+                    // This is critical because cell addresses stored in cell_index point to the original
+                    // segment addresses - if we allocate a different segment, addresses won't match!
+                    let segment = if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
+                        debug!(
+                            "Reusing existing segment {} for recovery (chunk {})",
+                            file_info.seg_id, file_info.chunk_id
+                        );
+                        existing_seg
+                    } else {
+                        // Allocate segment with original seq_id
+                        let new_seg = chunk
+                            .allocator
+                            .alloc_seg_with_seq_id(file_info.seq_id, &chunk.file_manager)
+                            .ok_or_else(|| {
+                                error!(
+                                    "Failed to allocate segment for chunk {} during recovery",
+                                    file_info.chunk_id
+                                );
+                                io::Error::new(
+                                    io::ErrorKind::OutOfMemory,
+                                    "Cannot allocate segment during recovery",
+                                )
+                            })?;
+                        // Add new segment to chunk and get the AArc reference
+                        let seg_id = new_seg.id as usize;
+                        chunk.put_segment(new_seg);
+                        chunk.segs.get(&seg_id).unwrap()
+                    };
 
                     // Determine recovery mode and reserve hot memory under lock to avoid races
                     let should_recover_cold = {
@@ -559,7 +575,7 @@ fn phase2a_allocate_segments(
                     Ok((
                         idx,
                         AllocatedSegment {
-                            segment: lightning::aarc::Arc::new(segment),
+                            segment: segment.clone(),
                             file_info: file_info.clone(),
                             file_data,
                             append_header,
