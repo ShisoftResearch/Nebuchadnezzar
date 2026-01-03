@@ -6,7 +6,9 @@ use std::time::Duration;
 
 static mut WB_STARTED: bool = false;
 lazy_static! {
-    pub static ref CHANGE_PROGRESS: AtomicUsize = AtomicUsize::new(0);
+    // Initialize to MAX to indicate "nothing processed yet"
+    // This prevents the race where counter=1, progress=0 looks like "operation 0 done"
+    pub static ref CHANGE_PROGRESS: AtomicUsize = AtomicUsize::new(usize::MAX);
 }
 
 pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
@@ -42,18 +44,30 @@ pub async fn wait_until_updated() {
     if counter == 0 {
         return;
     }
-    let newest = counter - 1; // fetch add
-    let ops = newest - CHANGE_PROGRESS.load(Ordering::Acquire);
-    if ops == 0 {
+    let newest = counter - 1; // The ID of the most recent operation (fetch_add returns old value)
+    let progress = CHANGE_PROGRESS.load(Ordering::Acquire);
+    
+    // If progress is MAX (initial value), nothing has been processed yet
+    // If progress < newest, there are pending operations
+    let has_pending = progress == usize::MAX || progress < newest;
+    if !has_pending {
         return;
     }
-    debug!("Waiting storage, {} ops to go", ops);
+    
+    let ops_remaining = if progress == usize::MAX { 
+        newest + 1  // All operations are pending
+    } else { 
+        newest - progress 
+    };
+    debug!("Waiting storage, {} ops to go", ops_remaining);
     loop {
         let current = CHANGE_PROGRESS.load(Ordering::Acquire);
-        if current >= newest {
+        // If current is still MAX, nothing processed yet
+        // Otherwise, wait until current >= newest
+        if current != usize::MAX && current >= newest {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    debug!("Write back updated, {} cells", ops);
+    debug!("Write back updated, {} cells", ops_remaining);
 }

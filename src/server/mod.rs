@@ -174,6 +174,14 @@ impl NebServer {
             info!("LSM client obtained, calling flush_all");
             let _ = lsm_client.flush_all().await;
             info!("LSM trees flushed successfully");
+            
+            // CRITICAL: Wait for background write-back of B-tree nodes to complete
+            // The flush triggers merge which adds nodes to CHANGED_NODES queue.
+            // The write-back task processes this asynchronously.
+            // We MUST wait for all nodes to be persisted before archiving!
+            info!("Waiting for B-tree nodes write-back to complete...");
+            crate::index::ranged::lsm::btree::storage::wait_until_updated().await;
+            info!("B-tree nodes write-back completed");
         } else {
             debug!("LSM tree service not available (likely not enabled)");
         }

@@ -110,6 +110,7 @@ impl LSMTree {
         let tree_1_id = &trees[1usize];
 
         info!("[LSM TREE RECOVERY] LSM tree root cell contains level trees: [level_0={:?}, level_1={:?}]", tree_0_id, tree_1_id);
+        
         info!("[LSM TREE RECOVERY] Recovering level 0 B-tree from head {:?}", tree_0_id);
         let tree_0 = Level0Tree::from_head_id(tree_0_id, neb_client, &deletion_ref, 0).await;
         info!("[LSM TREE RECOVERY] Level 0 B-tree recovered with {} keys", tree_0.count());
@@ -168,7 +169,6 @@ impl LSMTree {
 
             if should_merge && mem_count > 0 {
                 info!("Memory tree has {} items, moving everything to disk tree", mem_count);
-                eprintln!("MERGE_LEVELS: Moving {} items from mem_tree to disk_tree", mem_count);
                 // Memory tree oversized
                 // Will construct a new tree and swap the old one to trans_mem_tree for query and move all
                 // keys in old tree to disk tree level 0
@@ -339,6 +339,13 @@ impl LSMTree {
     pub fn count(&self) -> usize {
         // Only count keys in disk trees
         self.disk_trees.iter().map(|t| t.count()).sum()
+    }
+
+    pub fn mem_tree_count(&self) -> usize {
+        let guard = crossbeam_epoch::pin();
+        let mem_tree_ptr = self.mem_tree.load(Acquire, &guard);
+        let mem_tree = unsafe { mem_tree_ptr.as_ref().unwrap() };
+        mem_tree.count()
     }
 
     fn last_level_tree(&self) -> &Box<dyn LevelTree> {

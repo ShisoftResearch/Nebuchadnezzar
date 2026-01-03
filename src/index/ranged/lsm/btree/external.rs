@@ -378,7 +378,8 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // Only accept lower higher level trees
+    // Only persist nodes from higher level trees (Level 0 and Level 1, not LevelM)
+    // LevelM is the in-memory tree that gets merged to disk
     if KS::slice_len() > LEVEL_M {
         CHANGED_NODES.push((
             CHANGE_COUNTER.fetch_add(1, Relaxed),

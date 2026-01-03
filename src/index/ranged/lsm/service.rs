@@ -380,8 +380,9 @@ impl LSMTreeService {
         info!("Flushing all LSM trees to disk before shutdown");
         for (tree_id, dist_tree) in self.trees.entries() {
             let tree = &dist_tree.tree;
-            let count_before = tree.count();
-            info!("Flushing tree {:?} with {} items", tree_id, count_before);
+            let disk_count = tree.count();
+            let mem_count = tree.mem_tree_count();
+            info!("Flushing tree {:?} with {} items (disk) + {} items (mem)", tree_id, disk_count, mem_count);
 
             // Force merge regardless of whether oversized
             tree.force_merge_levels().await;

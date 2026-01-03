@@ -345,12 +345,11 @@ impl IndexBuilder {
                 .ranged_client
                 .insert(&key)
                 .await
+                .map(|_| ())
                 .map_err(|e| {
                     log::error!("ensure_scannable: Failed to insert key: {:?}", e);
                     IndexError::RPCError(e)
-                })?;
-            log::debug!("ensure_scannable: Successfully inserted key for cell_id={:?}, schema_id={}", cell_id, schema_id);
-            Ok(())
+                })
         });
     }
 
