@@ -151,19 +151,35 @@ impl NebServer {
         // This ensures enumeration indices are persisted before backup creation
         info!("Flushing LSM trees before shutdown");
         if let Ok(lsm_client) = self.get_lsm_tree_service().await {
+            info!("LSM client obtained, calling flush_all");
             let _ = lsm_client.flush_all().await;
             info!("LSM trees flushed successfully");
         } else {
             debug!("LSM tree service not available (likely not enabled)");
         }
+
+        // Step 1.5: Ensure all WAL data is synced to disk
+        // This is critical after LSM flush to ensure root cells and new pages are persisted
+        info!("Syncing WAL for all chunks...");
+        self.chunks.sync_all();
+        info!("WAL sync completed");
+
+        // Step 1.6: Archive all dirty segments to backup storage
+        // This ensures all in-memory data (including LSM B-Tree pages) is written to backup files
+        // Recovery reads from backup files, not WAL, so this is critical for proper recovery
+        info!("Archiving all dirty segments to backup storage...");
+        self.chunks.archive_all();
+        info!("Segment archiving completed");
         
         // Step 2: Shutdown Raft (triggers backup creation)
         info!("Shutting down Raft service (will create backups)");
         let _ = self.raft_service.shutdown().await;
+        info!("Raft service shutdown complete");
         
         // Step 3: Shutdown RPC server
         info!("Shutting down RPC server");
         let _ = self.rpc.shutdown().await;
+        info!("RPC server shutdown complete");
         
         info!("Server shutdown complete");
     }

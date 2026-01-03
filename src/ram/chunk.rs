@@ -1455,6 +1455,60 @@ impl Chunks {
 
         chunks_arc
     }
+
+    /// Sync all buffered WAL data to disk across all chunks
+    pub fn sync_all(&self) {
+        info!("Syncing WAL for all chunks...");
+        for chunk in &self.list {
+            for segment in chunk.segs.iter_values() {
+                segment.force_wal_sync();
+            }
+        }
+        info!("All WAL data synced to disk.");
+    }
+
+    /// Archive all dirty segments to backup storage across all chunks
+    /// This ensures all in-memory data is persisted to backup files before shutdown
+    pub fn archive_all(&self) {
+        info!("Archiving all dirty segments to backup storage...");
+        let mut total_archived = 0;
+        let mut total_skipped = 0;
+        let mut total_errors = 0;
+
+        for chunk in &self.list {
+            for segment in chunk.segs.iter_values() {
+                // Check if segment needs archiving
+                let is_clean = segment.is_archived() && !segment.is_dirty();
+                
+                if is_clean {
+                    total_skipped += 1;
+                    continue;
+                }
+
+                // Archive the segment
+                match segment.archive() {
+                    Ok(true) => {
+                        debug!("Archived segment {} (chunk {})", segment.id, chunk.id);
+                        total_archived += 1;
+                    }
+                    Ok(false) => {
+                        debug!("Segment {} already archived", segment.id);
+                        total_skipped += 1;
+                    }
+                    Err(e) => {
+                        error!("Failed to archive segment {} (chunk {}): {}", segment.id, chunk.id, e);
+                        total_errors += 1;
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Segment archiving complete: {} archived, {} skipped (clean), {} errors",
+            total_archived, total_skipped, total_errors
+        );
+    }
+
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         // Dummy doesn't use tiered memory or recovery
         Chunks::new(
