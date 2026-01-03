@@ -165,9 +165,10 @@ impl LSMTree {
             let mem_tree = unsafe { mem_tree_ptr.as_ref().unwrap() };
             let mem_count = mem_tree.count();
             let should_merge = force || mem_tree.oversized();
-            
+
             if should_merge && mem_count > 0 {
                 info!("Memory tree has {} items, moving everything to disk tree", mem_count);
+                eprintln!("MERGE_LEVELS: Moving {} items from mem_tree to disk_tree", mem_count);
                 // Memory tree oversized
                 // Will construct a new tree and swap the old one to trans_mem_tree for query and move all
                 // keys in old tree to disk tree level 0
@@ -322,11 +323,8 @@ impl LSMTree {
     }
 
     pub async fn mark_migration(&self, id: &Id, migration: Option<Id>, client: &Arc<AsyncClient>) {
-        let lsm_tree_cell = lsm_tree_cell(
-            &self.disk_trees.iter().map(|tree| tree.head_id()).collect(),
-            id,
-            migration,
-        );
+        let head_ids: Vec<Id> = self.disk_trees.iter().map(|tree| tree.head_id()).collect();
+        let lsm_tree_cell = lsm_tree_cell(&head_ids, id, migration);
         client.update_cell(lsm_tree_cell).await.unwrap().unwrap();
     }
 

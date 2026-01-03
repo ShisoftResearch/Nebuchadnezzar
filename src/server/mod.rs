@@ -147,6 +147,26 @@ impl NebServer {
     pub async fn shutdown(&self) {
         info!("Starting graceful server shutdown");
         
+        // Step 0: Wait for all pending index tasks to complete
+        // CRITICAL: Index tasks (especially enumeration index inserts) must complete
+        // before we flush LSM trees, otherwise the flush will have incomplete data!
+        // This fixes the bug where index tasks spawned on different threads were lost.
+        info!("Waiting for all pending index tasks to complete...");
+        if self.indexer.is_some() {
+            use crate::index::builder::IndexBuilder;
+            let _ = IndexBuilder::await_all_indices().await;
+            info!("All pending index tasks completed");
+
+            // CRITICAL DELAY: The RPC insert calls complete when sent to Raft,
+            // but Raft must commit them before the data appears in LSM mem_tree.
+            // Without this delay, flush_all() sees empty mem_tree and persists nothing!
+            info!("Waiting for Raft to commit index inserts before flushing...");
+            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+            info!("Index Raft commit grace period complete");
+        } else {
+            debug!("No index builder, skipping index task await");
+        }
+        
         // Step 1: Flush LSM trees if ranged indexer is enabled
         // This ensures enumeration indices are persisted before backup creation
         info!("Flushing LSM trees before shutdown");

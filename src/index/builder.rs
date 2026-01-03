@@ -23,8 +23,9 @@ use futures::{
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::{cell::RefCell, sync::Arc};
+use std::sync::{Arc, Mutex};
 use tokio::task::{JoinError, JoinHandle};
+use lazy_static::lazy_static;
 
 use crate::ram::types::OwnedPrimArray;
 
@@ -262,17 +263,18 @@ impl IndexMeta {
     }
 }
 
-// Thread local storage for pending index tasks
-thread_local! {
-    pub static PENDING_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), IndexError>>>> = RefCell::new(Vec::new());
+// Global storage for pending index tasks
+// Using std::sync::Mutex for immediate synchronous access
+lazy_static! {
+    static ref PENDING_INDEX_TASKS: Arc<Mutex<Vec<JoinHandle<Result<(), IndexError>>>>> =
+        Arc::new(Mutex::new(Vec::new()));
 }
 
 fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
-    let tokio_task = tokio::spawn(task);
-    PENDING_INDEX_TASKS.with(|task_list| {
-        task_list.borrow_mut().push(tokio_task);
-    });
+    let handle = tokio::spawn(task);
+    PENDING_INDEX_TASKS.lock().unwrap().push(handle);
 }
+
 // Main struct for building and managing indices
 pub struct IndexBuilder {
     pub clients: Arc<IndexerClients>,
@@ -309,10 +311,15 @@ impl IndexBuilder {
         schema: &Schema,
         old_indices: Option<Vec<IndexRes>>,
     ) {
+        log::debug!("ensure_indices: cell_id={:?}, schema_id={}, schema_name={}, is_scannable={}",
+            cell.id(), schema.id, schema.name, schema.is_scannable);
         let indexers = self.clients.clone();
         // Handle scannable indices if needed
         if schema.is_scannable {
+            log::debug!("Schema {} is scannable, calling ensure_scannable for cell {:?}", schema.id, cell.id());
             self.ensure_scannable(cell, &indexers);
+        } else {
+            log::debug!("Schema {} is NOT scannable for cell {:?}", schema.id, cell.id());
         }
         // Get new indices for the cell
         let new_indices = probe_cell_indices(cell, schema);
@@ -329,13 +336,20 @@ impl IndexBuilder {
     // Ensure scannable indices are set
     fn ensure_scannable(&self, cell: &OwnedCell, indexers: &Arc<IndexerClients>) {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
+        let cell_id = cell.id();
+        let schema_id = cell.header.schema;
         let indexers = indexers.clone();
         new_index_task(async move {
+            log::debug!("ensure_scannable: Inserting key for cell_id={:?}, schema_id={}", cell_id, schema_id);
             indexers
                 .ranged_client
                 .insert(&key)
                 .await
-                .map_err(|e| IndexError::RPCError(e))?;
+                .map_err(|e| {
+                    log::error!("ensure_scannable: Failed to insert key: {:?}", e);
+                    IndexError::RPCError(e)
+                })?;
+            log::debug!("ensure_scannable: Successfully inserted key for cell_id={:?}, schema_id={}", cell_id, schema_id);
             Ok(())
         });
     }
@@ -364,15 +378,47 @@ impl IndexBuilder {
         });
     }
 
-    // Wait for all pending index tasks to complete
+    // Wait for all pending index tasks to complete (legacy method for per-RPC call)
+    // This is called by with_indices_ensured() after each RPC to ensure indices are updated
     pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), IndexError>, JoinError>>> {
-        PENDING_INDEX_TASKS
-            .with(|task_list| {
-                let tasks = std::mem::take(&mut *task_list.borrow_mut());
-                tasks.into_iter().collect::<FuturesUnordered<_>>()
-            })
-            .collect::<Vec<_>>()
-            .boxed()
+        async move {
+            let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
+                let mut guard = PENDING_INDEX_TASKS.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
+            tasks
+                .into_iter()
+                .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
+                .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
+                .await
+        }
+        .boxed()
+    }
+
+    // Wait for ALL pending index tasks globally (for shutdown)
+    // This ensures all index tasks from all threads are completed before shutdown
+    pub async fn await_all_indices() -> Vec<Result<Result<(), IndexError>, JoinError>> {
+        let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
+            let mut guard = PENDING_INDEX_TASKS.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        
+        let count = tasks.len();
+        if count > 0 {
+            log::info!("Waiting for {} pending index tasks to complete before shutdown", count);
+        }
+
+        let results: Vec<Result<Result<(), IndexError>, JoinError>> = futures::future::join_all(tasks).await;
+
+        let success_count = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
+        let error_count = results.len() - success_count;
+        if error_count > 0 {
+            log::warn!("Index tasks completed: {} succeeded, {} failed", success_count, error_count);
+        } else if count > 0 {
+            log::info!("All {} index tasks completed successfully", success_count);
+        }
+        
+        results
     }
 
     // Helper function to remove indices

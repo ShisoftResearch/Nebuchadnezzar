@@ -143,7 +143,8 @@ impl Service for LSMTreeService {
 
     fn insert(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<'_, OpResult<bool>> {
         self.apply_in_ranged_tree(id, &entry, epoch, |entry, tree| {
-            if tree.insert(&entry) {
+            let inserted = tree.insert(&entry);
+            if inserted {
                 OpResult::Successful(true)
             } else {
                 OpResult::Successful(false)
@@ -381,14 +382,14 @@ impl LSMTreeService {
             let tree = &dist_tree.tree;
             let count_before = tree.count();
             info!("Flushing tree {:?} with {} items", tree_id, count_before);
-            
+
             // Force merge regardless of whether oversized
             tree.force_merge_levels().await;
-            
+
             // Mark migration to update the tree cell with new head IDs
             tree.mark_migration(&tree_id, None, &self.client).await;
         }
-        
+
         // Wait for all external node writes to complete
         super::btree::storage::wait_until_updated().await;
         info!("All LSM trees flushed to disk");
