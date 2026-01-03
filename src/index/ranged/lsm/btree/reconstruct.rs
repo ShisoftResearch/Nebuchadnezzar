@@ -132,19 +132,43 @@ where
 {
     info!("[B-TREE RECONSTRUCTION] Starting reconstruction of level {} tree from head cell {:?}", level, head_id);
     let mut len = 0;
+    let mut page_count = 0;
     let (root, height) = {
         let mut constructor = TreeConstructor::<KS, PS>::new();
         let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
         let mut id = head_id;
         let mut at_end = false;
         while !at_end {
-            let cell = neb.read_cell(id).await.unwrap().unwrap();
+            page_count += 1;
+            debug!("[B-TREE RECONSTRUCTION] Reading page {} (id={:?})", page_count, id);
+            
+            let cell = match neb.read_cell(id).await {
+                Ok(Ok(cell)) => cell,
+                Ok(Err(e)) => {
+                    eprintln!("[B-TREE RECONSTRUCTION] Failed to read page {} (id={:?}): {:?}", page_count, id, e);
+                    eprintln!("[B-TREE RECONSTRUCTION] This page was referenced by the previous page in the chain");
+                    eprintln!("[B-TREE RECONSTRUCTION] Total pages read before failure: {}", page_count - 1);
+                    panic!("B-tree reconstruction failed: page {:?} does not exist", id);
+                }
+                Err(e) => {
+                    eprintln!("[B-TREE RECONSTRUCTION] RPC error reading page {} (id={:?}): {:?}", page_count, id, e);
+                    panic!("B-tree reconstruction failed: RPC error for page {:?}", id);
+                }
+            };
             let page = ExtNode::<KS, PS>::from_cell(&cell);
             let next_id = page.next_id;
             let prev_id = page.prev_id;
             let mut node = page.node;
             
+            debug!("[B-TREE RECONSTRUCTION] Page {} has {} keys, next_id={:?}, prev_id={:?}", 
+                   page_count, node.len, next_id, prev_id);
+            
             at_end = next_id.is_unit_id();
+            if !at_end {
+                debug!("[B-TREE RECONSTRUCTION] Will read next page: {:?}", next_id);
+            } else {
+                debug!("[B-TREE RECONSTRUCTION] This is the last page in the chain");
+            }
             if at_end {
                 node.next = NodeCellRef::new_none::<KS, PS>();
             }

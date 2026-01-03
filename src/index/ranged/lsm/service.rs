@@ -386,13 +386,20 @@ impl LSMTreeService {
 
             // Force merge regardless of whether oversized
             tree.force_merge_levels().await;
+        }
 
-            // Mark migration to update the tree cell with new head IDs
+        // CRITICAL: Wait for all external B-tree node writes to complete BEFORE marking migration
+        // Otherwise, mark_migration() will update the LSM tree cell with head IDs pointing to
+        // B-tree pages that haven't been persisted yet, causing "CellDoesNotExisted" on recovery
+        super::btree::storage::wait_until_updated().await;
+        info!("All B-tree nodes persisted, now marking migrations");
+
+        // Now it's safe to update the LSM tree cells with the new head IDs
+        for (tree_id, dist_tree) in self.trees.entries() {
+            let tree = &dist_tree.tree;
             tree.mark_migration(&tree_id, None, &self.client).await;
         }
 
-        // Wait for all external node writes to complete
-        super::btree::storage::wait_until_updated().await;
         info!("All LSM trees flushed to disk");
     }
 

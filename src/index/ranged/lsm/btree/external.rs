@@ -356,9 +356,27 @@ where
         self.len = pos;
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
-        if cfg!(debug_assertions) && self.len != self_len_before_merge + right.len() {
-            error!("Merge sort failed, left len {}, right len {}, self len {}, self len before merge {}", self.len, right.len(), self_len_before_merge, self_len_before_merge);
+        
+        // Note: self.len can be less than (left + right) when there are duplicates
+        // This is expected behavior - duplicates are intentionally removed
+        debug_assert!(self.len <= self_len_before_merge + right.len());
+        
+        // Log a warning if we detect many duplicates, as this could indicate an issue
+        let num_duplicates = (self_len_before_merge + right.len()) - self.len;
+        if num_duplicates > 0 {
+            trace!(
+                "Merge removed {} duplicate keys (left={}, right={}, result={})",
+                num_duplicates, self_len_before_merge, right.len(), self.len
+            );
+            // If ALL keys are duplicates, this is highly suspicious and worth investigating
+            if num_duplicates == self_len_before_merge + right.len() {
+                warn!(
+                    "Merge resulted in NO unique keys! left={}, right={}, all {} keys were duplicates. This may indicate repeated merge of same data.",
+                    self_len_before_merge, right.len(), num_duplicates
+                );
+            }
         }
+        
         trace!(
             "Merge sorted page have keys: {:?}",
             &self.keys.as_slice_immute()[..self.len]
