@@ -190,6 +190,13 @@ impl NebServer {
             debug!("LSM tree service not available (likely not enabled)");
         }
 
+        // Step 1.4.5: Allow time for mark_migration() RPCs to complete
+        // mark_migration() updates LSM tree cells via client.update_cell() which is async
+        // We need to ensure these RPCs complete and cells are written before archiving
+        info!("Waiting for mark_migration() RPCs to complete...");
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        info!("Mark migration wait completed");
+
         // Step 1.5: Ensure all WAL data is synced to disk
         // This is critical after LSM flush to ensure root cells and new pages are persisted
         info!("Syncing WAL for all chunks...");
