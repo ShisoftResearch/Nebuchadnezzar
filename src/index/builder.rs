@@ -23,7 +23,8 @@ use futures::{
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+use parking_lot::Mutex;
 use tokio::task::{JoinError, JoinHandle};
 use lazy_static::lazy_static;
 
@@ -272,7 +273,7 @@ lazy_static! {
 
 fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
     let handle = tokio::spawn(task);
-    PENDING_INDEX_TASKS.lock().unwrap().push(handle);
+    PENDING_INDEX_TASKS.lock().push(handle);
 }
 
 // Main struct for building and managing indices
@@ -382,7 +383,7 @@ impl IndexBuilder {
     pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), IndexError>, JoinError>>> {
         async move {
             let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
-                let mut guard = PENDING_INDEX_TASKS.lock().unwrap();
+                let mut guard = PENDING_INDEX_TASKS.lock();
                 std::mem::take(&mut *guard)
             };
             tasks
@@ -398,7 +399,7 @@ impl IndexBuilder {
     // This ensures all index tasks from all threads are completed before shutdown
     pub async fn await_all_indices() -> Vec<Result<Result<(), IndexError>, JoinError>> {
         let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
-            let mut guard = PENDING_INDEX_TASKS.lock().unwrap();
+            let mut guard = PENDING_INDEX_TASKS.lock();
             std::mem::take(&mut *guard)
         };
         

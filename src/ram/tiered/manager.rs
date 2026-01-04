@@ -35,7 +35,7 @@ pub struct TieredMemoryManager {
     cached_hot_count: AtomicUsize,
 
     /// Last time we did a full scan to verify the cached count
-    last_full_scan: std::sync::Mutex<Instant>,
+    last_full_scan: parking_lot::Mutex<Instant>,
 }
 
 impl TieredMemoryManager {
@@ -52,7 +52,7 @@ impl TieredMemoryManager {
             enabled: true,
             disable_promotion: AtomicBool::new(false),
             cached_hot_count: AtomicUsize::new(0),
-            last_full_scan: std::sync::Mutex::new(Instant::now() - Duration::from_secs(100)),
+            last_full_scan: parking_lot::Mutex::new(Instant::now() - Duration::from_secs(100)),
         }
     }
 
@@ -248,7 +248,7 @@ impl TieredMemoryManager {
     /// every 10 seconds to verify/update the cached count.
     pub fn hot_count_cached(&self, chunk: &Chunk) -> usize {
         // Check if we need to do a full scan (every 10 seconds)
-        let should_full_scan = if let Ok(mut last_scan) = self.last_full_scan.try_lock() {
+        let should_full_scan = if let Some(mut last_scan) = self.last_full_scan.try_lock() {
             if last_scan.elapsed() >= Duration::from_secs(10) {
                 *last_scan = Instant::now();
                 true

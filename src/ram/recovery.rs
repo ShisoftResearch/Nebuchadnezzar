@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// Discover all segment files in storage directories
 pub fn discover_segment_files(
@@ -545,7 +545,7 @@ fn phase2a_allocate_segments(
 
                     // Determine recovery mode and reserve hot memory under lock to avoid races
                     let should_recover_cold = {
-                        let mut hot_used = hot_memory_used.lock().unwrap();
+                        let mut hot_used = hot_memory_used.lock();
                         let recover_cold = should_recover_as_cold(chunk, file_info, &hot_used);
                         if !recover_cold {
                             *hot_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
