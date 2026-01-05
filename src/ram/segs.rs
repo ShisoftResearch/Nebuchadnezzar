@@ -1094,6 +1094,53 @@ impl SegmentAllocator {
             })
     }
 
+    /// Allocate a segment at a specific ID for recovery purposes
+    /// This ensures recovered data goes to the correct address
+    pub fn alloc_seg_at_id(
+        &self,
+        seg_id: u64,
+        seq_id: u64,
+        file_manager: &Arc<SegmentFileManager>,
+    ) -> Option<Segment> {
+        let addr = self.addr_by_id(seg_id as usize);
+        
+        // Ensure address is within bounds
+        if addr >= self.limit {
+            error!(
+                "Cannot allocate segment {} at address {:#x}: exceeds limit {:#x}",
+                seg_id, addr, self.limit
+            );
+            return None;
+        }
+        
+        // Update offset if needed (to track allocated space)
+        let required_end = addr + SEGMENT_SIZE;
+        loop {
+            let current_offset = self.offset.load(Ordering::Relaxed);
+            if current_offset >= required_end {
+                break; // Already allocated past this point
+            }
+            // Try to bump the offset
+            if self.offset.compare_exchange(
+                current_offset,
+                required_end,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ).is_ok() {
+                break;
+            }
+        }
+        
+        Some(Segment::new(
+            seg_id,
+            seq_id,
+            self.chunk_id,
+            addr,
+            true, // hot - recovery starts segments as hot
+            file_manager.clone(),
+        ))
+    }
+
     pub fn free(&self, seg_addr: usize) {
         debug_assert!(seg_addr >= self.base);
         debug_assert!(seg_addr < self.limit);

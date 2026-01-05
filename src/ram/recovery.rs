@@ -345,6 +345,11 @@ fn phase1_5_set_initial_seq_ids(chunks: &[Chunk], files: &[SegmentFileInfo]) {
 }
 
 /// Check if we should recover this segment as cold based on tiered memory settings
+/// 
+/// Cold recovery (mmapping the backup file directly) is only possible when:
+/// 1. Tiered memory is enabled
+/// 2. The hot memory limit would be exceeded
+/// 3. The backup file is NOT compressed (compressed files cannot be mmap'd directly)
 fn should_recover_as_cold(
     chunk: &Chunk,
     file_info: &SegmentFileInfo,
@@ -358,15 +363,37 @@ fn should_recover_as_cold(
             .unwrap_or(0);
         let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
 
-        let recover_as_cold = file_info.is_backup && would_exceed_limit;
+        // Check if file is compressed - compressed files CANNOT be mmap'd directly
+        // because the data needs to be decompressed first
+        let is_compressed = match is_backup_file_compressed(&file_info.path) {
+            Ok(compressed) => compressed,
+            Err(e) => {
+                warn!(
+                    "Failed to check if backup file is compressed: {}, assuming not compressed",
+                    e
+                );
+                false
+            }
+        };
+
+        // Can only recover as cold if: backup file, would exceed limit, AND not compressed
+        let recover_as_cold = file_info.is_backup && would_exceed_limit && !is_compressed;
 
         debug!(
-            "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
+            "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, is_compressed={}, recover_as_cold={}",
             chunk_hot_used / (1024 * 1024),
             physical_limit / (1024 * 1024),
             would_exceed_limit,
+            is_compressed,
             recover_as_cold
         );
+
+        if is_compressed && would_exceed_limit {
+            info!(
+                "Backup file {} is compressed, cannot recover as cold - falling back to hot recovery",
+                file_info.path.display()
+            );
+        }
 
         recover_as_cold
     } else {
@@ -374,7 +401,27 @@ fn should_recover_as_cold(
     }
 }
 
+/// Check if a backup file is compressed by reading its magic header
+fn is_backup_file_compressed(path: &std::path::Path) -> io::Result<bool> {
+    use super::compression;
+    use std::io::Read;
+    
+    let mut file = File::open(path)?;
+    let mut header = [0u8; 8]; // Read enough for v2 header
+    
+    let bytes_read = match file.read(&mut header) {
+        Ok(n) => n,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => 0,
+        Err(e) => return Err(e),
+    };
+    
+    Ok(compression::is_compressed(&header[..bytes_read]))
+}
+
 /// Recover a segment as cold by mmapping the backup file directly
+/// 
+/// IMPORTANT: This only works for UNCOMPRESSED backup files!
+/// Compressed files must be recovered as hot (the caller should check this).
 fn recover_segment_as_cold(segment: &Segment, file_info: &SegmentFileInfo) -> io::Result<()> {
     info!(
         "Recovering segment {} as COLD (tiered memory enabled)",
@@ -434,6 +481,23 @@ fn recover_segment_as_cold(segment: &Segment, file_info: &SegmentFileInfo) -> io
 
 /// Recover a segment as hot by copying file data to memory
 fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
+    // Verify the data looks like valid segment data (should start with entry headers, not compression magic)
+    if file_data.len() >= 4 {
+        let magic = &file_data[..4];
+        // NEB\x01 or NEB\x02 are compression magic headers - data should NOT start with these
+        if magic == [0x4E, 0x45, 0x42, 0x01] || magic == [0x4E, 0x45, 0x42, 0x02] {
+            panic!(
+                "CRITICAL: Attempting to copy COMPRESSED data to segment memory!\n\
+                 Segment ID: {}, Address: {:#x}\n\
+                 Data starts with compression magic: {:02X} {:02X} {:02X} {:02X}\n\
+                 This indicates decompression was skipped. Data size: {} bytes",
+                segment.id, segment.addr,
+                magic[0], magic[1], magic[2], magic[3],
+                file_data.len()
+            );
+        }
+    }
+    
     // Traditional hot recovery - copy data to memory
     unsafe {
         let src_ptr = file_data.as_ptr();
@@ -441,10 +505,13 @@ fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
         std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, file_data.len());
     }
 
-    debug!(
-        "Copied {} bytes to segment memory at address {:#x} (HOT recovery)",
+    // Note: We don't have chunk_id in this function, but segment addresses are unique per chunk
+    info!(
+        "HOT recovery: copied {} bytes to segment {} at address {:#x} (first 8 bytes: {:02x?})",
         file_data.len(),
-        segment.addr
+        segment.id,
+        segment.addr,
+        &file_data[..8.min(file_data.len())]
     );
 }
 
@@ -523,14 +590,15 @@ fn phase2a_allocate_segments(
                         );
                         existing_seg
                     } else {
-                        // Allocate segment with original seq_id
+                        // Allocate segment at the SPECIFIC segment ID to ensure correct address
+                        // This is crucial for recovery - the data was written assuming specific addresses
                         let new_seg = chunk
                             .allocator
-                            .alloc_seg_with_seq_id(file_info.seq_id, &chunk.file_manager)
+                            .alloc_seg_at_id(file_info.seg_id, file_info.seq_id, &chunk.file_manager)
                             .ok_or_else(|| {
                                 error!(
-                                    "Failed to allocate segment for chunk {} during recovery",
-                                    file_info.chunk_id
+                                    "Failed to allocate segment {} for chunk {} during recovery",
+                                    file_info.seg_id, file_info.chunk_id
                                 );
                                 io::Error::new(
                                     io::ErrorKind::OutOfMemory,

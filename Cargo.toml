@@ -49,6 +49,7 @@ unicode-normalization = "0.1"
 rust-stemmers = "1.2"
 jieba-rs = "0.7"
 lindera = { version = "0.30", features = ["ipadic"] }
+crc-fast = "1.10.0"
 
 [features]
 # Enable zero-overhead page fault tracking via mprotect/SIGSEGV

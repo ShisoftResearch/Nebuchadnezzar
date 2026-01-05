@@ -281,23 +281,52 @@ impl SegmentFileManager {
             self.scan_dir_recursive(Path::new(wal_dir), &mut files, false)?;
         }
 
-        // Deduplicate: prefer backup over WAL for same (chunk_id, seg_id, seq_id)
-        use std::collections::HashSet;
-        let mut seen = HashSet::new();
-        let mut deduped = Vec::new();
-
-        // Sort: backup files first (is_backup = true)
-        files.sort_by(|a, b| b.is_backup.cmp(&a.is_backup));
+        // Deduplicate by (chunk_id, seg_id), keeping only the highest seq_id
+        // This is critical because a segment may be archived multiple times,
+        // and we only want the most recent version.
+        use std::collections::HashMap;
+        let mut best_files: HashMap<(usize, u64), SegmentFileInfo> = HashMap::new();
 
         for file in files {
-            let key = (file.chunk_id, file.seg_id, file.seq_id);
-            if seen.insert(key) {
-                deduped.push(file);
+            let key = (file.chunk_id, file.seg_id);
+            let should_replace = match best_files.get(&key) {
+                None => true,
+                Some(existing) => {
+                    // Prefer higher seq_id (more recent)
+                    // If seq_id is the same, prefer backup over WAL
+                    if file.seq_id > existing.seq_id {
+                        true
+                    } else if file.seq_id == existing.seq_id && file.is_backup && !existing.is_backup {
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if should_replace {
+                info!(
+                    "Segment file for chunk {} seg {}: keeping seq {} (path: {})",
+                    file.chunk_id, file.seg_id, file.seq_id, file.path.display()
+                );
+                best_files.insert(key, file);
+            } else {
+                debug!(
+                    "Segment file for chunk {} seg {} seq {}: superseded by newer version",
+                    file.chunk_id, file.seg_id, file.seq_id
+                );
             }
         }
 
-        // Sort by seq_id (chronological order)
+        let mut deduped: Vec<SegmentFileInfo> = best_files.into_values().collect();
+
+        // Sort by seq_id (chronological order for proper version resolution)
         deduped.sort_by_key(|f| f.seq_id);
+
+        info!(
+            "Discovered {} unique segment files for recovery",
+            deduped.len()
+        );
 
         Ok(deduped)
     }
