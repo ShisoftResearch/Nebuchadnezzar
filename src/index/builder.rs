@@ -25,6 +25,7 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc};
 use parking_lot::Mutex;
+use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinHandle};
 use lazy_static::lazy_static;
 
@@ -269,10 +270,29 @@ impl IndexMeta {
 lazy_static! {
     static ref PENDING_INDEX_TASKS: Arc<Mutex<Vec<JoinHandle<Result<(), IndexError>>>>> =
         Arc::new(Mutex::new(Vec::new()));
+    
+    // Semaphore to limit concurrent index tasks and prevent task explosion
+    // With 1000 max concurrent tasks, prevents unbounded accumulation
+    static ref INDEX_TASK_SEMAPHORE: Arc<Semaphore> = Arc::new(Semaphore::new(1000));
 }
 
 fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
-    let handle = tokio::spawn(task);
+    let semaphore = INDEX_TASK_SEMAPHORE.clone();
+    
+    // Wrap task with semaphore to limit concurrent tasks
+    let wrapped_task = async move {
+        // Acquire permit (blocks if 1000 tasks already running)
+        // This prevents task explosion and resource exhaustion
+        let _permit = semaphore.acquire().await.expect("Semaphore closed");
+        
+        // Run the actual indexing task
+        let result = task.await;
+        
+        // Permit automatically released when _permit drops
+        result
+    };
+    
+    let handle = tokio::spawn(wrapped_task);
     PENDING_INDEX_TASKS.lock().push(handle);
 }
 
