@@ -268,17 +268,10 @@ impl NebRPCService {
     where
         R: Send + 'a,
     {
-        // PERFORMANCE FIX: Don't wait for index tasks to complete
-        // Index tasks run in background (limited by semaphore)
-        // This allows high-throughput writes without blocking on indexing
-        // Trade-off: Eventual consistency instead of immediate consistency
-        future::ready(res).boxed()
-        
-        // Original implementation (blocks every write on ALL pending tasks):
-        // if self.server.indexer.is_some() {
-        //     IndexBuilder::await_indices().map(|_| res).boxed()
-        // } else {
-        //     future::ready(res).boxed()
-        // }
+        if self.server.indexer.is_some() {
+            IndexBuilder::await_indices().map(|_| res).boxed()
+        } else {
+            future::ready(res).boxed()
+        }
     }
 }

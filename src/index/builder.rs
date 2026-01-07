@@ -24,7 +24,7 @@ use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc};
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinHandle};
 use lazy_static::lazy_static;
@@ -265,17 +265,15 @@ impl IndexMeta {
     }
 }
 
-// Thread-local storage for pending index tasks (per-thread, no contention)
-// Note: Doesn't work perfectly with async (tasks can migrate threads)
-// but avoids lock contention entirely
-thread_local! {
-    static PENDING_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), IndexError>>>> =
-        RefCell::new(Vec::new());
-}
-
-// Semaphore to limit concurrent index tasks and prevent task explosion
-// With 1000 max concurrent tasks, prevents unbounded accumulation
+// Global storage for pending index tasks
+// Using Mutex for synchronous access across async boundaries
+// Semaphore limits concurrent tasks to prevent explosion
 lazy_static! {
+    static ref PENDING_INDEX_TASKS: Arc<Mutex<Vec<JoinHandle<Result<(), IndexError>>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    
+    // Semaphore to limit concurrent index tasks and prevent task explosion
+    // With 1000 max concurrent tasks, prevents unbounded accumulation
     static ref INDEX_TASK_SEMAPHORE: Arc<Semaphore> = Arc::new(Semaphore::new(1000));
 }
 
@@ -296,10 +294,7 @@ fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 's
     };
     
     let handle = tokio::spawn(wrapped_task);
-    // Thread-local push - no contention between threads!
-    PENDING_INDEX_TASKS.with_borrow_mut(|tasks| {
-        tasks.push(handle);
-    });
+    PENDING_INDEX_TASKS.lock().push(handle);
 }
 
 // Main struct for building and managing indices
@@ -408,11 +403,10 @@ impl IndexBuilder {
     // This is called by with_indices_ensured() after each RPC to ensure indices are updated
     pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), IndexError>, JoinError>>> {
         async move {
-            // Drain tasks from current thread's local storage
-            let tasks = PENDING_INDEX_TASKS.with_borrow_mut(|tasks| {
-                std::mem::take(tasks)
-            });
-            
+            let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
+                let mut guard = PENDING_INDEX_TASKS.lock();
+                std::mem::take(&mut *guard)
+            };
             tasks
                 .into_iter()
                 .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
@@ -423,17 +417,16 @@ impl IndexBuilder {
     }
 
     // Wait for ALL pending index tasks globally (for shutdown)
-    // Note: With thread_local, this only drains current thread's tasks
-    // Other threads' tasks will be completed when those threads shut down
+    // This ensures all index tasks from all threads are completed before shutdown
     pub async fn await_all_indices() -> Vec<Result<Result<(), IndexError>, JoinError>> {
-        // Drain tasks from current thread's local storage
-        let tasks = PENDING_INDEX_TASKS.with_borrow_mut(|tasks| {
-            std::mem::take(tasks)
-        });
+        let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
+            let mut guard = PENDING_INDEX_TASKS.lock();
+            std::mem::take(&mut *guard)
+        };
         
         let count = tasks.len();
         if count > 0 {
-            log::info!("Waiting for {} pending index tasks on current thread to complete before shutdown", count);
+            log::info!("Waiting for {} pending index tasks to complete before shutdown", count);
         }
 
         let results: Vec<Result<Result<(), IndexError>, JoinError>> = futures::future::join_all(tasks).await;
