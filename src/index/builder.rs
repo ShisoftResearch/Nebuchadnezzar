@@ -272,11 +272,9 @@ lazy_static! {
     static ref PENDING_INDEX_TASKS: Arc<Mutex<Vec<JoinHandle<Result<(), IndexError>>>>> =
         Arc::new(Mutex::new(Vec::new()));
     
-    // Semaphore to limit concurrent index tasks and prevent I/O saturation
-    // HNSW indexing is I/O intensive (multiple storage reads per insert)
-    // With 1000 permits, HNSW can trigger 5000+ concurrent storage ops → stalls
-    // Reduced to 50 to match storage/Raft capacity
-    static ref INDEX_TASK_SEMAPHORE: Arc<Semaphore> = Arc::new(Semaphore::new(50));
+    // Semaphore to limit concurrent index tasks and prevent task explosion
+    // 1000 permits allows high throughput while preventing unbounded accumulation
+    static ref INDEX_TASK_SEMAPHORE: Arc<Semaphore> = Arc::new(Semaphore::new(1000));
 }
 
 fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
