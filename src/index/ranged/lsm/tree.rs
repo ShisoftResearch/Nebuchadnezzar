@@ -322,10 +322,14 @@ impl LSMTree {
         }
     }
 
-    pub async fn mark_migration(&self, id: &Id, migration: Option<Id>, client: &Arc<AsyncClient>) {
+    pub async fn mark_migration(&self, id: &Id, migration: Option<Id>, client: &Arc<AsyncClient>) -> Result<(), String> {
         let head_ids: Vec<Id> = self.disk_trees.iter().map(|tree| tree.head_id()).collect();
         let lsm_tree_cell = lsm_tree_cell(&head_ids, id, migration);
-        client.update_cell(lsm_tree_cell).await.unwrap().unwrap();
+        match client.update_cell(lsm_tree_cell).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("Failed to write LSM tree cell: {:?}", e)),
+            Err(e) => Err(format!("RPC error updating LSM tree cell: {:?}", e)),
+        }
     }
 
     pub fn merge_keys(&self, keys: Vec<EntryKey>) {

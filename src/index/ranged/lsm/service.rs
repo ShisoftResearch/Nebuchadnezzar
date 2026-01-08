@@ -397,7 +397,9 @@ impl LSMTreeService {
         // Now it's safe to update the LSM tree cells with the new head IDs
         for (tree_id, dist_tree) in self.trees.entries() {
             let tree = &dist_tree.tree;
-            tree.mark_migration(&tree_id, None, &self.client).await;
+            if let Err(e) = tree.mark_migration(&tree_id, None, &self.client).await {
+                warn!("Failed to mark LSM tree migration after flush for tree {:?}: {:?}", tree_id, e);
+            }
         }
 
         info!("All LSM trees flushed to disk");
@@ -425,7 +427,9 @@ impl LSMTreeService {
                         // Wait for all external B+tree nodes to be written to storage
                         storage::wait_until_updated().await;
                         // Now update the cell with the new head IDs
-                        tree.mark_migration(&dist_tree.id, None, &client).await;
+                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
+                            warn!("Failed to mark LSM tree migration after merge: {:?}", e);
+                        }
                     }
                     
                     if tree.oversized() {
@@ -445,8 +449,9 @@ impl LSMTreeService {
                             });
                         }
                         debug!("Marking migration for tree {:?}", dist_tree.id);
-                        tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client)
-                            .await;
+                        if let Err(e) = tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client).await {
+                            warn!("Failed to mark LSM tree migration for oversized tree {:?}: {:?}", dist_tree.id, e);
+                        }
                         let buffer_size = MIGRATE_SIZE << 4;
                         let mut cursor = tree.seek(&pivot_key, Ordering::Forward);
                         let mut entry_buffer = Vec::with_capacity(buffer_size);
@@ -481,7 +486,9 @@ impl LSMTreeService {
                             dist_prop.epoch += 1;
                         }
                         debug!("Unmark migration {:?}", dist_tree.id);
-                        tree.mark_migration(&dist_tree.id, None, &client).await;
+                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
+                            warn!("Failed to unmark LSM tree migration for tree {:?}: {:?}", dist_tree.id, e);
+                        }
                         tree.retain(&pivot_key);
                         debug!(
                             "LSM tree migration from {:?} to {:?} succeed",

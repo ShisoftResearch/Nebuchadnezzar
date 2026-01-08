@@ -566,7 +566,7 @@ mod test {
         println!("=== Updating LSM tree cell with new head IDs ===");
         println!("Disk trees head IDs: {:?}", 
                 tree.disk_trees.iter().map(|t| t.head_id()).collect::<Vec<_>>());
-        tree.mark_migration(&lsm_tree_id, None, &client).await;
+        tree.mark_migration(&lsm_tree_id, None, &client).await.expect("Failed to mark migration in test");
         println!("LSM tree cell updated");
         
         // Wait for cell update to complete
@@ -766,7 +766,7 @@ mod test {
         println!("Tree count after additional merges: {}", tree.count());
         
         // Update the LSM tree cell with the current head IDs (critical for recovery!)
-        tree.mark_migration(&lsm_tree_id, None, &client).await;
+        tree.mark_migration(&lsm_tree_id, None, &client).await.expect("Failed to mark migration in test");
         
         // Wait for writeback to complete - longer wait for test isolation
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
