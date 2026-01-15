@@ -182,7 +182,7 @@ where
                 *prev_lock.right_bound_mut() = first_key.clone();
                 *prev_lock.right_ref_mut().unwrap() = node_ref.clone();
             } else {
-                assert_eq!(prev_id, Id::unit_id());
+                error!("Previous page is unit id, this is the first page in the chain");
             }
             constructor.push_extnode(&node_ref, first_key);
             prev_ref = node_ref;

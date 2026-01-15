@@ -687,7 +687,8 @@ impl Chunk {
         let hash = cell.header.hash;
         if let Some(mut guard) = self.location_for_write(hash, false) {
             let cell_location = *guard;
-            let cell_version = cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
+            let cell_version =
+                cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
             cell.header.version = cell_version;
             let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
             #[cfg(debug_assertions)]
@@ -719,7 +720,8 @@ impl Chunk {
             if let Some(mut guard) = self.location_for_write(hash, false) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
-                let cell_version = cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
+                let cell_version = cell_version_from_chunk_raw(cell_location)
+                    .map_err(|e| WriteError::ReadError(e))?;
                 cell.header.version = cell_version;
                 let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
                 #[cfg(debug_assertions)]
@@ -1071,6 +1073,14 @@ impl Chunk {
     }
 
     pub fn segs_for_compact_cleaner(&self) -> Vec<AArc<Segment>> {
+        self.segs_for_compact_cleaner_impl(false)
+    }
+
+    pub fn segs_for_compact_cleaner_full(&self) -> Vec<AArc<Segment>> {
+        self.segs_for_compact_cleaner_impl(true)
+    }
+
+    fn segs_for_compact_cleaner_impl(&self, full: bool) -> Vec<AArc<Segment>> {
         let utilization_selection = self
             .segments()
             .into_iter()
@@ -1078,7 +1088,12 @@ impl Chunk {
                 let rate = seg.living_rate();
                 (seg, rate)
             })
-            .filter(|(_, utilization)| *utilization < DEAD_RATE_FOR_COMPACT_CLEANER);
+            .filter(|(_, utilization)| {
+                // Always require some dead space (utilization < 100%)
+                // For full GC, accept any segment with dead space
+                // For partial GC, only consider high-dead segments
+                *utilization < 1.0 && (full || *utilization < DEAD_RATE_FOR_COMPACT_CLEANER)
+            });
         let head_seg_id = self.get_head_seg_id();
         let mut list: Vec<_> = utilization_selection
             .filter(|(seg, _)| {
@@ -1089,14 +1104,27 @@ impl Chunk {
             })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
+        let max_segments = if full {
+            list.len()
+        } else {
+            MAX_SEGMENTS_FOR_CLEANER
+        };
         return list
             .into_iter()
-            .take(MAX_SEGMENTS_FOR_CLEANER)
+            .take(max_segments)
             .map(|pair| pair.0)
             .collect();
     }
 
     pub fn segs_for_combine_cleaner(&self) -> Vec<(AArc<Segment>, f32)> {
+        self.segs_for_combine_cleaner_impl(false)
+    }
+
+    pub fn segs_for_combine_cleaner_full(&self) -> Vec<(AArc<Segment>, f32)> {
+        self.segs_for_combine_cleaner_impl(true)
+    }
+
+    fn segs_for_combine_cleaner_impl(&self, full: bool) -> Vec<(AArc<Segment>, f32)> {
         let head_seg_id = self.get_head_seg_id();
         let mut mapping: Vec<_> = self
             .segments()
@@ -1107,7 +1135,11 @@ impl Chunk {
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)| {
-                *utilization < DEAD_RATE_FOR_COMBINE_CLEANER
+                // Always require some dead space (utilization < 100%)
+                // For full GC, accept any segment with dead space
+                // For partial GC, only consider high-dead segments
+                *utilization < 1.0
+                    && (full || *utilization < DEAD_RATE_FOR_COMBINE_CLEANER)
                     && head_seg_id != seg.id
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
@@ -1115,7 +1147,12 @@ impl Chunk {
             })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
-        mapping.truncate(MAX_SEGMENTS_FOR_CLEANER);
+        let max_segments = if full {
+            mapping.len()
+        } else {
+            MAX_SEGMENTS_FOR_CLEANER
+        };
+        mapping.truncate(max_segments);
         return mapping;
     }
 
@@ -1479,7 +1516,7 @@ impl Chunks {
             for segment in chunk.segs.iter_values() {
                 // Check if segment needs archiving
                 let is_clean = segment.is_archived() && !segment.is_dirty();
-                
+
                 if is_clean {
                     total_skipped += 1;
                     continue;
@@ -1496,7 +1533,10 @@ impl Chunks {
                         total_skipped += 1;
                     }
                     Err(e) => {
-                        error!("Failed to archive segment {} (chunk {}): {}", segment.id, chunk.id, e);
+                        error!(
+                            "Failed to archive segment {} (chunk {}): {}",
+                            segment.id, chunk.id, e
+                        );
                         total_errors += 1;
                     }
                 }

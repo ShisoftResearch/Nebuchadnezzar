@@ -129,11 +129,7 @@ impl Cleaner {
     /// Returns true if any cleaning work reclaimed space or reduced segments.
     pub fn clean(chunk: &Chunk, full: bool) -> bool {
         trace!("Cleaner: ready for clean {}, full {}", chunk.id, full);
-        let guard = if full {
-            Some(chunk.gc_lock.lock())
-        } else {
-            chunk.gc_lock.try_lock()
-        };
+        let guard = chunk.gc_lock.try_lock();
         if guard.is_none() {
             debug!(
                 "Cleaner: Chunk {} GC in progress, will not wait it unless full GC",
@@ -158,7 +154,11 @@ impl Cleaner {
         #[cfg(feature = "combine_cleaner")]
         {
             trace!("Starting combine for chunk {}", chunk.id);
-            let segments_candidates_for_combine = chunk.segs_for_combine_cleaner();
+            let segments_candidates_for_combine = if full {
+                chunk.segs_for_combine_cleaner_full()
+            } else {
+                chunk.segs_for_combine_cleaner()
+            };
             let num_segments_candidates_for_combine = segments_candidates_for_combine.len();
             let mut segments_for_combine = vec![];
             let mut combining_size = 0f32;
@@ -187,7 +187,11 @@ impl Cleaner {
         #[cfg(feature = "compact_cleaner")]
         {
             trace!("Starting compact for chunk {}", chunk.id);
-            let segments_for_compact = chunk.segs_for_compact_cleaner();
+            let segments_for_compact = if full {
+                chunk.segs_for_compact_cleaner_full()
+            } else {
+                chunk.segs_for_compact_cleaner()
+            };
             if !segments_for_compact.is_empty() {
                 debug!(
                     "Selected {} segments for compaction from chunk {}",
