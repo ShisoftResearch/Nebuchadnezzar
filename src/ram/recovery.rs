@@ -6,13 +6,13 @@ use super::segs::{Segment, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
 use libc::{c_void, mmap, munmap, open, MAP_FIXED, MAP_PRIVATE, O_RDONLY, PROT_READ};
 use lightning::map::Map;
+use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use parking_lot::Mutex;
 
 /// Discover all segment files in storage directories
 pub fn discover_segment_files(
@@ -345,7 +345,7 @@ fn phase1_5_set_initial_seq_ids(chunks: &[Chunk], files: &[SegmentFileInfo]) {
 }
 
 /// Check if we should recover this segment as cold based on tiered memory settings
-/// 
+///
 /// Cold recovery (mmapping the backup file directly) is only possible when:
 /// 1. Tiered memory is enabled
 /// 2. The hot memory limit would be exceeded
@@ -405,21 +405,21 @@ fn should_recover_as_cold(
 fn is_backup_file_compressed(path: &std::path::Path) -> io::Result<bool> {
     use super::compression;
     use std::io::Read;
-    
+
     let mut file = File::open(path)?;
     let mut header = [0u8; 8]; // Read enough for v2 header
-    
+
     let bytes_read = match file.read(&mut header) {
         Ok(n) => n,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => 0,
         Err(e) => return Err(e),
     };
-    
+
     Ok(compression::is_compressed(&header[..bytes_read]))
 }
 
 /// Recover a segment as cold by mmapping the backup file directly
-/// 
+///
 /// IMPORTANT: This only works for UNCOMPRESSED backup files!
 /// Compressed files must be recovered as hot (the caller should check this).
 fn recover_segment_as_cold(segment: &Segment, file_info: &SegmentFileInfo) -> io::Result<()> {
@@ -491,13 +491,17 @@ fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
                  Segment ID: {}, Address: {:#x}\n\
                  Data starts with compression magic: {:02X} {:02X} {:02X} {:02X}\n\
                  This indicates decompression was skipped. Data size: {} bytes",
-                segment.id, segment.addr,
-                magic[0], magic[1], magic[2], magic[3],
+                segment.id,
+                segment.addr,
+                magic[0],
+                magic[1],
+                magic[2],
+                magic[3],
                 file_data.len()
             );
         }
     }
-    
+
     // Traditional hot recovery - copy data to memory
     unsafe {
         let src_ptr = file_data.as_ptr();
@@ -583,33 +587,38 @@ fn phase2a_allocate_segments(
                     // If so, we reuse it instead of allocating a new one to preserve address consistency
                     // This is critical because cell addresses stored in cell_index point to the original
                     // segment addresses - if we allocate a different segment, addresses won't match!
-                    let segment = if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
-                        debug!(
-                            "Reusing existing segment {} for recovery (chunk {})",
-                            file_info.seg_id, file_info.chunk_id
-                        );
-                        existing_seg
-                    } else {
-                        // Allocate segment at the SPECIFIC segment ID to ensure correct address
-                        // This is crucial for recovery - the data was written assuming specific addresses
-                        let new_seg = chunk
-                            .allocator
-                            .alloc_seg_at_id(file_info.seg_id, file_info.seq_id, &chunk.file_manager)
-                            .ok_or_else(|| {
-                                error!(
+                    let segment =
+                        if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
+                            debug!(
+                                "Reusing existing segment {} for recovery (chunk {})",
+                                file_info.seg_id, file_info.chunk_id
+                            );
+                            existing_seg
+                        } else {
+                            // Allocate segment at the SPECIFIC segment ID to ensure correct address
+                            // This is crucial for recovery - the data was written assuming specific addresses
+                            let new_seg = chunk
+                                .allocator
+                                .alloc_seg_at_id(
+                                    file_info.seg_id,
+                                    file_info.seq_id,
+                                    &chunk.file_manager,
+                                )
+                                .ok_or_else(|| {
+                                    error!(
                                     "Failed to allocate segment {} for chunk {} during recovery",
                                     file_info.seg_id, file_info.chunk_id
                                 );
-                                io::Error::new(
-                                    io::ErrorKind::OutOfMemory,
-                                    "Cannot allocate segment during recovery",
-                                )
-                            })?;
-                        // Add new segment to chunk and get the AArc reference
-                        let seg_id = new_seg.id as usize;
-                        chunk.put_segment(new_seg);
-                        chunk.segs.get(&seg_id).unwrap()
-                    };
+                                    io::Error::new(
+                                        io::ErrorKind::OutOfMemory,
+                                        "Cannot allocate segment during recovery",
+                                    )
+                                })?;
+                            // Add new segment to chunk and get the AArc reference
+                            let seg_id = new_seg.id as usize;
+                            chunk.put_segment(new_seg);
+                            chunk.segs.get(&seg_id).unwrap()
+                        };
 
                     // Determine recovery mode and reserve hot memory under lock to avoid races
                     let should_recover_cold = {

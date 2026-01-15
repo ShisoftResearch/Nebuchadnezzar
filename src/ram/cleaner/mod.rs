@@ -62,7 +62,7 @@ impl Cleaner {
                         // Main cleaning: compact and combine segments
                         clean_pool.install(|| {
                             checks_ref_clone.list.par_iter().for_each(|chunk| {
-                                if Self::clean(chunk, false) {
+                                if Self::clean(chunk, false, false) {
                                     progress.store(true, Ordering::Relaxed);
                                 }
                             });
@@ -127,9 +127,13 @@ impl Cleaner {
         return cleaner;
     }
     /// Returns true if any cleaning work reclaimed space or reduced segments.
-    pub fn clean(chunk: &Chunk, full: bool) -> bool {
+    pub fn clean(chunk: &Chunk, full: bool, wait: bool) -> bool {
         trace!("Cleaner: ready for clean {}, full {}", chunk.id, full);
-        let guard = chunk.gc_lock.try_lock();
+        let guard = if wait {
+            Some(chunk.gc_lock.lock())
+        } else {
+            chunk.gc_lock.try_lock()
+        };
         if guard.is_none() {
             debug!(
                 "Cleaner: Chunk {} GC in progress, will not wait it unless full GC",
@@ -212,7 +216,7 @@ impl Cleaner {
         let combined_cleaned_space = combiner_cleaned_space + compacter_cleaned_space;
         chunk
             .total_space
-            .fetch_sub(combined_cleaned_space, Ordering::Relaxed);
+            .fetch_sub(combiner_cleaned_space, Ordering::Relaxed); // only subtract combiner cleaned space, compacter cleaned does not reclaim segments
         if combined_cleaned_space > 0 {
             info!(
                 "Chunk {} cleaned total {} bytes, reduced {} segments (combiner {} bytes, compacter {} bytes)",

@@ -130,7 +130,10 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    info!("[B-TREE RECONSTRUCTION] Starting reconstruction of level {} tree from head cell {:?}", level, head_id);
+    info!(
+        "[B-TREE RECONSTRUCTION] Starting reconstruction of level {} tree from head cell {:?}",
+        level, head_id
+    );
     let mut len = 0;
     let mut page_count = 0;
     let (root, height) = {
@@ -140,18 +143,30 @@ where
         let mut at_end = false;
         while !at_end {
             page_count += 1;
-            debug!("[B-TREE RECONSTRUCTION] Reading page {} (id={:?})", page_count, id);
-            
+            debug!(
+                "[B-TREE RECONSTRUCTION] Reading page {} (id={:?})",
+                page_count, id
+            );
+
             let cell = match neb.read_cell(id).await {
                 Ok(Ok(cell)) => cell,
                 Ok(Err(e)) => {
-                    eprintln!("[B-TREE RECONSTRUCTION] Failed to read page {} (id={:?}): {:?}", page_count, id, e);
+                    eprintln!(
+                        "[B-TREE RECONSTRUCTION] Failed to read page {} (id={:?}): {:?}",
+                        page_count, id, e
+                    );
                     eprintln!("[B-TREE RECONSTRUCTION] This page was referenced by the previous page in the chain");
-                    eprintln!("[B-TREE RECONSTRUCTION] Total pages read before failure: {}", page_count - 1);
+                    eprintln!(
+                        "[B-TREE RECONSTRUCTION] Total pages read before failure: {}",
+                        page_count - 1
+                    );
                     panic!("B-tree reconstruction failed: page {:?} does not exist", id);
                 }
                 Err(e) => {
-                    eprintln!("[B-TREE RECONSTRUCTION] RPC error reading page {} (id={:?}): {:?}", page_count, id, e);
+                    eprintln!(
+                        "[B-TREE RECONSTRUCTION] RPC error reading page {} (id={:?}): {:?}",
+                        page_count, id, e
+                    );
                     panic!("B-tree reconstruction failed: RPC error for page {:?}", id);
                 }
             };
@@ -159,10 +174,12 @@ where
             let next_id = page.next_id;
             let prev_id = page.prev_id;
             let mut node = page.node;
-            
-            debug!("[B-TREE RECONSTRUCTION] Page {} has {} keys, next_id={:?}, prev_id={:?}", 
-                   page_count, node.len, next_id, prev_id);
-            
+
+            debug!(
+                "[B-TREE RECONSTRUCTION] Page {} has {} keys, next_id={:?}, prev_id={:?}",
+                page_count, node.len, next_id, prev_id
+            );
+
             at_end = next_id.is_unit_id();
             if !at_end {
                 debug!("[B-TREE RECONSTRUCTION] Will read next page: {:?}", next_id);
@@ -192,10 +209,16 @@ where
     };
     info!("[B-TREE RECONSTRUCTION] Completed reconstruction of tree {:?} at level {} with {} keys, height {}", head_id, level, len, height);
     let tree = BPlusTree::from_root(root, head_id, len, height, deletion);
-    debug!("[B-TREE RECONSTRUCTION] Verifying reconstruction at level {}", level);
+    debug!(
+        "[B-TREE RECONSTRUCTION] Verifying reconstruction at level {}",
+        level
+    );
     // debug_assert!(verification::tree_has_no_empty_node(&tree));
     debug_assert!(verification::is_tree_in_order(&tree, level));
-    debug!("[B-TREE RECONSTRUCTION] Reconstruction verification completed at level {}", level);
+    debug!(
+        "[B-TREE RECONSTRUCTION] Reconstruction verification completed at level {}",
+        level
+    );
     tree
 }
 

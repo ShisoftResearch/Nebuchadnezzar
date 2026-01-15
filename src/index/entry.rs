@@ -124,7 +124,10 @@ impl EntryKey {
 
     /// Check if this key's prefix (schema + field + feature) is greater than or equal to the other's.
     pub fn prefix_ge(&self, other: &EntryKey) -> bool {
-        matches!(self.cmp_prefix(other), cmp::Ordering::Greater | cmp::Ordering::Equal)
+        matches!(
+            self.cmp_prefix(other),
+            cmp::Ordering::Greater | cmp::Ordering::Equal
+        )
     }
 
     /// Check if this key's prefix (schema + field + feature) is less than the other's.
@@ -134,7 +137,10 @@ impl EntryKey {
 
     /// Check if this key's prefix (schema + field + feature) is less than or equal to the other's.
     pub fn prefix_le(&self, other: &EntryKey) -> bool {
-        matches!(self.cmp_prefix(other), cmp::Ordering::Less | cmp::Ordering::Equal)
+        matches!(
+            self.cmp_prefix(other),
+            cmp::Ordering::Less | cmp::Ordering::Equal
+        )
     }
 }
 

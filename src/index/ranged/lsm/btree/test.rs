@@ -149,11 +149,15 @@ fn crd() {
                 );
             }
             // next() returns current and advances
-            assert!(cursor.next().is_some(), "next() should return Some for valid position {}", i);
+            assert!(
+                cursor.next().is_some(),
+                "next() should return Some for valid position {}",
+                i
+            );
         }
         // Cursor should be exhausted after iterating all items
         assert!(cursor.next().is_none(), "cursor should be exhausted");
-        
+
         debug!("Forward scanning for sequence verification");
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         for i in 0..num {
@@ -162,7 +166,11 @@ fn crd() {
             let id = cursor.current().unwrap().id();
             assert_eq!(id, expected);
             // next() returns current and advances
-            assert!(cursor.next().is_some(), "next() should return Some for valid position {}", i);
+            assert!(
+                cursor.next().is_some(),
+                "next() should return Some for valid position {}",
+                i
+            );
         }
         // Cursor should be exhausted
         assert!(cursor.next().is_none(), "cursor should be exhausted");
@@ -180,7 +188,11 @@ fn crd() {
             let id = cursor.current().unwrap().id();
             assert_eq!(id, expected, "{}", i);
             // next() returns current and advances
-            assert!(cursor.next().is_some(), "next() should return Some for valid position {}", i);
+            assert!(
+                cursor.next().is_some(),
+                "next() should return Some for valid position {}",
+                i
+            );
         }
         // Cursor should be exhausted
         assert!(cursor.next().is_none(), "cursor should be exhausted");
@@ -238,10 +250,17 @@ pub fn alternative_insertion_pattern() {
             let key = EntryKey::from_id(&id);
             assert_eq!(cursor.current(), Some(&key));
             // next() returns current and advances, so it's always Some for valid positions
-            assert!(cursor.next().is_some(), "next() should return Some for position {}", j);
+            assert!(
+                cursor.next().is_some(),
+                "next() should return Some for position {}",
+                j
+            );
         }
         // After iterating through all items, cursor should be exhausted
-        assert!(cursor.next().is_none(), "cursor should be exhausted after iterating all items");
+        assert!(
+            cursor.next().is_none(),
+            "cursor should be exhausted after iterating all items"
+        );
     }
 }
 
@@ -300,10 +319,19 @@ fn parallel() {
                     let key = EntryKey::from_id(&id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     // next() returns current and advances
-                    assert!(cursor.next().is_some(), "next() should return Some for position {}/{}", i, j);
+                    assert!(
+                        cursor.next().is_some(),
+                        "next() should return Some for position {}/{}",
+                        i,
+                        j
+                    );
                 }
                 // Cursor should be exhausted after iterating all items
-                assert!(cursor.next().is_none(), "cursor should be exhausted after scanning from {}", i);
+                assert!(
+                    cursor.next().is_none(),
+                    "cursor should be exhausted after scanning from {}",
+                    i
+                );
             }
         }
         {
@@ -316,10 +344,19 @@ fn parallel() {
                     let key = EntryKey::from_id(&id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     // next() returns current and advances
-                    assert!(cursor.next().is_some(), "next() should return Some for position {}/{}", i, j);
+                    assert!(
+                        cursor.next().is_some(),
+                        "next() should return Some for position {}/{}",
+                        i,
+                        j
+                    );
                 }
                 // Cursor should be exhausted after iterating all items
-                assert!(cursor.next().is_none(), "cursor should be exhausted after scanning backward to {}", i);
+                assert!(
+                    cursor.next().is_none(),
+                    "cursor should be exhausted after scanning backward to {}",
+                    i
+                );
             }
         }
     });

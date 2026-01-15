@@ -1,4 +1,5 @@
 use crate::ram::chunk::Chunk;
+use crate::ram::chunk::PendingEntry;
 use crate::ram::clock;
 use crate::ram::entry::*;
 use crate::ram::io::align_address;
@@ -30,6 +31,12 @@ pub struct CellHeader {
     pub schema: u32,
     pub partition: u64,
     pub hash: u64,
+}
+
+pub struct WriteToChunkResult {
+    pub new_timestamp: u32,
+    pub new_version: u64,
+    pub addr: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -92,6 +99,13 @@ pub struct OwnedCell {
     pub data: OwnedValue,
 }
 
+pub struct WritePlan<'a> {
+    pub instructions: WriteInstructions<'a>,
+    pub entry_body_size: usize,
+    pub total_size: u32,
+    pub schema: SchemaRef,
+}
+
 def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor);
 
 impl OwnedCell {
@@ -132,11 +146,13 @@ impl OwnedCell {
         Self::new_with_id(schema_id, &id, value)
     }
 
-    pub fn write_to_chunk_with_schema(
-        &mut self,
-        chunk: &Chunk,
-        schema: &Schema,
-    ) -> Result<usize, WriteError> {
+    pub fn plan_write(&self, chunk: &Chunk) -> Result<WritePlan, WriteError> {
+        let schema_id = self.header.schema;
+        let schema = if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
+            schema
+        } else {
+            return Err(WriteError::SchemaDoesNotExisted(schema_id));
+        };
         let mut tail_offset: usize = schema.static_bound;
         let mut instructions = WriteInstructions::new();
         writer::plan_write_field(
@@ -159,55 +175,62 @@ impl OwnedCell {
         if total_size > MAX_CELL_SIZE {
             return Err(WriteError::CellIsTooLarge(total_size as usize));
         }
-        let addr_opt = chunk.try_acquire(total_size);
-        self.header.version += 1;
-        self.header.timestamp = clock::now();
-        match addr_opt {
-            None => {
-                error!(
-                    "Cannot allocate new spaces in chunk, total cells {}",
-                    chunk.cell_count()
+        Ok(WritePlan::new(
+            instructions,
+            entry_body_size,
+            total_size,
+            schema,
+        ))
+    }
+
+    pub fn write_to_chunk_with(
+        &self,
+        write_plan: &WritePlan,
+        pending_entry: &PendingEntry,
+        old_version: u64,
+    ) -> Result<WriteToChunkResult, WriteError> {
+        let addr = pending_entry.addr;
+        let new_version = old_version + 1;
+        let new_timestamp = clock::now();
+        debug_assert_eq!(align_address(8, addr), addr, "Entry address is not aligned");
+        Entry::encode_to(
+            addr,
+            EntryType::CELL,
+            write_plan.entry_body_size() as u32,
+            |content_addr| {
+                // write cell header
+                let header = &self.header;
+                let mut cursor = addr_to_header_cursor(content_addr);
+                cursor.write_u64::<Endian>(new_version).unwrap();
+                cursor.write_u32::<Endian>(new_timestamp).unwrap();
+                cursor.write_u32::<Endian>(header.schema).unwrap();
+                cursor.write_u64::<Endian>(header.partition).unwrap();
+                cursor.write_u64::<Endian>(header.hash).unwrap();
+                release_cursor(cursor);
+                let data_base_addr = content_addr + CELL_HEADER_SIZE;
+                debug_assert_eq!(
+                    align_address(8, content_addr),
+                    content_addr,
+                    "Content address is not aligned"
                 );
-                return Err(WriteError::CannotAllocateSpace);
-            }
-            Some(pending_entry) => {
-                let addr = pending_entry.addr;
-                debug_assert_eq!(align_address(8, addr), addr, "Entry address is not aligned");
-                Entry::encode_to(
-                    addr,
-                    EntryType::CELL,
-                    entry_body_size as u32,
-                    |content_addr| {
-                        // write cell header
-                        let header = &self.header;
-                        let mut cursor = addr_to_header_cursor(content_addr);
-                        cursor.write_u64::<Endian>(header.version).unwrap();
-                        cursor.write_u32::<Endian>(header.timestamp).unwrap();
-                        cursor.write_u32::<Endian>(header.schema).unwrap();
-                        cursor.write_u64::<Endian>(header.partition).unwrap();
-                        cursor.write_u64::<Endian>(header.hash).unwrap();
-                        release_cursor(cursor);
-                        let data_base_addr = content_addr + CELL_HEADER_SIZE;
-                        debug_assert_eq!(
-                            align_address(8, content_addr),
-                            content_addr,
-                            "Content address is not aligned"
-                        );
-                        debug_assert_eq!(
-                            align_address(8, data_base_addr),
-                            data_base_addr,
-                            "Data base address is not aligned"
-                        );
-                        writer::execute_plan(data_base_addr, &instructions);
-                    },
+                debug_assert_eq!(
+                    align_address(8, data_base_addr),
+                    data_base_addr,
+                    "Data base address is not aligned"
                 );
-                debug!(
-                    "Written cell {:?} with total size {}",
-                    self.header, total_size
-                );
-                return Ok(addr);
-            }
-        }
+                writer::execute_plan(data_base_addr, &write_plan.instructions);
+            },
+        );
+        debug!(
+            "Written cell {:?} with total size {}",
+            self.header,
+            write_plan.total_size()
+        );
+        return Ok(WriteToChunkResult {
+            new_timestamp,
+            new_version,
+            addr,
+        });
     }
     pub fn id(&self) -> Id {
         self.header.id()
@@ -259,6 +282,32 @@ impl<'a> Index<&'a str> for OwnedCell {
 impl<'a> IndexMut<&'a str> for OwnedCell {
     fn index_mut<'b>(&'b mut self, index: &'a str) -> &'b mut Self::Output {
         &mut self.data[index]
+    }
+}
+
+impl<'a> WritePlan<'a> {
+    pub fn new(
+        instructions: WriteInstructions<'a>,
+        entry_body_size: usize,
+        total_size: u32,
+        schema: SchemaRef,
+    ) -> Self {
+        Self {
+            instructions,
+            entry_body_size,
+            total_size,
+            schema,
+        }
+    }
+
+    pub fn allocate(&self, chunk: &Chunk, full_gc: bool) -> Result<PendingEntry, WriteError> {
+        chunk.try_acquire(self.total_size, full_gc)
+    }
+    pub fn entry_body_size(&self) -> usize {
+        self.entry_body_size
+    }
+    pub fn total_size(&self) -> u32 {
+        self.total_size
     }
 }
 

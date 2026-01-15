@@ -358,7 +358,7 @@ impl Chunk {
         self.head_seg_id.load(Ordering::Acquire)
     }
 
-    pub fn try_acquire(&self, size: u32) -> Option<PendingEntry> {
+    pub fn try_acquire(&self, size: u32, full_gc: bool) -> Result<PendingEntry, WriteError> {
         let mut tried_gc = false;
         let backoff = Backoff::new();
         loop {
@@ -392,7 +392,7 @@ impl Chunk {
                         head.id
                     );
                     head.references.fetch_add(1, Ordering::Relaxed);
-                    return Some(PendingEntry {
+                    return Ok(PendingEntry {
                         addr,
                         seg: head,
                         size,
@@ -403,17 +403,22 @@ impl Chunk {
                     if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE {
                         // No space left
                         if tried_gc {
-                            return None;
-                        } else {
+                            return Err(WriteError::CannotAllocateSpace);
+                        } else if full_gc {
                             debug!("No space left for chunk {}, emergency full GC", self.id);
-                            let _ = Cleaner::clean(self, true);
+                            let _ = Cleaner::clean(self, true, true);
+                            tried_gc = true;
+                            continue;
+                        } else {
+                            debug!("No space left for chunk {}, emergency best effort GC", self.id);
+                            let _ = Cleaner::clean(self, true, false);
                             tried_gc = true;
                             continue;
                         }
                     }
                     if self.allocator.meet_gc_threshold() {
                         debug!("Allocator meet GC threshold, will try partial GC");
-                        let _ = Cleaner::clean(self, false);
+                        let _ = Cleaner::clean(self, false, false);
                     }
 
                     // We are supposed to do proactive eviction here
@@ -601,16 +606,14 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
-    pub fn write_cell_to_chunk(
+    pub fn write_cell_to_chunk<'a>(
         &self,
-        cell: &mut OwnedCell,
-    ) -> Result<(usize, SchemaRef), WriteError> {
-        let schema_id = cell.header.schema;
-        if let Some(schema) = self.meta.schemas.get(&schema_id) {
-            Ok((cell.write_to_chunk_with_schema(self, &*schema)?, schema))
-        } else {
-            Err(WriteError::SchemaDoesNotExisted(schema_id))
-        }
+        cell: &OwnedCell,
+        write_plan: &WritePlan,
+        pending_entry: &PendingEntry,
+        old_version: u64,
+    ) -> Result<WriteToChunkResult, WriteError> {
+        cell.write_to_chunk_with(write_plan, pending_entry, old_version)
     }
 
     fn ensure_indices(&self, new_cell: &OwnedCell, old_cell: Option<&SharedCell>, schema: &Schema) {
@@ -639,8 +642,11 @@ impl Chunk {
 
     fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
-        let (cell_loc, schema) = self.write_cell_to_chunk(cell)?;
-
+        let write_plan = cell.plan_write(self)?;
+        let pending_entry = write_plan.allocate(self, true)?;
+        let write_result =
+            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+        let cell_loc = write_result.addr;
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -661,11 +667,13 @@ impl Chunk {
 
                 *guard = cell_loc;
                 drop(guard);
-                self.ensure_indices(cell, None, &*schema);
+                self.ensure_indices(cell, None, &*write_plan.schema);
                 self.refresh_statistics();
             }
             None => return Err(WriteError::CellAlreadyExisted),
         }
+        cell.header.version = write_result.new_version;
+        cell.header.timestamp = write_result.new_timestamp;
         Ok(cell.header)
     }
 
@@ -685,12 +693,15 @@ impl Chunk {
 
     fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
+        let write_plan = cell.plan_write(self)?;
+        let pending_entry = write_plan.allocate(self, true)?;
         if let Some(mut guard) = self.location_for_write(hash, false) {
             let cell_location = *guard;
             let cell_version =
                 cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
-            cell.header.version = cell_version;
-            let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
+            let write_result =
+                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell_version)?;
+            let new_cell_loc = write_result.addr;
             #[cfg(debug_assertions)]
             {
                 if cell_location != 0 {
@@ -699,15 +710,21 @@ impl Chunk {
                 self.assert_address_aligned_for_write(new_cell_loc, "update_cell", hash);
             }
 
-            let old_indices = self.old_index_res(&guard, &*schema)?;
-            self.ensure_indices_with_res(cell, old_indices, &*schema);
+            let schema = &*write_plan.schema;
+            let old_indices = self.old_index_res(&guard, schema)?;
+            self.ensure_indices_with_res(cell, old_indices, schema);
             *guard = new_cell_loc;
             drop(guard);
             self.mark_dead_entry_with_cell(cell_location, cell);
             self.refresh_statistics();
+            drop(write_plan);
+            cell.header.version = write_result.new_version;
+            cell.header.timestamp = write_result.new_timestamp;
         } else {
             // Optimistic update will remove the new inserted one
-            let (new_cell_loc, _schema) = self.write_cell_to_chunk(cell)?;
+            let write_result =
+                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+            let new_cell_loc = write_result.addr;
             self.mark_dead_entry_with_cell(new_cell_loc, cell);
             return Err(WriteError::CellDoesNotExisted);
         }
@@ -716,14 +733,17 @@ impl Chunk {
 
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
+        let write_plan = cell.plan_write(self)?;
+        let pending_entry = write_plan.allocate(self, true)?;
         loop {
             if let Some(mut guard) = self.location_for_write(hash, false) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
                 let cell_version = cell_version_from_chunk_raw(cell_location)
                     .map_err(|e| WriteError::ReadError(e))?;
-                cell.header.version = cell_version;
-                let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
+                let write_result =
+                    self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell_version)?;
+                let new_cell_loc = write_result.addr;
                 #[cfg(debug_assertions)]
                 {
                     if cell_location != 0 {
@@ -740,18 +760,27 @@ impl Chunk {
                     );
                 }
 
-                let old_indices = self.old_index_res(&guard, &*schema)?;
+                let old_indices = self.old_index_res(&guard, &*write_plan.schema)?;
                 *guard = new_cell_loc;
                 drop(guard);
-                self.ensure_indices_with_res(cell, old_indices, &*schema);
+                self.ensure_indices_with_res(cell, old_indices, &*write_plan.schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
                 self.refresh_statistics();
+                drop(write_plan);
+                cell.header.version = write_result.new_version;
+                cell.header.timestamp = write_result.new_timestamp;
             } else {
                 let reservation = self.cell_index.try_insert_locked(hash as usize);
                 if let Some(mut guard) = reservation {
                     // New cell
                     trace!("Cell {} does not exists, will insert for upsert", hash);
-                    let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
+                    let write_result = self.write_cell_to_chunk(
+                        cell,
+                        &write_plan,
+                        &pending_entry,
+                        cell.header.version,
+                    )?;
+                    let new_cell_loc = write_result.addr;
                     #[cfg(debug_assertions)]
                     self.assert_address_aligned_for_write(
                         new_cell_loc,
@@ -761,8 +790,11 @@ impl Chunk {
 
                     *guard = new_cell_loc;
                     drop(guard);
-                    self.ensure_indices(cell, None, &*schema);
+                    self.ensure_indices(cell, None, &*write_plan.schema);
                     self.refresh_statistics();
+                    drop(write_plan);
+                    cell.header.version = write_result.new_version;
+                    cell.header.timestamp = write_result.new_timestamp;
                 } else {
                     trace!("Cell {} was not exists, but found exists, will try", hash);
                     continue;
@@ -798,8 +830,15 @@ impl Chunk {
 
                     let new_cell = update(&cell);
                     if let Some(mut new_cell) = new_cell {
-                        new_cell.header.version = cell.header.version;
-                        let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
+                        let write_plan = new_cell.plan_write(self)?;
+                        let pending_entry = write_plan.allocate(self, false)?;
+                        let write_result = self.write_cell_to_chunk(
+                            &new_cell,
+                            &write_plan,
+                            &pending_entry,
+                            cell.header.version,
+                        )?;
+                        let new_cell_loc = write_result.addr;
 
                         #[cfg(debug_assertions)]
                         self.assert_address_aligned_for_write(new_cell_loc, "update_cell_by", hash);
@@ -817,6 +856,9 @@ impl Chunk {
                         }
 
                         self.refresh_statistics();
+                        drop(write_plan);
+                        new_cell.header.version = write_result.new_version;
+                        new_cell.header.timestamp = write_result.new_timestamp;
                         return Ok(new_cell);
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
@@ -851,8 +893,8 @@ impl Chunk {
                     Err(e) => return Err(WriteError::ReadError(e)),
                 }
             }
-            self.put_tombstone_by_cell_loc(cell_location)?;
             guard.remove();
+            self.put_tombstone_by_cell_loc(cell_location)?;
             Ok(())
         } else {
             Err(WriteError::CellDoesNotExisted)
@@ -877,17 +919,12 @@ impl Chunk {
             match SharedCell::from_chunk_raw(guard, self) {
                 Ok((cell, schema)) => {
                     if predict(&cell) {
-                        let put_tombstone_result = self.put_tombstone_by_cell_loc(cell_location);
-                        if put_tombstone_result.is_err() {
-                            put_tombstone_result
-                        } else {
-                            self.remove_indices(&cell, &schema);
-                            cell.into_guard().remove();
-                            Ok(())
-                        }
-                    } else {
-                        Err(WriteError::CellDoesNotExisted)
+                        self.remove_indices(&cell, &schema);
+                        cell.into_guard().remove();
+                        self.put_tombstone_by_cell_loc(cell_location)?;
+                        return Ok(());
                     }
+                    Err(WriteError::CellDoesNotExisted)
                 }
                 Err(e) => Err(WriteError::ReadError(e)),
             }
@@ -967,9 +1004,13 @@ impl Chunk {
     }
 
     #[inline]
-    fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &AArc<Segment>) {
+    fn put_tombstone(
+        &self,
+        cell_header: &CellHeader,
+        cell_seg: &AArc<Segment>,
+    ) -> Result<(), WriteError> {
         let pending_entry = (|| loop {
-            if let Some(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32) {
+            if let Ok(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true) {
                 return pending_entry;
             }
             warn!(
@@ -986,6 +1027,7 @@ impl Chunk {
         );
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
         pending_entry.seg.note_dead_bytes_change();
+        Ok(())
     }
 
     pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
@@ -1783,13 +1825,25 @@ impl<'a> CellGuard<'a> {
         if self.is_unassigned() {
             return Err(WriteError::CellDoesNotExisted);
         }
-        let (new_cell_loc, schema) = self.chunk.write_cell_to_chunk(cell)?;
-        let old_indices = self.chunk.old_index_res(&self.guard, &*schema)?;
+        let write_plan = cell.plan_write(self.chunk)?;
+        let pending_entry = write_plan.allocate(self.chunk, false)?;
+        let write_result = self.chunk.write_cell_to_chunk(
+            cell,
+            &write_plan,
+            &pending_entry,
+            cell.header.version,
+        )?;
+        let new_cell_loc = write_result.addr;
+        let schema = &*write_plan.schema;
+        let old_indices = self.chunk.old_index_res(&self.guard, schema)?;
         *self.guard = new_cell_loc;
         self.chunk
-            .ensure_indices_with_res(cell, old_indices, &*schema);
+            .ensure_indices_with_res(cell, old_indices, schema);
         self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
         self.chunk.refresh_statistics();
+        drop(write_plan);
+        cell.header.version = write_result.new_version;
+        cell.header.timestamp = write_result.new_timestamp;
         Ok(cell.header)
     }
 
@@ -1801,7 +1855,16 @@ impl<'a> CellGuard<'a> {
         if cell.header.version < self.version {
             cell.header.version = self.version;
         }
-        let (new_cell_loc, schema) = self.chunk.write_cell_to_chunk(cell)?;
+        let write_plan = cell.plan_write(self.chunk)?;
+        let pending_entry = write_plan.allocate(self.chunk, false)?;
+        let write_result = self.chunk.write_cell_to_chunk(
+            cell,
+            &write_plan,
+            &pending_entry,
+            cell.header.version,
+        )?;
+        let new_cell_loc = write_result.addr;
+        let schema = &*write_plan.schema;
 
         if old_cell_loc != 0 {
             // Update case - cell already exists
@@ -1815,6 +1878,10 @@ impl<'a> CellGuard<'a> {
             *self.guard = new_cell_loc;
             self.chunk.ensure_indices(cell, None, &*schema);
         }
+
+        drop(write_plan);
+        cell.header.version = write_result.new_version;
+        cell.header.timestamp = write_result.new_timestamp;
 
         self.chunk.refresh_statistics();
         Ok(cell.header)

@@ -1119,7 +1119,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
 
     // Trigger GC
     use crate::ram::cleaner::Cleaner;
-    let _ = Cleaner::clean(&server.chunks.list[0], true);
+    let _ = Cleaner::clean(&server.chunks.list[0], true, true);
 
     info!("GC complete, verifying data");
 
@@ -1428,7 +1428,7 @@ async fn test_direct_writes_with_tiered_memory() {
     let gc_result = tokio::task::spawn_blocking({
         let chunks = server.chunks.clone();
         move || {
-            let _ = Cleaner::clean(&chunks.list[0], true);
+            let _ = Cleaner::clean(&chunks.list[0], true, true);
         }
     });
 

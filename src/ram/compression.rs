@@ -144,7 +144,7 @@ mod tests {
         let original = b"Hello, World! This is a test string that should compress well.";
 
         let compressed = compress(original).unwrap();
-        
+
         // Verify format
         assert_eq!(&compressed[..4], &COMPRESSION_MAGIC);
         assert!(compressed.len() > HEADER_SIZE);
@@ -166,7 +166,7 @@ mod tests {
     fn test_checksum_mismatch_panics() {
         let original = b"Test data for checksum verification";
         let mut compressed = compress(original).unwrap();
-        
+
         // Corrupt the checksum
         compressed[4] ^= 0xFF;
 
@@ -226,11 +226,11 @@ mod tests {
     #[test]
     fn test_format_detection() {
         let original = b"Test data";
-        
+
         // Compressed format
         let compressed = compress(original).unwrap();
         assert!(is_compressed(&compressed));
-        
+
         // Uncompressed
         assert!(!is_compressed(original));
     }

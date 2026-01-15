@@ -146,7 +146,7 @@ impl NebServer {
     /// Gracefully shutdown the server, flushing all data to disk
     pub async fn shutdown(&self) {
         info!("Starting graceful server shutdown");
-        
+
         // Step 0: Wait for all pending index tasks to complete
         // CRITICAL: Index tasks (especially enumeration index inserts) must complete
         // before we flush LSM trees, otherwise the flush will have incomplete data!
@@ -166,7 +166,7 @@ impl NebServer {
         } else {
             debug!("No index builder, skipping index task await");
         }
-        
+
         // Step 1: Flush LSM trees if ranged indexer is enabled
         // This ensures enumeration indices are persisted before backup creation
         info!("Flushing LSM trees before shutdown");
@@ -174,7 +174,7 @@ impl NebServer {
             info!("LSM client obtained, calling flush_all");
             let _ = lsm_client.flush_all().await;
             info!("LSM trees flushed successfully");
-            
+
             // CRITICAL: Wait for background write-back of B-tree nodes to complete
             // The flush triggers merge which adds nodes to CHANGED_NODES queue.
             // The write-back task processes this asynchronously.
@@ -182,7 +182,7 @@ impl NebServer {
             info!("Waiting for B-tree nodes write-back to complete...");
             crate::index::ranged::lsm::btree::storage::wait_until_updated().await;
             info!("B-tree nodes write-back completed");
-            
+
             // Reset write-back state for potential restart within same process
             // This is critical for test scenarios where server is restarted multiple times
             crate::index::ranged::lsm::btree::storage::reset_write_back_state().await;
@@ -209,22 +209,24 @@ impl NebServer {
         info!("Archiving all dirty segments to backup storage...");
         self.chunks.archive_all();
         info!("Segment archiving completed");
-        
+
         // Step 2: Shutdown Raft (triggers backup creation)
         info!("Shutting down Raft service (will create backups)");
         let _ = self.raft_service.shutdown().await;
         info!("Raft service shutdown complete");
-        
+
         // Step 3: Shutdown RPC server
         info!("Shutting down RPC server");
         let _ = self.rpc.shutdown().await;
         info!("RPC server shutdown complete");
-        
+
         info!("Server shutdown complete");
     }
-    
+
     /// Get LSM tree service client
-    async fn get_lsm_tree_service(&self) -> Result<Arc<ranged::lsm::service::AsyncServiceClient>, bifrost::rpc::RPCError> {
+    async fn get_lsm_tree_service(
+        &self,
+    ) -> Result<Arc<ranged::lsm::service::AsyncServiceClient>, bifrost::rpc::RPCError> {
         // Use a dummy ID to locate the local LSM tree service via consistent hashing
         let dummy_id = Id::new(0, 1);
         ranged::lsm::service::locate_tree_server_from_conshash(&dummy_id, &self.consh).await

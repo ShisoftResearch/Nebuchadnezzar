@@ -296,7 +296,10 @@ impl SegmentFileManager {
                     // If seq_id is the same, prefer backup over WAL
                     if file.seq_id > existing.seq_id {
                         true
-                    } else if file.seq_id == existing.seq_id && file.is_backup && !existing.is_backup {
+                    } else if file.seq_id == existing.seq_id
+                        && file.is_backup
+                        && !existing.is_backup
+                    {
                         true
                     } else {
                         false
@@ -307,7 +310,10 @@ impl SegmentFileManager {
             if should_replace {
                 info!(
                     "Segment file for chunk {} seg {}: keeping seq {} (path: {})",
-                    file.chunk_id, file.seg_id, file.seq_id, file.path.display()
+                    file.chunk_id,
+                    file.seg_id,
+                    file.seq_id,
+                    file.path.display()
                 );
                 best_files.insert(key, file);
             } else {

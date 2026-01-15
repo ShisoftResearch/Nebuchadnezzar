@@ -20,13 +20,13 @@ use futures::{
     future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
 };
+use lazy_static::lazy_static;
+use parking_lot::Mutex;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc};
-use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::task::{JoinError, JoinHandle};
-use lazy_static::lazy_static;
 
 use crate::ram::types::OwnedPrimArray;
 
@@ -312,15 +312,28 @@ impl IndexBuilder {
         schema: &Schema,
         old_indices: Option<Vec<IndexRes>>,
     ) {
-        log::debug!("ensure_indices: cell_id={:?}, schema_id={}, schema_name={}, is_scannable={}",
-            cell.id(), schema.id, schema.name, schema.is_scannable);
+        log::debug!(
+            "ensure_indices: cell_id={:?}, schema_id={}, schema_name={}, is_scannable={}",
+            cell.id(),
+            schema.id,
+            schema.name,
+            schema.is_scannable
+        );
         let indexers = self.clients.clone();
         // Handle scannable indices if needed
         if schema.is_scannable {
-            log::debug!("Schema {} is scannable, calling ensure_scannable for cell {:?}", schema.id, cell.id());
+            log::debug!(
+                "Schema {} is scannable, calling ensure_scannable for cell {:?}",
+                schema.id,
+                cell.id()
+            );
             self.ensure_scannable(cell, &indexers);
         } else {
-            log::debug!("Schema {} is NOT scannable for cell {:?}", schema.id, cell.id());
+            log::debug!(
+                "Schema {} is NOT scannable for cell {:?}",
+                schema.id,
+                cell.id()
+            );
         }
         // Get new indices for the cell
         let new_indices = probe_cell_indices(cell, schema);
@@ -341,7 +354,11 @@ impl IndexBuilder {
         let schema_id = cell.header.schema;
         let indexers = indexers.clone();
         new_index_task(async move {
-            log::debug!("ensure_scannable: Inserting key for cell_id={:?}, schema_id={}", cell_id, schema_id);
+            log::debug!(
+                "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",
+                cell_id,
+                schema_id
+            );
             indexers
                 .ranged_client
                 .insert(&key)
@@ -402,22 +419,30 @@ impl IndexBuilder {
             let mut guard = PENDING_INDEX_TASKS.lock();
             std::mem::take(&mut *guard)
         };
-        
+
         let count = tasks.len();
         if count > 0 {
-            log::info!("Waiting for {} pending index tasks to complete before shutdown", count);
+            log::info!(
+                "Waiting for {} pending index tasks to complete before shutdown",
+                count
+            );
         }
 
-        let results: Vec<Result<Result<(), IndexError>, JoinError>> = futures::future::join_all(tasks).await;
+        let results: Vec<Result<Result<(), IndexError>, JoinError>> =
+            futures::future::join_all(tasks).await;
 
         let success_count = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
         let error_count = results.len() - success_count;
         if error_count > 0 {
-            log::warn!("Index tasks completed: {} succeeded, {} failed", success_count, error_count);
+            log::warn!(
+                "Index tasks completed: {} succeeded, {} failed",
+                success_count,
+                error_count
+            );
         } else if count > 0 {
             log::info!("All {} index tasks completed successfully", success_count);
         }
-        
+
         results
     }
 

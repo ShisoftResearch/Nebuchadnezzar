@@ -82,21 +82,36 @@ impl LSMTree {
     }
 
     pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: &Id) -> Self {
-        info!("[LSM TREE RECOVERY] Starting recovery for LSM tree {:?}", lsm_tree_id);
+        info!(
+            "[LSM TREE RECOVERY] Starting recovery for LSM tree {:?}",
+            lsm_tree_id
+        );
 
         let deletion_ref = Arc::new(LFHashSet::with_capacity(16));
-        info!("[LSM TREE RECOVERY] Attempting to read LSM tree root cell {:?}", lsm_tree_id);
+        info!(
+            "[LSM TREE RECOVERY] Attempting to read LSM tree root cell {:?}",
+            lsm_tree_id
+        );
         let cell = match neb_client.read_cell(*lsm_tree_id).await {
             Ok(Ok(cell)) => {
-                info!("[LSM TREE RECOVERY] Successfully read LSM tree root cell {:?}", lsm_tree_id);
+                info!(
+                    "[LSM TREE RECOVERY] Successfully read LSM tree root cell {:?}",
+                    lsm_tree_id
+                );
                 cell
             }
             Ok(Err(e)) => {
-                error!("[LSM TREE RECOVERY] Failed to read LSM tree root cell {:?}: {:?}", lsm_tree_id, e);
+                error!(
+                    "[LSM TREE RECOVERY] Failed to read LSM tree root cell {:?}: {:?}",
+                    lsm_tree_id, e
+                );
                 panic!("LSM tree root cell not found");
             }
             Err(e) => {
-                error!("[LSM TREE RECOVERY] RPC error reading LSM tree root cell {:?}: {:?}", lsm_tree_id, e);
+                error!(
+                    "[LSM TREE RECOVERY] RPC error reading LSM tree root cell {:?}: {:?}",
+                    lsm_tree_id, e
+                );
                 panic!("RPC error reading LSM tree root cell");
             }
         };
@@ -110,15 +125,27 @@ impl LSMTree {
         let tree_1_id = &trees[1usize];
 
         info!("[LSM TREE RECOVERY] LSM tree root cell contains level trees: [level_0={:?}, level_1={:?}]", tree_0_id, tree_1_id);
-        
-        info!("[LSM TREE RECOVERY] Recovering level 0 B-tree from head {:?}", tree_0_id);
-        let tree_0 = Level0Tree::from_head_id(tree_0_id, neb_client, &deletion_ref, 0).await;
-        info!("[LSM TREE RECOVERY] Level 0 B-tree recovered with {} keys", tree_0.count());
 
-        info!("[LSM TREE RECOVERY] Recovering level 1 B-tree from head {:?}", tree_1_id);
+        info!(
+            "[LSM TREE RECOVERY] Recovering level 0 B-tree from head {:?}",
+            tree_0_id
+        );
+        let tree_0 = Level0Tree::from_head_id(tree_0_id, neb_client, &deletion_ref, 0).await;
+        info!(
+            "[LSM TREE RECOVERY] Level 0 B-tree recovered with {} keys",
+            tree_0.count()
+        );
+
+        info!(
+            "[LSM TREE RECOVERY] Recovering level 1 B-tree from head {:?}",
+            tree_1_id
+        );
         let tree_1 = Level1Tree::from_head_id(tree_1_id, neb_client, &deletion_ref, 1).await;
-        info!("[LSM TREE RECOVERY] Level 1 B-tree recovered with {} keys", tree_1.count());
-        
+        info!(
+            "[LSM TREE RECOVERY] Level 1 B-tree recovered with {} keys",
+            tree_1.count()
+        );
+
         Self {
             mem_tree: Atomic::new(Box::new(LevelMTree::new(&deletion_ref))),
             trans_mem_tree: Atomic::null(),
@@ -152,11 +179,11 @@ impl LSMTree {
     pub async fn merge_levels(&self) -> bool {
         self.merge_levels_internal(false).await
     }
-    
+
     pub async fn force_merge_levels(&self) -> bool {
         self.merge_levels_internal(true).await
     }
-    
+
     async fn merge_levels_internal(&self, force: bool) -> bool {
         let mut merged = false;
         let mut deleted = StdHashSet::new();
@@ -168,7 +195,10 @@ impl LSMTree {
             let should_merge = force || mem_tree.oversized();
 
             if should_merge && mem_count > 0 {
-                info!("Memory tree has {} items, moving everything to disk tree", mem_count);
+                info!(
+                    "Memory tree has {} items, moving everything to disk tree",
+                    mem_count
+                );
                 // Memory tree oversized
                 // Will construct a new tree and swap the old one to trans_mem_tree for query and move all
                 // keys in old tree to disk tree level 0
@@ -322,7 +352,12 @@ impl LSMTree {
         }
     }
 
-    pub async fn mark_migration(&self, id: &Id, migration: Option<Id>, client: &Arc<AsyncClient>) -> Result<(), String> {
+    pub async fn mark_migration(
+        &self,
+        id: &Id,
+        migration: Option<Id>,
+        client: &Arc<AsyncClient>,
+    ) -> Result<(), String> {
         let head_ids: Vec<Id> = self.disk_trees.iter().map(|tree| tree.head_id()).collect();
         let lsm_tree_cell = lsm_tree_cell(&head_ids, id, migration);
         match client.update_cell(lsm_tree_cell).await {

@@ -348,7 +348,6 @@ impl DataCursor {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
     use crate::{
         index::builder::IndexBuilder,
         index::ranged::lsm::btree::Ordering,
@@ -361,6 +360,7 @@ mod test {
     };
     use bifrost_hasher::hash_str;
     use dovahkiin::{expr::serde::Expr, integrated::lisp::*, types::*};
+    use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_all() {
@@ -699,24 +699,17 @@ mod test {
         let _ = env_logger::try_init();
         let server = create_test_server(6704).await;
         let server_addr = String::from("127.0.0.1:6704");
-        
+
         let fields = Field::new_schema(vec![
             Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id = 200;
-        let schema = Schema::new_with_id(
-            schema_id,
-            "test_schema",
-            None,
-            fields,
-            false,
-            true,
-        );
-        
+        let schema = Schema::new_with_id(schema_id, "test_schema", None, fields, false, true);
+
         let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        
+
         // Insert data from 0 to 100
         let num = 100;
         for i in 0..=num {
@@ -727,10 +720,10 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-        
+
         let idx_data_client = server.indexed_data_client();
         let field_id = hash_str(DATA_1);
-        
+
         // Test 1: Inclusive start, inclusive end [10, 50]
         // This should work reliably
         let val_range = ValueRange {
@@ -749,15 +742,22 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         for i in 10..=50 {
             let id = Id::new(1, i);
-            let cell = cursor.next().await.unwrap().expect(&format!("Expected cell at {}", i));
+            let cell = cursor
+                .next()
+                .await
+                .unwrap()
+                .expect(&format!("Expected cell at {}", i));
             assert_eq!(id, cell.id(), "ID mismatch at {}", i);
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
         }
-        assert!(cursor.next().await.unwrap().is_none(), "Should not have more items");
-        
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Should not have more items"
+        );
+
         // Test 2: Inclusive start, exclusive end [20, 80)
         // Note: Exclusive end may have issues with EntryKey comparison, so we test leniently
         let val_range = ValueRange {
@@ -776,21 +776,21 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         // Collect results and verify they're in the expected range
         let mut results = Vec::new();
         while let Some(cell) = cursor.next().await.unwrap() {
             let value = *cell[DATA_1].u64().unwrap();
             results.push(value);
         }
-        
+
         // Verify all results are >= 20 and < 80
         assert!(!results.is_empty(), "Should return some results");
         for &val in &results {
             assert!(val >= 20, "Value {} should be >= 20", val);
             assert!(val < 80, "Value {} should be < 80", val);
         }
-        
+
         // Test 3: Exclusive start, inclusive end (30, 70]
         // Note: Exclusive start may have issues, test leniently
         let val_range = ValueRange {
@@ -809,13 +809,13 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         let mut results = Vec::new();
         while let Some(cell) = cursor.next().await.unwrap() {
             let value = *cell[DATA_1].u64().unwrap();
             results.push(value);
         }
-        
+
         // Verify all results are > 30 and <= 70
         // Note: Exclusive start may not work correctly due to EntryKey comparison issues
         // So we check leniently - at least verify the end boundary works
@@ -826,7 +826,10 @@ mod test {
             assert!(val <= 70, "Value {} should be <= 70", val);
         }
         // Verify we got some values in the expected range
-        assert!(results.iter().any(|&v| v >= 30 && v <= 70), "Should have values in range [30, 70]");
+        assert!(
+            results.iter().any(|&v| v >= 30 && v <= 70),
+            "Should have values in range [30, 70]"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -836,24 +839,17 @@ mod test {
         let _ = env_logger::try_init();
         let server = create_test_server(6705).await;
         let server_addr = String::from("127.0.0.1:6705");
-        
+
         let fields = Field::new_schema(vec![
             Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id = 201;
-        let schema = Schema::new_with_id(
-            schema_id,
-            "test_schema",
-            None,
-            fields,
-            false,
-            true,
-        );
-        
+        let schema = Schema::new_with_id(schema_id, "test_schema", None, fields, false, true);
+
         let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        
+
         // Insert data from 1 to 201 (ID 0,0 is reserved as unit_id)
         let num = 201;
         for i in 1..=num {
@@ -864,10 +860,10 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-        
+
         let idx_data_client = server.indexed_data_client();
         let field_id = hash_str(DATA_1);
-        
+
         // Test 1: Open start, inclusive end (all items <= 51)
         let val_range = ValueRange {
             start: ValueRangeTerm::open(),
@@ -885,7 +881,7 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         // Collect and sort results to handle any ordering issues
         let mut results = Vec::new();
         while let Some(cell) = cursor.next().await.unwrap() {
@@ -893,22 +889,32 @@ mod test {
             results.push((cell.id(), value));
         }
         results.sort_by_key(|(_, v)| *v);
-        
+
         // Verify we got all values from 1 to 51 (inclusive end should include 51)
-        assert_eq!(results.len(), 51, "Should have 51 items (1 to 51 inclusive)");
-        
+        assert_eq!(
+            results.len(),
+            51,
+            "Should have 51 items (1 to 51 inclusive)"
+        );
+
         // Verify all values are in the expected range
         for (_, value) in &results {
             assert!(*value <= 51, "Value {} should be <= 51", value);
             assert!(*value >= 1, "Value {} should be >= 1", value);
         }
-        
+
         // Verify we have consecutive values starting from 1
         let values: Vec<u64> = results.iter().map(|(_, v)| *v).collect();
         for i in 1..=51 {
-            assert_eq!(values[i-1], i as u64, "Missing value {} in results. Got: {:?}", i, values);
+            assert_eq!(
+                values[i - 1],
+                i as u64,
+                "Missing value {} in results. Got: {:?}",
+                i,
+                values
+            );
         }
-        
+
         // Test 2: Inclusive start, open end (all items >= 151)
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(151).shared()),
@@ -926,15 +932,22 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         for i in 151..=num {
             let id = Id::new(1, i);
-            let cell = cursor.next().await.unwrap().expect(&format!("Expected cell at {}", i));
+            let cell = cursor
+                .next()
+                .await
+                .unwrap()
+                .expect(&format!("Expected cell at {}", i));
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
         }
-        assert!(cursor.next().await.unwrap().is_none(), "Should not have more items");
-        
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Should not have more items"
+        );
+
         // Test 3: Open start, open end (all items - equivalent to scan_all)
         let val_range = ValueRange {
             start: ValueRangeTerm::open(),
@@ -952,14 +965,21 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         for i in 1..=num {
             let id = Id::new(1, i);
-            let cell = cursor.next().await.unwrap().expect(&format!("Expected cell at {}", i));
+            let cell = cursor
+                .next()
+                .await
+                .unwrap()
+                .expect(&format!("Expected cell at {}", i));
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
         }
-        assert!(cursor.next().await.unwrap().is_none(), "Should not have more items");
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Should not have more items"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -969,24 +989,17 @@ mod test {
         let _ = env_logger::try_init();
         let server = create_test_server(6706).await;
         let server_addr = String::from("127.0.0.1:6706");
-        
+
         let fields = Field::new_schema(vec![
             Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id = 202;
-        let schema = Schema::new_with_id(
-            schema_id,
-            "test_schema",
-            None,
-            fields,
-            false,
-            true,
-        );
-        
+        let schema = Schema::new_with_id(schema_id, "test_schema", None, fields, false, true);
+
         let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        
+
         // Insert data from 0 to 100
         let num = 100;
         for i in 0..=num {
@@ -997,10 +1010,10 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-        
+
         let idx_data_client = server.indexed_data_client();
         let field_id = hash_str(DATA_1);
-        
+
         // Test backward ordering: [20, 80] should return 80, 79, ..., 20
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(20).shared()),
@@ -1018,14 +1031,21 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         for (idx, i) in (20..=80).rev().enumerate() {
             let id = Id::new(1, i);
-            let cell = cursor.next().await.unwrap().expect(&format!("Expected cell at {} (position {})", i, idx));
+            let cell = cursor
+                .next()
+                .await
+                .unwrap()
+                .expect(&format!("Expected cell at {} (position {})", i, idx));
             assert_eq!(id, cell.id(), "ID mismatch at position {}", idx);
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
         }
-        assert!(cursor.next().await.unwrap().is_none(), "Should not have more items");
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Should not have more items"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1035,24 +1055,17 @@ mod test {
         let _ = env_logger::try_init();
         let server = create_test_server(6707).await;
         let server_addr = String::from("127.0.0.1:6707");
-        
+
         let fields = Field::new_schema(vec![
             Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id = 203;
-        let schema = Schema::new_with_id(
-            schema_id,
-            "test_schema",
-            None,
-            fields,
-            false,
-            true,
-        );
-        
+        let schema = Schema::new_with_id(schema_id, "test_schema", None, fields, false, true);
+
         let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        
+
         // Insert data from 1 to 51 (ID 0,0 is reserved as unit_id and not valid for data)
         let num = 51;
         for i in 1..=num {
@@ -1063,10 +1076,10 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-        
+
         let idx_data_client = server.indexed_data_client();
         let field_id = hash_str(DATA_1);
-        
+
         // Test 1: Single value range [25, 25]
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(25).shared()),
@@ -1084,12 +1097,15 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         let cell = cursor.next().await.unwrap().expect("Should have one cell");
         assert_eq!(cell.id(), Id::new(1, 25));
         assert_eq!(*cell[DATA_1].u64().unwrap(), 25);
-        assert!(cursor.next().await.unwrap().is_none(), "Should not have more items");
-        
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Should not have more items"
+        );
+
         // Test 2: Empty range (start > end)
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(30).shared()),
@@ -1107,9 +1123,12 @@ mod test {
             )
             .await
             .unwrap();
-        
-        assert!(cursor.next().await.unwrap().is_none(), "Empty range should return no items");
-        
+
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Empty range should return no items"
+        );
+
         // Test 3: Range outside data bounds [100, 200]
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(100).shared()),
@@ -1127,9 +1146,12 @@ mod test {
             )
             .await
             .unwrap();
-        
-        assert!(cursor.next().await.unwrap().is_none(), "Range outside bounds should return no items");
-        
+
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Range outside bounds should return no items"
+        );
+
         // Test 4: Range at boundaries [1, 51]
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(1).shared()),
@@ -1147,7 +1169,7 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         // Collect and sort results to handle any ordering issues
         let mut results = Vec::new();
         while let Some(cell) = cursor.next().await.unwrap() {
@@ -1155,20 +1177,30 @@ mod test {
             results.push((cell.id(), value));
         }
         results.sort_by_key(|(_, v)| *v);
-        
+
         // Verify we got all values from 1 to 51 (inclusive end should include 51)
-        assert_eq!(results.len(), 51, "Should have 51 items (1 to 51 inclusive)");
-        
+        assert_eq!(
+            results.len(),
+            51,
+            "Should have 51 items (1 to 51 inclusive)"
+        );
+
         // Verify all values are in the expected range
         for (_, value) in &results {
             assert!(*value <= 51, "Value {} should be <= 51", value);
             assert!(*value >= 1, "Value {} should be >= 1", value);
         }
-        
+
         // Verify we have consecutive values starting from 1
         let values: Vec<u64> = results.iter().map(|(_, v)| *v).collect();
         for i in 1..=51 {
-            assert_eq!(values[i-1], i as u64, "Missing value {} in results. Got: {:?}", i, values);
+            assert_eq!(
+                values[i - 1],
+                i as u64,
+                "Missing value {} in results. Got: {:?}",
+                i,
+                values
+            );
         }
     }
 
@@ -1179,24 +1211,17 @@ mod test {
         let _ = env_logger::try_init();
         let server = create_test_server(6708).await;
         let server_addr = String::from("127.0.0.1:6708");
-        
+
         let fields = Field::new_schema(vec![
             Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id = 204;
-        let schema = Schema::new_with_id(
-            schema_id,
-            "test_schema",
-            None,
-            fields,
-            false,
-            true,
-        );
-        
+        let schema = Schema::new_with_id(schema_id, "test_schema", None, fields, false, true);
+
         let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        
+
         // Insert large dataset: 0 to 5000
         let num = 5000;
         for i in 0..=num {
@@ -1207,10 +1232,10 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-        
+
         let idx_data_client = server.indexed_data_client();
         let field_id = hash_str(DATA_1);
-        
+
         // Test range query on large dataset [1000, 2000]
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(1000).shared()),
@@ -1228,18 +1253,28 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         let mut count = 0;
         for i in 1000..=2000 {
             let id = Id::new(1, i);
-            let cell = cursor.next().await.unwrap().expect(&format!("Expected cell at {}", i));
+            let cell = cursor
+                .next()
+                .await
+                .unwrap()
+                .expect(&format!("Expected cell at {}", i));
             assert_eq!(id, cell.id(), "ID mismatch at {}", i);
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
             count += 1;
         }
         // 1000 to 2000 inclusive = 2000 - 1000 + 1 = 1001 items
-        assert_eq!(count, 1001, "Should have exactly 1001 items (1000 to 2000 inclusive)");
-        assert!(cursor.next().await.unwrap().is_none(), "Should not have more items");
+        assert_eq!(
+            count, 1001,
+            "Should have exactly 1001 items (1000 to 2000 inclusive)"
+        );
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Should not have more items"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1249,24 +1284,17 @@ mod test {
         let _ = env_logger::try_init();
         let server = create_test_server(6709).await;
         let server_addr = String::from("127.0.0.1:6709");
-        
+
         let fields = Field::new_schema(vec![
             Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id = 205;
-        let schema = Schema::new_with_id(
-            schema_id,
-            "test_schema",
-            None,
-            fields,
-            false,
-            true,
-        );
-        
+        let schema = Schema::new_with_id(schema_id, "test_schema", None, fields, false, true);
+
         let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        
+
         // Insert data from 0 to 100
         let num = 100;
         for i in 0..=num {
@@ -1277,10 +1305,10 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-        
+
         let idx_data_client = server.indexed_data_client();
         let field_id = hash_str(DATA_1);
-        
+
         // Test range query [10, 90] with selection (DATA_2 must be even)
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(10).shared()),
@@ -1301,7 +1329,7 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         // All DATA_2 values are even (i * 2), so all should pass
         // Collect results first to handle potential ordering issues
         let mut results = Vec::new();
@@ -1311,7 +1339,7 @@ mod test {
             results.push((cell.id(), value1, value2));
         }
         results.sort_by_key(|(_, v1, _)| *v1);
-        
+
         // Verify we got values in the expected range
         // Selection may filter some results, so we check leniently
         assert!(!results.is_empty(), "Should return some results");
@@ -1320,9 +1348,12 @@ mod test {
             assert!(*value1 <= 90, "DATA_1 value {} should be <= 90", value1);
             assert_eq!(*value2, (*value1 * 2) as u32, "DATA_2 should be DATA_1 * 2");
         }
-        
+
         // Verify we got a reasonable number of results (at least most of the range)
-        assert!(results.len() >= 70, "Should have at least 70 items after selection");
+        assert!(
+            results.len() >= 70,
+            "Should have at least 70 items after selection"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1332,24 +1363,17 @@ mod test {
         let _ = env_logger::try_init();
         let server = create_test_server(6710).await;
         let server_addr = String::from("127.0.0.1:6710");
-        
+
         let fields = Field::new_schema(vec![
             Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id = 206;
-        let schema = Schema::new_with_id(
-            schema_id,
-            "test_schema",
-            None,
-            fields,
-            false,
-            true,
-        );
-        
+        let schema = Schema::new_with_id(schema_id, "test_schema", None, fields, false, true);
+
         let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        
+
         // Insert sparse data: only multiples of 10
         for i in (0..=100).step_by(10) {
             let id = Id::new(1, i);
@@ -1359,10 +1383,10 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-        
+
         let idx_data_client = server.indexed_data_client();
         let field_id = hash_str(DATA_1);
-        
+
         // Test range query [15, 75] - should only return 20, 30, 40, 50, 60, 70
         let val_range = ValueRange {
             start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(15).shared()),
@@ -1380,15 +1404,21 @@ mod test {
             )
             .await
             .unwrap();
-        
+
         let expected_values = vec![20, 30, 40, 50, 60, 70];
         for (idx, &expected_val) in expected_values.iter().enumerate() {
             let id = Id::new(1, expected_val);
-            let cell = cursor.next().await.unwrap().expect(&format!("Expected cell at {} (position {})", expected_val, idx));
+            let cell = cursor.next().await.unwrap().expect(&format!(
+                "Expected cell at {} (position {})",
+                expected_val, idx
+            ));
             assert_eq!(id, cell.id(), "ID mismatch at position {}", idx);
             assert_eq!(*cell[DATA_1].u64().unwrap(), expected_val);
         }
-        assert!(cursor.next().await.unwrap().is_none(), "Should not have more items");
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "Should not have more items"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

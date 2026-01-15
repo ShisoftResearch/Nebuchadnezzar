@@ -25,8 +25,12 @@ pub fn cell_rw() {
         header: CellHeader::new(schema.id, &id1),
         data,
     };
-    let mut loc = chunk.write_cell_to_chunk(&mut cell);
-    let cell_1_ptr = loc.unwrap().0;
+    let write_plan = cell.plan_write(chunk).unwrap();
+    let pending_entry = write_plan.allocate(chunk, true).unwrap();
+    let write_result = chunk
+        .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.version)
+        .unwrap();
+    let cell_1_ptr = write_result.addr;
     {
         let (stored_cell, _) = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
@@ -42,8 +46,12 @@ pub fn cell_rw() {
         header: CellHeader::new(schema.id, &id2),
         data,
     };
-    loc = chunk.write_cell_to_chunk(&mut cell);
-    let cell_2_ptr = loc.unwrap().0;
+    let write_plan = cell.plan_write(chunk).unwrap();
+    let pending_entry = write_plan.allocate(chunk, true).unwrap();
+    let write_result = chunk
+        .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.version)
+        .unwrap();
+    let cell_2_ptr = write_result.addr;
     {
         let stored_cell = SharedCellData::from_chunk_raw(cell_2_ptr, &chunk)
             .unwrap()

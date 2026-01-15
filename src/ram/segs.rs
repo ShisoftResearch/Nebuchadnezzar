@@ -1103,7 +1103,7 @@ impl SegmentAllocator {
         file_manager: &Arc<SegmentFileManager>,
     ) -> Option<Segment> {
         let addr = self.addr_by_id(seg_id as usize);
-        
+
         // Ensure address is within bounds
         if addr >= self.limit {
             error!(
@@ -1112,7 +1112,7 @@ impl SegmentAllocator {
             );
             return None;
         }
-        
+
         // Update offset if needed (to track allocated space)
         let required_end = addr + SEGMENT_SIZE;
         loop {
@@ -1121,16 +1121,20 @@ impl SegmentAllocator {
                 break; // Already allocated past this point
             }
             // Try to bump the offset
-            if self.offset.compare_exchange(
-                current_offset,
-                required_end,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ).is_ok() {
+            if self
+                .offset
+                .compare_exchange(
+                    current_offset,
+                    required_end,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
                 break;
             }
         }
-        
+
         Some(Segment::new(
             seg_id,
             seq_id,

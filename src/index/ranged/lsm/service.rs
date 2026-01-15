@@ -197,20 +197,28 @@ impl Service for LSMTreeService {
                     Ordering::Forward => {
                         match &range.start {
                             RangeTerm::Inclusive(k) => {
-                                if key.prefix_lt(k) { should_add = false; }
+                                if key.prefix_lt(k) {
+                                    should_add = false;
+                                }
                             }
                             RangeTerm::Exclusive(k) => {
-                                if key.prefix_le(k) { should_add = false; }
+                                if key.prefix_le(k) {
+                                    should_add = false;
+                                }
                             }
                             RangeTerm::Open => {}
                         }
                         if should_add {
                             match &range.end {
                                 RangeTerm::Inclusive(k) => {
-                                    if key.prefix_gt(k) { should_add = false; }
+                                    if key.prefix_gt(k) {
+                                        should_add = false;
+                                    }
                                 }
                                 RangeTerm::Exclusive(k) => {
-                                    if key.prefix_ge(k) { should_add = false; }
+                                    if key.prefix_ge(k) {
+                                        should_add = false;
+                                    }
                                 }
                                 RangeTerm::Open => {}
                             }
@@ -219,20 +227,28 @@ impl Service for LSMTreeService {
                     Ordering::Backward => {
                         match &range.end {
                             RangeTerm::Inclusive(k) => {
-                                if key.prefix_gt(k) { should_add = false; }
+                                if key.prefix_gt(k) {
+                                    should_add = false;
+                                }
                             }
                             RangeTerm::Exclusive(k) => {
-                                if key.prefix_ge(k) { should_add = false; }
+                                if key.prefix_ge(k) {
+                                    should_add = false;
+                                }
                             }
                             RangeTerm::Open => {}
                         }
                         if should_add {
                             match &range.start {
                                 RangeTerm::Inclusive(k) => {
-                                    if key.prefix_lt(k) { should_add = false; }
+                                    if key.prefix_lt(k) {
+                                        should_add = false;
+                                    }
                                 }
                                 RangeTerm::Exclusive(k) => {
-                                    if key.prefix_le(k) { should_add = false; }
+                                    if key.prefix_le(k) {
+                                        should_add = false;
+                                    }
                                 }
                                 RangeTerm::Open => {}
                             }
@@ -337,7 +353,7 @@ impl Service for LSMTreeService {
         }
         .boxed()
     }
-    
+
     fn stat(&self, id: Id) -> BoxFuture<'_, OpResult<LSMTreeStat>> {
         future::ready(if let Some(tree) = self.trees.get(&id) {
             OpResult::Successful(LSMTreeStat {
@@ -374,7 +390,7 @@ impl LSMTreeService {
             trees: trees_map,
         }
     }
-    
+
     /// Flush all trees to disk - called during shutdown
     pub async fn flush_all_trees(&self) {
         info!("Flushing all LSM trees to disk before shutdown");
@@ -382,7 +398,10 @@ impl LSMTreeService {
             let tree = &dist_tree.tree;
             let disk_count = tree.count();
             let mem_count = tree.mem_tree_count();
-            info!("Flushing tree {:?} with {} items (disk) + {} items (mem)", tree_id, disk_count, mem_count);
+            info!(
+                "Flushing tree {:?} with {} items (disk) + {} items (mem)",
+                tree_id, disk_count, mem_count
+            );
 
             // Force merge regardless of whether oversized
             tree.force_merge_levels().await;
@@ -398,7 +417,10 @@ impl LSMTreeService {
         for (tree_id, dist_tree) in self.trees.entries() {
             let tree = &dist_tree.tree;
             if let Err(e) = tree.mark_migration(&tree_id, None, &self.client).await {
-                warn!("Failed to mark LSM tree migration after flush for tree {:?}: {:?}", tree_id, e);
+                warn!(
+                    "Failed to mark LSM tree migration after flush for tree {:?}: {:?}",
+                    tree_id, e
+                );
             }
         }
 
@@ -421,7 +443,7 @@ impl LSMTreeService {
                     let tree = &dist_tree.tree;
                     let merged = tree.merge_levels().await;
                     fast_mode = merged | fast_mode;
-                    
+
                     // If merge happened, wait for external nodes to be written, then update the tree cell
                     if merged {
                         // Wait for all external B+tree nodes to be written to storage
@@ -431,7 +453,7 @@ impl LSMTreeService {
                             warn!("Failed to mark LSM tree migration after merge: {:?}", e);
                         }
                     }
-                    
+
                     if tree.oversized() {
                         info!("LSM Tree oversized {:?}, start migration", dist_tree.id);
                         // Tree oversized, need to migrate
@@ -449,8 +471,14 @@ impl LSMTreeService {
                             });
                         }
                         debug!("Marking migration for tree {:?}", dist_tree.id);
-                        if let Err(e) = tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client).await {
-                            warn!("Failed to mark LSM tree migration for oversized tree {:?}: {:?}", dist_tree.id, e);
+                        if let Err(e) = tree
+                            .mark_migration(&dist_tree.id, Some(migration_target_id), &client)
+                            .await
+                        {
+                            warn!(
+                                "Failed to mark LSM tree migration for oversized tree {:?}: {:?}",
+                                dist_tree.id, e
+                            );
                         }
                         let buffer_size = MIGRATE_SIZE << 4;
                         let mut cursor = tree.seek(&pivot_key, Ordering::Forward);
@@ -487,7 +515,10 @@ impl LSMTreeService {
                         }
                         debug!("Unmark migration {:?}", dist_tree.id);
                         if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
-                            warn!("Failed to unmark LSM tree migration for tree {:?}: {:?}", dist_tree.id, e);
+                            warn!(
+                                "Failed to unmark LSM tree migration for tree {:?}: {:?}",
+                                dist_tree.id, e
+                            );
                         }
                         tree.retain(&pivot_key);
                         debug!(
