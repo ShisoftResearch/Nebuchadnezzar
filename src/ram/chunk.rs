@@ -379,6 +379,7 @@ impl Chunk {
                         "Head segment {} was removed, retrying with current head",
                         head_seg_id
                     );
+                    backoff.spin();
                     continue;
                 }
             };
@@ -410,7 +411,10 @@ impl Chunk {
                             tried_gc = true;
                             continue;
                         } else {
-                            debug!("No space left for chunk {}, emergency best effort GC", self.id);
+                            debug!(
+                                "No space left for chunk {}, emergency best effort GC",
+                                self.id
+                            );
                             let _ = Cleaner::clean(self, true, false);
                             tried_gc = true;
                             continue;
@@ -445,9 +449,16 @@ impl Chunk {
                     // for performance, won't CAS total_space
                     self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                     let new_seg_id = new_seg.id;
-                    self.put_segment(new_seg);
-                    // Publish new head segment id
+
+                    // Publish new head segment id FIRST
+                    // This creates a window where the head_seg_id points to a segment not yet in self.segs.
+                    // Readers of head_seg_id must handle this by retrying.
+                    // This order is CRITICAL: if we put_segment first, the Cleaner might see the new segment
+                    // before it's marked as head_seg_id, and try to compact/clean it (since it looks like a
+                    // non-head segment). By setting head_seg_id first, we protect it from the cleaner.
                     self.head_seg_id.store(new_seg_id, Ordering::Release);
+
+                    self.put_segment(new_seg);
 
                     // Old head is no longer active for writes. Flush and close its WAL file
                     // to avoid keeping unnecessary file descriptors open.

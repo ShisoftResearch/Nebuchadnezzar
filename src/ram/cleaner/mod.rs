@@ -21,22 +21,52 @@ lazy_static! {
 }
 
 #[allow(dead_code)]
+#[allow(dead_code)]
 pub struct Cleaner {
     chunks: Arc<Chunks>,
     stopped: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     _handle: Option<std::thread::JoinHandle<()>>,
 }
 
 // The two-level cleaner
 impl Cleaner {
     pub fn new_and_start(chunks: Arc<Chunks>) -> Cleaner {
-        debug!("Starting cleaner for {} chunks", chunks.list.len());
+        Self::new_internal(chunks, false)
+    }
+
+    pub fn new_paused(chunks: Arc<Chunks>) -> Cleaner {
+        Self::new_internal(chunks, true)
+    }
+
+    fn new_internal(chunks: Arc<Chunks>, initial_paused: bool) -> Cleaner {
+        debug!(
+            "Starting cleaner for {} chunks (paused={})",
+            chunks.list.len(),
+            initial_paused
+        );
         let stop_tag = Arc::new(AtomicBool::new(false));
+        let paused_tag = Arc::new(AtomicBool::new(initial_paused));
         let stop_tag_ref_clone = stop_tag.clone();
+        let paused_tag_ref_clone = paused_tag.clone();
         let checks_ref_clone = chunks.clone();
         let sleep_interval_ms = env::var("NEB_CLEANER_SLEEP_INTERVAL_MS")
             .unwrap_or("100".to_string())
             .parse::<u64>()
+            .unwrap();
+
+        // Create thread pools once before the loop for reuse
+        let clean_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads((num_cpus::get() / 4).max(1))
+            .thread_name(|idx| format!("cleaner-clean-t{}", idx))
+            .build()
+            .unwrap();
+
+        #[cfg(feature = "tiered_memory")]
+        let evict_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads((num_cpus::get() / 8).min(8).max(1))
+            .thread_name(|idx| format!("cleaner-evict-t{}", idx))
+            .build()
             .unwrap();
         // Put follwing procedures in separate threads for real-time scheduling
         let handle = thread::Builder::new()
@@ -44,20 +74,14 @@ impl Cleaner {
             .spawn(move || {
                 #[cfg(feature = "cleaner")]
                 {
-                    // Create thread pools once before the loop for reuse
-                    let clean_pool = rayon::ThreadPoolBuilder::new()
-                        .thread_name(|idx| format!("cleaner-clean-t{}", idx))
-                        .build()
-                        .unwrap();
-                    
-                    #[cfg(feature = "tiered_memory")]
-                    let evict_pool = rayon::ThreadPoolBuilder::new()
-                        .thread_name(|idx| format!("cleaner-evict-t{}", idx))
-                        .build()
-                        .unwrap();
-                    
                     let mut idle_rounds: u32 = 0;
                     while !stop_tag_ref_clone.load(Ordering::Relaxed) {
+                        // Check if paused
+                        if paused_tag_ref_clone.load(Ordering::Relaxed) {
+                            thread::sleep(Duration::from_millis(100)); // Sleep while paused
+                            continue;
+                        }
+
                         let progress = AtomicBool::new(false);
                         // Main cleaning: compact and combine segments
                         clean_pool.install(|| {
@@ -122,6 +146,7 @@ impl Cleaner {
         let cleaner = Cleaner {
             chunks: chunks.clone(),
             stopped: stop_tag.clone(),
+            paused: paused_tag.clone(),
             _handle: Some(handle),
         };
         return cleaner;
@@ -228,13 +253,24 @@ impl Cleaner {
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
-        println!("Cleaner stopped");
+        info!("Cleaner stopped");
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+        info!("Cleaner paused");
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+        info!("Cleaner resumed");
     }
 
     pub fn dummy(chunks: &Arc<Chunks>) -> Self {
         Cleaner {
             chunks: chunks.clone(),
             stopped: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             _handle: None,
         }
     }

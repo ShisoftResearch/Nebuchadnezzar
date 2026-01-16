@@ -350,7 +350,14 @@ impl NebServer {
 
         // Start cleaner AFTER all recovery (segments + transactions) is complete
         // This ensures segments with old cell data needed for rollback aren't cleaned
-        let cleaner = Cleaner::new_and_start(chunks.clone());
+        // Note: If recovery is enabled, we start cleaner in PAUSED state to prevent
+        // interference/hangs during recovery. It must be explicitly resumed later.
+        let cleaner = if opts.enable_recovery {
+            debug!("Recovery enabled: Starting cleaner in PAUSED state");
+            Cleaner::new_paused(chunks.clone())
+        } else {
+            Cleaner::new_and_start(chunks.clone())
+        };
         let mut transaction_manager = None;
         let member_pool = Arc::new(rpc::ClientPool::new());
         let txn_peer = Peer::new(server_addr);

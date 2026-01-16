@@ -18,6 +18,15 @@ impl CompactCleaner {
             return 0;
         }
 
+        // Safety check: Never clean the head segment
+        // Although segs_for_compact_cleaner filters this, race conditions could cause
+        // the head to change or a new head to be created that looks like a candidate.
+        if seg.id == chunk.get_head_seg_id() {
+            debug!("Segment {} is the current head, skipping cleaning", seg.id);
+            seg.set_hot();
+            return 0;
+        }
+
         // Clean only if segment have fragments
         let dead_space = seg.total_dead_space();
         if dead_space == 0 {
