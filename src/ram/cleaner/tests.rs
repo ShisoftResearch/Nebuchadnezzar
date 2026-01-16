@@ -179,7 +179,11 @@ pub fn full_clean_cycle() {
             });
         // 4 remaining cells and 8 deleted cell tombstones
         assert_eq!(compacted_segment_1_entries.len(), 12);
-        assert_eq!(seg1.entry_iter().count(), 12);
+        assert_eq!(
+            seg1.entry_iter().count(), 12, 
+            "Head segment should not be compacted, but get entries: {:?}", 
+            seg1.entry_iter().map(|e| e.entry_header.entry_type).collect::<Vec<_>>()
+        );
     }
 
     // combine
