@@ -119,6 +119,10 @@ pub fn full_clean_cycle() {
 
     // compact
     {
+        // Cleaner refuses to work on head segment, set head segment to a dummy value
+        chunk
+            .head_seg_id
+            .store(1234, std::sync::atomic::Ordering::Relaxed);
         // Compact all segments order by id
         chunk.segments().into_iter().for_each(|seg| {
             compact::CompactCleaner::clean_segment(chunk, &seg);
@@ -180,10 +184,17 @@ pub fn full_clean_cycle() {
         // 4 remaining cells and 8 deleted cell tombstones
         assert_eq!(compacted_segment_1_entries.len(), 12);
         assert_eq!(
-            seg1.entry_iter().count(), 12, 
-            "Head segment should not be compacted, but get entries: {:?}", 
-            seg1.entry_iter().map(|e| e.entry_header.entry_type).collect::<Vec<_>>()
+            seg1.entry_iter().count(),
+            12,
+            "Head segment should not be compacted, but get entries: {:?}",
+            seg1.entry_iter()
+                .map(|e| e.entry_header.entry_type)
+                .collect::<Vec<_>>()
         );
+        // Restore head segment id for subsequent operations
+        chunk
+            .head_seg_id
+            .store(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // combine
