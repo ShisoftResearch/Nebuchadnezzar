@@ -808,68 +808,35 @@ fn scan_segment_and_update_index(
                 let hash = cell_header.hash;
                 let hash_usize = hash as usize;
 
-                // Fast path for existing and newer or non-existed
-                let mut should_continue = false;
-                if let Some(existing_addr) = chunk.cell_index.get_from_mutex(&hash_usize) {
-                    let existing_header =
-                        cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
-                    if existing_header.version >= cell_header.version {
-                        dead_space += entry_header.content_length as u64;
-                        debug!(
-                            "Cell hash={} has older version={} (current={}), marking dead",
-                            hash, cell_header.version, existing_header.version
-                        );
-                        should_continue = true;
-                    }
-                } else if chunk.cell_index.try_insert(hash_usize, cursor).is_none() {
-                    // Insert success, continue
-                    should_continue = true;
-                }
-
-                if should_continue {
-                    // Advance cursor before continuing to next iteration
-                    let new_cursor = prev_cursor + entry_size;
-                    if new_cursor <= prev_cursor {
-                        warn!("Segment {} cursor would not advance: prev={}, entry_size={}, new={}, breaking to prevent infinite loop",
-                              segment.id, prev_cursor, entry_size, new_cursor);
-                        break;
-                    }
-                    cursor = new_cursor;
-                    continue;
-                }
-
-                // Use lock or insert for might existing cell
-                // Lock this specific cell in the index (spins until acquired)
                 let mut guard = chunk.cell_index.lock_or_insert(hash as usize, cursor);
                 if *guard != cursor {
-                    // It is not an insert
                     let existing_addr = *guard;
-                    // Check version
-                    let existing_header =
-                        cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
-
-                    if cell_header.version > existing_header.version {
-                        // New version is newer, update index
-                        if let Some(old_seg) = chunk.locate_segment(existing_addr) {
-                            let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                            old_seg
-                                .dead_space
-                                .fetch_add(entry.content_length, Ordering::Relaxed);
-                            old_seg.note_dead_bytes_change();
-                        }
+                    if existing_addr == 0 {
                         *guard = cursor;
-                        // Old cell becomes dead space (cleaner will handle it)
-                        debug!(
-                            "Updated cell hash={} from version={} to version={} in segment={}",
-                            hash, existing_header.version, cell_header.version, segment.id
-                        );
                     } else {
-                        // This cell is older, mark as dead
-                        dead_space += entry_header.content_length as u64;
-                        debug!(
-                            "Cell hash={} has older version={} (current={}), marking dead",
-                            hash, cell_header.version, existing_header.version
-                        );
+                        let existing_header =
+                            cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
+
+                        if cell_header.version > existing_header.version {
+                            if let Some(old_seg) = chunk.locate_segment(existing_addr) {
+                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                                old_seg
+                                    .dead_space
+                                    .fetch_add(entry.content_length, Ordering::Relaxed);
+                                old_seg.note_dead_bytes_change();
+                            }
+                            *guard = cursor;
+                            debug!(
+                                "Updated cell hash={} from version={} to version={} in segment={}",
+                                hash, existing_header.version, cell_header.version, segment.id
+                            );
+                        } else {
+                            dead_space += entry_header.content_length as u64;
+                            debug!(
+                                "Cell hash={} has older version={} (current={}), marking dead",
+                                hash, cell_header.version, existing_header.version
+                            );
+                        }
                     }
                 }
             }
@@ -1137,38 +1104,14 @@ pub fn recover_chunks(
         allocated.len()
     );
 
-    // Phase 2b-3-4: Segment scanning and index building
-    // CRITICAL: Process segments sequentially in seq_id order to ensure proper version resolution
-    // Parallel processing can cause race conditions where newer versions are overwritten by older ones
     info!(
-        "Phase 2b-3-4: Starting sequential scanning of {} segments (in seq_id order)",
+        "Phase 2b-3-4: Starting parallel scanning of {} segments",
         allocated.len()
     );
-    let mut all_stashed = Vec::new();
-    for alloc in &allocated {
-        debug!(
-            "Processing segment {} with seq_id={}",
-            alloc.segment.id, alloc.file_info.seq_id
-        );
-        let chunk = &chunks[alloc.file_info.chunk_id];
-        let segment = &alloc.segment;
-        segment
-            .append_header
-            .store(alloc.append_header, Ordering::Release);
-        chunk.segs.insert_back(segment.id as usize, segment.clone());
-        let stashed = scan_segment_and_update_index(chunk, segment, alloc.append_header);
-        if alloc.is_cold {
-            if let Err(e) = unmap_cold_segment(segment) {
-                warn!(
-                    "Failed to unmap cold segment {} after scanning: {}",
-                    segment.id, e
-                );
-            }
-        }
-        all_stashed.push(stashed);
-    }
-    let stashed_tombstones = merge_stashed_tombstones(all_stashed);
-    info!("Phase 2b-3-4: Completed sequential scanning");
+    let progress = AtomicUsize::new(0);
+    let stashed_tombstones =
+        phase2b_3_4_parallel_scan(&allocated, chunks, &progress, &recovery_pool);
+    info!("Phase 2b-3-4: Completed parallel scanning");
 
     // Phase 4b: Apply stashed tombstones
     apply_stashed_tombstones(&stashed_tombstones, chunks);
