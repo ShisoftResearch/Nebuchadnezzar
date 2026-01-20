@@ -111,8 +111,6 @@ struct StashedTombstone {
 struct AllocatedSegment {
     segment: lightning::aarc::Arc<Segment>,
     file_info: SegmentFileInfo,
-    #[allow(dead_code)] // Used during allocation phase, kept for potential future use
-    file_data: Vec<u8>,
     append_header: usize,
     is_cold: bool,
 }
@@ -567,14 +565,11 @@ fn phase2a_allocate_segments(
                         file_info.path.display()
                     );
 
-                    // Load file data
-                    let file_data = load_file_to_memory(&file_info.path)?;
-
-                    if file_data.len() > SEGMENT_SIZE {
+                    if file_info.size as usize > SEGMENT_SIZE {
                         error!(
                             "File {} size {} exceeds segment size {}",
                             file_info.path.display(),
-                            file_data.len(),
+                            file_info.size,
                             SEGMENT_SIZE
                         );
                         return Err(io::Error::new(
@@ -630,15 +625,26 @@ fn phase2a_allocate_segments(
                         recover_cold
                     };
 
-                    // Recover segment data
-                    if should_recover_cold {
+                    let append_header = if should_recover_cold {
                         recover_segment_as_cold(&segment, file_info)?;
+                        find_append_header(segment.addr, file_info.size as usize)
                     } else {
+                        let file_data = load_file_to_memory(&file_info.path)?;
+                        if file_data.len() > SEGMENT_SIZE {
+                            error!(
+                                "File {} size {} exceeds segment size {}",
+                                file_info.path.display(),
+                                file_data.len(),
+                                SEGMENT_SIZE
+                            );
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "File size exceeds segment capacity",
+                            ));
+                        }
                         recover_segment_as_hot(&segment, &file_data);
-                    }
-
-                    // Calculate append_header
-                    let append_header = find_append_header(segment.addr, file_data.len());
+                        find_append_header(segment.addr, file_data.len())
+                    };
 
                     info!(
                         "Allocated segment: chunk={} seg={} seq={} append_offset={} mode={}",
@@ -654,7 +660,6 @@ fn phase2a_allocate_segments(
                         AllocatedSegment {
                             segment: segment.clone(),
                             file_info: file_info.clone(),
-                            file_data,
                             append_header,
                             is_cold: should_recover_cold,
                         },
