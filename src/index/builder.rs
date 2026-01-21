@@ -7,7 +7,7 @@ use crate::index::embedding::EmbeddingModel;
 use crate::index::full_text::{
     build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
-use crate::index::vector::MetricEncoding;
+use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
 use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
 use crate::ram::types::Id;
 use crate::ram::{
@@ -147,6 +147,7 @@ pub struct VectorIndexMeta {
     schema_id: u32,
     field_id: u64,
     metric_encoding: MetricEncoding,
+    hnsw_config: HnswConfig,
 }
 
 /// Metadata for embedding index operations.
@@ -185,7 +186,7 @@ pub enum IndexMeta {
 pub enum IndexComps {
     Ranged(Feature),
     Hashed(Feature),
-    Vector(Id, u32, u64, MetricEncoding),
+    Vector(Id, u32, u64, VectorIndexConfig),
 }
 
 #[derive(Debug)]
@@ -241,6 +242,7 @@ impl IndexMeta {
                         meta.schema_id,
                         meta.field_id,
                         meta.metric_encoding,
+                        meta.hnsw_config,
                     )
                     .await?;
             }
@@ -604,11 +606,11 @@ where
                                 .collect(),
                         ),
                         // For vector, only provide its property
-                        &IndexType::Vector(metric_encoding) => components.push(IndexComps::Vector(
+                        &IndexType::Vector(config) => components.push(IndexComps::Vector(
                             cell.id(),
                             schema.id,
                             *field_id,
-                            metric_encoding,
+                            config,
                         )),
                         &IndexType::Fulltext => {
                             let owned_value = value.to_owned_value();
@@ -643,7 +645,7 @@ where
                     match index {
                         &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
                         &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
-                        &IndexType::Vector(_metric_encoding) => {}
+                        &IndexType::Vector(_config) => {}
                         &IndexType::Fulltext => {
                             let owned_value = value.to_owned_value();
                             if let Some(meta) = build_inverted_index_meta(
@@ -691,12 +693,13 @@ where
                         let key = EntryKey::from_props(&cell_id, &feat, *field_id, schema.id);
                         metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                     }
-                    IndexComps::Vector(cell_id, schema_id, field_id, metric_encoding) => {
+                    IndexComps::Vector(cell_id, schema_id, field_id, config) => {
                         metas.push(IndexMeta::Vector(VectorIndexMeta {
                             cell_id,
                             schema_id,
                             field_id,
-                            metric_encoding,
+                            metric_encoding: config.metric,
+                            hnsw_config: config.hnsw,
                         }));
                     }
                 }

@@ -173,11 +173,13 @@ pub trait EmbeddingIndexerCore: Send + Sync {
     /// * `schema_id` - Schema ID for namespace isolation
     /// * `field_id` - Field ID to index
     /// * `model` - The embedding model to use for this index
+    /// * `hnsw_config` - Optional HNSW configuration (defaults to HnswConfig::default())
     fn new_index(
         &self,
         schema_id: u32,
         field_id: u64,
         model: &EmbeddingModel,
+        hnsw_config: Option<crate::index::vector::HnswConfig>,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
     /// Delete an embedding index for a schema/field combination.
@@ -288,9 +290,10 @@ impl EmbeddingIndexClient {
         schema_id: u32,
         field_id: u64,
         model: &'a EmbeddingModel,
+        hnsw_config: Option<crate::index::vector::HnswConfig>,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
         self.get_embedding_index_core()
-            .new_index(schema_id, field_id, model)
+            .new_index(schema_id, field_id, model, hnsw_config)
     }
 
     /// Delete an embedding index.

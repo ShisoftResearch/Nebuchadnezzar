@@ -51,6 +51,7 @@ impl VectorClient {
     /// * `field_id` - Field ID to search (must have Vector index)
     /// * `query_vector` - The query vector to find neighbors for
     /// * `limit` - Maximum results to return
+    /// * `ef_search` - Optional HNSW ef_search override
     ///
     /// # Returns
     /// Vector of `VectorHit` with document IDs and distance/similarity scores.
@@ -63,10 +64,11 @@ impl VectorClient {
         field_id: u64,
         query_vector: &[f32],
         limit: usize,
+        ef_search: Option<u16>,
     ) -> Result<Vec<VectorHit>, RPCError> {
         match self
             .vector_client
-            .search(schema_id, field_id, query_vector, limit)
+            .search(schema_id, field_id, query_vector, limit, ef_search)
             .await
         {
             Ok(hits) => Ok(hits),
@@ -86,9 +88,11 @@ impl VectorClient {
         field_name: &str,
         query_vector: &[f32],
         limit: usize,
+        ef_search: Option<u16>,
     ) -> Result<Vec<VectorHit>, RPCError> {
         let field_id = bifrost_hasher::hash_str(field_name) as u64;
-        self.search(schema_id, field_id, query_vector, limit).await
+        self.search(schema_id, field_id, query_vector, limit, ef_search)
+            .await
     }
 
     /// Check if the vector index core is available

@@ -25,6 +25,47 @@ pub enum MetricEncoding {
     Chebyshev,
 }
 
+/// HNSW configuration for vector indexing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct HnswConfig {
+    /// Max connections per node (M).
+    pub m: u16,
+    /// Neighbors considered during index build (ef_construction).
+    pub ef_construction: u16,
+    /// Default ef_search for queries when not overridden.
+    pub ef_search_default: u16,
+}
+
+impl Default for HnswConfig {
+    fn default() -> Self {
+        Self {
+            m: 16,
+            ef_construction: 256,
+            ef_search_default: 128,
+        }
+    }
+}
+
+/// Vector index configuration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct VectorIndexConfig {
+    pub metric: MetricEncoding,
+    pub hnsw: HnswConfig,
+}
+
+impl VectorIndexConfig {
+    pub fn new(metric: MetricEncoding) -> Self {
+        Self {
+            metric,
+            hnsw: HnswConfig::default(),
+        }
+    }
+
+    pub fn with_hnsw(metric: MetricEncoding, hnsw: HnswConfig) -> Self {
+        Self { metric, hnsw }
+    }
+}
+
 /// Result of a vector similarity search
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorHit {
@@ -63,6 +104,7 @@ pub trait VectorIndexerCore: Send + Sync {
         schema_id: u32,
         field_id: u64,
         metric_encoding: MetricEncoding,
+        hnsw_config: HnswConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
     /// Remove a vector from the index.
@@ -93,12 +135,19 @@ pub trait VectorIndexerCore: Send + Sync {
         field_id: u64,
         query_vector: &[f32],
         limit: usize,
+        ef_search: Option<u16>,
     ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>>;
 
     /// Create a new vector index for a schema/field combination.
     ///
     /// Called when a new schema with vector index is created.
     fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>>;
+    fn new_index_with_config(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        hnsw_config: HnswConfig,
+    ) -> BoxFuture<'_, Result<(), IndexError>>;
 
     /// Delete a vector index for a schema/field combination.
     ///
@@ -160,9 +209,10 @@ impl VectorIndexClient {
         schema_id: u32,
         field_id: u64,
         metric_encoding: MetricEncoding,
+        hnsw_config: HnswConfig,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
         self.get_vector_index_core()
-            .insert(cell_id, schema_id, field_id, metric_encoding)
+            .insert(cell_id, schema_id, field_id, metric_encoding, hnsw_config)
     }
 
     /// Remove a vector from the index.
@@ -189,9 +239,10 @@ impl VectorIndexClient {
         field_id: u64,
         query_vector: &'a [f32],
         limit: usize,
+        ef_search: Option<u16>,
     ) -> BoxFuture<'a, Result<Vec<VectorHit>, IndexError>> {
         self.get_vector_index_core()
-            .search(schema_id, field_id, query_vector, limit)
+            .search(schema_id, field_id, query_vector, limit, ef_search)
     }
 
     /// Create a new vector index.
@@ -201,6 +252,16 @@ impl VectorIndexClient {
         field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_vector_index_core().new_index(schema_id, field_id)
+    }
+
+    pub fn new_index_with_config(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        hnsw_config: HnswConfig,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        self.get_vector_index_core()
+            .new_index_with_config(schema_id, field_id, hnsw_config)
     }
 
     /// Delete a vector index.
