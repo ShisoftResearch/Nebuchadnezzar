@@ -12,7 +12,7 @@ use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
 use crate::ram::types::Id;
 use crate::ram::{
     cell::Cell,
-    schema::{IndexType, Schema},
+    schema::{CompoundIndex, IndexType, Schema},
 };
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use futures::FutureExt;
@@ -32,6 +32,7 @@ use crate::ram::types::OwnedPrimArray;
 
 // Constant representing an unset/empty feature
 const UNSETTLED: Feature = [0u8; 8];
+const COMPOUND_MISSING_PLACEHOLDER: &str = "";
 
 /// Build embedding index metadata from a cell value.
 /// Extracts text content from String or String array values.
@@ -68,6 +69,57 @@ fn build_embedding_index_meta(
         model,
         text,
     })
+}
+
+fn extract_embedding_text(value: &crate::ram::types::OwnedValue) -> Option<String> {
+    match value {
+        crate::ram::types::OwnedValue::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        crate::ram::types::OwnedValue::PrimArray(OwnedPrimArray::String(items)) => {
+            let joined = items.join(" ");
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        crate::ram::types::OwnedValue::Null => None,
+        _ => None,
+    }
+}
+
+fn build_compound_embedding_text<C>(
+    cell: &C,
+    schema: &Schema,
+    compound: &CompoundIndex,
+) -> Option<String>
+where
+    C: Cell,
+    <C::Value as Value>::Out: ToOwnedValue,
+{
+    let delimiter = ". ";
+    let mut parts = Vec::with_capacity(compound.field_ids.len());
+    for field_id in &compound.field_ids {
+        if let Some(id_path) = schema.id_index.get(field_id) {
+            let value = cell.data().get_in_by_ids(id_path);
+            if let Some(text) = extract_embedding_text(&value.to_owned_value()) {
+                parts.push(text);
+            } else {
+                parts.push(COMPOUND_MISSING_PLACEHOLDER.to_string());
+            }
+        } else {
+            parts.push(COMPOUND_MISSING_PLACEHOLDER.to_string());
+        }
+    }
+    if parts.iter().all(|part| part.is_empty()) {
+        return None;
+    }
+    Some(parts.join(delimiter))
 }
 
 // Define index rules
@@ -652,5 +704,119 @@ where
             res.push(IndexRes { meta: metas });
         }
     });
+
+    schema
+        .compound_index_fields
+        .iter()
+        .for_each(|(compound_id, compound)| {
+            let mut metas = vec![];
+            for index in &compound.indices {
+                match index {
+                    IndexType::Embedding(model) => {
+                        if let Some(text) = build_compound_embedding_text(cell, schema, compound) {
+                            metas.push(IndexMeta::Embedding(EmbeddingIndexMeta {
+                                cell_id: cell.id(),
+                                schema_id: schema.id,
+                                field_id: *compound_id,
+                                model: model.clone(),
+                                text,
+                            }));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !metas.is_empty() {
+                res.push(IndexRes { meta: metas });
+            }
+        });
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ram::schema::{Field, IndexType, Schema};
+    use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
+    use bifrost_hasher::hash_str;
+
+    fn collect_embedding_metas(indices: Vec<IndexRes>) -> Vec<EmbeddingIndexMeta> {
+        let mut embedding_metas = Vec::new();
+        for res in indices {
+            for meta in res.meta {
+                if let IndexMeta::Embedding(meta) = meta {
+                    embedding_metas.push(meta);
+                }
+            }
+        }
+        embedding_metas
+    }
+
+    #[test]
+    fn compound_embedding_concat_comma() {
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("title", dovahkiin::types::Type::String),
+            Field::new_unindexed("body", dovahkiin::types::Type::String),
+        ]);
+        let mut schema = Schema::new("compound_embedding", None, fields, false, false);
+        schema.add_compound_index(
+            "title_body",
+            vec!["title".to_string(), "body".to_string()],
+            vec![IndexType::Embedding(EmbeddingModel::from("test-model"))],
+        );
+
+        let mut data = OwnedMap::new();
+        data.insert("title", OwnedValue::String("hello".to_string()));
+        data.insert("body", OwnedValue::String("world".to_string()));
+        let cell = crate::ram::cell::OwnedCell::new_with_id(
+            schema.id,
+            &Id::new(1, 1),
+            OwnedValue::Map(data),
+        );
+
+        let embedding_metas = collect_embedding_metas(probe_cell_indices(&cell, &schema));
+
+        assert_eq!(embedding_metas.len(), 1);
+        let meta = &embedding_metas[0];
+        assert_eq!(meta.field_id, hash_str("title_body"));
+        assert_eq!(meta.text, "hello. world");
+        assert_eq!(meta.model, EmbeddingModel::from("test-model"));
+    }
+
+    #[test]
+    fn compound_embedding_concat_with_array() {
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed_array("title", dovahkiin::types::Type::String),
+            Field::new_unindexed("body", dovahkiin::types::Type::String),
+        ]);
+        let mut schema = Schema::new("compound_embedding_array", None, fields, false, false);
+        schema.add_compound_index(
+            "title_body",
+            vec!["title".to_string(), "body".to_string()],
+            vec![IndexType::Embedding(EmbeddingModel::from("test-model"))],
+        );
+
+        let mut data = OwnedMap::new();
+        data.insert(
+            "title",
+            OwnedValue::PrimArray(OwnedPrimArray::String(vec![
+                "hello".to_string(),
+                "there".to_string(),
+            ])),
+        );
+        data.insert("body", OwnedValue::String("world".to_string()));
+        let cell = crate::ram::cell::OwnedCell::new_with_id(
+            schema.id,
+            &Id::new(1, 2),
+            OwnedValue::Map(data),
+        );
+
+        let embedding_metas = collect_embedding_metas(probe_cell_indices(&cell, &schema));
+
+        assert_eq!(embedding_metas.len(), 1);
+        let meta = &embedding_metas[0];
+        assert_eq!(meta.field_id, hash_str("title_body"));
+        assert_eq!(meta.text, "hello there. world");
+        assert_eq!(meta.model, EmbeddingModel::from("test-model"));
+    }
 }

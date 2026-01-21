@@ -373,7 +373,7 @@ impl AsyncClient {
         let schema_id = schema.id;
         match res {
             Ok(Ok(_)) => {
-                if schema.index_fields.is_empty() {
+                if schema.index_fields.is_empty() && schema.compound_index_fields.is_empty() {
                     // Nothing to process
                     return res;
                 }
@@ -419,7 +419,8 @@ impl AsyncClient {
         let schema = self.schema_client.get_by_name(&name).await?;
         let has_index_fields;
         let schema_id = if let Some(schema) = schema {
-            has_index_fields = !schema.index_fields.is_empty();
+            has_index_fields =
+                !schema.index_fields.is_empty() || !schema.compound_index_fields.is_empty();
             schema.id
         } else {
             return Ok(Err(DelSchemaError::SchemaDoesNotExisted));

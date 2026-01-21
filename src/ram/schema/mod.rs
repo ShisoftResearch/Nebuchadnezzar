@@ -38,10 +38,19 @@ pub struct Schema {
     pub field_index: BTreeMap<u64, Vec<usize>>,
     pub id_index: BTreeMap<u64, Vec<u64>>,
     pub index_fields: BTreeMap<u64, Vec<IndexType>>,
+    #[serde(default)]
+    pub compound_index_fields: BTreeMap<u64, CompoundIndex>,
     pub fields: Field,
     pub static_bound: usize,
     pub is_dynamic: bool,
     pub is_scannable: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CompoundIndex {
+    pub fields: Vec<String>,
+    pub field_ids: Vec<u64>,
+    pub indices: Vec<IndexType>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -68,6 +77,7 @@ impl Schema {
         let mut field_index = BTreeMap::new();
         let mut id_index = BTreeMap::new();
         let mut index_fields = BTreeMap::new();
+        let compound_index_fields = BTreeMap::new();
         fields.assign_offsets(
             &mut bound,
             &mut field_index,
@@ -99,6 +109,7 @@ impl Schema {
             field_index,
             id_index,
             index_fields,
+            compound_index_fields,
         }
     }
     pub fn new_with_id(
@@ -124,6 +135,36 @@ impl Schema {
             }
         }
         Some(field)
+    }
+
+    pub fn add_compound_index(&mut self, name: &str, fields: Vec<String>, indices: Vec<IndexType>) {
+        let field_ids = fields.iter().map(|field| hash_str(field)).collect();
+        let name_id = hash_str(name);
+        self.compound_index_fields.insert(
+            name_id,
+            CompoundIndex {
+                fields,
+                field_ids,
+                indices,
+            },
+        );
+    }
+
+    pub fn add_compound_index_with_ids(
+        &mut self,
+        name: &str,
+        field_ids: Vec<u64>,
+        indices: Vec<IndexType>,
+    ) {
+        let name_id = hash_str(name);
+        self.compound_index_fields.insert(
+            name_id,
+            CompoundIndex {
+                fields: vec![],
+                field_ids,
+                indices,
+            },
+        );
     }
 }
 
@@ -591,6 +632,39 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
             }
         }
     }
+    for (compound_id, compound) in &schema.compound_index_fields {
+        for index in &compound.indices {
+            let field_id = *compound_id;
+            let schema_id = schema.id;
+            match index {
+                IndexType::Vector(_metric_encoding) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .vector_client
+                            .new_index(schema_id, field_id)
+                            .await
+                            .map_err(|e| format!("Error creating vector index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
+                }
+                IndexType::Embedding(model) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .embedding_client
+                            .new_index(schema_id, field_id, model)
+                            .await
+                            .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     Ok(())
 }
 
@@ -601,6 +675,39 @@ pub async fn post_schema_delete(
     for (field, indices) in &schema.index_fields {
         for index in indices {
             let field_id = *field;
+            let schema_id = schema.id;
+            match index {
+                IndexType::Vector(_metric_encoding) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .vector_client
+                            .delete_index(schema_id, field_id)
+                            .await
+                            .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
+                }
+                IndexType::Embedding(_model) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .embedding_client
+                            .delete_index(schema_id, field_id)
+                            .await
+                            .map_err(|e| format!("Error deleting embedding index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for (compound_id, compound) in &schema.compound_index_fields {
+        for index in &compound.indices {
+            let field_id = *compound_id;
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(_metric_encoding) => {
