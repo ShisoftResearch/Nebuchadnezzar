@@ -84,7 +84,8 @@ impl DistributedInvertedIndexCoordinator {
         field_id: u64,
         query: &str,
         limit: usize,
-        rerank: bool, // Whether to recompute BM25 with global stats
+        rerank: bool, // Whether to recompute BM25 with global stats (distributed re-ranking)
+        phrase_boost: bool, // Whether to apply local phrase boosting
     ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
         if query.trim().is_empty() || limit == 0 {
             return Ok(Ok(vec![]));
@@ -103,7 +104,8 @@ impl DistributedInvertedIndexCoordinator {
                 schema_id,
                 field_id,
                 query: query.to_string(),
-                limit, // Each node returns top K
+                limit,        // Each node returns top K
+                phrase_boost, // Apply local phrase boosting if requested
             };
             tasks.push(async move { client.search_local(req).await });
         }
@@ -603,7 +605,7 @@ mod tests {
         assert_eq!(stats1.doc_count, 2, "Shard1 should have 2 documents");
 
         let hits1 = coord1
-            .distributed_search(schema_id, content_field_id, "rust", 10, false)
+            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
             .await
             .unwrap()
             .unwrap();
@@ -626,7 +628,7 @@ mod tests {
         assert_eq!(stats2.doc_count, 2, "Shard2 should have 2 documents");
 
         let hits2 = coord2
-            .distributed_search(schema_id, content_field_id, "rust", 10, false)
+            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
             .await
             .unwrap()
             .unwrap();
@@ -673,7 +675,7 @@ mod tests {
 
         // Test 5: Each shard finds its unique content
         let db_hits = coord1
-            .distributed_search(schema_id, content_field_id, "database", 10, false)
+            .distributed_search(schema_id, content_field_id, "database", 10, false, false)
             .await
             .unwrap()
             .unwrap();
@@ -681,7 +683,14 @@ mod tests {
         assert_eq!(db_hits[0].id, shard1_docs[1]);
 
         let search_hits = coord2
-            .distributed_search(schema_id, content_field_id, "search engine", 10, false)
+            .distributed_search(
+                schema_id,
+                content_field_id,
+                "search engine",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -782,7 +791,7 @@ mod tests {
 
         // Search
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "hello world", 10, false)
+            .distributed_search(schema_id, content_field_id, "hello world", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -824,7 +833,7 @@ mod tests {
 
         // Empty query should return empty results
         let hits_result = coordinator
-            .distributed_search(100, 1, "", 10, false)
+            .distributed_search(100, 1, "", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -832,7 +841,7 @@ mod tests {
 
         // Whitespace-only query should return empty results
         let hits_result = coordinator
-            .distributed_search(100, 1, "   ", 10, false)
+            .distributed_search(100, 1, "   ", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();

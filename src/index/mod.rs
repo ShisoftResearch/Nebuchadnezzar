@@ -147,9 +147,13 @@ impl IndexerClients {
         field_id: u64,
         query: &str,
         limit: usize,
+        phrase_boost: bool,
     ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
         match self.fulltext_indexer() {
-            Some(indexer) => match indexer.bm25_search(schema_id, field_id, query, limit).await {
+            Some(indexer) => match indexer
+                .bm25_search(schema_id, field_id, query, limit, phrase_boost)
+                .await
+            {
                 Ok(hits) => Ok(Ok(hits)),
                 Err(e) => Ok(Err(ReadError::ExecError(format!("Index error: {:?}", e)))),
             },

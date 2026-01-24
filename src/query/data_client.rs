@@ -222,9 +222,10 @@ impl IndexedDataClient {
         field_id: u64,
         query: &str,
         limit: usize,
+        phrase_boost: bool,
     ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
         self.index_clients
-            .bm25_search(schema, field_id, query, limit)
+            .bm25_search(schema, field_id, query, limit, phrase_boost)
             .await
     }
 }
@@ -1709,7 +1710,7 @@ mod test {
 
         let idx_data_client = server.indexed_data_client();
         let hits = idx_data_client
-            .bm25_search(schema_id, hash_str(TEXT_FIELD), "database ranking", 5)
+            .bm25_search(schema_id, hash_str(TEXT_FIELD), "database ranking", 5, true)
             .await
             .unwrap()
             .unwrap();
@@ -1728,7 +1729,7 @@ mod test {
         );
 
         let empty_hits = idx_data_client
-            .bm25_search(schema_id, hash_str(TEXT_FIELD), "quantum muffins", 5)
+            .bm25_search(schema_id, hash_str(TEXT_FIELD), "quantum muffins", 5, true)
             .await
             .unwrap()
             .unwrap();

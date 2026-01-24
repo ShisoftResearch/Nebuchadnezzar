@@ -737,6 +737,7 @@ impl InvertedIndexer {
         field_id: u64,
         query: &str,
         limit: usize,
+        rerank: bool,
     ) -> Result<Vec<BM25Hit>, IndexError> {
         if query.trim().is_empty() || limit == 0 {
             return Ok(vec![]);
@@ -789,11 +790,83 @@ impl InvertedIndexer {
         }
 
         // Sort by score and return top K
+        // Valid candidates for re-ranking are the top results from base BM25
         let mut hits = scores
             .into_iter()
             .map(|(id, score)| BM25Hit { id, score })
             .collect::<Vec<_>>();
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+        if rerank && !hits.is_empty() {
+            // Re-ranking step: Check for exact phrase matches
+            // We'll fetch content for top 2*limit candidates (or all if fewer)
+            let rerank_limit = (limit * 2).min(hits.len());
+            let candidates = &mut hits[0..rerank_limit];
+            let candidate_ids: Vec<Id> = candidates.iter().map(|h| h.id).collect();
+
+            // Fetch actual cell content
+            if let Ok(cells) = self.neb_client.read_all_cells(&candidate_ids).await {
+                // Determine if we have a potential phrase (query with spaces)
+                let query_phrase = query.trim().to_lowercase();
+
+                if query_phrase.contains(' ') {
+                    log::info!(
+                        "Reranking for phrase: '{}', candidates: {}",
+                        query_phrase,
+                        cells.len()
+                    );
+                    for (i, result) in cells.into_iter().enumerate() {
+                        match result {
+                            Ok(cell) => {
+                                let boost = match cell.data() {
+                                    OwnedValue::Map(map) => {
+                                        // Try to find the indexed field in the cell
+                                        // Because we only have field_id, we need a way to lookup field name
+                                        // However, usually we can assume the structured content is what we want
+                                        // For now, scan all string values in the cell
+                                        let mut found = false;
+                                        for (_, val) in map.map.iter() {
+                                            if let OwnedValue::String(s) = val {
+                                                log::info!("Checking content: '{}'", s);
+                                                if s.to_lowercase().contains(&query_phrase) {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if found {
+                                            log::info!("Found phrase match in doc idx {}", i);
+                                            2.0
+                                        } else {
+                                            1.0
+                                        }
+                                    }
+                                    OwnedValue::String(s) => {
+                                        if s.to_lowercase().contains(&query_phrase) {
+                                            2.0
+                                        } else {
+                                            1.0
+                                        }
+                                    }
+                                    _ => 1.0,
+                                };
+
+                                if boost > 1.0 {
+                                    candidates[i].score *= boost;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to read cell for candidate {}: {:?}", i, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Re-sort after boosting
+            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        }
+
         if hits.len() > limit {
             hits.truncate(limit);
         }
@@ -1294,13 +1367,13 @@ mod tests {
                 assert_eq!(stats.doc_count, 2, "Should have 2 documents indexed");
 
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "hello", 10)
+                    .bm25_search(schema_id, content_field_id, "hello", 10, false)
                     .await
                     .unwrap();
                 assert_eq!(hits.len(), 2, "Should find both documents with 'hello'");
 
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "rust", 10)
+                    .bm25_search(schema_id, content_field_id, "rust", 10, false)
                     .await
                     .unwrap();
                 assert_eq!(hits.len(), 1, "Should find 1 document with 'rust'");
@@ -1447,7 +1520,7 @@ mod tests {
 
                 // Search for the common term - should find all documents
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "concurrent", 100)
+                    .bm25_search(schema_id, content_field_id, "concurrent", 100, false)
                     .await
                     .unwrap();
                 assert_eq!(
@@ -1614,7 +1687,7 @@ mod tests {
 
                 // Search for the common term
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "overflow", 500)
+                    .bm25_search(schema_id, content_field_id, "overflow", 500, false)
                     .await
                     .unwrap();
 
@@ -1776,7 +1849,7 @@ mod tests {
         if let Some(ref index_builder) = server.indexer {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let hits = indexer
-                    .bm25_search(schema_id, content_field_id, "rust programming", 10)
+                    .bm25_search(schema_id, content_field_id, "rust programming", 10, false)
                     .await
                     .unwrap();
 
@@ -1913,7 +1986,7 @@ mod tests {
 
         // Search for "hello"
         let hits = indexer
-            .bm25_search(schema_id, field_id, "hello", 10)
+            .bm25_search(schema_id, field_id, "hello", 10, false)
             .await
             .unwrap();
         assert_eq!(hits.len(), 2);
@@ -1922,7 +1995,7 @@ mod tests {
 
         // Search for "world" - should find doc1
         let hits = indexer
-            .bm25_search(schema_id, field_id, "world", 10)
+            .bm25_search(schema_id, field_id, "world", 10, false)
             .await
             .unwrap();
         assert!(!hits.is_empty());
@@ -1930,7 +2003,7 @@ mod tests {
 
         // Search for "rust" - should find doc2
         let hits = indexer
-            .bm25_search(schema_id, field_id, "rust", 10)
+            .bm25_search(schema_id, field_id, "rust", 10, false)
             .await
             .unwrap();
         assert!(!hits.is_empty());
@@ -2011,7 +2084,7 @@ mod tests {
 
         // Search should return nothing
         let hits = indexer
-            .bm25_search(schema_id, field_id, "test", 10)
+            .bm25_search(schema_id, field_id, "test", 10, false)
             .await
             .unwrap();
         assert!(hits.is_empty());
@@ -2096,7 +2169,7 @@ mod tests {
 
         // Search should still work after flush
         let hits = indexer
-            .bm25_search(schema_id, field_id, "test", 10)
+            .bm25_search(schema_id, field_id, "test", 10, false)
             .await
             .unwrap();
         assert_eq!(hits.len(), doc_ids.len());
@@ -2166,7 +2239,9 @@ mod tests {
         indexer.update_stats_for_add(&meta2);
 
         // Search should find documents from all chunks
-        let hits = indexer.bm25_search(schema_id, field_id, "hello", 10).await;
+        let hits = indexer
+            .bm25_search(schema_id, field_id, "hello", 10, false)
+            .await;
         assert!(hits.is_ok(), "Search should succeed");
         let hits = hits.unwrap();
         assert_eq!(
@@ -2332,7 +2407,7 @@ mod tests {
 
         // Search for "rust" - should find doc1 and doc3
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "rust", 10, false)
+            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2344,7 +2419,7 @@ mod tests {
 
         // Search for "database" - should find doc2
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "database", 10, false)
+            .distributed_search(schema_id, content_field_id, "database", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2355,7 +2430,7 @@ mod tests {
 
         // Search for "programming" - should find doc1 and doc3
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "programming", 10, false)
+            .distributed_search(schema_id, content_field_id, "programming", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2366,7 +2441,7 @@ mod tests {
 
         // Search for "storage" - should find doc2
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "storage", 10, false)
+            .distributed_search(schema_id, content_field_id, "storage", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2488,7 +2563,7 @@ mod tests {
         // Verify initial indexing
         info!("Verifying initial indexing...");
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "initial", 10, false)
+            .distributed_search(schema_id, content_field_id, "initial", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2526,14 +2601,14 @@ mod tests {
 
         // Should find "updated" and "rust"
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "updated", 10, false)
+            .distributed_search(schema_id, content_field_id, "updated", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
         assert!(!hits.is_empty(), "Should find 'updated' after update");
 
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "rust", 10, false)
+            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -2900,7 +2975,7 @@ mod tests {
         );
 
         let hits_result = coordinator1
-            .distributed_search(schema_id, content_field_id, "recovery", 10, false)
+            .distributed_search(schema_id, content_field_id, "recovery", 10, false, false)
             .await
             .unwrap();
         let hits1 = hits_result.unwrap();
@@ -3034,7 +3109,7 @@ mod tests {
 
         // Search should still work - indices should be recoverable from disk
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "recovery", 10, false)
+            .distributed_search(schema_id, content_field_id, "recovery", 10, false, false)
             .await
             .unwrap();
         let hits2 = hits_result.unwrap();
@@ -3046,7 +3121,7 @@ mod tests {
 
         // Verify specific terms
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "document", 10, false)
+            .distributed_search(schema_id, content_field_id, "document", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -3057,7 +3132,7 @@ mod tests {
         );
 
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "one", 10, false)
+            .distributed_search(schema_id, content_field_id, "one", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -3298,19 +3373,181 @@ mod tests {
         );
 
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "initial", 10, false)
+            .distributed_search(schema_id, content_field_id, "initial", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
         assert_eq!(hits.len(), initial_count, "Should find recovered documents");
 
         let hits_result = coordinator2
-            .distributed_search(schema_id, content_field_id, "new", 10, false)
+            .distributed_search(schema_id, content_field_id, "new", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
         assert_eq!(hits.len(), new_doc_ids.len(), "Should find new documents");
 
         info!("Index recovery with new documents test passed!");
+    }
+
+    /// Test: Phrase re-ranking
+    /// Verifies that documents with the exact phrase rank higher when rerank=true
+    #[tokio::test]
+    async fn test_phrase_reranking() {
+        let _ = env_logger::try_init();
+        info!("Starting phrase re-ranking test");
+
+        let server_addr = "127.0.0.1:5730";
+        let group_name = "phrase_test_group";
+
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_count: 1,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+            },
+            server_addr,
+            group_name,
+            async |_| {},
+        )
+        .await;
+
+        let schema_id = 700u32;
+        let content_field = "content";
+        let content_field_id = hash_str(content_field) as u64;
+
+        let fields =
+            crate::ram::schema::Field::new_schema(vec![crate::ram::schema::Field::new_indexed(
+                content_field,
+                dovahkiin::types::Type::String,
+                vec![crate::ram::schema::IndexType::Fulltext],
+            )]);
+
+        let schema = crate::ram::schema::Schema::new_with_id(
+            schema_id,
+            "phrase_test_schema",
+            None,
+            fields,
+            false,
+            false,
+        );
+
+        server.meta.schemas.debug_only_new_schema(schema.clone());
+
+        // Find owned document IDs
+        let mut owned_doc_ids = Vec::new();
+        for i in 1000..1100 {
+            let test_id = Id::new(i, i);
+            if server
+                .consh
+                .get_server_id(test_id.higher)
+                .map(|sid| sid == server.server_id)
+                .unwrap_or(false)
+            {
+                owned_doc_ids.push(test_id);
+                if owned_doc_ids.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        let doc1_id = owned_doc_ids[0];
+        let doc2_id = owned_doc_ids[1];
+
+        // Doc 1: "Bill Gates founded Microsoft" (Exact phrase match for "Bill Gates")
+        // Doc 2: "The gates are open for Bill" (Terms present but not as phrase)
+
+        let mut cell1_data = OwnedMap::new();
+        cell1_data.insert(
+            content_field,
+            OwnedValue::String("Bill Gates founded Microsoft".to_string()),
+        );
+        let mut cell1 = OwnedCell::new_with_id(schema_id, &doc1_id, OwnedValue::Map(cell1_data));
+
+        let mut cell2_data = OwnedMap::new();
+        cell2_data.insert(
+            content_field,
+            OwnedValue::String("The gates are open for Bill".to_string()),
+        );
+        let mut cell2 = OwnedCell::new_with_id(schema_id, &doc2_id, OwnedValue::Map(cell2_data));
+
+        // Index documents
+        server.chunks.write_cell(&mut cell1).unwrap();
+        server.chunks.write_cell(&mut cell2).unwrap();
+
+        if let Some(ref index_builder) = server.indexer {
+            index_builder.ensure_indices(&cell1, &schema, None);
+            index_builder.ensure_indices(&cell2, &schema, None);
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        if let Some(ref index_builder) = server.indexer {
+            if let Some(indexer) = index_builder.clients.fulltext_indexer() {
+                // Search WITHOUT re-ranking
+                let hits_no_rerank = indexer
+                    .bm25_search(schema_id, content_field_id, "Bill Gates", 10, false)
+                    .await
+                    .unwrap();
+
+                assert_eq!(hits_no_rerank.len(), 2);
+                let score1_base = hits_no_rerank
+                    .iter()
+                    .find(|h| h.id == doc1_id)
+                    .unwrap()
+                    .score;
+                let score2_base = hits_no_rerank
+                    .iter()
+                    .find(|h| h.id == doc2_id)
+                    .unwrap()
+                    .score;
+
+                info!(
+                    "Base scores - Doc1 (phrase): {}, Doc2 (scattered): {}",
+                    score1_base, score2_base
+                );
+
+                // Search WITH re-ranking
+                let hits_rerank = indexer
+                    .bm25_search(schema_id, content_field_id, "Bill Gates", 10, true)
+                    .await
+                    .unwrap();
+
+                assert_eq!(hits_rerank.len(), 2);
+                let score1_boosted = hits_rerank.iter().find(|h| h.id == doc1_id).unwrap().score;
+                let score2_boosted = hits_rerank.iter().find(|h| h.id == doc2_id).unwrap().score;
+
+                info!(
+                    "Boosted scores - Doc1 (phrase): {}, Doc2 (scattered): {}",
+                    score1_boosted, score2_boosted
+                );
+
+                // Verification:
+                // 1. Doc1 should have been boosted (score > base score)
+                assert!(
+                    score1_boosted > score1_base,
+                    "Doc1 with phrase should be boosted"
+                );
+
+                // 2. Doc2 should NOT have been boosted significantly
+                assert!(
+                    (score2_boosted - score2_base).abs() < 0.001,
+                    "Doc2 without phrase should not be boosted"
+                );
+
+                // 3. Ratio check (approx 2x boost)
+                assert!(
+                    score1_boosted > score1_base * 1.9,
+                    "Boost should be approximately 2x"
+                );
+
+                info!("Phrase re-ranking test passed!");
+            }
+        }
     }
 }

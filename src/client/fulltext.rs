@@ -62,6 +62,7 @@ impl FullTextClient {
     /// * `field_id` - Field ID to search (must have Fulltext index)
     /// * `query` - Search query (will be tokenized)
     /// * `limit` - Maximum results to return
+    /// * `phrase_boost` - Whether to boost exact phrase matches
     ///
     /// # Returns
     /// Vector of `BM25Hit` with document IDs and scores
@@ -71,11 +72,12 @@ impl FullTextClient {
         field_id: u64,
         query: &str,
         limit: usize,
+        phrase_boost: bool,
     ) -> Result<Vec<BM25Hit>, RPCError> {
         let coordinator = self.coordinator();
 
         match coordinator
-            .distributed_search(schema_id, field_id, query, limit, false)
+            .distributed_search(schema_id, field_id, query, limit, false, phrase_boost)
             .await
         {
             Ok(Ok(hits)) => Ok(hits),
@@ -100,11 +102,12 @@ impl FullTextClient {
         field_id: u64,
         query: &str,
         limit: usize,
+        phrase_boost: bool,
     ) -> Result<Vec<BM25Hit>, RPCError> {
         let coordinator = self.coordinator();
 
         match coordinator
-            .distributed_search(schema_id, field_id, query, limit, true)
+            .distributed_search(schema_id, field_id, query, limit, true, phrase_boost)
             .await
         {
             Ok(Ok(hits)) => Ok(hits),
@@ -125,9 +128,11 @@ impl FullTextClient {
         field_name: &str,
         query: &str,
         limit: usize,
+        phrase_boost: bool,
     ) -> Result<Vec<BM25Hit>, RPCError> {
         let field_id = bifrost_hasher::hash_str(field_name) as u64;
-        self.search(schema_id, field_id, query, limit).await
+        self.search(schema_id, field_id, query, limit, phrase_boost)
+            .await
     }
 }
 

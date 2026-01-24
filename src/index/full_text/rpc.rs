@@ -29,6 +29,7 @@ pub struct InvertedSearchRequest {
     pub field_id: u64,
     pub query: String,
     pub limit: usize,
+    pub phrase_boost: bool,
 }
 
 /// Response containing search results from this partition
@@ -95,7 +96,13 @@ impl Service for InvertedIndexRPCService {
         async move {
             let hits = self
                 .indexer
-                .bm25_search(req.schema_id, req.field_id, &req.query, req.limit)
+                .bm25_search(
+                    req.schema_id,
+                    req.field_id,
+                    &req.query,
+                    req.limit,
+                    req.phrase_boost,
+                )
                 .await
                 .map_err(|e| InvertedIndexError::SearchError(format!("{:?}", e)))?;
 

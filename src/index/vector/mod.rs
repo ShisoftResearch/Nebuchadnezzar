@@ -26,7 +26,7 @@ pub enum MetricEncoding {
 }
 
 /// HNSW configuration for vector indexing.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct HnswConfig {
     /// Max connections per node (M).
     pub m: u16,
@@ -34,6 +34,24 @@ pub struct HnswConfig {
     pub ef_construction: u16,
     /// Default ef_search for queries when not overridden.
     pub ef_search_default: u16,
+    /// Diversity factor for neighbor selection (0.0-1.0).
+    /// Higher values = more selective = better angular diversity.
+    /// Default: 0.7. Critical for high-dimensional spaces.
+    pub diversity_factor: f32,
+}
+
+// Implement Eq manually (f32 doesn't implement Eq, but we need it for schemas)
+impl Eq for HnswConfig {}
+
+// Implement Hash manually since f32 doesn't implement Hash
+impl std::hash::Hash for HnswConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.m.hash(state);
+        self.ef_construction.hash(state);
+        self.ef_search_default.hash(state);
+        // Convert f32 to bits for hashing
+        self.diversity_factor.to_bits().hash(state);
+    }
 }
 
 impl Default for HnswConfig {
@@ -42,6 +60,7 @@ impl Default for HnswConfig {
             m: 16,
             ef_construction: 256,
             ef_search_default: 128,
+            diversity_factor: 0.7,
         }
     }
 }
@@ -211,8 +230,13 @@ impl VectorIndexClient {
         metric_encoding: MetricEncoding,
         hnsw_config: HnswConfig,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
-        self.get_vector_index_core()
-            .insert(cell_id, schema_id, field_id, metric_encoding, hnsw_config)
+        self.get_vector_index_core().insert(
+            cell_id,
+            schema_id,
+            field_id,
+            metric_encoding,
+            hnsw_config,
+        )
     }
 
     /// Remove a vector from the index.

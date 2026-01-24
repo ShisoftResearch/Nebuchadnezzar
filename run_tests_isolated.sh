@@ -114,44 +114,49 @@ while IFS= read -r test_name; do
     
     # Run test with timeout (directly using test binary)
     # Run in background so we can track PID and handle signals
-    timeout "$TIMEOUT" "$TEST_BINARY" "$test_name" --test-threads="$TEST_THREADS" --nocapture 2>&1 | tee /tmp/test_output.log &
+    # Use PIPESTATUS to capture the test exit code, not tee's exit code
+    (timeout "$TIMEOUT" "$TEST_BINARY" "$test_name" --test-threads="$TEST_THREADS" --nocapture 2>&1; echo $? > /tmp/test_exit_code.txt) | tee /tmp/test_output.log &
     CURRENT_TEST_PID=$!
     
-    # Wait for test to complete
-    if wait $CURRENT_TEST_PID; then
-        CURRENT_TEST_PID=""
+     # Wait for background process to complete
+    wait $CURRENT_TEST_PID
+    CURRENT_TEST_PID=""
+    
+    # Read the actual test exit code (captured by the subprocess)
+    TEST_EXIT_CODE=$(cat /tmp/test_exit_code.txt 2>/dev/null || echo "1")
+    
+    if [ "$TEST_EXIT_CODE" -eq 0 ]; then
         # Check if test was actually ignored (look for "test result: ok. 0 passed" with ignored > 0)
         if grep -q "test result: ok. 0 passed; 0 failed; 1 ignored" /tmp/test_output.log || \
            grep -q "... ignored$" /tmp/test_output.log; then
-            echo -e "${YELLOW}IGNORED${NC}"
-            IGNORED=$((IGNORED + 1))
-        else
-            echo -e "${GREEN}PASSED${NC}"
-            PASSED=$((PASSED + 1))
-        fi
+             echo -e "${YELLOW}IGNORED${NC}"
+             IGNORED=$((IGNORED + 1))
+         else
+             echo -e "${GREEN}PASSED${NC}"
+             PASSED=$((PASSED + 1))
+         fi
     else
-        EXIT_CODE=$?
-        CURRENT_TEST_PID=""
-        if [ $EXIT_CODE -eq 124 ]; then
-            # Timeout exit code
-            echo -e "${RED}TIMED OUT after ${TIMEOUT}s${NC}"
-            TIMED_OUT=$((TIMED_OUT + 1))
-            TIMED_OUT_TESTS+=("$test_name")
-        elif [ $EXIT_CODE -eq 130 ]; then
-            # User interrupted (Ctrl+C)
-            echo -e "${RED}INTERRUPTED${NC}"
-            cleanup
-        else
-            echo -e "${RED}FAILED${NC}"
-            FAILED=$((FAILED + 1))
-            FAILED_TESTS+=("$test_name")
-        fi
-    fi
+        if [ "$TEST_EXIT_CODE" -eq 124 ]; then
+             echo -e "${RED}TIMED OUT after ${TIMEOUT}s${NC}"
+             TIMED_OUT=$((TIMED_OUT + 1))
+             TIMED_OUT_TESTS+=("$test_name")
+         elif [ "$TEST_EXIT_CODE" -eq 130 ]; then
+             echo -e "${RED}INTERRUPTED${NC}"
+             cleanup
+         else
+             echo -e "${RED}FAILED${NC}"
+             FAILED=$((FAILED + 1))
+             FAILED_TESTS+=("$test_name")
+         fi
+     fi
     
     echo ""
     
-    # Small delay between tests to allow resource cleanup
+     # Small delay between tests to allow resource cleanup
     sleep 0.5
+    
+    # Clean up temp files
+    rm -f /tmp/test_output.log /tmp/test_exit_code.txt
 done <<< "$TEST_LIST"
 
 # Print summary
@@ -183,8 +188,8 @@ fi
 
 echo ""
 
-# Clean up temp file
-rm -f /tmp/test_output.log
+# Clean up temp files
+rm -f /tmp/test_output.log /tmp/test_exit_code.txt
 
 # Exit with error if any tests failed
 if [ $FAILED -gt 0 ] || [ $TIMED_OUT -gt 0 ]; then
