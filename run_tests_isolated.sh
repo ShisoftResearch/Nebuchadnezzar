@@ -53,15 +53,15 @@ echo ""
 # Build tests once
 echo "Building tests..."
 if [ -z "$FILTER" ]; then
-    cargo test --lib --no-run 2>&1 | grep -E "Compiling|Finished"
+    cargo test --lib --no-run  --target x86_64-unknown-linux-gnu 2>&1 | grep -E "Compiling|Finished"
 else
-    cargo test --lib "$FILTER" --no-run 2>&1 | grep -E "Compiling|Finished"
+    cargo test --lib "$FILTER" --no-run --target x86_64-unknown-linux-gnu 2>&1 | grep -E "Compiling|Finished"
 fi
 
 # Find the test binary
 # Try to use jq if available, otherwise fall back to find
 if command -v jq >/dev/null 2>&1; then
-    TEST_BINARY=$(cargo test --lib --no-run --message-format=json 2>/dev/null | \
+    TEST_BINARY=$(cargo test --lib --no-run --target x86_64-unknown-linux-gnu --message-format=json 2>/dev/null | \
         jq -r 'select(.profile.test == true) | select(.target.kind | contains(["lib"])) | .executable' | \
         grep -v "^null$" | head -1)
 fi
@@ -73,7 +73,7 @@ if [ -z "$TEST_BINARY" ] || [ ! -f "$TEST_BINARY" ]; then
     
     if [ -z "$TEST_BINARY" ] || [ ! -f "$TEST_BINARY" ]; then
         echo "Error: Could not find test binary in target/debug/deps"
-        echo "Please run 'cargo test --lib --no-run' first"
+        echo "Please run 'cargo test --lib --target x86_64-unknown-linux-gnu --no-run' first"
         exit 1
     fi
 fi
