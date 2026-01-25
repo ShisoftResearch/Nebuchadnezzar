@@ -97,9 +97,10 @@ impl Cleaner {
                         evict_pool.install(|| {
                             checks_ref_clone.list.par_iter().for_each(|chunk| {
                                 if let Some(ref tiered_manager) = chunk.tiered_manager {
-                                    // Cheap skip: only evict if we're above physical limit
+                                    // Cheap skip: only evict if we're above threshold-adjusted limit
                                     let hot = tiered_manager.hot_count_cached(chunk);
-                                    if hot * SEGMENT_SIZE > tiered_manager.physical_memory_limit {
+                                    let threshold_limit = tiered_manager.threshold_limit();
+                                    if hot * SEGMENT_SIZE > threshold_limit {
                                         match tiered_manager.evict_for_allocation(chunk) {
                                             Ok(evicted) => {
                                                 if evicted > 0 {

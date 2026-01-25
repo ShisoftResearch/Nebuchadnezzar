@@ -56,6 +56,15 @@ impl TieredMemoryManager {
         }
     }
 
+    /// Get the threshold-adjusted memory limit
+    ///
+    /// This is `physical_memory_limit * eviction_threshold_percent`, the point
+    /// at which eviction will be triggered.
+    #[inline]
+    pub fn threshold_limit(&self) -> usize {
+        (self.physical_memory_limit as f64 * self.eviction_threshold_percent as f64) as usize
+    }
+
     /// Check if eviction is needed and evict segments if necessary (legacy/test-only)
     ///
     /// NOTE: This method is kept for tests/benchmarks compatibility.
@@ -162,10 +171,10 @@ impl TieredMemoryManager {
         Ok(evicted_count)
     }
 
-    /// Check if allocating a new segment would exceed the limit and evict if needed
+    /// Check if allocating a new segment would exceed the threshold and evict if needed
     ///
-    /// This is more aggressive than check_and_evict - it doesn't use the threshold,
-    /// instead it checks if adding one more segment would exceed the physical limit.
+    /// Eviction is triggered when hot memory would exceed `physical_memory_limit * threshold`.
+    /// For example, with 512GB limit and 0.8 threshold, eviction starts at ~410GB.
     ///
     /// Returns the number of segments evicted
     pub fn evict_for_allocation(&self, chunk: &Chunk) -> Result<usize, io::Error> {
@@ -200,16 +209,20 @@ impl TieredMemoryManager {
                     self.physical_memory_limit * 2 // Force eviction
                 });
 
-        // Check if allocating one more segment would exceed the physical limit
-        if after_alloc_memory > self.physical_memory_limit {
-            let excess_bytes = after_alloc_memory.saturating_sub(self.physical_memory_limit);
+        // Check if allocating one more segment would exceed the threshold-adjusted limit
+        let threshold_limit =
+            (self.physical_memory_limit as f64 * self.eviction_threshold_percent as f64) as usize;
+        if after_alloc_memory > threshold_limit {
+            let excess_bytes = after_alloc_memory.saturating_sub(threshold_limit);
             let segments_to_evict = (excess_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE; // Round up
 
             info!(
-                "Proactive eviction before allocation: current {} hot segments ({} MB), would be {} MB after allocation, limit {} MB, evicting {} segments",
+                "Proactive eviction before allocation: current {} hot segments ({} MB), would be {} MB after allocation, threshold {} MB ({}% of {} MB), evicting {} segments",
                 hot_segments_count,
                 current_hot_memory / (1024 * 1024),
                 after_alloc_memory / (1024 * 1024),
+                threshold_limit / (1024 * 1024),
+                (self.eviction_threshold_percent * 100.0) as u32,
                 self.physical_memory_limit / (1024 * 1024),
                 segments_to_evict
             );
