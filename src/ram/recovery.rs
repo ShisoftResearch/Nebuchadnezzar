@@ -4,15 +4,14 @@ use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
 use super::segs::{Segment, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
-use libc::{c_void, mmap, munmap, open, MAP_FIXED, MAP_PRIVATE, O_RDONLY, PROT_READ};
-use lightning::map::Map;
+use lightning::map::{Map, WordMap};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 /// Discover all segment files in storage directories
 pub fn discover_segment_files(
@@ -105,14 +104,6 @@ struct StashedTombstone {
     hash: u64,
     version: u64,
     chunk_id: usize,
-}
-
-/// Pre-allocated segment with associated file data
-struct AllocatedSegment {
-    segment: lightning::aarc::Arc<Segment>,
-    file_info: SegmentFileInfo,
-    append_header: usize,
-    is_cold: bool,
 }
 
 /// Rebuild cell index by scanning segment memory
@@ -361,120 +352,22 @@ fn should_recover_as_cold(
             .unwrap_or(0);
         let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
 
-        // Check if file is compressed - compressed files CANNOT be mmap'd directly
-        // because the data needs to be decompressed first
-        let is_compressed = match is_backup_file_compressed(&file_info.path) {
-            Ok(compressed) => compressed,
-            Err(e) => {
-                warn!(
-                    "Failed to check if backup file is compressed: {}, assuming not compressed",
-                    e
-                );
-                false
-            }
-        };
-
-        // Can only recover as cold if: backup file, would exceed limit, AND not compressed
-        let recover_as_cold = file_info.is_backup && would_exceed_limit && !is_compressed;
+        // Recover as cold if: backup file and would exceed hot memory limit
+        // Compressed files are now supported via Vec-based recovery
+        let recover_as_cold = file_info.is_backup && would_exceed_limit;
 
         debug!(
-            "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, is_compressed={}, recover_as_cold={}",
+            "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
             chunk_hot_used / (1024 * 1024),
             physical_limit / (1024 * 1024),
             would_exceed_limit,
-            is_compressed,
             recover_as_cold
         );
-
-        if is_compressed && would_exceed_limit {
-            info!(
-                "Backup file {} is compressed, cannot recover as cold - falling back to hot recovery",
-                file_info.path.display()
-            );
-        }
 
         recover_as_cold
     } else {
         false // Tiered memory not enabled
     }
-}
-
-/// Check if a backup file is compressed by reading its magic header
-fn is_backup_file_compressed(path: &std::path::Path) -> io::Result<bool> {
-    use super::compression;
-    use std::io::Read;
-
-    let mut file = File::open(path)?;
-    let mut header = [0u8; 8]; // Read enough for v2 header
-
-    let bytes_read = match file.read(&mut header) {
-        Ok(n) => n,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => 0,
-        Err(e) => return Err(e),
-    };
-
-    Ok(compression::is_compressed(&header[..bytes_read]))
-}
-
-/// Recover a segment as cold by mmapping the backup file directly
-///
-/// IMPORTANT: This only works for UNCOMPRESSED backup files!
-/// Compressed files must be recovered as hot (the caller should check this).
-fn recover_segment_as_cold(segment: &Segment, file_info: &SegmentFileInfo) -> io::Result<()> {
-    info!(
-        "Recovering segment {} as COLD (tiered memory enabled)",
-        segment.id
-    );
-
-    // mmap the backup file directly instead of copying to memory
-    let c_path = std::ffi::CString::new(file_info.path.to_str().unwrap()).unwrap();
-    let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
-
-    if fd < 0 {
-        error!(
-            "Failed to open backup file for cold recovery: {:?}",
-            io::Error::last_os_error()
-        );
-        return Err(io::Error::last_os_error());
-    }
-
-    // Use MAP_FIXED to replace the anonymous mapping with file-backed
-    let mmap_addr = unsafe {
-        mmap(
-            segment.addr as *mut c_void,
-            SEGMENT_SIZE,
-            PROT_READ,
-            MAP_PRIVATE | MAP_FIXED,
-            fd,
-            0,
-        )
-    };
-
-    if mmap_addr == libc::MAP_FAILED {
-        unsafe {
-            libc::close(fd);
-        }
-        error!(
-            "Failed to mmap backup file for cold recovery: {:?}",
-            io::Error::last_os_error()
-        );
-        return Err(io::Error::last_os_error());
-    }
-
-    // Mark segment as cold (acquire lock and set state)
-    // Note: We don't need to keep the fd open, just mark it as cold
-    segment.set_cold();
-    // Close the fd since we don't need it anymore (will reopen on promotion)
-    unsafe { libc::close(fd) };
-    segment.set_archived(); // Already archived (it's the backup file!)
-
-    info!(
-        "Recovered segment {} as COLD from {}",
-        segment.id,
-        file_info.path.display()
-    );
-
-    Ok(())
 }
 
 /// Recover a segment as hot by copying file data to memory
@@ -517,244 +410,192 @@ fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
     );
 }
 
-/// Unmap a cold segment after scanning
-/// Cold segments will be remapped by the promotion process when accessed
-fn unmap_cold_segment(segment: &Segment) -> io::Result<()> {
+/// Free physical memory for a cold segment after scanning
+/// Uses MADV_DONTNEED to release backing pages while keeping virtual address valid
+/// Cold segments will be reloaded by the promotion process when accessed
+fn free_cold_segment_memory(segment: &Segment) {
     debug!(
-        "Unmapping cold segment {} at address {:#x}",
+        "Freeing physical memory for cold segment {} at address {:#x}",
         segment.id, segment.addr
     );
 
-    let result = unsafe { munmap(segment.addr as *mut c_void, SEGMENT_SIZE) };
-
-    if result != 0 {
-        let err = io::Error::last_os_error();
-        error!(
-            "Failed to unmap cold segment {} at {:#x}: {:?}",
-            segment.id, segment.addr, err
-        );
-        return Err(err);
-    }
-
-    debug!("Successfully unmapped cold segment {}", segment.id);
-    Ok(())
-}
-
-/// Phase 2a: Allocate all segments sequentially
-fn phase2a_allocate_segments(
-    files: &[SegmentFileInfo],
-    chunks: &[Chunk],
-    hot_memory_used: &Mutex<HashMap<usize, usize>>,
-    pool: &rayon::ThreadPool,
-) -> io::Result<Vec<AllocatedSegment>> {
-    info!("Phase 2a: Allocating segments in parallel...");
-
-    let mut allocated: Vec<(usize, AllocatedSegment)> = pool.install(|| {
-        files
-            .par_iter()
-            .enumerate()
-            .map(
-                |(idx, file_info)| -> io::Result<(usize, AllocatedSegment)> {
-                    let chunk = &chunks[file_info.chunk_id];
-
-                    debug!(
-                        "Allocating segment: chunk={}, seg={}, seq={}, path={}",
-                        file_info.chunk_id,
-                        file_info.seg_id,
-                        file_info.seq_id,
-                        file_info.path.display()
-                    );
-
-                    if file_info.size as usize > SEGMENT_SIZE {
-                        error!(
-                            "File {} size {} exceeds segment size {}",
-                            file_info.path.display(),
-                            file_info.size,
-                            SEGMENT_SIZE
-                        );
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "File size exceeds segment capacity",
-                        ));
-                    }
-
-                    // Check if a segment with the same ID already exists (e.g., bootstrap segment)
-                    // If so, we reuse it instead of allocating a new one to preserve address consistency
-                    // This is critical because cell addresses stored in cell_index point to the original
-                    // segment addresses - if we allocate a different segment, addresses won't match!
-                    let segment =
-                        if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
-                            debug!(
-                                "Reusing existing segment {} for recovery (chunk {})",
-                                file_info.seg_id, file_info.chunk_id
-                            );
-                            existing_seg
-                        } else {
-                            // Allocate segment at the SPECIFIC segment ID to ensure correct address
-                            // This is crucial for recovery - the data was written assuming specific addresses
-                            let new_seg = chunk
-                                .allocator
-                                .alloc_seg_at_id(
-                                    file_info.seg_id,
-                                    file_info.seq_id,
-                                    &chunk.file_manager,
-                                )
-                                .ok_or_else(|| {
-                                    error!(
-                                    "Failed to allocate segment {} for chunk {} during recovery",
-                                    file_info.seg_id, file_info.chunk_id
-                                );
-                                    io::Error::new(
-                                        io::ErrorKind::OutOfMemory,
-                                        "Cannot allocate segment during recovery",
-                                    )
-                                })?;
-                            // Add new segment to chunk and get the AArc reference
-                            let seg_id = new_seg.id as usize;
-                            chunk.put_segment(new_seg);
-                            chunk.segs.get(&seg_id).unwrap()
-                        };
-
-                    // Determine recovery mode and reserve hot memory under lock to avoid races
-                    let should_recover_cold = {
-                        let mut hot_used = hot_memory_used.lock();
-                        let recover_cold = should_recover_as_cold(chunk, file_info, &hot_used);
-                        if !recover_cold {
-                            *hot_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
-                        }
-                        recover_cold
-                    };
-
-                    let append_header = if should_recover_cold {
-                        recover_segment_as_cold(&segment, file_info)?;
-                        find_append_header(segment.addr, file_info.size as usize)
-                    } else {
-                        let file_data = load_file_to_memory(&file_info.path)?;
-                        if file_data.len() > SEGMENT_SIZE {
-                            error!(
-                                "File {} size {} exceeds segment size {}",
-                                file_info.path.display(),
-                                file_data.len(),
-                                SEGMENT_SIZE
-                            );
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "File size exceeds segment capacity",
-                            ));
-                        }
-                        recover_segment_as_hot(&segment, &file_data);
-                        find_append_header(segment.addr, file_data.len())
-                    };
-
-                    info!(
-                        "Allocated segment: chunk={} seg={} seq={} append_offset={} mode={}",
-                        file_info.chunk_id,
-                        segment.id,
-                        segment.seq_id,
-                        append_header - segment.addr,
-                        if should_recover_cold { "COLD" } else { "HOT" }
-                    );
-
-                    Ok((
-                        idx,
-                        AllocatedSegment {
-                            segment: segment.clone(),
-                            file_info: file_info.clone(),
-                            append_header,
-                            is_cold: should_recover_cold,
-                        },
-                    ))
-                },
-            )
-            .collect::<io::Result<Vec<_>>>()
-    })?;
-
-    // Preserve original file ordering (by seq_id) to ensure proper version resolution
-    // Sort by seq_id to process segments in chronological order
-    allocated.sort_by_key(|(idx, alloc)| (alloc.file_info.seq_id, *idx));
-    let allocated: Vec<AllocatedSegment> = allocated.into_iter().map(|(_, alloc)| alloc).collect();
+    // segment.free_memory() uses MADV_DONTNEED to release physical pages
+    // while keeping the virtual address mapping intact
+    segment.free_memory();
 
     debug!(
-        "Allocated segments in seq_id order: {:?}",
-        allocated
-            .iter()
-            .map(|a| (a.file_info.seq_id, a.segment.id))
-            .collect::<Vec<_>>()
+        "Freed physical pages for cold segment {} (virtual address {:#x} remains valid)",
+        segment.id, segment.addr
     );
-
-    info!("Allocated {} segments", allocated.len());
-    Ok(allocated)
 }
 
-/// Phase 2b-3-4: Process segments in parallel, scan and build indices
-/// Currently unused - we use sequential processing to ensure proper version ordering
-#[allow(dead_code)]
-fn phase2b_3_4_parallel_scan(
-    allocated: &[AllocatedSegment],
-    chunks: &[Chunk],
-    progress: &AtomicUsize,
-    pool: &rayon::ThreadPool,
+/// Scan segment data from a slice and update cell index.
+/// Unlike scan_segment_and_update_index, this scans from `data` slice but computes
+/// virtual addresses as `segment.addr + offset`. This allows cold segments to be
+/// scanned from a Vec without copying to segment memory (no physical pages committed).
+///
+/// After scanning, the cell index contains valid virtual addresses that will
+/// trigger segment promotion on access.
+///
+/// Uses version_map to compare versions without reading from segment memory.
+fn scan_segment_from_data(
+    chunk: &Chunk,
+    segment: &Segment,
+    data: &[u8],
+    version_map: &WordMap,
 ) -> Vec<StashedTombstone> {
-    info!(
-        "Phase 2b-3-4: Parallel segment scanning and index building... ({} segments)",
-        allocated.len()
-    );
+    let data_base = data.as_ptr() as usize;
+    let segment_base = segment.addr;
+    let bound = data_base + data.len();
 
-    // Process segments in parallel
-    info!("Entering pool.install() for parallel processing");
-    let all_stashed: Vec<Vec<StashedTombstone>> = pool.install(|| {
-        info!("Inside pool.install(), starting parallel iteration");
-        allocated
-            .par_iter()
-            .map(|alloc| {
-                let chunk = &chunks[alloc.file_info.chunk_id];
-                let segment = &alloc.segment;
+    let mut cursor = data_base;
+    let mut stashed_tombstones = Vec::new();
+    let mut tombstone_count = 0u32;
+    let mut dead_space = 0u64;
+    let mut entries_processed = 0u32;
+    let mut append_header = data_base;
 
-                // Set append_header
-                segment
-                    .append_header
-                    .store(alloc.append_header, Ordering::Release);
+    while cursor < bound {
+        entries_processed += 1;
+        if entries_processed > 1_000_000 {
+            warn!(
+                "Cold segment {} scan exceeded 1M entries, breaking",
+                segment.id
+            );
+            break;
+        }
+        let prev_cursor = cursor;
 
-                // Insert segment into chunk (thread-safe)
-                chunk.segs.insert_back(segment.id as usize, segment.clone());
+        let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
+        let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
 
-                // Scan segment and update cell index
-                let stashed = scan_segment_and_update_index(chunk, segment, alloc.append_header);
+        if entry_size == 0 || entry_size > SEGMENT_SIZE || entry_size < ENTRY_HEAD_SIZE {
+            break;
+        }
 
-                // Unmap cold segments immediately after scanning
-                // They will be remapped by promotion process when accessed
-                if alloc.is_cold {
-                    if let Err(e) = unmap_cold_segment(segment) {
-                        warn!(
-                            "Failed to unmap cold segment {} after scanning: {}",
-                            segment.id, e
-                        );
+        let offset = cursor - data_base;
+        let virtual_cursor = segment_base + offset;
+
+        match entry_header.entry_type {
+            EntryType::CELL => {
+                let content_addr = Entry::content_pos(cursor);
+                let cell_header = cell_header_from_entry_content_addr(content_addr);
+                let hash = cell_header.hash;
+                let new_version = cell_header.version;
+
+                // Use version_map to check existing version (concurrent-safe)
+                let mut version_guard =
+                    version_map.lock_or_insert(hash as usize, new_version as usize);
+                let existing_version = *version_guard as u64;
+
+                if new_version >= existing_version {
+                    // Our version is newer or equal, update cell_index and version_map
+                    *version_guard = new_version as usize;
+                    drop(version_guard);
+
+                    let mut cell_guard = chunk
+                        .cell_index
+                        .lock_or_insert(hash as usize, virtual_cursor);
+                    if *cell_guard != virtual_cursor {
+                        let existing_addr = *cell_guard;
+                        if existing_addr == 0 {
+                            *cell_guard = virtual_cursor;
+                        } else {
+                            // Update dead space for old entry if in hot segment
+                            if let Some(old_seg) = chunk.locate_segment(existing_addr) {
+                                if !old_seg.is_cold() {
+                                    let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                                    old_seg
+                                        .dead_space
+                                        .fetch_add(entry.content_length, Ordering::Relaxed);
+                                    old_seg.note_dead_bytes_change();
+                                }
+                            }
+                            *cell_guard = virtual_cursor;
+                        }
                     }
+                } else {
+                    // Existing version is newer, this entry is dead
+                    dead_space += entry_header.content_length as u64;
                 }
+            }
 
-                // Update progress
-                let completed = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                if completed % 10 == 0 || completed == allocated.len() {
-                    info!(
-                        "Recovery progress: {}/{} segments processed",
-                        completed,
-                        allocated.len()
-                    );
+            EntryType::TOMBSTONE => {
+                let content_addr = Entry::content_pos(cursor);
+                let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
+                let hash = tombstone.hash;
+                tombstone_count += 1;
+
+                // Use lock_or_insert to handle case where no version exists yet
+                let mut version_guard =
+                    version_map.lock_or_insert(hash as usize, tombstone.version as usize);
+                let existing_version = *version_guard as u64;
+
+                if tombstone.version >= existing_version {
+                    // Update version_map BEFORE releasing lock (prevents race)
+                    *version_guard = tombstone.version as usize;
+                    drop(version_guard);
+
+                    // Tombstone is newer, delete cell from index
+                    if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
+                        let existing_addr = *cell_guard;
+                        if existing_addr != 0 {
+                            *cell_guard = 0;
+                            if let Some(target_seg) = chunk.locate_segment(existing_addr) {
+                                if !target_seg.is_cold() {
+                                    let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                                    target_seg
+                                        .dead_space
+                                        .fetch_add(entry.content_length, Ordering::Relaxed);
+                                    target_seg.note_dead_bytes_change();
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    drop(version_guard);
+                    stashed_tombstones.push(StashedTombstone {
+                        hash,
+                        version: tombstone.version,
+                        chunk_id: chunk.id,
+                    });
                 }
+            }
 
-                stashed
-            })
-            .collect()
-    });
-    info!(
-        "Exited pool.install(), collected {} segment results",
-        all_stashed.len()
+            _ => {}
+        }
+
+        append_header = prev_cursor + entry_size;
+        let new_cursor = prev_cursor + entry_size;
+        if new_cursor <= prev_cursor {
+            break;
+        }
+        cursor = new_cursor;
+    }
+
+    // Set append_header to virtual address
+    let final_append_offset = append_header - data_base;
+    segment
+        .append_header
+        .store(segment_base + final_append_offset, Ordering::Release);
+
+    // Update segment statistics
+    let dead_space_u32 = dead_space.min(u32::MAX as u64) as u32;
+    segment.dead_space.store(dead_space_u32, Ordering::Release);
+    segment.tombstones.store(tombstone_count, Ordering::Release);
+    if dead_space_u32 > 0 || tombstone_count > 0 {
+        segment.note_dead_bytes_change();
+    }
+
+    debug!(
+        "Cold segment {} scanned from data: {} entries, {} dead bytes, {} stashed tombstones",
+        segment.id,
+        entries_processed,
+        dead_space_u32,
+        stashed_tombstones.len()
     );
 
-    info!("Parallel scanning complete");
-
-    // Merge stashed tombstones (pick latest version per hash)
-    merge_stashed_tombstones(all_stashed)
+    stashed_tombstones
 }
 
 /// Scan a single segment and update cell index
@@ -942,6 +783,134 @@ fn scan_segment_and_update_index(
     stashed_tombstones
 }
 
+/// Scan a hot segment and update both cell_index and version_map
+/// The version_map is used by cold segments for version comparison without reading segment memory
+fn scan_segment_and_update_index_with_versions(
+    chunk: &Chunk,
+    segment: &Segment,
+    bound: usize,
+    version_map: &WordMap,
+) -> Vec<StashedTombstone> {
+    let mut cursor = segment.addr;
+    let mut stashed_tombstones = Vec::new();
+    let mut tombstone_count = 0u32;
+    let mut dead_space = 0u64;
+    let mut entries_processed = 0u32;
+
+    while cursor < bound {
+        entries_processed += 1;
+        if entries_processed > 1_000_000 {
+            warn!("Segment {} scan exceeded 1M entries, breaking", segment.id);
+            break;
+        }
+        let prev_cursor = cursor;
+
+        let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
+        let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
+
+        if entry_size == 0 || entry_size > SEGMENT_SIZE || entry_size < ENTRY_HEAD_SIZE {
+            break;
+        }
+
+        match entry_header.entry_type {
+            EntryType::CELL => {
+                let content_addr = Entry::content_pos(cursor);
+                let cell_header = cell_header_from_entry_content_addr(content_addr);
+                let hash = cell_header.hash;
+                let new_version = cell_header.version;
+
+                // Update version_map (for cold segment comparison later)
+                let mut version_guard =
+                    version_map.lock_or_insert(hash as usize, new_version as usize);
+                let existing_version = *version_guard as u64;
+
+                if new_version >= existing_version {
+                    *version_guard = new_version as usize;
+                    drop(version_guard);
+
+                    // Update cell_index
+                    let mut cell_guard = chunk.cell_index.lock_or_insert(hash as usize, cursor);
+                    if *cell_guard != cursor {
+                        let existing_addr = *cell_guard;
+                        if existing_addr == 0 {
+                            *cell_guard = cursor;
+                        } else {
+                            // Mark old entry as dead
+                            if let Some(old_seg) = chunk.locate_segment(existing_addr) {
+                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                                old_seg
+                                    .dead_space
+                                    .fetch_add(entry.content_length, Ordering::Relaxed);
+                                old_seg.note_dead_bytes_change();
+                            }
+                            *cell_guard = cursor;
+                        }
+                    }
+                } else {
+                    drop(version_guard);
+                    dead_space += entry_header.content_length as u64;
+                }
+            }
+
+            EntryType::TOMBSTONE => {
+                let content_addr = Entry::content_pos(cursor);
+                let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
+                let hash = tombstone.hash;
+                tombstone_count += 1;
+
+                // Update version_map with tombstone version
+                let mut version_guard =
+                    version_map.lock_or_insert(hash as usize, tombstone.version as usize);
+                let existing_version = *version_guard as u64;
+
+                if tombstone.version >= existing_version {
+                    *version_guard = tombstone.version as usize;
+                    drop(version_guard);
+
+                    // Delete from cell_index
+                    if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
+                        let existing_addr = *cell_guard;
+                        if existing_addr != 0 {
+                            *cell_guard = 0;
+                            if let Some(target_seg) = chunk.locate_segment(existing_addr) {
+                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                                target_seg
+                                    .dead_space
+                                    .fetch_add(entry.content_length, Ordering::Relaxed);
+                                target_seg.note_dead_bytes_change();
+                            }
+                        }
+                    }
+                } else {
+                    drop(version_guard);
+                    stashed_tombstones.push(StashedTombstone {
+                        hash,
+                        version: tombstone.version,
+                        chunk_id: chunk.id,
+                    });
+                }
+            }
+
+            _ => {}
+        }
+
+        let new_cursor = prev_cursor + entry_size;
+        if new_cursor <= prev_cursor {
+            break;
+        }
+        cursor = new_cursor;
+    }
+
+    let dead_space_u32 = dead_space.min(u32::MAX as u64) as u32;
+    segment.dead_space.store(dead_space_u32, Ordering::Release);
+    segment.tombstones.store(tombstone_count, Ordering::Release);
+    if dead_space_u32 > 0 || tombstone_count > 0 {
+        segment.note_dead_bytes_change();
+    }
+
+    stashed_tombstones
+}
+
 /// Merge stashed tombstones from all threads, keeping latest version per hash
 fn merge_stashed_tombstones(all_stashed: Vec<Vec<StashedTombstone>>) -> Vec<StashedTombstone> {
     let mut merged: HashMap<u64, StashedTombstone> = HashMap::new();
@@ -1014,7 +983,7 @@ pub fn recover_chunks(
     raft_storage: &Option<String>,
     chunks: &[Chunk],
 ) -> io::Result<()> {
-    info!("=== Starting parallel recovery from storage directories ===");
+    info!("=== Starting streamlined recovery from storage directories ===");
 
     // Phase 1: Discover files
     let files = match phase1_discover_files(backup_storage, wal_storage) {
@@ -1039,9 +1008,7 @@ pub fn recover_chunks(
         ));
     }
 
-    // We have files to recover; ensure raft storage is configured so schemas can also recover.
-    // If a path is provided, allow cold start by creating the directory. If none is provided,
-    // panic to avoid restoring data without schemas.
+    // We have files to recover; ensure raft storage is configured
     if files.len() > 0 {
         match raft_storage {
             Some(path) => {
@@ -1062,69 +1029,202 @@ pub fn recover_chunks(
         }
     }
 
-    // Phase 1.5: Pre-set next_seq_id for each chunk BEFORE allocating segments
+    // Pre-set next_seq_id for each chunk BEFORE allocating segments
     phase1_5_set_initial_seq_ids(chunks, &files);
 
-    // Create thread pool for recovery operations
-    // Limit threads to the number of files to avoid overhead with small workloads
-    let max_threads = config.max_threads.unwrap_or(32);
-    let num_threads = max_threads.min(files.len().max(1));
+    info!("Processing {} segment files...", files.len());
+
+    // Track hot memory usage per chunk to decide hot vs cold
+    let hot_memory_used: Mutex<HashMap<usize, usize>> = Mutex::new(HashMap::new());
+    let all_stashed_tombstones: Mutex<Vec<StashedTombstone>> = Mutex::new(Vec::new());
+    let hot_count = std::sync::atomic::AtomicUsize::new(0);
+    let cold_count = std::sync::atomic::AtomicUsize::new(0);
+    let segments_processed = std::sync::atomic::AtomicUsize::new(0);
+
+    // Pre-compute hot vs cold decisions to avoid lock contention during parallel processing
+    let recovery_decisions: Vec<(SegmentFileInfo, bool)> = {
+        let mut hot_used: HashMap<usize, usize> = HashMap::new();
+        files
+            .iter()
+            .map(|file_info| {
+                let chunk = &chunks[file_info.chunk_id];
+                let is_cold = should_recover_as_cold(chunk, file_info, &hot_used);
+                if !is_cold {
+                    *hot_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
+                }
+                (file_info.clone(), is_cold)
+            })
+            .collect()
+    };
+
+    // Separate hot and cold files for two-phase processing
+    let (hot_files, cold_files): (Vec<_>, Vec<_>) = recovery_decisions
+        .into_iter()
+        .partition(|(_, is_cold)| !is_cold);
+
     info!(
-        "Creating recovery thread pool with {} threads (max configured: {}, files: {})",
-        num_threads,
-        max_threads,
-        files.len()
+        "Processing {} hot segments, {} cold segments",
+        hot_files.len(),
+        cold_files.len()
     );
-    let recovery_pool = rayon::ThreadPoolBuilder::new()
-        .thread_name(|idx| format!("recovery-t{}", idx))
-        .num_threads(num_threads)
-        .build()
-        .map_err(|e| {
-            error!("Failed to create recovery thread pool: {}", e);
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to create thread pool: {}", e),
-            )
+
+    // Create per-chunk version maps for comparing versions during cold segment recovery
+    // This allows cold segments to be scanned without loading data into segment memory
+    let version_maps: Vec<WordMap> = chunks
+        .iter()
+        .map(|_| WordMap::with_capacity(1024))
+        .collect();
+
+    // Track max seq_id per chunk to update allocators after recovery
+    // This ensures new segments continue from where recovered segments left off
+    let max_seq_ids: Vec<std::sync::atomic::AtomicU64> = chunks
+        .iter()
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect();
+
+    // Phase 1: Process HOT segments in parallel (keep in memory)
+    // These also populate the version_maps for later cold segment comparison
+    let total_files = hot_files.len() + cold_files.len();
+    hot_files
+        .into_par_iter()
+        .try_for_each(|(file_info, _)| -> io::Result<()> {
+            let chunk = &chunks[file_info.chunk_id];
+            let version_map = &version_maps[file_info.chunk_id];
+
+            let segment = if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
+                existing_seg
+            } else {
+                let new_seg = chunk
+                    .allocator
+                    .alloc_seg_at_id(file_info.seg_id, file_info.seq_id, &chunk.file_manager)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::OutOfMemory, "Cannot allocate segment")
+                    })?;
+                let seg_id = new_seg.id as usize;
+                chunk.put_segment(new_seg);
+                chunk.segs.get(&seg_id).unwrap()
+            };
+
+            let file_data = load_file_to_memory(&file_info.path)?;
+            if file_data.len() > SEGMENT_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
+            }
+
+            // Copy to segment memory
+            recover_segment_as_hot(&segment, &file_data);
+            let append_header = find_append_header(segment.addr, file_data.len());
+            segment
+                .append_header
+                .store(append_header, Ordering::Release);
+            drop(file_data);
+
+            // Scan and update both cell_index and version_map
+            let stashed = scan_segment_and_update_index_with_versions(
+                chunk,
+                &segment,
+                append_header,
+                version_map,
+            );
+            all_stashed_tombstones.lock().extend(stashed);
+            segment.set_archived();
+            segment.clear_dirty(); // Recovered segments should not be archived again
+            hot_count.fetch_add(1, Ordering::Relaxed);
+
+            // Track max seq_id for this chunk
+            max_seq_ids[file_info.chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
+
+            let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if processed % 100 == 0 {
+                info!("Recovery progress: {}/{} segments", processed, total_files);
+            }
+            Ok(())
         })?;
 
+    // Phase 2: Process COLD segments in parallel
+    // NO segment memory allocation - scan directly from Vec using version_map
+    cold_files
+        .into_par_iter()
+        .try_for_each(|(file_info, _)| -> io::Result<()> {
+            let chunk = &chunks[file_info.chunk_id];
+            let version_map = &version_maps[file_info.chunk_id];
+
+            // Allocate segment (virtual address only - no physical memory used)
+            let segment = if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
+                existing_seg
+            } else {
+                let new_seg = chunk
+                    .allocator
+                    .alloc_seg_at_id(file_info.seg_id, file_info.seq_id, &chunk.file_manager)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::OutOfMemory, "Cannot allocate segment")
+                    })?;
+                let seg_id = new_seg.id as usize;
+                chunk.put_segment(new_seg);
+                chunk.segs.get(&seg_id).unwrap()
+            };
+
+            // Mark as cold/archived BEFORE scanning
+            segment.set_cold();
+            segment.set_archived();
+            segment.clear_dirty(); // Recovered segments should not be archived again
+
+            // Load data to heap memory (temporary)
+            let file_data = load_file_to_memory(&file_info.path)?;
+            if file_data.len() > SEGMENT_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
+            }
+
+            // Scan from Vec - NO COPY to segment memory
+            // Uses version_map for comparing versions instead of reading segment memory
+            let stashed = scan_segment_from_data(chunk, &segment, &file_data, version_map);
+            all_stashed_tombstones.lock().extend(stashed);
+            cold_count.fetch_add(1, Ordering::Relaxed);
+
+            // Vec is dropped here - heap memory freed immediately
+            // Segment has no physical memory committed
+
+            // Track max seq_id for this chunk
+            max_seq_ids[file_info.chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
+
+            let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if processed % 100 == 0 || processed == total_files {
+                info!("Recovery progress: {}/{} segments", processed, total_files);
+            }
+            Ok(())
+        })?;
+
+    // Version maps are dropped here, freeing all temporary version tracking memory
+    drop(version_maps);
+    info!("Version maps freed, recovery memory usage reduced");
+
+    // Update allocator next_seq_id for each chunk to continue from max recovered seq_id
+    for (chunk_id, max_seq) in max_seq_ids.iter().enumerate() {
+        let next_seq = max_seq.load(Ordering::Relaxed);
+        if next_seq > 0 {
+            chunks[chunk_id].allocator.set_next_seq_id(next_seq);
+        }
+    }
+
+    let final_hot = hot_count.load(Ordering::Relaxed);
+    let final_cold = cold_count.load(Ordering::Relaxed);
+    let final_processed = segments_processed.load(Ordering::Relaxed);
     info!(
-        "Recovery thread pool created with {} threads",
-        recovery_pool.current_num_threads()
+        "Segment processing complete: {} hot, {} cold",
+        final_hot, final_cold
     );
 
-    // Phase 2a: Allocate all segments sequentially
-    info!(
-        "Phase 2a: Starting segment allocation for {} files",
-        files.len()
-    );
-    let hot_memory_used = Mutex::new(HashMap::new());
-    let allocated = phase2a_allocate_segments(&files, chunks, &hot_memory_used, &recovery_pool)?;
-    info!(
-        "Phase 2a: Completed, allocated {} segments",
-        allocated.len()
-    );
-
-    info!(
-        "Phase 2b-3-4: Starting parallel scanning of {} segments",
-        allocated.len()
-    );
-    let progress = AtomicUsize::new(0);
-    let stashed_tombstones =
-        phase2b_3_4_parallel_scan(&allocated, chunks, &progress, &recovery_pool);
-    info!("Phase 2b-3-4: Completed parallel scanning");
-
-    // Phase 4b: Apply stashed tombstones
-    apply_stashed_tombstones(&stashed_tombstones, chunks);
+    // Merge and apply stashed tombstones
+    let stashed = all_stashed_tombstones.into_inner();
+    let merged_tombstones = merge_stashed_tombstones(vec![stashed]);
+    apply_stashed_tombstones(&merged_tombstones, chunks);
 
     // Count recovered cells
     let total_cells = count_recovered_cells(chunks);
 
     info!(
-        "=== Recovery complete: {} cells across {} segments ===",
-        total_cells,
-        allocated.len()
+        "=== Recovery complete: {} cells across {} segments ({} hot, {} cold) ===",
+        total_cells, final_processed, final_hot, final_cold
     );
-    info!("=== Recovery completed successfully ===");
 
     Ok(())
 }

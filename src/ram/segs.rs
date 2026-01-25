@@ -1145,6 +1145,20 @@ impl SegmentAllocator {
         ))
     }
 
+    /// Set the next seq_id for allocations (used after recovery)
+    /// This ensures new segments continue from where recovered segments left off
+    pub fn set_next_seq_id(&self, seq_id: u64) {
+        let current = self.next_seq_id.load(Ordering::Relaxed);
+        // Only update if the new value is higher (could be called from multiple threads during recovery)
+        if seq_id as usize > current {
+            self.next_seq_id.store(seq_id as usize, Ordering::Release);
+            info!(
+                "Set next_seq_id for chunk {} to {} (was {})",
+                self.chunk_id, seq_id, current
+            );
+        }
+    }
+
     pub fn free(&self, seg_addr: usize) {
         debug_assert!(seg_addr >= self.base);
         debug_assert!(seg_addr < self.limit);
