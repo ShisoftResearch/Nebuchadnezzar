@@ -1180,7 +1180,7 @@ impl SegmentAllocator {
 
 pub unsafe fn madvise_free(addr: usize, size: usize) {
     #[cfg(target_os = "linux")]
-    let advice = MADV_FREE;
+    let advice = MADV_DONTNEED; // Drop the memory immediately instead of using MADV_FREE to wait for the kernel to reclaim it;
     #[cfg(not(target_os = "linux"))]
     let advice = MADV_DONTNEED;
 
