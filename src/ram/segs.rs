@@ -591,6 +591,7 @@ impl Segment {
                     }
 
                     file.sync_all()?;
+                    drop(file);
 
                     #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
                     {
@@ -602,12 +603,28 @@ impl Segment {
                         );
                     }
 
+                    // Sanity check: verify backup file actually exists before marking archived
+                    let backup_file_path = Path::new(&backup_file);
+                    if !backup_file_path.exists() {
+                        error!(
+                            "CRITICAL: Archive wrote segment {} but backup file does not exist at '{}'",
+                            self.id, backup_file
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!(
+                                "Archive failed: backup file '{}' not found after write",
+                                backup_file
+                            ),
+                        ));
+                    }
+
                     debug!(
-                        "Archived segment {} to backup file, keeping backup handler open",
-                        self.id
+                        "Archived segment {} to backup file '{}'",
+                        self.id, backup_file
                     );
                     self.set_archived();
-                    self.clear_dirty(); // Backup updated - clean state
+                    self.clear_dirty();
 
                     // Close and delete WAL file since backup now contains all data
                     // Recovery prefers backup files over WAL files (see file_manager.rs:272-285)

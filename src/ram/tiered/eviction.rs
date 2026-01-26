@@ -120,10 +120,28 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     // Verify file exists (either newly created or already present)
     let backup_path_ref = std::path::Path::new(&backup_path);
     if !backup_path_ref.exists() {
+        // Check if parent directory exists to help diagnose path issues
+        let parent_exists = backup_path_ref
+            .parent()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        error!(
+            "CRITICAL: Segment {} backup file does not exist at '{}'. \
+             Parent directory exists: {}. is_archived={}, is_dirty={}. \
+             This should not happen - segment was marked archived but file is missing!",
+            segment.id,
+            backup_path,
+            parent_exists,
+            segment.is_archived(),
+            segment.is_dirty()
+        );
         segment.set_hot();
         return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Segment {} backup file does not exist", segment.id),
+            io::ErrorKind::NotFound,
+            format!(
+                "Segment {} backup file does not exist at '{}' (parent_exists={})",
+                segment.id, backup_path, parent_exists
+            ),
         ));
     }
 

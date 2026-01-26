@@ -13,9 +13,26 @@ pub struct SegmentFileManager {
 impl SegmentFileManager {
     pub fn new(backup_storage: Option<String>, wal_storage: Option<String>) -> Self {
         Self {
-            backup_storage,
-            wal_storage,
+            backup_storage: backup_storage.map(|p| Self::normalize_path(&p)),
+            wal_storage: wal_storage.map(|p| Self::normalize_path(&p)),
         }
+    }
+
+    fn normalize_path(path: &str) -> String {
+        let normalized = PathBuf::from(path)
+            .components()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .into_owned();
+
+        if normalized != path {
+            warn!(
+                "Storage path normalized: '{}' -> '{}' (check config for double slashes)",
+                path, normalized
+            );
+        }
+
+        normalized
     }
 
     /// Get backup storage path
@@ -484,5 +501,32 @@ mod tests {
         assert_eq!(files[0].seq_id, 1);
         assert_eq!(files[1].seq_id, 2);
         assert_eq!(files[2].seq_id, 3);
+    }
+
+    #[test]
+    fn test_path_normalization() {
+        let mgr = SegmentFileManager::new(
+            Some("/mnt/data//backup".to_string()),
+            Some("/mnt/data//wal".to_string()),
+        );
+
+        assert_eq!(
+            mgr.backup_path(1, 2, 3),
+            Some("/mnt/data/backup/1-2-3.nbackup".to_string())
+        );
+        assert_eq!(
+            mgr.wal_path(1, 2, 3),
+            Some("/mnt/data/wal/1-2-3.nlog".to_string())
+        );
+
+        let mgr_trailing = SegmentFileManager::new(
+            Some("/mnt/data/backup/".to_string()),
+            Some("/mnt/data/wal/".to_string()),
+        );
+
+        assert_eq!(
+            mgr_trailing.backup_path(1, 2, 3),
+            Some("/mnt/data/backup/1-2-3.nbackup".to_string())
+        );
     }
 }
