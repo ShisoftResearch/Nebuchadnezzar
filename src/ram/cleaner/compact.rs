@@ -12,9 +12,28 @@ pub struct CompactCleaner;
 
 impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Segment) -> usize {
+        // Check references before locking to avoid conflict with writers
+        if seg.references.load(Ordering::Relaxed) > 0 {
+            debug!(
+                "Segment {} has active references, skipping cleaning",
+                seg.id
+            );
+            return 0;
+        }
+
         // Try to acquire segment lock first
         if !seg.lock_hot() {
             debug!("Segment {} is not hot or locked, skipping cleaning", seg.id);
+            return 0;
+        }
+
+        // Double-check references after locking
+        if seg.references.load(Ordering::Relaxed) > 0 {
+            debug!(
+                "Segment {} acquired active references during lock, skipping",
+                seg.id
+            );
+            seg.set_hot();
             return 0;
         }
 

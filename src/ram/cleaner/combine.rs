@@ -74,7 +74,26 @@ impl CombinedCleaner {
         // Skip cold segments to avoid accessing evicted data (would trigger promotion)
         let segments = selected_segments
             .iter()
-            .filter(|seg| seg.id != head_seg_id && seg.lock_hot())
+            .filter(|seg| {
+                if seg.id == head_seg_id {
+                    return false;
+                }
+                // Check references first to avoid locking if busy (fast path)
+                if seg.references.load(Ordering::Relaxed) > 0 {
+                    return false;
+                }
+                // Determine lock success
+                if !seg.lock_hot() {
+                    return false;
+                }
+                // Double-checked locking: re-read references to avoid race where writer increments
+                // after we checked but before we locked.
+                if seg.references.load(Ordering::Relaxed) > 0 {
+                    seg.set_hot(); // Revert lock
+                    return false;
+                }
+                true
+            })
             .cloned()
             .collect_vec();
 
