@@ -779,7 +779,7 @@ impl Service for DataManager {
                                     break;
                                 }
                             };
-                            let addr = **shared_cell.guard();
+                            let addr = shared_cell.cell_guard().get_ptr();
                             let version = shared_cell.header.version;
                             let cell_ref = shared_cell.to_owned().into_ref();
                             (addr, version, cell_ref)

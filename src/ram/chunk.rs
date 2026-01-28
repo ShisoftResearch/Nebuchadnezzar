@@ -509,46 +509,6 @@ impl Chunk {
                     warn!("Cannot find cell with hash {} for index is zero", hash);
                     return Err(ReadError::CellDoesNotExisted);
                 }
-
-                #[cfg(feature = "tiered_memory")]
-                {
-                    #[cfg(debug_assertions)]
-                    self.assert_address_aligned_for_read(*index, "location_for_read", hash);
-
-                    let seg_id = self.allocator.id_by_addr(*index);
-                    if let Some(segment) = self.segs.get(&seg_id) {
-                        use crate::ram::tiered::promotion::promote_segment;
-
-                        while segment.is_cold() {
-                            if segment.lock_cold() {
-                                debug!(
-                                    "[PROMOTION TRIGGERED] Cell read on cold segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                promote_segment(&segment);
-                                debug!(
-                                    "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                break;
-                            } else {
-                                debug!(
-                                    "[PROMOTION WAIT] Waiting for promotion of segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                while segment.is_locked() {
-                                    std::thread::yield_now();
-                                }
-                                debug!(
-                                    "[PROMOTION WAIT DONE] Retrying check for segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                            }
-                        }
-
-                        segment.mark_referenced();
-                    }
-                }
                 return Ok(index);
             }
             None => {
@@ -575,49 +535,6 @@ impl Chunk {
 
                 #[cfg(debug_assertions)]
                 self.assert_address_aligned_for_read(*index, "location_for_write", hash);
-
-                #[cfg(feature = "tiered_memory")]
-                if has_read {
-                    // Writes may also need to touch cold segments. If the target segment is cold,
-                    // promote it back to hot before proceeding so we never write into unmapped memory.
-                    // Always check, not just when has_read is true, because we may read old cell data.
-                    let seg_id = self.allocator.id_by_addr(*index);
-                    if let Some(segment) = self.segs.get(&seg_id) {
-                        // Loop until segment is hot (handle promotion by another thread)
-                        while segment.is_cold() {
-                            use crate::ram::tiered::promotion::promote_segment;
-
-                            // Try to acquire the cold lock - if successful, we do the promotion
-                            if segment.lock_cold() {
-                                debug!(
-                                    "[PROMOTION TRIGGERED] Write access on cold segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                promote_segment(&segment);
-                                debug!(
-                                    "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                break;
-                            } else {
-                                // Another thread is promoting, wait and retry
-                                debug!(
-                                    "[PROMOTION WAIT] Waiting for promotion of segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                while segment.is_locked() {
-                                    std::thread::yield_now();
-                                }
-                                debug!(
-                                    "[PROMOTION WAIT DONE] Retrying check for segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                // Loop will recheck is_cold() - if promotion succeeded, it will be hot now
-                            }
-                        }
-                    }
-                }
-
                 Some(index)
             }
             None => None,
@@ -626,15 +543,15 @@ impl Chunk {
 
     pub fn lock_or_insert_cell(&self, hash: u64) -> CellGuard<'_> {
         let guard = self.cell_index.lock_or_insert(hash as usize, 0);
-        CellGuard::new(guard, self)
+        CellGuard::from_guard(guard, self)
     }
 
     pub(crate) fn head_cell(&self, hash: u64) -> Result<CellHeader, ReadError> {
-        header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
+        header_from_chunk_raw(*CellGuard::for_read(hash, self)?).map(|pair| pair.0)
     }
 
     pub fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
-        SharedCell::from_chunk_raw(self.location_for_read(hash)?, self).map(|(c, _)| c)
+        SharedCell::from_chunk_raw(CellGuard::for_read(hash, self)?, self).map(|(c, _)| c)
     }
 
     fn read_selected(
@@ -643,7 +560,7 @@ impl Chunk {
         fields: &[u64],
         need_header: bool,
     ) -> Result<SharedCell<'_>, ReadError> {
-        let loc = self.location_for_read(hash)?;
+        let loc = CellGuard::for_read(hash, self)?;
         let (val, hdr) = select_from_chunk_raw(*loc, self, fields, need_header)?;
         Ok(SharedCell::compose(
             SharedCellData::from_data(hdr, val),
@@ -652,7 +569,7 @@ impl Chunk {
     }
 
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
-        let loc = self.location_for_read(hash)?;
+        let loc = CellGuard::for_read(hash, self)?;
         let head_ptr = *loc + offset;
         let mut data = Vec::with_capacity(len);
         for ptr in head_ptr..(head_ptr + len) {
@@ -863,9 +780,8 @@ impl Chunk {
     where
         U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
     {
-        if let Some(cell_guard) = self.location_for_write(hash, true) {
-            let mut cell_guard = CellGuard::new(cell_guard, self);
-            let old_loc = *cell_guard.guard;
+        if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
+            let old_loc = cell_guard.get_ptr();
             match SharedCellData::from_chunk_raw(*cell_guard, self) {
                 Ok((cell, schema)) => {
                     let old_indices = self
@@ -876,19 +792,6 @@ impl Chunk {
                     // Get old entry size BEFORE releasing lock to avoid race condition
                     // where old_loc could be corrupted after we update cell_index
                     let old_entry_size = if old_loc != 0 {
-                        let seg_id = self.allocator.id_by_addr(old_loc);
-                        if let Some(segment) = self.segs.get(&seg_id) {
-                            while segment.is_cold() {
-                                use crate::ram::tiered::promotion::promote_segment;
-                                if segment.lock_cold() {
-                                    promote_segment(&segment);
-                                    break;
-                                }
-                                while segment.is_locked() {
-                                    std::thread::yield_now();
-                                }
-                            }
-                        }
                         match Entry::decode_from(old_loc, |_, _| {}) {
                             (entry, _) => Some(entry.content_length),
                         }
@@ -941,25 +844,24 @@ impl Chunk {
 
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
         // Use location_for_read to ensure promotion happens if segment is cold
-        let guard = match self.location_for_read(hash) {
+        let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
             Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
             Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
             Err(e) => return Err(WriteError::ReadError(e)),
         };
-        let cell_location = *guard;
+        let cell_location = guard.get_ptr();
 
         if let Some(indexer) = &self.index_builder {
             match SharedCell::from_chunk_raw(guard, self) {
                 Ok((cell, schema)) => {
                     indexer.remove_indices(&cell, &*schema);
-                    let mut guard = cell.into_guard();
-                    guard.remove();
+                    cell.into_cell_guard().remove_cell();
                 }
                 Err(e) => return Err(WriteError::ReadError(e)),
             }
         } else {
-            guard.remove();
+            guard.remove_cell();
         }
         self.put_tombstone_by_cell_loc(cell_location)?;
         Ok(())
@@ -970,7 +872,7 @@ impl Chunk {
         P: Fn(&SharedCell) -> bool,
     {
         // Use location_for_read to ensure promotion happens if segment is cold
-        let guard = match self.location_for_read(hash) {
+        let guard = match CellGuard::for_read(hash, self) {
             Ok(guard) => guard,
             Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
             Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
@@ -982,7 +884,7 @@ impl Chunk {
             Ok((cell, schema)) => {
                 if predict(&cell) {
                     self.remove_indices(&cell, &schema);
-                    cell.into_guard().remove();
+                    cell.into_cell_guard().remove_cell();
                     self.put_tombstone_by_cell_loc(cell_location)?;
                     return Ok(());
                 }
@@ -1347,8 +1249,7 @@ impl Chunk {
     }
 
     pub fn lock_cell_for_read(&self, hash: u64) -> Result<CellGuard<'_>, ReadError> {
-        let guard = self.location_for_read(hash)?;
-        Ok(CellGuard::new(guard, self))
+        CellGuard::for_read(hash, self)
     }
 
     pub fn lock_cell_for_write(
@@ -1356,10 +1257,8 @@ impl Chunk {
         hash: u64,
         has_read: bool,
     ) -> Result<CellGuard<'_>, ReadError> {
-        let guard = self
-            .location_for_write(hash, has_read)
-            .ok_or(ReadError::CellDoesNotExisted)?;
-        Ok(CellGuard::new(guard, self))
+        CellGuard::for_write(hash, has_read, self)
+            .ok_or(ReadError::CellDoesNotExisted)
     }
 
     pub fn compare_version_and_update_cell(
@@ -1802,32 +1701,46 @@ impl Chunks {
 
 pub struct CellGuard<'a> {
     segment: Option<AArc<Segment>>,
-    guard: WordMutexGuard<'a>,
+    guard: Option<WordMutexGuard<'a>>,
     chunk: &'a Chunk,
     version: u64,
 }
 
 impl<'a> CellGuard<'a> {
-    pub fn new(guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Self {
+    pub fn from_guard(guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Self {
         let mut segment = None;
         let mut version = 0;
         if *guard != 0 {
-            segment = chunk.locate_segment(*guard);
-            if let Some(segment) = &segment {
-                segment.references.fetch_add(1, Ordering::Relaxed);
-                if segment.is_cold() {
-                    use crate::ram::tiered::promotion::promote_segment;
-                    promote_segment(segment);
+            #[cfg(feature = "tiered_memory")]
+            {
+                segment = chunk.locate_segment(*guard);
+                if let Some(segment) = &segment {
+                    segment.references.fetch_add(1, Ordering::Relaxed);
+                    if segment.is_cold() {
+                        crate::ram::tiered::promotion::promote_segment(segment);
+                    }
+                    segment.mark_referenced();
                 }
             }
             version = cell_version_from_chunk_raw(*guard).unwrap();
         }
+
         Self {
-            guard,
+            guard: Some(guard),
             chunk,
             segment,
             version,
         }
+    }
+
+    pub fn for_read(hash: u64, chunk: &'a Chunk) -> Result<Self, ReadError> {
+        let guard = chunk.location_for_read(hash)?;
+        Ok(Self::from_guard(guard, chunk))
+    }
+
+    pub fn for_write(hash: u64, has_read: bool, chunk: &'a Chunk) -> Option<Self> {
+        let guard = chunk.location_for_write(hash, has_read)?;
+        Some(Self::from_guard(guard, chunk))
     }
 
     fn update_version(&mut self, version: u64) {
@@ -1840,7 +1753,7 @@ impl<'a> CellGuard<'a> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        let (header, _) = header_from_chunk_raw(*self.guard)?;
+        let (header, _) = header_from_chunk_raw(self.get_ptr())?;
         self.update_version(header.version);
         Ok(header)
     }
@@ -1849,7 +1762,7 @@ impl<'a> CellGuard<'a> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        let version = cell_version_from_chunk_raw(*self.guard)?;
+        let version = cell_version_from_chunk_raw(self.get_ptr())?;
         self.update_version(version);
         Ok(version)
     }
@@ -1858,7 +1771,7 @@ impl<'a> CellGuard<'a> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        let (data, _) = SharedCellData::from_chunk_raw(*self.guard, self.chunk)?;
+        let (data, _) = SharedCellData::from_chunk_raw(self.get_ptr(), self.chunk)?;
         self.update_version(data.header.version);
         Ok(data.to_owned())
     }
@@ -1867,17 +1780,17 @@ impl<'a> CellGuard<'a> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        let (data, _) = SharedCellData::from_chunk_raw(*self.guard, self.chunk)?;
+        let (data, _) = SharedCellData::from_chunk_raw(self.get_ptr(), self.chunk)?;
         self.update_version(data.header.version);
         Ok(data)
     }
 
     pub fn is_unassigned(&self) -> bool {
-        *self.guard == 0
+        self.get_ptr() == 0
     }
 
     pub fn update_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let old_cell_loc = *self.guard;
+        let old_cell_loc = self.get_ptr();
         if cell.header.version < self.version {
             cell.header.version = self.version;
         }
@@ -1894,8 +1807,9 @@ impl<'a> CellGuard<'a> {
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
-        let old_indices = self.chunk.old_index_res(&self.guard, schema)?;
-        *self.guard = new_cell_loc;
+        let guard = self.guard.as_mut().unwrap();
+        let old_indices = self.chunk.old_index_res(guard, schema)?;
+        **guard = new_cell_loc;
         self.chunk
             .ensure_indices_with_res(cell, old_indices, schema);
         self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
@@ -1910,7 +1824,7 @@ impl<'a> CellGuard<'a> {
     /// This is useful when you have a guard from `try_insert_locked` which may point to
     /// an empty slot (insert case) or an existing cell (update case).
     pub fn upsert_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let old_cell_loc = *self.guard;
+        let old_cell_loc = self.get_ptr();
         if cell.header.version < self.version {
             cell.header.version = self.version;
         }
@@ -1924,17 +1838,17 @@ impl<'a> CellGuard<'a> {
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
-
+        let guard = self.guard.as_mut().unwrap();
         if old_cell_loc != 0 {
             // Update case - cell already exists
-            let old_indices = self.chunk.old_index_res(&self.guard, &*schema)?;
-            *self.guard = new_cell_loc;
+            let old_indices = self.chunk.old_index_res(guard, &*schema)?;
+            **guard = new_cell_loc;
             self.chunk
                 .ensure_indices_with_res(cell, old_indices, &*schema);
             self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
         } else {
             // Insert case - new cell
-            *self.guard = new_cell_loc;
+            **guard = new_cell_loc;
             self.chunk.ensure_indices(cell, None, &*schema);
         }
 
@@ -1947,21 +1861,35 @@ impl<'a> CellGuard<'a> {
     }
 
     pub fn word_mutex_guard(&mut self) -> &mut WordMutexGuard<'a> {
-        &mut self.guard
+        self.guard.as_mut().unwrap()
     }
-}
 
-impl<'a> Drop for CellGuard<'a> {
-    fn drop(&mut self) {
+    pub fn get_ptr(&self) -> usize {
+        **self.guard.as_ref().unwrap() as usize
+    }
+
+    pub fn remove_cell(mut self) {
+        self.decrement_segment_references();
+        self.guard.take().unwrap().remove();
+    }
+
+    #[inline(always)]
+    fn decrement_segment_references(&self) {
         if let Some(segment) = &self.segment {
             segment.references.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
 
+impl<'a> Drop for CellGuard<'a> {
+    fn drop(&mut self) {
+        self.decrement_segment_references();
+    }
+}
+
 impl<'a> Deref for CellGuard<'a> {
     type Target = usize;
     fn deref(&self) -> &Self::Target {
-        &*self.guard
+        &**self.guard.as_ref().unwrap()
     }
 }

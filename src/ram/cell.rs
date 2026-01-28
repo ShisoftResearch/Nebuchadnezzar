@@ -1,3 +1,4 @@
+use crate::ram::chunk::CellGuard;
 use crate::ram::chunk::Chunk;
 use crate::ram::chunk::PendingEntry;
 use crate::ram::clock;
@@ -353,13 +354,13 @@ impl<'v> SharedCellData<'v> {
             data: self.data.owned(),
         }
     }
-    pub fn into_shared(self, guard: WordMutexGuard<'v>) -> SharedCell<'v> {
-        SharedCell { guard, inner: self }
+    pub fn into_shared(self, cell_guard: CellGuard<'v>) -> SharedCell<'v> {
+        SharedCell { cell_guard, inner: self }
     }
 }
 
 pub struct SharedData<'a, T> {
-    guard: WordMutexGuard<'a>,
+    cell_guard: CellGuard<'a>,
     inner: T,
 }
 
@@ -372,23 +373,23 @@ impl<'a, T> Deref for SharedData<'a, T> {
 }
 
 impl<'a, T> SharedData<'a, T> {
-    pub fn new(data: T, guard: WordMutexGuard<'a>) -> Self {
-        Self { inner: data, guard }
+    pub fn new(data: T, cell_guard: CellGuard<'a>) -> Self {
+        Self { inner: data, cell_guard }
     }
-    pub fn decompose(self) -> (T, WordMutexGuard<'a>) {
-        (self.inner, self.guard)
+    pub fn decompose(self) -> (T, CellGuard<'a>) {
+        (self.inner, self.cell_guard)
     }
-    pub fn compose(data: T, guard: WordMutexGuard<'a>) -> Self {
-        Self { inner: data, guard }
+    pub fn compose(data: T, cell_guard: CellGuard<'a>) -> Self {
+        Self { inner: data, cell_guard }
     }
-    pub fn guard(&self) -> &WordMutexGuard<'_> {
-        &self.guard
+    pub fn cell_guard(&self) -> &CellGuard<'a> {
+        &self.cell_guard
     }
-    pub fn guard_mut(&'a mut self) -> &'a mut WordMutexGuard<'a> {
-        &mut self.guard
+    pub fn cell_guard_mut(&'a mut self) -> &'a mut CellGuard<'a> {
+        &mut self.cell_guard
     }
-    pub fn into_guard(self) -> WordMutexGuard<'a> {
-        self.guard
+    pub fn into_cell_guard(self) -> CellGuard<'a> {
+        self.cell_guard
     }
 }
 
@@ -396,26 +397,26 @@ pub type SharedCell<'a> = SharedData<'a, SharedCellData<'a>>;
 
 impl<'a> SharedCell<'a> {
     pub fn from_chunk_raw(
-        guard: WordMutexGuard<'a>,
+        cell_guard: CellGuard<'a>,
         chunk: &'a Chunk,
     ) -> Result<(Self, SchemaRef), ReadError> {
-        let ptr = *guard;
+        let ptr = cell_guard.get_ptr();
         match SharedCellData::from_chunk_raw(ptr, chunk) {
             Ok((data, schema)) => {
-                let cell = Self { guard, inner: data };
+                let cell = Self { cell_guard, inner: data };
                 Ok((cell, schema))
             }
             Err(e) => Err(e),
         }
     }
     pub fn select_from_chunk_raw(
-        ptr: WordMutexGuard<'a>,
+        cell_guard: CellGuard<'a>,
         chunk: &'a Chunk,
         fields: &[u64],
         need_header: bool,
     ) -> Result<SharedCell<'a>, ReadError> {
-        select_from_chunk_raw(*ptr, chunk, fields, need_header).map(|(val, hdr)| SharedData {
-            guard: ptr,
+        select_from_chunk_raw(cell_guard.get_ptr(), chunk, fields, need_header).map(|(val, hdr)| SharedData {
+            cell_guard,
             inner: SharedCellData::from_data(hdr, val),
         })
     }
