@@ -755,13 +755,39 @@ impl Segment {
     }
     // remove the backup if it have one
     pub fn dispense(&self) {
-        debug!("dispense segment {}", self.id);
+        let backtrace = std::backtrace::Backtrace::capture();
+        eprintln!(
+            "[DISPENSE] segment {} (chunk={}, seq_id={}) - tiered_state={}\nBacktrace:\n{}",
+            self.id,
+            self.chunk_id,
+            self.seq_id,
+            if self.is_hot() { "HOT" } else { "COLD" },
+            backtrace
+        );
         let state = self.file_state.lock();
+        if let Some(backup_path) = state
+            .manager
+            .backup_path(self.chunk_id, self.id, self.seq_id)
+        {
+            let exists = std::path::Path::new(&backup_path).exists();
+            eprintln!(
+                "[DISPENSE] Deleting backup for segment {} (chunk={}, seq_id={}): {} (exists: {})",
+                self.id, self.chunk_id, self.seq_id, backup_path, exists
+            );
+        }
         if let Err(e) = state
             .manager
             .delete_all(self.chunk_id, self.id, self.seq_id)
         {
-            error!("cannot reclaim segment files on dispense: {}", e);
+            eprintln!(
+                "[DISPENSE ERROR] Failed to delete files for segment {} (chunk={}, seq_id={}): {}",
+                self.id, self.chunk_id, self.seq_id, e
+            );
+        } else {
+            eprintln!(
+                "[DISPENSE SUCCESS] Deleted files for segment {} (chunk={}, seq_id={})",
+                self.id, self.chunk_id, self.seq_id
+            );
         }
     }
 
@@ -780,7 +806,13 @@ impl Segment {
     /// This is a fast check that doesn't acquire the lock (may be stale)
     #[inline]
     pub fn is_cold(&self) -> bool {
-        self.tiered_lock.load(Ordering::Relaxed) & HOT_COLD_MASK == COLD_SEGMENT
+        // Check if segment is cold or being promoted (locked while cold)
+        // During promotion, tiered_lock is COLD_SEGMENT | LOCKING_SEGMENT_BITS
+        // We need to return true in both cases to prevent reads from seeing garbage
+        // Use Acquire ordering to ensure we see the latest state from other threads
+        let state = self.tiered_lock.load(Ordering::Acquire);
+        (state & HOT_COLD_MASK) == COLD_SEGMENT
+            || (state & HOT_COLD_MASK) == (COLD_SEGMENT | LOCKING_SEGMENT_BITS)
     }
 
     #[inline]
@@ -790,11 +822,50 @@ impl Segment {
     }
 
     pub fn set_cold(&self) {
+        // Debug: capture backtrace to track who is marking this segment cold
+        let backtrace = std::backtrace::Backtrace::capture();
+
+        // Verify backup file exists before marking cold
+        let backup_path = {
+            let state = self.file_state.lock();
+            state
+                .manager
+                .backup_path(self.chunk_id, self.id, self.seq_id)
+        };
+
+        if let Some(ref path) = backup_path {
+            let exists = std::path::Path::new(path).exists();
+            if !exists {
+                eprintln!(
+                    "CRITICAL BUG: set_cold() called for segment {} (chunk={}, seq_id={}) but backup file does NOT exist at '{}'!\n\
+                     Backtrace:\n{}",
+                    self.id, self.chunk_id, self.seq_id, path, backtrace
+                );
+                // Always panic to catch this immediately
+                panic!(
+                    "set_cold() called without backup file for segment {} (chunk={}, seq_id={}) at '{}'",
+                    self.id, self.chunk_id, self.seq_id, path
+                );
+            } else {
+                eprintln!(
+                    "[DEBUG] set_cold() for segment {} (chunk={}, seq_id={}): backup verified at '{}'",
+                    self.id, self.chunk_id, self.seq_id, path
+                );
+            }
+        } else {
+            eprintln!(
+                "[DEBUG] set_cold() for segment {} (chunk={}, seq_id={}) but no backup path configured",
+                self.id, self.chunk_id, self.seq_id
+            );
+        }
+
         self.tiered_lock.store(COLD_SEGMENT, Ordering::Relaxed);
     }
 
     pub fn set_hot(&self) {
-        self.tiered_lock.store(HOT_SEGMENT, Ordering::Relaxed);
+        // Use Release ordering to ensure all previous writes are visible before setting hot
+        // This pairs with Acquire in is_cold() to prevent reading stale data
+        self.tiered_lock.store(HOT_SEGMENT, Ordering::Release);
     }
     pub fn lock_cold(&self) -> bool {
         self.tiered_lock

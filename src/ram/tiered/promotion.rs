@@ -32,9 +32,9 @@ use std::thread;
 /// - No "empty window" - data is copied atomically from reader's perspective
 /// This function have to succeed or panic.
 pub fn promote_segment(segment: &Segment) {
-    debug!(
-        "Promoting segment {} to hot storage with cell locking",
-        segment.id
+    eprintln!(
+        "[PROMOTE] Starting promotion of segment {} (chunk={}, seq_id={})",
+        segment.id, segment.chunk_id, segment.seq_id
     );
 
     // Step 1: Acquire segment lock (blocks until available)
@@ -42,18 +42,28 @@ pub fn promote_segment(segment: &Segment) {
     loop {
         if segment.is_hot() {
             // Already hot, skip promotion
-            debug!("Segment {} is already hot, skipping promotion", segment.id);
+            eprintln!(
+                "[PROMOTE] Segment {} (chunk={}, seq_id={}) is already hot, skipping",
+                segment.id, segment.chunk_id, segment.seq_id
+            );
             return;
         }
         if segment.lock_cold() {
             // Locked cold, proceed with promotion
+            eprintln!(
+                "[PROMOTE] Acquired cold lock on segment {} (chunk={}, seq_id={})",
+                segment.id, segment.chunk_id, segment.seq_id
+            );
             break;
         }
         // Locked for any reason, wait
         thread::yield_now();
     }
 
-    debug!("Segment {} is cold, proceeding with promotion", segment.id);
+    eprintln!(
+        "[PROMOTE] Proceeding with promotion of segment {} (chunk={}, seq_id={})",
+        segment.id, segment.chunk_id, segment.seq_id
+    );
 
     // Step 3: Wait for no active references (prevents races with cleaner)
     // We hold the tiered_lock while waiting - this is safe because:
@@ -101,14 +111,34 @@ pub fn promote_segment(segment: &Segment) {
     let mut backup_file = match std::fs::File::open(&backup_path) {
         Ok(file) => file,
         Err(e) => {
-            error!(
-                "Failed to open backup file {} for segment {}: {}",
-                backup_path, segment.id, e
+            let parent_dir = std::path::Path::new(&backup_path).parent();
+            let files_in_dir: Vec<String> = parent_dir
+                .and_then(|p| std::fs::read_dir(p).ok())
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .filter(|name| name.contains(&format!("-{}-", segment.id)))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            eprintln!(
+                "PROMOTION FAILED: Failed to open backup file {} for segment {} (chunk={}, seq_id={}): {}\n\
+                 Files in directory matching seg_id {}: {:?}",
+                backup_path,
+                segment.id,
+                segment.chunk_id,
+                segment.seq_id,
+                e,
+                segment.id,
+                files_in_dir
             );
             segment.set_cold();
             panic!(
-                "Cannot promote segment {}: failed to open backup file: {}",
-                segment.id, e
+                "Cannot promote segment {} (seq_id={}): failed to open backup file: {}. \
+                 Existing files for this seg_id: {:?}",
+                segment.id, segment.seq_id, e, files_in_dir
             );
         }
     };
@@ -196,6 +226,10 @@ pub fn promote_segment(segment: &Segment) {
         ptr::copy_nonoverlapping(temp_buffer.as_ptr(), segment_addr as *mut u8, SEGMENT_SIZE);
     }
 
+    // Memory barrier: ensure the copy is complete and visible before marking hot
+    // This prevents other threads from reading the segment before data is fully written
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
     let restored_append_header = segment.addr + scanned_size;
     segment
         .append_header
@@ -243,6 +277,10 @@ pub fn promote_segment(segment: &Segment) {
     info!(
         "Successfully promoted segment {} to hot storage with cell locking",
         segment.id
+    );
+    eprintln!(
+        "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
+        segment.id, segment.chunk_id, segment.seq_id
     );
 }
 

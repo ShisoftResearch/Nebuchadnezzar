@@ -1,6 +1,6 @@
 use crate::ram::segs::Segment;
 use lightning::aarc::{Arc as AArc, AtomicArc};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// A lock-free array-based segment list that provides O(1) access by segment ID.
 /// Uses AtomicArc from Lightning to allow concurrent reads and updates without locks.
@@ -17,6 +17,8 @@ pub struct SegmentList {
     /// Each AtomicU64 covers 64 segments
     /// Bit i in bitmap[j] indicates if segment (j*64 + i) is occupied
     bitmap: Vec<AtomicU64>,
+    /// Cached count of active segments for O(1) len()
+    count: AtomicUsize,
 }
 
 impl SegmentList {
@@ -52,7 +54,11 @@ impl SegmentList {
             );
         }
 
-        SegmentList { segments, bitmap }
+        SegmentList {
+            segments,
+            bitmap,
+            count: AtomicUsize::new(0),
+        }
     }
 
     /// Set a bit in the bitmap
@@ -124,6 +130,7 @@ impl SegmentList {
         self.set_bit(key);
 
         if old.is_null() {
+            self.count.fetch_add(1, Ordering::Relaxed);
             None
         } else {
             Some(old)
@@ -159,6 +166,7 @@ impl SegmentList {
         } else {
             // Update bitmap: clear the bit for this segment
             self.clear_bit(*key);
+            self.count.fetch_sub(1, Ordering::Relaxed);
             Some(old)
         }
     }
@@ -227,10 +235,7 @@ impl SegmentList {
     /// Count the number of active segments
     /// Uses bitmap with population count for O(capacity/64) performance
     pub fn len(&self) -> usize {
-        self.bitmap
-            .iter()
-            .map(|word| word.load(Ordering::Acquire).count_ones() as usize)
-            .sum()
+        self.count.load(Ordering::Acquire)
     }
 
     /// Check if the list is empty

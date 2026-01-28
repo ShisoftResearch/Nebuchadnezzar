@@ -78,11 +78,19 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
                 );
             }
             Ok(false) => {
-                warn!(
-                    "Segment {} archive returned false before eviction",
+                eprintln!(
+                    "[EVICTION BUG] Segment {} (chunk={}, seq_id={}) archive returned Ok(false), aborting eviction",
+                    segment.id, segment.chunk_id, segment.seq_id
+                );
+                error!(
+                    "Segment {} archive returned false before eviction - aborting",
                     segment.id
                 );
-                // Continue anyway - backup file might exist from previous archive
+                segment.set_hot();
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Segment {} archive returned false", segment.id),
+                ));
             }
             Err(e) => {
                 error!(

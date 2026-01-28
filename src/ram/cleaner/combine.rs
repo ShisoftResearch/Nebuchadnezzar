@@ -276,7 +276,32 @@ impl CombinedCleaner {
                 })
                 .map(|(segment, cells)| {
                     trace!("Putting new segment {}, cells {}", segment.id, cells.len());
-                    segment.archive().unwrap();
+                    let archive_result = segment.archive();
+                    match archive_result {
+                        Ok(true) => {
+                            trace!("Segment {} archived successfully", segment.id);
+                        }
+                        Ok(false) => {
+                            eprintln!(
+                                "[COMBINE CRITICAL] Segment {} (chunk={}, seq_id={}) archive returned Ok(false) - NOT putting in list",
+                                segment.id, segment.chunk_id, segment.seq_id
+                            );
+                            panic!(
+                                "Combine failed: segment {} archive returned false",
+                                segment.id
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[COMBINE CRITICAL] Segment {} (chunk={}, seq_id={}) archive failed: {} - NOT putting in list",
+                                segment.id, segment.chunk_id, segment.seq_id, e
+                            );
+                            panic!(
+                                "Combine failed: segment {} archive error: {}",
+                                segment.id, e
+                            );
+                        }
+                    }
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();

@@ -401,17 +401,28 @@ impl Chunk {
                     });
                 }
                 None => {
-                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE {
+                    let total_space = self.segs.len() * SEGMENT_SIZE;
+                    if total_space >= self.capacity - SEGMENT_SIZE {
                         // No space left
                         if tried_gc {
+                            eprintln!(
+                                "chunk-allocation-failure: chunk={}, total_space={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}",
+                                self.id,
+                                total_space,
+                                self.capacity,
+                                self.head_seg_id.load(Ordering::Relaxed),
+                                self.segs.len(),
+                                full_gc
+                            );
+                            error!("No space left for chunk {}, cannot allocate space", self.id);
                             return Err(WriteError::CannotAllocateSpace);
                         } else if full_gc {
-                            debug!("No space left for chunk {}, emergency full GC", self.id);
+                            warn!("No space left for chunk {}, emergency full GC", self.id);
                             let _ = Cleaner::clean(self, true, true);
                             tried_gc = true;
                             continue;
                         } else {
-                            debug!(
+                            warn!(
                                 "No space left for chunk {}, emergency best effort GC",
                                 self.id
                             );
@@ -446,8 +457,6 @@ impl Chunk {
                     // head segment did not changed and locked, suitable for creating a new segment and point it to
                     let new_seg_opt = self.allocator.alloc_seg(&self.file_manager);
                     let new_seg = new_seg_opt.expect("No space left after full GCs");
-                    // for performance, won't CAS total_space
-                    self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                     let new_seg_id = new_seg.id;
 
                     // Publish new head segment id FIRST
@@ -509,14 +518,37 @@ impl Chunk {
                     let seg_id = self.allocator.id_by_addr(*index);
                     if let Some(segment) = self.segs.get(&seg_id) {
                         // If segment is cold (evicted to file), promote it back to hot
-                        if segment.is_cold() {
+                        // Loop until segment is hot (handle promotion by another thread)
+                        while segment.is_cold() {
                             use crate::ram::tiered::promotion::promote_segment;
 
-                            debug!(
-                                "Cell access triggered promotion of cold segment {}",
-                                segment.id
-                            );
-                            promote_segment(&segment)
+                            // Try to acquire the cold lock - if successful, we do the promotion
+                            if segment.lock_cold() {
+                                eprintln!(
+                                    "[PROMOTION TRIGGERED] Cell access on cold segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                promote_segment(&segment);
+                                eprintln!(
+                                    "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                break;
+                            } else {
+                                // Another thread is promoting, wait and retry
+                                eprintln!(
+                                    "[PROMOTION WAIT] Waiting for promotion of segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                while segment.is_locked() {
+                                    std::thread::yield_now();
+                                }
+                                eprintln!(
+                                    "[PROMOTION WAIT DONE] Retrying check for segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                // Loop will recheck is_cold() - if promotion succeeded, it will be hot now
+                            }
                         }
 
                         // Reference bit tracking:
