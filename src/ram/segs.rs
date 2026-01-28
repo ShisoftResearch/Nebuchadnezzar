@@ -798,7 +798,9 @@ impl Segment {
     /// This is a fast check that doesn't acquire the lock (may be stale)
     #[inline]
     pub fn is_hot(&self) -> bool {
-        self.tiered_lock.load(Ordering::Relaxed) & HOT_COLD_MASK == HOT_SEGMENT
+        // Use Acquire ordering to ensure we see the latest state from other threads
+        // This pairs with Release in set_hot() to prevent reading stale data
+        self.tiered_lock.load(Ordering::Acquire) & HOT_COLD_MASK == HOT_SEGMENT
     }
 
     /// Check if segment is cold (backed by file)

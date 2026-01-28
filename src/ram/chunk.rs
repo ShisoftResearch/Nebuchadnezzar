@@ -518,37 +518,18 @@ impl Chunk {
                     let seg_id = self.allocator.id_by_addr(*index);
                     if let Some(segment) = self.segs.get(&seg_id) {
                         // If segment is cold (evicted to file), promote it back to hot
-                        // Loop until segment is hot (handle promotion by another thread)
-                        while segment.is_cold() {
+                        if segment.is_cold() {
                             use crate::ram::tiered::promotion::promote_segment;
 
-                            // Try to acquire the cold lock - if successful, we do the promotion
-                            if segment.lock_cold() {
-                                eprintln!(
-                                    "[PROMOTION TRIGGERED] Cell access on cold segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                promote_segment(&segment);
-                                eprintln!(
-                                    "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                break;
-                            } else {
-                                // Another thread is promoting, wait and retry
-                                eprintln!(
-                                    "[PROMOTION WAIT] Waiting for promotion of segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                while segment.is_locked() {
-                                    std::thread::yield_now();
-                                }
-                                eprintln!(
-                                    "[PROMOTION WAIT DONE] Retrying check for segment {} (chunk={}, seq_id={})",
-                                    segment.id, segment.chunk_id, segment.seq_id
-                                );
-                                // Loop will recheck is_cold() - if promotion succeeded, it will be hot now
-                            }
+                            eprintln!(
+                                "[PROMOTION TRIGGERED] Cell access on cold segment {} (chunk={}, seq_id={})",
+                                segment.id, segment.chunk_id, segment.seq_id
+                            );
+                            promote_segment(&segment);
+                            eprintln!(
+                                "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
+                                segment.id, segment.chunk_id, segment.seq_id
+                            );
                         }
 
                         // Reference bit tracking:
@@ -589,19 +570,43 @@ impl Chunk {
                 self.assert_address_aligned_for_read(*index, "location_for_write", hash);
 
                 #[cfg(feature = "tiered_memory")]
-                if has_read {
+                {
                     // Writes may also need to touch cold segments. If the target segment is cold,
                     // promote it back to hot before proceeding so we never write into unmapped memory.
+                    // Always check, not just when has_read is true, because we may read old cell data.
                     let seg_id = self.allocator.id_by_addr(*index);
                     if let Some(segment) = self.segs.get(&seg_id) {
-                        if segment.is_cold() {
+                        // Loop until segment is hot (handle promotion by another thread)
+                        while segment.is_cold() {
                             use crate::ram::tiered::promotion::promote_segment;
 
-                            debug!(
-                                "Write access triggered promotion of cold segment {}",
-                                segment.id
-                            );
-                            promote_segment(&segment);
+                            // Try to acquire the cold lock - if successful, we do the promotion
+                            if segment.lock_cold() {
+                                eprintln!(
+                                    "[PROMOTION TRIGGERED] Write access on cold segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                promote_segment(&segment);
+                                eprintln!(
+                                    "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                break;
+                            } else {
+                                // Another thread is promoting, wait and retry
+                                eprintln!(
+                                    "[PROMOTION WAIT] Waiting for promotion of segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                while segment.is_locked() {
+                                    std::thread::yield_now();
+                                }
+                                eprintln!(
+                                    "[PROMOTION WAIT DONE] Retrying check for segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                // Loop will recheck is_cold() - if promotion succeeded, it will be hot now
+                            }
                         }
                     }
                 }
@@ -915,64 +920,55 @@ impl Chunk {
     }
 
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
-        let hash_key = hash as usize;
-        let guard_opt = self.cell_index.lock(hash_key);
-        if let Some(mut guard) = guard_opt {
-            let cell_location = *guard;
+        // Use location_for_read to ensure promotion happens if segment is cold
+        let guard = match self.location_for_read(hash) {
+            Ok(guard) => guard,
+            Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
+            Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
+            Err(e) => return Err(WriteError::ReadError(e)),
+        };
+        let cell_location = *guard;
 
-            #[cfg(debug_assertions)]
-            {
-                if cell_location != 0 {
-                    self.assert_address_aligned_for_read(cell_location, "remove_cell", hash);
+        if let Some(indexer) = &self.index_builder {
+            match SharedCell::from_chunk_raw(guard, self) {
+                Ok((cell, schema)) => {
+                    indexer.remove_indices(&cell, &*schema);
+                    let mut guard = cell.into_guard();
+                    guard.remove();
                 }
+                Err(e) => return Err(WriteError::ReadError(e)),
             }
-
-            if let Some(indexer) = &self.index_builder {
-                match SharedCell::from_chunk_raw(guard, self) {
-                    Ok((cell, schema)) => {
-                        indexer.remove_indices(&cell, &*schema);
-                        guard = cell.into_guard();
-                    }
-                    Err(e) => return Err(WriteError::ReadError(e)),
-                }
-            }
-            guard.remove();
-            self.put_tombstone_by_cell_loc(cell_location)?;
-            Ok(())
         } else {
-            Err(WriteError::CellDoesNotExisted)
+            guard.remove();
         }
+        self.put_tombstone_by_cell_loc(cell_location)?;
+        Ok(())
     }
 
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
     where
         P: Fn(&SharedCell) -> bool,
     {
-        let guard = self.cell_index.lock(hash as usize);
-        if let Some(guard) = guard {
-            let cell_location = *guard;
+        // Use location_for_read to ensure promotion happens if segment is cold
+        let guard = match self.location_for_read(hash) {
+            Ok(guard) => guard,
+            Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
+            Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
+            Err(e) => return Err(WriteError::ReadError(e)),
+        };
+        let cell_location = *guard;
 
-            #[cfg(debug_assertions)]
-            {
-                if cell_location != 0 {
-                    self.assert_address_aligned_for_read(cell_location, "remove_cell_by", hash);
+        match SharedCell::from_chunk_raw(guard, self) {
+            Ok((cell, schema)) => {
+                if predict(&cell) {
+                    self.remove_indices(&cell, &schema);
+                    cell.into_guard().remove();
+                    self.put_tombstone_by_cell_loc(cell_location)?;
+                    return Ok(());
                 }
+                Err(WriteError::CellDoesNotExisted)
             }
-
-            match SharedCell::from_chunk_raw(guard, self) {
-                Ok((cell, schema)) => {
-                    if predict(&cell) {
-                        self.remove_indices(&cell, &schema);
-                        cell.into_guard().remove();
-                        self.put_tombstone_by_cell_loc(cell_location)?;
-                        return Ok(());
-                    }
-                    Err(WriteError::CellDoesNotExisted)
-                }
-                Err(e) => Err(WriteError::ReadError(e)),
-            }
-        } else {
-            Err(WriteError::CellDoesNotExisted)
+            Err(e) => Err(WriteError::ReadError(e)),
         }
     }
 
