@@ -52,28 +52,13 @@ lindera = { version = "0.30", features = ["ipadic"] }
 crc-fast = "1.10.0"
 
 [features]
-# Enable zero-overhead page fault tracking via mprotect/SIGSEGV
-# When disabled (default), segments are marked as referenced directly during reads
-# Can be enabled for production use to get zero-overhead reference tracking
-# Default: disabled to avoid signal handler conflicts in tests
 default = ["cleaner", "combine_cleaner", "compact_cleaner", "tiered_memory", "compress_backups"]
-page_fault_tracking = ["tiered_memory"]
 
 cleaner = []
-# Enable combine cleaner: merges multiple sparse segments into dense ones
-# This improves memory utilization by consolidating fragmented segments
-# Default: enabled for better memory efficiency
 combine_cleaner = ["cleaner"]
-# Enable compact cleaner: compacts segments to reclaim dead space
 compact_cleaner = ["cleaner"]
 
-# Enable verbose page fault logging (only works in debug builds + page_fault_tracking feature)
-# Usage: cargo build --features debug_page_faults
-debug_page_faults = ["page_fault_tracking"]
-
 # Enable CRC32 checksum verification during eviction and promotion
-# Only works in debug builds (debug_assertions must be enabled)
-# Usage: cargo build --features verify_checksums
 debug_verify_checksums = ["tiered_memory"]
 
 # Enable LZ4 compression for segment backup files

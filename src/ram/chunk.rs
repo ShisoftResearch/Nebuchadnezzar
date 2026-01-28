@@ -514,32 +514,38 @@ impl Chunk {
                     #[cfg(debug_assertions)]
                     self.assert_address_aligned_for_read(*index, "location_for_read", hash);
 
-                    // Check if segment is cold and promote if needed
                     let seg_id = self.allocator.id_by_addr(*index);
                     if let Some(segment) = self.segs.get(&seg_id) {
-                        // If segment is cold (evicted to file), promote it back to hot
-                        if segment.is_cold() {
-                            use crate::ram::tiered::promotion::promote_segment;
+                        use crate::ram::tiered::promotion::promote_segment;
 
-                            debug!(
-                                "[PROMOTION TRIGGERED] Cell access on cold segment {} (chunk={}, seq_id={})",
-                                segment.id, segment.chunk_id, segment.seq_id
-                            );
-                            promote_segment(&segment);
-                            debug!(
-                                "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
-                                segment.id, segment.chunk_id, segment.seq_id
-                            );
+                        while segment.is_cold() {
+                            if segment.lock_cold() {
+                                debug!(
+                                    "[PROMOTION TRIGGERED] Cell read on cold segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                promote_segment(&segment);
+                                debug!(
+                                    "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                break;
+                            } else {
+                                debug!(
+                                    "[PROMOTION WAIT] Waiting for promotion of segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                                while segment.is_locked() {
+                                    std::thread::yield_now();
+                                }
+                                debug!(
+                                    "[PROMOTION WAIT DONE] Retrying check for segment {} (chunk={}, seq_id={})",
+                                    segment.id, segment.chunk_id, segment.seq_id
+                                );
+                            }
                         }
 
-                        // Reference bit tracking:
-                        // With page_fault_tracking feature: mprotect + SIGSEGV handles reference marking automatically
-                        // Without page_fault_tracking feature: mark reference bit directly here
-                        #[cfg(not(feature = "page_fault_tracking"))]
-                        {
-                            // Mark segment as referenced directly (no page fault tracking)
-                            segment.mark_referenced();
-                        }
+                        segment.mark_referenced();
                     }
                 }
                 return Ok(index);
@@ -570,7 +576,7 @@ impl Chunk {
                 self.assert_address_aligned_for_read(*index, "location_for_write", hash);
 
                 #[cfg(feature = "tiered_memory")]
-                {
+                if has_read {
                     // Writes may also need to touch cold segments. If the target segment is cold,
                     // promote it back to hot before proceeding so we never write into unmapped memory.
                     // Always check, not just when has_read is true, because we may read old cell data.
@@ -743,7 +749,7 @@ impl Chunk {
         let hash = cell.header.hash;
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
-        if let Some(mut guard) = self.location_for_write(hash, false) {
+        if let Some(mut guard) = self.location_for_write(hash, true) {
             let cell_location = *guard;
             let cell_version =
                 cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
@@ -784,7 +790,7 @@ impl Chunk {
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
         loop {
-            if let Some(mut guard) = self.location_for_write(hash, false) {
+            if let Some(mut guard) = self.location_for_write(hash, true) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
                 let cell_version = cell_version_from_chunk_raw(cell_location)
@@ -869,6 +875,19 @@ impl Chunk {
                     // Get old entry size BEFORE releasing lock to avoid race condition
                     // where old_loc could be corrupted after we update cell_index
                     let old_entry_size = if old_loc != 0 {
+                        let seg_id = self.allocator.id_by_addr(old_loc);
+                        if let Some(segment) = self.segs.get(&seg_id) {
+                            while segment.is_cold() {
+                                use crate::ram::tiered::promotion::promote_segment;
+                                if segment.lock_cold() {
+                                    promote_segment(&segment);
+                                    break;
+                                }
+                                while segment.is_locked() {
+                                    std::thread::yield_now();
+                                }
+                            }
+                        }
                         match Entry::decode_from(old_loc, |_, _| {}) {
                             (entry, _) => Some(entry.content_length),
                         }
@@ -1085,7 +1104,7 @@ impl Chunk {
         };
 
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg);
+        self.put_tombstone(&header, &cell_seg)?;
         self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
         Ok(())
     }
@@ -1346,7 +1365,7 @@ impl Chunk {
         cell: &mut OwnedCell,
     ) -> Result<CellHeader, WriteError> {
         let mut guard = self
-            .lock_cell_for_write(hash, false)
+            .lock_cell_for_write(hash, true)
             .map_err(WriteError::ReadError)?;
         let cell_version = guard.cell_version().map_err(WriteError::ReadError)?;
         if cell_version == version {
@@ -1365,7 +1384,7 @@ impl Chunk {
         value: OwnedValue,
     ) -> Result<CellHeader, WriteError> {
         let mut guard = self
-            .lock_cell_for_write(hash, false)
+            .lock_cell_for_write(hash, true)
             .map_err(WriteError::ReadError)?;
         let mut cell = guard.read_cell_owned().map_err(WriteError::ReadError)?;
         if cell.header.version == version {
@@ -1508,9 +1527,6 @@ impl Chunks {
                 config.physical_memory_limit / (1024 * 1024),
                 (config.physical_memory_limit * count) / (1024 * 1024)
             );
-
-            // Install page fault handlers for reference bit tracking
-            crate::ram::tiered::page_fault_tracker::install_fault_handlers();
         }
 
         let mut chunks = Vec::new();

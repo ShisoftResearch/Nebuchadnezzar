@@ -8,7 +8,6 @@ use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
 use crate::ram::schema::*;
 use crate::ram::segs::SEGMENT_SIZE;
-use crate::ram::tiered::page_fault_tracker;
 use crate::ram::types::*;
 use crate::server::transactions;
 use crate::server::ServerMeta;
@@ -365,9 +364,6 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
 
-    // Install page fault handlers
-    page_fault_tracker::install_fault_handlers();
-
     // Configure: 64MB physical limit, 1GB virtual capacity
     let physical_limit = 64 * 1024 * 1024; // 64MB = 8 segments
     let virtual_capacity = 1024 * 1024 * 1024; // 1GB = 128 segments
@@ -713,8 +709,6 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     let _ = env_logger::try_init();
 
     info!("=== Starting Stress Test: Mixed Concurrent Workload ===");
-
-    page_fault_tracker::install_fault_handlers();
 
     // Reduced configuration: 16MB physical, 64MB virtual (reduced for faster test)
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
@@ -1203,8 +1197,6 @@ async fn test_direct_writes_with_tiered_memory() {
     let _ = env_logger::try_init();
 
     info!("=== Starting Direct Write Test WITH Tiered Memory ===");
-
-    page_fault_tracker::install_fault_handlers();
 
     // Configure tiered memory with a small physical memory limit
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");

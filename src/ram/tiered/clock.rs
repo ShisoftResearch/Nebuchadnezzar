@@ -79,26 +79,6 @@ impl ClockEvictionPolicy {
                 // Check and clear reference bit
                 let was_referenced = segment.clear_reference_bit();
 
-                // If reference bit was set (now cleared), re-arm the segment with mprotect
-                // This applies to both hot and cold (file-backed) segments
-                #[cfg(feature = "page_fault_tracking")]
-                if was_referenced {
-                    debug!(
-                        "CLOCK re-arming segment {} with mprotect(PROT_NONE)",
-                        segment.id
-                    );
-                    if let Err(e) =
-                        crate::ram::tiered::page_fault_tracker::protect_segment(segment.addr)
-                    {
-                        warn!(
-                            "Failed to protect segment {} after clearing ref bit: {}",
-                            segment.id, e
-                        );
-                    } else {
-                        debug!("CLOCK successfully protected segment {}", segment.id);
-                    }
-                }
-
                 if pass == 0 {
                     // First pass: only select if not referenced
                     if !was_referenced {

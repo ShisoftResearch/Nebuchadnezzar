@@ -222,6 +222,7 @@ pub fn promote_segment(segment: &Segment) {
     //     cell_locking::lock_all_cells_in_segment(segment, chunk, _temp_entry_iter, true).unwrap();
 
     let segment_addr = segment.addr;
+
     unsafe {
         ptr::copy_nonoverlapping(temp_buffer.as_ptr(), segment_addr as *mut u8, SEGMENT_SIZE);
     }

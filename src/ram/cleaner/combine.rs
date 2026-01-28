@@ -409,8 +409,22 @@ impl CombinedCleaner {
 
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
 
-        // Hold references to all source segments to prevent eviction/promotion during memcpy
-        // This prevents data corruption if a segment is remapped while we're copying from it
+        let mut locked_segments: Vec<lightning::aarc::Arc<Segment>> = Vec::new();
+        for seg in segments.iter() {
+            if !seg.lock_hot() {
+                debug!(
+                    "Segment {} is not hot or already locked, skipping combine",
+                    seg.id
+                );
+                for locked_seg in &locked_segments {
+                    locked_seg.set_hot();
+                }
+                return (0, 0);
+            }
+            locked_segments.push(seg.clone());
+        }
+        debug!("Locked {} segments for combine", locked_segments.len());
+
         for seg in segments.iter() {
             seg.references.fetch_add(1, Ordering::Relaxed);
         }
@@ -439,7 +453,6 @@ impl CombinedCleaner {
                 for seg in segments.iter() {
                     seg.mark_clean_no_progress();
                 }
-                // Release references before returning (they were acquired at line 88)
                 for seg in segments.iter() {
                     seg.references.fetch_sub(1, Ordering::Relaxed);
                     seg.set_hot();

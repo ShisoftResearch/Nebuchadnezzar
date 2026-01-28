@@ -2,7 +2,6 @@ pub mod cell_locking;
 pub mod clock;
 pub mod eviction;
 pub mod manager;
-pub mod page_fault_tracker;
 pub mod promotion;
 
 #[cfg(test)]
