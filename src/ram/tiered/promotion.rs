@@ -72,13 +72,13 @@ pub fn promote_segment(segment: &Segment) {
 
     // Step 4: Check if segment has active references (including transaction guards)
     // Promotion should not happen while segment has active references
-    if !segment.no_references() {
-        warn!(
-            "Segment {} has active references (ref count: {}), should not promote, but promoting anyway",
-            segment.id,
-            segment.references.load(std::sync::atomic::Ordering::Relaxed)
-        );
-    }
+    // if !segment.no_references() {
+    //     warn!(
+    //         "Segment {} has active references (ref count: {}), should not promote, but promoting anyway",
+    //         segment.id,
+    //         segment.references.load(std::sync::atomic::Ordering::Relaxed)
+    //     );
+    // }
 
     // Step 5: Open backup file on demand instead of keeping it open
     // This avoids holding file descriptors for idle/cold segments.

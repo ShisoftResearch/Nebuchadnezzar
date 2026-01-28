@@ -11,6 +11,7 @@ use bifrost::utils::time::get_time;
 use crc32fast::Hasher as Crc32Hasher;
 use libc::*;
 use lightning::list::LinkedRingBufferList;
+use lightning::spin_hint::Backoff;
 use parking_lot;
 use std::fs;
 use std::fs::File;
@@ -39,6 +40,8 @@ pub const LOCKING_SEGMENT_BITS: u8 = !HOT_COLD_MASK;
 // Page constants (used for alignment and mprotect)
 pub const PAGE_SHIFT: usize = 12; // 4KB pages
 pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
+
+pub const EXCLUSIVE_REF_COUNT: usize = usize::MAX;
 
 // WAL Performance Configuration
 // These settings implement group commit batching to improve write throughput
@@ -83,7 +86,7 @@ pub struct Segment {
     dead_bytes_generation: AtomicU64,
     /// Marker used by cleaners to skip segments that were cleaned without reclaiming space
     last_no_progress_clean_generation: AtomicU64,
-    pub references: AtomicUsize,
+    references: AtomicUsize,
     pub file_state: parking_lot::Mutex<SegmentFileState>,
     archived: AtomicBool,
     pub dropped: AtomicBool,
@@ -745,12 +748,35 @@ impl Segment {
     }
 
     pub fn obtain_exclusive_references(&self) -> bool {
-        self.references.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        self.references.compare_exchange(0, EXCLUSIVE_REF_COUNT, Ordering::AcqRel, Ordering::Relaxed) .is_ok()
     }
 
 
     pub fn release_exclusive_references(&self) {
         self.references.store(0, Ordering::Relaxed);
+    }
+
+    pub fn incr_references(&self) {
+        let backoff = Backoff::new();
+        loop {
+            let curr_refs = self.references.load(Ordering::Relaxed);
+            if curr_refs != EXCLUSIVE_REF_COUNT && self.references.compare_exchange(curr_refs, curr_refs + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return;
+            }
+            backoff.spin();
+        }
+    }
+
+    pub fn decr_references(&self) {
+        let backoff = Backoff::new();
+        loop {
+            let curr_refs = self.references.load(Ordering::Relaxed);
+            debug_assert!(curr_refs > 0, "Segment {} has negative references {}", self.id, curr_refs);
+            if curr_refs != EXCLUSIVE_REF_COUNT && self.references.compare_exchange(curr_refs, curr_refs - 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                return;
+            }
+            backoff.spin();
+        }
     }
 
     pub fn mem_drop(&self, chunk: &Chunk) {
@@ -976,7 +1002,7 @@ pub struct SegmentReferenceGuard {
 impl SegmentReferenceGuard {
     /// Create a new guard and increment the segment's reference count
     pub fn new(segment: lightning::aarc::Arc<Segment>) -> Self {
-        segment.references.fetch_add(1, Ordering::Relaxed);
+        segment.incr_references();
         debug!(
             "SegmentReferenceGuard acquired for segment {} (ref count: {})",
             segment.id,
@@ -998,14 +1024,7 @@ impl SegmentReferenceGuard {
 
 impl Drop for SegmentReferenceGuard {
     fn drop(&mut self) {
-        let old_count = self.segment.references.fetch_sub(1, Ordering::Relaxed);
-        debug_assert!(old_count > 0);
-        debug!(
-            "SegmentReferenceGuard dropped for segment {} (ref count: {} -> {})",
-            self.segment.id,
-            old_count,
-            old_count - 1
-        );
+        self.segment.decr_references();
     }
 }
 

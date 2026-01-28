@@ -393,7 +393,7 @@ impl Chunk {
                         size,
                         head.id
                     );
-                    head.references.fetch_add(1, Ordering::Relaxed);
+                    head.incr_references();
                     return Ok(PendingEntry {
                         addr,
                         seg: head,
@@ -1301,7 +1301,7 @@ impl Drop for PendingEntry {
             .write_wal(self.addr, self.size, self.skip_sync)
             .unwrap();
         self.seg.set_dirty();
-        self.seg.references.fetch_sub(1, Ordering::Relaxed);
+        self.seg.decr_references();
     }
 }
 
@@ -1703,7 +1703,7 @@ impl<'a> CellGuard<'a> {
             {
                 segment = chunk.locate_segment(*guard);
                 if let Some(segment) = &segment {
-                    segment.references.fetch_add(1, Ordering::Relaxed);
+                    segment.incr_references();
                     if segment.is_cold() {
                         crate::ram::tiered::promotion::promote_segment(segment);
                     }
@@ -1865,7 +1865,7 @@ impl<'a> CellGuard<'a> {
     #[inline(always)]
     fn decrement_segment_references(&self) {
         if let Some(segment) = &self.segment {
-            segment.references.fetch_sub(1, Ordering::Relaxed);
+            segment.decr_references();
         }
     }
 

@@ -79,7 +79,7 @@ impl CombinedCleaner {
                     return None;
                 }
                 // Check references first to avoid locking if busy (fast path)
-                if seg.references.load(Ordering::Relaxed) > 0 {
+                if !seg.no_references() {
                     return None;
                 }
 
