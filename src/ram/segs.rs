@@ -756,7 +756,7 @@ impl Segment {
     // remove the backup if it have one
     pub fn dispense(&self) {
         let backtrace = std::backtrace::Backtrace::capture();
-        eprintln!(
+        debug!(
             "[DISPENSE] segment {} (chunk={}, seq_id={}) - tiered_state={}\nBacktrace:\n{}",
             self.id,
             self.chunk_id,
@@ -770,7 +770,7 @@ impl Segment {
             .backup_path(self.chunk_id, self.id, self.seq_id)
         {
             let exists = std::path::Path::new(&backup_path).exists();
-            eprintln!(
+            debug!(
                 "[DISPENSE] Deleting backup for segment {} (chunk={}, seq_id={}): {} (exists: {})",
                 self.id, self.chunk_id, self.seq_id, backup_path, exists
             );
@@ -779,12 +779,12 @@ impl Segment {
             .manager
             .delete_all(self.chunk_id, self.id, self.seq_id)
         {
-            eprintln!(
+            debug!(
                 "[DISPENSE ERROR] Failed to delete files for segment {} (chunk={}, seq_id={}): {}",
                 self.id, self.chunk_id, self.seq_id, e
             );
         } else {
-            eprintln!(
+            debug!(
                 "[DISPENSE SUCCESS] Deleted files for segment {} (chunk={}, seq_id={})",
                 self.id, self.chunk_id, self.seq_id
             );
@@ -838,7 +838,7 @@ impl Segment {
         if let Some(ref path) = backup_path {
             let exists = std::path::Path::new(path).exists();
             if !exists {
-                eprintln!(
+                debug!(
                     "CRITICAL BUG: set_cold() called for segment {} (chunk={}, seq_id={}) but backup file does NOT exist at '{}'!\n\
                      Backtrace:\n{}",
                     self.id, self.chunk_id, self.seq_id, path, backtrace
@@ -849,13 +849,13 @@ impl Segment {
                     self.id, self.chunk_id, self.seq_id, path
                 );
             } else {
-                eprintln!(
+                debug!(
                     "[DEBUG] set_cold() for segment {} (chunk={}, seq_id={}): backup verified at '{}'",
                     self.id, self.chunk_id, self.seq_id, path
                 );
             }
         } else {
-            eprintln!(
+            debug!(
                 "[DEBUG] set_cold() for segment {} (chunk={}, seq_id={}) but no backup path configured",
                 self.id, self.chunk_id, self.seq_id
             );

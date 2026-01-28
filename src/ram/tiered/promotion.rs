@@ -32,7 +32,7 @@ use std::thread;
 /// - No "empty window" - data is copied atomically from reader's perspective
 /// This function have to succeed or panic.
 pub fn promote_segment(segment: &Segment) {
-    eprintln!(
+    debug!(
         "[PROMOTE] Starting promotion of segment {} (chunk={}, seq_id={})",
         segment.id, segment.chunk_id, segment.seq_id
     );
@@ -42,7 +42,7 @@ pub fn promote_segment(segment: &Segment) {
     loop {
         if segment.is_hot() {
             // Already hot, skip promotion
-            eprintln!(
+            debug!(
                 "[PROMOTE] Segment {} (chunk={}, seq_id={}) is already hot, skipping",
                 segment.id, segment.chunk_id, segment.seq_id
             );
@@ -50,7 +50,7 @@ pub fn promote_segment(segment: &Segment) {
         }
         if segment.lock_cold() {
             // Locked cold, proceed with promotion
-            eprintln!(
+            debug!(
                 "[PROMOTE] Acquired cold lock on segment {} (chunk={}, seq_id={})",
                 segment.id, segment.chunk_id, segment.seq_id
             );
@@ -60,7 +60,7 @@ pub fn promote_segment(segment: &Segment) {
         thread::yield_now();
     }
 
-    eprintln!(
+    debug!(
         "[PROMOTE] Proceeding with promotion of segment {} (chunk={}, seq_id={})",
         segment.id, segment.chunk_id, segment.seq_id
     );
@@ -123,7 +123,7 @@ pub fn promote_segment(segment: &Segment) {
                 })
                 .unwrap_or_default();
 
-            eprintln!(
+            debug!(
                 "PROMOTION FAILED: Failed to open backup file {} for segment {} (chunk={}, seq_id={}): {}\n\
                  Files in directory matching seg_id {}: {:?}",
                 backup_path,
@@ -278,7 +278,7 @@ pub fn promote_segment(segment: &Segment) {
         "Successfully promoted segment {} to hot storage with cell locking",
         segment.id
     );
-    eprintln!(
+    debug!(
         "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
         segment.id, segment.chunk_id, segment.seq_id
     );

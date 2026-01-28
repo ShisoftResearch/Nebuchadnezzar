@@ -287,7 +287,7 @@ impl CombinedCleaner {
                             // In production with tiered memory, this indicates a configuration issue
                             #[cfg(feature = "tiered_memory")]
                             {
-                                eprintln!(
+                                debug!(
                                     "[COMBINE WARNING] Segment {} (chunk={}, seq_id={}) archive returned Ok(false) - backup storage may not be configured",
                                     segment.id, segment.chunk_id, segment.seq_id
                                 );
@@ -298,7 +298,7 @@ impl CombinedCleaner {
                             }
                         }
                         Err(e) => {
-                            eprintln!(
+                            debug!(
                                 "[COMBINE CRITICAL] Segment {} (chunk={}, seq_id={}) archive failed: {} - NOT putting in list",
                                 segment.id, segment.chunk_id, segment.seq_id, e
                             );

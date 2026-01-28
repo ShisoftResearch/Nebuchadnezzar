@@ -405,7 +405,7 @@ impl Chunk {
                     if total_space >= self.capacity - SEGMENT_SIZE {
                         // No space left
                         if tried_gc {
-                            eprintln!(
+                            debug!(
                                 "chunk-allocation-failure: chunk={}, total_space={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}",
                                 self.id,
                                 total_space,
@@ -521,12 +521,12 @@ impl Chunk {
                         if segment.is_cold() {
                             use crate::ram::tiered::promotion::promote_segment;
 
-                            eprintln!(
+                            debug!(
                                 "[PROMOTION TRIGGERED] Cell access on cold segment {} (chunk={}, seq_id={})",
                                 segment.id, segment.chunk_id, segment.seq_id
                             );
                             promote_segment(&segment);
-                            eprintln!(
+                            debug!(
                                 "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
                                 segment.id, segment.chunk_id, segment.seq_id
                             );
@@ -582,26 +582,26 @@ impl Chunk {
 
                             // Try to acquire the cold lock - if successful, we do the promotion
                             if segment.lock_cold() {
-                                eprintln!(
+                                debug!(
                                     "[PROMOTION TRIGGERED] Write access on cold segment {} (chunk={}, seq_id={})",
                                     segment.id, segment.chunk_id, segment.seq_id
                                 );
                                 promote_segment(&segment);
-                                eprintln!(
+                                debug!(
                                     "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
                                     segment.id, segment.chunk_id, segment.seq_id
                                 );
                                 break;
                             } else {
                                 // Another thread is promoting, wait and retry
-                                eprintln!(
+                                debug!(
                                     "[PROMOTION WAIT] Waiting for promotion of segment {} (chunk={}, seq_id={})",
                                     segment.id, segment.chunk_id, segment.seq_id
                                 );
                                 while segment.is_locked() {
                                     std::thread::yield_now();
                                 }
-                                eprintln!(
+                                debug!(
                                     "[PROMOTION WAIT DONE] Retrying check for segment {} (chunk={}, seq_id={})",
                                     segment.id, segment.chunk_id, segment.seq_id
                                 );

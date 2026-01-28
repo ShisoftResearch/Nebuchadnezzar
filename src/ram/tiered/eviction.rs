@@ -78,7 +78,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
                 );
             }
             Ok(false) => {
-                eprintln!(
+                debug!(
                     "[EVICTION BUG] Segment {} (chunk={}, seq_id={}) archive returned Ok(false), aborting eviction",
                     segment.id, segment.chunk_id, segment.seq_id
                 );
