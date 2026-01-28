@@ -649,26 +649,14 @@ impl Chunk {
         Ok(cell.header)
     }
 
-    fn old_index_res<'a>(
-        &'a self,
-        cell_loc: &WordMutexGuard<'a>,
-        schema: &Schema,
-    ) -> Result<Option<Vec<IndexRes>>, WriteError> {
-        if self.index_builder.is_some() {
-            SharedCellData::from_chunk_raw(**cell_loc, self)
-                .map(|(c, _)| Some(probe_cell_indices(&c, schema)))
-                .map_err(|e| WriteError::ReadError(e))
-        } else {
-            Ok(None)
-        }
-    }
+
 
     fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
-        if let Some(mut guard) = self.location_for_write(hash, true) {
-            let cell_location = *guard;
+        if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
+            let cell_location = cell_guard.get_ptr();
             let cell_version =
                 cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
             let write_result =
@@ -683,10 +671,10 @@ impl Chunk {
             }
 
             let schema = &*write_plan.schema;
-            let old_indices = self.old_index_res(&guard, schema)?;
+            let old_indices = cell_guard.old_index_res(schema)?;
             self.ensure_indices_with_res(cell, old_indices, schema);
-            *guard = new_cell_loc;
-            drop(guard);
+            cell_guard.set_ptr(new_cell_loc);
+            drop(cell_guard);
             self.mark_dead_entry_with_cell(cell_location, cell);
             self.refresh_statistics();
             drop(write_plan);
@@ -708,9 +696,9 @@ impl Chunk {
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
         loop {
-            if let Some(mut guard) = self.location_for_write(hash, true) {
+            if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
                 trace!("Cell {} exists, will update for upsert", hash);
-                let cell_location = *guard;
+                let cell_location = cell_guard.get_ptr();
                 let cell_version = cell_version_from_chunk_raw(cell_location)
                     .map_err(|e| WriteError::ReadError(e))?;
                 let write_result =
@@ -732,9 +720,9 @@ impl Chunk {
                     );
                 }
 
-                let old_indices = self.old_index_res(&guard, &*write_plan.schema)?;
-                *guard = new_cell_loc;
-                drop(guard);
+                let old_indices = cell_guard.old_index_res(&*write_plan.schema)?;
+                cell_guard.set_ptr(new_cell_loc);
+                drop(cell_guard);
                 self.ensure_indices_with_res(cell, old_indices, &*write_plan.schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
                 self.refresh_statistics();
@@ -1807,8 +1795,8 @@ impl<'a> CellGuard<'a> {
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
+        let old_indices = self.old_index_res(schema)?;
         let guard = self.guard.as_mut().unwrap();
-        let old_indices = self.chunk.old_index_res(guard, schema)?;
         **guard = new_cell_loc;
         self.chunk
             .ensure_indices_with_res(cell, old_indices, schema);
@@ -1838,16 +1826,17 @@ impl<'a> CellGuard<'a> {
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
-        let guard = self.guard.as_mut().unwrap();
         if old_cell_loc != 0 {
             // Update case - cell already exists
-            let old_indices = self.chunk.old_index_res(guard, &*schema)?;
+            let old_indices = self.old_index_res(&*schema)?;
+            let guard = self.guard.as_mut().unwrap();
             **guard = new_cell_loc;
             self.chunk
                 .ensure_indices_with_res(cell, old_indices, &*schema);
             self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
         } else {
             // Insert case - new cell
+            let guard = self.guard.as_mut().unwrap();
             **guard = new_cell_loc;
             self.chunk.ensure_indices(cell, None, &*schema);
         }
@@ -1878,6 +1867,24 @@ impl<'a> CellGuard<'a> {
         if let Some(segment) = &self.segment {
             segment.references.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    fn old_index_res(
+        &self,
+        schema: &Schema,
+    ) -> Result<Option<Vec<IndexRes>>, WriteError> {
+        if self.chunk.index_builder.is_some() {
+            SharedCellData::from_chunk_raw(self.get_ptr(), self.chunk)
+                .map(|(c, _)| Some(probe_cell_indices(&c, schema)))
+                .map_err(|e| WriteError::ReadError(e))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn set_ptr(&mut self, ptr: usize) {
+        let guard = self.guard.as_mut().unwrap();
+        **guard = ptr;
     }
 }
 

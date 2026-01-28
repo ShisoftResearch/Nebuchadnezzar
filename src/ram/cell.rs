@@ -328,11 +328,12 @@ impl<'v> SharedCellData<'v> {
             Ok((cell, schema))
         } else {
             let msg = format!(
-                "Schema {} does not existed to read ptr {} from chunk {}, segment {:?}",
+                "Schema {} does not existed to read ptr {} from chunk {}, segment {:?}. Backtrace: {:?}",
                 schema_id,
                 ptr,
                 chunk.id,
-                chunk.locate_segment(ptr).map(|seg| seg.id)
+                chunk.locate_segment(ptr).map(|seg| seg.id),
+                std::backtrace::Backtrace::capture()
             );
             error!("{}", msg);
             if cfg!(debug_assertions) {
