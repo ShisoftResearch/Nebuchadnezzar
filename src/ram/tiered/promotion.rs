@@ -65,14 +65,6 @@ pub fn promote_segment(segment: &Segment) {
         segment.id, segment.chunk_id, segment.seq_id
     );
 
-    // Step 3: Wait for no active references (prevents races with cleaner)
-    // We hold the tiered_lock while waiting - this is safe because:
-    // - Cell read/write operations don't need tiered_lock, only cell locks
-    // - Eviction will skip if lock is held
-    // - Other promotions will block on the lock (which is what we want)
-    while !segment.no_references() {
-        thread::yield_now();
-    }
     debug!(
         "Promotion: all references released for segment {}",
         segment.id

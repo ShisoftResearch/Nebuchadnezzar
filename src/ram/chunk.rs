@@ -1883,6 +1883,7 @@ impl<'a> CellGuard<'a> {
 
 impl<'a> Drop for CellGuard<'a> {
     fn drop(&mut self) {
+        #[cfg(feature = "tiered_memory")]
         self.decrement_segment_references();
     }
 }
