@@ -1,7 +1,8 @@
 use crate::ram::chunk::{Chunk, Chunks};
-use crate::ram::segs::SEGMENT_SIZE;
+use crate::ram::segs::{SEGMENT_SIZE, Segment};
 use rayon::prelude::*;
 use std::env;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -234,7 +235,7 @@ impl Cleaner {
                     segments_for_compact
                         .into_par_iter()
                         .take(segments_compact_per_turn) // limit max segment to clean per turn
-                        .map(|segment| compact::CompactCleaner::clean_segment(chunk, &segment))
+                        .map(|segment| compact::CompactCleaner::clean_segment(chunk, segment))
                         .sum::<usize>()
                 });
             }
@@ -286,5 +287,36 @@ impl Drop for Cleaner {
         if let Some(handle) = self._handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+pub struct SegmentCandidate {
+    segment: lightning::aarc::Arc<Segment>,
+}
+
+impl SegmentCandidate {
+    pub fn new(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
+        if !segment.obtain_exclusive_references() {
+            return None;
+        }
+        if !segment.lock_hot() {
+            segment.release_exclusive_references();
+            return None;
+        }
+        Some(Self { segment: segment.clone() })
+    }
+}
+
+impl Drop for SegmentCandidate {
+    fn drop(&mut self) {
+        self.segment.release_exclusive_references();
+        self.segment.set_hot();
+    }
+}
+
+impl Deref for SegmentCandidate {
+    type Target = Segment;
+    fn deref(&self) -> &Self::Target {
+        &self.segment
     }
 }

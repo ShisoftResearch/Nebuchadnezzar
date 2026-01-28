@@ -744,6 +744,15 @@ impl Segment {
         self.references.load(Ordering::Relaxed) == 0
     }
 
+    pub fn obtain_exclusive_references(&self) -> bool {
+        self.references.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }
+
+
+    pub fn release_exclusive_references(&self) {
+        self.references.store(0, Ordering::Relaxed);
+    }
+
     pub fn mem_drop(&self, chunk: &Chunk) {
         if self
             .dropped

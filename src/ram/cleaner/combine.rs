@@ -1,5 +1,6 @@
 use crate::ram::cell;
 use crate::ram::chunk::Chunk;
+use crate::ram::cleaner::SegmentCandidate;
 use crate::ram::entry::EntryContent;
 use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use itertools::Itertools;
@@ -62,39 +63,28 @@ impl DummySegment {
 
 // for higher hit rate for fetching cells in segments, we need to put data with close timestamp together
 // this optimization is intended for enabling neb to contain data more than it's memory
-
 impl CombinedCleaner {
     fn select_candidate_segments(
         chunk: &Chunk,
         selected_segments: &[lightning::aarc::Arc<Segment>],
-    ) -> Vec<lightning::aarc::Arc<Segment>> {
+    ) -> Vec<SegmentCandidate> {
         let head_seg_id = chunk.get_head_seg_id();
         // Remove the head segment, cold segments, and segments locked by tiered operations
         // Skip locked segments (eviction/promotion in progress) to avoid conflicts
         // Skip cold segments to avoid accessing evicted data (would trigger promotion)
         let segments = selected_segments
             .iter()
-            .filter(|seg| {
+            .filter_map(|seg| {
                 if seg.id == head_seg_id {
-                    return false;
+                    return None;
                 }
                 // Check references first to avoid locking if busy (fast path)
                 if seg.references.load(Ordering::Relaxed) > 0 {
-                    return false;
+                    return None;
                 }
-                // Determine lock success
-                if !seg.lock_hot() {
-                    return false;
-                }
-                // Double-checked locking: re-read references to avoid race where writer increments
-                // after we checked but before we locked.
-                if seg.references.load(Ordering::Relaxed) > 0 {
-                    seg.set_hot(); // Revert lock
-                    return false;
-                }
-                true
+
+                SegmentCandidate::new(&seg)
             })
-            .cloned()
             .collect_vec();
 
         if segments.len() < 2 {
@@ -103,9 +93,6 @@ impl CombinedCleaner {
                 chunk.id,
                 segments.len()
             );
-            for seg in segments.iter() {
-                seg.set_hot();
-            }
             return Vec::new();
         }
         segments
@@ -113,7 +100,7 @@ impl CombinedCleaner {
 
     fn collect_and_deduplicate_entries(
         chunk: &Chunk,
-        segments: &[lightning::aarc::Arc<Segment>],
+        segments: &[SegmentCandidate],
         segment_ids_to_combine: &HashSet<u64>,
     ) -> Vec<DummyEntry> {
         debug!(
@@ -378,17 +365,10 @@ impl CombinedCleaner {
         })
     }
 
-    fn cleanup_segments(chunk: &Chunk, segments: &[lightning::aarc::Arc<Segment>]) {
-        // Release references now that all memcpy operations are complete
-        // This allows eviction/promotion to proceed if needed
-        for old_seg in segments.iter() {
-            old_seg.references.fetch_sub(1, Ordering::Relaxed);
-        }
+    fn cleanup_segments(chunk: &Chunk, segments: &[SegmentCandidate]) {
         debug!("Released references for {} source segments", segments.len());
-
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
-            old_seg.set_hot();
             old_seg.mem_drop(chunk);
         }
     }
@@ -408,27 +388,6 @@ impl CombinedCleaner {
             .sum::<usize>();
 
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
-
-        let mut locked_segments: Vec<lightning::aarc::Arc<Segment>> = Vec::new();
-        for seg in segments.iter() {
-            if !seg.lock_hot() {
-                debug!(
-                    "Segment {} is not hot or already locked, skipping combine",
-                    seg.id
-                );
-                for locked_seg in &locked_segments {
-                    locked_seg.set_hot();
-                }
-                return (0, 0);
-            }
-            locked_segments.push(seg.clone());
-        }
-        debug!("Locked {} segments for combine", locked_segments.len());
-
-        for seg in segments.iter() {
-            seg.references.fetch_add(1, Ordering::Relaxed);
-        }
-        debug!("Acquired references for {} source segments", segments.len());
 
         let all_entries =
             Self::collect_and_deduplicate_entries(chunk, &segments, &segment_ids_to_combine);
@@ -452,10 +411,6 @@ impl CombinedCleaner {
             );
                 for seg in segments.iter() {
                     seg.mark_clean_no_progress();
-                }
-                for seg in segments.iter() {
-                    seg.references.fetch_sub(1, Ordering::Relaxed);
-                    seg.set_hot();
                 }
                 return (0, 0);
             }

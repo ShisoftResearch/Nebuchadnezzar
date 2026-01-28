@@ -125,7 +125,7 @@ pub fn full_clean_cycle() {
             .store(1234, std::sync::atomic::Ordering::Relaxed);
         // Compact all segments order by id
         chunk.segments().into_iter().for_each(|seg| {
-            compact::CompactCleaner::clean_segment(chunk, &seg);
+            compact::CompactCleaner::clean_segment(chunk, SegmentCandidate::new(&seg).unwrap());
         });
 
         assert_eq!(chunk.seg_count(), 2);
@@ -276,7 +276,7 @@ fn compact_marks_no_progress_and_skips_segment() {
         "segment should be considered for compaction when utilization drops"
     );
 
-    let reclaimed = compact::CompactCleaner::clean_segment(chunk, &victim_seg);
+    let reclaimed = compact::CompactCleaner::clean_segment(chunk, SegmentCandidate::new(&victim_seg).unwrap());
     assert_eq!(
         reclaimed, 0,
         "no space should be reclaimed without dead cells"

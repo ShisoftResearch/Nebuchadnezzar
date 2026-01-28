@@ -1,4 +1,5 @@
 use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
+use crate::ram::cleaner::SegmentCandidate;
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
@@ -1172,15 +1173,15 @@ impl Chunk {
         self.segs.iter_front_values().collect()
     }
 
-    pub fn segs_for_compact_cleaner(&self) -> Vec<AArc<Segment>> {
+    pub fn segs_for_compact_cleaner(&self) -> Vec<SegmentCandidate> {
         self.segs_for_compact_cleaner_impl(false)
     }
 
-    pub fn segs_for_compact_cleaner_full(&self) -> Vec<AArc<Segment>> {
+    pub fn segs_for_compact_cleaner_full(&self) -> Vec<SegmentCandidate> {
         self.segs_for_compact_cleaner_impl(true)
     }
 
-    fn segs_for_compact_cleaner_impl(&self, full: bool) -> Vec<AArc<Segment>> {
+    fn segs_for_compact_cleaner_impl(&self, full: bool) -> Vec<SegmentCandidate> {
         let utilization_selection = self
             .segments()
             .into_iter()
@@ -1201,6 +1202,9 @@ impl Chunk {
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
                     && !seg.cleaned_without_progress()
+            })
+            .filter_map(|(seg, f)| {
+                SegmentCandidate::new(&seg).map(|candidate| (candidate, f))
             })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());

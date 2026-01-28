@@ -1,5 +1,6 @@
 use super::super::chunk::Chunk;
 use super::super::segs::{Segment, SEGMENT_SIZE};
+use crate::ram::cleaner::SegmentCandidate;
 use crate::ram::entry::*;
 
 use std::sync::atomic::Ordering;
@@ -11,38 +12,12 @@ use lightning::map::Map;
 pub struct CompactCleaner;
 
 impl CompactCleaner {
-    pub fn clean_segment(chunk: &Chunk, seg: &Segment) -> usize {
-        // Check references before locking to avoid conflict with writers
-        if seg.references.load(Ordering::Relaxed) > 0 {
-            debug!(
-                "Segment {} has active references, skipping cleaning",
-                seg.id
-            );
-            return 0;
-        }
-
-        // Try to acquire segment lock first
-        if !seg.lock_hot() {
-            debug!("Segment {} is not hot or locked, skipping cleaning", seg.id);
-            return 0;
-        }
-
-        // Double-check references after locking
-        if seg.references.load(Ordering::Relaxed) > 0 {
-            debug!(
-                "Segment {} acquired active references during lock, skipping",
-                seg.id
-            );
-            seg.set_hot();
-            return 0;
-        }
-
+    pub fn clean_segment(chunk: &Chunk, seg: SegmentCandidate) -> usize {
         // Safety check: Never clean the head segment
         // Although segs_for_compact_cleaner filters this, race conditions could cause
         // the head to change or a new head to be created that looks like a candidate.
         if seg.id == chunk.get_head_seg_id() {
             debug!("Segment {} is the current head, skipping cleaning", seg.id);
-            seg.set_hot();
             return 0;
         }
 
@@ -53,13 +28,8 @@ impl CompactCleaner {
                 "Skip cleaning chunk {} segment {} for it have no dead spaces",
                 chunk.id, dead_space
             );
-            seg.set_hot();
             return 0;
         }
-
-        // Hold a reference to prevent eviction from freeing memory during compaction
-        // Eviction waits for no_references() before calling madvise_free()
-        seg.references.fetch_add(1, Ordering::Relaxed);
 
         // Previous implementation is inplace compaction. Segments are mutable and subject to changes.
         // Log-structured cleaner suggests new segment allocation and copy living entries from the
@@ -84,7 +54,7 @@ impl CompactCleaner {
         );
 
         // scan and mark live entries
-        let entries = chunk.live_entries(seg).collect_vec();
+        let entries = chunk.live_entries(&*seg).collect_vec();
 
         if entries.len() == 0 {
             chunk.remove_segment(seg.id);
@@ -93,8 +63,6 @@ impl CompactCleaner {
                 "Compact segment {} leades to remove the segment for it is empty",
                 seg.id
             );
-            seg.references.fetch_sub(1, Ordering::Relaxed);
-            seg.set_hot();
             return SEGMENT_SIZE;
         }
 
@@ -255,9 +223,6 @@ impl CompactCleaner {
         // Eviction will archive the segment for tiered memory
         // For recovery, even if the segment is not archived, it will still be able to recover from the old backup file.
 
-        // Release reference before unlocking
-        seg.references.fetch_sub(1, Ordering::Relaxed);
-        seg.set_hot();
         space_cleaned
     }
 }
