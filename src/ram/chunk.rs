@@ -1810,11 +1810,11 @@ impl<'a> CellGuard<'a> {
         if *guard != 0 {
             segment = chunk.locate_segment(*guard);
             if let Some(segment) = &segment {
+                segment.references.fetch_add(1, Ordering::Relaxed);
                 if segment.is_cold() {
                     use crate::ram::tiered::promotion::promote_segment;
                     promote_segment(segment);
                 }
-                segment.references.fetch_add(1, Ordering::Relaxed);
             }
             version = cell_version_from_chunk_raw(*guard).unwrap();
         }
