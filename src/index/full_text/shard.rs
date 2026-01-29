@@ -1125,6 +1125,7 @@ impl Clone for InvertedIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::builder::IndexBuilder;
     use crate::ram::schema::LocalSchemasCache;
     use crate::server::ServerMeta;
     use bifrost::conshash::weights::Weights;
@@ -2384,8 +2385,8 @@ mod tests {
             index_builder.ensure_indices(&cell3, &schema, None);
         }
 
-        // Give time for async indexing to complete
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for async indexing tasks to complete
+        let _ = IndexBuilder::await_indices().await;
 
         // Use the coordinator for distributed search
         use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
@@ -2550,8 +2551,8 @@ mod tests {
             info!("Ensuring indices for initial cell...");
             index_builder.ensure_indices(&cell, &schema, None);
         }
-        // Give time for async indexing to complete
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for async indexing tasks to complete
+        let _ = IndexBuilder::await_indices().await;
 
         // Use the coordinator for distributed search
         use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
