@@ -542,8 +542,14 @@ impl Chunk {
     }
 
     pub fn lock_or_insert_cell(&self, hash: u64) -> CellGuard<'_> {
-        let guard = self.cell_index.lock_or_insert(hash as usize, 0);
-        CellGuard::from_guard(guard, self)
+        let backoff = Backoff::new();
+        loop {
+            let guard = self.cell_index.lock_or_insert(hash as usize, 0);
+            if let Some(guard) = CellGuard::from_guard(guard, self) {
+                return guard;
+            }
+            backoff.spin();
+        }
     }
 
     pub(crate) fn head_cell(&self, hash: u64) -> Result<CellHeader, ReadError> {
@@ -1690,7 +1696,7 @@ pub struct CellGuard<'a> {
 }
 
 impl<'a> CellGuard<'a> {
-    pub fn from_guard(guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Self {
+    pub fn from_guard(guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Option<Self> {
         let mut segment = None;
         let mut version = 0;
         if *guard != 0 {
@@ -1698,32 +1704,49 @@ impl<'a> CellGuard<'a> {
             {
                 segment = chunk.locate_segment(*guard);
                 if let Some(segment) = &segment {
-                    segment.incr_references();
                     if segment.is_cold() {
                         crate::ram::tiered::promotion::promote_segment(segment);
                     }
+                    if !segment.incr_references() {
+                        return None;
+                    }
                     segment.mark_referenced();
+                } else {
+                    trace!("Segment not found for cell at {:?} for chunk {}. Should retry.", *guard, chunk.id);
+                    return None;
                 }
             }
             version = cell_version_from_chunk_raw(*guard).unwrap();
         }
 
-        Self {
+        Some(Self {
             guard: Some(guard),
             chunk,
             segment,
             version,
-        }
+        })
     }
 
     pub fn for_read(hash: u64, chunk: &'a Chunk) -> Result<Self, ReadError> {
-        let guard = chunk.location_for_read(hash)?;
-        Ok(Self::from_guard(guard, chunk))
+        let backoff = Backoff::new();
+        loop {
+            let guard = chunk.location_for_read(hash)?;
+            if let Some(guard) = CellGuard::from_guard(guard, chunk) {
+                return Ok(guard);
+            }
+            backoff.spin();
+        }
     }
 
     pub fn for_write(hash: u64, has_read: bool, chunk: &'a Chunk) -> Option<Self> {
-        let guard = chunk.location_for_write(hash, has_read)?;
-        Some(Self::from_guard(guard, chunk))
+        let backoff = Backoff::new();
+        loop {
+            let guard = chunk.location_for_write(hash, has_read)?;
+            if let Some(guard) = CellGuard::from_guard(guard, chunk) {
+                return Some(guard);
+            }
+            backoff.spin();
+        }
     }
 
     fn update_version(&mut self, version: u64) {

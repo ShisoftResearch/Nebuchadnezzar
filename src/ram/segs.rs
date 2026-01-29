@@ -748,20 +748,37 @@ impl Segment {
     }
 
     pub fn obtain_exclusive_references(&self) -> bool {
-        self.references.compare_exchange(0, EXCLUSIVE_REF_COUNT, Ordering::AcqRel, Ordering::Relaxed) .is_ok()
+        self.references
+            .compare_exchange(0, EXCLUSIVE_REF_COUNT, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
-
 
     pub fn release_exclusive_references(&self) {
         self.references.store(0, Ordering::Relaxed);
     }
 
-    pub fn incr_references(&self) {
+    pub fn incr_references(&self) -> bool {
         let backoff = Backoff::new();
         loop {
             let curr_refs = self.references.load(Ordering::Relaxed);
-            if curr_refs != EXCLUSIVE_REF_COUNT && self.references.compare_exchange(curr_refs, curr_refs + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                return;
+            if curr_refs == EXCLUSIVE_REF_COUNT {
+                // Do not compete for exclusive references, bail out instead of spinning
+                // The cleaners obtains segment lock first, then cell locks,
+                // while normal operations obtains cell lock then segment counter
+                // this could cause deadlock if the cleaners is waiting for the segment lock
+                return false;
+            }
+            if self
+                    .references
+                    .compare_exchange(
+                        curr_refs,
+                        curr_refs + 1,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                return true;
             }
             backoff.spin();
         }
@@ -769,13 +786,30 @@ impl Segment {
 
     pub fn decr_references(&self) {
         let backoff = Backoff::new();
+        #[cfg(debug_assertions)]
         loop {
             let curr_refs = self.references.load(Ordering::Relaxed);
+            // If reference count is already 0, just return. This can happen in race conditions
+            // where a PendingEntry is dropped after the segment has been cleaned up.
             debug_assert!(curr_refs > 0, "Segment {} has negative references {}", self.id, curr_refs);
-            if curr_refs != EXCLUSIVE_REF_COUNT && self.references.compare_exchange(curr_refs, curr_refs - 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            debug_assert!(curr_refs != EXCLUSIVE_REF_COUNT, "Segment {} has exclusive references, which should not happen", self.id);
+            if self
+                    .references
+                    .compare_exchange(
+                        curr_refs,
+                        curr_refs - 1,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
                 return;
             }
             backoff.spin();
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.references.fetch_sub(1, Ordering::Relaxed);
         }
     }
 

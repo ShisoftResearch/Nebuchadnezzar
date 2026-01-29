@@ -1,7 +1,6 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::segs::Segment;
 use std::io;
-use std::thread;
 
 /// Evict a hot segment to cold storage with cell-level locking
 ///
@@ -27,6 +26,16 @@ use std::thread;
 pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> {
     debug!("evict_segment called for segment {}", segment.id);
 
+    struct ExclusiveRefGuard<'a> {
+        segment: &'a Segment,
+    }
+
+    impl<'a> Drop for ExclusiveRefGuard<'a> {
+        fn drop(&mut self) {
+            self.segment.release_exclusive_references();
+        }
+    }
+
     // Step 1: Try to acquire segment lock (skip if already locked)
     if !segment.lock_hot_to_cold() {
         debug!("Segment {} is not hot, skipping eviction", segment.id);
@@ -38,24 +47,20 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         segment.id
     );
 
-    // Step 3: Wait for no active references (prevents races with cleaner)
-    let mut wait_count = 0;
-    while !segment.no_references() {
-        wait_count += 1;
-        if wait_count % 1000 == 0 {
-            debug!(
-                "Segment {} waiting for references to drop (waited {} times)",
-                segment.id, wait_count
-            );
-        }
-        thread::yield_now();
-    }
-    if wait_count > 0 {
+    // Step 3: Obtain exclusive references (skip if not available)
+    let _exclusive_guard = if segment.obtain_exclusive_references() {
+        ExclusiveRefGuard { segment }
+    } else {
         debug!(
-            "Segment {} references dropped after {} waits",
-            segment.id, wait_count
+            "Segment {} has active references, skipping eviction",
+            segment.id
         );
-    }
+        segment.set_hot();
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Segment has active references",
+        ));
+    };
 
     // Check if segment needs archiving based on archived and wal_dirty flags
     // archived=true means backup file exists
