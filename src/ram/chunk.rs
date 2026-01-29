@@ -649,8 +649,6 @@ impl Chunk {
         Ok(cell.header)
     }
 
-
-
     fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         let write_plan = cell.plan_write(self)?;
@@ -1093,9 +1091,7 @@ impl Chunk {
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
                     && !seg.cleaned_without_progress()
             })
-            .filter_map(|(seg, f)| {
-                SegmentCandidate::new(&seg).map(|candidate| (candidate, f))
-            })
+            .filter_map(|(seg, f)| SegmentCandidate::new(&seg).map(|candidate| (candidate, f)))
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
         let max_segments = if full {
@@ -1245,8 +1241,7 @@ impl Chunk {
         hash: u64,
         has_read: bool,
     ) -> Result<CellGuard<'_>, ReadError> {
-        CellGuard::for_write(hash, has_read, self)
-            .ok_or(ReadError::CellDoesNotExisted)
+        CellGuard::for_write(hash, has_read, self).ok_or(ReadError::CellDoesNotExisted)
     }
 
     pub fn compare_version_and_update_cell(
@@ -1859,6 +1854,7 @@ impl<'a> CellGuard<'a> {
 
     pub fn remove_cell(mut self) {
         self.decrement_segment_references();
+        self.segment = None;
         self.guard.take().unwrap().remove();
     }
 
@@ -1869,10 +1865,7 @@ impl<'a> CellGuard<'a> {
         }
     }
 
-    fn old_index_res(
-        &self,
-        schema: &Schema,
-    ) -> Result<Option<Vec<IndexRes>>, WriteError> {
+    fn old_index_res(&self, schema: &Schema) -> Result<Option<Vec<IndexRes>>, WriteError> {
         if self.chunk.index_builder.is_some() {
             SharedCellData::from_chunk_raw(self.get_ptr(), self.chunk)
                 .map(|(c, _)| Some(probe_cell_indices(&c, schema)))
