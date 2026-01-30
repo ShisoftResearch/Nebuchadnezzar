@@ -1062,6 +1062,27 @@ impl Drop for SegmentReferenceGuard {
     }
 }
 
+pub struct SegmentExclusiveRefGuard<'a> {
+    segment: &'a Segment,
+}
+
+impl<'a> Drop for SegmentExclusiveRefGuard<'a> {
+    fn drop(&mut self) {
+        debug_assert_eq!(self.segment.references.load(Ordering::Relaxed), EXCLUSIVE_REF_COUNT);
+        self.segment.release_exclusive_references();
+    }
+}
+
+impl<'a> SegmentExclusiveRefGuard<'a> {
+    pub fn new(segment: &'a Segment) -> Option<Self> {
+        if !segment.obtain_exclusive_references() {
+            return None;
+        }
+        Some(Self { segment })
+    }
+}
+
+
 pub struct SegmentEntryIter {
     pub(crate) bound: usize,
     pub(crate) cursor: usize,
