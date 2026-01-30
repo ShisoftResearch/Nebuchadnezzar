@@ -545,7 +545,7 @@ impl Chunk {
         let backoff = Backoff::new();
         loop {
             let guard = self.cell_index.lock_or_insert(hash as usize, 0);
-            if let Some(guard) = CellGuard::from_guard(guard, self) {
+            if let Some(guard) = CellGuard::from_guard(hash, guard, self) {
                 return guard;
             }
             backoff.spin();
@@ -557,7 +557,7 @@ impl Chunk {
     }
 
     pub fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
-        SharedCell::from_chunk_raw(CellGuard::for_read(hash, self)?, self).map(|(c, _)| c)
+        SharedCell::from_chunk_raw(hash, CellGuard::for_read(hash, self)?, self).map(|(c, _)| c)
     }
 
     fn read_selected(
@@ -774,7 +774,7 @@ impl Chunk {
     {
         if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
             let old_loc = cell_guard.get_ptr();
-            match SharedCellData::from_chunk_raw(*cell_guard, self) {
+            match SharedCellData::from_chunk_raw(hash, *cell_guard, self) {
                 Ok((cell, schema)) => {
                     let old_indices = self
                         .index_builder
@@ -845,7 +845,7 @@ impl Chunk {
         let cell_location = guard.get_ptr();
 
         if let Some(indexer) = &self.index_builder {
-            match SharedCell::from_chunk_raw(guard, self) {
+            match SharedCell::from_chunk_raw(hash, guard, self) {
                 Ok((cell, schema)) => {
                     indexer.remove_indices(&cell, &*schema);
                     cell.into_cell_guard().remove_cell();
@@ -872,7 +872,7 @@ impl Chunk {
         };
         let cell_location = *guard;
 
-        match SharedCell::from_chunk_raw(guard, self) {
+        match SharedCell::from_chunk_raw(hash, guard, self) {
             Ok((cell, schema)) => {
                 if predict(&cell) {
                     self.remove_indices(&cell, &schema);
@@ -918,8 +918,13 @@ impl Chunk {
         // If we decrement after removing, a full scan could miss the removed segment
         // and update the cache, then we'd decrement again, leading to under-counting
         let should_decrement = if let Some(seg) = self.segs.get(&(segment_id as usize)) {
-            seg.is_hot()
+            let is_hot = seg.is_hot();
+            if !is_hot {
+                error!("Segment {} is not hot in chunk {} to remove", segment_id, self.id);
+            }
+            is_hot
         } else {
+            error!("Segment {} not found in chunk {} to remove", segment_id, self.id);
             false
         };
 
@@ -936,6 +941,8 @@ impl Chunk {
             seg.free_memory();
             // Free the segment files
             seg.dispense();
+        } else {
+            error!("Segment {} not found in chunk {} to remove", segment_id, self.id);
         }
     }
 
@@ -1692,11 +1699,12 @@ pub struct CellGuard<'a> {
     segment: Option<AArc<Segment>>,
     guard: Option<WordMutexGuard<'a>>,
     chunk: &'a Chunk,
+    hash: u64,
     version: u64,
 }
 
 impl<'a> CellGuard<'a> {
-    pub fn from_guard(guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Option<Self> {
+    pub fn from_guard(hash: u64, guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Option<Self> {
         let mut segment = None;
         let mut version = 0;
         if *guard != 0 {
@@ -1722,6 +1730,7 @@ impl<'a> CellGuard<'a> {
         Some(Self {
             guard: Some(guard),
             chunk,
+            hash,
             segment,
             version,
         })
@@ -1731,7 +1740,7 @@ impl<'a> CellGuard<'a> {
         let backoff = Backoff::new();
         loop {
             let guard = chunk.location_for_read(hash)?;
-            if let Some(guard) = CellGuard::from_guard(guard, chunk) {
+            if let Some(guard) = CellGuard::from_guard(hash, guard, chunk) {
                 return Ok(guard);
             }
             backoff.spin();
@@ -1742,7 +1751,7 @@ impl<'a> CellGuard<'a> {
         let backoff = Backoff::new();
         loop {
             let guard = chunk.location_for_write(hash, has_read)?;
-            if let Some(guard) = CellGuard::from_guard(guard, chunk) {
+            if let Some(guard) = CellGuard::from_guard(hash, guard, chunk) {
                 return Some(guard);
             }
             backoff.spin();
@@ -1777,7 +1786,7 @@ impl<'a> CellGuard<'a> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        let (data, _) = SharedCellData::from_chunk_raw(self.get_ptr(), self.chunk)?;
+        let (data, _) = SharedCellData::from_chunk_raw(self.hash, self.get_ptr(), self.chunk)?;
         self.update_version(data.header.version);
         Ok(data.to_owned())
     }
@@ -1786,7 +1795,7 @@ impl<'a> CellGuard<'a> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        let (data, _) = SharedCellData::from_chunk_raw(self.get_ptr(), self.chunk)?;
+        let (data, _) = SharedCellData::from_chunk_raw(self.hash, self.get_ptr(), self.chunk)?;
         self.update_version(data.header.version);
         Ok(data)
     }
@@ -1890,7 +1899,7 @@ impl<'a> CellGuard<'a> {
 
     fn old_index_res(&self, schema: &Schema) -> Result<Option<Vec<IndexRes>>, WriteError> {
         if self.chunk.index_builder.is_some() {
-            SharedCellData::from_chunk_raw(self.get_ptr(), self.chunk)
+            SharedCellData::from_chunk_raw(self.hash, self.get_ptr(), self.chunk)
                 .map(|(c, _)| Some(probe_cell_indices(&c, schema)))
                 .map_err(|e| WriteError::ReadError(e))
         } else {

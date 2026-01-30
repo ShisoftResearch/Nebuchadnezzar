@@ -91,7 +91,7 @@ impl TieredMemoryManager {
         let evicted = self.evict_until_target(chunk, num_segments)?;
 
         // Update cached count after eviction
-        self.cached_hot_count.fetch_sub(evicted, Ordering::Relaxed);
+        self.decrement_hot_count_by(evicted);
 
         Ok(evicted)
     }
@@ -230,7 +230,7 @@ impl TieredMemoryManager {
             let evicted = self.evict_until_target(chunk, segments_to_evict)?;
 
             // Update cached count
-            self.cached_hot_count.fetch_sub(evicted, Ordering::Relaxed);
+            self.decrement_hot_count_by(evicted);
 
             Ok(evicted)
         } else {
@@ -281,7 +281,24 @@ impl TieredMemoryManager {
             actual_count
         } else {
             // Use cached value
-            self.cached_hot_count.load(Ordering::Relaxed)
+            let count = self.cached_hot_count.load(Ordering::Relaxed);
+            let total_segments = chunk.segments().len();
+            if count == 0 || count > total_segments {
+                let actual_count = self.count_hot_segments(chunk);
+                if count > total_segments {
+                    warn!(
+                        "Cached hot count out of range: cached={}, total_segments={}, recalculated={}",
+                        count,
+                        total_segments,
+                        actual_count
+                    );
+                }
+                self.cached_hot_count.store(actual_count, Ordering::Relaxed);
+                debug!("Full scan updated hot segment count: {}", actual_count);
+                return actual_count;
+            }
+            debug!("Using cached hot segment count: {}", count);
+            count
         }
     }
 
@@ -294,7 +311,24 @@ impl TieredMemoryManager {
     /// Decrement the cached hot segment count
     /// Called when a hot segment is removed or evicted
     pub fn decrement_hot_count(&self) {
-        self.cached_hot_count.fetch_sub(1, Ordering::Relaxed);
+        self.decrement_hot_count_by(1);
+    }
+
+    /// Decrement the cached hot segment count by N, saturating at zero
+    fn decrement_hot_count_by(&self, by: usize) {
+        let res = self.cached_hot_count.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(by)),
+        );
+        if let Ok(previous) = res {
+            if previous < by {
+                warn!(
+                    "Hot count underflow avoided: previous={}, decrement_by={}",
+                    previous, by
+                );
+            }
+        }
     }
 
     /// Count hot segments in the chunk

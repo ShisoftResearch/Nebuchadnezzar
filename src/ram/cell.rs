@@ -6,6 +6,7 @@ use crate::ram::entry::*;
 use crate::ram::io::align_address;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
+use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, OwnedValue, RandValue, SharedValue, Value};
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -320,19 +321,40 @@ pub struct SharedCellData<'v> {
 
 impl<'v> SharedCellData<'v> {
     //TODO: check or set checksum from crc32c cell content
-    pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, SchemaRef), ReadError> {
+    pub fn from_chunk_raw(hash: u64, ptr: usize, chunk: &Chunk) -> Result<(Self, SchemaRef), ReadError> {
         let (header, data_ptr) = header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             let cell = Self::from_data(header, reader::read_by_schema(data_ptr, &*schema));
             Ok((cell, schema))
         } else {
+            let seg = chunk.locate_segment(ptr);
+            let segment_dump = seg
+                .as_ref()
+                .map(|seg| {
+                    if seg.is_hot() {
+                        let preview_len = std::cmp::min(SEGMENT_SIZE, 64);
+                        let preview = unsafe {
+                            std::slice::from_raw_parts(seg.addr as *const u8, preview_len)
+                        };
+                        format!("{:02x?}", preview)
+                    } else {
+                        "<cold segment; dump skipped>".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "<segment not found>".to_string());
             let msg = format!(
-                "Schema {} does not existed to read ptr {} from chunk {}, segment {:?}. Backtrace: {:?}",
+                "Schema {} does not existed to read ptr {} from chunk {}, hash {}, segment {:?}, hot {:?}, is_head: {:?}, seq_id: {:?}, append_header: {:?}, segment_dump (first 64 bytes): {}. Backtrace: {:?}",
                 schema_id,
                 ptr,
                 chunk.id,
-                chunk.locate_segment(ptr).map(|seg| seg.id),
+                hash,
+                seg.as_ref().map(|seg| seg.id),
+                seg.as_ref().map(|seg| seg.is_hot()),
+                seg.as_ref().map(|seg| seg.id == chunk.get_head_seg_id()),
+                seg.as_ref().map(|seg| seg.seq_id),
+                seg.as_ref().map(|seg| seg.append_header.load(std::sync::atomic::Ordering::Relaxed)),
+                segment_dump,
                 std::backtrace::Backtrace::capture()
             );
             error!("{}", msg);
@@ -398,11 +420,12 @@ pub type SharedCell<'a> = SharedData<'a, SharedCellData<'a>>;
 
 impl<'a> SharedCell<'a> {
     pub fn from_chunk_raw(
+        hash: u64,
         cell_guard: CellGuard<'a>,
         chunk: &'a Chunk,
     ) -> Result<(Self, SchemaRef), ReadError> {
         let ptr = cell_guard.get_ptr();
-        match SharedCellData::from_chunk_raw(ptr, chunk) {
+        match SharedCellData::from_chunk_raw(hash, ptr, chunk) {
             Ok((data, schema)) => {
                 let cell = Self { cell_guard, inner: data };
                 Ok((cell, schema))

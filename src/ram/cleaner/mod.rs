@@ -101,7 +101,16 @@ impl Cleaner {
                                     // Cheap skip: only evict if we're above threshold-adjusted limit
                                     let hot = tiered_manager.hot_count_cached(chunk);
                                     let threshold_limit = tiered_manager.threshold_limit();
-                                    if hot * SEGMENT_SIZE > threshold_limit {
+                                    let hot_bytes = if hot > usize::MAX / SEGMENT_SIZE {
+                                        warn!(
+                                            "Hot segment count overflow risk: hot={}, seg_size={}",
+                                            hot, SEGMENT_SIZE
+                                        );
+                                        usize::MAX
+                                    } else {
+                                        hot * SEGMENT_SIZE
+                                    };
+                                    if hot_bytes > threshold_limit {
                                         match tiered_manager.evict_for_allocation(chunk) {
                                             Ok(evicted) => {
                                                 if evicted > 0 {

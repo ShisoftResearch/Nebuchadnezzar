@@ -1,5 +1,5 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::segs::Segment;
+use crate::ram::segs::{Segment, SegmentExclusiveRefGuard};
 use std::sync::atomic::Ordering;
 
 /// CLOCK eviction policy for selecting victim segments to evict

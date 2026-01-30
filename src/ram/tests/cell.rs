@@ -32,7 +32,7 @@ pub fn cell_rw() {
         .unwrap();
     let cell_1_ptr = write_result.addr;
     {
-        let (stored_cell, _) = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
+        let (stored_cell, _) = SharedCellData::from_chunk_raw(id1.lower, cell_1_ptr, &chunk).unwrap();
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
@@ -53,7 +53,7 @@ pub fn cell_rw() {
         .unwrap();
     let cell_2_ptr = write_result.addr;
     {
-        let stored_cell = SharedCellData::from_chunk_raw(cell_2_ptr, &chunk)
+        let stored_cell = SharedCellData::from_chunk_raw(id2.lower, cell_2_ptr, &chunk)
             .unwrap()
             .0;
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
@@ -61,7 +61,7 @@ pub fn cell_rw() {
         assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
     }
     {
-        let stored_cell = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk)
+        let stored_cell = SharedCellData::from_chunk_raw(id1.lower, cell_1_ptr, &chunk)
             .unwrap()
             .0;
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
