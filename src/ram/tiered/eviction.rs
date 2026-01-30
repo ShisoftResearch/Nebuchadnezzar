@@ -1,5 +1,5 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::segs::Segment;
+use crate::ram::segs::{Segment, SegmentExclusiveRefGuard};
 use std::io;
 
 /// Evict a hot segment to cold storage with cell-level locking
@@ -26,15 +26,21 @@ use std::io;
 pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> {
     debug!("evict_segment called for segment {}", segment.id);
 
-    struct ExclusiveRefGuard<'a> {
-        segment: &'a Segment,
-    }
 
-    impl<'a> Drop for ExclusiveRefGuard<'a> {
-        fn drop(&mut self) {
-            self.segment.release_exclusive_references();
-        }
-    }
+
+    // Step 3: Obtain exclusive references (skip if not available)
+    let _exclusive_guard = if let Some(l) = SegmentExclusiveRefGuard::new(segment) {
+        l
+    } else {
+        debug!(
+            "Segment {} has active references, skipping eviction",
+            segment.id
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Segment has active references",
+        ));
+    };
 
     // Step 1: Try to acquire segment lock (skip if already locked)
     if !segment.lock_hot_to_cold() {
@@ -46,21 +52,6 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         "Evicting segment {} to cold storage with cell locking",
         segment.id
     );
-
-    // Step 3: Obtain exclusive references (skip if not available)
-    let _exclusive_guard = if segment.obtain_exclusive_references() {
-        ExclusiveRefGuard { segment }
-    } else {
-        debug!(
-            "Segment {} has active references, skipping eviction",
-            segment.id
-        );
-        segment.set_hot();
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Segment has active references",
-        ));
-    };
 
     // Check if segment needs archiving based on archived and wal_dirty flags
     // archived=true means backup file exists
