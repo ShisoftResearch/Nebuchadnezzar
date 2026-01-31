@@ -1,6 +1,6 @@
 use crate::ram::compression;
 use crate::ram::recovery::find_append_header;
-use crate::ram::segs::{Segment, SegmentEntryIter, SEGMENT_SIZE};
+use crate::ram::segs::{SEGMENT_SIZE, Segment, SegmentEntryIter, SegmentExclusiveRefGuard};
 use std::io::Read;
 use std::ptr;
 use std::sync::atomic::Ordering;
@@ -40,6 +40,15 @@ pub fn promote_segment(segment: &Segment) {
     // Step 1: Acquire segment lock (blocks until available)
     // This ensures only one promotion/eviction/cleaner operation at a time
     loop {
+        let _exclusive_guard = if let Some(l) = SegmentExclusiveRefGuard::new(segment) {
+            l
+        } else {
+            debug!(
+                "Segment {} has active references, skipping promotion",
+                segment.id
+            );
+            return;
+        };
         if segment.is_hot() {
             // Already hot, skip promotion
             debug!(
@@ -82,8 +91,8 @@ pub fn promote_segment(segment: &Segment) {
 
     // Step 5: Open backup file on demand instead of keeping it open
     // This avoids holding file descriptors for idle/cold segments.
+    let file_state = segment.file_state.lock();
     let backup_path = {
-        let file_state = segment.file_state.lock();
         match file_state
             .manager
             .backup_path(segment.chunk_id, segment.id, segment.seq_id)
@@ -184,13 +193,7 @@ pub fn promote_segment(segment: &Segment) {
     // Resize to SEGMENT_SIZE, padding with zeros if needed
     // This ensures the segment memory is fully initialized
     let decompressed_size = temp_buffer.len();
-    temp_buffer.resize(SEGMENT_SIZE, 0);
-    debug!(
-        "Resized buffer to {} bytes (padded {} zero bytes) for segment {}",
-        SEGMENT_SIZE,
-        SEGMENT_SIZE - decompressed_size,
-        segment.id
-    );
+    debug_assert_eq!(decompressed_size, SEGMENT_SIZE);
 
     // Always scan the buffer to find the actual valid data boundary
     // We need to treat the buffer as a memory region for scanning

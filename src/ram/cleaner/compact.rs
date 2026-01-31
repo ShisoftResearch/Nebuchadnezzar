@@ -76,12 +76,6 @@ impl CompactCleaner {
             original_used_space
         );
 
-        // Mark segment as unarchived and dirty before modifying it
-        // archived=false makes segment INELIGIBLE for CLOCK eviction victim selection
-        // wal_dirty=true ensures eviction will re-archive if it somehow proceeds
-        seg.clear_archived();
-        seg.set_dirty();
-
         let seg_addr = seg.addr;
         let mut cursor = seg_addr;
         let mut released_tombstones = 0;
@@ -187,6 +181,7 @@ impl CompactCleaner {
         seg.append_header.store(cursor, Ordering::Release);
         seg.tombstones
             .fetch_sub(released_tombstones as u32, Ordering::Relaxed);
+        seg.set_dirty();
         let used_size = cursor - seg_addr;
         if used_size < SEGMENT_SIZE {
             seg.shrink(used_size);

@@ -52,7 +52,10 @@ lindera = { version = "0.30", features = ["ipadic"] }
 crc-fast = "1.10.0"
 
 [features]
-default = ["cleaner", "combine_cleaner", "compact_cleaner", "tiered_memory", "compress_backups"]
+default = [
+    "cleaner", "combine_cleaner", "compact_cleaner", 
+    "tiered_memory", "compress_backups"
+]
 
 cleaner = []
 combine_cleaner = ["cleaner"]

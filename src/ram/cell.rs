@@ -344,7 +344,7 @@ impl<'v> SharedCellData<'v> {
                 })
                 .unwrap_or_else(|| "<segment not found>".to_string());
             let msg = format!(
-                "Schema {} does not existed to read ptr {} from chunk {}, hash {}, segment {:?}, hot {:?}, is_head: {:?}, seq_id: {:?}, append_header: {:?}, segment_dump (first 64 bytes): {}. Backtrace: {:?}",
+                "Schema {} does not existed to read ptr {} from chunk {}, hash {}, segment {:?}, hot {:?}, is_head: {:?}, seq_id: {:?}, append_header: {:?}, dirty: {:?}, beyond_append_header: {:?}, segment_dump (first 64 bytes): {}. Backtrace: {:?}",
                 schema_id,
                 ptr,
                 chunk.id,
@@ -354,6 +354,8 @@ impl<'v> SharedCellData<'v> {
                 seg.as_ref().map(|seg| seg.id == chunk.get_head_seg_id()),
                 seg.as_ref().map(|seg| seg.seq_id),
                 seg.as_ref().map(|seg| seg.append_header.load(std::sync::atomic::Ordering::Relaxed)),
+                seg.as_ref().map(|seg| seg.is_dirty()),
+                seg.as_ref().map(|seg| ptr > seg.append_header.load(std::sync::atomic::Ordering::Relaxed)),
                 segment_dump,
                 std::backtrace::Backtrace::capture()
             );

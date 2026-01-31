@@ -88,7 +88,6 @@ pub struct Segment {
     last_no_progress_clean_generation: AtomicU64,
     references: AtomicUsize,
     pub file_state: parking_lot::Mutex<SegmentFileState>,
-    archived: AtomicBool,
     pub dropped: AtomicBool,
     // Tiered memory fields
     /// Segment lock for tiered memory operations (eviction, promotion, cleaner)
@@ -165,7 +164,6 @@ impl Segment {
                 manager: file_manager,
                 wal: wal_file_opt,
             }),
-            archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
             reference_bit: AtomicBool::new(false),
@@ -535,20 +533,7 @@ impl Segment {
                     self.seq_id,
                 )?;
             }
-
-            // Fallback: write from memory if WAL file doesn't exist or wasn't configured
-            // Reuse existing backup handler if available, otherwise create new one
             {
-                let write_size = {
-                    let valid_size = self.append_header() - self.addr;
-                    valid_size.max(PAGE_SIZE) // At least one page to ensure file exists
-                };
-
-                debug!(
-                    "Archiving segment {} from memory: write_size={}",
-                    self.id, write_size
-                );
-
                 // Always open a fresh backup writer for this archive operation
                 if let Some(mut file) = state.manager.open_or_create_backup_writer(
                     self.chunk_id,
@@ -560,14 +545,12 @@ impl Segment {
                     file.sync_all()?;
 
                     unsafe {
-                        let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
+                        let data_block = slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
 
                         // Create a padded copy to SEGMENT_SIZE to match WAL-based archiving behavior
-                        let mut padded_data = Vec::with_capacity(SEGMENT_SIZE);
-                        padded_data.extend_from_slice(data_block);
-                        if write_size < SEGMENT_SIZE {
-                            padded_data.resize(SEGMENT_SIZE, 0);
-                        }
+                        let padded_data = Vec::from(data_block);
+
+                        debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
 
                         // Conditionally compress based on feature flag
                         #[cfg(feature = "compress_backups")]
@@ -626,7 +609,6 @@ impl Segment {
                         "Archived segment {} to backup file '{}'",
                         self.id, backup_file
                     );
-                    self.set_archived();
                     self.clear_dirty();
 
                     // Close and delete WAL file since backup now contains all data
@@ -660,6 +642,7 @@ impl Segment {
                 "Segment {} has no backup storage configured, cannot archive",
                 self.id
             );
+            return Ok(false);
         }
         return Ok(false);
     }
@@ -997,16 +980,6 @@ impl Segment {
         self.addr <= addr && addr < self.bound
     }
 
-    pub fn set_archived(&self) {
-        debug!("set_archived for segment {}", self.id);
-        self.archived.store(true, Ordering::Release);
-    }
-
-    pub fn clear_archived(&self) {
-        debug!("clear_archived for segment {}", self.id);
-        self.archived.store(false, Ordering::Release);
-    }
-
     pub fn set_dirty(&self) {
         debug!("set_dirty for segment {}", self.id);
         self.is_dirty.store(true, Ordering::Release);
@@ -1019,10 +992,6 @@ impl Segment {
 
     pub fn is_dirty(&self) -> bool {
         self.is_dirty.load(Ordering::Relaxed)
-    }
-
-    pub fn is_archived(&self) -> bool {
-        self.archived.load(Ordering::Relaxed)
     }
 }
 

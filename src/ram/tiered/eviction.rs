@@ -57,13 +57,12 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     // archived=true means backup file exists
     // wal_dirty=false means no WAL writes or memory modifications since last archive
     // Both must be true to skip archiving
-    let is_clean = segment.is_archived() && !segment.is_dirty();
+    let is_clean = !segment.is_dirty();
 
     if !is_clean {
         debug!(
-            "Segment {} needs archiving before eviction (archived={}, wal_dirty={})",
+            "Segment {} needs archiving before eviction (dirty={})",
             segment.id,
-            segment.is_archived(),
             segment.is_dirty()
         );
         match segment.archive() {
@@ -131,12 +130,11 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
             .unwrap_or(false);
         error!(
             "CRITICAL: Segment {} backup file does not exist at '{}'. \
-             Parent directory exists: {}. is_archived={}, is_dirty={}. \
+             Parent directory exists: {}. dirty={}. \
              This should not happen - segment was marked archived but file is missing!",
             segment.id,
             backup_path,
             parent_exists,
-            segment.is_archived(),
             segment.is_dirty()
         );
         segment.set_hot();

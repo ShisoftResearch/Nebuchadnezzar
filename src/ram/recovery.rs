@@ -1126,7 +1126,6 @@ pub fn recover_chunks(
                 version_map,
             );
             all_stashed_tombstones.lock().extend(stashed);
-            segment.set_archived();
             segment.clear_dirty(); // Recovered segments should not be archived again
             hot_count.fetch_add(1, Ordering::Relaxed);
 
@@ -1165,7 +1164,6 @@ pub fn recover_chunks(
 
             // Mark as cold/archived BEFORE scanning
             segment.set_cold();
-            segment.set_archived();
             segment.clear_dirty(); // Recovered segments should not be archived again
 
             // Load data to heap memory (temporary)

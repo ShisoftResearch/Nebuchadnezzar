@@ -1511,7 +1511,7 @@ impl Chunks {
         for chunk in &self.list {
             for segment in chunk.segs.iter_values() {
                 // Check if segment needs archiving
-                let is_clean = segment.is_archived() && !segment.is_dirty();
+                let is_clean = !segment.is_dirty();
 
                 if is_clean {
                     total_skipped += 1;
