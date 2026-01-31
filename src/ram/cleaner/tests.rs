@@ -276,7 +276,10 @@ fn compact_marks_no_progress_and_skips_segment() {
         "segment should be considered for compaction when utilization drops"
     );
 
-    let reclaimed = compact::CompactCleaner::clean_segment(chunk, SegmentCandidate::new(&victim_seg).unwrap());
+    drop(initial_candidates);
+
+    let reclaimed =
+        compact::CompactCleaner::clean_segment(chunk, SegmentCandidate::new(&victim_seg).unwrap());
     assert_eq!(
         reclaimed, 0,
         "no space should be reclaimed without dead cells"

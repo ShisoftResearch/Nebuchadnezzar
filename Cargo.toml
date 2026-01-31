@@ -53,7 +53,8 @@ crc-fast = "1.10.0"
 
 [features]
 default = [
-    "cleaner", "combine_cleaner", "compact_cleaner", 
+    "cleaner", "combine_cleaner", 
+    # "compact_cleaner", 
     "tiered_memory", "compress_backups"
 ]
 

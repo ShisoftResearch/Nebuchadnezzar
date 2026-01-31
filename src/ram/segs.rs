@@ -545,7 +545,8 @@ impl Segment {
                     file.sync_all()?;
 
                     unsafe {
-                        let data_block = slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
+                        let data_block =
+                            slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
 
                         // Create a padded copy to SEGMENT_SIZE to match WAL-based archiving behavior
                         let padded_data = Vec::from(data_block);
@@ -752,14 +753,14 @@ impl Segment {
                 return false;
             }
             if self
-                    .references
-                    .compare_exchange(
-                        curr_refs,
-                        curr_refs + 1,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
+                .references
+                .compare_exchange(
+                    curr_refs,
+                    curr_refs + 1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
             {
                 return true;
             }
@@ -774,17 +775,26 @@ impl Segment {
             let curr_refs = self.references.load(Ordering::Relaxed);
             // If reference count is already 0, just return. This can happen in race conditions
             // where a PendingEntry is dropped after the segment has been cleaned up.
-            debug_assert!(curr_refs > 0, "Segment {} has negative references {}", self.id, curr_refs);
-            debug_assert!(curr_refs != EXCLUSIVE_REF_COUNT, "Segment {} has exclusive references, which should not happen", self.id);
+            debug_assert!(
+                curr_refs > 0,
+                "Segment {} has negative references {}",
+                self.id,
+                curr_refs
+            );
+            debug_assert!(
+                curr_refs != EXCLUSIVE_REF_COUNT,
+                "Segment {} has exclusive references, which should not happen",
+                self.id
+            );
             if self
-                    .references
-                    .compare_exchange(
-                        curr_refs,
-                        curr_refs - 1,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
+                .references
+                .compare_exchange(
+                    curr_refs,
+                    curr_refs - 1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
             {
                 return;
             }
@@ -1037,7 +1047,10 @@ pub struct SegmentExclusiveRefGuard<'a> {
 
 impl<'a> Drop for SegmentExclusiveRefGuard<'a> {
     fn drop(&mut self) {
-        debug_assert_eq!(self.segment.references.load(Ordering::Relaxed), EXCLUSIVE_REF_COUNT);
+        debug_assert_eq!(
+            self.segment.references.load(Ordering::Relaxed),
+            EXCLUSIVE_REF_COUNT
+        );
         self.segment.release_exclusive_references();
     }
 }
@@ -1050,7 +1063,6 @@ impl<'a> SegmentExclusiveRefGuard<'a> {
         Some(Self { segment })
     }
 }
-
 
 pub struct SegmentEntryIter {
     pub(crate) bound: usize,

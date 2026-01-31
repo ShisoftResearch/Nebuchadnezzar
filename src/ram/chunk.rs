@@ -1219,8 +1219,12 @@ impl Chunk {
                             trace!("Tombstone target at {} have been removed, will be ditched", tombstone.segment_id)
                         }
                     },
+                    EntryType::UNDECIDED => {
+                        trace!("Scanning entry at {} is undecided", entry_meta.entry_pos);
+                        return None;
+                    },
                     _ => panic!("Unexpected cell type on getting live entries at {}: type {:?}, size {}, append header {}, ends at {}",
-                                entry_meta.entry_pos, entry_header, entry_size,
+                                entry_meta.entry_pos, entry_header.entry_type.bits(), entry_size,
                                 seg.append_header.load(Ordering::Relaxed),
                                 entry_meta.entry_pos + entry_size)
                 }
