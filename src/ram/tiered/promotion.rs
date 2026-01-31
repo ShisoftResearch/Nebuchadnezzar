@@ -43,11 +43,7 @@ pub fn promote_segment(segment: &Segment) {
         let _exclusive_guard = if let Some(l) = SegmentExclusiveRefGuard::new(segment) {
             l
         } else {
-            debug!(
-                "Segment {} has active references, skipping promotion",
-                segment.id
-            );
-            return;
+            continue;
         };
         if segment.is_hot() {
             // Already hot, skip promotion
