@@ -278,8 +278,7 @@ fn compact_marks_no_progress_and_skips_segment() {
 
     drop(initial_candidates);
 
-    let reclaimed =
-        compact::CompactCleaner::clean_segment(chunk, victim_seg.clone());
+    let reclaimed = compact::CompactCleaner::clean_segment(chunk, victim_seg.clone());
     assert_eq!(
         reclaimed, 0,
         "no space should be reclaimed without dead cells"

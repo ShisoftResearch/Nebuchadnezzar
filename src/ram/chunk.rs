@@ -1,6 +1,6 @@
 use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
 use crate::ram::cleaner::SegmentCandidate;
-use crate::ram::entry::{ENTRY_HEAD_SIZE, Entry, EntryContent, EntryType};
+use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segment_list::SegmentList;
@@ -920,11 +920,17 @@ impl Chunk {
         let should_decrement = if let Some(seg) = self.segs.get(&(segment_id as usize)) {
             let is_hot = seg.is_hot();
             if !is_hot {
-                error!("Segment {} is not hot in chunk {} to remove", segment_id, self.id);
+                error!(
+                    "Segment {} is not hot in chunk {} to remove",
+                    segment_id, self.id
+                );
             }
             is_hot
         } else {
-            error!("Segment {} not found in chunk {} to remove", segment_id, self.id);
+            error!(
+                "Segment {} not found in chunk {} to remove",
+                segment_id, self.id
+            );
             false
         };
 
@@ -942,7 +948,10 @@ impl Chunk {
             // Free the segment files
             seg.dispense();
         } else {
-            error!("Segment {} not found in chunk {} to remove", segment_id, self.id);
+            error!(
+                "Segment {} not found in chunk {} to remove",
+                segment_id, self.id
+            );
         }
     }
 
@@ -1728,7 +1737,11 @@ impl<'a> CellGuard<'a> {
                     }
                     segment.mark_referenced();
                 } else {
-                    trace!("Segment not found for cell at {:?} for chunk {}. Should retry.", *guard, chunk.id);
+                    trace!(
+                        "Segment not found for cell at {:?} for chunk {}. Should retry.",
+                        *guard,
+                        chunk.id
+                    );
                     return None;
                 }
             }

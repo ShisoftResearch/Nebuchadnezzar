@@ -1,6 +1,6 @@
 use crate::ram::compression;
 use crate::ram::recovery::find_append_header;
-use crate::ram::segs::{SEGMENT_SIZE, Segment, SegmentEntryIter, SegmentExclusiveRefGuard};
+use crate::ram::segs::{Segment, SegmentEntryIter, SegmentExclusiveRefGuard, SEGMENT_SIZE};
 use std::io::Read;
 use std::ptr;
 use std::sync::atomic::Ordering;

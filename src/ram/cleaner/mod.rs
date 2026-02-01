@@ -1,5 +1,5 @@
 use crate::ram::chunk::{Chunk, Chunks};
-use crate::ram::segs::{SEGMENT_SIZE, Segment};
+use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use rayon::prelude::*;
 use std::env;
 use std::ops::Deref;
@@ -312,7 +312,9 @@ impl SegmentCandidate {
             segment.decr_references();
             return None;
         }
-        Some(Self { segment: segment.clone() })
+        Some(Self {
+            segment: segment.clone(),
+        })
     }
 }
 

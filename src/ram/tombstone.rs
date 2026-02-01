@@ -65,7 +65,13 @@ impl Tombstone {
         .1
     }
 
-    pub fn put(tombstone_addr: usize, segment_seq_id: u64, version: u64, partition: u64, hash: u64) {
+    pub fn put(
+        tombstone_addr: usize,
+        segment_seq_id: u64,
+        version: u64,
+        partition: u64,
+        hash: u64,
+    ) {
         Tombstone {
             segment_seq_id,
             version,

@@ -191,7 +191,7 @@ impl SegmentList {
         } else {
             // Remove from seq_id index (cast u64 seq_id to usize)
             self.seq_id_index.remove(&(old.seq_id as usize));
-            
+
             // Update bitmap: clear the bit for this segment
             self.clear_bit(*key);
             self.count.fetch_sub(1, Ordering::Relaxed);
@@ -516,16 +516,16 @@ mod tests {
 
         // Insert segments with different seq_ids
         let seg1 = AArc::new(Segment::new(
-            0,     // id (segment_id)
-            100,   // seq_id
-            0,     // chunk_id
+            0,   // id (segment_id)
+            100, // seq_id
+            0,   // chunk_id
             0x1000,
             true,
             Arc::clone(&file_manager),
         ));
         let seg2 = AArc::new(Segment::new(
-            1,     // id
-            200,   // seq_id
+            1,   // id
+            200, // seq_id
             0,
             0x2000,
             true,
@@ -553,8 +553,8 @@ mod tests {
 
         // Test replacing segment updates seq_id index
         let seg3 = AArc::new(Segment::new(
-            0,     // Same segment_id as seg1
-            300,   // Different seq_id
+            0,   // Same segment_id as seg1
+            300, // Different seq_id
             0,
             0x1000,
             true,

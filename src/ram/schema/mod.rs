@@ -613,26 +613,26 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
                             .await
                             .map_err(|e| format!("Error creating vector index: {:?}", e))?;
                     } else {
-                    return Err(format!("Indexing not enabled"));
+                        return Err(format!("Indexing not enabled"));
+                    }
                 }
-            }
-            IndexType::Embedding(model) => {
-                if let Some(indexer) = &neb_server.indexer {
-                    let _ = indexer
-                        .clients
-                        .embedding_client
-                        .new_index(schema_id, field_id, model, None)
-                        .await
-                        .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
-                } else {
-                    return Err(format!("Indexing not enabled"));
+                IndexType::Embedding(model) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .embedding_client
+                            .new_index(schema_id, field_id, model, None)
+                            .await
+                            .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
-}
-for (compound_id, compound) in &schema.compound_index_fields {
+    for (compound_id, compound) in &schema.compound_index_fields {
         for index in &compound.indices {
             let field_id = *compound_id;
             let schema_id = schema.id;
@@ -649,23 +649,23 @@ for (compound_id, compound) in &schema.compound_index_fields {
                         return Err(format!("Indexing not enabled"));
                     }
                 }
-            IndexType::Embedding(model) => {
-                if let Some(indexer) = &neb_server.indexer {
-                    let _ = indexer
-                        .clients
-                        .embedding_client
-                        .new_index(schema_id, field_id, model, None)
-                        .await
-                        .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
-                } else {
-                    return Err(format!("Indexing not enabled"));
+                IndexType::Embedding(model) => {
+                    if let Some(indexer) = &neb_server.indexer {
+                        let _ = indexer
+                            .clients
+                            .embedding_client
+                            .new_index(schema_id, field_id, model, None)
+                            .await
+                            .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
-}
-Ok(())
+    Ok(())
 }
 
 pub async fn post_schema_delete(

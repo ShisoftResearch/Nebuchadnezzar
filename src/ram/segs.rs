@@ -1100,13 +1100,14 @@ impl Iterator for SegmentEntryIter {
             return None;
         }
 
-
         // Validate that the entry doesn't exceed the bound
         let next_cursor = cursor + entry_meta.entry_size;
         debug_assert!(
             next_cursor <= self.bound,
             "Entry at position {} exceeds segment bound (size: {}, bound: {})",
-            cursor, entry_meta.entry_size, self.bound
+            cursor,
+            entry_meta.entry_size,
+            self.bound
         );
 
         self.cursor = next_cursor;

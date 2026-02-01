@@ -6,8 +6,8 @@ use crate::ram::entry::*;
 use crate::ram::io::align_address;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
-use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::schema::{Field, Schema};
+use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::types::{Id, Map, OwnedValue, RandValue, SharedValue, Value};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use dovahkiin::types::referred::ARef;
@@ -321,7 +321,11 @@ pub struct SharedCellData<'v> {
 
 impl<'v> SharedCellData<'v> {
     //TODO: check or set checksum from crc32c cell content
-    pub fn from_chunk_raw(hash: u64, ptr: usize, chunk: &Chunk) -> Result<(Self, SchemaRef), ReadError> {
+    pub fn from_chunk_raw(
+        hash: u64,
+        ptr: usize,
+        chunk: &Chunk,
+    ) -> Result<(Self, SchemaRef), ReadError> {
         let (header, data_ptr) = header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
@@ -380,7 +384,10 @@ impl<'v> SharedCellData<'v> {
         }
     }
     pub fn into_shared(self, cell_guard: CellGuard<'v>) -> SharedCell<'v> {
-        SharedCell { cell_guard, inner: self }
+        SharedCell {
+            cell_guard,
+            inner: self,
+        }
     }
 }
 
@@ -399,13 +406,19 @@ impl<'a, T> Deref for SharedData<'a, T> {
 
 impl<'a, T> SharedData<'a, T> {
     pub fn new(data: T, cell_guard: CellGuard<'a>) -> Self {
-        Self { inner: data, cell_guard }
+        Self {
+            inner: data,
+            cell_guard,
+        }
     }
     pub fn decompose(self) -> (T, CellGuard<'a>) {
         (self.inner, self.cell_guard)
     }
     pub fn compose(data: T, cell_guard: CellGuard<'a>) -> Self {
-        Self { inner: data, cell_guard }
+        Self {
+            inner: data,
+            cell_guard,
+        }
     }
     pub fn cell_guard(&self) -> &CellGuard<'a> {
         &self.cell_guard
@@ -429,7 +442,10 @@ impl<'a> SharedCell<'a> {
         let ptr = cell_guard.get_ptr();
         match SharedCellData::from_chunk_raw(hash, ptr, chunk) {
             Ok((data, schema)) => {
-                let cell = Self { cell_guard, inner: data };
+                let cell = Self {
+                    cell_guard,
+                    inner: data,
+                };
                 Ok((cell, schema))
             }
             Err(e) => Err(e),
@@ -441,9 +457,11 @@ impl<'a> SharedCell<'a> {
         fields: &[u64],
         need_header: bool,
     ) -> Result<SharedCell<'a>, ReadError> {
-        select_from_chunk_raw(cell_guard.get_ptr(), chunk, fields, need_header).map(|(val, hdr)| SharedData {
-            cell_guard,
-            inner: SharedCellData::from_data(hdr, val),
+        select_from_chunk_raw(cell_guard.get_ptr(), chunk, fields, need_header).map(|(val, hdr)| {
+            SharedData {
+                cell_guard,
+                inner: SharedCellData::from_data(hdr, val),
+            }
         })
     }
 }

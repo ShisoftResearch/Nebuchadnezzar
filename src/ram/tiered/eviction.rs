@@ -26,8 +26,6 @@ use std::io;
 pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> {
     debug!("evict_segment called for segment {}", segment.id);
 
-
-
     // Step 3: Obtain exclusive references (skip if not available)
     let _exclusive_guard = if let Some(l) = SegmentExclusiveRefGuard::new(segment) {
         l

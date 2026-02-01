@@ -6,7 +6,7 @@ use crate::ram::entry::*;
 use std::sync::atomic::Ordering;
 
 use itertools::Itertools;
-use libc;
+use libc::{self, memset};
 use lightning::aarc::Arc;
 use lightning::map::Map;
 
@@ -92,69 +92,32 @@ impl CompactCleaner {
         let mut cursor = seg_addr;
         let mut released_tombstones = 0;
         // Compact in place
-        entries
-            .into_iter()
-            .for_each(|entry: Entry| {
-                let entry_size = entry.meta.entry_size;
-                let entry_pos = entry.meta.entry_pos;
-                let needs_move = cursor != entry_pos;
+        entries.into_iter().for_each(|entry: Entry| {
+            let entry_size = entry.meta.entry_size;
+            let entry_pos = entry.meta.entry_pos;
+            let needs_move = cursor != entry_pos;
 
-                // Validate and process entry based on type
-                // CRITICAL: Always revalidate entries even if already at correct position,
-                // since entries may become stale between live_entries scan and processing
-                match entry.meta.entry_header.entry_type {
-                    EntryType::CELL => {
-                        let header = entry.content.as_cell_header();
-                        let cell_guard = chunk.cell_index.lock(header.hash as usize);
+            // Validate and process entry based on type
+            // CRITICAL: Always revalidate entries even if already at correct position,
+            // since entries may become stale between live_entries scan and processing
+            match entry.meta.entry_header.entry_type {
+                EntryType::CELL => {
+                    let header = entry.content.as_cell_header();
+                    let cell_guard = chunk.cell_index.lock(header.hash as usize);
 
-                        if let Some(mut guard) = cell_guard {
-                            if *guard == entry_pos {
-                                // Cell still valid at this position
-                                if needs_move {
-                                    // Move cell to compact location
-                                    trace!(
-                                        "Memcpy cell entry, size: {}, from {} to {}, for {:?}",
-                                        entry_size, entry_pos, cursor, entry.content
-                                    );
-                                    unsafe {
-                                        libc::memmove(
-                                            cursor as *mut libc::c_void,
-                                            entry_pos as *mut libc::c_void,
-                                            entry_size,
-                                        );
-                                    }
-                                    *guard = cursor;
-                                }
-                                cursor += entry_size;
-                            } else {
-                                // Cell was moved by another thread - skip this stale entry
-                                trace!(
-                                    "Cell {:?} at {} changed to {} during compact - skipping",
-                                    header.id(), entry_pos, *guard
-                                );
-                            }
-                        } else {
-                            // Cell was deleted - skip this stale entry
-                            trace!("Cell {:?} at {} was deleted - skipping", header.id(), entry_pos);
-                        }
-                    }
-                    EntryType::TOMBSTONE => {
-                        let tombstone = entry.content.as_tombstone();
-                        let target_seg_exists = chunk.segs.contains_seq_id(tombstone.segment_seq_id);
-                        let is_obsolete = chunk.cell_index.contains_key(&(tombstone.hash as usize))
-                            || !target_seg_exists;
-
-                        if is_obsolete {
-                            // Tombstone is obsolete - skip it
-                            trace!("Tombstone {:?} is obsolete - skipping", tombstone.hash);
-                            released_tombstones += 1;
-                        } else {
-                            // Tombstone still valid
+                    if let Some(mut guard) = cell_guard {
+                        if *guard == entry_pos {
+                            // Cell still valid at this position
                             if needs_move {
+                                // Move cell to compact location
                                 trace!(
-                                    "Memcpy tombstone entry, size: {}, from {} to {}",
-                                    entry_size, entry_pos, cursor
+                                    "Memcpy cell entry, size: {}, from {} to {}, for {:?}",
+                                    entry_size,
+                                    entry_pos,
+                                    cursor,
+                                    entry.content
                                 );
+                                assert!(cursor < entry_pos);
                                 unsafe {
                                     libc::memmove(
                                         cursor as *mut libc::c_void,
@@ -162,16 +125,68 @@ impl CompactCleaner {
                                         entry_size,
                                     );
                                 }
+                                *guard = cursor;
                             }
                             cursor += entry_size;
+                        } else {
+                            // Cell was moved by another thread - skip this stale entry
+                            trace!(
+                                "Cell {:?} at {} changed to {} during compact - skipping",
+                                header.id(),
+                                entry_pos,
+                                *guard
+                            );
                         }
-                    }
-                    _ => {
-                        // Should never happen - live_entries filters these
-                        warn!("Unexpected entry type {:?} during compact", entry.meta.entry_header.entry_type);
+                    } else {
+                        // Cell was deleted - skip this stale entry
+                        trace!(
+                            "Cell {:?} at {} was deleted - skipping",
+                            header.id(),
+                            entry_pos
+                        );
                     }
                 }
-            });
+                EntryType::TOMBSTONE => {
+                    let tombstone = entry.content.as_tombstone();
+                    let target_seg_exists = chunk.segs.contains_seq_id(tombstone.segment_seq_id);
+                    let is_obsolete = chunk.cell_index.contains_key(&(tombstone.hash as usize))
+                        || !target_seg_exists;
+
+                    if is_obsolete {
+                        // Tombstone is obsolete - skip it
+                        trace!("Tombstone {:?} is obsolete - skipping", tombstone.hash);
+                        released_tombstones += 1;
+                    } else {
+                        // Tombstone still valid
+                        if needs_move {
+                            trace!(
+                                "Memcpy tombstone entry, size: {}, from {} to {}",
+                                entry_size,
+                                entry_pos,
+                                cursor
+                            );
+                            assert!(cursor < entry_pos);
+                            unsafe {
+                                libc::memmove(
+                                    cursor as *mut libc::c_void,
+                                    entry_pos as *mut libc::c_void,
+                                    entry_size,
+                                );
+                            }
+                        }
+                        cursor += entry_size;
+                    }
+                }
+                _ => {
+                    // Should never happen - live_entries filters these
+                    warn!(
+                        "Unexpected entry type {:?} during compact",
+                        entry.meta.entry_header.entry_type
+                    );
+                }
+            }
+        });
+        unsafe { memset(cursor as *mut libc::c_void, 0, SEGMENT_SIZE - cursor) };
         seg.append_header.store(cursor, Ordering::Release);
         seg.tombstones
             .fetch_sub(released_tombstones as u32, Ordering::Relaxed);

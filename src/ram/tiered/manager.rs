@@ -316,11 +316,11 @@ impl TieredMemoryManager {
 
     /// Decrement the cached hot segment count by N, saturating at zero
     fn decrement_hot_count_by(&self, by: usize) {
-        let res = self.cached_hot_count.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(by)),
-        );
+        let res =
+            self.cached_hot_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(by))
+                });
         if let Ok(previous) = res {
             if previous < by {
                 warn!(
