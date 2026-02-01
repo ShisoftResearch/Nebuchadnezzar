@@ -1074,15 +1074,15 @@ impl Chunk {
         self.segs.iter_front_values().collect()
     }
 
-    pub fn segs_for_compact_cleaner(&self) -> Vec<SegmentCandidate> {
+    pub fn segs_for_compact_cleaner(&self) -> Vec<AArc<Segment>> {
         self.segs_for_compact_cleaner_impl(false)
     }
 
-    pub fn segs_for_compact_cleaner_full(&self) -> Vec<SegmentCandidate> {
+    pub fn segs_for_compact_cleaner_full(&self) -> Vec<AArc<Segment>> {
         self.segs_for_compact_cleaner_impl(true)
     }
 
-    fn segs_for_compact_cleaner_impl(&self, full: bool) -> Vec<SegmentCandidate> {
+    fn segs_for_compact_cleaner_impl(&self, full: bool) -> Vec<AArc<Segment>> {
         let utilization_selection = self
             .segments()
             .into_iter()
@@ -1104,7 +1104,6 @@ impl Chunk {
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
                     && !seg.cleaned_without_progress()
             })
-            .filter_map(|(seg, f)| SegmentCandidate::new(&seg).map(|candidate| (candidate, f)))
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
         let max_segments = if full {

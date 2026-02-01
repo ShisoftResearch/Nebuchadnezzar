@@ -2,20 +2,33 @@ use super::super::chunk::Chunk;
 use super::super::segs::{Segment, SEGMENT_SIZE};
 use crate::ram::cleaner::SegmentCandidate;
 use crate::ram::entry::*;
+use crate::ram::segs::SegmentExclusiveRefGuard;
 
 use std::sync::atomic::Ordering;
 
 use itertools::Itertools;
 use libc;
+use lightning::aarc::Arc;
 use lightning::map::Map;
 
 pub struct CompactCleaner;
 
 impl CompactCleaner {
-    pub fn clean_segment(chunk: &Chunk, seg: SegmentCandidate) -> usize {
+    pub fn clean_segment(chunk: &Chunk, seg: Arc<Segment>) -> usize {
         // Safety check: Never clean the head segment
         // Although segs_for_compact_cleaner filters this, race conditions could cause
         // the head to change or a new head to be created that looks like a candidate.
+
+        let _guard = if let Some(g) = SegmentCandidate::new(&seg) {
+            g
+        } else {
+            debug!(
+                "Segment {} has active references, skipping cleaning",
+                seg.id
+            );
+            return 0;
+        };
+
         if seg.id == chunk.get_head_seg_id() {
             debug!("Segment {} is the current head, skipping cleaning", seg.id);
             return 0;
@@ -85,97 +98,78 @@ impl CompactCleaner {
             .for_each(|entry: Entry| {
                 let entry_size = entry.meta.entry_size;
                 let entry_pos = entry.meta.entry_pos;
-                if cursor != entry_pos {
-                    // Need to move
-                    if entry.meta.entry_header.entry_type == EntryType::CELL {
-                        // Is cell - acquire lock FIRST before deciding whether to move
+                let needs_move = cursor != entry_pos;
+
+                // Validate and process entry based on type
+                // CRITICAL: Always revalidate entries even if already at correct position,
+                // since entries may become stale between live_entries scan and processing
+                match entry.meta.entry_header.entry_type {
+                    EntryType::CELL => {
                         let header = entry.content.as_cell_header();
-                        trace!(
-                            "Acquiring cell guard for update on compact {:?}",
-                            header.id()
-                        );
                         let cell_guard = chunk.cell_index.lock(header.hash as usize);
 
-                        // Check if cell is still at expected location BEFORE moving
                         if let Some(mut guard) = cell_guard {
-                            let actual_addr = *guard;
-                            if actual_addr == entry_pos {
-                                // Cell still at expected location, safe to move
-                                let old_addr = entry_pos;
-                                let new_addr = cursor;
-
-                                trace!(
-                                    "Memcpy cell entry, size: {}, from {} to {}, seg_addr {}, for {:?}",
-                                    entry_size,
-                                    old_addr,
-                                    new_addr,
-                                    seg_addr,
-                                    entry.content
-                                );
-
-                                // Now safe to move - we hold the lock
-                                unsafe {
-                                    libc::memmove(
-                                        new_addr as *mut libc::c_void,
-                                        old_addr as *mut libc::c_void,
-                                        entry_size,
+                            if *guard == entry_pos {
+                                // Cell still valid at this position
+                                if needs_move {
+                                    // Move cell to compact location
+                                    trace!(
+                                        "Memcpy cell entry, size: {}, from {} to {}, for {:?}",
+                                        entry_size, entry_pos, cursor, entry.content
                                     );
+                                    unsafe {
+                                        libc::memmove(
+                                            cursor as *mut libc::c_void,
+                                            entry_pos as *mut libc::c_void,
+                                            entry_size,
+                                        );
+                                    }
+                                    *guard = cursor;
                                 }
-
-                                // Update cell_index to point to new location
-                                *guard = new_addr;
                                 cursor += entry_size;
                             } else {
-                                // Cell address changed - another thread updated it
-                                // Don't move this stale entry, don't advance cursor
+                                // Cell was moved by another thread - skip this stale entry
                                 trace!(
-                                    "Cell {:?} address changed from {} to {} during compact - skipping stale entry",
-                                    header.id(),
-                                    entry_pos,
-                                    actual_addr
+                                    "Cell {:?} at {} changed to {} during compact - skipping",
+                                    header.id(), entry_pos, *guard
                                 );
                             }
                         } else {
-                            // Cell was deleted - don't move, don't advance cursor
-                            trace!(
-                                "Cell {:?} was deleted during compact - skipping entry at {}",
-                                header.id(),
-                                entry_pos
-                            );
+                            // Cell was deleted - skip this stale entry
+                            trace!("Cell {:?} at {} was deleted - skipping", header.id(), entry_pos);
                         }
-                    } else {
-                        // Tombstone - always safe to move (no cell_index entry)
-                        let old_addr = entry_pos;
-                        let new_addr = cursor;
-                        let tombstone = entry.content.as_tombstone();
-                        let cell_hash = tombstone.hash;
-                        let seg_id = tombstone.segment_id;
-                        if chunk.cell_index.contains_key(&(cell_hash as usize)) || !chunk.contains_seg(seg_id) {
-                            trace!("Tombstone entry {:?} is obsolete, skipping moving", cell_hash);
-                            released_tombstones += 1;
-                            return;
-                        }
-
-                        trace!(
-                            "Memcpy tombstone entry, size: {}, from {} to {}",
-                            entry_size,
-                            old_addr,
-                            new_addr
-                        );
-
-                        unsafe {
-                            libc::memmove(
-                                new_addr as *mut libc::c_void,
-                                old_addr as *mut libc::c_void,
-                                entry_size,
-                            );
-                        }
-
-                        cursor += entry_size;
                     }
-                } else {
-                    // Entry already at correct position, just advance cursor
-                    cursor += entry_size;
+                    EntryType::TOMBSTONE => {
+                        let tombstone = entry.content.as_tombstone();
+                        let is_obsolete = chunk.cell_index.contains_key(&(tombstone.hash as usize))
+                            || !chunk.contains_seg(tombstone.segment_id);
+
+                        if is_obsolete {
+                            // Tombstone is obsolete - skip it
+                            trace!("Tombstone {:?} is obsolete - skipping", tombstone.hash);
+                            released_tombstones += 1;
+                        } else {
+                            // Tombstone still valid
+                            if needs_move {
+                                trace!(
+                                    "Memcpy tombstone entry, size: {}, from {} to {}",
+                                    entry_size, entry_pos, cursor
+                                );
+                                unsafe {
+                                    libc::memmove(
+                                        cursor as *mut libc::c_void,
+                                        entry_pos as *mut libc::c_void,
+                                        entry_size,
+                                    );
+                                }
+                            }
+                            cursor += entry_size;
+                        }
+                    }
+                    _ => {
+                        // Should never happen - live_entries filters these
+                        warn!("Unexpected entry type {:?} during compact", entry.meta.entry_header.entry_type);
+                    }
                 }
             });
         seg.append_header.store(cursor, Ordering::Release);
@@ -217,7 +211,6 @@ impl CompactCleaner {
         // We are not going to archive here to reduce write amplification.
         // Eviction will archive the segment for tiered memory
         // For recovery, even if the segment is not archived, it will still be able to recover from the old backup file.
-
         space_cleaned
     }
 }

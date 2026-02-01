@@ -1100,6 +1100,17 @@ impl Iterator for SegmentEntryIter {
             return None;
         }
 
+        // Validate entry type is a known valid type (CELL or TOMBSTONE)
+        // Invalid types indicate we're reading garbage (possibly from inside another entry)
+        // which can happen if append_header was set incorrectly by a previous operation
+        debug_assert!(entry_header.entry_type == entry::EntryType::CELL || entry_header.entry_type == entry::EntryType::TOMBSTONE);
+
+        // Validate that entry size is reasonable (must be at least header size and 8-byte aligned)
+        // Real entries are always 8-byte aligned; non-aligned sizes indicate corruption
+        debug_assert!(entry_meta.entry_size % 8 == 0);
+        debug_assert!(entry_meta.entry_size >= ENTRY_HEAD_SIZE);
+
+
         // Validate that the entry doesn't exceed the bound
         let next_cursor = cursor + entry_meta.entry_size;
         if next_cursor > self.bound {
