@@ -2,7 +2,6 @@ use super::super::chunk::Chunk;
 use super::super::segs::{Segment, SEGMENT_SIZE};
 use crate::ram::cleaner::SegmentCandidate;
 use crate::ram::entry::*;
-use crate::ram::segs::SegmentExclusiveRefGuard;
 
 use std::sync::atomic::Ordering;
 

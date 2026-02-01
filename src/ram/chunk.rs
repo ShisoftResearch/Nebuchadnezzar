@@ -1,6 +1,6 @@
 use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
 use crate::ram::cleaner::SegmentCandidate;
-use crate::ram::entry::{Entry, EntryContent, EntryType};
+use crate::ram::entry::{ENTRY_HEAD_SIZE, Entry, EntryContent, EntryType};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segment_list::SegmentList;
@@ -1179,6 +1179,15 @@ impl Chunk {
                 let entry_header = entry_meta.entry_header;
                 trace!("Iterating live entries on chunk {} segment {}. Got {:?} at {} size {}",
                        chunk_id, seg.id, entry_header.entry_type, entry_meta.entry_pos, entry_size);
+                // Validate entry type is a known valid type (CELL or TOMBSTONE)
+                // Invalid types indicate we're reading garbage (possibly from inside another entry)
+                // which can happen if append_header was set incorrectly by a previous operation
+                debug_assert!(entry_header.entry_type == EntryType::CELL || entry_header.entry_type == EntryType::TOMBSTONE);
+
+                // Validate that entry size is reasonable (must be at least header size and 8-byte aligned)
+                // Real entries are always 8-byte aligned; non-aligned sizes indicate corruption
+                debug_assert!(entry_meta.entry_size % 8 == 0);
+                debug_assert!(entry_meta.entry_size >= ENTRY_HEAD_SIZE);
                 match entry_header.entry_type {
                     EntryType::CELL => {
                         trace!("Entry at {} is a cell", entry_meta.entry_pos);
@@ -1218,11 +1227,7 @@ impl Chunk {
                             trace!("Tombstone target at {} have been removed, will be ditched", tombstone.segment_id)
                         }
                     },
-                    EntryType::UNDECIDED => {
-                        trace!("Scanning entry at {} is undecided", entry_meta.entry_pos);
-                        return None;
-                    },
-                    _ => panic!("Unexpected cell type on getting live entries at {}: type {:?}, size {}, append header {}, ends at {}",
+                    _ => unreachable!("Unexpected cell type on getting live entries at {}: type {:?}, size {}, append header {}, ends at {}",
                                 entry_meta.entry_pos, entry_header.entry_type.bits(), entry_size,
                                 seg.append_header.load(Ordering::Relaxed),
                                 entry_meta.entry_pos + entry_size)
