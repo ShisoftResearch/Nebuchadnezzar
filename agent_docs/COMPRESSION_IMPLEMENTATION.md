@@ -19,7 +19,7 @@ This implementation adds LZ4 compression to segment backup files to reduce disk 
 - **compress_backups**: Controls whether new backup files are compressed
   - **Default**: Enabled (compression ON by default)
   - **Decompression**: Always enabled (auto-detects compressed files)
-  - **Disable**: `cargo build --no-default-features --features cleaner,combine_cleaner,compact_cleaner,tiered_memory`
+- **Disable**: `cargo build --no-default-features --features cleaner,combine_cleaner,tiered_memory`
   - **Use case**: Disable if CPU is more constrained than disk I/O
 
 ### 3. Compression Module (`src/ram/compression.rs`)
@@ -160,13 +160,13 @@ cargo build  # compress_backups is enabled by default
 
 ### Disable Compression
 ```bash
-cargo build --no-default-features --features cleaner,combine_cleaner,compact_cleaner,tiered_memory
+cargo build --no-default-features --features cleaner,combine_cleaner,tiered_memory
 ```
 
 Or in `Cargo.toml`:
 ```toml
 [dependencies]
-neb = { version = "0.2.0", default-features = false, features = ["cleaner", "combine_cleaner", "compact_cleaner", "tiered_memory"] }
+neb = { version = "0.2.0", default-features = false, features = ["cleaner", "combine_cleaner", "tiered_memory"] }
 ```
 
 ## Files Modified
@@ -189,4 +189,3 @@ This implementation successfully addresses the disk write bottleneck in tiered m
 - **Simple**: Clean separation via compression module
 
 The compression reduces disk I/O by 30-70% (depending on data), which should significantly improve tiered memory performance during eviction. Users can disable compression if CPU is more constrained than disk I/O.
-

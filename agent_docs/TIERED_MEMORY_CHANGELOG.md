@@ -104,10 +104,9 @@ Implemented a comprehensive tiered memory system that enables Nebuchadnezzar to 
   - Check if segment is cold (promote if true)
   - Mark segment as referenced for CLOCK
   - Retry read after promotion completes
-- Modified `segs_for_compact_cleaner()`:
-  - Added `seg.is_hot()` filter to skip cold segments
 - Modified `segs_for_combine_cleaner()`:
-  - Added `seg.is_hot()` filter to skip cold segments
+   - Added `seg.is_hot()` filter to skip cold segments
+- Compact cleaner was removed from mainline; only combine cleaner filters remain.
 
 #### `src/ram/mod.rs`
 - Added `pub mod tiered;` declaration
@@ -275,4 +274,3 @@ Before deploying to production:
 ## License
 
 Same as Nebuchadnezzar project.
-

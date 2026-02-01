@@ -54,13 +54,11 @@ crc-fast = "1.10.0"
 [features]
 default = [
     "cleaner", "combine_cleaner", 
-    # "compact_cleaner", 
     "tiered_memory", "compress_backups"
 ]
 
 cleaner = []
 combine_cleaner = ["cleaner"]
-compact_cleaner = ["cleaner"]
 
 # Enable CRC32 checksum verification during eviction and promotion
 debug_verify_checksums = ["tiered_memory"]

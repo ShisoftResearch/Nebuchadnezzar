@@ -503,9 +503,8 @@ impl Segment {
         if let Some(backup_file) = backup_path_opt {
             // NOTE: We do NOT wait for no_references() here because:
             // 1. The file_state mutex already ensures only one archive at a time
-            // 2. References are held by compact cleaner while holding tiered_lock
-            // 3. Waiting here would deadlock: cleaner holds ref+tiered_lock, we hold file_state
-            // 4. Reading segment memory during archive is safe - data is copied atomically
+            // 2. Waiting here could deadlock if another component holds tiered_lock
+            // 3. Reading segment memory during archive is safe - data is copied atomically
             // The reference counter is only for preventing madvise_free during eviction
             let backup_file_path = Path::new(&backup_file);
             let has_old_backup = backup_file_path.exists();

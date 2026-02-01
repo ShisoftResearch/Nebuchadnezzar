@@ -217,8 +217,8 @@ pub struct Segment {
 
 - `tiered_manager: Option<TieredMemoryManager>` - Manages eviction/promotion
 - `location_for_read()` - Checks if segment is cold, triggers promotion
-- `segs_for_compact_cleaner()` - Filters out cold segments
 - `segs_for_combine_cleaner()` - Filters out cold segments
+- Compact cleaner removed in mainline; combine cleaner remains the sole in-memory defragmentation path.
 
 #### Segment
 
@@ -418,4 +418,3 @@ cargo test --lib tiered::bench -- --ignored --list
 ## License
 
 Same as Nebuchadnezzar project.
-

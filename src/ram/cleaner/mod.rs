@@ -9,17 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 pub mod combine;
-pub mod compact;
 #[cfg(test)]
 mod tests;
-
-lazy_static! {
-    /// Global thread pool for compact cleaning operations
-    static ref COMPACT_CLEAN_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
-        .thread_name(|idx| format!("compact-clean-t{}", idx))
-        .build()
-        .unwrap();
-}
 
 #[allow(dead_code)]
 #[allow(dead_code)]
@@ -185,11 +176,9 @@ impl Cleaner {
             num_segs,
             chunk.get_head_seg_id()
         );
-        let segments_compact_per_turn = if full { num_segs } else { num_segs / 5 + 1 };
         let segments_combine_per_turn = if full { num_segs } else { num_segs / 5 + 2 };
 
         let mut combiner_cleaned_space: usize = 0;
-        let mut compacter_cleaned_space: usize = 0;
         let mut reduced_segments_count: usize = 0;
         #[cfg(feature = "combine_cleaner")]
         {
@@ -224,39 +213,14 @@ impl Cleaner {
                 reduced_segments_count += num_reduced_segments;
             }
         }
-        #[cfg(feature = "compact_cleaner")]
-        {
-            trace!("Starting compact for chunk {}", chunk.id);
-            let segments_for_compact = if full {
-                chunk.segs_for_compact_cleaner_full()
-            } else {
-                chunk.segs_for_compact_cleaner()
-            };
-            if !segments_for_compact.is_empty() {
-                debug!(
-                    "Selected {} segments for compaction from chunk {}",
-                    segments_for_compact.len(),
-                    chunk.id
-                );
-
-                // Use global thread pool for compact cleaning
-                compacter_cleaned_space += COMPACT_CLEAN_POOL.install(|| {
-                    segments_for_compact
-                        .into_par_iter()
-                        .take(segments_compact_per_turn) // limit max segment to clean per turn
-                        .map(|segment| compact::CompactCleaner::clean_segment(chunk, segment))
-                        .sum::<usize>()
-                });
-            }
-        }
-        let combined_cleaned_space = combiner_cleaned_space + compacter_cleaned_space;
+        let combined_cleaned_space = combiner_cleaned_space;
         chunk
             .total_space
             .fetch_sub(combiner_cleaned_space, Ordering::Relaxed); // only subtract combiner cleaned space, compacter cleaned does not reclaim segments
         if combined_cleaned_space > 0 {
             info!(
-                "Chunk {} cleaned total {} bytes, reduced {} segments (combiner {} bytes, compacter {} bytes)",
-                chunk.id, combined_cleaned_space, reduced_segments_count, combiner_cleaned_space, compacter_cleaned_space
+                "Chunk {} cleaned total {} bytes, reduced {} segments (combiner {} bytes)",
+                chunk.id, combined_cleaned_space, reduced_segments_count, combiner_cleaned_space
             );
         }
         combined_cleaned_space > 0 || reduced_segments_count > 0

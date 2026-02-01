@@ -2,7 +2,7 @@
 
 ## Summary
 
-Fixed a critical **Time-Of-Check-Time-Of-Use (TOCTOU)** race condition between the compact cleaner and concurrent cell updates that caused panics with corrupted entry headers.
+Fixed a critical **Time-Of-Check-Time-Of-Use (TOCTOU)** race condition between the compact cleaner and concurrent cell updates that caused panics with corrupted entry headers. The compact cleaner has been removed from the main branch; refer to branch `compact-cleaner-legacy` for the last revision containing it.
 
 **Commits:**
 - `2938e606` - Improved entry decode error diagnostics
@@ -298,4 +298,3 @@ This was a classic concurrent programming bug:
 - Fixed by moving lock acquisition before all operations
 
 The fix is minimal, focused, and addresses the root cause without changing the overall cleaner architecture.
-

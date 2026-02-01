@@ -1,5 +1,4 @@
 use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
-use crate::ram::cleaner::SegmentCandidate;
 use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
@@ -38,7 +37,6 @@ static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
 static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.50f32;
-static DEAD_RATE_FOR_COMPACT_CLEANER: f32 = 0.75f32;
 
 /// Get the current global chunk base address
 pub fn get_global_chunk_base() -> usize {
@@ -1081,50 +1079,6 @@ impl Chunk {
 
     pub fn segments(&self) -> Vec<AArc<Segment>> {
         self.segs.iter_front_values().collect()
-    }
-
-    pub fn segs_for_compact_cleaner(&self) -> Vec<AArc<Segment>> {
-        self.segs_for_compact_cleaner_impl(false)
-    }
-
-    pub fn segs_for_compact_cleaner_full(&self) -> Vec<AArc<Segment>> {
-        self.segs_for_compact_cleaner_impl(true)
-    }
-
-    fn segs_for_compact_cleaner_impl(&self, full: bool) -> Vec<AArc<Segment>> {
-        let utilization_selection = self
-            .segments()
-            .into_iter()
-            .map(|seg| {
-                let rate = seg.living_rate();
-                (seg, rate)
-            })
-            .filter(|(_, utilization)| {
-                // Always require some dead space (utilization < 100%)
-                // For full GC, accept any segment with dead space
-                // For partial GC, only consider high-dead segments
-                *utilization < 1.0 && (full || *utilization < DEAD_RATE_FOR_COMPACT_CLEANER)
-            });
-        let head_seg_id = self.get_head_seg_id();
-        let mut list: Vec<_> = utilization_selection
-            .filter(|(seg, _)| {
-                seg.id != head_seg_id
-                    && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
-                    && seg.is_hot() // Don't clean cold segments (tiered memory)
-                    && !seg.cleaned_without_progress()
-            })
-            .collect();
-        list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
-        let max_segments = if full {
-            list.len()
-        } else {
-            MAX_SEGMENTS_FOR_CLEANER
-        };
-        return list
-            .into_iter()
-            .take(max_segments)
-            .map(|pair| pair.0)
-            .collect();
     }
 
     pub fn segs_for_combine_cleaner(&self) -> Vec<(AArc<Segment>, f32)> {
