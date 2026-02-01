@@ -204,7 +204,7 @@ pub fn rebuild_cell_index_from_segment(
 
                             // Mark cell as dead in its segment
                             if let Some(target_seg) =
-                                chunk.segs.get(&(tombstone.segment_id as usize))
+                                chunk.segs.get_by_seq_id(tombstone.segment_seq_id)
                             {
                                 chunk.mark_dead_entry_with_seg(existing.addr, &target_seg);
                             }

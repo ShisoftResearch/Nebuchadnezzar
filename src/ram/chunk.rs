@@ -980,7 +980,7 @@ impl Chunk {
         })();
         Tombstone::put(
             pending_entry.addr,
-            cell_seg.id,
+            cell_seg.seq_id,
             cell_header.version,
             cell_header.partition,
             cell_header.hash,
@@ -1215,16 +1215,16 @@ impl Chunk {
                         trace!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        let contains_seg = chunk_segs.contains_key(&(tombstone.segment_id as usize));
+                        let contains_seg = chunk_segs.contains_seq_id(tombstone.segment_seq_id);
                         if contains_seg {
-                            trace!("Tomestone entry {:?} - {:?} at {} is valid",
-                                   tombstone.partition, tombstone.hash, tombstone.segment_id);
+                            trace!("Tomestone entry {:?} - {:?} at seq_id {} is valid",
+                                   tombstone.partition, tombstone.hash, tombstone.segment_seq_id);
                             return Some(Entry {
                                 meta: entry_meta,
                                 content: EntryContent::Tombstone(tombstone)
                             });
                         } else {
-                            trace!("Tombstone target at {} have been removed, will be ditched", tombstone.segment_id)
+                            trace!("Tombstone target at seq_id {} have been removed, will be ditched", tombstone.segment_seq_id)
                         }
                     },
                     _ => unreachable!("Unexpected cell type on getting live entries at {}: type {:?}, size {}, append header {}, ends at {}",

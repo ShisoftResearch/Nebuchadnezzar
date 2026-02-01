@@ -8,7 +8,7 @@ use std::{
 
 #[derive(Debug)]
 pub struct Tombstone {
-    pub segment_id: u64,
+    pub segment_seq_id: u64,
     pub version: u64,
     pub partition: u64,
     pub hash: u64,
@@ -32,7 +32,7 @@ impl Tombstone {
         Entry::encode_to(addr, EntryType::TOMBSTONE, TOMBSTONE_SIZE_U32, |addr| {
             let mut cursor = addr_to_cursor(addr);
             {
-                write_u64(&mut cursor, self.segment_id);
+                write_u64(&mut cursor, self.segment_seq_id);
                 write_u64(&mut cursor, self.version);
                 write_u64(&mut cursor, self.partition);
                 write_u64(&mut cursor, self.hash);
@@ -44,7 +44,7 @@ impl Tombstone {
     pub fn read_from_entry_content_addr(addr: usize) -> Tombstone {
         let mut cursor = addr_to_cursor(addr);
         let tombstone = Tombstone {
-            segment_id: cursor.read_u64::<Endian>().unwrap(),
+            segment_seq_id: cursor.read_u64::<Endian>().unwrap(),
             version: cursor.read_u64::<Endian>().unwrap(),
             partition: cursor.read_u64::<Endian>().unwrap(),
             hash: cursor.read_u64::<Endian>().unwrap(),
@@ -65,9 +65,9 @@ impl Tombstone {
         .1
     }
 
-    pub fn put(tombstone_addr: usize, segment_id: u64, version: u64, partition: u64, hash: u64) {
+    pub fn put(tombstone_addr: usize, segment_seq_id: u64, version: u64, partition: u64, hash: u64) {
         Tombstone {
-            segment_id,
+            segment_seq_id,
             version,
             partition,
             hash,

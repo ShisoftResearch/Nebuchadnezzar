@@ -140,8 +140,9 @@ impl CompactCleaner {
                     }
                     EntryType::TOMBSTONE => {
                         let tombstone = entry.content.as_tombstone();
+                        let target_seg_exists = chunk.segs.contains_seq_id(tombstone.segment_seq_id);
                         let is_obsolete = chunk.cell_index.contains_key(&(tombstone.hash as usize))
-                            || !chunk.contains_seg(tombstone.segment_id);
+                            || !target_seg_exists;
 
                         if is_obsolete {
                             // Tombstone is obsolete - skip it

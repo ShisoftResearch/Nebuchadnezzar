@@ -1,5 +1,6 @@
 use crate::ram::segs::Segment;
 use lightning::aarc::{Arc as AArc, AtomicArc};
+use lightning::map::{Map, WordMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// A lock-free array-based segment list that provides O(1) access by segment ID.
@@ -19,6 +20,9 @@ pub struct SegmentList {
     bitmap: Vec<AtomicU64>,
     /// Cached count of active segments for O(1) len()
     count: AtomicUsize,
+    /// Maps seq_id (u64) to segment_id (usize) for O(1) lookup by seq_id
+    /// Used for tombstone resolution and recovery operations
+    seq_id_index: WordMap,
 }
 
 impl SegmentList {
@@ -58,6 +62,7 @@ impl SegmentList {
             segments,
             bitmap,
             count: AtomicUsize::new(0),
+            seq_id_index: WordMap::with_capacity(capacity.next_power_of_two()),
         }
     }
 
@@ -124,15 +129,24 @@ impl SegmentList {
             );
         }
 
+        let seq_id = segment.seq_id;
         let old = self.segments[key].swap_ref(segment);
 
         // Update bitmap: set the bit for this segment
         self.set_bit(key);
 
+        // Update seq_id index (cast u64 seq_id to usize for WordMap)
+        self.seq_id_index.insert(seq_id as usize, key);
+
         if old.is_null() {
             self.count.fetch_add(1, Ordering::Relaxed);
             None
         } else {
+            // Remove old segment's seq_id from index if it exists
+            let old_seq_id = old.seq_id;
+            if old_seq_id != seq_id {
+                self.seq_id_index.remove(&(old_seq_id as usize));
+            }
             Some(old)
         }
     }
@@ -152,6 +166,17 @@ impl SegmentList {
         }
     }
 
+    /// Get a segment by seq_id
+    /// Returns a cloned Arc if the segment exists
+    pub fn get_by_seq_id(&self, seq_id: u64) -> Option<AArc<Segment>> {
+        let segment_id = self.seq_id_index.get(&(seq_id as usize))?;
+        self.get(&segment_id)
+    }
+
+    pub fn contains_seq_id(&self, seq_id: u64) -> bool {
+        self.seq_id_index.contains_key(&(seq_id as usize))
+    }
+
     /// Remove a segment by key (segment ID)
     /// Returns the removed segment if it existed
     pub fn remove(&self, key: &usize) -> Option<AArc<Segment>> {
@@ -164,6 +189,9 @@ impl SegmentList {
         if old.is_null() {
             None
         } else {
+            // Remove from seq_id index (cast u64 seq_id to usize)
+            self.seq_id_index.remove(&(old.seq_id as usize));
+            
             // Update bitmap: clear the bit for this segment
             self.clear_bit(*key);
             self.count.fetch_sub(1, Ordering::Relaxed);
@@ -479,5 +507,73 @@ mod tests {
         assert_eq!(keys.len(), 10);
         assert_eq!(keys[0], 0);
         assert_eq!(keys[9], 9000);
+    }
+
+    #[test]
+    fn test_segment_list_seq_id_index() {
+        let list = SegmentList::new(10);
+        let file_manager = new_test_file_manager();
+
+        // Insert segments with different seq_ids
+        let seg1 = AArc::new(Segment::new(
+            0,     // id (segment_id)
+            100,   // seq_id
+            0,     // chunk_id
+            0x1000,
+            true,
+            Arc::clone(&file_manager),
+        ));
+        let seg2 = AArc::new(Segment::new(
+            1,     // id
+            200,   // seq_id
+            0,
+            0x2000,
+            true,
+            Arc::clone(&file_manager),
+        ));
+
+        list.insert(0, seg1.clone());
+        list.insert(1, seg2.clone());
+
+        // Test get_by_seq_id
+        let found1 = list.get_by_seq_id(100);
+        assert!(found1.is_some());
+        let found1 = found1.unwrap();
+        assert_eq!(found1.id, 0);
+        assert_eq!(found1.seq_id, 100);
+
+        let found2 = list.get_by_seq_id(200);
+        assert!(found2.is_some());
+        let found2 = found2.unwrap();
+        assert_eq!(found2.id, 1);
+        assert_eq!(found2.seq_id, 200);
+
+        // Test non-existent seq_id
+        assert!(list.get_by_seq_id(999).is_none());
+
+        // Test replacing segment updates seq_id index
+        let seg3 = AArc::new(Segment::new(
+            0,     // Same segment_id as seg1
+            300,   // Different seq_id
+            0,
+            0x1000,
+            true,
+            Arc::clone(&file_manager),
+        ));
+        list.insert(0, seg3.clone());
+
+        // Old seq_id should no longer be found
+        assert!(list.get_by_seq_id(100).is_none());
+
+        // New seq_id should be found
+        let found3 = list.get_by_seq_id(300);
+        assert!(found3.is_some());
+        let found3 = found3.unwrap();
+        assert_eq!(found3.id, 0);
+        assert_eq!(found3.seq_id, 300);
+
+        // Test removal clears seq_id index
+        list.remove(&1);
+        assert!(list.get_by_seq_id(200).is_none());
     }
 }
