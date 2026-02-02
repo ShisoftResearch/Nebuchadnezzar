@@ -1,6 +1,6 @@
-use super::lsm::service::*;
 use super::sm::client::SMClient;
-use super::{lsm::btree::Ordering, sm::TreePlacement};
+use super::tree::service::*;
+use super::{sm::TreePlacement, tree::btree::Ordering};
 use crate::index::EntryKey;
 use crate::ram::types::Id;
 use bifrost::raft::client::RaftClient;
@@ -103,7 +103,7 @@ impl RangedIndexerClient {
         .await
     }
 
-    pub async fn tree_stats(&self) -> Result<Vec<LSMTreeStat>, RPCError> {
+    pub async fn tree_stats(&self) -> Result<Vec<TreeStat>, RPCError> {
         let mut res = vec![];
         for tree_placement in self.placement.read().values().map(|(id, _)| id) {
             let tree_id = tree_placement.id;

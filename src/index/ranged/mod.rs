@@ -1,15 +1,15 @@
 pub mod client;
-pub mod lsm;
 pub mod sm;
+pub mod tree;
 pub mod trees;
 
 #[cfg(test)]
 mod tests {
-    use super::lsm::btree::storage;
-    use super::lsm::btree::Ordering;
+    use super::tree::btree::storage;
+    use super::tree::btree::Ordering;
     use super::*;
     use crate::client::*;
-    use crate::index::ranged::lsm::btree;
+    use crate::index::ranged::tree::btree;
     use crate::index::ranged::trees::Range;
     use crate::index::EntryKey;
     use crate::ram::schema::*;

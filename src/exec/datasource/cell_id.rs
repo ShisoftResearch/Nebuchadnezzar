@@ -8,7 +8,7 @@ use std::{
 
 use crate::index::ranged::client::cursor::ClientCursor;
 use crate::{
-    index::{ranged::lsm::btree::Ordering, IndexerClients},
+    index::{ranged::tree::btree::Ordering, IndexerClients},
     query::data_client::ValueRange,
 };
 

@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use self::ranged::client::cursor::ClientCursor;
 use self::ranged::client::RangedIndexerClient;
-use self::ranged::lsm::service::Range;
+use self::ranged::tree::service::Range;
 
 pub type Feature = [u8; FEATURE_SIZE];
 

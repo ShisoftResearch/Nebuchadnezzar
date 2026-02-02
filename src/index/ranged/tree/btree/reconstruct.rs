@@ -232,8 +232,8 @@ where
 #[cfg(test)]
 mod test {
     use super::external::*;
-    use crate::index::ranged::lsm::btree::test::*;
-    use crate::index::ranged::lsm::btree::*;
+    use crate::index::ranged::tree::btree::test::*;
+    use crate::index::ranged::tree::btree::*;
     use crate::ram::types::*;
     use crate::rand::Rng;
     use crate::server::*;

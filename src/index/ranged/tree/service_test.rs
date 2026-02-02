@@ -215,9 +215,9 @@ mod test {
 
     #[test]
     fn test_range_seek_with_actual_btree() {
-        use crate::index::ranged::lsm::btree::test::LevelBPlusTree;
-        use crate::index::ranged::lsm::btree::Ordering;
-        use crate::index::ranged::lsm::service::{Range, RangeTerm};
+        use crate::index::ranged::tree::btree::test::LevelBPlusTree;
+        use crate::index::ranged::tree::btree::Ordering;
+        use crate::index::ranged::tree::service::{Range, RangeTerm};
         use crate::index::ranged::trees::Cursor;
         use lightning::map::HashSet;
         use std::sync::Arc;
@@ -492,7 +492,7 @@ mod test {
     /// Test that range queries work correctly after LSM tree recovery from persistent storage.
     ///
     /// Key requirements for recovery:
-    /// 1. Create both page_schema and LSM_TREE_SCHEMA
+    /// 1. Create both page_schema and RANGED_TREE_SCHEMA
     /// 2. Start the external node writeback background task
     /// 3. Merge data from memory to disk trees
     /// 4. Update the LSM tree cell with new head IDs after merge
@@ -500,9 +500,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_range_query_survives_recovery() {
         use crate::client;
-        use crate::index::ranged::lsm::btree::{page_schema, Ordering};
-        use crate::index::ranged::lsm::service::{Range, RangeTerm};
-        use crate::index::ranged::lsm::tree::{LSMTree, LSM_TREE_SCHEMA};
+        use crate::index::ranged::tree::btree::{page_schema, Ordering};
+        use crate::index::ranged::tree::service::{Range, RangeTerm};
+        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
         use crate::index::ranged::trees::Cursor;
         use crate::server::*;
         use std::sync::Arc;
@@ -546,13 +546,13 @@ mod test {
             .unwrap()
             .unwrap();
         client
-            .new_schema_with_id(LSM_TREE_SCHEMA.clone())
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
             .await
             .unwrap()
             .unwrap();
 
         // CRITICAL: Start the background task that writes external nodes to storage
-        use crate::index::ranged::lsm::btree::storage;
+        use crate::index::ranged::tree::btree::storage;
         storage::start_external_nodes_write_back(&client);
 
         let lsm_tree_id = Id::new(999, 999);
@@ -560,7 +560,7 @@ mod test {
         let field = 200;
 
         // Create LSM tree and insert test data
-        let tree = LSMTree::create(&client, &lsm_tree_id).await;
+        let tree = RangedTree::create(&client, &lsm_tree_id).await;
 
         // Insert keys with feature values 10..=100
         for i in 10..=100 {
@@ -574,7 +574,7 @@ mod test {
         println!("Tree oversized: {}", tree.oversized());
 
         // Helper function to perform range query and collect results
-        let collect_range = |tree: &LSMTree, start: u64, end: u64| -> Vec<u64> {
+        let collect_range = |tree: &RangedTree, start: u64, end: u64| -> Vec<u64> {
             let start_key =
                 EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(start));
             let max_id = Id::new(u64::MAX, u64::MAX);
@@ -675,13 +675,7 @@ mod test {
 
         // Update the LSM tree cell with the current head IDs (critical for recovery!)
         println!("=== Updating LSM tree cell with new head IDs ===");
-        println!(
-            "Disk trees head IDs: {:?}",
-            tree.disk_trees
-                .iter()
-                .map(|t| t.head_id())
-                .collect::<Vec<_>>()
-        );
+        println!("Tree head ID: {:?}", tree.head_id());
         tree.mark_migration(&lsm_tree_id, None, &client)
             .await
             .expect("Failed to mark migration in test");
@@ -691,14 +685,10 @@ mod test {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Verify the cell was updated by reading it back
-        use crate::index::ranged::lsm::tree::LSM_TREE_LEVELS_HASH;
+        use crate::index::ranged::tree::tree::RANGED_TREE_HEAD_HASH;
         let verify_cell = client.read_cell(lsm_tree_id).await.unwrap().unwrap();
-        let stored_tree_ids = &verify_cell.data[*LSM_TREE_LEVELS_HASH]
-            .prim_array()
-            .unwrap()
-            .id()
-            .unwrap();
-        println!("Stored tree IDs in cell: {:?}", stored_tree_ids);
+        let stored_head_id = verify_cell.data[*RANGED_TREE_HEAD_HASH].id().unwrap();
+        println!("Stored tree head ID in cell: {:?}", stored_head_id);
 
         // Drop the tree to simulate server restart
         drop(tree);
@@ -706,7 +696,7 @@ mod test {
         println!("=== Recovering LSM tree from storage ===");
 
         // Recover the tree
-        let recovered_tree = LSMTree::recover(&client, &lsm_tree_id).await;
+        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id).await;
 
         println!("=== Recovered tree state ===");
         println!("Recovered tree count: {}", recovered_tree.count());
@@ -767,9 +757,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_range_query_backward_survives_recovery() {
         use crate::client;
-        use crate::index::ranged::lsm::btree::{page_schema, Ordering};
-        use crate::index::ranged::lsm::service::{Range, RangeTerm};
-        use crate::index::ranged::lsm::tree::{LSMTree, LSM_TREE_SCHEMA};
+        use crate::index::ranged::tree::btree::{page_schema, Ordering};
+        use crate::index::ranged::tree::service::{Range, RangeTerm};
+        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
         use crate::index::ranged::trees::Cursor;
         use crate::server::*;
         use std::sync::Arc;
@@ -813,13 +803,13 @@ mod test {
             .unwrap()
             .unwrap();
         client
-            .new_schema_with_id(LSM_TREE_SCHEMA.clone())
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
             .await
             .unwrap()
             .unwrap();
 
         // CRITICAL: Start the background task that writes external nodes to storage
-        use crate::index::ranged::lsm::btree::storage;
+        use crate::index::ranged::tree::btree::storage;
         storage::start_external_nodes_write_back(&client);
 
         let lsm_tree_id = Id::new(888, 888);
@@ -827,7 +817,7 @@ mod test {
         let field = 300;
 
         // Create LSM tree and insert test data
-        let tree = LSMTree::create(&client, &lsm_tree_id).await;
+        let tree = RangedTree::create(&client, &lsm_tree_id).await;
 
         // Insert keys with feature values 10..=100 (91 items to ensure oversized mem tree)
         for i in 10..=100 {
@@ -840,7 +830,7 @@ mod test {
         println!("Tree ideal_capacity: {}", tree.ideal_capacity());
 
         // Helper function to perform backward range query
-        let collect_range_backward = |tree: &LSMTree, start: u64, end: u64| -> Vec<u64> {
+        let collect_range_backward = |tree: &RangedTree, start: u64, end: u64| -> Vec<u64> {
             let start_key =
                 EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(start));
             let max_id = Id::new(u64::MAX, u64::MAX);
@@ -918,7 +908,7 @@ mod test {
         drop(tree);
 
         println!("=== Recovering tree ===");
-        let recovered_tree = LSMTree::recover(&client, &lsm_tree_id).await;
+        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id).await;
         println!("Recovered tree count: {}", recovered_tree.count());
 
         println!("=== Testing BACKWARD range queries AFTER recovery ===");
@@ -956,7 +946,7 @@ mod test {
     /// 5. Query again and verify results match
     #[tokio::test(flavor = "multi_thread")]
     async fn test_e2e_range_index_recovery_with_schema() {
-        use crate::index::ranged::lsm::btree::Ordering;
+        use crate::index::ranged::tree::btree::Ordering;
         use crate::query::data_client::{ValueRange, ValueRangeTerm};
         use crate::ram::cell::OwnedCell;
         use crate::ram::schema::{Field, IndexType, Schema};

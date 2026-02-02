@@ -16,7 +16,7 @@ use crate::{
         hash::get_hash_id_from_value,
         ranged::{
             client::cursor::ClientCursor,
-            lsm::{
+            tree::{
                 btree::Ordering,
                 service::{Range, RangeTerm},
             },
@@ -351,7 +351,7 @@ impl DataCursor {
 mod test {
     use crate::{
         index::builder::IndexBuilder,
-        index::ranged::lsm::btree::Ordering,
+        index::ranged::tree::btree::Ordering,
         query::data_client::{ValueRange, ValueRangeTerm},
         ram::{
             cell::OwnedCell,

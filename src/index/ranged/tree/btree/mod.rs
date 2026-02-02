@@ -1,5 +1,5 @@
 use crate::client::AsyncClient;
-use crate::index::ranged::lsm::tree::DeletionSet;
+use crate::index::ranged::tree::tree::DeletionSet;
 pub use crate::index::ranged::trees::*;
 use crate::ram::types::RandValue;
 pub use cell_ref::NodeCellRef;

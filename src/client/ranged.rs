@@ -12,8 +12,8 @@ use bifrost::rpc::RPCError;
 use crate::index::entry::EntryKey;
 use crate::index::ranged::client::cursor::ClientCursor;
 use crate::index::ranged::client::RangedIndexerClient;
-use crate::index::ranged::lsm::btree::Ordering;
-use crate::index::ranged::lsm::service::{Range, RangeTerm};
+use crate::index::ranged::tree::btree::Ordering;
+use crate::index::ranged::tree::service::{Range, RangeTerm};
 use crate::index::Feature;
 use crate::ram::types::Id;
 
@@ -187,7 +187,7 @@ impl RangedClient {
     /// Get statistics for all trees
     pub async fn stats(
         &self,
-    ) -> Result<Vec<crate::index::ranged::lsm::service::LSMTreeStat>, RPCError> {
+    ) -> Result<Vec<crate::index::ranged::tree::service::TreeStat>, RPCError> {
         self.inner.tree_stats().await
     }
 

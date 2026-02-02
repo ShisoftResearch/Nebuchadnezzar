@@ -1,4 +1,4 @@
-use super::super::lsm::service::*;
+use super::super::tree::service::*;
 use crate::index::ranged::{
     client::RangedIndexerClient,
     trees::{max_entry_key, min_entry_key},

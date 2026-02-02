@@ -1,5 +1,5 @@
-use super::lsm::service::*;
-use super::lsm::{service::AsyncServiceClient as LSMServiceClient, tree::INITIAL_TREE_EPOCH};
+use super::tree::service::*;
+use super::tree::{service::AsyncServiceClient as LSMServiceClient, tree::INITIAL_TREE_EPOCH};
 use super::trees::*;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
@@ -201,7 +201,7 @@ impl MasterTreeSM {
         // Don't initialize if tree already has data (recovered from disk)
         if !self.tree.is_empty() {
             info!("[RANGED INDEX RECOVERY] MasterTreeSM already has data from disk recovery, loading {} recovered trees", self.tree.len());
-            // Load all recovered trees into the LSMTreeService
+            // Load all recovered trees into the TreeService
             let tree_entries: Vec<_> = self
                 .tree
                 .iter()

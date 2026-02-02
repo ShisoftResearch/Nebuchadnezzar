@@ -39,9 +39,9 @@ pub struct ServBlock {
     pub next: Option<EntryKey>,
 }
 
-pub struct DistLSMTree {
+pub struct DistTree {
     id: Id,
-    tree: LSMTree,
+    tree: RangedTree,
     prop: RwLock<DistProp>,
 }
 
@@ -67,7 +67,7 @@ pub struct BTreeStat {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct LSMTreeStat {
+pub struct TreeStat {
     pub id: Id,
     pub prop: DistProp,
     pub trees: Vec<BTreeStat>,
@@ -94,28 +94,26 @@ service! {
     rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc seek(id: Id, range: Range, pattern: &Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
-    rpc stat(id: Id) -> OpResult<LSMTreeStat>;
+    rpc stat(id: Id) -> OpResult<TreeStat>;
     rpc flush_all();
 }
 
-service_with_id!(LSMTreeService, DEFAULT_SERVICE_ID);
+service_with_id!(TreeService, DEFAULT_SERVICE_ID);
 
-pub struct LSMTreeService {
+pub struct TreeService {
     client: Arc<AsyncClient>,
-    trees: Arc<HashMap<Id, Arc<DistLSMTree>>>,
+    trees: Arc<HashMap<Id, Arc<DistTree>>>,
 }
 
-impl Service for LSMTreeService {
+impl Service for TreeService {
     fn crate_tree(&self, id: Id, boundary: Boundary, epoch: u64) -> BoxFuture<'_, ()> {
         async move {
             if self.trees.contains_key(&id) {
                 return;
             }
-            let tree = LSMTree::create(&self.client, &id).await;
-            self.trees.insert(
-                id,
-                Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)),
-            );
+            let tree = RangedTree::create(&self.client, &id).await;
+            self.trees
+                .insert(id, Arc::new(DistTree::new(id, tree, boundary, None, epoch)));
         }
         .boxed()
     }
@@ -127,16 +125,14 @@ impl Service for LSMTreeService {
                 return;
             }
             info!("Called to load tree {:?}, boundary {:?}", id, boundary);
-            let tree = LSMTree::recover(&self.client, &id).await;
+            let tree = RangedTree::recover(&self.client, &id).await;
             debug!(
                 "LSM tree loaded with {} keys, capacity {}.",
                 tree.count(),
                 tree.ideal_capacity()
             );
-            self.trees.insert(
-                id,
-                Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)),
-            );
+            self.trees
+                .insert(id, Arc::new(DistTree::new(id, tree, boundary, None, epoch)));
         }
         .boxed()
     }
@@ -337,13 +333,13 @@ impl Service for LSMTreeService {
                     break;
                 }
             }
-            let mut next = tree_cursor.current.as_ref().map(|(_, k)| k.clone());
+            let mut next = tree_cursor.current().cloned();
             // Skip next duplicates
             while next.is_some() && next.as_ref().map(|k| k.id()).as_ref() == buffer.last() {
                 next = tree_cursor.next();
             }
-            let lsm_cursor = ServBlock { buffer, next };
-            OpResult::Successful(lsm_cursor)
+            let result_block = ServBlock { buffer, next };
+            OpResult::Successful(result_block)
         })
     }
 
@@ -354,23 +350,18 @@ impl Service for LSMTreeService {
         .boxed()
     }
 
-    fn stat(&self, id: Id) -> BoxFuture<'_, OpResult<LSMTreeStat>> {
+    fn stat(&self, id: Id) -> BoxFuture<'_, OpResult<TreeStat>> {
         future::ready(if let Some(tree) = self.trees.get(&id) {
-            OpResult::Successful(LSMTreeStat {
+            OpResult::Successful(TreeStat {
                 id,
                 prop: tree.prop.read().clone(),
-                trees: tree
-                    .tree
-                    .disk_trees
-                    .iter()
-                    .map(|t| BTreeStat {
-                        size: t.size(),
-                        count: t.count(),
-                        head: t.head_id(),
-                        ideal_cap: t.ideal_capacity(),
-                        oversized: t.oversized(),
-                    })
-                    .collect(),
+                trees: vec![BTreeStat {
+                    size: MIGRATE_SIZE, // Single tree always uses LEVEL_1 size
+                    count: tree.tree.count(),
+                    head: tree.tree.head_id(),
+                    ideal_cap: tree.tree.ideal_capacity(),
+                    oversized: tree.tree.oversized(),
+                }],
             })
         } else {
             OpResult::NotFound
@@ -379,7 +370,7 @@ impl Service for LSMTreeService {
     }
 }
 
-impl LSMTreeService {
+impl TreeService {
     pub fn new(client: &Arc<AsyncClient>, sm_client: &Arc<SMClient>) -> Self {
         info!("Initializing LSM tree service");
         let trees_map = Arc::new(HashMap::with_capacity(32));
@@ -428,7 +419,7 @@ impl LSMTreeService {
     }
 
     pub fn start_tree_balancer(
-        trees_map: &Arc<HashMap<Id, Arc<DistLSMTree>>>,
+        trees_map: &Arc<HashMap<Id, Arc<DistTree>>>,
         client: &Arc<AsyncClient>,
         sm_client: &Arc<SMClient>,
     ) {
@@ -463,7 +454,8 @@ impl LSMTreeService {
                             "Creating migration target tree {:?} split at {:?}",
                             migration_target_id, pivot_key
                         );
-                        let migration_tree = LSMTree::create(&client, &migration_target_id).await;
+                        let migration_tree =
+                            RangedTree::create(&client, &migration_target_id).await;
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();
                             dist_tree_prop.migration = Some(Migration {
@@ -543,7 +535,7 @@ impl LSMTreeService {
         func: F,
     ) -> BoxFuture<'_, OpResult<R>>
     where
-        F: Fn(&EntryKey, &LSMTree) -> OpResult<R>,
+        F: Fn(&EntryKey, &RangedTree) -> OpResult<R>,
         R: Send + 'static,
     {
         future::ready(if let Some(tree) = self.trees.get(&id) {
@@ -571,10 +563,10 @@ impl LSMTreeService {
     }
 }
 
-impl DistLSMTree {
+impl DistTree {
     fn new(
         id: Id,
-        tree: LSMTree,
+        tree: RangedTree,
         boundary: Boundary,
         migration: Option<Migration>,
         epoch: u64,
@@ -636,10 +628,10 @@ impl Range {
     }
 }
 
-dispatch_rpc_service_functions!(LSMTreeService);
+dispatch_rpc_service_functions!(TreeService);
 
-unsafe impl Send for DistLSMTree {}
-unsafe impl Sync for DistLSMTree {}
+unsafe impl Send for DistTree {}
+unsafe impl Sync for DistTree {}
 
 pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<AsyncServiceClient> {
     AsyncServiceClient::new(rpc)

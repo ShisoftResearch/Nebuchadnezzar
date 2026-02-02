@@ -180,12 +180,12 @@ impl NebServer {
             // The write-back task processes this asynchronously.
             // We MUST wait for all nodes to be persisted before archiving!
             info!("Waiting for B-tree nodes write-back to complete...");
-            crate::index::ranged::lsm::btree::storage::wait_until_updated().await;
+            crate::index::ranged::tree::btree::storage::wait_until_updated().await;
             info!("B-tree nodes write-back completed");
 
             // Reset write-back state for potential restart within same process
             // This is critical for test scenarios where server is restarted multiple times
-            crate::index::ranged::lsm::btree::storage::reset_write_back_state().await;
+            crate::index::ranged::tree::btree::storage::reset_write_back_state().await;
         } else {
             debug!("LSM tree service not available (likely not enabled)");
         }
@@ -226,10 +226,10 @@ impl NebServer {
     /// Get LSM tree service client
     async fn get_lsm_tree_service(
         &self,
-    ) -> Result<Arc<ranged::lsm::service::AsyncServiceClient>, bifrost::rpc::RPCError> {
+    ) -> Result<Arc<ranged::tree::service::AsyncServiceClient>, bifrost::rpc::RPCError> {
         // Use a dummy ID to locate the local LSM tree service via consistent hashing
         let dummy_id = Id::new(0, 1);
-        ranged::lsm::service::locate_tree_server_from_conshash(&dummy_id, &self.consh).await
+        ranged::tree::service::locate_tree_server_from_conshash(&dummy_id, &self.consh).await
     }
 
     pub async fn new(
@@ -716,11 +716,11 @@ pub async fn init_ranged_indexer_service(
     info!("Initializing range indexer service");
     // TODO: create the schema only when it does not exists
     let _ = neb_client
-        .new_schema_with_id(ranged::lsm::tree::LSM_TREE_SCHEMA.clone())
+        .new_schema_with_id(ranged::tree::tree::RANGED_TREE_SCHEMA.clone())
         .await
         .unwrap();
     let _ = neb_client
-        .new_schema_with_id(ranged::lsm::btree::page_schema())
+        .new_schema_with_id(ranged::tree::btree::page_schema())
         .await
         .unwrap();
     let sm_client = Arc::new(ranged::sm::client::SMClient::new(
@@ -728,7 +728,7 @@ pub async fn init_ranged_indexer_service(
         raft_client,
     ));
     rpc_server
-        .register_service(&Arc::new(ranged::lsm::service::LSMTreeService::new(
+        .register_service(&Arc::new(ranged::tree::service::TreeService::new(
             neb_client, &sm_client,
         )))
         .await;

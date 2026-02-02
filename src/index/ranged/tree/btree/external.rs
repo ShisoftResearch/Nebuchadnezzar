@@ -1,8 +1,8 @@
 use super::*;
-use crate::index::ranged::lsm::tree::DeletionSet;
+use crate::index::ranged::tree::tree::DeletionSet;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use crate::{index::ranged::lsm::btree::level::LEVEL_M, ram::cell::OwnedCell};
+use crate::{index::ranged::tree::btree::level::LEVEL_M, ram::cell::OwnedCell};
 use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
 use itertools::Itertools;
