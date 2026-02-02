@@ -1,6 +1,6 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::segs::{Segment, SegmentExclusiveRefGuard};
-use std::sync::atomic::Ordering;
+use crate::ram::segs::Segment;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// CLOCK eviction policy for selecting victim segments to evict
 ///
@@ -9,12 +9,15 @@ use std::sync::atomic::Ordering;
 pub struct ClockEvictionPolicy {
     /// Current position in the clock hand (cursor)
     cursor: std::sync::atomic::AtomicUsize,
+    /// Cooldown window in milliseconds during which recently promoted segments are skipped
+    promotion_cooldown_ms: AtomicU64,
 }
 
 impl ClockEvictionPolicy {
-    pub fn new() -> Self {
+    pub fn new(promotion_cooldown_ms: u64) -> Self {
         ClockEvictionPolicy {
             cursor: std::sync::atomic::AtomicUsize::new(0),
+            promotion_cooldown_ms: std::sync::atomic::AtomicU64::new(promotion_cooldown_ms),
         }
     }
 
@@ -76,6 +79,13 @@ impl ClockEvictionPolicy {
                     continue;
                 }
 
+                // Skip if recently promoted within cooldown window
+                let cooldown_ms = self.promotion_cooldown_ms.load(Ordering::Relaxed);
+                if cooldown_ms > 0 && segment.recently_promoted_within(cooldown_ms) {
+                    debug!("CLOCK: seg {} recently promoted, skipping", segment.id);
+                    continue;
+                }
+
                 // Check and clear reference bit
                 let was_referenced = segment.clear_reference_bit();
 
@@ -119,7 +129,7 @@ impl ClockEvictionPolicy {
 
 impl Default for ClockEvictionPolicy {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 

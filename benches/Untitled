@@ -1,0 +1,2 @@
+config.storage.tiered_config = Some(neb::ram::tiered::TieredConfig {
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `lower_watermark` and `promotion_cooldown_ms`

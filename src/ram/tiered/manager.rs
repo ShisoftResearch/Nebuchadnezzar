@@ -3,8 +3,9 @@ use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::tiered::eviction::evict_segment;
 use crate::ram::tiered::promotion::promote_segment;
+use crate::ram::tiered::TieredConfig;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Manages tiered memory for a chunk
@@ -20,6 +21,12 @@ pub struct TieredMemoryManager {
     /// Default: 0.8 (80%)
     eviction_threshold_percent: f32,
 
+    /// Lower watermark percentage we evict down to when crossing the threshold
+    lower_watermark_percent: f32,
+
+    /// Cooldown after promotion during which eviction should skip the segment
+    promotion_cooldown_ms: u64,
+
     /// CLOCK eviction policy for victim selection
     clock_policy: ClockEvictionPolicy,
 
@@ -34,6 +41,12 @@ pub struct TieredMemoryManager {
     /// This avoids scanning all segments on every check
     cached_hot_count: AtomicUsize,
 
+    /// Metrics counters
+    promotion_count: AtomicU64,
+    eviction_count: AtomicU64,
+    churn_count: AtomicU64,
+    lower_watermark_evictions: AtomicU64,
+
     /// Last time we did a full scan to verify the cached count
     last_full_scan: parking_lot::Mutex<Instant>,
 }
@@ -44,15 +57,21 @@ impl TieredMemoryManager {
     /// # Arguments
     /// * `physical_memory_limit` - Physical memory limit in bytes for hot segments
     /// * `eviction_threshold_percent` - Percentage (0.0-1.0) of limit before eviction
-    pub fn new(physical_memory_limit: usize, eviction_threshold_percent: f32) -> Self {
+    pub fn new(config: TieredConfig) -> Self {
         TieredMemoryManager {
-            physical_memory_limit,
-            eviction_threshold_percent: eviction_threshold_percent.clamp(0.0, 1.0),
-            clock_policy: ClockEvictionPolicy::new(),
+            physical_memory_limit: config.physical_memory_limit,
+            eviction_threshold_percent: config.threshold.clamp(0.0, 1.0),
+            lower_watermark_percent: config.lower_watermark.clamp(0.0, 1.0),
+            promotion_cooldown_ms: config.promotion_cooldown_ms,
+            clock_policy: ClockEvictionPolicy::new(config.promotion_cooldown_ms),
             enabled: true,
             disable_promotion: AtomicBool::new(false),
             cached_hot_count: AtomicUsize::new(0),
             last_full_scan: parking_lot::Mutex::new(Instant::now() - Duration::from_secs(100)),
+            promotion_count: AtomicU64::new(0),
+            eviction_count: AtomicU64::new(0),
+            churn_count: AtomicU64::new(0),
+            lower_watermark_evictions: AtomicU64::new(0),
         }
     }
 
@@ -63,6 +82,18 @@ impl TieredMemoryManager {
     #[inline]
     pub fn threshold_limit(&self) -> usize {
         (self.physical_memory_limit as f64 * self.eviction_threshold_percent as f64) as usize
+    }
+
+    #[inline]
+    fn lower_watermark_limit(&self) -> usize {
+        (self.physical_memory_limit as f64 * self.lower_watermark_percent as f64) as usize
+    }
+
+    #[inline]
+    fn hot_memory_bytes(&self, hot_segments_count: usize) -> usize {
+        hot_segments_count
+            .checked_mul(SEGMENT_SIZE)
+            .unwrap_or_else(|| self.physical_memory_limit * 2)
     }
 
     /// Check if eviction is needed and evict segments if necessary (legacy/test-only)
@@ -116,6 +147,7 @@ impl TieredMemoryManager {
                     match evict_segment(&victim, chunk) {
                         Ok(()) => {
                             evicted_count += 1;
+                            self.eviction_count.fetch_add(1, Ordering::Relaxed);
                             attempts_without_progress = 0; // Reset counter on success
                             debug!(
                                 "Evicted segment {} ({}/{}, attempt {})",
@@ -191,16 +223,7 @@ impl TieredMemoryManager {
         let hot_segments_count = hot_segments_count.min(max_reasonable_segments);
 
         // Use checked arithmetic to prevent overflow
-        let current_hot_memory =
-            hot_segments_count
-                .checked_mul(SEGMENT_SIZE)
-                .unwrap_or_else(|| {
-                    error!(
-                        "Overflow calculating hot memory: {} segments * {} bytes",
-                        hot_segments_count, SEGMENT_SIZE
-                    );
-                    self.physical_memory_limit * 2 // Force eviction
-                });
+        let current_hot_memory = self.hot_memory_bytes(hot_segments_count);
         let after_alloc_memory =
             current_hot_memory
                 .checked_add(SEGMENT_SIZE)
@@ -210,11 +233,12 @@ impl TieredMemoryManager {
                 });
 
         // Check if allocating one more segment would exceed the threshold-adjusted limit
-        let threshold_limit =
-            (self.physical_memory_limit as f64 * self.eviction_threshold_percent as f64) as usize;
+        let threshold_limit = self.threshold_limit();
         if after_alloc_memory > threshold_limit {
-            let excess_bytes = after_alloc_memory.saturating_sub(threshold_limit);
-            let segments_to_evict = (excess_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE; // Round up
+            // Evict down to lower watermark to create headroom
+            let lower_limit = self.lower_watermark_limit();
+            let target_bytes = after_alloc_memory.saturating_sub(lower_limit);
+            let segments_to_evict = (target_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE; // Round up
 
             info!(
                 "Proactive eviction before allocation: current {} hot segments ({} MB), would be {} MB after allocation, threshold {} MB ({}% of {} MB), evicting {} segments",
@@ -242,17 +266,54 @@ impl TieredMemoryManager {
     ///
     /// This is called when a cold segment is accessed and needs to be brought
     /// back into hot storage
-    pub fn promote(&self, segment: &Segment) -> Result<(), io::Error> {
+    pub fn promote(&self, chunk: &Chunk, segment: &Segment) -> Result<(), io::Error> {
         if !self.enabled {
             return Ok(());
         }
+
+        // Ensure we have headroom before promotion
+        let hot_segments_count = self.hot_count_cached(chunk);
+        let after_promotion_bytes = self.hot_memory_bytes(hot_segments_count.saturating_add(1));
+        if after_promotion_bytes > self.threshold_limit() {
+            let _ = self.evict_down_to_lower(chunk, hot_segments_count)?;
+        }
+
+        let churn_candidate = segment.recently_evicted_within(self.promotion_cooldown_ms);
 
         promote_segment(segment);
 
         // Update cached count after promotion
         self.cached_hot_count.fetch_add(1, Ordering::Relaxed);
+        self.promotion_count.fetch_add(1, Ordering::Relaxed);
+        if churn_candidate {
+            self.churn_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         Ok(())
+    }
+
+    /// Evict segments down to the lower watermark to create headroom
+    fn evict_down_to_lower(
+        &self,
+        chunk: &Chunk,
+        current_hot_segments: usize,
+    ) -> Result<usize, io::Error> {
+        let current_bytes = self.hot_memory_bytes(current_hot_segments);
+        let lower_limit = self.lower_watermark_limit();
+        if current_bytes <= lower_limit {
+            return Ok(0);
+        }
+
+        let excess_bytes = current_bytes.saturating_sub(lower_limit);
+        let target_segments = (excess_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
+
+        let evicted = self.evict_until_target(chunk, target_segments)?;
+        self.decrement_hot_count_by(evicted);
+        if evicted > 0 {
+            self.lower_watermark_evictions
+                .fetch_add(evicted as u64, Ordering::Relaxed);
+        }
+        Ok(evicted)
     }
 
     /// Get hot segment count using cached value with periodic full scans
@@ -353,6 +414,10 @@ impl TieredMemoryManager {
             hot_segments: hot,
             cold_segments: cold,
             threshold: (chunk.capacity / SEGMENT_SIZE) as f32 * self.eviction_threshold_percent,
+            promotions: self.promotion_count.load(Ordering::Relaxed),
+            evictions: self.eviction_count.load(Ordering::Relaxed),
+            churns: self.churn_count.load(Ordering::Relaxed),
+            lower_watermark_evictions: self.lower_watermark_evictions.load(Ordering::Relaxed),
         }
     }
 
@@ -374,6 +439,10 @@ pub struct TieredMemoryStats {
     pub hot_segments: usize,
     pub cold_segments: usize,
     pub threshold: f32,
+    pub promotions: u64,
+    pub evictions: u64,
+    pub churns: u64,
+    pub lower_watermark_evictions: u64,
 }
 
 #[cfg(test)]
@@ -383,7 +452,7 @@ mod tests {
     #[test]
     fn test_manager_creation() {
         let limit = 1024 * 1024 * 1024; // 1GB
-        let manager = TieredMemoryManager::new(limit, 0.8);
+        let manager = TieredMemoryManager::new(TieredConfig::with_threshold(0.8, limit));
         assert!(manager.is_enabled());
         assert_eq!(manager.eviction_threshold_percent, 0.8);
         assert_eq!(manager.physical_memory_limit, limit);
@@ -392,17 +461,17 @@ mod tests {
     #[test]
     fn test_threshold_clamping() {
         let limit = 1024 * 1024 * 1024; // 1GB
-        let manager = TieredMemoryManager::new(limit, 1.5);
+        let manager = TieredMemoryManager::new(TieredConfig::with_threshold(1.5, limit));
         assert_eq!(manager.eviction_threshold_percent, 1.0);
 
-        let manager = TieredMemoryManager::new(limit, -0.5);
+        let manager = TieredMemoryManager::new(TieredConfig::with_threshold(-0.5, limit));
         assert_eq!(manager.eviction_threshold_percent, 0.0);
     }
 
     #[test]
     fn test_manager_with_memory_limit() {
         let limit = 64 * 1024 * 1024; // 64MB
-        let manager = TieredMemoryManager::new(limit, 0.9);
+        let manager = TieredMemoryManager::new(TieredConfig::with_threshold(0.9, limit));
         assert!(manager.is_enabled());
         assert_eq!(manager.physical_memory_limit, limit);
         assert_eq!(manager.eviction_threshold_percent, 0.9);

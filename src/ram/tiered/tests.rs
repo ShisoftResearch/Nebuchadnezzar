@@ -345,6 +345,108 @@ fn test_cold_segment_promotion() {
     let _ = std::fs::remove_dir_all("/tmp/neb_test_promotion_schema");
 }
 
+/// Test churn-related metrics and promotion cooldown skip logic
+#[test]
+fn test_metrics_and_churn_counters() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
+    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.75");
+    std::env::set_var("NEB_TIERED_MEMORY_LOWER_WATERMARK", "0.50");
+    std::env::set_var("NEB_TIERED_PROMOTION_COOLDOWN_MS", "5000");
+    std::env::set_var(
+        "NEB_TIERED_PHYSICAL_MEMORY_LIMIT",
+        &format!("{}", 2 * SEGMENT_SIZE),
+    );
+
+    let chunk_capacity = 4 * SEGMENT_SIZE;
+    let fields = default_fields();
+    let schema = Schema::new("test_metrics", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("/tmp/neb_test_metrics_schema");
+    schemas.debug_only_new_schema(schema.clone());
+
+    let backup_dir = "/tmp/neb_test_metrics_bk";
+    let wal_dir = "/tmp/neb_test_metrics_wal";
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let chunks = Chunks::new(
+        1,
+        chunk_capacity,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+        crate::ram::tiered::TieredConfig::from_env(),
+    );
+
+    let manager = chunks
+        .list
+        .first()
+        .and_then(|c| c.tiered_manager.as_ref())
+        .expect("Tiered manager should be enabled");
+
+    // Write enough cells to create multiple segments
+    let large_data = "metrics_test".repeat(128); // ~1KB
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    let num_cells = cells_per_segment * 3;
+
+    for i in 0..num_cells {
+        let id = Id::new(schema.id as u64, i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("metrics_{}", i)),
+        );
+        data_map.insert(
+            &String::from("data"),
+            OwnedValue::String(large_data.clone()),
+        );
+
+        let data = OwnedValue::Map(data_map);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data,
+        };
+
+        let _ = chunks.write_cell(&mut cell);
+    }
+
+    let chunk = &chunks.list[0];
+
+    // Evict a segment to mark last_evicted_ms and increment eviction count
+    let evicted = manager.explicit_evict(chunk, 1).expect("eviction to succeed");
+    assert!(evicted > 0, "Should evict at least one segment");
+
+    // Pick a cold segment and promote it, which should count churn
+    let cold_seg = chunk
+        .segments()
+        .into_iter()
+        .find(|s| s.is_cold())
+        .expect("Should have a cold segment after eviction");
+
+    manager
+        .promote(chunk, &cold_seg)
+        .expect("promotion should succeed");
+
+    let stats = manager.stats(chunk);
+    assert!(stats.evictions > 0, "Eviction counter should increase");
+    assert!(stats.promotions > 0, "Promotion counter should increase");
+    assert!(stats.churns > 0, "Churn counter should detect evict→promote");
+
+    // Cleanup
+    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
+    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
+    std::env::remove_var("NEB_TIERED_MEMORY_LOWER_WATERMARK");
+    std::env::remove_var("NEB_TIERED_PROMOTION_COOLDOWN_MS");
+    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all("/tmp/neb_test_metrics_schema");
+}
+
 /// Large-scale end-to-end test: 64MB physical limit, 1GB virtual, 512MB data
 /// with batched transactional inserts followed by random transactional updates.
 /// Tests natural eviction/promotion with serializability guarantees.

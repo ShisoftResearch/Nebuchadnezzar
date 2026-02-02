@@ -15,8 +15,12 @@ mod bench;
 pub struct TieredConfig {
     /// Memory usage threshold (0.0-1.0) to trigger eviction
     pub threshold: f32,
+    /// Lower watermark (0.0-1.0) to evict down to when threshold is crossed
+    pub lower_watermark: f32,
     /// Physical memory limit in bytes for hot segments
     pub physical_memory_limit: usize,
+    /// Cooldown in milliseconds after promotion during which eviction should skip the segment
+    pub promotion_cooldown_ms: u64,
 }
 
 impl TieredConfig {
@@ -59,7 +63,9 @@ impl TieredConfig {
     pub fn new() -> Self {
         Self {
             threshold: 0.8,
+            lower_watermark: 0.72,
             physical_memory_limit: Self::get_system_memory(),
+            promotion_cooldown_ms: 2000,
         }
     }
 
@@ -67,7 +73,9 @@ impl TieredConfig {
     pub fn with_memory_limit(physical_memory_limit: usize) -> Self {
         Self {
             threshold: 0.8,
+            lower_watermark: 0.72,
             physical_memory_limit,
+            promotion_cooldown_ms: 2000,
         }
     }
 
@@ -75,7 +83,9 @@ impl TieredConfig {
     pub fn with_threshold(threshold: f32, physical_memory_limit: usize) -> Self {
         Self {
             threshold,
+            lower_watermark: 0.72,
             physical_memory_limit,
+            promotion_cooldown_ms: 2000,
         }
     }
 
@@ -94,6 +104,16 @@ impl TieredConfig {
             .and_then(|v| v.parse::<f32>().ok())
             .unwrap_or(0.8);
 
+        let lower_watermark = std::env::var("NEB_TIERED_MEMORY_LOWER_WATERMARK")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.72);
+
+        let promotion_cooldown_ms = std::env::var("NEB_TIERED_PROMOTION_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2000);
+
         let physical_memory_limit = std::env::var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -101,7 +121,9 @@ impl TieredConfig {
 
         Some(Self {
             threshold,
+            lower_watermark,
             physical_memory_limit,
+            promotion_cooldown_ms,
         })
     }
 }

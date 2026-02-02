@@ -325,12 +325,8 @@ impl Chunk {
         let segs = SegmentList::new(num_segs);
         let index = WordMap::with_capacity(64);
         // Create tiered memory manager if enabled
-        let tiered_manager = tiered_config.map(|config| {
-            crate::ram::tiered::manager::TieredMemoryManager::new(
-                config.physical_memory_limit,
-                config.threshold,
-            )
-        });
+        let tiered_manager = tiered_config
+            .map(|config| crate::ram::tiered::manager::TieredMemoryManager::new(config));
 
         let chunk = Chunk {
             id,
@@ -1383,7 +1379,9 @@ impl Chunks {
             );
             crate::ram::tiered::TieredConfig {
                 threshold: config.threshold,
+                lower_watermark: config.lower_watermark,
                 physical_memory_limit: per_chunk_limit,
+                promotion_cooldown_ms: config.promotion_cooldown_ms,
             }
         });
 
@@ -1682,14 +1680,33 @@ impl<'a> CellGuard<'a> {
             #[cfg(feature = "tiered_memory")]
             {
                 segment = chunk.locate_segment(*guard);
-                if let Some(segment) = &segment {
-                    if segment.is_cold() {
-                        crate::ram::tiered::promotion::promote_segment(segment);
-                    }
-                    if !segment.incr_references() {
+                if let Some(seg) = &segment {
+                    if seg.is_cold() {
+                        // CRITICAL: Release the cell lock BEFORE promotion to avoid deadlock.
+                        // The deadlock scenario:
+                        // - Thread A holds cell lock, calls promote_segment, waits for segment exclusive access
+                        // - Thread B holds segment reference (via another cell), waits for the same cell lock
+                        // By releasing the guard first, we break this circular wait.
+                        // The caller's retry loop will re-acquire the lock after promotion completes.
+                        drop(guard);
+
+                        if let Some(ref tiered_manager) = chunk.tiered_manager {
+                            if let Err(e) = tiered_manager.promote(chunk, seg) {
+                                warn!(
+                                    "Failed to promote segment {} in chunk {}: {}",
+                                    seg.id, chunk.id, e
+                                );
+                            }
+                        } else {
+                            crate::ram::tiered::promotion::promote_segment(&seg);
+                        }
+                        // Return None to signal caller to retry (now segment should be hot)
                         return None;
                     }
-                    segment.mark_referenced();
+                    if !seg.incr_references() {
+                        return None;
+                    }
+                    seg.mark_referenced();
                 } else {
                     trace!(
                         "Segment not found for cell at {:?} for chunk {}. Should retry.",

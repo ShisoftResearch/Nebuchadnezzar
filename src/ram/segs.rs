@@ -95,6 +95,10 @@ pub struct Segment {
     /// Cell read/write operations do NOT need this lock, only cell-level locks
     pub tiered_lock: AtomicU8, // 1 = hot, 2 = cold, highest bit for locking
     pub reference_bit: AtomicBool, // For CLOCK eviction algorithm (set by mprotect fault handler)
+    /// Timestamp in ms of last promotion, used to avoid immediate re-eviction
+    pub last_promoted_ms: AtomicI64,
+    /// Timestamp in ms of last eviction, used for churn detection
+    pub last_evicted_ms: AtomicI64,
     /// Tracks if WAL has been written to since last successful archive
     /// Used to optimize eviction: if archived=true && is_dirty=false, can skip re-archiving
     is_dirty: AtomicBool,
@@ -167,6 +171,8 @@ impl Segment {
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
             reference_bit: AtomicBool::new(false),
+            last_promoted_ms: AtomicI64::new(0),
+            last_evicted_ms: AtomicI64::new(0),
             is_dirty: AtomicBool::new(true), // Start dirty
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
@@ -968,6 +974,46 @@ impl Segment {
     #[inline]
     pub fn mark_referenced(&self) {
         self.reference_bit.store(true, Ordering::Relaxed);
+    }
+
+    /// Mark the segment as recently promoted to give it a cooldown window during eviction
+    #[inline]
+    pub fn mark_promoted_now(&self) {
+        self.last_promoted_ms.store(get_time(), Ordering::Relaxed);
+    }
+
+    /// Check if the segment was promoted within the provided window (milliseconds)
+    #[inline]
+    pub fn recently_promoted_within(&self, window_ms: u64) -> bool {
+        if window_ms == 0 {
+            return false;
+        }
+        let last = self.last_promoted_ms.load(Ordering::Relaxed);
+        if last <= 0 {
+            return false;
+        }
+        let now = get_time();
+        now - last <= window_ms as i64
+    }
+
+    /// Mark the segment as recently evicted for churn detection
+    #[inline]
+    pub fn mark_evicted_now(&self) {
+        self.last_evicted_ms.store(get_time(), Ordering::Relaxed);
+    }
+
+    /// Check if the segment was evicted within a window (milliseconds)
+    #[inline]
+    pub fn recently_evicted_within(&self, window_ms: u64) -> bool {
+        if window_ms == 0 {
+            return false;
+        }
+        let last = self.last_evicted_ms.load(Ordering::Relaxed);
+        if last <= 0 {
+            return false;
+        }
+        let now = get_time();
+        now - last <= window_ms as i64
     }
 
     /// Clear reference bit and return old value (for CLOCK algorithm)

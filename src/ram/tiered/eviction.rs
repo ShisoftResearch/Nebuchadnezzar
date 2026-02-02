@@ -218,6 +218,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
 
     // Step 7: Mark as cold and free physical pages (update tiered_lock)
     segment.set_cold();
+    segment.mark_evicted_now();
     debug!(
         "Marked segment {} as COLD (addr {:#x}), about to free physical pages",
         segment.id, segment.addr

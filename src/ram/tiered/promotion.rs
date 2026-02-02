@@ -43,6 +43,8 @@ pub fn promote_segment(segment: &Segment) {
         let _exclusive_guard = if let Some(l) = SegmentExclusiveRefGuard::new(segment) {
             l
         } else {
+            // Yield to allow other threads to release their segment references
+            thread::yield_now();
             continue;
         };
         if segment.is_hot() {
@@ -209,9 +211,6 @@ pub fn promote_segment(segment: &Segment) {
         cursor: temp_start,
     };
 
-    // let _locks =
-    //     cell_locking::lock_all_cells_in_segment(segment, chunk, _temp_entry_iter, true).unwrap();
-
     let segment_addr = segment.addr;
 
     unsafe {
@@ -252,6 +251,7 @@ pub fn promote_segment(segment: &Segment) {
 
     // Step 9: Mark as hot (update tiered_lock)
     segment.set_hot();
+    segment.mark_promoted_now();
     debug!(
         "Marked segment {} as HOT (addr {:#x}) after promotion",
         segment.id, segment.addr
