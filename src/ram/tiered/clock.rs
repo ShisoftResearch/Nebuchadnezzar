@@ -53,65 +53,39 @@ impl ClockEvictionPolicy {
             num_segments, head_seg_id
         );
 
-        // Make two passes: first try to find unreferenced segment,
-        // second pass will clear all reference bits if needed
-        for pass in 0..2 {
-            for i in 0..num_segments {
-                let pos = (start_pos + i) % num_segments;
-                let segment = &segments[pos];
+        for i in 0..num_segments {
+            let pos = (start_pos + i) % num_segments;
+            let segment = &segments[pos];
 
-                // Skip head segment - it's actively being written to
-                if segment.id == head_seg_id {
-                    debug!("CLOCK: seg {} is head, skipping", segment.id);
-                    continue;
-                }
+            if segment.id == head_seg_id {
+                debug!("CLOCK: seg {} is head, skipping", segment.id);
+                continue;
+            }
 
-                // Skip if segment has active references (being read or protected by transactions)
-                // SegmentReferenceGuards in transactions increment the reference count
-                if !segment.no_references() {
-                    debug!("CLOCK: seg {} has active references, skipping", segment.id);
-                    continue;
-                }
+            if !segment.no_references() {
+                debug!("CLOCK: seg {} has active references, skipping", segment.id);
+                continue;
+            }
 
-                // Skip if already cold
-                if segment.is_cold() {
-                    debug!("CLOCK: seg {} is already cold, skipping", segment.id);
-                    continue;
-                }
+            if segment.is_cold() {
+                debug!("CLOCK: seg {} is already cold, skipping", segment.id);
+                continue;
+            }
 
-                // Skip if recently promoted within cooldown window
-                let cooldown_ms = self.promotion_cooldown_ms.load(Ordering::Relaxed);
-                if cooldown_ms > 0 && segment.recently_promoted_within(cooldown_ms) {
-                    debug!("CLOCK: seg {} recently promoted, skipping", segment.id);
-                    continue;
-                }
+            let cooldown_ms = self.promotion_cooldown_ms.load(Ordering::Relaxed);
+            if cooldown_ms > 0 && segment.recently_promoted_within(cooldown_ms) {
+                debug!("CLOCK: seg {} recently promoted, skipping", segment.id);
+                continue;
+            }
 
-                // Check and clear reference bit
-                let was_referenced = segment.clear_reference_bit();
-
-                if pass == 0 {
-                    // First pass: only select if not referenced
-                    if !was_referenced {
-                        // Found victim!
-                        self.cursor
-                            .store((pos + 1) % num_segments, Ordering::Relaxed);
-                        debug!(
-                            "CLOCK selected segment {} as victim (first pass, unreferenced)",
-                            segment.id
-                        );
-                        return Some(segment.clone());
-                    }
-                } else {
-                    // Second pass: select any eligible segment (bits already cleared)
-                    // This only happens if ALL segments were referenced in first pass
-                    self.cursor
-                        .store((pos + 1) % num_segments, Ordering::Relaxed);
-                    debug!(
-                        "CLOCK selected segment {} as victim (second pass, all were referenced)",
-                        segment.id
-                    );
-                    return Some(segment.clone());
-                }
+            if segment.decrement_and_check() {
+                self.cursor
+                    .store((pos + 1) % num_segments, Ordering::Relaxed);
+                debug!(
+                    "CLOCK selected segment {} as victim (count reached zero)",
+                    segment.id
+                );
+                return Some(segment.clone());
             }
         }
 

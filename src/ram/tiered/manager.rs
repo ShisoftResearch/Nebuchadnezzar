@@ -271,7 +271,16 @@ impl TieredMemoryManager {
             return Ok(());
         }
 
-        // Ensure we have headroom before promotion
+        const MIN_ACCESSES_FOR_PROMOTION: u8 = 2;
+        let access_count = segment.increment_access_count();
+        if access_count < MIN_ACCESSES_FOR_PROMOTION {
+            debug!(
+                "Segment {} accessed {} time(s), needs {} before promotion",
+                segment.id, access_count, MIN_ACCESSES_FOR_PROMOTION
+            );
+            return Ok(());
+        }
+
         let hot_segments_count = self.hot_count_cached(chunk);
         let after_promotion_bytes = self.hot_memory_bytes(hot_segments_count.saturating_add(1));
         if after_promotion_bytes > self.threshold_limit() {
@@ -281,8 +290,8 @@ impl TieredMemoryManager {
         let churn_candidate = segment.recently_evicted_within(self.promotion_cooldown_ms);
 
         promote_segment(segment);
+        segment.reset_access_count();
 
-        // Update cached count after promotion
         self.cached_hot_count.fetch_add(1, Ordering::Relaxed);
         self.promotion_count.fetch_add(1, Ordering::Relaxed);
         if churn_candidate {

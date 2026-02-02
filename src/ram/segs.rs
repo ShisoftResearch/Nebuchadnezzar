@@ -94,7 +94,8 @@ pub struct Segment {
     /// Holds the hot/cold state: false = hot (anonymous memory), true = cold (backed by file)
     /// Cell read/write operations do NOT need this lock, only cell-level locks
     pub tiered_lock: AtomicU8, // 1 = hot, 2 = cold, highest bit for locking
-    pub reference_bit: AtomicBool, // For CLOCK eviction algorithm (set by mprotect fault handler)
+    pub reference_count: AtomicU8, // Multi-chance CLOCK: 0-7 chances before eviction
+    pub access_count: AtomicU8,    // Tracks cold accesses for promotion threshold
     /// Timestamp in ms of last promotion, used to avoid immediate re-eviction
     pub last_promoted_ms: AtomicI64,
     /// Timestamp in ms of last eviction, used for churn detection
@@ -170,7 +171,8 @@ impl Segment {
             }),
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
-            reference_bit: AtomicBool::new(false),
+            reference_count: AtomicU8::new(0),
+            access_count: AtomicU8::new(0),
             last_promoted_ms: AtomicI64::new(0),
             last_evicted_ms: AtomicI64::new(0),
             is_dirty: AtomicBool::new(true), // Start dirty
@@ -969,11 +971,14 @@ impl Segment {
             .is_ok()
     }
 
-    /// Mark segment as recently accessed (for CLOCK algorithm)
-    /// No-op when tiered memory is disabled
+    /// Mark segment as recently accessed (for multi-chance CLOCK algorithm)
+    /// Increments reference count up to 7, giving hot segments multiple chances
     #[inline]
     pub fn mark_referenced(&self) {
-        self.reference_bit.store(true, Ordering::Relaxed);
+        let current = self.reference_count.load(Ordering::Relaxed);
+        if current < 7 {
+            self.reference_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Mark the segment as recently promoted to give it a cooldown window during eviction
@@ -1016,18 +1021,37 @@ impl Segment {
         now - last <= window_ms as i64
     }
 
-    /// Clear reference bit and return old value (for CLOCK algorithm)
-    /// Always returns false when tiered memory is disabled
+    /// Decrement reference count and return true if zero (for multi-chance CLOCK)
     #[inline]
-    pub fn clear_reference_bit(&self) -> bool {
-        self.reference_bit.swap(false, Ordering::Relaxed)
+    pub fn decrement_and_check(&self) -> bool {
+        let prev = self.reference_count.fetch_sub(1, Ordering::Relaxed);
+        prev.saturating_sub(1) == 0
     }
 
-    /// Get current reference bit value without clearing
-    /// Always returns false when tiered memory is disabled
+    /// Get current reference count without modifying
     #[inline]
-    pub fn get_reference_bit(&self) -> bool {
-        self.reference_bit.load(Ordering::Relaxed)
+    pub fn get_reference_count(&self) -> u8 {
+        self.reference_count.load(Ordering::Relaxed)
+    }
+
+    /// Increment cold access count and return new value (for promotion threshold)
+    #[inline]
+    pub fn increment_access_count(&self) -> u8 {
+        self.access_count
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// Reset access count to zero (called after promotion)
+    #[inline]
+    pub fn reset_access_count(&self) {
+        self.access_count.store(0, Ordering::Relaxed);
+    }
+
+    /// Get current access count
+    #[inline]
+    pub fn get_access_count(&self) -> u8 {
+        self.access_count.load(Ordering::Relaxed)
     }
 
     #[inline]

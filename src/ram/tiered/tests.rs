@@ -420,7 +420,6 @@ fn test_metrics_and_churn_counters() {
     let evicted = manager.explicit_evict(chunk, 1).expect("eviction to succeed");
     assert!(evicted > 0, "Should evict at least one segment");
 
-    // Pick a cold segment and promote it, which should count churn
     let cold_seg = chunk
         .segments()
         .into_iter()
@@ -429,7 +428,11 @@ fn test_metrics_and_churn_counters() {
 
     manager
         .promote(chunk, &cold_seg)
-        .expect("promotion should succeed");
+        .expect("first access should succeed");
+    
+    manager
+        .promote(chunk, &cold_seg)
+        .expect("second access should trigger promotion");
 
     let stats = manager.stats(chunk);
     assert!(stats.evictions > 0, "Eviction counter should increase");
@@ -445,6 +448,39 @@ fn test_metrics_and_churn_counters() {
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
     let _ = std::fs::remove_dir_all("/tmp/neb_test_metrics_schema");
+}
+
+#[test]
+fn test_multi_chance_clock_api() {
+    use crate::ram::segs::Segment;
+    use std::sync::Arc;
+    use crate::ram::file_manager::SegmentFileManager;
+
+    let file_manager = Arc::new(SegmentFileManager::new(None, None));
+    let segment = Segment::new(1, 1, 0, 0x1000, true, file_manager);
+
+    segment.mark_referenced();
+    assert_eq!(segment.get_reference_count(), 1);
+    segment.mark_referenced();
+    segment.mark_referenced();
+    assert_eq!(segment.get_reference_count(), 3);
+
+    let is_victim = segment.decrement_and_check();
+    assert!(!is_victim);
+    assert_eq!(segment.get_reference_count(), 2);
+
+    segment.decrement_and_check();
+    segment.decrement_and_check();
+    let is_victim = segment.decrement_and_check();
+    assert!(is_victim);
+
+    assert_eq!(segment.get_access_count(), 0);
+    let count = segment.increment_access_count();
+    assert_eq!(count, 1);
+    let count = segment.increment_access_count();
+    assert_eq!(count, 2);
+    segment.reset_access_count();
+    assert_eq!(segment.get_access_count(), 0);
 }
 
 /// Large-scale end-to-end test: 64MB physical limit, 1GB virtual, 512MB data
