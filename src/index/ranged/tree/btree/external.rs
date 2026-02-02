@@ -1,8 +1,8 @@
 use super::*;
 use crate::index::ranged::tree::tree::DeletionSet;
+use crate::ram::cell::OwnedCell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use crate::{index::ranged::tree::btree::level::NODE_FANOUT, ram::cell::OwnedCell};
 use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
 use itertools::Itertools;
@@ -399,17 +399,14 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // Only persist nodes from higher level trees (Level 0 and Level 1, not LevelM)
-    // LevelM is the in-memory tree that gets merged to disk
-    if KS::slice_len() > NODE_FANOUT {
-        CHANGED_NODES.push((
-            CHANGE_COUNTER.fetch_add(1, Relaxed),
-            ChangingNode::Modified(NodeModified {
-                node: node.clone(),
-                deletion: tree.deletion.clone(),
-            }),
-        ));
-    }
+    // Persist all changed nodes from the single B+ tree
+    CHANGED_NODES.push((
+        CHANGE_COUNTER.fetch_add(1, Relaxed),
+        ChangingNode::Modified(NodeModified {
+            node: node.clone(),
+            deletion: tree.deletion.clone(),
+        }),
+    ));
 }
 
 pub fn make_deleted<KS, PS>(id: &Id)
@@ -417,13 +414,11 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // Only accept lower higher level trees
-    if KS::slice_len() > NODE_FANOUT {
-        CHANGED_NODES.push((
-            CHANGE_COUNTER.fetch_add(1, Relaxed),
-            ChangingNode::Deleted(*id),
-        ));
-    }
+    // Persist all deleted nodes from the single B+ tree
+    CHANGED_NODES.push((
+        CHANGE_COUNTER.fetch_add(1, Relaxed),
+        ChangingNode::Deleted(*id),
+    ));
 }
 
 pub fn page_schema() -> Schema {

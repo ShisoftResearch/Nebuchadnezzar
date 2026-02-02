@@ -10,10 +10,8 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 
 // B+ tree node size constants
-// Using a fanout of 8 gives us 512-key nodes (8^3)
-pub const NODE_FANOUT: usize = 8;
 // BTREE_NODE_SIZE is the number of keys per node in the ranged tree
-pub const BTREE_NODE_SIZE: usize = NODE_FANOUT * NODE_FANOUT * NODE_FANOUT; // 512 keys
+pub const BTREE_NODE_SIZE: usize = 128;
 
 enum NodeSelection<KS, PS>
 where

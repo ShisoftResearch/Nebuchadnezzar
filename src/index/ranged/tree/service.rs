@@ -1,6 +1,6 @@
 use super::super::sm::client::SMClient;
 use super::super::trees::*;
-pub use super::btree::level::{BTREE_NODE_SIZE as MIGRATE_SIZE, NODE_FANOUT as BLOCK_SIZE};
+pub use super::btree::level::BTREE_NODE_SIZE as MIGRATE_SIZE;
 use super::btree::storage;
 use super::tree::*;
 use crate::client::AsyncClient;
@@ -15,8 +15,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub type IdBlock = [Id; BLOCK_SIZE];
-pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
+pub type IdBlock = [Id; MIGRATE_SIZE]; // Fixed size for ID arrays (not related to tree node size)
+pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(RANGED_TREE_RPC_SERVICE) as u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Boundary {
