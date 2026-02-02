@@ -1,6 +1,6 @@
 use super::super::sm::client::SMClient;
 use super::super::trees::*;
-pub use super::btree::level::{LEVEL_1 as MIGRATE_SIZE, LEVEL_M as BLOCK_SIZE};
+pub use super::btree::level::{BTREE_NODE_SIZE as MIGRATE_SIZE, NODE_FANOUT as BLOCK_SIZE};
 use super::btree::storage;
 use super::tree::*;
 use crate::client::AsyncClient;
@@ -356,7 +356,7 @@ impl Service for TreeService {
                 id,
                 prop: tree.prop.read().clone(),
                 trees: vec![BTreeStat {
-                    size: MIGRATE_SIZE, // Single tree always uses LEVEL_1 size
+                    size: MIGRATE_SIZE, // Single tree uses BTREE_NODE_SIZE (512)
                     count: tree.tree.count(),
                     head: tree.tree.head_id(),
                     ideal_cap: tree.tree.ideal_capacity(),

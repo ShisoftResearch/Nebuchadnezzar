@@ -63,7 +63,7 @@ mod tests {
         ));
         info!("Tree stat {:?}", index_client.tree_stats().await.unwrap());
         client.new_schema_with_id(schema()).await.unwrap().unwrap();
-        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_1) * 3;
+        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::BTREE_NODE_SIZE) * 3;
         let mut futs = FuturesUnordered::new();
         info!(
             "Testing ranged indexer preesure test with {} items",

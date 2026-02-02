@@ -9,13 +9,11 @@ use itertools::Itertools;
 use std::collections::HashSet;
 use std::fmt::Debug;
 
-pub const LEVEL_TREE_DEPTH: u32 = 2;
-
-pub const LEVEL_M: usize = 8;
-pub const LEVEL_0: usize = LEVEL_M * LEVEL_M; // Smaller can be faster but more fragmented
-pub const LEVEL_1: usize = LEVEL_0 * LEVEL_M;
-
-pub const NUM_LEVELS: usize = 2;
+// B+ tree node size constants
+// Using a fanout of 8 gives us 512-key nodes (8^3)
+pub const NODE_FANOUT: usize = 8;
+// BTREE_NODE_SIZE is the number of keys per node in the ranged tree
+pub const BTREE_NODE_SIZE: usize = NODE_FANOUT * NODE_FANOUT * NODE_FANOUT; // 512 keys
 
 enum NodeSelection<KS, PS>
 where

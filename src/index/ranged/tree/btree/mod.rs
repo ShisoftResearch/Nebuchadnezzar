@@ -12,7 +12,7 @@ use futures::future::BoxFuture;
 use insert::*;
 use internal::*;
 use itertools::Itertools;
-use level::LEVEL_TREE_DEPTH;
+
 use merge::*;
 pub use node::*;
 use parking_lot::RwLock;
@@ -332,7 +332,7 @@ pub trait LevelTree: Sync + Send {
 }
 
 pub fn ideal_capacity_from_node_size(size: usize) -> usize {
-    size.pow(LEVEL_TREE_DEPTH)
+    size.pow(2) // B+ tree has 2-level depth
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>

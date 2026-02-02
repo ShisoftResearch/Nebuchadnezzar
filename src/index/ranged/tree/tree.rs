@@ -25,9 +25,9 @@ lazy_static! {
     pub static ref RANGED_TREE_SCHEMA: Schema = ranged_tree_schema();
 }
 
-// Single disk tree type - using LEVEL_1 size (512 keys per node)
-type DiskTreeKeySlice = [EntryKey; LEVEL_1];
-type DiskTreePtrSlice = [NodeCellRef; LEVEL_1 + 1];
+// Single disk tree type - 512 keys per node
+type DiskTreeKeySlice = [EntryKey; BTREE_NODE_SIZE];
+type DiskTreePtrSlice = [NodeCellRef; BTREE_NODE_SIZE + 1];
 type DiskTree = BPlusTree<DiskTreeKeySlice, DiskTreePtrSlice>;
 
 /// Single B+ tree for range indexing
@@ -251,8 +251,8 @@ fn ranged_tree_cell(head_id: &Id, id: &Id, migration: Option<Id>) -> OwnedCell {
     OwnedCell::new_with_id(*RANGED_TREE_SCHEMA_ID, id, OwnedValue::Map(cell_map))
 }
 
-// Keep LEVEL_1 tree type for the disk tree
-impl_btree_level!(LEVEL_1);
+// Implement slice operations for the B+ tree node size
+impl_btree_level!(BTREE_NODE_SIZE);
 
 unsafe impl Send for RangedTree {}
 unsafe impl Sync for RangedTree {}

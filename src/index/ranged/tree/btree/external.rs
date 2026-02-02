@@ -2,7 +2,7 @@ use super::*;
 use crate::index::ranged::tree::tree::DeletionSet;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use crate::{index::ranged::tree::btree::level::LEVEL_M, ram::cell::OwnedCell};
+use crate::{index::ranged::tree::btree::level::NODE_FANOUT, ram::cell::OwnedCell};
 use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
 use itertools::Itertools;
@@ -401,7 +401,7 @@ where
 {
     // Only persist nodes from higher level trees (Level 0 and Level 1, not LevelM)
     // LevelM is the in-memory tree that gets merged to disk
-    if KS::slice_len() > LEVEL_M {
+    if KS::slice_len() > NODE_FANOUT {
         CHANGED_NODES.push((
             CHANGE_COUNTER.fetch_add(1, Relaxed),
             ChangingNode::Modified(NodeModified {
@@ -418,7 +418,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     // Only accept lower higher level trees
-    if KS::slice_len() > LEVEL_M {
+    if KS::slice_len() > NODE_FANOUT {
         CHANGED_NODES.push((
             CHANGE_COUNTER.fetch_add(1, Relaxed),
             ChangingNode::Deleted(*id),
