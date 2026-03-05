@@ -1,12 +1,12 @@
 use crate::ram::io::align_ptr_addr;
-use crate::ram::schema::Field;
+use crate::ram::schema::{Field, FieldCompression};
 use crate::ram::types;
 use crate::ram::types::OwnedValue;
-use crate::ram::{cell::*, io::align_address_with_ty};
+use crate::ram::{cell::*, compression, io::align_address_with_ty};
 
 use std::collections::{HashMap, HashSet};
 
-use dovahkiin::types::{key_hash, Map, Type, ARRAY_LEN_TYPE};
+use dovahkiin::types::{key_hash, Bytes, Map, Type, ARRAY_LEN_TYPE};
 use itertools::Itertools;
 
 #[derive(Debug)]
@@ -178,23 +178,56 @@ pub fn plan_write_field<'a>(
         if !field.nullable && is_null {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
-        let size = types::get_vsize(field.data_type, &value);
-        *offset = align_address_with_ty(field.data_type, *offset);
-        ins.push(Instruction {
-            data_type: field.data_type,
-            val: InstData::Ref(value),
-            offset: *offset,
-        });
-        let new_offset = *offset + size;
-        trace!(
-            "Pushing value ref {} inst with {:?} at {}, size {}, new offset {}",
-            field.name,
-            value,
-            *offset,
-            size,
-            new_offset
-        );
-        *offset = new_offset;
+
+        let should_compress = matches!(field.compression, Some(FieldCompression::Lz4))
+            && (field.data_type == Type::String || field.data_type == Type::Bytes);
+
+        if should_compress {
+            let raw_bytes = match value {
+                OwnedValue::String(s) => s.as_bytes(),
+                OwnedValue::Bytes(b) => b.as_slice(),
+                _ => return Err(WriteError::DataMismatchSchema(field.clone(), value.clone())),
+            };
+
+            let compressed = compression::compress_field(raw_bytes)
+                .map_err(|e| WriteError::CompressionFailed(field.clone(), e.to_string()))?;
+
+            let compressed_owned = OwnedValue::Bytes(Bytes::from_vec(compressed));
+            let size = types::get_vsize(Type::Bytes, &compressed_owned);
+            *offset = align_address_with_ty(Type::Bytes, *offset);
+            ins.push(Instruction {
+                data_type: Type::Bytes,
+                val: InstData::Val(compressed_owned),
+                offset: *offset,
+            });
+            *offset += size;
+
+            trace!(
+                "Pushing compressed {:?} field {} at {}, original {} bytes",
+                field.data_type,
+                field.name,
+                *offset,
+                raw_bytes.len()
+            );
+        } else {
+            let size = types::get_vsize(field.data_type, &value);
+            *offset = align_address_with_ty(field.data_type, *offset);
+            ins.push(Instruction {
+                data_type: field.data_type,
+                val: InstData::Ref(value),
+                offset: *offset,
+            });
+            let new_offset = *offset + size;
+            trace!(
+                "Pushing value ref {} inst with {:?} at {}, size {}, new offset {}",
+                field.name,
+                value,
+                *offset,
+                size,
+                new_offset
+            );
+            *offset = new_offset;
+        }
     }
     return Ok(());
 }

@@ -1,7 +1,7 @@
 use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
 use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
-use crate::ram::schema::{LocalSchemasCache, SchemaRef};
+use crate::ram::schema::LocalSchemasCache;
 use crate::ram::segment_list::SegmentList;
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
@@ -1124,7 +1124,7 @@ impl Chunk {
         if let Some(segment) = self.segs.get(&(segment_id as usize)) {
             (segment.id, segment.seq_id)
         } else {
-            panic!("Cannot find segment for cell at address {}", cell_addr);
+            unreachable!("Cannot find segment for cell at address {}", cell_addr)
         }
     }
 

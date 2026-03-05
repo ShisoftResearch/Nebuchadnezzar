@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use futures::prelude::*;
 use futures::FutureExt;
+use smallvec::SmallVec;
 use std::ops::Deref;
 
 pub mod sm;
@@ -41,6 +42,8 @@ pub struct Schema {
     #[serde(default)]
     pub compound_index_fields: BTreeMap<u64, CompoundIndex>,
     pub fields: Field,
+    #[serde(skip, default)]
+    pub compression_plan: SchemaCompressionPlan,
     pub static_bound: usize,
     pub is_dynamic: bool,
     pub is_scannable: bool,
@@ -63,6 +66,34 @@ pub enum IndexType {
     /// The model name is interpreted by the embedding implementation (e.g., Morpheus).
     Embedding(EmbeddingModel),
     Statistics,
+}
+
+/// Field-level compression configuration
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum FieldCompression {
+    /// LZ4 block compression (fast, moderate ratio)
+    /// Only valid for Type::String and Type::Bytes
+    Lz4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressedFieldKind {
+    String,
+    Bytes,
+}
+
+pub type CompressedFieldPath = SmallVec<[u64; 4]>;
+pub type CompressedFieldPlans = SmallVec<[CompressedFieldPlan; 8]>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedFieldPlan {
+    pub path: CompressedFieldPath,
+    pub kind: CompressedFieldKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaCompressionPlan {
+    pub fields: CompressedFieldPlans,
 }
 
 impl Schema {
@@ -94,7 +125,7 @@ impl Schema {
         // which is only 4-byte aligned, causing misaligned u64 reads in variable region.
         bound = align_address(8, bound);
         trace!("Schema {:?} has bound {} (8-byte aligned)", fields, bound);
-        Schema {
+        let mut schema = Schema {
             id: 0,
             name: name.to_string(),
             key_field: match key_field {
@@ -104,13 +135,16 @@ impl Schema {
             str_key_field: key_field,
             static_bound: bound,
             fields,
+            compression_plan: SchemaCompressionPlan::default(),
             is_dynamic,
             is_scannable,
             field_index,
             id_index,
             index_fields,
             compound_index_fields,
-        }
+        };
+        schema.refresh_compression_plan();
+        schema
     }
     pub fn new_with_id(
         id: u32,
@@ -166,6 +200,10 @@ impl Schema {
             },
         );
     }
+
+    pub fn refresh_compression_plan(&mut self) {
+        self.compression_plan = SchemaCompressionPlan::from_schema(self);
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -180,6 +218,8 @@ pub struct Field {
     pub name_id: u64,
     pub indices: Vec<IndexType>,
     pub offset: Option<usize>,
+    #[serde(default)]
+    pub compression: Option<FieldCompression>,
 }
 
 impl Field {
@@ -209,11 +249,18 @@ impl Field {
             indices,
             offset: None,
             vector_size: None,
+            compression: None,
         }
     }
     pub fn new_map(name: &str, sub_fields: Vec<Field>) -> Field {
         Self::new(name, Type::Map, false, false, Some(sub_fields), vec![])
     }
+
+    pub fn with_compression(mut self, compression: FieldCompression) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+
     pub fn new_map_array(name: &str, sub_fields: Vec<Field>) -> Field {
         Self::new(name, Type::Map, false, true, Some(sub_fields), vec![])
     }
@@ -288,6 +335,7 @@ impl Field {
             name_id: types::key_hash(name),
             indices,
             offset: None,
+            compression: None,
         }
     }
     fn assign_offsets(
@@ -372,6 +420,53 @@ impl Field {
             m.get(name_id)
                 .and_then(|idx| self.sub_fields.as_ref().map(|f| &f[*idx]))
         })
+    }
+}
+
+impl SchemaCompressionPlan {
+    pub fn from_schema(schema: &Schema) -> Self {
+        let mut fields = CompressedFieldPlans::new();
+        let mut path = CompressedFieldPath::new();
+        Self::collect(&schema.fields, &mut path, &mut fields);
+        Self { fields }
+    }
+
+    fn collect(
+        field: &Field,
+        path: &mut CompressedFieldPath,
+        out: &mut CompressedFieldPlans,
+    ) {
+        if let Some(sub_fields) = &field.sub_fields {
+            for sub in sub_fields {
+                path.push(sub.name_id);
+                Self::collect(sub, path, out);
+                path.pop();
+            }
+            return;
+        }
+
+        if !matches!(field.compression, Some(FieldCompression::Lz4)) {
+            return;
+        }
+
+        if field.is_array || field.vector_size.is_some() {
+            return;
+        }
+
+        let kind = match field.data_type {
+            Type::String => CompressedFieldKind::String,
+            Type::Bytes => CompressedFieldKind::Bytes,
+            _ => return,
+        };
+
+        out.push(CompressedFieldPlan {
+            path: path.clone(),
+            kind,
+        });
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
     }
 }
 
@@ -536,9 +631,10 @@ impl LocalSchemasMap {
         self.name_map.get(&name.to_string()).map(|id| id as u32)
     }
 
-    fn new_schema(&self, schema: Schema) {
+    fn new_schema(&self, mut schema: Schema) {
         let name = schema.name.clone();
         let id = schema.id;
+        schema.refresh_compression_plan();
 
         // Check if schema already exists (could happen during subscription race)
         if let Some(existing_id) = self.name_map.get(&name) {

@@ -2,16 +2,16 @@ use crate::ram::chunk::CellGuard;
 use crate::ram::chunk::Chunk;
 use crate::ram::chunk::PendingEntry;
 use crate::ram::clock;
+use crate::ram::compression;
 use crate::ram::entry::*;
 use crate::ram::io::align_address;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{CompressedFieldKind, Field, Schema, SchemaCompressionPlan};
 use crate::ram::segs::SEGMENT_SIZE;
-use crate::ram::types::{Id, Map, OwnedValue, RandValue, SharedValue, Value};
+use crate::ram::types::{self, Bytes, Id, Map, OwnedValue, RandValue, SharedValue, Value};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use dovahkiin::types::referred::ARef;
-use lightning::map::WordMutexGuard;
 use serde::Serialize;
 use std::io::Cursor;
 use std::io::Seek;
@@ -54,6 +54,7 @@ pub enum WriteError {
     NetworkingError,
     DataMismatchSchema(Field, OwnedValue),
     CellVersionMismatch,
+    CompressionFailed(Field, String),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -66,6 +67,7 @@ pub enum ReadError {
     NotMatch,
     ExecError(String),
     SegmentPromotionFailed,
+    DecompressionFailed(String),
 }
 
 impl CellHeader {
@@ -317,6 +319,7 @@ impl<'a> WritePlan<'a> {
 pub struct SharedCellData<'v> {
     pub header: CellHeader,
     pub data: SharedValue<'v>,
+    compression_plan: Option<SchemaCompressionPlan>,
 }
 
 impl<'v> SharedCellData<'v> {
@@ -329,7 +332,16 @@ impl<'v> SharedCellData<'v> {
         let (header, data_ptr) = header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
-            let cell = Self::from_data(header, reader::read_by_schema(data_ptr, &*schema));
+            let compression_plan = if schema.compression_plan.is_empty() {
+                None
+            } else {
+                Some(schema.compression_plan.clone())
+            };
+            let cell = Self::from_data_with_plan(
+                header,
+                reader::read_by_schema(data_ptr, &*schema),
+                compression_plan,
+            );
             Ok((cell, schema))
         } else {
             let seg = chunk.locate_segment(ptr);
@@ -372,17 +384,74 @@ impl<'v> SharedCellData<'v> {
         }
     }
     pub fn from_data(header: CellHeader, data: SharedValue<'v>) -> Self {
-        Self { header, data }
+        Self {
+            header,
+            data,
+            compression_plan: None,
+        }
+    }
+    pub fn from_data_with_plan(
+        header: CellHeader,
+        data: SharedValue<'v>,
+        compression_plan: Option<SchemaCompressionPlan>,
+    ) -> Self {
+        Self {
+            header,
+            data,
+            compression_plan,
+        }
     }
     pub fn id(&self) -> Id {
         self.header.id()
     }
     pub fn to_owned(&self) -> OwnedCell {
-        OwnedCell {
+        let mut owned = OwnedCell {
             header: self.header.clone(),
             data: self.data.owned(),
+        };
+        if let Some(plan) = &self.compression_plan {
+            decode_owned_by_plan(plan, &mut owned.data);
+        }
+        owned
+    }
+
+    pub fn string(&self, key: &str) -> Option<String> {
+        self.string_by_path(&[types::key_hash(key)])
+    }
+
+    pub fn bytes(&self, key: &str) -> Option<Vec<u8>> {
+        self.bytes_by_path(&[types::key_hash(key)])
+    }
+
+    pub fn string_by_path(&self, path: &[u64]) -> Option<String> {
+        let value = shared_value_by_path(&self.data, path)?;
+        let owned = value.owned();
+        let kind = compression_kind_for_path(self.compression_plan.as_ref(), path);
+
+        match (kind, owned) {
+            (Some(CompressedFieldKind::String), OwnedValue::Bytes(bytes)) => {
+                let decompressed = compression::decompress_field(bytes.data.as_slice()).ok()?;
+                String::from_utf8(decompressed).ok()
+            }
+            (None, OwnedValue::String(s)) => Some(s),
+            _ => None,
         }
     }
+
+    pub fn bytes_by_path(&self, path: &[u64]) -> Option<Vec<u8>> {
+        let value = shared_value_by_path(&self.data, path)?;
+        let owned = value.owned();
+        let kind = compression_kind_for_path(self.compression_plan.as_ref(), path);
+
+        match (kind, owned) {
+            (Some(CompressedFieldKind::Bytes), OwnedValue::Bytes(bytes)) => {
+                compression::decompress_field(bytes.data.as_slice()).ok()
+            }
+            (None, OwnedValue::Bytes(bytes)) => Some(bytes.data),
+            _ => None,
+        }
+    }
+
     pub fn into_shared(self, cell_guard: CellGuard<'v>) -> SharedCell<'v> {
         SharedCell {
             cell_guard,
@@ -463,6 +532,94 @@ impl<'a> SharedCell<'a> {
                 inner: SharedCellData::from_data(hdr, val),
             }
         })
+    }
+
+    pub fn to_owned(&self) -> OwnedCell {
+        self.inner.to_owned()
+    }
+
+    pub fn string(&self, key: &str) -> Option<String> {
+        self.inner.string(key)
+    }
+
+    pub fn bytes(&self, key: &str) -> Option<Vec<u8>> {
+        self.inner.bytes(key)
+    }
+
+    pub fn string_by_path(&self, path: &[u64]) -> Option<String> {
+        self.inner.string_by_path(path)
+    }
+
+    pub fn bytes_by_path(&self, path: &[u64]) -> Option<Vec<u8>> {
+        self.inner.bytes_by_path(path)
+    }
+}
+
+fn shared_value_by_path<'a>(
+    value: &'a SharedValue<'a>,
+    path: &[u64],
+) -> Option<&'a SharedValue<'a>> {
+    let mut current = value;
+    for key in path {
+        current = &current[*key];
+    }
+    Some(current)
+}
+
+fn compression_kind_for_path(
+    plan: Option<&SchemaCompressionPlan>,
+    path: &[u64],
+) -> Option<CompressedFieldKind> {
+    plan.and_then(|p| {
+        p.fields
+            .iter()
+            .find(|entry| entry.path.as_slice() == path)
+            .map(|entry| entry.kind)
+    })
+}
+
+fn value_mut_by_path<'a>(value: &'a mut OwnedValue, path: &[u64]) -> Option<&'a mut OwnedValue> {
+    let mut current = value;
+    for key in path {
+        current = match current {
+            OwnedValue::Map(map) => map.get_mut_by_key_id(*key),
+            _ => return None,
+        };
+    }
+    Some(current)
+}
+
+fn decode_owned_by_plan(plan: &SchemaCompressionPlan, value: &mut OwnedValue) {
+    if plan.is_empty() {
+        return;
+    }
+
+    for entry in &plan.fields {
+        let target = match value_mut_by_path(value, &entry.path) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let compressed = match target {
+            OwnedValue::Bytes(bytes) => bytes.data.as_slice(),
+            _ => continue,
+        };
+
+        let decompressed = compression::decompress_field(compressed)
+            .unwrap_or_else(|e| panic!("Failed to decompress field {:?}: {}", entry.path, e));
+
+        *target = match entry.kind {
+            CompressedFieldKind::Bytes => OwnedValue::Bytes(Bytes::from_vec(decompressed)),
+            CompressedFieldKind::String => {
+                let decoded = String::from_utf8(decompressed).unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to decode decompressed UTF-8 field {:?}: {}",
+                        entry.path, e
+                    )
+                });
+                OwnedValue::String(decoded)
+            }
+        };
     }
 }
 

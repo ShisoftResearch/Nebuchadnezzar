@@ -127,6 +127,39 @@ pub fn is_compressed(data: &[u8]) -> bool {
     &data[..4] == &COMPRESSION_MAGIC
 }
 
+pub fn compress_field(data: &[u8]) -> io::Result<Vec<u8>> {
+    let compressed = compress_prepend_size(data);
+
+    debug!(
+        "Field compress: {} bytes -> {} bytes (ratio: {:.2}%)",
+        data.len(),
+        compressed.len(),
+        (compressed.len() as f64 / data.len() as f64) * 100.0
+    );
+
+    Ok(compressed)
+}
+
+pub fn decompress_field(compressed_data: &[u8]) -> io::Result<Vec<u8>> {
+    match decompress_size_prepended(compressed_data) {
+        Ok(decompressed) => {
+            debug!(
+                "Field decompress: {} bytes -> {} bytes",
+                compressed_data.len(),
+                decompressed.len()
+            );
+            Ok(decompressed)
+        }
+        Err(e) => {
+            error!("Field LZ4 decompression failed: {:?}", e);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to decompress field data: {:?}", e),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +266,13 @@ mod tests {
 
         // Uncompressed
         assert!(!is_compressed(original));
+    }
+
+    #[test]
+    fn test_field_decompress_corruption_returns_error() {
+        let original = b"Field payload that should compress";
+        let mut compressed = compress_field(original).unwrap();
+        compressed.pop();
+        assert!(decompress_field(&compressed).is_err());
     }
 }

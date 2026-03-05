@@ -1,7 +1,7 @@
 use itertools::Itertools;
 
 use crate::ram::io::align_ptr_addr;
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{Field, FieldCompression, Schema};
 use crate::ram::types;
 use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
 
@@ -116,17 +116,24 @@ fn read_field<'v>(
     ) {
         // Case 1: Simple typed fields (primitives) - direct read
         (_, false, _, None) => {
-            let val = types::get_shared_val(field.data_type, base_ptr + target_offset);
-            let size = if field_var_base_ty {
-                types::get_rsize(field.data_type, &val) // Calculate size for variable-sized types
+            let compressed = matches!(field.compression, Some(FieldCompression::Lz4))
+                && (field.data_type == Type::String || field.data_type == Type::Bytes);
+            let read_type = if compressed {
+                Type::Bytes
             } else {
-                types::size_of_type(field.data_type) // Use fixed size for fixed types
+                field.data_type
+            };
+            let val = types::get_shared_val(read_type, base_ptr + target_offset);
+            let size = if field_var_base_ty {
+                types::get_rsize(read_type, &val) // Calculate size for variable-sized types
+            } else {
+                types::size_of_type(read_type) // Use fixed size for fixed types
             };
             trace!(
                 "Reading schema field {} shared value {:?}, type {:?}, size {}, offset {}, base {}",
                 field.name,
                 val,
-                field.data_type,
+                read_type,
                 size,
                 target_offset,
                 base_ptr
