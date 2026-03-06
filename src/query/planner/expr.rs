@@ -25,15 +25,23 @@ pub(crate) enum IndexedClausePlan {
 
 pub(crate) struct IndexedPredicatePlan {
     candidates: Vec<IndexedClausePlan>,
+    disjunction: bool,
 }
 
 impl IndexedPredicatePlan {
-    pub(crate) fn new(candidates: Vec<IndexedClausePlan>) -> Self {
-        Self { candidates }
+    pub(crate) fn new(candidates: Vec<IndexedClausePlan>, disjunction: bool) -> Self {
+        Self {
+            candidates,
+            disjunction,
+        }
     }
 
     pub(crate) fn all(&self) -> &[IndexedClausePlan] {
         self.candidates.as_slice()
+    }
+
+    pub(crate) fn is_disjunction(&self) -> bool {
+        self.disjunction
     }
 }
 
@@ -41,12 +49,27 @@ pub(crate) fn build_indexed_predicate_plan(
     schema: &Schema,
     selection: &Expr,
 ) -> Option<IndexedPredicatePlan> {
-    let mut candidates = indexed_clause_candidates(schema, selection);
+    let mut candidates;
+    let disjunction;
+    if let Some(disjuncts) = selection_disjuncts(selection) {
+        let mut disj_candidates = Vec::with_capacity(disjuncts.len());
+        for disjunct in disjuncts {
+            let Some(candidate) = indexed_clause_candidate(schema, disjunct) else {
+                return None;
+            };
+            disj_candidates.push(candidate);
+        }
+        candidates = disj_candidates;
+        disjunction = true;
+    } else {
+        candidates = indexed_clause_candidates(schema, selection);
+        disjunction = false;
+    }
     if candidates.is_empty() {
         return None;
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(clause_priority(candidate)));
-    Some(IndexedPredicatePlan::new(candidates))
+    Some(IndexedPredicatePlan::new(candidates, disjunction))
 }
 
 fn clause_priority(candidate: &IndexedClausePlan) -> u8 {
@@ -88,6 +111,18 @@ fn selection_conjuncts(selection: &Expr) -> Vec<&Expr> {
         }
     }
     vec![selection]
+}
+
+fn selection_disjuncts(selection: &Expr) -> Option<Vec<&Expr>> {
+    if let Expr::List(exprs) = selection {
+        if exprs.is_empty() {
+            return None;
+        }
+        if is_symbol_named(&exprs[0], "or") {
+            return Some(exprs.iter().skip(1).collect());
+        }
+    }
+    None
 }
 
 fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedClausePlan> {

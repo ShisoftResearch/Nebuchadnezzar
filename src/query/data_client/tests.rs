@@ -1563,6 +1563,125 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_ids_supports_indexed_or_union() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6722).await;
+    let server_addr = String::from("127.0.0.1:6722");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_unindexed(DATA_2, Type::U32),
+    ]);
+    let schema_id = 218;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_ids_or_union_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=12u64 {
+        let id = Id::new(12, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 3);
+        value[DATA_2] = OwnedValue::U32(i as u32);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
+        .clone();
+    let mut cursor = idx_data_client
+        .scan_by_expr_ids(schema_id, selection, Ordering::Backward)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    let expected = vec![
+        Id::new(12, 11),
+        Id::new(12, 10),
+        Id::new(12, 8),
+        Id::new(12, 7),
+        Id::new(12, 5),
+        Id::new(12, 4),
+        Id::new(12, 2),
+        Id::new(12, 1),
+    ];
+    assert_eq!(ids, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6723).await;
+    let server_addr = String::from("127.0.0.1:6723");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_unindexed(DATA_2, Type::U32),
+    ]);
+    let schema_id = 219;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_or_non_indexed_branch_schema",
+        None,
+        fields,
+        false,
+        true,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=10u64 {
+        let id = Id::new(13, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 4);
+        value[DATA_2] = OwnedValue::U32((i % 5) as u32);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_2 3u32))").unwrap()[0]
+        .clone();
+    let mut cursor = idx_data_client
+        .scan_by_expr_ids(schema_id, selection, Ordering::Forward)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(
+        ids,
+        vec![
+            Id::new(13, 1),
+            Id::new(13, 3),
+            Id::new(13, 5),
+            Id::new(13, 8),
+            Id::new(13, 9),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn scan_by_expr_ranged_clause_with_no_hits_returns_empty() {
     const DATA_1: &str = "DATA_1";
     let _ = env_logger::try_init();

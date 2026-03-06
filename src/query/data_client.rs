@@ -26,7 +26,7 @@ use crate::{
 mod cursor;
 mod ids;
 
-use ids::{clause_execution_order, intersect_ids_ordered, sort_ids_by_ordering};
+use ids::{clause_execution_order, intersect_ids_ordered, sort_ids_by_ordering, union_ids_ordered};
 pub use cursor::{DataCursor, IdCursor};
 
 pub use crate::query::planner::{ValueRange, ValueRangeTerm};
@@ -148,15 +148,9 @@ impl IndexedDataClient {
     ) -> Result<IdCursor, RPCError> {
         let plan = self.indexed_predicate_plan(schema, &selection).await;
         let candidate_ids = if let Some(plan) = plan {
-            let ordered_candidates = clause_execution_order(plan.all());
-            let mut candidates = ordered_candidates.iter().copied();
-            if let Some(first) = candidates.next() {
-                let mut candidate_ids = match self.execute_clause_ids(schema, first, ordering).await {
-                    Ok(ids) => ids,
-                    Err(_) => self.scan_schema_ids(schema, ordering).await?,
-                };
-
-                for candidate in candidates {
+            if plan.is_disjunction() {
+                let mut candidate_ids = vec![];
+                for candidate in plan.all() {
                     let ids = match self.execute_clause_ids(schema, candidate, ordering).await {
                         Ok(ids) => ids,
                         Err(_) => {
@@ -164,21 +158,44 @@ impl IndexedDataClient {
                             break;
                         }
                     };
-                    candidate_ids = intersect_ids_ordered(candidate_ids, &ids);
-                    if candidate_ids.is_empty() {
-                        break;
-                    }
+                    candidate_ids = union_ids_ordered(candidate_ids, &ids);
                 }
-
-                if !ordered_candidates
-                    .iter()
-                    .any(|candidate| matches!(candidate, IndexedClausePlan::Ranged { .. }))
-                {
-                    sort_ids_by_ordering(&mut candidate_ids, ordering);
-                }
+                sort_ids_by_ordering(&mut candidate_ids, ordering);
                 candidate_ids
             } else {
-                self.scan_schema_ids(schema, ordering).await?
+                let ordered_candidates = clause_execution_order(plan.all());
+                let mut candidates = ordered_candidates.iter().copied();
+                if let Some(first) = candidates.next() {
+                    let mut candidate_ids =
+                        match self.execute_clause_ids(schema, first, ordering).await {
+                            Ok(ids) => ids,
+                            Err(_) => self.scan_schema_ids(schema, ordering).await?,
+                        };
+
+                    for candidate in candidates {
+                        let ids = match self.execute_clause_ids(schema, candidate, ordering).await {
+                            Ok(ids) => ids,
+                            Err(_) => {
+                                candidate_ids = self.scan_schema_ids(schema, ordering).await?;
+                                break;
+                            }
+                        };
+                        candidate_ids = intersect_ids_ordered(candidate_ids, &ids);
+                        if candidate_ids.is_empty() {
+                            break;
+                        }
+                    }
+
+                    if !ordered_candidates
+                        .iter()
+                        .any(|candidate| matches!(candidate, IndexedClausePlan::Ranged { .. }))
+                    {
+                        sort_ids_by_ordering(&mut candidate_ids, ordering);
+                    }
+                    candidate_ids
+                } else {
+                    self.scan_schema_ids(schema, ordering).await?
+                }
             }
         } else {
             self.scan_schema_ids(schema, ordering).await?
