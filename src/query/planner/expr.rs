@@ -1,7 +1,10 @@
 use bifrost_hasher::hash_str;
 use dovahkiin::{expr::serde::Expr, types::OwnedValue};
 
-use crate::ram::schema::{IndexType, Schema};
+use crate::{
+    query::cost::planner::indexed_clause_priority,
+    ram::schema::{IndexType, Schema},
+};
 
 use super::{ValueRange, ValueRangeTerm};
 
@@ -15,32 +18,60 @@ enum ClauseOp {
 }
 
 #[derive(Clone)]
-pub(super) enum IndexedClausePlan {
+pub(crate) enum IndexedClausePlan {
     HashedEq { field_id: u64, value: OwnedValue },
     Ranged { field_id: u64, range: ValueRange },
 }
 
-pub(super) struct IndexedPredicatePlan {
+pub(crate) struct IndexedPredicatePlan {
     candidates: Vec<IndexedClausePlan>,
 }
 
 impl IndexedPredicatePlan {
-    pub(super) fn new(candidates: Vec<IndexedClausePlan>) -> Self {
+    pub(crate) fn new(candidates: Vec<IndexedClausePlan>) -> Self {
         Self { candidates }
     }
 
-    pub(super) fn chosen(&self) -> Option<&IndexedClausePlan> {
-        self.candidates
-            .iter()
-            .find(|candidate| matches!(candidate, IndexedClausePlan::HashedEq { .. }))
-            .or_else(|| self.candidates.first())
+    pub(crate) fn all(&self) -> &[IndexedClausePlan] {
+        self.candidates.as_slice()
     }
 }
 
-pub(super) fn indexed_clause_candidates(
+pub(crate) fn build_indexed_predicate_plan(
     schema: &Schema,
     selection: &Expr,
-) -> Vec<IndexedClausePlan> {
+) -> Option<IndexedPredicatePlan> {
+    let mut candidates = indexed_clause_candidates(schema, selection);
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(clause_priority(candidate)));
+    Some(IndexedPredicatePlan::new(candidates))
+}
+
+fn clause_priority(candidate: &IndexedClausePlan) -> u8 {
+    match candidate {
+        IndexedClausePlan::HashedEq { .. } => {
+            indexed_clause_priority(true, false, true, false, false)
+        }
+        IndexedClausePlan::Ranged { range, .. } => indexed_clause_priority(
+            false,
+            true,
+            is_range_equality(range),
+            matches!(range.start, ValueRangeTerm::Open),
+            matches!(range.end, ValueRangeTerm::Open),
+        ),
+    }
+}
+
+fn is_range_equality(range: &ValueRange) -> bool {
+    match (&range.start, &range.end) {
+        (ValueRangeTerm::Inclusive(s), ValueRangeTerm::Inclusive(e)) => s == e,
+        _ => false,
+    }
+}
+
+fn indexed_clause_candidates(schema: &Schema, selection: &Expr) -> Vec<IndexedClausePlan> {
     selection_conjuncts(selection)
         .iter()
         .filter_map(|clause| indexed_clause_candidate(schema, clause))
@@ -62,10 +93,15 @@ fn selection_conjuncts(selection: &Expr) -> Vec<&Expr> {
 fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedClausePlan> {
     let (op, field_id, value) = comparison_clause(clause)?;
     let indices = schema.index_fields.get(&field_id)?;
-    if matches!(op, ClauseOp::Eq) && indices.iter().any(|idx| matches!(idx, IndexType::Hashed)) {
+
+    let supports_hashed = indices.iter().any(|idx| matches!(idx, IndexType::Hashed));
+    let supports_ranged = indices.iter().any(|idx| matches!(idx, IndexType::Ranged));
+
+    if supports_hashed && matches!(op, ClauseOp::Eq) {
         return Some(IndexedClausePlan::HashedEq { field_id, value });
     }
-    if indices.iter().any(|idx| matches!(idx, IndexType::Ranged)) {
+
+    if supports_ranged {
         let range = match op {
             ClauseOp::Eq => ValueRange {
                 start: ValueRangeTerm::Inclusive(value.shared().feature()),
@@ -90,6 +126,7 @@ fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedCla
         };
         return Some(IndexedClausePlan::Ranged { field_id, range });
     }
+
     None
 }
 
@@ -100,15 +137,18 @@ fn comparison_clause(clause: &Expr) -> Option<(ClauseOp, u64, OwnedValue)> {
     if items.len() != 3 {
         return None;
     }
+
     let mut op = parse_clause_op(&items[0])?;
 
     if let (Some(field_id), Some(value)) = (expr_field_id(&items[1]), expr_owned_value(&items[2])) {
         return Some((op, field_id, value));
     }
+
     if let (Some(value), Some(field_id)) = (expr_owned_value(&items[1]), expr_field_id(&items[2])) {
         op = reverse_op(op);
         return Some((op, field_id, value));
     }
+
     None
 }
 

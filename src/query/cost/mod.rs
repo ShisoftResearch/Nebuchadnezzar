@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use crate::server::NebServer;
 
-use super::{data_client::ValueRange, statistics::SchemaStatistics};
+use super::{planner::ValueRange, statistics::SchemaStatistics};
 
+pub mod planner;
 pub mod range_index;
 pub mod scan;
 
