@@ -8,13 +8,13 @@ use crate::index::{
 };
 use dovahkiin::types::{Id, SharedValue};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ValueRange {
     pub start: ValueRangeTerm,
     pub end: ValueRangeTerm,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ValueRangeTerm {
     Inclusive(Feature),
     Exclusive(Feature),

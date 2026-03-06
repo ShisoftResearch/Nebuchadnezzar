@@ -19,7 +19,9 @@ use crate::{
         },
         EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
-    query::planner::{build_indexed_predicate_plan, IndexedClausePlan, IndexedPredicatePlan},
+    query::planner::{
+        build_indexed_predicate_plan, IndexedClausePlan, IndexedPredicatePlan, QueryPlanExplain,
+    },
     ram::cell::{OwnedCell, ReadError},
     ram::schema::IndexType,
 };
@@ -153,6 +155,18 @@ impl IndexedDataClient {
         })
     }
 
+    pub async fn scan_by_expr_plan(
+        &self,
+        schema: u32,
+        selection: Expr,
+        order_by_field: Option<u64>,
+        limit: Option<usize>,
+    ) -> Option<QueryPlanExplain> {
+        self.indexed_predicate_plan(schema, &selection, order_by_field, limit)
+            .await
+            .map(IndexedPredicatePlan::into_explain)
+    }
+
     pub async fn scan_by_expr_ids<'a>(
         &'a self,
         schema: u32,
@@ -234,22 +248,16 @@ impl IndexedDataClient {
             self.scan_schema_ids(schema, ordering).await?
         };
 
-        let selected_cells = self
-            .read_cells_from_ids(
-                &candidate_ids,
-                &vec![],
-                &selection,
-                &Expr::nothing(),
-            )
+        let ordered_candidate_ids = if let Some(field_id) = order_by_field {
+            self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering)
+                .await?
+        } else {
+            candidate_ids
+        };
+
+        let mut selected_ids = self
+            .filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, limit)
             .await;
-        let mut selected_ids = selected_cells.into_iter().map(|cell| cell.id()).collect_vec();
-
-        if let Some(field_id) = order_by_field {
-            selected_ids = self
-                .reorder_ids_by_field(schema, field_id, &selected_ids, ordering)
-                .await?;
-        }
-
         if let Some(limit) = limit {
             selected_ids.truncate(limit);
         }
@@ -303,6 +311,38 @@ impl IndexedDataClient {
             }
         }
         Ok(ids)
+    }
+
+    async fn filter_ids_by_selection_limit(
+        &self,
+        candidate_ids: &[Id],
+        selection: &Expr,
+        limit: Option<usize>,
+    ) -> Vec<Id> {
+        let empty_projection: Vec<u64> = vec![];
+        let Some(limit) = limit else {
+            let selected_cells = self
+                .read_cells_from_ids(candidate_ids, &empty_projection, selection, &Expr::nothing())
+                .await;
+            return selected_cells.into_iter().map(|cell| cell.id()).collect_vec();
+        };
+        if limit == 0 || candidate_ids.is_empty() {
+            return vec![];
+        }
+
+        let mut selected_ids = Vec::with_capacity(limit);
+        let batch = usize::from(SCAN_BUFFER_SIZE.max(1));
+        for chunk in candidate_ids.chunks(batch) {
+            let selected_cells = self
+                .read_cells_from_ids(chunk, &empty_projection, selection, &Expr::nothing())
+                .await;
+            selected_ids.extend(selected_cells.into_iter().map(|cell| cell.id()));
+            if selected_ids.len() >= limit {
+                selected_ids.truncate(limit);
+                break;
+            }
+        }
+        selected_ids
     }
 
     async fn new_cursor<'a>(

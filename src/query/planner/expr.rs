@@ -25,7 +25,7 @@ enum ClauseOp {
     Le,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum IndexedClausePlan {
     HashedEq { field_id: u64, value: OwnedValue },
     Ranged { field_id: u64, range: ValueRange },
@@ -38,12 +38,54 @@ pub(crate) struct IndexedPredicatePlan {
     explain: Vec<ClauseOrderExplain>,
 }
 
-#[derive(Clone)]
-pub(crate) struct ClauseOrderExplain {
-    pub clause: IndexedClausePlan,
-    pub estimated_rows: Option<usize>,
-    pub total_cost: Option<f64>,
-    pub reason: &'static str,
+#[derive(Clone, Debug)]
+pub struct ClauseOrderExplain {
+    clause: IndexedClausePlan,
+    estimated_rows: Option<usize>,
+    total_cost: Option<f64>,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub struct QueryPlanExplain {
+    disjunction: bool,
+    impossible: bool,
+    clauses: Vec<ClauseOrderExplain>,
+}
+
+impl ClauseOrderExplain {
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    pub fn estimated_rows(&self) -> Option<usize> {
+        self.estimated_rows
+    }
+
+    pub fn total_cost(&self) -> Option<f64> {
+        self.total_cost
+    }
+
+    pub fn clause_kind(&self) -> &'static str {
+        match self.clause {
+            IndexedClausePlan::HashedEq { .. } => "hashed_eq",
+            IndexedClausePlan::Ranged { .. } => "ranged",
+        }
+    }
+}
+
+impl QueryPlanExplain {
+    pub fn disjunction(&self) -> bool {
+        self.disjunction
+    }
+
+    pub fn impossible(&self) -> bool {
+        self.impossible
+    }
+
+    pub fn clauses(&self) -> &[ClauseOrderExplain] {
+        self.clauses.as_slice()
+    }
 }
 
 impl IndexedPredicatePlan {
@@ -75,6 +117,14 @@ impl IndexedPredicatePlan {
 
     pub(crate) fn explain(&self) -> &[ClauseOrderExplain] {
         self.explain.as_slice()
+    }
+
+    pub(crate) fn into_explain(self) -> QueryPlanExplain {
+        QueryPlanExplain {
+            disjunction: self.disjunction,
+            impossible: self.impossible,
+            clauses: self.explain,
+        }
     }
 }
 
@@ -640,7 +690,7 @@ mod tests {
             _ => panic!("expected hashed clause"),
         }
         assert_eq!(plan.explain().len(), 2);
-        assert_eq!(plan.explain()[0].reason, "cost-model");
+        assert_eq!(plan.explain()[0].reason(), "cost-model");
     }
 
     #[test]
@@ -693,7 +743,7 @@ mod tests {
             IndexedClausePlan::Ranged { field_id, .. } => assert_eq!(*field_id, range_field_id),
             _ => panic!("expected ranged clause first"),
         }
-        assert_eq!(plan.explain()[0].reason, "cost-model-limit-order");
+        assert_eq!(plan.explain()[0].reason(), "cost-model-limit-order");
     }
 
     fn eq_expr(field: &str, value: u64) -> Expr {

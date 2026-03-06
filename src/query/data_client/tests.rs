@@ -1626,6 +1626,62 @@ async fn scan_by_expr_with_options_rejects_non_indexed_order_by_field() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_plan_exposes_optimizer_trace() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6732).await;
+    let server_addr = String::from("127.0.0.1:6732");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_indexed(DATA_2, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 228;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_plan_trace_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=8u64 {
+        let id = Id::new(22, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 2);
+        value[DATA_2] = OwnedValue::U64(i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(and (= DATA_1 1u64) (>= DATA_2 3u64))").unwrap()[0]
+        .clone();
+    let explain = idx_data_client
+        .scan_by_expr_plan(
+            schema_id,
+            selection,
+            Some(hash_str(DATA_2)),
+            Some(2),
+        )
+        .await
+        .expect("expected indexed plan");
+
+    assert!(!explain.impossible());
+    assert!(!explain.clauses().is_empty());
+    assert!(
+        explain.clauses()[0].reason() == "cost-model-limit-order"
+            || explain.clauses()[0].reason() == "cost-model"
+            || explain.clauses()[0].reason() == "heuristic"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn scan_by_expr_detects_contradictory_hashed_predicates() {
     const DATA_1: &str = "DATA_1";
     let _ = env_logger::try_init();
