@@ -431,11 +431,7 @@ impl SchemaCompressionPlan {
         Self { fields }
     }
 
-    fn collect(
-        field: &Field,
-        path: &mut CompressedFieldPath,
-        out: &mut CompressedFieldPlans,
-    ) {
+    fn collect(field: &Field, path: &mut CompressedFieldPath, out: &mut CompressedFieldPlans) {
         if let Some(sub_fields) = &field.sub_fields {
             for sub in sub_fields {
                 path.push(sub.name_id);

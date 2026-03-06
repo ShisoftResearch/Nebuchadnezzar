@@ -417,7 +417,9 @@ fn test_metrics_and_churn_counters() {
     let chunk = &chunks.list[0];
 
     // Evict a segment to mark last_evicted_ms and increment eviction count
-    let evicted = manager.explicit_evict(chunk, 1).expect("eviction to succeed");
+    let evicted = manager
+        .explicit_evict(chunk, 1)
+        .expect("eviction to succeed");
     assert!(evicted > 0, "Should evict at least one segment");
 
     let cold_seg = chunk
@@ -429,7 +431,7 @@ fn test_metrics_and_churn_counters() {
     manager
         .promote(chunk, &cold_seg)
         .expect("first access should succeed");
-    
+
     manager
         .promote(chunk, &cold_seg)
         .expect("second access should trigger promotion");
@@ -437,7 +439,10 @@ fn test_metrics_and_churn_counters() {
     let stats = manager.stats(chunk);
     assert!(stats.evictions > 0, "Eviction counter should increase");
     assert!(stats.promotions > 0, "Promotion counter should increase");
-    assert!(stats.churns > 0, "Churn counter should detect evict→promote");
+    assert!(
+        stats.churns > 0,
+        "Churn counter should detect evict→promote"
+    );
 
     // Cleanup
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
@@ -452,9 +457,9 @@ fn test_metrics_and_churn_counters() {
 
 #[test]
 fn test_multi_chance_clock_api() {
+    use crate::ram::file_manager::SegmentFileManager;
     use crate::ram::segs::Segment;
     use std::sync::Arc;
-    use crate::ram::file_manager::SegmentFileManager;
 
     let file_manager = Arc::new(SegmentFileManager::new(None, None));
     let segment = Segment::new(1, 1, 0, 0x1000, true, file_manager);
