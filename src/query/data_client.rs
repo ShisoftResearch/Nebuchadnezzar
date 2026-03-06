@@ -3,7 +3,7 @@ use std::{mem, sync::Arc};
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
     expr::serde::Expr,
-    types::{Id, OwnedValue, SharedValue},
+    types::{Id, OwnedValue},
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
@@ -11,20 +11,22 @@ use itertools::Itertools;
 use crate::{
     client::{client_by_server_name, AsyncClient},
     index::{
-        entry::{MAX_FEATURE, MIN_FEATURE},
         full_text::BM25Hit,
         hash::get_hash_id_from_value,
         ranged::{
             client::cursor::ClientCursor,
-            tree::{
-                btree::Ordering,
-                service::{Range, RangeTerm},
-            },
+            tree::{btree::Ordering, service::Range},
         },
-        EntryKey, Feature, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
+        EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
     ram::cell::{OwnedCell, ReadError},
 };
+
+mod plan;
+mod range;
+
+use plan::{indexed_clause_candidates, IndexedClausePlan, IndexedPredicatePlan};
+pub use range::{ValueRange, ValueRangeTerm};
 
 const SCAN_BUFFER_SIZE: u16 = 64;
 
@@ -42,74 +44,6 @@ pub struct DataCursor {
     proc: Expr,
     client: IndexedDataClient,
     pos: usize,
-}
-
-pub struct ValueRange {
-    pub start: ValueRangeTerm,
-    pub end: ValueRangeTerm,
-}
-
-pub enum ValueRangeTerm {
-    Inclusive(Feature),
-    Exclusive(Feature),
-    Open,
-}
-
-impl ValueRange {
-    pub fn to_key_range(self, schema: u32, field: u64, ordering: Ordering) -> Range {
-        Range {
-            start: match self.start {
-                ValueRangeTerm::Inclusive(v) => {
-                    // Use unit_id() for inclusive start to ensure seek lands at or before the first matching entry
-                    RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema, field, &v))
-                }
-                ValueRangeTerm::Exclusive(v) => {
-                    // For exclusive, use max_id so we exclude all entries with this feature value
-                    RangeTerm::Exclusive(EntryKey::from_props(&Id::max_id(), &v, field, schema))
-                }
-                ValueRangeTerm::Open => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(
-                    schema,
-                    field,
-                    &MIN_FEATURE,
-                )),
-            },
-            end: match self.end {
-                ValueRangeTerm::Inclusive(v) => {
-                    RangeTerm::Inclusive(EntryKey::from_props(&Id::max_id(), &v, field, schema))
-                }
-                ValueRangeTerm::Exclusive(v) => {
-                    RangeTerm::Exclusive(EntryKey::for_schema_field_feature(schema, field, &v))
-                }
-                ValueRangeTerm::Open => RangeTerm::Inclusive(EntryKey::from_props(
-                    &Id::max_id(),
-                    &MAX_FEATURE,
-                    field,
-                    schema,
-                )),
-            },
-            ordering,
-        }
-    }
-}
-
-impl ValueRangeTerm {
-    pub fn inclusive_from(val: &SharedValue) -> Self {
-        Self::Inclusive(val.feature())
-    }
-    pub fn exclusive_from(val: &SharedValue) -> Self {
-        Self::Exclusive(val.feature())
-    }
-    pub fn open() -> Self {
-        Self::Open
-    }
-    pub fn pos_of(&self, slice: &[Feature]) -> Option<usize> {
-        match self {
-            &ValueRangeTerm::Inclusive(x) | &ValueRangeTerm::Exclusive(x) => {
-                Some(slice.binary_search(&x).unwrap_or_else(|p| p))
-            }
-            _ => None,
-        }
-    }
 }
 
 impl IndexedDataClient {
@@ -167,6 +101,71 @@ impl IndexedDataClient {
         proc: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
+        self.scan_by_expr(schema, projection, selection, proc, ordering)
+            .await
+    }
+
+    pub async fn scan_by_expr<'a>(
+        &'a self,
+        schema: u32,
+        projection: Vec<u64>,
+        selection: Expr,
+        proc: Expr,
+        ordering: Ordering,
+    ) -> Result<DataCursor, RPCError> {
+        let plan = self.indexed_predicate_plan(schema, &selection).await;
+        if let Some(chosen) = plan.as_ref().and_then(IndexedPredicatePlan::chosen) {
+            match chosen {
+                IndexedClausePlan::Ranged { field_id, range } => {
+                    return self
+                        .range_index_scan(
+                            schema,
+                            *field_id,
+                            range.clone(),
+                            projection,
+                            selection,
+                            proc,
+                            ordering,
+                        )
+                        .await;
+                }
+                IndexedClausePlan::HashedEq { field_id, value } => {
+                    let ids = match self.hashed_query(schema, *field_id, value).await {
+                        Ok(Ok(ids)) => ids,
+                        _ => {
+                            return self
+                                .scan_schema_index(schema, projection, selection, proc, ordering)
+                                .await;
+                        }
+                    };
+                    let cells = self
+                        .read_cells_from_ids(&ids, &projection, &selection, &proc)
+                        .await;
+                    return Ok(DataCursor {
+                        index_cursor: None,
+                        buffer: cells,
+                        projection,
+                        selection: Expr::nothing(),
+                        proc: Expr::nothing(),
+                        client: self.clone(),
+                        pos: 0,
+                    });
+                }
+            }
+        }
+
+        self.scan_schema_index(schema, projection, selection, proc, ordering)
+            .await
+    }
+
+    async fn scan_schema_index<'a>(
+        &'a self,
+        schema: u32,
+        projection: Vec<u64>,
+        selection: Expr,
+        proc: Expr,
+        ordering: Ordering,
+    ) -> Result<DataCursor, RPCError> {
         let key = EntryKey::for_schema(schema);
         let index_cursor = self
             .index_clients
@@ -180,6 +179,7 @@ impl IndexedDataClient {
             .new_cursor(index_cursor, projection, selection, proc)
             .await)
     }
+
     async fn new_cursor<'a>(
         &'a self,
         index_cursor: Option<ClientCursor>,
@@ -198,6 +198,91 @@ impl IndexedDataClient {
         };
         cursor.refresh_batch().await;
         cursor
+    }
+
+    async fn indexed_predicate_plan(
+        &self,
+        schema_id: u32,
+        selection: &Expr,
+    ) -> Option<IndexedPredicatePlan> {
+        if selection.is_empty() {
+            return None;
+        }
+        let schema = self
+            .index_clients
+            .neb_client
+            .schema_by_id(schema_id)
+            .await
+            .ok()
+            .flatten()?;
+        let candidates = indexed_clause_candidates(&schema, selection);
+        if candidates.is_empty() {
+            None
+        } else {
+            Some(IndexedPredicatePlan::new(candidates))
+        }
+    }
+
+    async fn read_cells_from_ids(
+        &self,
+        ids: &[Id],
+        projection: &Vec<u64>,
+        selection: &Expr,
+        proc: &Expr,
+    ) -> Vec<OwnedCell> {
+        let mut all_cells = vec![];
+        let mut tasks = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| self.conshash.get_server_id_by(id).map(|sid| (i, sid, *id)))
+            .sorted_by_key(|(_i, sid, _id)| *sid)
+            .chunk_by(|(_i, sid, _id)| *sid)
+            .into_iter()
+            .map(|(sid, pairs)| {
+                let mut grouped_ids = vec![];
+                let mut idx = vec![];
+                for (i, _, id) in pairs {
+                    idx.push(i);
+                    grouped_ids.push(id);
+                }
+                let projection = projection.clone();
+                let selection = selection.clone();
+                let proc = proc.clone();
+                let server_name = self.conshash.to_server_name(sid);
+                async move {
+                    match client_by_server_name(sid, server_name).await {
+                        Ok(client) => {
+                            let read_res = client
+                                .read_all_cells_proced(&grouped_ids, &projection, &selection, &proc)
+                                .await
+                                .map(|cells| {
+                                    cells
+                                        .into_iter()
+                                        .zip(idx)
+                                        .filter_map(|(cell_res, original_idx)| {
+                                            cell_res.ok().map(|cell| (cell, original_idx))
+                                        })
+                                        .collect_vec()
+                                });
+                            match read_res {
+                                Ok(cells) => Ok(cells),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        while let Some(task_res) = tasks.next().await {
+            if let Ok(mut cells) = task_res {
+                all_cells.append(&mut cells);
+            }
+        }
+
+        all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
+        all_cells.into_iter().map(|(cell, _)| cell).collect_vec()
     }
 
     pub fn hashed_index_id(schema: u32, field: u64, value: &OwnedValue) -> Id {
@@ -1420,6 +1505,111 @@ mod test {
             cursor.next().await.unwrap().is_none(),
             "Should not have more items"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_all_auto_uses_ranged_clause_from_selection() {
+        const DATA_1: &str = "DATA_1";
+        const DATA_2: &str = "DATA_2";
+        let _ = env_logger::try_init();
+        let server = create_test_server(6711).await;
+        let server_addr = String::from("127.0.0.1:6711");
+
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
+        let schema_id = 207;
+        let schema =
+            Schema::new_with_id(schema_id, "ranged_expr_schema", None, fields, false, false);
+
+        let client = server.data_client(&vec![server_addr]).await.unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+        for i in 0..=100u64 {
+            let id = Id::new(1, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[DATA_1] = OwnedValue::U64(i);
+            value[DATA_2] = OwnedValue::U32((i * 2) as u32);
+            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+
+        let idx_data_client = server.indexed_data_client();
+        let selection =
+            parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 20u64) (= DATA_2 24u32))")
+                .unwrap()[0]
+                .clone();
+        let mut cursor = idx_data_client
+            .scan_all(
+                schema_id,
+                vec![],
+                selection,
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+
+        let cell = cursor
+            .next()
+            .await
+            .unwrap()
+            .expect("Expected one matching row");
+        assert_eq!(*cell[DATA_1].u64().unwrap(), 12);
+        assert_eq!(*cell[DATA_2].u32().unwrap(), 24);
+        assert!(cursor.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_all_auto_uses_hashed_equality_clause_from_selection() {
+        const DATA_1: &str = "DATA_1";
+        const DATA_2: &str = "DATA_2";
+        let _ = env_logger::try_init();
+        let server = create_test_server(6712).await;
+        let server_addr = String::from("127.0.0.1:6712");
+
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
+        let schema_id = 208;
+        let schema =
+            Schema::new_with_id(schema_id, "hashed_expr_schema", None, fields, false, false);
+
+        let client = server.data_client(&vec![server_addr]).await.unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+        for i in 0..100u64 {
+            let id = Id::new(2, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[DATA_1] = OwnedValue::U64(if i % 10 == 0 { 42 } else { i });
+            value[DATA_2] = OwnedValue::U32((i * 3) as u32);
+            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+
+        let idx_data_client = server.indexed_data_client();
+        let selection =
+            parse_to_serde_expr("(and (= DATA_1 42u64) (> DATA_2 80u32))").unwrap()[0].clone();
+        let mut cursor = idx_data_client
+            .scan_all(
+                schema_id,
+                vec![],
+                selection,
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+
+        let mut seen = vec![];
+        while let Some(cell) = cursor.next().await.unwrap() {
+            seen.push(*cell[DATA_2].u32().unwrap());
+            assert_eq!(*cell[DATA_1].u64().unwrap(), 42);
+            assert!(*cell[DATA_2].u32().unwrap() > 80);
+        }
+        assert!(!seen.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
