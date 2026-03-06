@@ -1213,7 +1213,7 @@ async fn scan_by_expr_supports_single_ranged_clause() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 95u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(
+        .query(
             schema_id,
             selection,
             Ordering::Forward,
@@ -1266,7 +1266,7 @@ async fn scan_by_expr_supports_reversed_comparison_operands() {
     let selection =
         parse_to_serde_expr("(and (< 10u64 DATA_1) (< DATA_1 15u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(
+        .query(
             schema_id,
             selection,
             Ordering::Forward,
@@ -1318,7 +1318,7 @@ async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(= DATA_2 24u32)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(
+        .query(
             schema_id,
             selection,
             Ordering::Forward,
@@ -1380,7 +1380,7 @@ async fn scan_by_expr_intersects_hashed_and_ranged_indexed_clauses() {
     .unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(
+        .query(
             schema_id,
             selection,
             Ordering::Forward,
@@ -1442,7 +1442,7 @@ async fn scan_by_expr_multi_index_intersection_can_be_empty() {
             .unwrap()[0]
             .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(
+        .query(
             schema_id,
             selection,
             Ordering::Forward,
@@ -1491,7 +1491,7 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
     let selection = parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(
+        .query(
             schema_id,
             selection,
             Ordering::Backward,
@@ -1794,7 +1794,7 @@ async fn scan_by_expr_detects_contradictory_hashed_predicates() {
     let selection = parse_to_serde_expr("(and (= DATA_1 0u64) (= DATA_1 1u64))").unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
     assert!(cursor.next().await.unwrap().is_none());
@@ -1837,7 +1837,7 @@ async fn scan_by_expr_detects_contradictory_ranged_predicates() {
     let selection = parse_to_serde_expr("(and (> DATA_1 8u64) (< DATA_1 2u64))").unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
     assert!(cursor.next().await.unwrap().is_none());
@@ -1881,7 +1881,7 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     let selection = parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr_ids(schema_id, selection, Ordering::Backward)
+        .query_ids(schema_id, selection, Ordering::Backward)
         .await
         .unwrap();
 
@@ -1936,7 +1936,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
         Expr::Value(OwnedValue::U64(1)),
     ]);
     let mut cursor = idx_data_client
-        .scan_by_expr_ids_with_options(
+        .query_ids_with_options(
             schema_id,
             selection,
             Ordering::Forward,
@@ -1994,7 +1994,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
         Expr::Value(OwnedValue::U64(1)),
     ]);
     let mut cursor = idx_data_client
-        .scan_by_expr_ids_with_options(
+        .query_ids_with_options(
             schema_id,
             selection,
             Ordering::Backward,
@@ -2052,7 +2052,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
         Expr::Value(OwnedValue::U64(1)),
     ]);
     let mut cursor = idx_data_client
-        .scan_by_expr_ids_with_options(
+        .query_ids_with_options(
             schema_id,
             selection,
             Ordering::Forward,
@@ -2106,7 +2106,7 @@ async fn scan_by_expr_ids_with_options_rejects_non_indexed_order_by_field() {
         Expr::Value(OwnedValue::U64(1)),
     ]);
     let err = idx_data_client
-        .scan_by_expr_ids_with_options(
+        .query_ids_with_options(
             schema_id,
             selection,
             Ordering::Forward,
@@ -2160,7 +2160,7 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr_ids(schema_id, selection, Ordering::Backward)
+        .query_ids(schema_id, selection, Ordering::Backward)
         .await
         .unwrap();
 
@@ -2220,7 +2220,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr_ids_with_options(schema_id, selection, Ordering::Backward, None, Some(3))
+        .query_ids_with_options(schema_id, selection, Ordering::Backward, None, Some(3))
         .await
         .unwrap();
 
@@ -2269,7 +2269,7 @@ async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_2 3u32))").unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .scan_by_expr_ids(schema_id, selection, Ordering::Forward)
+        .query_ids(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
 
@@ -2326,7 +2326,7 @@ async fn scan_by_expr_ranged_clause_with_no_hits_returns_empty() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 100u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .scan_by_expr(
+        .query(
             schema_id,
             selection,
             Ordering::Forward,
@@ -2700,7 +2700,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
 
     for _ in 0..2 {
         let mut c = idx_data_client
-            .scan_by_expr_ids_with_options(
+            .query_ids_with_options(
                 schema_id,
                 selection.clone(),
                 Ordering::Backward,
@@ -2720,7 +2720,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
     for _ in 0..runs {
         let t0 = Instant::now();
         let mut optimized = idx_data_client
-            .scan_by_expr_ids_with_options(
+            .query_ids_with_options(
                 schema_id,
                 selection.clone(),
                 Ordering::Backward,
@@ -2737,7 +2737,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
 
         let t1 = Instant::now();
         let mut baseline = idx_data_client
-            .scan_by_expr_ids(schema_id, selection.clone(), Ordering::Backward)
+            .query_ids(schema_id, selection.clone(), Ordering::Backward)
             .await
             .unwrap();
         let mut baseline_count = 0usize;
@@ -2819,7 +2819,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
 
     for _ in 0..2 {
         let mut c = idx_data_client
-            .scan_by_expr_ids_with_options(
+            .query_ids_with_options(
                 schema_id,
                 selection.clone(),
                 Ordering::Backward,
@@ -2838,7 +2838,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
     for _ in 0..runs {
         let t0 = Instant::now();
         let mut optimized = idx_data_client
-            .scan_by_expr_ids_with_options(
+            .query_ids_with_options(
                 schema_id,
                 selection.clone(),
                 Ordering::Backward,
@@ -2855,7 +2855,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
 
         let t1 = Instant::now();
         let mut baseline = idx_data_client
-            .scan_by_expr_ids(schema_id, selection.clone(), Ordering::Backward)
+            .query_ids(schema_id, selection.clone(), Ordering::Backward)
             .await
             .unwrap();
         let mut baseline_count = 0usize;

@@ -97,7 +97,7 @@ impl IndexedDataClient {
         proc: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        let mut id_cursor = self.scan_by_expr_ids(schema, selection, ordering).await?;
+        let mut id_cursor = self.query_ids(schema, selection, ordering).await?;
         let mut ids = vec![];
         while let Some(id) = id_cursor.next().await? {
             ids.push(id);
@@ -116,17 +116,17 @@ impl IndexedDataClient {
         })
     }
 
-    pub async fn scan_by_expr<'a>(
+    pub async fn query<'a>(
         &'a self,
         schema: u32,
         selection: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        self.scan_by_expr_with_options(schema, selection, ordering, None, None)
+        self.query_with_options(schema, selection, ordering, None, None)
             .await
     }
 
-    pub async fn scan_by_expr_with_options<'a>(
+    pub async fn query_with_options<'a>(
         &'a self,
         schema: u32,
         selection: Expr,
@@ -135,7 +135,7 @@ impl IndexedDataClient {
         limit: Option<usize>,
     ) -> Result<DataCursor, RPCError> {
         let mut id_cursor = self
-            .scan_by_expr_ids_with_options(schema, selection.clone(), ordering, order_by_field, limit)
+            .query_ids_with_options(schema, selection.clone(), ordering, order_by_field, limit)
             .await?;
         let mut ids = vec![];
         while let Some(id) = id_cursor.next().await? {
@@ -155,6 +155,27 @@ impl IndexedDataClient {
         })
     }
 
+    pub async fn scan_by_expr<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: Ordering,
+    ) -> Result<DataCursor, RPCError> {
+        self.query(schema, selection, ordering).await
+    }
+
+    pub async fn scan_by_expr_with_options<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: Ordering,
+        order_by_field: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<DataCursor, RPCError> {
+        self.query_with_options(schema, selection, ordering, order_by_field, limit)
+            .await
+    }
+
     pub async fn scan_by_expr_plan(
         &self,
         schema: u32,
@@ -167,17 +188,17 @@ impl IndexedDataClient {
             .map(IndexedPredicatePlan::into_explain)
     }
 
-    pub async fn scan_by_expr_ids<'a>(
+    pub async fn query_ids<'a>(
         &'a self,
         schema: u32,
         selection: Expr,
         ordering: Ordering,
     ) -> Result<IdCursor, RPCError> {
-        self.scan_by_expr_ids_with_options(schema, selection, ordering, None, None)
+        self.query_ids_with_options(schema, selection, ordering, None, None)
             .await
     }
 
-    pub async fn scan_by_expr_ids_with_options<'a>(
+    pub async fn query_ids_with_options<'a>(
         &'a self,
         schema: u32,
         selection: Expr,
@@ -272,6 +293,27 @@ impl IndexedDataClient {
             buffer: selected_ids,
             pos: 0,
         })
+    }
+
+    pub async fn scan_by_expr_ids<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: Ordering,
+    ) -> Result<IdCursor, RPCError> {
+        self.query_ids(schema, selection, ordering).await
+    }
+
+    pub async fn scan_by_expr_ids_with_options<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: Ordering,
+        order_by_field: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<IdCursor, RPCError> {
+        self.query_ids_with_options(schema, selection, ordering, order_by_field, limit)
+            .await
     }
 
     async fn scan_schema_index<'a>(
