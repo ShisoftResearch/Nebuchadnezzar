@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, io, sync::Arc};
 
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
@@ -21,6 +21,7 @@ use crate::{
     },
     query::planner::{build_indexed_predicate_plan, IndexedClausePlan, IndexedPredicatePlan},
     ram::cell::{OwnedCell, ReadError},
+    ram::schema::IndexType,
 };
 
 mod cursor;
@@ -146,6 +147,22 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: Ordering,
     ) -> Result<IdCursor, RPCError> {
+        self.scan_by_expr_ids_with_options(schema, selection, ordering, None, None)
+            .await
+    }
+
+    pub async fn scan_by_expr_ids_with_options<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: Ordering,
+        order_by_field: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<IdCursor, RPCError> {
+        if let Some(field_id) = order_by_field {
+            self.ensure_orderable_field(schema, field_id).await?;
+        }
+
         let plan = self.indexed_predicate_plan(schema, &selection).await;
         let candidate_ids = if let Some(plan) = plan {
             if plan.is_disjunction() {
@@ -209,7 +226,18 @@ impl IndexedDataClient {
                 &Expr::nothing(),
             )
             .await;
-        let selected_ids = selected_cells.into_iter().map(|cell| cell.id()).collect_vec();
+        let mut selected_ids = selected_cells.into_iter().map(|cell| cell.id()).collect_vec();
+
+        if let Some(field_id) = order_by_field {
+            selected_ids = self
+                .reorder_ids_by_field(schema, field_id, &selected_ids, ordering)
+                .await?;
+        }
+
+        if let Some(limit) = limit {
+            selected_ids.truncate(limit);
+        }
+
         Ok(IdCursor {
             buffer: selected_ids,
             pos: 0,
@@ -297,6 +325,59 @@ impl IndexedDataClient {
             .ok()
             .flatten()?;
         build_indexed_predicate_plan(&schema, selection)
+    }
+
+    async fn ensure_orderable_field(&self, schema_id: u32, field_id: u64) -> Result<(), RPCError> {
+        let schema = self
+            .index_clients
+            .neb_client
+            .schema_by_id(schema_id)
+            .await
+            .map_err(|e| RPCError::IOError(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+            .ok_or_else(|| {
+                RPCError::IOError(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("schema {schema_id} not found"),
+                ))
+            })?;
+
+        let orderable = schema
+            .index_fields
+            .get(&field_id)
+            .map(|indices| indices.iter().any(|idx| matches!(idx, IndexType::Ranged)))
+            .unwrap_or(false);
+        if !orderable {
+            return Err(RPCError::IOError(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ORDER BY field {field_id} requires ranged index"),
+            )));
+        }
+        Ok(())
+    }
+
+    async fn reorder_ids_by_field(
+        &self,
+        schema: u32,
+        field_id: u64,
+        ids: &[Id],
+        ordering: Ordering,
+    ) -> Result<Vec<Id>, RPCError> {
+        let ordered_scan_ids = self
+            .range_query_ids(
+                schema,
+                field_id,
+                &ValueRange {
+                    start: ValueRangeTerm::Open,
+                    end: ValueRangeTerm::Open,
+                },
+                ordering,
+            )
+            .await?;
+        let selected: HashSet<Id> = ids.iter().copied().collect();
+        Ok(ordered_scan_ids
+            .into_iter()
+            .filter(|id| selected.contains(id))
+            .collect())
     }
 
     async fn execute_clause_ids(
