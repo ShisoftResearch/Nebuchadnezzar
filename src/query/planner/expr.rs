@@ -42,6 +42,7 @@ pub(crate) struct IndexedPredicatePlan {
 pub struct ClauseOrderExplain {
     clause: IndexedClausePlan,
     estimated_rows: Option<usize>,
+    effective_rows: Option<usize>,
     total_cost: Option<f64>,
     reason: &'static str,
 }
@@ -64,6 +65,10 @@ impl ClauseOrderExplain {
 
     pub fn total_cost(&self) -> Option<f64> {
         self.total_cost
+    }
+
+    pub fn effective_rows(&self) -> Option<usize> {
+        self.effective_rows
     }
 
     pub fn clause_kind(&self) -> &'static str {
@@ -128,6 +133,14 @@ impl IndexedPredicatePlan {
     }
 }
 
+type ScoredClause = (
+    IndexedClausePlan,
+    Option<usize>,
+    Option<usize>,
+    Option<PlanCost>,
+    &'static str,
+);
+
 pub(crate) fn build_indexed_predicate_plan(
     schema: &Schema,
     selection: &Expr,
@@ -135,25 +148,20 @@ pub(crate) fn build_indexed_predicate_plan(
     order_by_field: Option<u64>,
     limit: Option<usize>,
 ) -> Option<IndexedPredicatePlan> {
-    let mut candidates;
-    let disjunction;
-    let mut impossible = false;
-    if let Some(disjuncts) = selection_disjuncts(selection) {
-        let mut disj_candidates = Vec::with_capacity(disjuncts.len());
-        for disjunct in disjuncts {
-            let Some(candidate) = indexed_clause_candidate(schema, disjunct) else {
-                return None;
-            };
-            disj_candidates.push(candidate);
-        }
-        candidates = disj_candidates;
-        disjunction = true;
-    } else {
-        let normalized = normalized_indexed_candidates(schema, selection);
-        candidates = normalized.candidates;
-        impossible = normalized.impossible;
-        disjunction = false;
-    }
+    let (candidates, disjunction, impossible) =
+        if let Some(disjuncts) = selection_disjuncts(selection) {
+            let mut disj_candidates = Vec::with_capacity(disjuncts.len());
+            for disjunct in disjuncts {
+                let Some(candidate) = indexed_clause_candidate(schema, disjunct) else {
+                    return None;
+                };
+                disj_candidates.push(candidate);
+            }
+            (disj_candidates, true, false)
+        } else {
+            let normalized = normalized_indexed_candidates(schema, selection);
+            (normalized.candidates, false, normalized.impossible)
+        };
     if candidates.is_empty() && !impossible {
         return None;
     }
@@ -161,16 +169,19 @@ pub(crate) fn build_indexed_predicate_plan(
 
     let explain = scored
         .iter()
-        .map(|(candidate, rows, cost, reason)| ClauseOrderExplain {
-            clause: candidate.clone(),
-            estimated_rows: *rows,
-            total_cost: cost.map(|c| c.total_cost),
-            reason: *reason,
-        })
+        .map(
+            |(candidate, rows, effective_rows, cost, reason)| ClauseOrderExplain {
+                clause: candidate.clone(),
+                estimated_rows: *rows,
+                effective_rows: *effective_rows,
+                total_cost: cost.map(|c| c.total_cost),
+                reason: *reason,
+            },
+        )
         .collect::<Vec<_>>();
     let candidates = scored
         .into_iter()
-        .map(|(candidate, _, _, _)| candidate)
+        .map(|(candidate, _, _, _, _)| candidate)
         .collect::<Vec<_>>();
     Some(IndexedPredicatePlan::new(
         candidates,
@@ -189,6 +200,7 @@ fn score_candidates(
 ) -> Vec<(
     IndexedClausePlan,
     Option<usize>,
+    Option<usize>,
     Option<PlanCost>,
     &'static str,
 )> {
@@ -199,6 +211,8 @@ fn score_candidates(
             let order_aligned = is_order_aligned(&candidate, order_by_field);
             let cost = estimated_rows
                 .map(|rows| candidate_plan_cost(&candidate, rows, limit, order_aligned));
+            let effective_rows =
+                estimated_rows.map(|rows| limit.map(|l| rows.min(l.max(1))).unwrap_or(rows.max(1)));
             let reason = if cost.is_some() {
                 if order_aligned && limit.is_some() {
                     "cost-model-limit-order"
@@ -208,7 +222,7 @@ fn score_candidates(
             } else {
                 "heuristic"
             };
-            (candidate, estimated_rows, cost, reason)
+            (candidate, estimated_rows, effective_rows, cost, reason)
         })
         .collect::<Vec<_>>();
 
@@ -216,58 +230,55 @@ fn score_candidates(
         return order_disjunction_candidates(scored, schema_stats, limit);
     }
 
-    scored.sort_by(|(left, l_rows, l_cost, _), (right, r_rows, r_cost, _)| {
-        if let (Some(lc), Some(rc)) = (l_cost, r_cost) {
-            return lc
-                .total_cost
-                .partial_cmp(&rc.total_cost)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| clause_priority(right).cmp(&clause_priority(left)))
-                .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right)));
-        }
+    scored.sort_by(
+        |(left, l_rows, _l_effective_rows, l_cost, _),
+         (right, r_rows, _r_effective_rows, r_cost, _)| {
+            if let (Some(lc), Some(rc)) = (l_cost, r_cost) {
+                return lc
+                    .total_cost
+                    .partial_cmp(&rc.total_cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| clause_priority(right).cmp(&clause_priority(left)))
+                    .then_with(|| {
+                        clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right))
+                    });
+            }
 
-        if l_cost.is_some() {
-            return std::cmp::Ordering::Less;
-        }
-        if r_cost.is_some() {
-            return std::cmp::Ordering::Greater;
-        }
+            if l_cost.is_some() {
+                return std::cmp::Ordering::Less;
+            }
+            if r_cost.is_some() {
+                return std::cmp::Ordering::Greater;
+            }
 
-        if let (Some(lv), Some(rv)) = (l_rows, r_rows) {
-            return lv
-                .cmp(rv)
-                .then_with(|| clause_priority(right).cmp(&clause_priority(left)))
-                .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right)));
-        }
-        if l_rows.is_some() {
-            return std::cmp::Ordering::Less;
-        }
-        if r_rows.is_some() {
-            return std::cmp::Ordering::Greater;
-        }
+            if let (Some(lv), Some(rv)) = (l_rows, r_rows) {
+                return lv
+                    .cmp(rv)
+                    .then_with(|| clause_priority(right).cmp(&clause_priority(left)))
+                    .then_with(|| {
+                        clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right))
+                    });
+            }
+            if l_rows.is_some() {
+                return std::cmp::Ordering::Less;
+            }
+            if r_rows.is_some() {
+                return std::cmp::Ordering::Greater;
+            }
 
-        clause_priority(right)
-            .cmp(&clause_priority(left))
-            .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right)))
-    });
+            clause_priority(right)
+                .cmp(&clause_priority(left))
+                .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right)))
+        },
+    );
     scored
 }
 
 fn order_disjunction_candidates(
-    mut candidates: Vec<(
-        IndexedClausePlan,
-        Option<usize>,
-        Option<PlanCost>,
-        &'static str,
-    )>,
+    mut candidates: Vec<ScoredClause>,
     schema_stats: Option<&SchemaStatistics>,
     limit: Option<usize>,
-) -> Vec<(
-    IndexedClausePlan,
-    Option<usize>,
-    Option<PlanCost>,
-    &'static str,
-)> {
+) -> Vec<ScoredClause> {
     let mut ordered = Vec::with_capacity(candidates.len());
     let mut estimated_union_rows = 0usize;
     let total_rows = schema_stats.map(|stats| stats.count.max(1)).unwrap_or(1);
@@ -275,7 +286,9 @@ fn order_disjunction_candidates(
     while !candidates.is_empty() {
         let mut best_idx = 0usize;
         let mut best_cost = f64::INFINITY;
-        for (idx, (_clause, est_rows, base_cost, _reason)) in candidates.iter().enumerate() {
+        for (idx, (_clause, est_rows, _effective_rows, base_cost, _reason)) in
+            candidates.iter().enumerate()
+        {
             let marginal_rows =
                 estimate_or_marginal_rows(*est_rows, estimated_union_rows, total_rows);
             let effective_rows = limit
@@ -294,10 +307,16 @@ fn order_disjunction_candidates(
             }
         }
 
-        let (clause, est_rows, _base_cost, _reason) = candidates.swap_remove(best_idx);
+        let (clause, est_rows, _effective_rows, _base_cost, _reason) =
+            candidates.swap_remove(best_idx);
         let marginal_rows = estimate_or_marginal_rows(est_rows, estimated_union_rows, total_rows);
         estimated_union_rows = (estimated_union_rows + marginal_rows).min(total_rows);
         let effective_cost = candidate_plan_cost_for_or(&clause, est_rows, marginal_rows, limit);
+        let effective_rows = Some(
+            limit
+                .map(|l| marginal_rows.min(l.max(1)))
+                .unwrap_or(marginal_rows),
+        );
         let reason = if effective_cost.is_some() {
             if limit.is_some() {
                 "cost-model-or-limit"
@@ -307,7 +326,7 @@ fn order_disjunction_candidates(
         } else {
             "heuristic-or"
         };
-        ordered.push((clause, est_rows, effective_cost, reason));
+        ordered.push((clause, est_rows, effective_rows, effective_cost, reason));
     }
 
     ordered

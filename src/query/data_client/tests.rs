@@ -1674,11 +1674,87 @@ async fn scan_by_expr_plan_exposes_optimizer_trace() {
 
     assert!(!explain.impossible());
     assert!(!explain.clauses().is_empty());
+    let reason = explain.clauses()[0].reason();
     assert!(
-        explain.clauses()[0].reason() == "cost-model-limit-order"
-            || explain.clauses()[0].reason() == "cost-model"
-            || explain.clauses()[0].reason() == "heuristic"
+        reason == "cost-model-limit-order" || reason == "cost-model" || reason == "heuristic"
     );
+    if reason == "cost-model-limit-order" || reason == "cost-model" {
+        assert!(explain.clauses()[0].effective_rows().is_some());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_plan_reports_heuristic_when_stats_missing() {
+    const DATA_1: &str = "DATA_1";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6733).await;
+    let server_addr = String::from("127.0.0.1:6733");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        DATA_1,
+        Type::U64,
+        vec![IndexType::Hashed],
+    )]);
+    let schema_id = 229;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_plan_heuristic_no_stats",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(= DATA_1 1u64)").unwrap()[0].clone();
+    let explain = idx_data_client
+        .scan_by_expr_plan(schema_id, selection, None, Some(10))
+        .await
+        .expect("expected indexed plan");
+
+    assert!(!explain.clauses().is_empty());
+    assert_eq!(explain.clauses()[0].reason(), "heuristic");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_plan_reports_or_heuristic_when_stats_missing() {
+    const DATA_1: &str = "DATA_1";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6734).await;
+    let server_addr = String::from("127.0.0.1:6734");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        DATA_1,
+        Type::U64,
+        vec![IndexType::Hashed],
+    )]);
+    let schema_id = 230;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_plan_heuristic_or_no_stats",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
+        .clone();
+    let explain = idx_data_client
+        .scan_by_expr_plan(schema_id, selection, None, Some(10))
+        .await
+        .expect("expected indexed plan");
+
+    assert!(explain.disjunction());
+    assert!(!explain.clauses().is_empty());
+    assert_eq!(explain.clauses()[0].reason(), "heuristic-or");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2104,6 +2180,55 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
         Id::new(12, 1),
     ];
     assert_eq!(ids, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_ids_or_union_respects_limit() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6735).await;
+    let server_addr = String::from("127.0.0.1:6735");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_unindexed(DATA_2, Type::U32),
+    ]);
+    let schema_id = 231;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_ids_or_union_limit_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=12u64 {
+        let id = Id::new(23, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 3);
+        value[DATA_2] = OwnedValue::U32(i as u32);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
+        .clone();
+    let mut cursor = idx_data_client
+        .scan_by_expr_ids_with_options(schema_id, selection, Ordering::Backward, None, Some(3))
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+    assert_eq!(ids, vec![Id::new(23, 11), Id::new(23, 10), Id::new(23, 8)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
