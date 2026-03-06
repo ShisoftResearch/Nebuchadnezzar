@@ -6,8 +6,8 @@ use dovahkiin::{expr::serde::Expr, types::OwnedValue};
 use crate::{
     query::{
         cost::planner::{
-            distinct_estimate_from_stats, estimate_hashed_eq_rows, estimate_ranged_rows,
-            indexed_clause_priority,
+            distinct_estimate_from_stats, estimate_clause_plan_cost, estimate_hashed_eq_rows,
+            estimate_ranged_rows, indexed_clause_priority, PlanCost,
         },
         statistics::SchemaStatistics,
     },
@@ -35,6 +35,15 @@ pub(crate) struct IndexedPredicatePlan {
     candidates: Vec<IndexedClausePlan>,
     disjunction: bool,
     impossible: bool,
+    explain: Vec<ClauseOrderExplain>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClauseOrderExplain {
+    pub clause: IndexedClausePlan,
+    pub estimated_rows: Option<usize>,
+    pub total_cost: Option<f64>,
+    pub reason: &'static str,
 }
 
 impl IndexedPredicatePlan {
@@ -42,11 +51,13 @@ impl IndexedPredicatePlan {
         candidates: Vec<IndexedClausePlan>,
         disjunction: bool,
         impossible: bool,
+        explain: Vec<ClauseOrderExplain>,
     ) -> Self {
         Self {
             candidates,
             disjunction,
             impossible,
+            explain,
         }
     }
 
@@ -61,12 +72,18 @@ impl IndexedPredicatePlan {
     pub(crate) fn is_impossible(&self) -> bool {
         self.impossible
     }
+
+    pub(crate) fn explain(&self) -> &[ClauseOrderExplain] {
+        self.explain.as_slice()
+    }
 }
 
 pub(crate) fn build_indexed_predicate_plan(
     schema: &Schema,
     selection: &Expr,
     schema_stats: Option<&SchemaStatistics>,
+    order_by_field: Option<u64>,
+    limit: Option<usize>,
 ) -> Option<IndexedPredicatePlan> {
     let mut candidates;
     let disjunction;
@@ -90,26 +107,79 @@ pub(crate) fn build_indexed_predicate_plan(
     if candidates.is_empty() && !impossible {
         return None;
     }
-    candidates.sort_by(|left, right| {
-        match (
-            estimate_candidate_rows(left, schema_stats),
-            estimate_candidate_rows(right, schema_stats),
-        ) {
-            (Some(l_rows), Some(r_rows)) => l_rows
-                .cmp(&r_rows)
+    let mut scored = candidates
+        .into_iter()
+        .map(|candidate| {
+            let estimated_rows = estimate_candidate_rows(&candidate, schema_stats);
+            let order_aligned = is_order_aligned(&candidate, order_by_field);
+            let cost = estimated_rows
+                .map(|rows| candidate_plan_cost(&candidate, rows, limit, order_aligned));
+            let reason = if cost.is_some() {
+                if order_aligned && limit.is_some() {
+                    "cost-model-limit-order"
+                } else {
+                    "cost-model"
+                }
+            } else {
+                "heuristic"
+            };
+            (candidate, estimated_rows, cost, reason)
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|(left, l_rows, l_cost, _), (right, r_rows, r_cost, _)| {
+        if let (Some(lc), Some(rc)) = (l_cost, r_cost) {
+            return lc
+                .total_cost
+                .partial_cmp(&rc.total_cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| clause_priority(right).cmp(&clause_priority(left)))
-                .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right))),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => clause_priority(right)
-                .cmp(&clause_priority(left))
-                .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right))),
+                .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right)));
         }
+
+        if l_cost.is_some() {
+            return std::cmp::Ordering::Less;
+        }
+        if r_cost.is_some() {
+            return std::cmp::Ordering::Greater;
+        }
+
+        if let (Some(lv), Some(rv)) = (l_rows, r_rows) {
+            return lv
+                .cmp(rv)
+                .then_with(|| clause_priority(right).cmp(&clause_priority(left)))
+                .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right)));
+        }
+        if l_rows.is_some() {
+            return std::cmp::Ordering::Less;
+        }
+        if r_rows.is_some() {
+            return std::cmp::Ordering::Greater;
+        }
+
+        clause_priority(right)
+            .cmp(&clause_priority(left))
+            .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right)))
     });
+
+    let explain = scored
+        .iter()
+        .map(|(candidate, rows, cost, reason)| ClauseOrderExplain {
+            clause: candidate.clone(),
+            estimated_rows: *rows,
+            total_cost: cost.map(|c| c.total_cost),
+            reason: *reason,
+        })
+        .collect::<Vec<_>>();
+    let candidates = scored
+        .into_iter()
+        .map(|(candidate, _, _, _)| candidate)
+        .collect::<Vec<_>>();
     Some(IndexedPredicatePlan::new(
         candidates,
         disjunction,
         impossible,
+        explain,
     ))
 }
 
@@ -133,6 +203,35 @@ fn estimate_candidate_rows(
                     .estimated_rows,
             )
         }
+    }
+}
+
+fn is_order_aligned(candidate: &IndexedClausePlan, order_by_field: Option<u64>) -> bool {
+    match (candidate, order_by_field) {
+        (IndexedClausePlan::Ranged { field_id, .. }, Some(order_field)) => *field_id == order_field,
+        _ => false,
+    }
+}
+
+fn candidate_plan_cost(
+    candidate: &IndexedClausePlan,
+    estimated_rows: usize,
+    limit: Option<usize>,
+    order_aligned: bool,
+) -> PlanCost {
+    match candidate {
+        IndexedClausePlan::HashedEq { .. } => {
+            estimate_clause_plan_cost(true, false, false, false, estimated_rows, limit, false)
+        }
+        IndexedClausePlan::Ranged { range, .. } => estimate_clause_plan_cost(
+            false,
+            true,
+            matches!(range.start, ValueRangeTerm::Open),
+            matches!(range.end, ValueRangeTerm::Open),
+            estimated_rows,
+            limit,
+            order_aligned,
+        ),
     }
 }
 
@@ -534,11 +633,67 @@ mod tests {
             eq_expr(field_b, 1),
         ]);
 
-        let plan = build_indexed_predicate_plan(&schema, &selection, Some(&stats)).unwrap();
+        let plan =
+            build_indexed_predicate_plan(&schema, &selection, Some(&stats), None, None).unwrap();
         match plan.all().first().unwrap() {
             IndexedClausePlan::HashedEq { field_id, .. } => assert_eq!(*field_id, field_b_id),
             _ => panic!("expected hashed clause"),
         }
+        assert_eq!(plan.explain().len(), 2);
+        assert_eq!(plan.explain()[0].reason, "cost-model");
+    }
+
+    #[test]
+    fn plan_prefers_order_aligned_ranged_clause_when_limit_present() {
+        let hash_field = "HASH_F";
+        let range_field = "RANGE_F";
+        let schema = Schema::new_with_id(
+            3002,
+            "planner_limit_ordering",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(hash_field, Type::U64, vec![IndexType::Hashed]),
+                Field::new_indexed(range_field, Type::U64, vec![IndexType::Ranged]),
+            ]),
+            false,
+            false,
+        );
+
+        let range_field_id = hash_str(range_field);
+        let mut histogram = HashMap::new();
+        histogram.insert(hash_str(hash_field), histogram_with_distinct(100));
+        histogram.insert(range_field_id, histogram_with_distinct(100));
+        let stats = SchemaStatistics {
+            histogram,
+            count: 50_000,
+            segs: 1,
+            bytes: 1,
+            timestamp: 1,
+        };
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("and"), "and".to_string()),
+            eq_expr(hash_field, 7),
+            Expr::List(vec![
+                Expr::Symbol(hash_str(">="), ">=".to_string()),
+                Expr::Symbol(range_field_id, range_field.to_string()),
+                Expr::Value(OwnedValue::U64(10)),
+            ]),
+        ]);
+
+        let plan = build_indexed_predicate_plan(
+            &schema,
+            &selection,
+            Some(&stats),
+            Some(range_field_id),
+            Some(5),
+        )
+        .unwrap();
+        match plan.all().first().unwrap() {
+            IndexedClausePlan::Ranged { field_id, .. } => assert_eq!(*field_id, range_field_id),
+            _ => panic!("expected ranged clause first"),
+        }
+        assert_eq!(plan.explain()[0].reason, "cost-model-limit-order");
     }
 
     fn eq_expr(field: &str, value: u64) -> Expr {

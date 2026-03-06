@@ -9,6 +9,14 @@ pub struct ClauseEstimate {
     pub reason: &'static str,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PlanCost {
+    pub startup_cost: f64,
+    pub per_row_cost: f64,
+    pub estimated_rows: usize,
+    pub total_cost: f64,
+}
+
 pub fn estimate_hashed_eq_rows(
     row_count: usize,
     distinct_estimate: Option<usize>,
@@ -102,6 +110,52 @@ fn range_term_pos(term: &ValueRangeTerm, histogram: &[[u8; 8]], start_side: bool
         ValueRangeTerm::Inclusive(val) | ValueRangeTerm::Exclusive(val) => {
             histogram.binary_search(val).unwrap_or_else(|pos| pos)
         }
+    }
+}
+
+pub fn estimate_clause_plan_cost(
+    supports_hashed: bool,
+    supports_ranged: bool,
+    open_start: bool,
+    open_end: bool,
+    estimated_rows: usize,
+    limit: Option<usize>,
+    order_aligned: bool,
+) -> PlanCost {
+    let mut startup_cost = if supports_hashed {
+        1.0
+    } else if supports_ranged {
+        2.0
+    } else {
+        4.0
+    };
+    let mut per_row_cost = if supports_hashed {
+        1.0
+    } else if supports_ranged {
+        if open_start || open_end {
+            1.8
+        } else {
+            1.2
+        }
+    } else {
+        2.5
+    };
+
+    if order_aligned {
+        startup_cost *= 0.25;
+        per_row_cost *= 0.35;
+    }
+
+    let effective_rows = limit
+        .map(|l| estimated_rows.min(l.max(1)))
+        .unwrap_or(estimated_rows);
+    let total_cost = startup_cost + (effective_rows as f64 * per_row_cost);
+
+    PlanCost {
+        startup_cost,
+        per_row_cost,
+        estimated_rows,
+        total_cost,
     }
 }
 

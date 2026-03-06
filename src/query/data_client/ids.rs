@@ -23,20 +23,6 @@ pub(super) fn union_ids_ordered(mut base: Vec<Id>, next_ids: &[Id]) -> Vec<Id> {
 }
 
 pub(super) fn clause_execution_order(candidates: &[IndexedClausePlan]) -> Vec<&IndexedClausePlan> {
-    if let Some((idx, _)) = candidates
-        .iter()
-        .enumerate()
-        .find(|(_, candidate)| matches!(candidate, IndexedClausePlan::Ranged { .. }))
-    {
-        let mut ordered = Vec::with_capacity(candidates.len());
-        ordered.push(&candidates[idx]);
-        for (i, candidate) in candidates.iter().enumerate() {
-            if i != idx {
-                ordered.push(candidate);
-            }
-        }
-        return ordered;
-    }
     candidates.iter().collect()
 }
 

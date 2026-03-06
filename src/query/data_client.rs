@@ -175,7 +175,9 @@ impl IndexedDataClient {
             self.ensure_orderable_field(schema, field_id).await?;
         }
 
-        let plan = self.indexed_predicate_plan(schema, &selection).await;
+        let plan = self
+            .indexed_predicate_plan(schema, &selection, order_by_field, limit)
+            .await;
         let candidate_ids = if let Some(plan) = plan {
             if plan.is_impossible() {
                 vec![]
@@ -327,6 +329,8 @@ impl IndexedDataClient {
         &self,
         schema_id: u32,
         selection: &Expr,
+        order_by_field: Option<u64>,
+        limit: Option<usize>,
     ) -> Option<IndexedPredicatePlan> {
         if selection.is_empty() {
             return None;
@@ -339,7 +343,7 @@ impl IndexedDataClient {
             .ok()
             .flatten()?;
         let stats = self.index_clients.overall_schema_statistics(schema_id);
-        build_indexed_predicate_plan(&schema, selection, stats.as_deref())
+        build_indexed_predicate_plan(&schema, selection, stats.as_deref(), order_by_field, limit)
     }
 
     async fn ensure_orderable_field(&self, schema_id: u32, field_id: u64) -> Result<(), RPCError> {
