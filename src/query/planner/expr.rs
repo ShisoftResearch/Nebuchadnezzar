@@ -157,6 +157,41 @@ pub(crate) fn build_indexed_predicate_plan(
     if candidates.is_empty() && !impossible {
         return None;
     }
+    let scored = score_candidates(candidates, disjunction, schema_stats, order_by_field, limit);
+
+    let explain = scored
+        .iter()
+        .map(|(candidate, rows, cost, reason)| ClauseOrderExplain {
+            clause: candidate.clone(),
+            estimated_rows: *rows,
+            total_cost: cost.map(|c| c.total_cost),
+            reason: *reason,
+        })
+        .collect::<Vec<_>>();
+    let candidates = scored
+        .into_iter()
+        .map(|(candidate, _, _, _)| candidate)
+        .collect::<Vec<_>>();
+    Some(IndexedPredicatePlan::new(
+        candidates,
+        disjunction,
+        impossible,
+        explain,
+    ))
+}
+
+fn score_candidates(
+    candidates: Vec<IndexedClausePlan>,
+    disjunction: bool,
+    schema_stats: Option<&SchemaStatistics>,
+    order_by_field: Option<u64>,
+    limit: Option<usize>,
+) -> Vec<(
+    IndexedClausePlan,
+    Option<usize>,
+    Option<PlanCost>,
+    &'static str,
+)> {
     let mut scored = candidates
         .into_iter()
         .map(|candidate| {
@@ -176,6 +211,10 @@ pub(crate) fn build_indexed_predicate_plan(
             (candidate, estimated_rows, cost, reason)
         })
         .collect::<Vec<_>>();
+
+    if disjunction {
+        return order_disjunction_candidates(scored, schema_stats, limit);
+    }
 
     scored.sort_by(|(left, l_rows, l_cost, _), (right, r_rows, r_cost, _)| {
         if let (Some(lc), Some(rc)) = (l_cost, r_cost) {
@@ -211,26 +250,107 @@ pub(crate) fn build_indexed_predicate_plan(
             .cmp(&clause_priority(left))
             .then_with(|| clause_selectivity_cost(left).cmp(&clause_selectivity_cost(right)))
     });
+    scored
+}
 
-    let explain = scored
-        .iter()
-        .map(|(candidate, rows, cost, reason)| ClauseOrderExplain {
-            clause: candidate.clone(),
-            estimated_rows: *rows,
-            total_cost: cost.map(|c| c.total_cost),
-            reason: *reason,
-        })
-        .collect::<Vec<_>>();
-    let candidates = scored
-        .into_iter()
-        .map(|(candidate, _, _, _)| candidate)
-        .collect::<Vec<_>>();
-    Some(IndexedPredicatePlan::new(
-        candidates,
-        disjunction,
-        impossible,
-        explain,
-    ))
+fn order_disjunction_candidates(
+    mut candidates: Vec<(
+        IndexedClausePlan,
+        Option<usize>,
+        Option<PlanCost>,
+        &'static str,
+    )>,
+    schema_stats: Option<&SchemaStatistics>,
+    limit: Option<usize>,
+) -> Vec<(
+    IndexedClausePlan,
+    Option<usize>,
+    Option<PlanCost>,
+    &'static str,
+)> {
+    let mut ordered = Vec::with_capacity(candidates.len());
+    let mut estimated_union_rows = 0usize;
+    let total_rows = schema_stats.map(|stats| stats.count.max(1)).unwrap_or(1);
+
+    while !candidates.is_empty() {
+        let mut best_idx = 0usize;
+        let mut best_cost = f64::INFINITY;
+        for (idx, (_clause, est_rows, base_cost, _reason)) in candidates.iter().enumerate() {
+            let marginal_rows =
+                estimate_or_marginal_rows(*est_rows, estimated_union_rows, total_rows);
+            let effective_rows = limit
+                .map(|l| marginal_rows.min(l.max(1)))
+                .unwrap_or(marginal_rows.max(1));
+            let base = base_cost.map(|cost| cost.startup_cost).unwrap_or(5.0);
+            let per_row = base_cost.map(|cost| cost.per_row_cost).unwrap_or(2.0);
+            let dedup_penalty = ((est_rows
+                .unwrap_or(effective_rows)
+                .saturating_sub(marginal_rows)) as f64)
+                * 0.05;
+            let effective_cost = base + (effective_rows as f64 * per_row) + dedup_penalty;
+            if effective_cost < best_cost {
+                best_cost = effective_cost;
+                best_idx = idx;
+            }
+        }
+
+        let (clause, est_rows, _base_cost, _reason) = candidates.swap_remove(best_idx);
+        let marginal_rows = estimate_or_marginal_rows(est_rows, estimated_union_rows, total_rows);
+        estimated_union_rows = (estimated_union_rows + marginal_rows).min(total_rows);
+        let effective_cost = candidate_plan_cost_for_or(&clause, est_rows, marginal_rows, limit);
+        let reason = if effective_cost.is_some() {
+            if limit.is_some() {
+                "cost-model-or-limit"
+            } else {
+                "cost-model-or"
+            }
+        } else {
+            "heuristic-or"
+        };
+        ordered.push((clause, est_rows, effective_cost, reason));
+    }
+
+    ordered
+}
+
+fn estimate_or_marginal_rows(
+    estimated_rows: Option<usize>,
+    union_rows_so_far: usize,
+    total_rows: usize,
+) -> usize {
+    let estimated_rows = estimated_rows.unwrap_or((total_rows / 3).max(1));
+    let overlap_ratio = (union_rows_so_far as f64 / total_rows as f64).clamp(0.0, 0.85);
+    let marginal = ((estimated_rows as f64) * (1.0 - overlap_ratio)).ceil() as usize;
+    marginal.max(1)
+}
+
+fn candidate_plan_cost_for_or(
+    clause: &IndexedClausePlan,
+    estimated_rows: Option<usize>,
+    marginal_rows: usize,
+    limit: Option<usize>,
+) -> Option<PlanCost> {
+    let rows = estimated_rows?;
+    match clause {
+        IndexedClausePlan::HashedEq { .. } => Some(estimate_clause_plan_cost(
+            true,
+            false,
+            false,
+            false,
+            rows.max(marginal_rows),
+            limit,
+            false,
+        )),
+        IndexedClausePlan::Ranged { range, .. } => Some(estimate_clause_plan_cost(
+            false,
+            true,
+            matches!(range.start, ValueRangeTerm::Open),
+            matches!(range.end, ValueRangeTerm::Open),
+            rows.max(marginal_rows),
+            limit,
+            false,
+        )),
+    }
 }
 
 fn estimate_candidate_rows(
@@ -744,6 +864,49 @@ mod tests {
             _ => panic!("expected ranged clause first"),
         }
         assert_eq!(plan.explain()[0].reason(), "cost-model-limit-order");
+    }
+
+    #[test]
+    fn disjunction_plan_uses_or_cost_reasoning() {
+        let field_a = "OR_A";
+        let field_b = "OR_B";
+        let schema = Schema::new_with_id(
+            3003,
+            "planner_or_costing",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(field_a, Type::U64, vec![IndexType::Hashed]),
+                Field::new_indexed(field_b, Type::U64, vec![IndexType::Hashed]),
+            ]),
+            false,
+            false,
+        );
+
+        let mut histogram = HashMap::new();
+        histogram.insert(hash_str(field_a), histogram_with_distinct(200));
+        histogram.insert(hash_str(field_b), histogram_with_distinct(2));
+        let stats = SchemaStatistics {
+            histogram,
+            count: 20_000,
+            segs: 1,
+            bytes: 1,
+            timestamp: 1,
+        };
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("or"), "or".to_string()),
+            eq_expr(field_a, 1),
+            eq_expr(field_b, 1),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, Some(&stats), None, Some(20))
+            .unwrap();
+        assert!(plan.is_disjunction());
+        assert_eq!(plan.explain().len(), 2);
+        assert!(
+            plan.explain()[0].reason() == "cost-model-or-limit"
+                || plan.explain()[0].reason() == "cost-model-or"
+        );
     }
 
     fn eq_expr(field: &str, value: u64) -> Expr {

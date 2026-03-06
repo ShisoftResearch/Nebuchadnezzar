@@ -185,6 +185,12 @@ impl IndexedDataClient {
         order_by_field: Option<u64>,
         limit: Option<usize>,
     ) -> Result<IdCursor, RPCError> {
+        if matches!(limit, Some(0)) {
+            return Ok(IdCursor {
+                buffer: vec![],
+                pos: 0,
+            });
+        }
         if let Some(field_id) = order_by_field {
             self.ensure_orderable_field(schema, field_id).await?;
         }
