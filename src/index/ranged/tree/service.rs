@@ -448,7 +448,13 @@ impl TreeService {
                     if tree.oversized() {
                         info!("LSM Tree oversized {:?}, start migration", dist_tree.id);
                         // Tree oversized, need to migrate
-                        let pivot_key = tree.pivot_key().unwrap();
+                        let Some(pivot_key) = tree.pivot_key() else {
+                            warn!(
+                                "Skipping migration for {:?}: oversized tree has no pivot key",
+                                dist_tree.id
+                            );
+                            continue;
+                        };
                         let migration_target_id = Id::rand();
                         debug!(
                             "Creating migration target tree {:?} split at {:?}",

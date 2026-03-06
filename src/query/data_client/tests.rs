@@ -10,7 +10,7 @@ use crate::{
 };
 use bifrost_hasher::hash_str;
 use dovahkiin::{expr::serde::Expr, integrated::lisp::*, types::*};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_all() {
@@ -2652,5 +2652,239 @@ async fn bm25_search_returns_ranked_results() {
         empty_hits.is_empty(),
         "Irrelevant query should return no matches, got {:?}",
         empty_hits
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scan_by_expr_vs_scan_all_and() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6736).await;
+    let server_addr = String::from("127.0.0.1:6736");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_indexed(DATA_2, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 232;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "bench_scan_by_expr_vs_scan_all_and",
+        None,
+        fields,
+        false,
+        true,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..120_000u64 {
+        let id = Id::new(24, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 5);
+        value[DATA_2] = OwnedValue::U64(i % 120_000);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(and (= DATA_1 1u64) (>= DATA_2 0u64))").unwrap()[0]
+        .clone();
+    let limit = 200usize;
+
+    for _ in 0..2 {
+        let mut c = idx_data_client
+            .scan_by_expr_ids_with_options(
+                schema_id,
+                selection.clone(),
+                Ordering::Backward,
+                None,
+                Some(limit),
+            )
+            .await
+            .unwrap();
+        while c.next().await.unwrap().is_some() {}
+    }
+
+    let runs = 4u32;
+    let mut optimized_ms = 0f64;
+    let mut baseline_ms = 0f64;
+    let mut expected_count = None;
+
+    for _ in 0..runs {
+        let t0 = Instant::now();
+        let mut optimized = idx_data_client
+            .scan_by_expr_ids_with_options(
+                schema_id,
+                selection.clone(),
+                Ordering::Backward,
+                None,
+                Some(limit),
+            )
+            .await
+            .unwrap();
+        let mut optimized_count = 0usize;
+        while optimized.next().await.unwrap().is_some() {
+            optimized_count += 1;
+        }
+        optimized_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let mut baseline = idx_data_client
+            .scan_by_expr_ids(schema_id, selection.clone(), Ordering::Backward)
+            .await
+            .unwrap();
+        let mut baseline_count = 0usize;
+        while baseline_count < limit {
+            if baseline.next().await.unwrap().is_some() {
+                baseline_count += 1;
+            } else {
+                break;
+            }
+        }
+        baseline_ms += t1.elapsed().as_secs_f64() * 1000.0;
+
+        assert_eq!(optimized_count, baseline_count, "result cardinality mismatch");
+        expected_count = Some(optimized_count);
+    }
+
+    let opt_avg = optimized_ms / f64::from(runs);
+    let base_avg = baseline_ms / f64::from(runs);
+    let speedup = if opt_avg > 0.0 { base_avg / opt_avg } else { 0.0 };
+
+    println!(
+        "[bench][and+limit] rows={} limit={} avg_optimized_ms={:.3} avg_baseline_no_limit_ms={:.3} speedup={:.2}x",
+        expected_count.unwrap_or_default(),
+        limit,
+        opt_avg,
+        base_avg,
+        speedup
+    );
+    assert!(
+        speedup >= 2.0,
+        "expected substantial speedup for AND+LIMIT benchmark, got {:.2}x",
+        speedup
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6737).await;
+    let server_addr = String::from("127.0.0.1:6737");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_unindexed(DATA_2, Type::U32),
+    ]);
+    let schema_id = 233;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "bench_scan_by_expr_ids_or_limit_vs_scan_all",
+        None,
+        fields,
+        false,
+        true,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..35_000u64 {
+        let id = Id::new(25, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 17);
+        value[DATA_2] = OwnedValue::U32((i % 9) as u32);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(or (= DATA_1 3u64) (= DATA_1 5u64) (= DATA_1 7u64))")
+        .unwrap()[0]
+        .clone();
+    let limit = 100usize;
+
+    for _ in 0..2 {
+        let mut c = idx_data_client
+            .scan_by_expr_ids_with_options(
+                schema_id,
+                selection.clone(),
+                Ordering::Backward,
+                None,
+                Some(limit),
+            )
+            .await
+            .unwrap();
+        while c.next().await.unwrap().is_some() {}
+    }
+
+    let runs = 8u32;
+    let mut optimized_ms = 0f64;
+    let mut baseline_ms = 0f64;
+
+    for _ in 0..runs {
+        let t0 = Instant::now();
+        let mut optimized = idx_data_client
+            .scan_by_expr_ids_with_options(
+                schema_id,
+                selection.clone(),
+                Ordering::Backward,
+                None,
+                Some(limit),
+            )
+            .await
+            .unwrap();
+        let mut optimized_count = 0usize;
+        while optimized.next().await.unwrap().is_some() {
+            optimized_count += 1;
+        }
+        optimized_ms += t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let mut baseline = idx_data_client
+            .scan_by_expr_ids(schema_id, selection.clone(), Ordering::Backward)
+            .await
+            .unwrap();
+        let mut baseline_count = 0usize;
+        while baseline_count < limit {
+            if baseline.next().await.unwrap().is_some() {
+                baseline_count += 1;
+            } else {
+                break;
+            }
+        }
+        baseline_ms += t1.elapsed().as_secs_f64() * 1000.0;
+
+        assert_eq!(optimized_count, baseline_count, "limit cardinality mismatch");
+    }
+
+    let opt_avg = optimized_ms / f64::from(runs);
+    let base_avg = baseline_ms / f64::from(runs);
+    let speedup = if opt_avg > 0.0 { base_avg / opt_avg } else { 0.0 };
+
+    println!(
+        "[bench][or+limit] limit={} avg_optimized_ms={:.3} avg_baseline_no_limit_ms={:.3} speedup={:.2}x",
+        limit,
+        opt_avg,
+        base_avg,
+        speedup
+    );
+    assert!(
+        speedup >= 2.0,
+        "expected substantial speedup for OR+LIMIT benchmark, got {:.2}x",
+        speedup
     );
 }
