@@ -1511,6 +1511,121 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6728).await;
+    let server_addr = String::from("127.0.0.1:6728");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_indexed(DATA_2, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 224;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_with_options_order_by_limit_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=9u64 {
+        let id = Id::new(18, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 2);
+        value[DATA_2] = OwnedValue::U64(10 - i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("="), "=".to_string()),
+        Expr::Symbol(hash_str(DATA_1), DATA_1.to_string()),
+        Expr::Value(OwnedValue::U64(1)),
+    ]);
+    let mut cursor = idx_data_client
+        .scan_by_expr_with_options(
+            schema_id,
+            selection,
+            Ordering::Forward,
+            Some(hash_str(DATA_2)),
+            Some(3),
+        )
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(cell) = cursor.next().await.unwrap() {
+        ids.push(cell.id());
+    }
+    assert_eq!(ids, vec![Id::new(18, 9), Id::new(18, 7), Id::new(18, 5)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_with_options_rejects_non_indexed_order_by_field() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6729).await;
+    let server_addr = String::from("127.0.0.1:6729");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_unindexed(DATA_2, Type::U64),
+    ]);
+    let schema_id = 225;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_with_options_non_indexed_order_by",
+        None,
+        fields,
+        false,
+        true,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=4u64 {
+        let id = Id::new(19, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 2);
+        value[DATA_2] = OwnedValue::U64(i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("="), "=".to_string()),
+        Expr::Symbol(hash_str(DATA_1), DATA_1.to_string()),
+        Expr::Value(OwnedValue::U64(1)),
+    ]);
+    let err = idx_data_client
+        .scan_by_expr_with_options(
+            schema_id,
+            selection,
+            Ordering::Forward,
+            Some(hash_str(DATA_2)),
+            Some(2),
+        )
+        .await
+        .err()
+        .expect("expected ORDER BY to fail for non-indexed field");
+    assert!(
+        format!("{err:?}").contains("requires ranged index"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn scan_by_expr_ids_returns_ids_only_cursor() {
     const DATA_1: &str = "DATA_1";
     const DATA_2: &str = "DATA_2";

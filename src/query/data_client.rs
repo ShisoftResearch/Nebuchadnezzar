@@ -120,8 +120,20 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
+        self.scan_by_expr_with_options(schema, selection, ordering, None, None)
+            .await
+    }
+
+    pub async fn scan_by_expr_with_options<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: Ordering,
+        order_by_field: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<DataCursor, RPCError> {
         let mut id_cursor = self
-            .scan_by_expr_ids(schema, selection.clone(), ordering)
+            .scan_by_expr_ids_with_options(schema, selection.clone(), ordering, order_by_field, limit)
             .await?;
         let mut ids = vec![];
         while let Some(id) = id_cursor.next().await? {
