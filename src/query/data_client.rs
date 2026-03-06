@@ -1613,6 +1613,168 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn scan_by_expr_supports_single_ranged_clause() {
+        const DATA_1: &str = "DATA_1";
+        const DATA_2: &str = "DATA_2";
+        let _ = env_logger::try_init();
+        let server = create_test_server(6713).await;
+        let server_addr = String::from("127.0.0.1:6713");
+
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
+        let schema_id = 209;
+        let schema = Schema::new_with_id(
+            schema_id,
+            "scan_by_expr_single_clause_schema",
+            None,
+            fields,
+            false,
+            false,
+        );
+
+        let client = server.data_client(&vec![server_addr]).await.unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+        for i in 0..=100u64 {
+            let id = Id::new(3, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[DATA_1] = OwnedValue::U64(i);
+            value[DATA_2] = OwnedValue::U32((i * 4) as u32);
+            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+
+        let idx_data_client = server.indexed_data_client();
+        let selection = parse_to_serde_expr("(>= DATA_1 95u64)").unwrap()[0].clone();
+        let mut cursor = idx_data_client
+            .scan_by_expr(
+                schema_id,
+                vec![],
+                selection,
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+
+        for i in 95..=100u64 {
+            let cell = cursor.next().await.unwrap().expect("Expected matching row");
+            assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+        }
+        assert!(cursor.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_by_expr_supports_reversed_comparison_operands() {
+        const DATA_1: &str = "DATA_1";
+        const DATA_2: &str = "DATA_2";
+        let _ = env_logger::try_init();
+        let server = create_test_server(6714).await;
+        let server_addr = String::from("127.0.0.1:6714");
+
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
+        let schema_id = 210;
+        let schema = Schema::new_with_id(
+            schema_id,
+            "scan_by_expr_reversed_ops_schema",
+            None,
+            fields,
+            false,
+            false,
+        );
+
+        let client = server.data_client(&vec![server_addr]).await.unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+        for i in 0..=25u64 {
+            let id = Id::new(4, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[DATA_1] = OwnedValue::U64(i);
+            value[DATA_2] = OwnedValue::U32((i * 5) as u32);
+            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+
+        let idx_data_client = server.indexed_data_client();
+        let selection = parse_to_serde_expr("(and (< 10u64 DATA_1) (< DATA_1 15u64))").unwrap()[0]
+            .clone();
+        let mut cursor = idx_data_client
+            .scan_by_expr(
+                schema_id,
+                vec![],
+                selection,
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+
+        for expected in 11..15u64 {
+            let cell = cursor.next().await.unwrap().expect("Expected matching row");
+            assert_eq!(*cell[DATA_1].u64().unwrap(), expected);
+        }
+        assert!(cursor.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
+        const DATA_1: &str = "DATA_1";
+        const DATA_2: &str = "DATA_2";
+        let _ = env_logger::try_init();
+        let server = create_test_server(6715).await;
+        let server_addr = String::from("127.0.0.1:6715");
+
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed(DATA_1, Type::U64),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
+        let schema_id = 211;
+        let schema = Schema::new_with_id(
+            schema_id,
+            "scan_by_expr_schema_fallback",
+            None,
+            fields,
+            false,
+            true,
+        );
+
+        let client = server.data_client(&vec![server_addr]).await.unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+        for i in 0..=20u64 {
+            let id = Id::new(5, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[DATA_1] = OwnedValue::U64(i);
+            value[DATA_2] = OwnedValue::U32((i * 2) as u32);
+            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+
+        let idx_data_client = server.indexed_data_client();
+        let selection = parse_to_serde_expr("(= DATA_2 24u32)").unwrap()[0].clone();
+        let mut cursor = idx_data_client
+            .scan_by_expr(
+                schema_id,
+                vec![],
+                selection,
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+
+        let cell = cursor.next().await.unwrap().expect("Expected one matching row");
+        assert_eq!(*cell[DATA_1].u64().unwrap(), 12);
+        assert_eq!(*cell[DATA_2].u32().unwrap(), 24);
+        assert!(cursor.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn hashed_query_test() {
         const DATA_1: &'static str = "DATA_1";
         const DATA_2: &'static str = "DATA_2";
