@@ -14,6 +14,7 @@ use crate::ram::cell::{Cell, OwnedCell};
 use crate::ram::chunk::Chunks;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
+use crate::query::statistics::{merge_statistics, SchemaStatistics};
 
 use super::{
     bm25_score, compute_idf, tokenize_query, BM25Hit, FullTextIndexMeta, TokenStat,
@@ -499,6 +500,16 @@ impl InvertedIndexer {
     /// Hash key for doc_metadata: (schema_id, field_id, doc_id) -> u64
     pub fn doc_meta_key(schema_id: u32, field_id: u64, doc_id: &Id) -> u64 {
         Id::from_obj(&(schema_id, field_id, doc_id.higher, doc_id.lower)).lower
+    }
+
+    pub fn try_overall_schema_statistics(&self, schema_id: u32) -> Option<Arc<SchemaStatistics>> {
+        let all_stats = self
+            .chunks
+            .all_chunk_statistics(schema_id)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        merge_statistics(all_stats).map(Arc::new)
     }
 
     fn stats_cell_id(schema_id: u32, field_id: u64) -> Id {

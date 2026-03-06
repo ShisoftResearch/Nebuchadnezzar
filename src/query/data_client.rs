@@ -177,7 +177,9 @@ impl IndexedDataClient {
 
         let plan = self.indexed_predicate_plan(schema, &selection).await;
         let candidate_ids = if let Some(plan) = plan {
-            if plan.is_disjunction() {
+            if plan.is_impossible() {
+                vec![]
+            } else if plan.is_disjunction() {
                 let mut candidate_ids = vec![];
                 for candidate in plan.all() {
                     let ids = match self.execute_clause_ids(schema, candidate, ordering).await {
@@ -336,7 +338,8 @@ impl IndexedDataClient {
             .await
             .ok()
             .flatten()?;
-        build_indexed_predicate_plan(&schema, selection)
+        let stats = self.index_clients.overall_schema_statistics(schema_id);
+        build_indexed_predicate_plan(&schema, selection, stats.as_deref())
     }
 
     async fn ensure_orderable_field(&self, schema_id: u32, field_id: u64) -> Result<(), RPCError> {

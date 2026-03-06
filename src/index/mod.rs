@@ -31,6 +31,7 @@ use crate::index::full_text::shard::InvertedIndexer;
 use crate::index::full_text::{
     inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit,
 };
+use crate::query::statistics::SchemaStatistics;
 use crate::index::vector::VectorIndexClient;
 use crate::ram::cell::ReadError;
 use crate::ram::chunk::Chunks;
@@ -91,6 +92,11 @@ impl IndexerClients {
     /// Get the inverted indexer if initialized
     pub fn fulltext_indexer(&self) -> Option<&Arc<InvertedIndexer>> {
         self.fulltext_indexer.get()
+    }
+
+    pub fn overall_schema_statistics(&self, schema_id: u32) -> Option<Arc<SchemaStatistics>> {
+        self.fulltext_indexer()
+            .and_then(|indexer| indexer.try_overall_schema_statistics(schema_id))
     }
 
     /// Create IndexerClients without hybrid inverted indexer (for query-only clients)

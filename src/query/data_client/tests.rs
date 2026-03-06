@@ -1626,6 +1626,92 @@ async fn scan_by_expr_with_options_rejects_non_indexed_order_by_field() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_detects_contradictory_hashed_predicates() {
+    const DATA_1: &str = "DATA_1";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6730).await;
+    let server_addr = String::from("127.0.0.1:6730");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        DATA_1,
+        Type::U64,
+        vec![IndexType::Hashed],
+    )]);
+    let schema_id = 226;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_contradict_hashed",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=5u64 {
+        let id = Id::new(20, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 2);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(and (= DATA_1 0u64) (= DATA_1 1u64))").unwrap()[0]
+        .clone();
+    let mut cursor = idx_data_client
+        .scan_by_expr(schema_id, selection, Ordering::Forward)
+        .await
+        .unwrap();
+    assert!(cursor.next().await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_detects_contradictory_ranged_predicates() {
+    const DATA_1: &str = "DATA_1";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6731).await;
+    let server_addr = String::from("127.0.0.1:6731");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        DATA_1,
+        Type::U64,
+        vec![IndexType::Ranged],
+    )]);
+    let schema_id = 227;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_contradict_range",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=10u64 {
+        let id = Id::new(21, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(and (> DATA_1 8u64) (< DATA_1 2u64))").unwrap()[0]
+        .clone();
+    let mut cursor = idx_data_client
+        .scan_by_expr(schema_id, selection, Ordering::Forward)
+        .await
+        .unwrap();
+    assert!(cursor.next().await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn scan_by_expr_ids_returns_ids_only_cursor() {
     const DATA_1: &str = "DATA_1";
     const DATA_2: &str = "DATA_2";
