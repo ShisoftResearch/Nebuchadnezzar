@@ -200,7 +200,7 @@ impl Cleaner {
                 segments_for_combine.push(seg);
                 combining_size = new_size;
             }
-            if segments_for_combine.len() > 2 {
+            if segments_for_combine.len() >= 2 {
                 debug!(
                     "Have {} segments to combine, candidates {}",
                     segments_for_combine.len(),
