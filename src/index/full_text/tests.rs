@@ -33,7 +33,7 @@ mod tests {
 
         Chunks::new(
             1,
-            16 * 1024 * 1024, // 16MB
+            128 * 1024 * 1024,
             Arc::new(ServerMeta { schemas }),
             None,
             None,
@@ -47,7 +47,7 @@ mod tests {
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
                 chunk_count: 1,
-                total_size: 16 * 1024 * 1024,
+                total_size: 128 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

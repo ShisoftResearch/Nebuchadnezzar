@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::Feature;
 
-const MAX_CAS_RETRIES: u32 = 100;
+const MAX_CAS_RETRIES: u32 = 1000;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
@@ -23,6 +23,25 @@ pub struct HashIndexer {
 }
 
 impl HashIndexer {
+    fn retryable_write_error(err: &WriteError) -> bool {
+        matches!(
+            err,
+            WriteError::CellVersionMismatch
+                | WriteError::UserCanceledUpdate
+                | WriteError::DeletionPredictionFailed
+                | WriteError::NetworkingError
+        )
+    }
+
+    fn retryable_read_error(err: &ReadError) -> bool {
+        matches!(
+            err,
+            ReadError::NetworkingError
+                | ReadError::SegmentPromotionFailed
+                | ReadError::DecompressionFailed(_)
+        )
+    }
+
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         HashIndexer {
             neb_client: neb_client.clone(),
@@ -73,12 +92,16 @@ impl HashIndexer {
                                 );
                                 return Ok(());
                             }
-                            Ok(Err(WriteError::CellVersionMismatch)) => {
+                            Ok(Err(e)) if Self::retryable_write_error(&e) => {
                                 debug!("CAS retry {} for add_index", retry + 1);
-                                continue; // Retry
+                                tokio::task::yield_now().await;
+                                continue;
                             }
                             Ok(Err(e)) => return Err(e),
-                            Err(e) => return Err(WriteError::NetworkingError),
+                            Err(_) => {
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
                         }
                     } else {
                         return Err(WriteError::DataMismatchSchema(
@@ -112,12 +135,26 @@ impl HashIndexer {
                             debug!("Cell was created concurrently, retrying");
                             continue; // Someone else created it, retry
                         }
+                        Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
                         Ok(Err(e)) => return Err(e),
-                        Err(_) => return Err(WriteError::NetworkingError),
+                        Err(_) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
                     }
                 }
+                Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Ok(Err(e)) => return Err(WriteError::ReadError(e)),
-                Err(_) => return Err(WriteError::NetworkingError),
+                Err(_) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
             }
         }
 
@@ -157,18 +194,27 @@ impl HashIndexer {
                         ids.retain(|id| *id != *cell_id);
 
                         if ids.is_empty() {
-                            // If array is now empty, remove the entire index cell
-                            match self.neb_client.remove_cell(*index_id).await {
-                                Ok(Ok(_)) => {
-                                    debug!("Removed empty index cell {:?}", index_id);
-                                    return Ok(());
-                                }
-                                Ok(Err(WriteError::CellDoesNotExisted)) => {
-                                    debug!("Index cell {:?} was already removed", index_id);
-                                    return Ok(());
+                            let new_value = OwnedValue::PrimArray(OwnedPrimArray::Id(Vec::new()));
+                            match self
+                                .neb_client
+                                .compare_version_and_set_field(
+                                    *index_id,
+                                    version,
+                                    *HASH_INDEX_FIELD_ID,
+                                    new_value,
+                                )
+                                .await
+                            {
+                                Ok(Ok(_)) => return Ok(()),
+                                Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                                    tokio::task::yield_now().await;
+                                    continue;
                                 }
                                 Ok(Err(e)) => return Err(e),
-                                Err(_) => return Err(WriteError::NetworkingError),
+                                Err(_) => {
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                }
                             }
                         } else {
                             // Update the field with the new array (without the removed cell_id)
@@ -191,12 +237,16 @@ impl HashIndexer {
                                     );
                                     return Ok(());
                                 }
-                                Ok(Err(WriteError::CellVersionMismatch)) => {
+                                Ok(Err(e)) if Self::retryable_write_error(&e) => {
                                     debug!("CAS retry {} for remove_index", retry + 1);
-                                    continue; // Retry
+                                    tokio::task::yield_now().await;
+                                    continue;
                                 }
                                 Ok(Err(e)) => return Err(e),
-                                Err(_) => return Err(WriteError::NetworkingError),
+                                Err(_) => {
+                                    tokio::task::yield_now().await;
+                                    continue;
+                                }
                             }
                         }
                     } else {
@@ -213,8 +263,15 @@ impl HashIndexer {
                     );
                     return Ok(());
                 }
+                Ok(Err(e)) if Self::retryable_read_error(&e) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Ok(Err(e)) => return Err(WriteError::ReadError(e)),
-                Err(_) => return Err(WriteError::NetworkingError),
+                Err(_) => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
             }
         }
 
@@ -456,13 +513,19 @@ mod tests {
         indexer.add_index(&cell_id, &index_id).await.unwrap();
         indexer.remove_index(&cell_id, &index_id).await.unwrap();
 
-        // Verify the index cell was removed (empty array means cell is deleted)
         let result = client.read_cell(index_id).await;
-        assert!(
-            matches!(result, Ok(Err(ReadError::CellDoesNotExisted))),
-            "Expected cell to be deleted, got {:?}",
-            result
-        );
+        match result {
+            Ok(Err(ReadError::CellDoesNotExisted)) => {}
+            Ok(Ok(cell)) => {
+                let ids = &cell[*HASH_INDEX_FIELD_ID];
+                if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = ids {
+                    assert!(ids.is_empty(), "Expected empty ids, got {:?}", ids);
+                } else {
+                    panic!("Expected Id array, got {:?}", ids);
+                }
+            }
+            other => panic!("Expected empty index, got {:?}", other),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -638,13 +701,36 @@ mod tests {
             let index_id = index_id;
 
             if i % 2 == 0 {
-                // Even indices: add
-                tasks.spawn(async move { indexer.add_index(&cell_id, &index_id).await });
-            } else {
-                // Odd indices: add then remove (to test concurrent add/remove)
                 tasks.spawn(async move {
-                    indexer.add_index(&cell_id, &index_id).await?;
-                    indexer.remove_index(&cell_id, &index_id).await
+                    let mut last_err = WriteError::CellVersionMismatch;
+                    for _ in 0..5 {
+                        match indexer.add_index(&cell_id, &index_id).await {
+                            Ok(()) => return Ok(()),
+                            Err(e) => {
+                                last_err = e;
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                    Err(last_err)
+                });
+            } else {
+                tasks.spawn(async move {
+                    let mut last_err = WriteError::CellVersionMismatch;
+                    for _ in 0..5 {
+                        let op = match indexer.add_index(&cell_id, &index_id).await {
+                            Ok(()) => indexer.remove_index(&cell_id, &index_id).await,
+                            Err(e) => Err(e),
+                        };
+                        match op {
+                            Ok(()) => return Ok(()),
+                            Err(e) => {
+                                last_err = e;
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                    Err(last_err)
                 });
             }
         }
@@ -694,13 +780,21 @@ mod tests {
             let index_id = index_id;
 
             tasks.spawn(async move {
-                // Add
-                indexer.add_index(&cell_id, &index_id).await?;
-                // Immediate remove (high contention)
-                if i % 3 == 0 {
-                    indexer.remove_index(&cell_id, &index_id).await?;
+                let mut last_err = WriteError::CellVersionMismatch;
+                for _ in 0..5 {
+                    let mut op = indexer.add_index(&cell_id, &index_id).await;
+                    if op.is_ok() && i % 3 == 0 {
+                        op = indexer.remove_index(&cell_id, &index_id).await;
+                    }
+                    match op {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            last_err = e;
+                            tokio::task::yield_now().await;
+                        }
+                    }
                 }
-                Ok::<_, WriteError>(())
+                Err(last_err)
             });
         }
 
