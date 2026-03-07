@@ -20,7 +20,8 @@ use crate::{
         EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
     query::planner::{
-        build_indexed_predicate_plan, IndexedClausePlan, IndexedPredicatePlan, QueryPlanExplain,
+        build_indexed_predicate_plan, IndexedClausePlan, IndexedDisjunctPlan,
+        IndexedPredicatePlan, QueryPlanExplain,
     },
     ram::cell::{OwnedCell, ReadError},
     ram::schema::IndexType,
@@ -219,61 +220,14 @@ impl IndexedDataClient {
         let plan = self
             .indexed_predicate_plan(schema, &selection, order_by_field, limit)
             .await;
-        let residual_selection = self.residual_selection_for_plan(&selection, plan.as_ref());
-        let candidate_ids: Vec<Id> = if let Some(plan) = plan {
+        let (candidate_ids, requires_selection_filter): (Vec<Id>, bool) = if let Some(plan) = plan {
             if plan.is_impossible() {
-                vec![]
-            } else if plan.is_disjunction() {
-                let mut candidate_ids = vec![];
-                for candidate in plan.all() {
-                    let ids = match self.execute_clause_ids(schema, candidate, ordering).await {
-                        Ok(ids) => ids,
-                        Err(_) => {
-                            candidate_ids = self.scan_schema_ids(schema, ordering).await?;
-                            break;
-                        }
-                    };
-                    candidate_ids = union_ids_ordered(candidate_ids, &ids);
-                }
-                sort_ids_by_ordering(&mut candidate_ids, ordering);
-                candidate_ids
+                (vec![], false)
             } else {
-                let ordered_candidates = clause_execution_order(plan.all());
-                let mut candidates = ordered_candidates.iter().copied();
-                if let Some(first) = candidates.next() {
-                    let mut candidate_ids =
-                        match self.execute_clause_ids(schema, first, ordering).await {
-                            Ok(ids) => ids,
-                            Err(_) => self.scan_schema_ids(schema, ordering).await?,
-                        };
-
-                    for candidate in candidates {
-                        let ids = match self.execute_clause_ids(schema, candidate, ordering).await {
-                            Ok(ids) => ids,
-                            Err(_) => {
-                                candidate_ids = self.scan_schema_ids(schema, ordering).await?;
-                                break;
-                            }
-                        };
-                        candidate_ids = intersect_ids_ordered(candidate_ids, &ids);
-                        if candidate_ids.is_empty() {
-                            break;
-                        }
-                    }
-
-                    if !ordered_candidates
-                        .iter()
-                        .any(|candidate| matches!(candidate, IndexedClausePlan::Ranged { .. }))
-                    {
-                        sort_ids_by_ordering(&mut candidate_ids, ordering);
-                    }
-                    candidate_ids
-                } else {
-                    self.scan_schema_ids(schema, ordering).await?
-                }
+                (self.execute_predicate_plan_ids(schema, &plan, ordering).await?, false)
             }
         } else {
-            self.scan_schema_ids(schema, ordering).await?
+            (self.scan_schema_ids(schema, ordering).await?, true)
         };
 
         let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = order_by_field {
@@ -283,9 +237,12 @@ impl IndexedDataClient {
             candidate_ids
         };
 
-        let mut selected_ids = self
-            .filter_ids_by_selection_limit(&ordered_candidate_ids, &residual_selection, limit)
-            .await;
+        let mut selected_ids = if requires_selection_filter {
+            self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, limit)
+                .await
+        } else {
+            ordered_candidate_ids
+        };
         if let Some(limit) = limit {
             selected_ids.truncate(limit);
         }
@@ -528,6 +485,91 @@ impl IndexedDataClient {
         }
     }
 
+    async fn execute_predicate_plan_ids(
+        &self,
+        schema: u32,
+        plan: &IndexedPredicatePlan,
+        ordering: Ordering,
+    ) -> Result<Vec<Id>, RPCError> {
+        let mut all_ids = vec![];
+        for disjunct in plan.disjuncts() {
+            let ids = self.execute_disjunct_ids(schema, disjunct, ordering).await?;
+            all_ids = union_ids_ordered(all_ids, &ids);
+        }
+        if plan.is_disjunction() {
+            sort_ids_by_ordering(&mut all_ids, ordering);
+        }
+        Ok(all_ids)
+    }
+
+    async fn execute_disjunct_ids(
+        &self,
+        schema: u32,
+        disjunct: &IndexedDisjunctPlan,
+        ordering: Ordering,
+    ) -> Result<Vec<Id>, RPCError> {
+        let mut candidate_ids = if disjunct.clauses().is_empty() {
+            self.scan_schema_ids(schema, ordering).await?
+        } else {
+            let ordered_candidates = clause_execution_order(disjunct.clauses());
+            let mut candidates = ordered_candidates.iter().copied();
+            let Some(first) = candidates.next() else {
+                return Ok(vec![]);
+            };
+
+            let mut candidate_ids = match self.execute_clause_ids(schema, first, ordering).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    if Self::is_special_clause(first) {
+                        return Err(e);
+                    }
+                    self.scan_schema_ids(schema, ordering).await?
+                }
+            };
+
+            for candidate in candidates {
+                let ids = match self.execute_clause_ids(schema, candidate, ordering).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        if Self::is_special_clause(candidate) {
+                            return Err(e);
+                        }
+                        candidate_ids = self.scan_schema_ids(schema, ordering).await?;
+                        break;
+                    }
+                };
+                candidate_ids = intersect_ids_ordered(candidate_ids, &ids);
+                if candidate_ids.is_empty() {
+                    break;
+                }
+            }
+
+            if !ordered_candidates
+                .iter()
+                .any(|candidate| matches!(candidate, IndexedClausePlan::Ranged { .. }))
+            {
+                sort_ids_by_ordering(&mut candidate_ids, ordering);
+            }
+            candidate_ids
+        };
+
+        if !disjunct.residual().is_empty() {
+            candidate_ids = self
+                .filter_ids_by_selection_limit(&candidate_ids, disjunct.residual(), None)
+                .await;
+        }
+        Ok(candidate_ids)
+    }
+
+    fn is_special_clause(clause: &IndexedClausePlan) -> bool {
+        match clause {
+            IndexedClausePlan::VectorSimilarity { .. }
+            | IndexedClausePlan::EmbeddingSimilarity { .. }
+            | IndexedClausePlan::FullTextMatch { .. } => true,
+            _ => false,
+        }
+    }
+
     async fn vector_query_ids(
         &self,
         schema: u32,
@@ -604,87 +646,6 @@ impl IndexedDataClient {
                 ))
             })?;
         Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
-    }
-
-    fn residual_selection_for_plan(
-        &self,
-        selection: &Expr,
-        plan: Option<&IndexedPredicatePlan>,
-    ) -> Expr {
-        let Some(plan) = plan else {
-            return selection.clone();
-        };
-
-        if !plan
-            .all()
-            .iter()
-            .any(Self::clause_plan_uses_special_operator)
-        {
-            return selection.clone();
-        }
-
-        if plan.is_disjunction() {
-            return Expr::nothing();
-        }
-
-        Self::strip_special_operator_clauses(selection)
-    }
-
-    fn strip_special_operator_clauses(selection: &Expr) -> Expr {
-        if Self::expr_uses_special_operator(selection) {
-            return Expr::nothing();
-        }
-
-        let Expr::List(items) = selection else {
-            return selection.clone();
-        };
-        if items.is_empty() || !Self::is_symbol_named(&items[0], "and") {
-            return selection.clone();
-        }
-
-        let mut remaining = vec![];
-        for clause in items.iter().skip(1) {
-            if !Self::expr_uses_special_operator(clause) {
-                remaining.push(clause.clone());
-            }
-        }
-
-        if remaining.is_empty() {
-            Expr::nothing()
-        } else if remaining.len() == 1 {
-            remaining[0].clone()
-        } else {
-            let mut exprs = vec![items[0].clone()];
-            exprs.extend(remaining);
-            Expr::List(exprs)
-        }
-    }
-
-    fn clause_plan_uses_special_operator(clause: &IndexedClausePlan) -> bool {
-        match clause {
-            IndexedClausePlan::VectorSimilarity { .. }
-            | IndexedClausePlan::EmbeddingSimilarity { .. }
-            | IndexedClausePlan::FullTextMatch { .. } => true,
-            _ => false,
-        }
-    }
-
-    fn expr_uses_special_operator(expr: &Expr) -> bool {
-        let Expr::List(items) = expr else {
-            return false;
-        };
-        if items.len() != 3 {
-            return false;
-        }
-        Self::is_symbol_named(&items[0], "~") || Self::is_symbol_named(&items[0], "@")
-    }
-
-    fn is_symbol_named(expr: &Expr, name: &str) -> bool {
-        if let Expr::Symbol(id, symbol) = expr {
-            symbol == name || *id == bifrost_hasher::hash_str(name)
-        } else {
-            false
-        }
     }
 
     async fn range_query_ids(

@@ -63,9 +63,16 @@ const DEFAULT_FULLTEXT_LIMIT: usize = 256;
 
 pub(crate) struct IndexedPredicatePlan {
     candidates: Vec<IndexedClausePlan>,
+    disjuncts: Vec<IndexedDisjunctPlan>,
     disjunction: bool,
     impossible: bool,
     explain: Vec<ClauseOrderExplain>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IndexedDisjunctPlan {
+    clauses: Vec<IndexedClausePlan>,
+    residual: Expr,
 }
 
 #[derive(Clone, Debug)]
@@ -129,12 +136,14 @@ impl QueryPlanExplain {
 impl IndexedPredicatePlan {
     pub(crate) fn new(
         candidates: Vec<IndexedClausePlan>,
+        disjuncts: Vec<IndexedDisjunctPlan>,
         disjunction: bool,
         impossible: bool,
         explain: Vec<ClauseOrderExplain>,
     ) -> Self {
         Self {
             candidates,
+            disjuncts,
             disjunction,
             impossible,
             explain,
@@ -153,6 +162,10 @@ impl IndexedPredicatePlan {
         self.impossible
     }
 
+    pub(crate) fn disjuncts(&self) -> &[IndexedDisjunctPlan] {
+        self.disjuncts.as_slice()
+    }
+
     pub(crate) fn explain(&self) -> &[ClauseOrderExplain] {
         self.explain.as_slice()
     }
@@ -163,6 +176,20 @@ impl IndexedPredicatePlan {
             impossible: self.impossible,
             clauses: self.explain,
         }
+    }
+}
+
+impl IndexedDisjunctPlan {
+    fn new(clauses: Vec<IndexedClausePlan>, residual: Expr) -> Self {
+        Self { clauses, residual }
+    }
+
+    pub(crate) fn clauses(&self) -> &[IndexedClausePlan] {
+        self.clauses.as_slice()
+    }
+
+    pub(crate) fn residual(&self) -> &Expr {
+        &self.residual
     }
 }
 
@@ -181,25 +208,115 @@ pub(crate) fn build_indexed_predicate_plan(
     order_by_field: Option<u64>,
     limit: Option<usize>,
 ) -> Option<IndexedPredicatePlan> {
-    let (candidates, disjunction, impossible) =
-        if let Some(disjuncts) = selection_disjuncts(selection) {
-            let mut disj_candidates = Vec::with_capacity(disjuncts.len());
-            for disjunct in disjuncts {
-                let Some(candidate) = indexed_clause_candidate(schema, disjunct) else {
-                    return None;
-                };
-                disj_candidates.push(candidate);
-            }
-            (disj_candidates, true, false)
-        } else {
-            let normalized = normalized_indexed_candidates(schema, selection);
-            (normalized.candidates, false, normalized.impossible)
-        };
-    if candidates.is_empty() && !impossible {
+    if let Some(plan) =
+        build_simple_disjunction_plan(schema, selection, schema_stats, order_by_field, limit)
+    {
+        return Some(plan);
+    }
+
+    let dnf_conjunctions = selection_to_dnf_conjunctions(selection);
+    if dnf_conjunctions.is_empty() {
+        return Some(IndexedPredicatePlan::new(
+            vec![],
+            vec![],
+            false,
+            true,
+            vec![],
+        ));
+    }
+
+    let mut disjuncts = vec![];
+    let mut explain = vec![];
+    for conjunction in dnf_conjunctions {
+        let conjunction_selection = conjunction_expr(&conjunction);
+        let normalized = normalized_indexed_candidates(schema, &conjunction_selection);
+        if normalized.impossible {
+            continue;
+        }
+
+        let residual_clauses = conjunction
+            .iter()
+            .filter(|clause| indexed_clause_candidate(schema, clause).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let residual = conjunction_expr(&residual_clauses);
+
+        let scored = score_candidates(
+            normalized.candidates,
+            false,
+            schema_stats,
+            order_by_field,
+            limit,
+        );
+        let clauses = scored
+            .iter()
+            .map(|(candidate, _, _, _, _)| candidate.clone())
+            .collect::<Vec<_>>();
+        explain.extend(
+            scored
+                .iter()
+                .map(
+                    |(candidate, rows, effective_rows, cost, reason)| ClauseOrderExplain {
+                        clause: candidate.clone(),
+                        estimated_rows: *rows,
+                        effective_rows: *effective_rows,
+                        total_cost: cost.map(|c| c.total_cost),
+                        reason: *reason,
+                    },
+                ),
+        );
+
+        disjuncts.push(IndexedDisjunctPlan::new(clauses, residual));
+    }
+
+    if disjuncts.is_empty() {
+        return Some(IndexedPredicatePlan::new(
+            vec![],
+            vec![],
+            false,
+            true,
+            vec![],
+        ));
+    }
+
+    if disjuncts.iter().all(|disjunct| disjunct.clauses.is_empty()) {
         return None;
     }
-    let scored = score_candidates(candidates, disjunction, schema_stats, order_by_field, limit);
 
+    let disjunction = disjuncts.len() > 1;
+    let candidates = disjuncts
+        .iter()
+        .flat_map(|disjunct| disjunct.clauses.iter().cloned())
+        .collect::<Vec<_>>();
+    Some(IndexedPredicatePlan::new(
+        candidates,
+        disjuncts,
+        disjunction,
+        false,
+        explain,
+    ))
+}
+
+fn build_simple_disjunction_plan(
+    schema: &Schema,
+    selection: &Expr,
+    schema_stats: Option<&SchemaStatistics>,
+    order_by_field: Option<u64>,
+    limit: Option<usize>,
+) -> Option<IndexedPredicatePlan> {
+    let disjuncts = selection_disjuncts(selection)?;
+    let mut disj_candidates = Vec::with_capacity(disjuncts.len());
+    for disjunct in disjuncts {
+        let Some(candidate) = indexed_clause_candidate(schema, disjunct) else {
+            return None;
+        };
+        disj_candidates.push(candidate);
+    }
+    if disj_candidates.is_empty() {
+        return None;
+    }
+
+    let scored = score_candidates(disj_candidates, true, schema_stats, order_by_field, limit);
     let explain = scored
         .iter()
         .map(
@@ -216,10 +333,16 @@ pub(crate) fn build_indexed_predicate_plan(
         .into_iter()
         .map(|(candidate, _, _, _, _)| candidate)
         .collect::<Vec<_>>();
+    let disjunct_plans = candidates
+        .iter()
+        .cloned()
+        .map(|candidate| IndexedDisjunctPlan::new(vec![candidate], Expr::nothing()))
+        .collect::<Vec<_>>();
     Some(IndexedPredicatePlan::new(
         candidates,
-        disjunction,
-        impossible,
+        disjunct_plans,
+        true,
+        false,
         explain,
     ))
 }
@@ -733,6 +856,60 @@ fn selection_disjuncts(selection: &Expr) -> Option<Vec<&Expr>> {
     None
 }
 
+fn selection_to_dnf_conjunctions(selection: &Expr) -> Vec<Vec<Expr>> {
+    let Expr::List(items) = selection else {
+        return vec![vec![selection.clone()]];
+    };
+
+    if items.is_empty() {
+        return vec![];
+    }
+
+    if is_symbol_named(&items[0], "and") {
+        let mut conjunctions = vec![Vec::new()];
+        for child in items.iter().skip(1) {
+            let child_dnf = selection_to_dnf_conjunctions(child);
+            if child_dnf.is_empty() {
+                return vec![];
+            }
+
+            let mut next = Vec::with_capacity(conjunctions.len() * child_dnf.len().max(1));
+            for base in &conjunctions {
+                for child_conjunction in &child_dnf {
+                    let mut merged = Vec::with_capacity(base.len() + child_conjunction.len());
+                    merged.extend(base.iter().cloned());
+                    merged.extend(child_conjunction.iter().cloned());
+                    next.push(merged);
+                }
+            }
+            conjunctions = next;
+        }
+        return conjunctions;
+    }
+
+    if is_symbol_named(&items[0], "or") {
+        let mut disjuncts = vec![];
+        for child in items.iter().skip(1) {
+            disjuncts.extend(selection_to_dnf_conjunctions(child));
+        }
+        return disjuncts;
+    }
+
+    vec![vec![selection.clone()]]
+}
+
+fn conjunction_expr(clauses: &[Expr]) -> Expr {
+    match clauses.len() {
+        0 => Expr::nothing(),
+        1 => clauses[0].clone(),
+        _ => {
+            let mut exprs = vec![Expr::Symbol(hash_str("and"), "and".to_string())];
+            exprs.extend_from_slice(clauses);
+            Expr::List(exprs)
+        }
+    }
+}
+
 fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedClausePlan> {
     let (op, field_id, value) = comparison_clause(clause)?;
     let indices = schema.index_fields.get(&field_id)?;
@@ -1216,6 +1393,197 @@ mod tests {
             .explain()
             .iter()
             .map(ClauseOrderExplain::clause_kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"embedding_similarity"));
+        assert!(kinds.contains(&"hashed_eq"));
+    }
+
+    #[test]
+    fn vector_similarity_requires_vector_payload() {
+        let field = "VEC";
+        let schema = Schema::new_with_id(
+            3009,
+            "planner_vector_operator_payload",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                field,
+                Type::String,
+                vec![IndexType::Vector(VectorIndexConfig::new(
+                    MetricEncoding::Cosine,
+                ))],
+            )]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("~"), "~".to_string()),
+            Expr::Symbol(hash_str(field), field.to_string()),
+            Expr::Value(OwnedValue::String("not a vector".to_string())),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None);
+        assert!(plan.is_none(), "vector ~ should require f32 array payload");
+    }
+
+    #[test]
+    fn fulltext_match_requires_string_payload() {
+        let field = "TEXT";
+        let schema = Schema::new_with_id(
+            3010,
+            "planner_fulltext_operator_payload",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                field,
+                Type::String,
+                vec![IndexType::Fulltext],
+            )]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("@"), "@".to_string()),
+            Expr::Symbol(hash_str(field), field.to_string()),
+            Expr::Value(OwnedValue::U64(42)),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None);
+        assert!(plan.is_none(), "@ should require string payload");
+    }
+
+    #[test]
+    fn nested_and_or_plans_into_multiple_disjuncts() {
+        let field_a = "A";
+        let field_b = "B";
+        let field_c = "C";
+        let schema = Schema::new_with_id(
+            3011,
+            "planner_nested_and_or",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(field_a, Type::U64, vec![IndexType::Hashed]),
+                Field::new_indexed(field_b, Type::U64, vec![IndexType::Hashed]),
+                Field::new_indexed(field_c, Type::U64, vec![IndexType::Hashed]),
+            ]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("and"), "and".to_string()),
+            eq_expr(field_a, 1),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("or"), "or".to_string()),
+                eq_expr(field_b, 2),
+                eq_expr(field_c, 3),
+            ]),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None).unwrap();
+        assert!(plan.is_disjunction());
+        assert_eq!(plan.disjuncts().len(), 2);
+        assert!(plan
+            .disjuncts()
+            .iter()
+            .all(|disjunct| disjunct.clauses().len() == 2));
+    }
+
+    #[test]
+    fn nested_or_and_keeps_fulltext_and_hashed_clauses() {
+        let text_field = "TEXT";
+        let tag_field = "TAG";
+        let schema = Schema::new_with_id(
+            3012,
+            "planner_nested_or_and_special",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(text_field, Type::String, vec![IndexType::Fulltext]),
+                Field::new_indexed(tag_field, Type::String, vec![IndexType::Hashed]),
+            ]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("or"), "or".to_string()),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("and"), "and".to_string()),
+                Expr::List(vec![
+                    Expr::Symbol(hash_str("@"), "@".to_string()),
+                    Expr::Symbol(hash_str(text_field), text_field.to_string()),
+                    Expr::Value(OwnedValue::String("database ranking".to_string())),
+                ]),
+                eq_string_expr(tag_field, "infra"),
+            ]),
+            eq_string_expr(tag_field, "search"),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None).unwrap();
+        assert!(plan.is_disjunction());
+        assert_eq!(plan.disjuncts().len(), 2);
+        let kinds = plan
+            .all()
+            .iter()
+            .map(|clause| match clause {
+                IndexedClausePlan::HashedEq { .. } => "hashed_eq",
+                IndexedClausePlan::Ranged { .. } => "ranged",
+                IndexedClausePlan::VectorSimilarity { .. } => "vector_similarity",
+                IndexedClausePlan::EmbeddingSimilarity { .. } => "embedding_similarity",
+                IndexedClausePlan::FullTextMatch { .. } => "fulltext_match",
+            })
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"fulltext_match"));
+        assert!(kinds.contains(&"hashed_eq"));
+    }
+
+    #[test]
+    fn nested_or_and_keeps_embedding_and_hashed_clauses() {
+        let emb_field = "EMB";
+        let tag_field = "TAG";
+        let schema = Schema::new_with_id(
+            3013,
+            "planner_nested_or_and_embedding",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(
+                    emb_field,
+                    Type::String,
+                    vec![IndexType::Embedding(EmbeddingModel::default_model())],
+                ),
+                Field::new_indexed(tag_field, Type::String, vec![IndexType::Hashed]),
+            ]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("or"), "or".to_string()),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("and"), "and".to_string()),
+                Expr::List(vec![
+                    Expr::Symbol(hash_str("~"), "~".to_string()),
+                    Expr::Symbol(hash_str(emb_field), emb_field.to_string()),
+                    Expr::Value(OwnedValue::String("semantic query".to_string())),
+                ]),
+                eq_string_expr(tag_field, "infra"),
+            ]),
+            eq_string_expr(tag_field, "ops"),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None).unwrap();
+        assert!(plan.is_disjunction());
+        assert_eq!(plan.disjuncts().len(), 2);
+        let kinds = plan
+            .all()
+            .iter()
+            .map(|clause| match clause {
+                IndexedClausePlan::HashedEq { .. } => "hashed_eq",
+                IndexedClausePlan::Ranged { .. } => "ranged",
+                IndexedClausePlan::VectorSimilarity { .. } => "vector_similarity",
+                IndexedClausePlan::EmbeddingSimilarity { .. } => "embedding_similarity",
+                IndexedClausePlan::FullTextMatch { .. } => "fulltext_match",
+            })
             .collect::<Vec<_>>();
         assert!(kinds.contains(&"embedding_similarity"));
         assert!(kinds.contains(&"hashed_eq"));

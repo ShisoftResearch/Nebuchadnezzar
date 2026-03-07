@@ -1,6 +1,11 @@
 use crate::{
     index::builder::IndexBuilder,
+    index::builder::IndexError,
+    index::embedding::{EmbeddingHit, EmbeddingIndexerCore, EmbeddingModel, EmbeddingModelInfo},
     index::ranged::tree::btree::Ordering,
+    index::vector::{
+        HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore,
+    },
     query::data_client::{ValueRange, ValueRangeTerm},
     ram::{
         cell::OwnedCell,
@@ -10,7 +15,177 @@ use crate::{
 };
 use bifrost_hasher::hash_str;
 use dovahkiin::{expr::serde::Expr, integrated::lisp::*, types::*};
-use std::{sync::Arc, time::Instant};
+use futures::{future::BoxFuture, FutureExt};
+use std::{collections::HashMap, sync::Arc, time::Instant};
+
+#[derive(Clone)]
+struct MockVectorIndexerCore {
+    hits_by_field: Arc<HashMap<(u32, u64), Vec<VectorHit>>>,
+    fail_search: bool,
+}
+
+impl MockVectorIndexerCore {
+    fn successful(hits_by_field: HashMap<(u32, u64), Vec<VectorHit>>) -> Self {
+        Self {
+            hits_by_field: Arc::new(hits_by_field),
+            fail_search: false,
+        }
+    }
+
+    fn failing() -> Self {
+        Self {
+            hits_by_field: Arc::new(HashMap::new()),
+            fail_search: true,
+        }
+    }
+}
+
+impl VectorIndexerCore for MockVectorIndexerCore {
+    fn insert(
+        &self,
+        _cell_id: &Id,
+        _schema_id: u32,
+        _field_id: u64,
+        _metric_encoding: MetricEncoding,
+        _hnsw_config: HnswConfig,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn remove(
+        &self,
+        _cell_id: &Id,
+        _schema_id: u32,
+        _field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn search(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        _query_vector: &[f32],
+        limit: usize,
+        _ef_search: Option<u16>,
+    ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>> {
+        let should_fail = self.fail_search;
+        let hits = self
+            .hits_by_field
+            .get(&(schema_id, field_id))
+            .cloned()
+            .unwrap_or_default();
+        async move {
+            if should_fail {
+                Err(IndexError::Other("mock vector failure".to_string()))
+            } else {
+                Ok(hits.into_iter().take(limit).collect())
+            }
+        }
+        .boxed()
+    }
+
+    fn new_index(&self, _schema_id: u32, _field_id: u64) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn new_index_with_config(
+        &self,
+        _schema_id: u32,
+        _field_id: u64,
+        _hnsw_config: HnswConfig,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn delete_index(
+        &self,
+        _schema_id: u32,
+        _field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+}
+
+#[derive(Clone)]
+struct MockEmbeddingIndexerCore {
+    hits_by_field: Arc<HashMap<(u32, u64), Vec<EmbeddingHit>>>,
+}
+
+impl MockEmbeddingIndexerCore {
+    fn successful(hits_by_field: HashMap<(u32, u64), Vec<EmbeddingHit>>) -> Self {
+        Self {
+            hits_by_field: Arc::new(hits_by_field),
+        }
+    }
+}
+
+impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
+    fn list_models(&self) -> BoxFuture<'_, Result<Vec<EmbeddingModelInfo>, IndexError>> {
+        async {
+            Ok(vec![EmbeddingModelInfo {
+                name: "mock-model".to_string(),
+                description: "mock".to_string(),
+                dimensions: 8,
+                max_input_length: Some(512),
+            }])
+        }
+        .boxed()
+    }
+
+    fn insert(
+        &self,
+        _cell_id: &Id,
+        _schema_id: u32,
+        _field_id: u64,
+        _model: &EmbeddingModel,
+        _text: &str,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn remove(
+        &self,
+        _cell_id: &Id,
+        _schema_id: u32,
+        _field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn search(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        _query: &str,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<EmbeddingHit>, IndexError>> {
+        let hits = self
+            .hits_by_field
+            .get(&(schema_id, field_id))
+            .cloned()
+            .unwrap_or_default();
+        async move { Ok(hits.into_iter().take(limit).collect()) }.boxed()
+    }
+
+    fn new_index(
+        &self,
+        _schema_id: u32,
+        _field_id: u64,
+        _model: &EmbeddingModel,
+        _hnsw_config: Option<HnswConfig>,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+
+    fn delete_index(
+        &self,
+        _schema_id: u32,
+        _field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        async { Ok(()) }.boxed()
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_all() {
@@ -2759,6 +2934,817 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
     }
 
     assert_eq!(ids, vec![Id::new(6, 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_supports_text_match_operator_in_or_predicate() {
+    let _ = env_logger::try_init();
+    const TEXT_FIELD: &str = "BODY";
+    const TAG_FIELD: &str = "TAG";
+    let server_addr = String::from("127.0.0.1:6741");
+    let server_group = String::from("query_text_match_or_predicate_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
+        Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
+    ]);
+    let schema_id = 779;
+    let schema = Schema::new_with_id(schema_id, "query_text_match_or_schema", None, fields, false, false);
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let rows = vec![
+        (
+            Id::new(7, 1),
+            "modern database storage engine with ranking support",
+            "docs",
+        ),
+        (Id::new(7, 2), "kitchen recipes and baking tips", "infra"),
+        (
+            Id::new(7, 3),
+            "ranking algorithms for search and bm25 scoring",
+            "search",
+        ),
+    ];
+
+    for (id, body, tag) in &rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
+        value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
+        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("or"), "or".to_string()),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("@"), "@".to_string()),
+            Expr::Symbol(hash_str(TEXT_FIELD), TEXT_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("database ranking".to_string())),
+        ]),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("="), "=".to_string()),
+            Expr::Symbol(hash_str(TAG_FIELD), TAG_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("infra".to_string())),
+        ]),
+    ]);
+
+    let mut cursor = idx_data_client
+        .query_ids(schema_id, selection, Ordering::Forward)
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(7, 1), Id::new(7, 2), Id::new(7, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
+    let _ = env_logger::try_init();
+    const TEXT_FIELD: &str = "BODY";
+    const SCORE_FIELD: &str = "SCORE";
+    let server_addr = String::from("127.0.0.1:6742");
+    let server_group = String::from("query_text_match_order_by_field_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
+        Field::new_indexed(SCORE_FIELD, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 780;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_text_match_ordered_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let rows = vec![
+        (
+            Id::new(8, 1),
+            "distributed database ranking pipeline",
+            30u64,
+        ),
+        (
+            Id::new(8, 2),
+            "database ranking for analysts",
+            10u64,
+        ),
+        (
+            Id::new(8, 3),
+            "ranking reports and database metrics",
+            20u64,
+        ),
+        (Id::new(8, 4), "kitchen recipes and baking", 5u64),
+    ];
+
+    for (id, body, score) in &rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
+        value[SCORE_FIELD] = OwnedValue::U64(*score);
+        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("@"), "@".to_string()),
+        Expr::Symbol(hash_str(TEXT_FIELD), TEXT_FIELD.to_string()),
+        Expr::Value(OwnedValue::String("database ranking".to_string())),
+    ]);
+
+    let mut cursor = idx_data_client
+        .query_ids_with_options(
+            schema_id,
+            selection,
+            Ordering::Forward,
+            Some(hash_str(SCORE_FIELD)),
+            Some(2),
+        )
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(8, 2), Id::new(8, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
+    let _ = env_logger::try_init();
+    const TEXT_FIELD: &str = "BODY";
+    const TAG_FIELD: &str = "TAG";
+    const STATE_FIELD: &str = "STATE";
+    const NOTE_FIELD: &str = "NOTE";
+    let server_addr = String::from("127.0.0.1:6743");
+    let server_group = String::from("query_nested_and_or_text_match_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
+        Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
+        Field::new_indexed(STATE_FIELD, Type::String, vec![IndexType::Hashed]),
+        Field::new_unindexed(NOTE_FIELD, Type::String),
+    ]);
+    let schema_id = 781;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_nested_and_or_text_match_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let rows = vec![
+        (
+            Id::new(9, 1),
+            "database ranking and scoring",
+            "infra",
+            "active",
+            "keep",
+        ),
+        (Id::new(9, 2), "kitchen recipes", "ops", "active", "keep"),
+        (
+            Id::new(9, 3),
+            "database ranking handbook",
+            "infra",
+            "inactive",
+            "keep",
+        ),
+        (Id::new(9, 4), "distributed systems", "ops", "active", "drop"),
+        (Id::new(9, 5), "travel notes", "docs", "active", "keep"),
+    ];
+
+    for (id, body, tag, state, note) in &rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
+        value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
+        value[STATE_FIELD] = OwnedValue::String((*state).to_string());
+        value[NOTE_FIELD] = OwnedValue::String((*note).to_string());
+        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("and"), "and".to_string()),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("or"), "or".to_string()),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("@"), "@".to_string()),
+                Expr::Symbol(hash_str(TEXT_FIELD), TEXT_FIELD.to_string()),
+                Expr::Value(OwnedValue::String("database ranking".to_string())),
+            ]),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("="), "=".to_string()),
+                Expr::Symbol(hash_str(TAG_FIELD), TAG_FIELD.to_string()),
+                Expr::Value(OwnedValue::String("ops".to_string())),
+            ]),
+        ]),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("="), "=".to_string()),
+            Expr::Symbol(hash_str(STATE_FIELD), STATE_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("active".to_string())),
+        ]),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("="), "=".to_string()),
+            Expr::Symbol(hash_str(NOTE_FIELD), NOTE_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("keep".to_string())),
+        ]),
+    ]);
+
+    let mut cursor = idx_data_client
+        .query_ids(schema_id, selection, Ordering::Forward)
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(9, 1), Id::new(9, 2)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_with_options_supports_nested_or_and_order_limit() {
+    let _ = env_logger::try_init();
+    const TEXT_FIELD: &str = "BODY";
+    const TAG_FIELD: &str = "TAG";
+    const SCORE_FIELD: &str = "SCORE";
+    let server_addr = String::from("127.0.0.1:6744");
+    let server_group = String::from("query_nested_or_and_order_limit_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
+        Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
+        Field::new_indexed(SCORE_FIELD, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 782;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_nested_or_and_ordered_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let rows = vec![
+        (Id::new(10, 1), "database ranking deep dive", "infra", 30u64),
+        (Id::new(10, 2), "ranking notes", "infra", 10u64),
+        (Id::new(10, 3), "operations handbook", "ops", 20u64),
+        (Id::new(10, 4), "ops runbook", "ops", 5u64),
+        (Id::new(10, 5), "travel guide", "docs", 50u64),
+    ];
+
+    for (id, body, tag, score) in &rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
+        value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
+        value[SCORE_FIELD] = OwnedValue::U64(*score);
+        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("or"), "or".to_string()),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("and"), "and".to_string()),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("@"), "@".to_string()),
+                Expr::Symbol(hash_str(TEXT_FIELD), TEXT_FIELD.to_string()),
+                Expr::Value(OwnedValue::String("database ranking".to_string())),
+            ]),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("="), "=".to_string()),
+                Expr::Symbol(hash_str(TAG_FIELD), TAG_FIELD.to_string()),
+                Expr::Value(OwnedValue::String("infra".to_string())),
+            ]),
+        ]),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("and"), "and".to_string()),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("="), "=".to_string()),
+                Expr::Symbol(hash_str(TAG_FIELD), TAG_FIELD.to_string()),
+                Expr::Value(OwnedValue::String("ops".to_string())),
+            ]),
+            Expr::List(vec![
+                Expr::Symbol(hash_str(">="), ">=".to_string()),
+                Expr::Symbol(hash_str(SCORE_FIELD), SCORE_FIELD.to_string()),
+                Expr::Value(OwnedValue::U64(0)),
+            ]),
+        ]),
+    ]);
+
+    let mut cursor = idx_data_client
+        .query_ids_with_options(
+            schema_id,
+            selection,
+            Ordering::Forward,
+            Some(hash_str(SCORE_FIELD)),
+            Some(3),
+        )
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(10, 4), Id::new(10, 2), Id::new(10, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
+    let _ = env_logger::try_init();
+    const VEC_FIELD: &str = "VEC";
+    const TAG_FIELD: &str = "TAG";
+    let schema_id = 783;
+    let server_addr = String::from("127.0.0.1:6745");
+    let server_group = String::from("query_vector_similarity_and_filter_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let vector_field_id = hash_str(VEC_FIELD);
+    let mut vector_hits = HashMap::new();
+    vector_hits.insert(
+        (schema_id, vector_field_id),
+        vec![
+            VectorHit {
+                id: Id::new(11, 1),
+                score: 0.98,
+            },
+            VectorHit {
+                id: Id::new(11, 2),
+                score: 0.90,
+            },
+        ],
+    );
+    assert!(server
+        .indexer
+        .as_ref()
+        .unwrap()
+        .clients
+        .vector_client
+        .set_vector_index_core(MockVectorIndexerCore::successful(vector_hits)));
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(
+            VEC_FIELD,
+            Type::String,
+            vec![IndexType::Vector(VectorIndexConfig::new(MetricEncoding::Cosine))],
+        ),
+        Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
+    ]);
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_vector_similarity_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (id, tag) in &[(Id::new(11, 1), "infra"), (Id::new(11, 2), "ops"), (Id::new(11, 3), "infra")] {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[VEC_FIELD] = OwnedValue::String("placeholder".to_string());
+        value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("and"), "and".to_string()),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("~"), "~".to_string()),
+            Expr::Symbol(vector_field_id, VEC_FIELD.to_string()),
+            Expr::Value(OwnedValue::PrimArray(OwnedPrimArray::F32(vec![0.1, 0.2, 0.3]))),
+        ]),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("="), "=".to_string()),
+            Expr::Symbol(hash_str(TAG_FIELD), TAG_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("infra".to_string())),
+        ]),
+    ]);
+
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, Ordering::Forward)
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(11, 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
+    let _ = env_logger::try_init();
+    const EMB_FIELD: &str = "EMB";
+    const TAG_FIELD: &str = "TAG";
+    const NOTE_FIELD: &str = "NOTE";
+    let schema_id = 784;
+    let server_addr = String::from("127.0.0.1:6746");
+    let server_group = String::from("query_embedding_similarity_nested_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let embedding_field_id = hash_str(EMB_FIELD);
+    let mut embedding_hits = HashMap::new();
+    embedding_hits.insert(
+        (schema_id, embedding_field_id),
+        vec![
+            EmbeddingHit {
+                id: Id::new(12, 1),
+                score: 0.97,
+            },
+            EmbeddingHit {
+                id: Id::new(12, 3),
+                score: 0.86,
+            },
+        ],
+    );
+    assert!(server
+        .indexer
+        .as_ref()
+        .unwrap()
+        .clients
+        .embedding_client
+        .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits)));
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(
+            EMB_FIELD,
+            Type::String,
+            vec![IndexType::Embedding(EmbeddingModel::default_model())],
+        ),
+        Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
+        Field::new_unindexed(NOTE_FIELD, Type::String),
+    ]);
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_embedding_similarity_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let rows = vec![
+        (Id::new(12, 1), "infra", "keep"),
+        (Id::new(12, 2), "ops", "keep"),
+        (Id::new(12, 3), "infra", "drop"),
+        (Id::new(12, 4), "docs", "keep"),
+    ];
+    for (id, tag, note) in &rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[EMB_FIELD] = OwnedValue::String("placeholder text".to_string());
+        value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
+        value[NOTE_FIELD] = OwnedValue::String((*note).to_string());
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("and"), "and".to_string()),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("or"), "or".to_string()),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("~"), "~".to_string()),
+                Expr::Symbol(embedding_field_id, EMB_FIELD.to_string()),
+                Expr::Value(OwnedValue::String("semantic ranking".to_string())),
+            ]),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("="), "=".to_string()),
+                Expr::Symbol(hash_str(TAG_FIELD), TAG_FIELD.to_string()),
+                Expr::Value(OwnedValue::String("ops".to_string())),
+            ]),
+        ]),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("="), "=".to_string()),
+            Expr::Symbol(hash_str(NOTE_FIELD), NOTE_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("keep".to_string())),
+        ]),
+    ]);
+
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, Ordering::Forward)
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(12, 1), Id::new(12, 2)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_returns_error_when_vector_similarity_search_fails() {
+    let _ = env_logger::try_init();
+    const VEC_FIELD: &str = "VEC";
+    let schema_id = 785;
+    let server_addr = String::from("127.0.0.1:6747");
+    let server_group = String::from("query_vector_similarity_failure_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    assert!(server
+        .indexer
+        .as_ref()
+        .unwrap()
+        .clients
+        .vector_client
+        .set_vector_index_core(MockVectorIndexerCore::failing()));
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        VEC_FIELD,
+        Type::String,
+        vec![IndexType::Vector(VectorIndexConfig::new(MetricEncoding::Cosine))],
+    )]);
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_vector_similarity_failure_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let mut value = OwnedValue::Map(OwnedMap::new());
+    value[VEC_FIELD] = OwnedValue::String("placeholder".to_string());
+    client
+        .write_cell(OwnedCell::new_with_id(schema_id, &Id::new(13, 1), value))
+        .await
+        .unwrap()
+        .unwrap();
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("~"), "~".to_string()),
+        Expr::Symbol(hash_str(VEC_FIELD), VEC_FIELD.to_string()),
+        Expr::Value(OwnedValue::PrimArray(OwnedPrimArray::F32(vec![0.1, 0.2]))),
+    ]);
+
+    let query_res = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, Ordering::Forward)
+        .await;
+    assert!(query_res.is_err(), "expected vector similarity query failure");
 }
 
 #[tokio::test(flavor = "multi_thread")]
