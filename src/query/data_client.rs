@@ -219,7 +219,8 @@ impl IndexedDataClient {
         let plan = self
             .indexed_predicate_plan(schema, &selection, order_by_field, limit)
             .await;
-        let candidate_ids = if let Some(plan) = plan {
+        let residual_selection = self.residual_selection_for_plan(&selection, plan.as_ref());
+        let candidate_ids: Vec<Id> = if let Some(plan) = plan {
             if plan.is_impossible() {
                 vec![]
             } else if plan.is_disjunction() {
@@ -275,7 +276,7 @@ impl IndexedDataClient {
             self.scan_schema_ids(schema, ordering).await?
         };
 
-        let ordered_candidate_ids = if let Some(field_id) = order_by_field {
+        let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = order_by_field {
             self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering)
                 .await?
         } else {
@@ -283,7 +284,7 @@ impl IndexedDataClient {
         };
 
         let mut selected_ids = self
-            .filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, limit)
+            .filter_ids_by_selection_limit(&ordered_candidate_ids, &residual_selection, limit)
             .await;
         if let Some(limit) = limit {
             selected_ids.truncate(limit);
@@ -502,6 +503,187 @@ impl IndexedDataClient {
                 self.range_query_ids(schema, *field_id, range, ordering)
                     .await
             }
+            IndexedClausePlan::VectorSimilarity {
+                field_id,
+                query,
+                limit,
+            } => self.vector_query_ids(schema, *field_id, query.as_slice(), *limit).await,
+            IndexedClausePlan::EmbeddingSimilarity {
+                field_id,
+                query,
+                limit,
+            } => {
+                self.embedding_query_ids(schema, *field_id, query.as_str(), *limit)
+                    .await
+            }
+            IndexedClausePlan::FullTextMatch {
+                field_id,
+                query,
+                limit,
+                phrase_boost,
+            } => {
+                self.fulltext_query_ids(schema, *field_id, query.as_str(), *limit, *phrase_boost)
+                    .await
+            }
+        }
+    }
+
+    async fn vector_query_ids(
+        &self,
+        schema: u32,
+        field_id: u64,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> Result<Vec<Id>, RPCError> {
+        if !self.index_clients.vector_client.is_vector_index_core_set() {
+            return Err(RPCError::IOError(io::Error::new(
+                io::ErrorKind::Other,
+                "Vector indexer core is not available",
+            )));
+        }
+        let hits = self
+            .index_clients
+            .vector_client
+            .search(schema, field_id, query_vector, limit.max(1), None)
+            .await
+            .map_err(|e| {
+                RPCError::IOError(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Vector search error: {:?}", e),
+                ))
+            })?;
+        Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
+    }
+
+    async fn embedding_query_ids(
+        &self,
+        schema: u32,
+        field_id: u64,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Id>, RPCError> {
+        if !self
+            .index_clients
+            .embedding_client
+            .is_embedding_index_core_set()
+        {
+            return Err(RPCError::IOError(io::Error::new(
+                io::ErrorKind::Other,
+                "Embedding indexer core is not available",
+            )));
+        }
+        let hits = self
+            .index_clients
+            .embedding_client
+            .search(schema, field_id, query, limit.max(1))
+            .await
+            .map_err(|e| {
+                RPCError::IOError(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Embedding search error: {:?}", e),
+                ))
+            })?;
+        Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
+    }
+
+    async fn fulltext_query_ids(
+        &self,
+        schema: u32,
+        field_id: u64,
+        query: &str,
+        limit: usize,
+        phrase_boost: bool,
+    ) -> Result<Vec<Id>, RPCError> {
+        let hits = self
+            .bm25_search(schema, field_id, query, limit.max(1), phrase_boost)
+            .await?
+            .map_err(|e| {
+                RPCError::IOError(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Full-text search error: {:?}", e),
+                ))
+            })?;
+        Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
+    }
+
+    fn residual_selection_for_plan(
+        &self,
+        selection: &Expr,
+        plan: Option<&IndexedPredicatePlan>,
+    ) -> Expr {
+        let Some(plan) = plan else {
+            return selection.clone();
+        };
+
+        if !plan
+            .all()
+            .iter()
+            .any(Self::clause_plan_uses_special_operator)
+        {
+            return selection.clone();
+        }
+
+        if plan.is_disjunction() {
+            return Expr::nothing();
+        }
+
+        Self::strip_special_operator_clauses(selection)
+    }
+
+    fn strip_special_operator_clauses(selection: &Expr) -> Expr {
+        if Self::expr_uses_special_operator(selection) {
+            return Expr::nothing();
+        }
+
+        let Expr::List(items) = selection else {
+            return selection.clone();
+        };
+        if items.is_empty() || !Self::is_symbol_named(&items[0], "and") {
+            return selection.clone();
+        }
+
+        let mut remaining = vec![];
+        for clause in items.iter().skip(1) {
+            if !Self::expr_uses_special_operator(clause) {
+                remaining.push(clause.clone());
+            }
+        }
+
+        if remaining.is_empty() {
+            Expr::nothing()
+        } else if remaining.len() == 1 {
+            remaining[0].clone()
+        } else {
+            let mut exprs = vec![items[0].clone()];
+            exprs.extend(remaining);
+            Expr::List(exprs)
+        }
+    }
+
+    fn clause_plan_uses_special_operator(clause: &IndexedClausePlan) -> bool {
+        match clause {
+            IndexedClausePlan::VectorSimilarity { .. }
+            | IndexedClausePlan::EmbeddingSimilarity { .. }
+            | IndexedClausePlan::FullTextMatch { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn expr_uses_special_operator(expr: &Expr) -> bool {
+        let Expr::List(items) = expr else {
+            return false;
+        };
+        if items.len() != 3 {
+            return false;
+        }
+        Self::is_symbol_named(&items[0], "~") || Self::is_symbol_named(&items[0], "@")
+    }
+
+    fn is_symbol_named(expr: &Expr, name: &str) -> bool {
+        if let Expr::Symbol(id, symbol) = expr {
+            symbol == name || *id == bifrost_hasher::hash_str(name)
+        } else {
+            false
         }
     }
 

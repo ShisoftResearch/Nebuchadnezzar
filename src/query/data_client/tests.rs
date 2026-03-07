@@ -2656,6 +2656,112 @@ async fn bm25_search_returns_ranked_results() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn query_ids_supports_text_match_operator_with_residual_filter() {
+    let _ = env_logger::try_init();
+    const TEXT_FIELD: &str = "BODY";
+    const TAG_FIELD: &str = "TAG";
+    let server_addr = String::from("127.0.0.1:6740");
+    let server_group = String::from("query_text_match_operator_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
+        Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
+    ]);
+    let schema_id = 778;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_text_match_operator_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let rows = vec![
+        (
+            Id::new(6, 1),
+            "modern database storage engine with ranking support",
+            "infra",
+        ),
+        (
+            Id::new(6, 2),
+            "ranking algorithms for search and bm25 scoring",
+            "search",
+        ),
+        (Id::new(6, 3), "kitchen recipes and baking tips", "infra"),
+    ];
+
+    for (id, body, tag) in &rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
+        value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
+        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("and"), "and".to_string()),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("@"), "@".to_string()),
+            Expr::Symbol(hash_str(TEXT_FIELD), TEXT_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("database ranking".to_string())),
+        ]),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("="), "=".to_string()),
+            Expr::Symbol(hash_str(TAG_FIELD), TAG_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("infra".to_string())),
+        ]),
+    ]);
+
+    let mut cursor = idx_data_client
+        .query_ids(schema_id, selection, Ordering::Forward)
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(6, 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn bench_scan_by_expr_vs_scan_all_and() {
     const DATA_1: &str = "DATA_1";

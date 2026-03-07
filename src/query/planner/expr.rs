@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use bifrost_hasher::hash_str;
-use dovahkiin::{expr::serde::Expr, types::OwnedValue};
+use dovahkiin::{
+    expr::serde::Expr,
+    types::{OwnedPrimArray, OwnedValue},
+};
 
 use crate::{
     query::{
@@ -23,13 +26,40 @@ enum ClauseOp {
     Ge,
     Lt,
     Le,
+    Similar,
+    TextMatch,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum IndexedClausePlan {
-    HashedEq { field_id: u64, value: OwnedValue },
-    Ranged { field_id: u64, range: ValueRange },
+    HashedEq {
+        field_id: u64,
+        value: OwnedValue,
+    },
+    Ranged {
+        field_id: u64,
+        range: ValueRange,
+    },
+    VectorSimilarity {
+        field_id: u64,
+        query: Vec<f32>,
+        limit: usize,
+    },
+    EmbeddingSimilarity {
+        field_id: u64,
+        query: String,
+        limit: usize,
+    },
+    FullTextMatch {
+        field_id: u64,
+        query: String,
+        limit: usize,
+        phrase_boost: bool,
+    },
 }
+
+const DEFAULT_SIMILARITY_LIMIT: usize = 256;
+const DEFAULT_FULLTEXT_LIMIT: usize = 256;
 
 pub(crate) struct IndexedPredicatePlan {
     candidates: Vec<IndexedClausePlan>,
@@ -75,6 +105,9 @@ impl ClauseOrderExplain {
         match self.clause {
             IndexedClausePlan::HashedEq { .. } => "hashed_eq",
             IndexedClausePlan::Ranged { .. } => "ranged",
+            IndexedClausePlan::VectorSimilarity { .. } => "vector_similarity",
+            IndexedClausePlan::EmbeddingSimilarity { .. } => "embedding_similarity",
+            IndexedClausePlan::FullTextMatch { .. } => "fulltext_match",
         }
     }
 }
@@ -369,6 +402,17 @@ fn candidate_plan_cost_for_or(
             limit,
             false,
         )),
+        IndexedClausePlan::VectorSimilarity { .. }
+        | IndexedClausePlan::EmbeddingSimilarity { .. }
+        | IndexedClausePlan::FullTextMatch { .. } => Some(estimate_clause_plan_cost(
+            false,
+            false,
+            false,
+            false,
+            rows.max(marginal_rows),
+            limit,
+            false,
+        )),
     }
 }
 
@@ -392,6 +436,9 @@ fn estimate_candidate_rows(
                     .estimated_rows,
             )
         }
+        IndexedClausePlan::VectorSimilarity { .. } => Some((stats.count / 12).max(1)),
+        IndexedClausePlan::EmbeddingSimilarity { .. } => Some((stats.count / 10).max(1)),
+        IndexedClausePlan::FullTextMatch { .. } => Some((stats.count / 8).max(1)),
     }
 }
 
@@ -421,6 +468,11 @@ fn candidate_plan_cost(
             limit,
             order_aligned,
         ),
+        IndexedClausePlan::VectorSimilarity { .. }
+        | IndexedClausePlan::EmbeddingSimilarity { .. }
+        | IndexedClausePlan::FullTextMatch { .. } => {
+            estimate_clause_plan_cost(false, false, false, false, estimated_rows, limit, false)
+        }
     }
 }
 
@@ -436,6 +488,9 @@ fn clause_priority(candidate: &IndexedClausePlan) -> u8 {
             matches!(range.start, ValueRangeTerm::Open),
             matches!(range.end, ValueRangeTerm::Open),
         ),
+        IndexedClausePlan::VectorSimilarity { .. }
+        | IndexedClausePlan::EmbeddingSimilarity { .. } => 85,
+        IndexedClausePlan::FullTextMatch { .. } => 60,
     }
 }
 
@@ -454,6 +509,7 @@ struct NormalizedCandidates {
 fn normalized_indexed_candidates(schema: &Schema, selection: &Expr) -> NormalizedCandidates {
     let mut hashed_eq_by_field: HashMap<u64, OwnedValue> = HashMap::new();
     let mut range_by_field: HashMap<u64, ValueRange> = HashMap::new();
+    let mut extra_candidates = vec![];
 
     for clause in selection_conjuncts(selection) {
         let Some(candidate) = indexed_clause_candidate(schema, clause) else {
@@ -504,10 +560,17 @@ fn normalized_indexed_candidates(schema: &Schema, selection: &Expr) -> Normalize
                     range_by_field.insert(field_id, range);
                 }
             }
+            IndexedClausePlan::VectorSimilarity { .. }
+            | IndexedClausePlan::EmbeddingSimilarity { .. }
+            | IndexedClausePlan::FullTextMatch { .. } => {
+                extra_candidates.push(candidate);
+            }
         }
     }
 
-    let mut candidates = Vec::with_capacity(hashed_eq_by_field.len() + range_by_field.len());
+    let mut candidates = Vec::with_capacity(
+        hashed_eq_by_field.len() + range_by_field.len() + extra_candidates.len(),
+    );
     for (field_id, value) in hashed_eq_by_field {
         candidates.push(IndexedClausePlan::HashedEq { field_id, value });
     }
@@ -519,6 +582,7 @@ fn normalized_indexed_candidates(schema: &Schema, selection: &Expr) -> Normalize
             candidates.push(IndexedClausePlan::Ranged { field_id, range });
         }
     }
+    candidates.extend(extra_candidates);
     NormalizedCandidates {
         candidates,
         impossible: false,
@@ -541,6 +605,9 @@ fn clause_selectivity_cost(candidate: &IndexedClausePlan) -> u8 {
                 16
             }
         }
+        IndexedClausePlan::VectorSimilarity { .. }
+        | IndexedClausePlan::EmbeddingSimilarity { .. } => 6,
+        IndexedClausePlan::FullTextMatch { .. } => 10,
     }
 }
 
@@ -672,6 +739,13 @@ fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedCla
 
     let supports_hashed = indices.iter().any(|idx| matches!(idx, IndexType::Hashed));
     let supports_ranged = indices.iter().any(|idx| matches!(idx, IndexType::Ranged));
+    let supports_vector = indices
+        .iter()
+        .any(|idx| matches!(idx, IndexType::Vector(_)));
+    let supports_embedding = indices
+        .iter()
+        .any(|idx| matches!(idx, IndexType::Embedding(_)));
+    let supports_fulltext = indices.iter().any(|idx| matches!(idx, IndexType::Fulltext));
 
     if supports_hashed && matches!(op, ClauseOp::Eq) {
         return Some(IndexedClausePlan::HashedEq { field_id, value });
@@ -699,8 +773,41 @@ fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedCla
                 start: ValueRangeTerm::Open,
                 end: ValueRangeTerm::Inclusive(value.shared().feature()),
             },
+            ClauseOp::Similar | ClauseOp::TextMatch => return None,
         };
         return Some(IndexedClausePlan::Ranged { field_id, range });
+    }
+
+    if matches!(op, ClauseOp::Similar) {
+        if supports_embedding {
+            if let Some(query) = owned_value_string(&value) {
+                return Some(IndexedClausePlan::EmbeddingSimilarity {
+                    field_id,
+                    query,
+                    limit: DEFAULT_SIMILARITY_LIMIT,
+                });
+            }
+        }
+        if supports_vector {
+            if let Some(query) = owned_value_f32_vector(&value) {
+                return Some(IndexedClausePlan::VectorSimilarity {
+                    field_id,
+                    query,
+                    limit: DEFAULT_SIMILARITY_LIMIT,
+                });
+            }
+        }
+    }
+
+    if matches!(op, ClauseOp::TextMatch) && supports_fulltext {
+        if let Some(query) = owned_value_string(&value) {
+            return Some(IndexedClausePlan::FullTextMatch {
+                field_id,
+                query,
+                limit: DEFAULT_FULLTEXT_LIMIT,
+                phrase_boost: true,
+            });
+        }
     }
 
     None
@@ -739,6 +846,10 @@ fn parse_clause_op(expr: &Expr) -> Option<ClauseOp> {
         Some(ClauseOp::Lt)
     } else if is_symbol_named(expr, "<=") {
         Some(ClauseOp::Le)
+    } else if is_symbol_named(expr, "~") {
+        Some(ClauseOp::Similar)
+    } else if is_symbol_named(expr, "@") {
+        Some(ClauseOp::TextMatch)
     } else {
         None
     }
@@ -751,6 +862,23 @@ fn reverse_op(op: ClauseOp) -> ClauseOp {
         ClauseOp::Ge => ClauseOp::Le,
         ClauseOp::Lt => ClauseOp::Gt,
         ClauseOp::Le => ClauseOp::Ge,
+        ClauseOp::Similar => ClauseOp::Similar,
+        ClauseOp::TextMatch => ClauseOp::TextMatch,
+    }
+}
+
+fn owned_value_string(value: &OwnedValue) -> Option<String> {
+    if let OwnedValue::String(query) = value {
+        Some(query.clone())
+    } else {
+        None
+    }
+}
+
+fn owned_value_f32_vector(value: &OwnedValue) -> Option<Vec<f32>> {
+    match value {
+        OwnedValue::PrimArray(OwnedPrimArray::F32(values)) => Some(values.clone()),
+        _ => None,
     }
 }
 
@@ -781,9 +909,12 @@ fn is_symbol_named(expr: &Expr, name: &str) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use dovahkiin::types::{OwnedValue, Type};
+    use dovahkiin::types::{OwnedPrimArray, OwnedValue, Type};
 
-    use crate::ram::schema::{Field, IndexType, Schema};
+    use crate::{
+        index::{embedding::EmbeddingModel, vector::MetricEncoding, vector::VectorIndexConfig},
+        ram::schema::{Field, IndexType, Schema},
+    };
 
     use super::*;
 
@@ -928,11 +1059,181 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plan_supports_fulltext_operator() {
+        let field = "TEXT";
+        let schema = Schema::new_with_id(
+            3004,
+            "planner_fulltext_operator",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                field,
+                Type::String,
+                vec![IndexType::Fulltext],
+            )]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("@"), "@".to_string()),
+            Expr::Symbol(hash_str(field), field.to_string()),
+            Expr::Value(OwnedValue::String("ranking database".to_string())),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None).unwrap();
+        assert_eq!(plan.explain()[0].clause_kind(), "fulltext_match");
+    }
+
+    #[test]
+    fn plan_supports_embedding_similarity_operator() {
+        let field = "EMB";
+        let schema = Schema::new_with_id(
+            3005,
+            "planner_embedding_operator",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                field,
+                Type::String,
+                vec![IndexType::Embedding(EmbeddingModel::default_model())],
+            )]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("~"), "~".to_string()),
+            Expr::Symbol(hash_str(field), field.to_string()),
+            Expr::Value(OwnedValue::String("semantic query".to_string())),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None).unwrap();
+        assert_eq!(plan.explain()[0].clause_kind(), "embedding_similarity");
+    }
+
+    #[test]
+    fn plan_supports_vector_similarity_operator() {
+        let field = "VEC";
+        let schema = Schema::new_with_id(
+            3006,
+            "planner_vector_operator",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                field,
+                Type::String,
+                vec![IndexType::Vector(VectorIndexConfig::new(
+                    MetricEncoding::Cosine,
+                ))],
+            )]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("~"), "~".to_string()),
+            Expr::Symbol(hash_str(field), field.to_string()),
+            Expr::Value(OwnedValue::PrimArray(OwnedPrimArray::F32(vec![
+                0.1, 0.2, 0.3,
+            ]))),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None).unwrap();
+        assert_eq!(plan.explain()[0].clause_kind(), "vector_similarity");
+    }
+
+    #[test]
+    fn disjunction_plan_supports_fulltext_and_hashed_clauses() {
+        let text_field = "TEXT";
+        let tag_field = "TAG";
+        let schema = Schema::new_with_id(
+            3007,
+            "planner_fulltext_or_hashed",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(text_field, Type::String, vec![IndexType::Fulltext]),
+                Field::new_indexed(tag_field, Type::String, vec![IndexType::Hashed]),
+            ]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("or"), "or".to_string()),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("@"), "@".to_string()),
+                Expr::Symbol(hash_str(text_field), text_field.to_string()),
+                Expr::Value(OwnedValue::String("database ranking".to_string())),
+            ]),
+            eq_string_expr(tag_field, "infra"),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, Some(20)).unwrap();
+        assert!(plan.is_disjunction());
+        assert_eq!(plan.explain().len(), 2);
+        let kinds = plan
+            .explain()
+            .iter()
+            .map(ClauseOrderExplain::clause_kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"fulltext_match"));
+        assert!(kinds.contains(&"hashed_eq"));
+    }
+
+    #[test]
+    fn conjunction_plan_supports_embedding_and_hashed_clauses() {
+        let emb_field = "EMB";
+        let tag_field = "TAG";
+        let schema = Schema::new_with_id(
+            3008,
+            "planner_embedding_and_hashed",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(
+                    emb_field,
+                    Type::String,
+                    vec![IndexType::Embedding(EmbeddingModel::default_model())],
+                ),
+                Field::new_indexed(tag_field, Type::String, vec![IndexType::Hashed]),
+            ]),
+            false,
+            false,
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("and"), "and".to_string()),
+            Expr::List(vec![
+                Expr::Symbol(hash_str("~"), "~".to_string()),
+                Expr::Symbol(hash_str(emb_field), emb_field.to_string()),
+                Expr::Value(OwnedValue::String("semantic query".to_string())),
+            ]),
+            eq_string_expr(tag_field, "infra"),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None).unwrap();
+        assert!(!plan.is_disjunction());
+        assert_eq!(plan.explain().len(), 2);
+        let kinds = plan
+            .explain()
+            .iter()
+            .map(ClauseOrderExplain::clause_kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&"embedding_similarity"));
+        assert!(kinds.contains(&"hashed_eq"));
+    }
+
     fn eq_expr(field: &str, value: u64) -> Expr {
         Expr::List(vec![
             Expr::Symbol(hash_str("="), "=".to_string()),
             Expr::Symbol(hash_str(field), field.to_string()),
             Expr::Value(OwnedValue::U64(value)),
+        ])
+    }
+
+    fn eq_string_expr(field: &str, value: &str) -> Expr {
+        Expr::List(vec![
+            Expr::Symbol(hash_str("="), "=".to_string()),
+            Expr::Symbol(hash_str(field), field.to_string()),
+            Expr::Value(OwnedValue::String(value.to_string())),
         ])
     }
 
