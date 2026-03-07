@@ -23,7 +23,7 @@ impl CostFunction for RangeIndexCost {
         let range = range?;
         let start_index = range.start.pos_of(field_histo).unwrap_or(0);
         let end_index = range.end.pos_of(field_histo).unwrap_or(field_histo.len());
-        let width = end_index - start_index;
+        let width = end_index.saturating_sub(start_index);
         let ratio = (width as f64) / (field_histo.len() as f64);
         let row_count = (ratio * (num_all_rows as f64)) as usize;
         let row_bytes = row_bytes(schema, &projection, &self.server, &stat)?;

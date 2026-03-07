@@ -57,9 +57,12 @@ impl ChunkStatistics {
     }
     pub fn refresh_from_chunk(&self, chunk: &Chunk) {
         let last_update = self.timestamp.load(Ordering::Relaxed);
-        let refresh_changes = self.changes.fetch_add(1, Ordering::Relaxed);
-        // Refresh rate 10 seconds
+        let refresh_changes = self.changes.fetch_add(1, Ordering::Relaxed) + 1;
         if refresh_changes < REFRESH_CHANGES_THRESHOLD || now() - last_update < 10 {
+            return;
+        }
+        let claimed_changes = self.changes.swap(0, Ordering::AcqRel);
+        if claimed_changes < REFRESH_CHANGES_THRESHOLD {
             return;
         }
         self.ensured_refresh_chunk(chunk)
@@ -129,29 +132,35 @@ impl ChunkStatistics {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let empty_histo = Default::default();
+        let empty_histo: TargetHistogram = [[0u8; 8]; HISTOGRAM_TARGET_KEYS];
         let mut schema_histograms = schema_ids
             .iter()
             .map(|sid| {
                 (*sid, {
                     let parted_histos = partitations
                         .iter()
-                        .map(|(_, _, _, histo)| histo.get(sid).unwrap_or(&empty_histo))
+                        .map(|(_, _, _, histo)| histo.get(sid))
                         .collect_vec();
                     let field_ids = parted_histos
                         .iter()
-                        .map(|histo_map| histo_map.keys())
-                        .flatten()
+                        .filter_map(|opt_histo| *opt_histo)
+                        .flat_map(|histo_map| histo_map.keys())
                         .dedup()
                         .collect::<Vec<_>>();
                     field_ids
                         .par_iter()
                         .map(|field_id| {
-                            let schema_field_histograms = parted_histos
+                            let schema_field_histograms: Vec<_> = parted_histos
                                 .iter()
-                                .map(|histo_map| &histo_map[field_id])
-                                .collect_vec();
-                            (**field_id, build_histogram(schema_field_histograms))
+                                .filter_map(|opt_histo| *opt_histo)
+                                .filter_map(|histo_map| histo_map.get(field_id))
+                                .collect();
+                            let histo: TargetHistogram = if schema_field_histograms.is_empty() {
+                                empty_histo.clone()
+                            } else {
+                                build_histogram(schema_field_histograms)
+                            };
+                            (**field_id, histo)
                         })
                         .collect::<HashMap<u64, _>>()
                 })
@@ -174,7 +183,6 @@ impl ChunkStatistics {
             self.schemas.insert(*schema_id, Arc::new(statistics));
         }
         self.timestamp.store(now, Ordering::Relaxed);
-        self.changes.fetch_sub(refresh_changes, Ordering::Relaxed);
     }
 }
 
@@ -290,10 +298,10 @@ fn build_partitation_statistics(
 }
 
 fn build_partitation_histogram(mut items: Vec<HistogramKey>) -> (Vec<HistogramKey>, usize) {
+    items.sort();
     if items.len() <= HISTOGRAM_PARTITATION_BUCKETS {
         return (items, 1);
     }
-    items.sort();
     let depth = items.len() / HISTOGRAM_PARTITATION_BUCKETS;
     let mut histogram = (0..HISTOGRAM_PARTITATION_BUCKETS)
         .map(|tile| items[tile * depth])
@@ -329,7 +337,8 @@ fn build_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> Tar
         .iter()
         .filter_map(|(part, _, _)| part.last())
         .max()
-        .unwrap();
+        .cloned()
+        .unwrap_or_default();
     let target_width = num_total / HISTOGRAM_TARGET_BUCKETS;
     let mut target_histogram = [[0u8; 8]; HISTOGRAM_TARGET_KEYS];
     // Perform a merge sort for sorted pre-histogram

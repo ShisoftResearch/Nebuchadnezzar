@@ -19,6 +19,8 @@ use crate::{
 
 use super::{ValueRange, ValueRangeTerm};
 
+const DNF_CONJUNCTIONS_CAP: usize = 1024;
+
 #[derive(Clone)]
 enum ClauseOp {
     Eq,
@@ -871,6 +873,11 @@ fn selection_to_dnf_conjunctions(selection: &Expr) -> Vec<Vec<Expr>> {
             let child_dnf = selection_to_dnf_conjunctions(child);
             if child_dnf.is_empty() {
                 return vec![];
+            }
+
+            let expected_len = conjunctions.len() * child_dnf.len().max(1);
+            if expected_len > DNF_CONJUNCTIONS_CAP {
+                return vec![conjunctions.into_iter().flatten().collect()];
             }
 
             let mut next = Vec::with_capacity(conjunctions.len() * child_dnf.len().max(1));

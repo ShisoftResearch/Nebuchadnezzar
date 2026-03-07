@@ -231,7 +231,7 @@ impl IndexedDataClient {
         };
 
         let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = order_by_field {
-            self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering)
+            self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering, limit)
                 .await?
         } else {
             candidate_ids
@@ -426,6 +426,7 @@ impl IndexedDataClient {
         field_id: u64,
         ids: &[Id],
         ordering: Ordering,
+        limit: Option<usize>,
     ) -> Result<Vec<Id>, RPCError> {
         let ordered_scan_ids = self
             .range_query_ids(
@@ -439,10 +440,14 @@ impl IndexedDataClient {
             )
             .await?;
         let selected: HashSet<Id> = ids.iter().copied().collect();
-        Ok(ordered_scan_ids
+        let mut result: Vec<Id> = ordered_scan_ids
             .into_iter()
             .filter(|id| selected.contains(id))
-            .collect())
+            .collect();
+        if let Some(limit) = limit {
+            result.truncate(limit);
+        }
+        Ok(result)
     }
 
     async fn execute_clause_ids(
@@ -453,8 +458,10 @@ impl IndexedDataClient {
     ) -> Result<Vec<Id>, RPCError> {
         match clause {
             IndexedClausePlan::HashedEq { field_id, value } => {
-                let ids = self.hashed_query(schema, *field_id, value).await?;
-                Ok(ids.unwrap_or_default())
+                match self.hashed_query(schema, *field_id, value).await? {
+                    Ok(ids) => Ok(ids),
+                    Err(_) => Ok(Vec::new()),
+                }
             }
             IndexedClausePlan::Ranged { field_id, range } => {
                 self.range_query_ids(schema, *field_id, range, ordering)
@@ -710,7 +717,13 @@ impl IndexedDataClient {
                                         .into_iter()
                                         .zip(idx)
                                         .filter_map(|(cell_res, original_idx)| {
-                                            cell_res.ok().map(|cell| (cell, original_idx))
+                                            match cell_res {
+                                                Ok(cell) => Some((cell, original_idx)),
+                                                Err(e) => {
+                                                    warn!("Cell read error at index {}: {:?}", original_idx, e);
+                                                    None
+                                                }
+                                            }
                                         })
                                         .collect_vec()
                                 });
@@ -726,8 +739,11 @@ impl IndexedDataClient {
             .collect::<FuturesUnordered<_>>();
 
         while let Some(task_res) = tasks.next().await {
-            if let Ok(mut cells) = task_res {
-                all_cells.append(&mut cells);
+            match task_res {
+                Ok(mut cells) => all_cells.append(&mut cells),
+                Err(e) => {
+                    warn!("Task error in read_cells_from_ids: {:?}", e);
+                }
             }
         }
 

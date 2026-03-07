@@ -110,7 +110,13 @@ impl DataCursor {
                                         match read_res {
                                             Ok(cells) => Ok(cells
                                                 .into_iter()
-                                                .filter_map(|(c, i)| c.ok().map(|c| (c, i)))
+                                                .filter_map(|(c, i)| match c {
+                                                    Ok(cell) => Some((cell, i)),
+                                                    Err(e) => {
+                                                        warn!("Cursor cell read error at index {}: {:?}", i, e);
+                                                        None
+                                                    }
+                                                })
                                                 .collect_vec()),
                                             Err(e) => Err(e),
                                         }
@@ -121,8 +127,11 @@ impl DataCursor {
                         })
                         .collect::<FuturesUnordered<_>>();
                     while let Some(task_res) = tasks.next().await {
-                        if let Ok(mut cells) = task_res {
-                            all_cells.append(&mut cells);
+                        match task_res {
+                            Ok(mut cells) => all_cells.append(&mut cells),
+                            Err(e) => {
+                                warn!("Cursor task error: {:?}", e);
+                            }
                         }
                     }
                 }

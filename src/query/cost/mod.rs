@@ -58,6 +58,9 @@ fn row_bytes(
     stat: &Arc<SchemaStatistics>,
 ) -> Option<usize> {
     if projection.is_empty() {
+        if stat.count == 0 {
+            return Some(0);
+        }
         Some(((stat.bytes as f64) / (stat.count as f64)) as usize)
     } else {
         Some(
