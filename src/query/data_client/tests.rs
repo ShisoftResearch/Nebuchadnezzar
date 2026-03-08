@@ -1732,6 +1732,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
             Ordering::Forward,
             Some(hash_str(DATA_2)),
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -1790,6 +1791,7 @@ async fn scan_by_expr_with_options_rejects_non_indexed_order_by_field() {
             Ordering::Forward,
             Some(hash_str(DATA_2)),
             Some(2),
+            None,
         )
         .await
         .err()
@@ -2117,6 +2119,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
             Ordering::Forward,
             Some(hash_str(DATA_2)),
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -2126,6 +2129,179 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
         ids.push(id);
     }
     assert_eq!(ids, vec![Id::new(14, 9), Id::new(14, 7), Id::new(14, 5)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6748).await;
+    let server_addr = String::from("127.0.0.1:6748");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_indexed(DATA_2, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 786;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_ids_offset_limit_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=9u64 {
+        let id = Id::new(18, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 2);
+        value[DATA_2] = OwnedValue::U64(10 - i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("="), "=".to_string()),
+        Expr::Symbol(hash_str(DATA_1), DATA_1.to_string()),
+        Expr::Value(OwnedValue::U64(1)),
+    ]);
+    let mut cursor = idx_data_client
+        .query_ids_with_options(
+            schema_id,
+            selection,
+            Ordering::Forward,
+            Some(hash_str(DATA_2)),
+            Some(2),
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+    assert_eq!(ids, vec![Id::new(18, 7), Id::new(18, 5)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_with_options_supports_offset_and_limit() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6749).await;
+    let server_addr = String::from("127.0.0.1:6749");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_indexed(DATA_2, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 787;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_offset_limit_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=9u64 {
+        let id = Id::new(19, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 2);
+        value[DATA_2] = OwnedValue::U64(10 - i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("="), "=".to_string()),
+        Expr::Symbol(hash_str(DATA_1), DATA_1.to_string()),
+        Expr::Value(OwnedValue::U64(1)),
+    ]);
+    let mut cursor = idx_data_client
+        .scan_by_expr_with_options(
+            schema_id,
+            selection,
+            Ordering::Forward,
+            Some(hash_str(DATA_2)),
+            Some(2),
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(cell) = cursor.next().await.unwrap() {
+        ids.push(cell.id());
+    }
+    assert_eq!(ids, vec![Id::new(19, 7), Id::new(19, 5)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_ids_with_options_offset_beyond_result_returns_empty() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6750).await;
+    let server_addr = String::from("127.0.0.1:6750");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_indexed(DATA_2, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 788;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_ids_offset_beyond_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=5u64 {
+        let id = Id::new(20, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(1);
+        value[DATA_2] = OwnedValue::U64(i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("="), "=".to_string()),
+        Expr::Symbol(hash_str(DATA_1), DATA_1.to_string()),
+        Expr::Value(OwnedValue::U64(1)),
+    ]);
+    let mut cursor = idx_data_client
+        .query_ids_with_options(
+            schema_id,
+            selection,
+            Ordering::Forward,
+            Some(hash_str(DATA_2)),
+            None,
+            Some(10),
+        )
+        .await
+        .unwrap();
+
+    assert!(cursor.next().await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2175,6 +2351,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
             Ordering::Backward,
             Some(hash_str(DATA_2)),
             Some(2),
+            None,
         )
         .await
         .unwrap();
@@ -2233,6 +2410,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
             Ordering::Forward,
             Some(hash_str(DATA_2)),
             Some(0),
+            None,
         )
         .await
         .unwrap();
@@ -2287,6 +2465,7 @@ async fn scan_by_expr_ids_with_options_rejects_non_indexed_order_by_field() {
             Ordering::Forward,
             Some(hash_str(DATA_2)),
             Some(2),
+            None,
         )
         .await
         .err()
@@ -2395,7 +2574,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .query_ids_with_options(schema_id, selection, Ordering::Backward, None, Some(3))
+        .query_ids_with_options(schema_id, selection, Ordering::Backward, None, Some(3), None)
         .await
         .unwrap();
 
@@ -3133,6 +3312,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
             Ordering::Forward,
             Some(hash_str(SCORE_FIELD)),
             Some(2),
+            None,
         )
         .await
         .unwrap();
@@ -3389,6 +3569,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
             Ordering::Forward,
             Some(hash_str(SCORE_FIELD)),
             Some(3),
+            None,
         )
         .await
         .unwrap();
@@ -3798,6 +3979,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
                 Ordering::Backward,
                 None,
                 Some(limit),
+                None,
             )
             .await
             .unwrap();
@@ -3818,6 +4000,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
                 Ordering::Backward,
                 None,
                 Some(limit),
+                None,
             )
             .await
             .unwrap();
@@ -3917,6 +4100,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
                 Ordering::Backward,
                 None,
                 Some(limit),
+                None,
             )
             .await
             .unwrap();
@@ -3936,6 +4120,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
                 Ordering::Backward,
                 None,
                 Some(limit),
+                None,
             )
             .await
             .unwrap();

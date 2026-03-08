@@ -123,7 +123,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, None, None)
+        self.query_with_options(schema, selection, ordering, None, None, None)
             .await
     }
 
@@ -134,9 +134,17 @@ impl IndexedDataClient {
         ordering: Ordering,
         order_by_field: Option<u64>,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<DataCursor, RPCError> {
         let mut id_cursor = self
-            .query_ids_with_options(schema, selection.clone(), ordering, order_by_field, limit)
+            .query_ids_with_options(
+                schema,
+                selection.clone(),
+                ordering,
+                order_by_field,
+                limit,
+                offset,
+            )
             .await?;
         let mut ids = vec![];
         while let Some(id) = id_cursor.next().await? {
@@ -172,8 +180,9 @@ impl IndexedDataClient {
         ordering: Ordering,
         order_by_field: Option<u64>,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, order_by_field, limit)
+        self.query_with_options(schema, selection, ordering, order_by_field, limit, offset)
             .await
     }
 
@@ -195,7 +204,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: Ordering,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(schema, selection, ordering, None, None)
+        self.query_ids_with_options(schema, selection, ordering, None, None, None)
             .await
     }
 
@@ -206,6 +215,7 @@ impl IndexedDataClient {
         ordering: Ordering,
         order_by_field: Option<u64>,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<IdCursor, RPCError> {
         if matches!(limit, Some(0)) {
             return Ok(IdCursor {
@@ -213,12 +223,17 @@ impl IndexedDataClient {
                 pos: 0,
             });
         }
+        let effective_limit = match (limit, offset) {
+            (Some(limit), Some(offset)) => Some(limit.saturating_add(offset)),
+            (Some(limit), None) => Some(limit),
+            (None, _) => None,
+        };
         if let Some(field_id) = order_by_field {
             self.ensure_orderable_field(schema, field_id).await?;
         }
 
         let plan = self
-            .indexed_predicate_plan(schema, &selection, order_by_field, limit)
+            .indexed_predicate_plan(schema, &selection, order_by_field, effective_limit)
             .await;
         let (candidate_ids, requires_selection_filter): (Vec<Id>, bool) = if let Some(plan) = plan {
             if plan.is_impossible() {
@@ -231,17 +246,26 @@ impl IndexedDataClient {
         };
 
         let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = order_by_field {
-            self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering, limit)
+            self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering, effective_limit)
                 .await?
         } else {
             candidate_ids
         };
 
         let mut selected_ids = if requires_selection_filter {
-            self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, limit)
+            self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, effective_limit)
                 .await
         } else {
             ordered_candidate_ids
+        };
+        if let Some(limit) = effective_limit {
+            selected_ids.truncate(limit);
+        }
+        let offset = offset.unwrap_or(0);
+        let mut selected_ids = if offset >= selected_ids.len() {
+            vec![]
+        } else {
+            selected_ids.split_off(offset)
         };
         if let Some(limit) = limit {
             selected_ids.truncate(limit);
@@ -269,8 +293,16 @@ impl IndexedDataClient {
         ordering: Ordering,
         order_by_field: Option<u64>,
         limit: Option<usize>,
+        offset: Option<usize>,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(schema, selection, ordering, order_by_field, limit)
+        self.query_ids_with_options(
+            schema,
+            selection,
+            ordering,
+            order_by_field,
+            limit,
+            offset,
+        )
             .await
     }
 
