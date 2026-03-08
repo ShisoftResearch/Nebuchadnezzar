@@ -15,6 +15,8 @@ use crate::index::builder::IndexError;
 
 pub const NO_VECTOR_CORE_ERROR: &str =
     "Vector indexer core is not set. Should call `set_vector_index_core` to set it.";
+pub const NO_VECTOR_SEARCH_COORDINATOR_ERROR: &str =
+    "Vector search coordinator is not set. Should call `set_vector_search_coordinator` to set it.";
 
 /// Encodings to allow metric serialization and conversion.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -174,6 +176,17 @@ pub trait VectorIndexerCore: Send + Sync {
     fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>>;
 }
 
+pub trait VectorSearchCoordinator: Send + Sync {
+    fn search_distributed(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        query_vector: &[f32],
+        limit: usize,
+        ef_search: Option<u16>,
+    ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>>;
+}
+
 /// Client for vector index operations.
 ///
 /// This client wraps a `VectorIndexerCore` implementation and provides
@@ -190,12 +203,14 @@ pub trait VectorIndexerCore: Send + Sync {
 /// ```
 pub struct VectorIndexClient {
     vector_core: OnceLock<Arc<dyn VectorIndexerCore>>,
+    vector_search_coordinator: OnceLock<Arc<dyn VectorSearchCoordinator>>,
 }
 
 impl VectorIndexClient {
     pub fn new() -> Self {
         Self {
             vector_core: OnceLock::new(),
+            vector_search_coordinator: OnceLock::new(),
         }
     }
 
@@ -219,6 +234,41 @@ impl VectorIndexClient {
     /// Check if the vector index core has been set.
     pub fn is_vector_index_core_set(&self) -> bool {
         self.vector_core.get().is_some()
+    }
+
+    pub fn set_vector_search_coordinator<C: VectorSearchCoordinator + 'static>(
+        &self,
+        coordinator: C,
+    ) -> bool {
+        let res = self.vector_search_coordinator.set(Arc::new(coordinator));
+        res.is_ok()
+    }
+
+    pub fn is_vector_search_coordinator_set(&self) -> bool {
+        self.vector_search_coordinator.get().is_some()
+    }
+
+    pub fn get_vector_search_coordinator(&self) -> &Arc<dyn VectorSearchCoordinator> {
+        self.vector_search_coordinator
+            .get()
+            .expect(NO_VECTOR_SEARCH_COORDINATOR_ERROR)
+    }
+
+    pub fn search_distributed<'a>(
+        &'a self,
+        schema_id: u32,
+        field_id: u64,
+        query_vector: &'a [f32],
+        limit: usize,
+        ef_search: Option<u16>,
+    ) -> BoxFuture<'a, Result<Vec<VectorHit>, IndexError>> {
+        self.get_vector_search_coordinator().search_distributed(
+            schema_id,
+            field_id,
+            query_vector,
+            limit,
+            ef_search,
+        )
     }
 
     /// Insert a vector into the index.

@@ -616,23 +616,38 @@ impl IndexedDataClient {
         query_vector: &[f32],
         limit: usize,
     ) -> Result<Vec<Id>, RPCError> {
-        if !self.index_clients.vector_client.is_vector_index_core_set() {
-            return Err(RPCError::IOError(io::Error::new(
-                io::ErrorKind::Other,
-                "Vector indexer core is not available",
-            )));
-        }
-        let hits = self
+        if !self
             .index_clients
             .vector_client
-            .search(schema, field_id, query_vector, limit.max(1), None)
-            .await
-            .map_err(|e| {
-                RPCError::IOError(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Vector search error: {:?}", e),
-                ))
-            })?;
+            .is_vector_search_coordinator_set()
+            && !self.index_clients.vector_client.is_vector_index_core_set()
+        {
+            return Err(RPCError::IOError(io::Error::new(
+                io::ErrorKind::Other,
+                "Vector indexer core and distributed coordinator are not available",
+            )));
+        }
+        let search_result = if self
+            .index_clients
+            .vector_client
+            .is_vector_search_coordinator_set()
+        {
+            self.index_clients
+                .vector_client
+                .search_distributed(schema, field_id, query_vector, limit.max(1), None)
+                .await
+        } else {
+            self.index_clients
+                .vector_client
+                .search(schema, field_id, query_vector, limit.max(1), None)
+                .await
+        };
+        let hits = search_result.map_err(|e| {
+            RPCError::IOError(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Vector search error: {:?}", e),
+            ))
+        })?;
         Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
     }
 
