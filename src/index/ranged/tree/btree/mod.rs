@@ -171,7 +171,7 @@ where
                 let pivot = split.pivot;
                 let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(1, max_entry_key());
                 let old_root = self.get_root().clone();
-                new_in_root.keys.as_slice()[0] = pivot;
+                new_in_root.keys = InternalKeys::from_keys(&[pivot]);
                 new_in_root.ptrs.as_slice()[0] = old_root;
                 new_in_root.ptrs.as_slice()[1] = new_node;
                 *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));

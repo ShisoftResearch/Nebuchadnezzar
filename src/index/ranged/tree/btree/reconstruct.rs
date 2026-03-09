@@ -77,7 +77,7 @@ where
             // arrange a valid new page by putting the ptr from current page at 1st
             new_innode.ptrs.as_slice()[0] = new_innode_head_ptr;
             new_innode.ptrs.as_slice()[1] = node.clone();
-            new_innode.keys.as_slice()[0] = left_bound;
+            new_innode.keys = InternalKeys::from_keys(&[left_bound]);
             let new_node = NodeCellRef::new(Node::with_internal(new_innode));
             self.push(
                 level + 1,
@@ -93,7 +93,9 @@ where
                 0
             } else {
                 let len = parent_innode.len;
-                parent_innode.keys.as_slice()[len] = left_bound;
+                let mut parent_keys = parent_innode.keys.to_vec(len);
+                parent_keys.push(left_bound);
+                parent_innode.keys = InternalKeys::from_keys(parent_keys.as_slice());
                 len + 1
             };
             parent_innode.ptrs.as_slice()[new_len] = node.clone();

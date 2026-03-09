@@ -56,26 +56,16 @@ where
                 // Update deleted key set
                 nodes
                     .iter()
-                    .map(|node| {
-                        node.keys()
-                            .iter()
-                            .filter(|k| src_tree.deletion.contains(k))
-                            .cloned()
-                    })
-                    .flatten()
+                    .flat_map(|node| node.keys().into_iter())
+                    .filter(|k| src_tree.deletion.contains(k))
                     .for_each(|k| {
                         deleted.insert(k);
                     });
                 // Collect keys to merge to next level
                 let merging_keys = nodes
                     .iter()
-                    .map(|node| {
-                        node.keys()
-                            .iter()
-                            .filter(|k| !src_tree.deletion.contains(k))
-                            .map(|k| k.clone())
-                    })
-                    .flatten()
+                    .flat_map(|node| node.keys().into_iter())
+                    .filter(|k| !src_tree.deletion.contains(k))
                     .collect_vec();
                 let num_keys_merged = merging_keys.len();
                 debug!(
@@ -176,9 +166,11 @@ where
                             }
                             let terminal_ref = terminal_node.node_ref();
                             {
-                                let mut terminal_node = write_node(&terminal_ref);
+                                let mut terminal_node = write_node::<KS, PS>(&terminal_ref);
                                 let innode = terminal_node.innode_mut();
-                                innode.keys = new_keys;
+                                innode.keys = InternalKeys::from_keys(
+                                    &new_keys.as_slice_immute()[..num_keys],
+                                );
                                 innode.ptrs = new_ptrs;
                                 innode.len = num_keys;
                             }

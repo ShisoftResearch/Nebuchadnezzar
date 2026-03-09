@@ -98,11 +98,11 @@ where
         }
     }
 
-    pub fn keys(&self) -> &[EntryKey] {
+    pub fn keys(&self) -> Vec<EntryKey> {
         if self.is_ext() {
-            &self.extnode().keys.as_slice_immute()[..self.len()]
+            self.extnode().keys.as_slice_immute()[..self.len()].to_vec()
         } else {
-            &self.innode().keys.as_slice_immute()[..self.len()]
+            self.innode().keys.to_vec(self.len())
         }
     }
 
@@ -111,7 +111,7 @@ where
         if self.is_ext() {
             &mut self.extnode_mut().keys.as_slice()[..len]
         } else {
-            &mut self.innode_mut().keys.as_slice()[..len]
+            panic!("internal keys are prefix-compressed and cannot be mutably borrowed as a slice")
         }
     }
 
@@ -131,19 +131,19 @@ where
         }
     }
 
-    pub fn first_key(&self) -> &EntryKey {
+    pub fn first_key(&self) -> EntryKey {
         if self.is_empty() && !self.is_empty_node() {
-            &*MIN_ENTRY_KEY
+            MIN_ENTRY_KEY.clone()
         } else {
-            &self.keys()[0]
+            self.keys()[0].clone()
         }
     }
 
-    pub fn last_key(&self) -> &EntryKey {
+    pub fn last_key(&self) -> EntryKey {
         if self.is_empty() && !self.is_empty_node() {
-            &*MIN_ENTRY_KEY
+            MIN_ENTRY_KEY.clone()
         } else {
-            &self.keys()[self.len() - 1]
+            self.keys()[self.len() - 1].clone()
         }
     }
 
@@ -217,7 +217,7 @@ where
         if self.is_empty() || (self.len() > 0 && self.right_bound() <= key) {
             let right_node = read_unchecked::<KS, PS>(self.right_ref().unwrap());
             if !right_node.is_none()
-                && (self.is_empty() || (right_node.len() > 0 && right_node.first_key() <= key))
+                && (self.is_empty() || (right_node.len() > 0 && right_node.first_key() <= *key))
             {
                 trace!(
                     "found key to put to right page {:?}/{:?}",
@@ -225,7 +225,7 @@ where
                     if right_node.is_empty() {
                         min_entry_key()
                     } else {
-                        right_node.first_key().clone()
+                        right_node.first_key()
                     }
                 );
                 return Some(self.right_ref().unwrap());

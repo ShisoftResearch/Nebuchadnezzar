@@ -53,15 +53,13 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let mut new_keys = KS::init();
     let mut new_ptrs = PS::init();
     let first_key = new_pages.keys().next().unwrap().clone();
     let first_ptr = new_pages.remove(&first_key).unwrap();
     new_ptrs.as_slice()[0] = left_most.clone();
     new_ptrs.as_slice()[1] = first_ptr;
-    new_keys.as_slice()[0] = first_key;
     let mut new_innode = InNode::<KS, PS>::new(1, EntryKey::max());
-    new_innode.keys = new_keys;
+    new_innode.keys = InternalKeys::from_keys(&[first_key]);
     new_innode.ptrs = new_ptrs;
     NodeCellRef::new(Node::with_internal(new_innode))
 }

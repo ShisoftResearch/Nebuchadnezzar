@@ -35,7 +35,7 @@ where
             );
             let pivot = split.pivot;
             let mut target_guard = write_targeted(split.parent_latch, &pivot);
-            debug_assert!(read_unchecked::<KS, PS>(&split.new_right_node).first_key() >= &pivot);
+            debug_assert!(read_unchecked::<KS, PS>(&split.new_right_node).first_key() >= pivot);
             let mut split_result =
                 target_guard
                     .innode_mut()

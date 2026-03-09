@@ -79,7 +79,9 @@ where
         }
         &NodeData::Internal(ref innode) => {
             let len = innode.len;
-            let keys = innode.keys.as_slice_immute()[..node.len()]
+            let keys = innode
+                .keys
+                .to_vec(node.len())
                 .iter()
                 .map(|key| format!("{:?}", key))
                 .collect();

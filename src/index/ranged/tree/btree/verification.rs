@@ -23,7 +23,7 @@ where
     if node.is_ref_none() {
         return true;
     }
-    if !are_keys_serial(node.keys()) {
+    if !are_keys_serial(&node.keys()) {
         return false;
     }
     for i in 0..node.len() {
@@ -65,7 +65,7 @@ where
             );
             return false;
         }
-        if first_right_bound > second_first_node {
+        if first_right_bound > &second_first_node {
             error!(
                 "right bound at {} larger than right first node, first_right_bound {:?}, second_first_node {:?}", 
                 i, first_right_bound, second_first_node
@@ -101,14 +101,14 @@ where
                 error!("Node not serial - {} - {}", lsm_level, tree_level);
                 return false;
             }
-            if node.first_key() > right_bound {
+            if node.first_key() > *right_bound {
                 error!(
                     "Node have right key smaller than the first - {} - {}",
                     lsm_level, tree_level
                 );
                 return false;
             }
-            if node.last_key() > right_bound {
+            if node.last_key() > *right_bound {
                 error!(
                     "Node have right key smaller than the last - {} - {}",
                     lsm_level, tree_level
@@ -129,7 +129,7 @@ where
         }
         if !next.is_empty_node() && !node.is_empty_node() {
             assert!(right_bound > &*MIN_ENTRY_KEY, "unreachable");
-            if next.first_key() < right_bound {
+            if next.first_key() < *right_bound {
                 error!("next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
                        lsm_level, tree_level, node.type_name(), node.keys(), next.keys(), node.right_bound(), next.right_bound());
                 return false;
