@@ -1,14 +1,11 @@
 use super::node::EmptyNode;
 use super::Slice;
 use super::*;
-use crate::index::ranged::tree::btree::level::BTREE_NODE_SIZE;
 use crate::index::KEY_SIZE;
 use itertools::free::chain;
 use std::any::Any;
 use std::marker::PhantomData;
 use std::{mem, panic};
-
-const MAX_INTERNAL_SUFFIX_BYTES: usize = BTREE_NODE_SIZE * KEY_SIZE;
 
 #[derive(Clone, Debug)]
 pub struct InternalKeys {
@@ -19,8 +16,7 @@ pub struct InternalKeys {
 struct InternalKeysBlob {
     shared_prefix: [u8; KEY_SIZE],
     shared_prefix_len: u8,
-    suffix_len: u16,
-    suffixes: [u8; MAX_INTERNAL_SUFFIX_BYTES],
+    suffixes: Vec<u8>,
 }
 
 impl InternalKeys {
@@ -29,8 +25,7 @@ impl InternalKeys {
             blob: InternalKeysBlob {
                 shared_prefix: [0; KEY_SIZE],
                 shared_prefix_len: 0,
-                suffixes: [0; MAX_INTERNAL_SUFFIX_BYTES],
-                suffix_len: 0,
+                suffixes: Vec::new(),
             },
         }
     }
@@ -56,22 +51,10 @@ impl InternalKeys {
 
         let mut shared_prefix = [0; KEY_SIZE];
         shared_prefix[..prefix_len].copy_from_slice(&first[..prefix_len]);
-
-        // Calculate total suffix space needed
-        let total_suffix_len = keys.len() * (KEY_SIZE - prefix_len);
-        debug_assert!(
-            total_suffix_len <= MAX_INTERNAL_SUFFIX_BYTES,
-            "Suffix length {} exceeds capacity {}",
-            total_suffix_len,
-            MAX_INTERNAL_SUFFIX_BYTES
-        );
-
-        let mut suffixes = [0; MAX_INTERNAL_SUFFIX_BYTES];
-        let mut offset = 0;
+        let mut suffixes = Vec::with_capacity(keys.len() * (KEY_SIZE - prefix_len));
         for key in keys {
             let tail = &key.as_slice()[prefix_len..];
-            suffixes[offset..offset + tail.len()].copy_from_slice(tail);
-            offset += tail.len();
+            suffixes.extend_from_slice(tail);
         }
 
         Self {
@@ -79,7 +62,6 @@ impl InternalKeys {
                 shared_prefix,
                 shared_prefix_len: prefix_len as u8,
                 suffixes,
-                suffix_len: total_suffix_len as u16,
             },
         }
     }
@@ -89,7 +71,7 @@ impl InternalKeys {
         let suffix_len = KEY_SIZE - prefix_len;
         let start = index * suffix_len;
         let end = start + suffix_len;
-        debug_assert!(end <= self.blob.suffix_len as usize);
+        debug_assert!(end <= self.blob.suffixes.len());
         let mut key = EntryKey::new();
         key.as_mut_slice()[..prefix_len].copy_from_slice(&self.blob.shared_prefix[..prefix_len]);
         key.as_mut_slice()[prefix_len..].copy_from_slice(&self.blob.suffixes[start..end]);
@@ -109,7 +91,7 @@ impl InternalKeys {
         let suffix_len = KEY_SIZE - prefix_len;
         let start = index * suffix_len;
         let end = start + suffix_len;
-        debug_assert!(end <= self.blob.suffix_len as usize);
+        debug_assert!(end <= self.blob.suffixes.len());
         self.blob.suffixes[start..end].cmp(&key_bytes[prefix_len..])
     }
 
