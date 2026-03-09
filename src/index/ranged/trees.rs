@@ -4,6 +4,7 @@ use std::mem;
 pub use crate::index::*;
 
 pub trait Slice<T: Default>: Send + Sync {
+    const SLICE_LEN: usize;
     fn as_slice(&mut self) -> &mut [T];
     #[inline]
     fn as_slice_immute(&self) -> &[T] {
@@ -12,7 +13,10 @@ pub trait Slice<T: Default>: Send + Sync {
             (*raw).as_slice()
         }
     }
-    fn slice_len() -> usize;
+    #[inline]
+    fn slice_len() -> usize {
+        Self::SLICE_LEN
+    }
     fn init() -> Self;
     fn item_default() -> T {
         T::default()

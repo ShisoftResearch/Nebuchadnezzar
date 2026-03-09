@@ -68,7 +68,7 @@ fi
 
 if [ -z "$TEST_BINARY" ] || [ ! -f "$TEST_BINARY" ]; then
     # Fallback: find the most recently modified test binary
-    TEST_BINARY=$(find target/debug/deps -name 'morpheus-*' -type f -executable -not -name '*.d' | \
+    TEST_BINARY=$(find target/debug/deps -name 'neb-*' -type f -executable -not -name '*.d' | \
         xargs ls -t 2>/dev/null | head -1)
     
     if [ -z "$TEST_BINARY" ] || [ ! -f "$TEST_BINARY" ]; then
