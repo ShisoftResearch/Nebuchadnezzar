@@ -676,7 +676,6 @@ dependencies = [
 [[package]]
 name = "dovahkiin"
 version = "0.1.0"
-source = "git+https://github.com/ShisoftResearch/Dovahkiin.git?branch=develop#3200566b43821c84956fb490ad0f2b9da5d787fd"
 dependencies = [
  "ahash",
  "bifrost",
