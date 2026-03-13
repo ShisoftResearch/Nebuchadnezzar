@@ -1604,6 +1604,16 @@ impl Chunks {
         self.list.iter().map(|c| c.count()).sum()
     }
 
+    pub fn clear_cell_index(&self) -> usize {
+        let mut removed = 0usize;
+        for chunk in &self.list {
+            removed += chunk.cell_index.len();
+            chunk.cell_index.clear();
+            chunk.statistics.ensured_refresh_chunk(chunk);
+        }
+        removed
+    }
+
     pub fn all_chunk_statistics(&self, schema_id: u32) -> Vec<Option<Arc<SchemaStatistics>>> {
         self.list
             .iter()

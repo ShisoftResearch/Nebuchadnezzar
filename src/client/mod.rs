@@ -108,8 +108,13 @@ impl AsyncClient {
         &self,
         id: Id,
     ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
-        let server_id = self.locate_server_id(&id).unwrap();
-        debug_assert!(server_id > 0, "Have server id 0 for id {:?}", id);
+        let server_id = self.locate_server_id(&id)?;
+        if server_id == 0 {
+            return Err(RPCError::IOError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid server id 0 for id {:?}", id),
+            )));
+        }
         self.client_by_server_id(server_id).await
     }
 
