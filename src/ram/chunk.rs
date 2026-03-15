@@ -670,9 +670,9 @@ impl Chunk {
 
             let schema = &*write_plan.schema;
             let old_indices = cell_guard.old_index_res(schema)?;
-            self.ensure_indices_with_res(cell, old_indices, schema);
             cell_guard.set_ptr(new_cell_loc);
             drop(cell_guard);
+            self.ensure_indices_with_res(cell, old_indices, schema);
             self.mark_dead_entry_with_cell(cell_location, cell);
             self.refresh_statistics();
             drop(write_plan);

@@ -347,7 +347,7 @@ impl TieredMemoryManager {
             // Do a full scan and update cache
             let actual_count = self.count_hot_segments(chunk);
             self.cached_hot_count.store(actual_count, Ordering::Relaxed);
-            debug!("Full scan updated hot segment count: {}", actual_count);
+            trace!("Full scan updated hot segment count: {}", actual_count);
             actual_count
         } else {
             // Use cached value
@@ -364,10 +364,10 @@ impl TieredMemoryManager {
                     );
                 }
                 self.cached_hot_count.store(actual_count, Ordering::Relaxed);
-                debug!("Full scan updated hot segment count: {}", actual_count);
+                trace!("Full scan updated hot segment count: {}", actual_count);
                 return actual_count;
             }
-            debug!("Using cached hot segment count: {}", count);
+            trace!("Using cached hot segment count: {}", count);
             count
         }
     }
