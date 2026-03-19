@@ -31,8 +31,8 @@ use crate::index::full_text::shard::InvertedIndexer;
 use crate::index::full_text::{
     inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit,
 };
-use crate::query::statistics::SchemaStatistics;
 use crate::index::vector::VectorIndexClient;
+use crate::query::statistics::SchemaStatistics;
 use crate::ram::cell::ReadError;
 use crate::ram::chunk::Chunks;
 use std::time::Duration;

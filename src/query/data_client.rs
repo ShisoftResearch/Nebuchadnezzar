@@ -2,36 +2,33 @@ use std::{collections::HashSet, io, sync::Arc};
 
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
-    expr::serde::Expr,
-    types::{Id, OwnedValue},
+    ahash::HashMap, expr::serde::Expr, types::{Id, OwnedValue}
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-    client::{client_by_server_name, AsyncClient},
+    client::{AsyncClient, SemanticHit, SimilarityHit, client_by_server_name},
     index::{
-        full_text::BM25Hit,
-        hash::get_hash_id_from_value,
-        ranged::{
+        EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE, embedding::EmbeddingHit, full_text::BM25Hit, vector::VectorHit, hash::get_hash_id_from_value, ranged::{
             client::cursor::ClientCursor,
             tree::{btree::Ordering, service::Range},
-        },
-        EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
+        }
     },
     query::planner::{
-        build_indexed_predicate_plan, IndexedClausePlan, IndexedDisjunctPlan,
-        IndexedPredicatePlan, QueryPlanExplain,
+        IndexedClausePlan, IndexedDisjunctPlan, IndexedPredicatePlan, QueryPlanExplain, build_indexed_predicate_plan
     },
-    ram::cell::{OwnedCell, ReadError},
-    ram::schema::IndexType,
+    ram::{
+        cell::{OwnedCell, ReadError},
+        schema::IndexType,
+    },
 };
 
 mod cursor;
 mod ids;
 
-use ids::{clause_execution_order, intersect_ids_ordered, sort_ids_by_ordering, union_ids_ordered};
 pub use cursor::{DataCursor, IdCursor};
+use ids::{clause_execution_order, intersect_ids_ordered, sort_ids_by_ordering, union_ids_ordered};
 
 pub use crate::query::planner::{ValueRange, ValueRangeTerm};
 
@@ -42,6 +39,15 @@ pub struct IndexedDataClient {
     conshash: Arc<ConsistentHashing>,
     index_clients: Arc<IndexerClients>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QueryHitType {
+    VectorHit,
+    EmbeddingHit,
+    BM25Hit,
+}
+
+pub type QueryHitTable = Option<HashMap<Id, HashMap<(u64, QueryHitType), f32>>>;
 
 impl IndexedDataClient {
     pub fn new(
@@ -98,7 +104,7 @@ impl IndexedDataClient {
         proc: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        let mut id_cursor = self.query_ids(schema, selection, ordering).await?;
+        let mut id_cursor = self.query_ids(schema, selection, ordering, &mut None).await?;
         let mut ids = vec![];
         while let Some(id) = id_cursor.next().await? {
             ids.push(id);
@@ -123,7 +129,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, None, None, None)
+        self.query_with_options(schema, selection, ordering, None, None, None, &mut None)
             .await
     }
 
@@ -135,6 +141,7 @@ impl IndexedDataClient {
         order_by_field: Option<u64>,
         limit: Option<usize>,
         offset: Option<usize>,
+        hit_table: &mut QueryHitTable,
     ) -> Result<DataCursor, RPCError> {
         let mut id_cursor = self
             .query_ids_with_options(
@@ -144,6 +151,7 @@ impl IndexedDataClient {
                 order_by_field,
                 limit,
                 offset,
+                hit_table,
             )
             .await?;
         let mut ids = vec![];
@@ -182,7 +190,7 @@ impl IndexedDataClient {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, order_by_field, limit, offset)
+        self.query_with_options(schema, selection, ordering, order_by_field, limit, offset, &mut None)
             .await
     }
 
@@ -203,8 +211,9 @@ impl IndexedDataClient {
         schema: u32,
         selection: Expr,
         ordering: Ordering,
+        hit_table: &mut QueryHitTable,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(schema, selection, ordering, None, None, None)
+        self.query_ids_with_options(schema, selection, ordering, None, None, None, hit_table)
             .await
     }
 
@@ -216,6 +225,7 @@ impl IndexedDataClient {
         order_by_field: Option<u64>,
         limit: Option<usize>,
         offset: Option<usize>,
+        hit_table: &mut QueryHitTable,
     ) -> Result<IdCursor, RPCError> {
         if matches!(limit, Some(0)) {
             return Ok(IdCursor {
@@ -239,7 +249,11 @@ impl IndexedDataClient {
             if plan.is_impossible() {
                 (vec![], false)
             } else {
-                (self.execute_predicate_plan_ids(schema, &plan, ordering).await?, false)
+                (
+                    self.execute_predicate_plan_ids(schema, &plan, ordering, hit_table)
+                        .await?,
+                    false,
+                )
             }
         } else {
             (self.scan_schema_ids(schema, ordering).await?, true)
@@ -283,7 +297,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: Ordering,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids(schema, selection, ordering).await
+        self.query_ids(schema, selection, ordering, &mut None).await
     }
 
     pub async fn scan_by_expr_ids_with_options<'a>(
@@ -295,14 +309,7 @@ impl IndexedDataClient {
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(
-            schema,
-            selection,
-            ordering,
-            order_by_field,
-            limit,
-            offset,
-        )
+        self.query_ids_with_options(schema, selection, ordering, order_by_field, limit, offset, &mut None)
             .await
     }
 
@@ -360,9 +367,17 @@ impl IndexedDataClient {
         let empty_projection: Vec<u64> = vec![];
         let Some(limit) = limit else {
             let selected_cells = self
-                .read_cells_from_ids(candidate_ids, &empty_projection, selection, &Expr::nothing())
+                .read_cells_from_ids(
+                    candidate_ids,
+                    &empty_projection,
+                    selection,
+                    &Expr::nothing(),
+                )
                 .await;
-            return selected_cells.into_iter().map(|cell| cell.id()).collect_vec();
+            return selected_cells
+                .into_iter()
+                .map(|cell| cell.id())
+                .collect_vec();
         };
         if limit == 0 || candidate_ids.is_empty() {
             return vec![];
@@ -487,6 +502,7 @@ impl IndexedDataClient {
         schema: u32,
         clause: &IndexedClausePlan,
         ordering: Ordering,
+        hit_table: &mut QueryHitTable,
     ) -> Result<Vec<Id>, RPCError> {
         match clause {
             IndexedClausePlan::HashedEq { field_id, value } => {
@@ -503,14 +519,35 @@ impl IndexedDataClient {
                 field_id,
                 query,
                 limit,
-            } => self.vector_query_ids(schema, *field_id, query.as_slice(), *limit).await,
+            } => {
+                let hits = self.vector_query_hits(schema, *field_id, query.as_slice(), *limit).await?;
+                if let Some(hit_table) = hit_table {
+                    for hit in &hits {
+                        hit_table.entry(hit.id)
+                            .or_insert_with(|| HashMap::default())
+                            .entry((*field_id, QueryHitType::VectorHit))
+                            .and_modify(|score| *score = score.max(hit.score))
+                            .or_insert(hit.score);
+                    }
+                }
+                Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
+            }
             IndexedClausePlan::EmbeddingSimilarity {
                 field_id,
                 query,
                 limit,
             } => {
-                self.embedding_query_ids(schema, *field_id, query.as_str(), *limit)
-                    .await
+                let hits = self.embedding_query_hits(schema, *field_id, query.as_str(), *limit).await?;
+                if let Some(hit_table) = hit_table {
+                    for hit in &hits {
+                        hit_table.entry(hit.id)
+                            .or_insert_with(|| HashMap::default())
+                            .entry((*field_id, QueryHitType::EmbeddingHit))
+                            .and_modify(|score| *score = score.max(hit.score))
+                            .or_insert(hit.score);
+                    }
+                }
+                Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
             }
             IndexedClausePlan::FullTextMatch {
                 field_id,
@@ -518,8 +555,17 @@ impl IndexedDataClient {
                 limit,
                 phrase_boost,
             } => {
-                self.fulltext_query_ids(schema, *field_id, query.as_str(), *limit, *phrase_boost)
-                    .await
+                let hits = self.fulltext_query_hits(schema, *field_id, query.as_str(), *limit, *phrase_boost).await?;
+                if let Some(hit_table) = hit_table {
+                    for hit in &hits {
+                    hit_table.entry(hit.id)
+                            .or_insert_with(|| HashMap::default())  
+                            .entry((*field_id, QueryHitType::BM25Hit))
+                            .and_modify(|score| *score = score.max(hit.score))
+                            .or_insert(hit.score);
+                    }
+                }
+                Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
             }
         }
     }
@@ -529,10 +575,13 @@ impl IndexedDataClient {
         schema: u32,
         plan: &IndexedPredicatePlan,
         ordering: Ordering,
+        hit_table: &mut QueryHitTable,
     ) -> Result<Vec<Id>, RPCError> {
         let mut all_ids = vec![];
         for disjunct in plan.disjuncts() {
-            let ids = self.execute_disjunct_ids(schema, disjunct, ordering).await?;
+            let ids = self
+                .execute_disjunct_ids(schema, disjunct, ordering, hit_table)
+                .await?;
             all_ids = union_ids_ordered(all_ids, &ids);
         }
         if plan.is_disjunction() {
@@ -546,6 +595,7 @@ impl IndexedDataClient {
         schema: u32,
         disjunct: &IndexedDisjunctPlan,
         ordering: Ordering,
+        hit_table: &mut QueryHitTable,
     ) -> Result<Vec<Id>, RPCError> {
         let mut candidate_ids = if disjunct.clauses().is_empty() {
             self.scan_schema_ids(schema, ordering).await?
@@ -555,8 +605,7 @@ impl IndexedDataClient {
             let Some(first) = candidates.next() else {
                 return Ok(vec![]);
             };
-
-            let mut candidate_ids = match self.execute_clause_ids(schema, first, ordering).await {
+            let mut candidate_ids = match self.execute_clause_ids(schema, first, ordering, hit_table).await {
                 Ok(ids) => ids,
                 Err(e) => {
                     if Self::is_special_clause(first) {
@@ -567,7 +616,7 @@ impl IndexedDataClient {
             };
 
             for candidate in candidates {
-                let ids = match self.execute_clause_ids(schema, candidate, ordering).await {
+                let ids = match self.execute_clause_ids(schema, candidate, ordering, hit_table).await {
                     Ok(ids) => ids,
                     Err(e) => {
                         if Self::is_special_clause(candidate) {
@@ -609,13 +658,13 @@ impl IndexedDataClient {
         }
     }
 
-    async fn vector_query_ids(
+    async fn vector_query_hits(
         &self,
         schema: u32,
         field_id: u64,
         query_vector: &[f32],
         limit: usize,
-    ) -> Result<Vec<Id>, RPCError> {
+    ) -> Result<Vec<VectorHit>, RPCError> {
         if !self
             .index_clients
             .vector_client
@@ -648,16 +697,16 @@ impl IndexedDataClient {
                 format!("Vector search error: {:?}", e),
             ))
         })?;
-        Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
+        Ok(hits)
     }
 
-    async fn embedding_query_ids(
+    async fn embedding_query_hits(
         &self,
         schema: u32,
         field_id: u64,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<Id>, RPCError> {
+    ) -> Result<Vec<EmbeddingHit>, RPCError> {
         if !self
             .index_clients
             .embedding_client
@@ -679,17 +728,17 @@ impl IndexedDataClient {
                     format!("Embedding search error: {:?}", e),
                 ))
             })?;
-        Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
+        Ok(hits)
     }
 
-    async fn fulltext_query_ids(
+    async fn fulltext_query_hits(
         &self,
         schema: u32,
         field_id: u64,
         query: &str,
         limit: usize,
         phrase_boost: bool,
-    ) -> Result<Vec<Id>, RPCError> {
+    ) -> Result<Vec<BM25Hit>, RPCError> {
         let hits = self
             .bm25_search(schema, field_id, query, limit.max(1), phrase_boost)
             .await?
@@ -699,7 +748,7 @@ impl IndexedDataClient {
                     format!("Full-text search error: {:?}", e),
                 ))
             })?;
-        Ok(hits.into_iter().map(|hit| hit.id).collect_vec())
+        Ok(hits)
     }
 
     async fn range_query_ids(
@@ -763,13 +812,14 @@ impl IndexedDataClient {
                                     cells
                                         .into_iter()
                                         .zip(idx)
-                                        .filter_map(|(cell_res, original_idx)| {
-                                            match cell_res {
-                                                Ok(cell) => Some((cell, original_idx)),
-                                                Err(e) => {
-                                                    warn!("Cell read error at index {}: {:?}", original_idx, e);
-                                                    None
-                                                }
+                                        .filter_map(|(cell_res, original_idx)| match cell_res {
+                                            Ok(cell) => Some((cell, original_idx)),
+                                            Err(e) => {
+                                                warn!(
+                                                    "Cell read error at index {}: {:?}",
+                                                    original_idx, e
+                                                );
+                                                None
                                             }
                                         })
                                         .collect_vec()

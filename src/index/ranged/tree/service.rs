@@ -13,6 +13,7 @@ use futures::prelude::*;
 use lightning::map::{Map, PtrHashMap as HashMap};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Duration;
 
 pub type IdBlock = [Id; MIGRATE_SIZE]; // Fixed size for ID arrays (not related to tree node size)
@@ -172,6 +173,7 @@ impl Service for TreeService {
             let buffer_size = buffer_size as usize;
             let mut tree_cursor = tree.seek(&entry, ordering);
             let mut buffer = Vec::with_capacity(buffer_size);
+            let mut seen_ids: HashSet<Id> = HashSet::with_capacity(buffer_size);
             let mut num_collected = 0;
             let pattern = pattern.as_ref().map(|p| (p.as_slice(), p.len()));
             // Process current() first to avoid skipping first element
@@ -251,7 +253,7 @@ impl Service for TreeService {
                         }
                     }
                 }
-                if should_add {
+                if should_add && seen_ids.insert(key_id) {
                     buffer.push(key_id);
                     num_collected += 1;
                 }
@@ -264,11 +266,6 @@ impl Service for TreeService {
                         }
                     }
                     let key_id = key.id();
-                    if let Some(last_key) = buffer.last() {
-                        if last_key == &key_id {
-                            continue;
-                        }
-                    }
                     match ordering {
                         Ordering::Forward => {
                             match &range.start {
@@ -327,8 +324,10 @@ impl Service for TreeService {
                             }
                         }
                     }
-                    buffer.push(key_id);
-                    num_collected += 1;
+                    if seen_ids.insert(key_id) {
+                        buffer.push(key_id);
+                        num_collected += 1;
+                    }
                 } else {
                     break;
                 }

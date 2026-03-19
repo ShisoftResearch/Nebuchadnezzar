@@ -10,11 +10,11 @@ use parking_lot::Mutex;
 
 use crate::client::AsyncClient;
 use crate::index::builder::IndexError;
+use crate::query::statistics::{merge_statistics, SchemaStatistics};
 use crate::ram::cell::{Cell, OwnedCell};
 use crate::ram::chunk::Chunks;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
-use crate::query::statistics::{merge_statistics, SchemaStatistics};
 
 use super::{
     bm25_score, compute_idf, tokenize_query, BM25Hit, FullTextIndexMeta, TokenStat,

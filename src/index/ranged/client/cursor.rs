@@ -6,6 +6,7 @@ use crate::index::ranged::{
 use crate::index::EntryKey;
 use crate::ram::types::Id;
 use bifrost::rpc::RPCError;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ pub struct ClientCursor {
     buffer_size: u16,
     pattern: Option<Vec<u8>>,
     range: Range,
+    seen_ids: HashSet<Id>,
 }
 
 impl ClientCursor {
@@ -34,7 +36,12 @@ impl ClientCursor {
             block.buffer
         );
         let next = block.next;
-        let ids = block.buffer;
+        let mut seen_ids: HashSet<Id> = HashSet::new();
+        let ids: Vec<Id> = block
+            .buffer
+            .into_iter()
+            .filter(|id| seen_ids.insert(*id))
+            .collect();
         Ok(Self {
             ids,
             query_client,
@@ -43,6 +50,7 @@ impl ClientCursor {
             pos: 0,
             pattern,
             range,
+            seen_ids,
         })
     }
 
@@ -82,7 +90,10 @@ impl ClientCursor {
             self.pattern.clone(),
         )
         .await?;
-        if let Some(cursor) = next_cursor {
+        if let Some(mut cursor) = next_cursor {
+            let mut seen = std::mem::take(&mut self.seen_ids);
+            cursor.ids.retain(|id| seen.insert(*id));
+            cursor.seen_ids = seen;
             *self = cursor;
         } else {
             self.ids = vec![];
@@ -146,7 +157,7 @@ impl ClientCursor {
                                 "Tree refill seek returns block sized {}",
                                 block.buffer.len()
                             );
-                            *self = Self::new(
+                            let mut cursor = Self::new(
                                 block,
                                 self.range.clone().move_to(tree_key),
                                 self.query_client.clone(),
@@ -154,6 +165,10 @@ impl ClientCursor {
                                 self.pattern.clone(),
                             )
                             .await?;
+                            let mut seen = std::mem::take(&mut self.seen_ids);
+                            cursor.ids.retain(|id| seen.insert(*id));
+                            cursor.seen_ids = seen;
+                            *self = cursor;
                         }
                         return Ok(());
                     }

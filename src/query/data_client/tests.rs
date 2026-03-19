@@ -3,9 +3,7 @@ use crate::{
     index::builder::IndexError,
     index::embedding::{EmbeddingHit, EmbeddingIndexerCore, EmbeddingModel, EmbeddingModelInfo},
     index::ranged::tree::btree::Ordering,
-    index::vector::{
-        HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore,
-    },
+    index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore},
     query::data_client::{ValueRange, ValueRangeTerm},
     ram::{
         cell::OwnedCell,
@@ -329,9 +327,8 @@ async fn scan_all() {
     }
     {
         // Testing selection
-        let select_expr = parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 100u64))")
-            .unwrap()[0]
-            .clone();
+        let select_expr =
+            parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 100u64))").unwrap()[0].clone();
         let mut cursor = idx_data_client
             .scan_all(
                 schema_id_1,
@@ -358,9 +355,8 @@ async fn scan_all() {
     }
     {
         info!("Testing selection 2");
-        let select_expr = parse_to_serde_expr("(or (= DATA_1 100u64) (= DATA_1 1000u64))")
-            .unwrap()[0]
-            .clone();
+        let select_expr =
+            parse_to_serde_expr("(or (= DATA_1 100u64) (= DATA_1 1000u64))").unwrap()[0].clone();
         let mut cursor = idx_data_client
             .scan_all(
                 schema_id_1,
@@ -1259,8 +1255,7 @@ async fn scan_all_auto_uses_ranged_clause_from_selection() {
         Field::new_unindexed(DATA_2, Type::U32),
     ]);
     let schema_id = 207;
-    let schema =
-        Schema::new_with_id(schema_id, "ranged_expr_schema", None, fields, false, false);
+    let schema = Schema::new_with_id(schema_id, "ranged_expr_schema", None, fields, false, false);
 
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     client.new_schema_with_id(schema).await.unwrap().unwrap();
@@ -1276,9 +1271,9 @@ async fn scan_all_auto_uses_ranged_clause_from_selection() {
 
     let idx_data_client = server.indexed_data_client();
     let selection =
-        parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 20u64) (= DATA_2 24u32))")
-            .unwrap()[0]
-            .clone();
+        parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 20u64) (= DATA_2 24u32))").unwrap()
+            [0]
+        .clone();
     let mut cursor = idx_data_client
         .scan_all(
             schema_id,
@@ -1313,8 +1308,7 @@ async fn scan_all_auto_uses_hashed_equality_clause_from_selection() {
         Field::new_unindexed(DATA_2, Type::U32),
     ]);
     let schema_id = 208;
-    let schema =
-        Schema::new_with_id(schema_id, "hashed_expr_schema", None, fields, false, false);
+    let schema = Schema::new_with_id(schema_id, "hashed_expr_schema", None, fields, false, false);
 
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     client.new_schema_with_id(schema).await.unwrap().unwrap();
@@ -1388,11 +1382,7 @@ async fn scan_by_expr_supports_single_ranged_clause() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 95u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(
-            schema_id,
-            selection,
-            Ordering::Forward,
-        )
+        .query(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
 
@@ -1441,11 +1431,7 @@ async fn scan_by_expr_supports_reversed_comparison_operands() {
     let selection =
         parse_to_serde_expr("(and (< 10u64 DATA_1) (< DATA_1 15u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(
-            schema_id,
-            selection,
-            Ordering::Forward,
-        )
+        .query(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
 
@@ -1493,11 +1479,7 @@ async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(= DATA_2 24u32)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(
-            schema_id,
-            selection,
-            Ordering::Forward,
-        )
+        .query(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
 
@@ -1555,11 +1537,7 @@ async fn scan_by_expr_intersects_hashed_and_ranged_indexed_clauses() {
     .unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .query(
-            schema_id,
-            selection,
-            Ordering::Forward,
-        )
+        .query(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
 
@@ -1613,15 +1591,11 @@ async fn scan_by_expr_multi_index_intersection_can_be_empty() {
 
     let idx_data_client = server.indexed_data_client();
     let selection =
-        parse_to_serde_expr("(and (>= DATA_1 10u64) (<= DATA_1 30u64) (= DATA_2 3u64))")
-            .unwrap()[0]
-            .clone();
+        parse_to_serde_expr("(and (>= DATA_1 10u64) (<= DATA_1 30u64) (= DATA_2 3u64))").unwrap()
+            [0]
+        .clone();
     let mut cursor = idx_data_client
-        .query(
-            schema_id,
-            selection,
-            Ordering::Forward,
-        )
+        .query(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
 
@@ -1663,14 +1637,10 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0]
-        .clone();
+    let selection =
+        parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(
-            schema_id,
-            selection,
-            Ordering::Backward,
-        )
+        .query(schema_id, selection, Ordering::Backward)
         .await
         .unwrap();
 
@@ -1837,24 +1807,17 @@ async fn scan_by_expr_plan_exposes_optimizer_trace() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(and (= DATA_1 1u64) (>= DATA_2 3u64))").unwrap()[0]
-        .clone();
+    let selection =
+        parse_to_serde_expr("(and (= DATA_1 1u64) (>= DATA_2 3u64))").unwrap()[0].clone();
     let explain = idx_data_client
-        .scan_by_expr_plan(
-            schema_id,
-            selection,
-            Some(hash_str(DATA_2)),
-            Some(2),
-        )
+        .scan_by_expr_plan(schema_id, selection, Some(hash_str(DATA_2)), Some(2))
         .await
         .expect("expected indexed plan");
 
     assert!(!explain.impossible());
     assert!(!explain.clauses().is_empty());
     let reason = explain.clauses()[0].reason();
-    assert!(
-        reason == "cost-model-limit-order" || reason == "cost-model" || reason == "heuristic"
-    );
+    assert!(reason == "cost-model-limit-order" || reason == "cost-model" || reason == "heuristic");
     if reason == "cost-model-limit-order" || reason == "cost-model" {
         assert!(explain.clauses()[0].effective_rows().is_some());
     }
@@ -1922,8 +1885,7 @@ async fn scan_by_expr_plan_reports_or_heuristic_when_stats_missing() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
-        .clone();
+    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0].clone();
     let explain = idx_data_client
         .scan_by_expr_plan(schema_id, selection, None, Some(10))
         .await
@@ -1968,8 +1930,8 @@ async fn scan_by_expr_detects_contradictory_hashed_predicates() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(and (= DATA_1 0u64) (= DATA_1 1u64))").unwrap()[0]
-        .clone();
+    let selection =
+        parse_to_serde_expr("(and (= DATA_1 0u64) (= DATA_1 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query(schema_id, selection, Ordering::Forward)
         .await
@@ -2011,8 +1973,8 @@ async fn scan_by_expr_detects_contradictory_ranged_predicates() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(and (> DATA_1 8u64) (< DATA_1 2u64))").unwrap()[0]
-        .clone();
+    let selection =
+        parse_to_serde_expr("(and (> DATA_1 8u64) (< DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query(schema_id, selection, Ordering::Forward)
         .await
@@ -2055,8 +2017,8 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0]
-        .clone();
+    let selection =
+        parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query_ids(schema_id, selection, Ordering::Backward)
         .await
@@ -2068,7 +2030,12 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     }
     assert_eq!(
         ids,
-        vec![Id::new(11, 19), Id::new(11, 13), Id::new(11, 7), Id::new(11, 1)]
+        vec![
+            Id::new(11, 19),
+            Id::new(11, 13),
+            Id::new(11, 7),
+            Id::new(11, 1)
+        ]
     );
 }
 
@@ -2511,8 +2478,7 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
-        .clone();
+    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query_ids(schema_id, selection, Ordering::Backward)
         .await
@@ -2571,10 +2537,16 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0]
-        .clone();
+    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids_with_options(schema_id, selection, Ordering::Backward, None, Some(3), None)
+        .query_ids_with_options(
+            schema_id,
+            selection,
+            Ordering::Backward,
+            None,
+            Some(3),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2620,8 +2592,7 @@ async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_2 3u32))").unwrap()[0]
-        .clone();
+    let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_2 3u32))").unwrap()[0].clone();
     let mut cursor = idx_data_client
         .query_ids(schema_id, selection, Ordering::Forward)
         .await
@@ -2680,11 +2651,7 @@ async fn scan_by_expr_ranged_clause_with_no_hits_returns_empty() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 100u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(
-            schema_id,
-            selection,
-            Ordering::Forward,
-        )
+        .query(schema_id, selection, Ordering::Forward)
         .await
         .unwrap();
 
@@ -3151,7 +3118,14 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
         Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
     ]);
     let schema_id = 779;
-    let schema = Schema::new_with_id(schema_id, "query_text_match_or_schema", None, fields, false, false);
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_text_match_or_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
     let client = server
         .data_client(&vec![server_addr.clone()])
         .await
@@ -3270,16 +3244,8 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
             "distributed database ranking pipeline",
             30u64,
         ),
-        (
-            Id::new(8, 2),
-            "database ranking for analysts",
-            10u64,
-        ),
-        (
-            Id::new(8, 3),
-            "ranking reports and database metrics",
-            20u64,
-        ),
+        (Id::new(8, 2), "database ranking for analysts", 10u64),
+        (Id::new(8, 3), "ranking reports and database metrics", 20u64),
         (Id::new(8, 4), "kitchen recipes and baking", 5u64),
     ];
 
@@ -3394,7 +3360,13 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
             "inactive",
             "keep",
         ),
-        (Id::new(9, 4), "distributed systems", "ops", "active", "drop"),
+        (
+            Id::new(9, 4),
+            "distributed systems",
+            "ops",
+            "active",
+            "drop",
+        ),
         (Id::new(9, 5), "travel notes", "docs", "active", "keep"),
     ];
 
@@ -3640,7 +3612,9 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
         Field::new_indexed(
             VEC_FIELD,
             Type::String,
-            vec![IndexType::Vector(VectorIndexConfig::new(MetricEncoding::Cosine))],
+            vec![IndexType::Vector(VectorIndexConfig::new(
+                MetricEncoding::Cosine,
+            ))],
         ),
         Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
     ]);
@@ -3658,7 +3632,11 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
         .unwrap();
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
-    for (id, tag) in &[(Id::new(11, 1), "infra"), (Id::new(11, 2), "ops"), (Id::new(11, 3), "infra")] {
+    for (id, tag) in &[
+        (Id::new(11, 1), "infra"),
+        (Id::new(11, 2), "ops"),
+        (Id::new(11, 3), "infra"),
+    ] {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[VEC_FIELD] = OwnedValue::String("placeholder".to_string());
         value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
@@ -3681,7 +3659,9 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
         Expr::List(vec![
             Expr::Symbol(hash_str("~"), "~".to_string()),
             Expr::Symbol(vector_field_id, VEC_FIELD.to_string()),
-            Expr::Value(OwnedValue::PrimArray(OwnedPrimArray::F32(vec![0.1, 0.2, 0.3]))),
+            Expr::Value(OwnedValue::PrimArray(OwnedPrimArray::F32(vec![
+                0.1, 0.2, 0.3,
+            ]))),
         ]),
         Expr::List(vec![
             Expr::Symbol(hash_str("="), "=".to_string()),
@@ -3884,7 +3864,9 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
     let fields = Field::new_schema(vec![Field::new_indexed(
         VEC_FIELD,
         Type::String,
-        vec![IndexType::Vector(VectorIndexConfig::new(MetricEncoding::Cosine))],
+        vec![IndexType::Vector(VectorIndexConfig::new(
+            MetricEncoding::Cosine,
+        ))],
     )]);
     let schema = Schema::new_with_id(
         schema_id,
@@ -3925,7 +3907,10 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
         .indexed_data_client()
         .query_ids(schema_id, selection, Ordering::Forward)
         .await;
-    assert!(query_res.is_err(), "expected vector similarity query failure");
+    assert!(
+        query_res.is_err(),
+        "expected vector similarity query failure"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3967,8 +3952,8 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr("(and (= DATA_1 1u64) (>= DATA_2 0u64))").unwrap()[0]
-        .clone();
+    let selection =
+        parse_to_serde_expr("(and (= DATA_1 1u64) (>= DATA_2 0u64))").unwrap()[0].clone();
     let limit = 200usize;
 
     for _ in 0..2 {
@@ -4025,13 +4010,20 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
         }
         baseline_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
-        assert_eq!(optimized_count, baseline_count, "result cardinality mismatch");
+        assert_eq!(
+            optimized_count, baseline_count,
+            "result cardinality mismatch"
+        );
         expected_count = Some(optimized_count);
     }
 
     let opt_avg = optimized_ms / f64::from(runs);
     let base_avg = baseline_ms / f64::from(runs);
-    let speedup = if opt_avg > 0.0 { base_avg / opt_avg } else { 0.0 };
+    let speedup = if opt_avg > 0.0 {
+        base_avg / opt_avg
+    } else {
+        0.0
+    };
 
     println!(
         "[bench][and+limit] rows={} limit={} avg_optimized_ms={:.3} avg_baseline_no_limit_ms={:.3} speedup={:.2}x",
@@ -4145,12 +4137,19 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
         }
         baseline_ms += t1.elapsed().as_secs_f64() * 1000.0;
 
-        assert_eq!(optimized_count, baseline_count, "limit cardinality mismatch");
+        assert_eq!(
+            optimized_count, baseline_count,
+            "limit cardinality mismatch"
+        );
     }
 
     let opt_avg = optimized_ms / f64::from(runs);
     let base_avg = baseline_ms / f64::from(runs);
-    let speedup = if opt_avg > 0.0 { base_avg / opt_avg } else { 0.0 };
+    let speedup = if opt_avg > 0.0 {
+        base_avg / opt_avg
+    } else {
+        0.0
+    };
 
     println!(
         "[bench][or+limit] limit={} avg_optimized_ms={:.3} avg_baseline_no_limit_ms={:.3} speedup={:.2}x",

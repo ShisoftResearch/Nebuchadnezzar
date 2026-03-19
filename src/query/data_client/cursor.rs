@@ -6,8 +6,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-    client::client_by_server_name,
-    index::ranged::client::cursor::ClientCursor,
+    client::client_by_server_name, index::ranged::client::cursor::ClientCursor,
     ram::cell::OwnedCell,
 };
 
