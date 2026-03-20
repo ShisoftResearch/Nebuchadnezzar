@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use dovahkiin::types::Id;
 
-use crate::{index::ranged::tree::btree::Ordering, query::planner::IndexedClausePlan};
+use crate::query::{data_client::QueryOrdering, planner::IndexedClausePlan};
 
 pub(super) fn intersect_ids_ordered(base: Vec<Id>, next_ids: &[Id]) -> Vec<Id> {
     let next_set: HashSet<Id> = next_ids.iter().copied().collect();
@@ -26,9 +26,9 @@ pub(super) fn clause_execution_order(candidates: &[IndexedClausePlan]) -> Vec<&I
     candidates.iter().collect()
 }
 
-pub(super) fn sort_ids_by_ordering(ids: &mut [Id], ordering: Ordering) {
+pub(super) fn sort_ids_by_query_order(ids: &mut [Id], ordering: QueryOrdering) {
     ids.sort_unstable();
-    if matches!(ordering, Ordering::Backward) {
+    if matches!(ordering, QueryOrdering::Desc) {
         ids.reverse();
     }
 }

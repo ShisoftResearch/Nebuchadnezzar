@@ -947,7 +947,7 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_e2e_range_index_recovery_with_schema() {
         use crate::index::ranged::tree::btree::Ordering;
-        use crate::query::data_client::{ValueRange, ValueRangeTerm};
+        use crate::query::data_client::{QueryOrdering, ValueRange, ValueRangeTerm};
         use crate::ram::cell::OwnedCell;
         use crate::ram::schema::{Field, IndexType, Schema};
         use crate::ram::types::Type;
@@ -1101,8 +1101,7 @@ mod test {
                 schema_id,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(),
-                Ordering::Forward,
+                Expr::nothing(), QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -1212,8 +1211,7 @@ mod test {
                 schema_id,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(),
-                Ordering::Forward,
+                Expr::nothing(), QueryOrdering::Asc,
             )
             .await
             .unwrap();

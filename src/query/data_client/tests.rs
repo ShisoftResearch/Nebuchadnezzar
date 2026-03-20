@@ -4,7 +4,7 @@ use crate::{
     index::embedding::{EmbeddingHit, EmbeddingIndexerCore, EmbeddingModel, EmbeddingModelInfo},
     index::ranged::tree::btree::Ordering,
     index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore},
-    query::data_client::{ValueRange, ValueRangeTerm},
+    query::data_client::{QueryOrdering, ValueRange, ValueRangeTerm},
     ram::{
         cell::OwnedCell,
         schema::{Field, IndexType, Schema},
@@ -252,8 +252,7 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(),
-                Ordering::Forward,
+                Expr::nothing(), QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -290,8 +289,7 @@ async fn scan_all() {
                 schema_id_2,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(),
-                Ordering::Forward,
+                Expr::nothing(), QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -314,8 +312,7 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(),
-                Ordering::Forward,
+                Expr::nothing(), QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -334,8 +331,7 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 select_expr,
-                Expr::nothing(),
-                Ordering::Forward,
+                Expr::nothing(), QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -362,8 +358,7 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 select_expr,
-                Expr::nothing(),
-                Ordering::Forward,
+                Expr::nothing(), QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -389,8 +384,7 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 Expr::nothing(),
-                proc_expr,
-                Ordering::Forward,
+                proc_expr, QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -847,8 +841,7 @@ async fn range_query_scan_backward_ordering() {
             val_range,
             vec![],
             Expr::nothing(),
-            Expr::nothing(),
-            Ordering::Backward,
+            Expr::nothing(), Ordering::Backward,
         )
         .await
         .unwrap();
@@ -1279,8 +1272,7 @@ async fn scan_all_auto_uses_ranged_clause_from_selection() {
             schema_id,
             vec![],
             selection,
-            Expr::nothing(),
-            Ordering::Forward,
+            Expr::nothing(), QueryOrdering::Asc,
         )
         .await
         .unwrap();
@@ -1330,8 +1322,7 @@ async fn scan_all_auto_uses_hashed_equality_clause_from_selection() {
             schema_id,
             vec![],
             selection,
-            Expr::nothing(),
-            Ordering::Forward,
+            Expr::nothing(), QueryOrdering::Asc,
         )
         .await
         .unwrap();
@@ -1382,7 +1373,7 @@ async fn scan_by_expr_supports_single_ranged_clause() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 95u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -1431,7 +1422,7 @@ async fn scan_by_expr_supports_reversed_comparison_operands() {
     let selection =
         parse_to_serde_expr("(and (< 10u64 DATA_1) (< DATA_1 15u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -1479,7 +1470,7 @@ async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(= DATA_2 24u32)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -1537,7 +1528,7 @@ async fn scan_by_expr_intersects_hashed_and_ranged_indexed_clauses() {
     .unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -1595,7 +1586,7 @@ async fn scan_by_expr_multi_index_intersection_can_be_empty() {
             [0]
         .clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -1640,7 +1631,7 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Backward)
+        .query(schema_id, selection, QueryOrdering::Desc)
         .await
         .unwrap();
 
@@ -1699,7 +1690,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
         .scan_by_expr_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             Some(3),
             None,
@@ -1758,7 +1749,7 @@ async fn scan_by_expr_with_options_rejects_non_indexed_order_by_field() {
         .scan_by_expr_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             Some(2),
             None,
@@ -1933,7 +1924,7 @@ async fn scan_by_expr_detects_contradictory_hashed_predicates() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 0u64) (= DATA_1 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
     assert!(cursor.next().await.unwrap().is_none());
@@ -1976,7 +1967,7 @@ async fn scan_by_expr_detects_contradictory_ranged_predicates() {
     let selection =
         parse_to_serde_expr("(and (> DATA_1 8u64) (< DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
     assert!(cursor.next().await.unwrap().is_none());
@@ -2020,7 +2011,7 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, Ordering::Backward)
+        .query_ids(schema_id, selection, QueryOrdering::Desc)
         .await
         .unwrap();
 
@@ -2083,7 +2074,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             Some(3),
             None,
@@ -2142,7 +2133,7 @@ async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             Some(2),
             Some(1),
@@ -2201,7 +2192,7 @@ async fn scan_by_expr_with_options_supports_offset_and_limit() {
         .scan_by_expr_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             Some(2),
             Some(1),
@@ -2260,7 +2251,7 @@ async fn scan_by_expr_ids_with_options_offset_beyond_result_returns_empty() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             None,
             Some(10),
@@ -2315,7 +2306,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Backward,
+            QueryOrdering::Desc,
             Some(hash_str(DATA_2)),
             Some(2),
             None,
@@ -2328,6 +2319,53 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
         ids.push(id);
     }
     assert_eq!(ids, vec![Id::new(16, 1), Id::new(16, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_ids_with_inferred_ranged_order_applies_post_sort_before_limit() {
+    const DATA_1: &str = "DATA_1";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6761).await;
+    let server_addr = String::from("127.0.0.1:6761");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        DATA_1,
+        Type::U64,
+        vec![IndexType::Ranged],
+    )]);
+    let schema_id = 889;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "scan_by_expr_ids_inferred_ranged_post_sort_limit",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=9u64 {
+        let id = Id::new(31, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr("(>= DATA_1 3u64)").unwrap()[0].clone();
+    let mut cursor = idx_data_client
+        .query_ids_with_options(schema_id, selection, QueryOrdering::Desc, None, Some(2), None)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+    assert_eq!(ids, vec![Id::new(31, 9), Id::new(31, 8)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2374,7 +2412,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             Some(0),
             None,
@@ -2429,7 +2467,7 @@ async fn scan_by_expr_ids_with_options_rejects_non_indexed_order_by_field() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             Some(2),
             None,
@@ -2480,7 +2518,7 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, Ordering::Backward)
+        .query_ids(schema_id, selection, QueryOrdering::Desc)
         .await
         .unwrap();
 
@@ -2542,7 +2580,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Backward,
+            QueryOrdering::Desc,
             None,
             Some(3),
             None,
@@ -2594,7 +2632,7 @@ async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(or (= DATA_1 1u64) (= DATA_2 3u32))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, Ordering::Forward)
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -2651,7 +2689,7 @@ async fn scan_by_expr_ranged_clause_with_no_hits_returns_empty() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 100u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, Ordering::Forward)
+        .query(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
 
@@ -3071,7 +3109,7 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, Ordering::Forward)
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -3177,7 +3215,7 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, Ordering::Forward)
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -3275,7 +3313,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(SCORE_FIELD)),
             Some(2),
             None,
@@ -3416,7 +3454,7 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
     ]);
 
     let mut cursor = idx_data_client
-        .query_ids(schema_id, selection, Ordering::Forward)
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -3538,7 +3576,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
         .query_ids_with_options(
             schema_id,
             selection,
-            Ordering::Forward,
+            QueryOrdering::Asc,
             Some(hash_str(SCORE_FIELD)),
             Some(3),
             None,
@@ -3672,7 +3710,7 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
 
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, Ordering::Forward)
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -3811,7 +3849,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
 
     let mut cursor = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, Ordering::Forward)
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
         .await
         .unwrap();
     let mut ids = vec![];
@@ -3905,7 +3943,7 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
 
     let query_res = server
         .indexed_data_client()
-        .query_ids(schema_id, selection, Ordering::Forward)
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
         .await;
     assert!(
         query_res.is_err(),
@@ -3960,8 +3998,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
         let mut c = idx_data_client
             .query_ids_with_options(
                 schema_id,
-                selection.clone(),
-                Ordering::Backward,
+                selection.clone(), QueryOrdering::Desc,
                 None,
                 Some(limit),
                 None,
@@ -3981,8 +4018,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
         let mut optimized = idx_data_client
             .query_ids_with_options(
                 schema_id,
-                selection.clone(),
-                Ordering::Backward,
+                selection.clone(), QueryOrdering::Desc,
                 None,
                 Some(limit),
                 None,
@@ -3997,7 +4033,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
 
         let t1 = Instant::now();
         let mut baseline = idx_data_client
-            .query_ids(schema_id, selection.clone(), Ordering::Backward)
+            .query_ids(schema_id, selection.clone(), QueryOrdering::Desc)
             .await
             .unwrap();
         let mut baseline_count = 0usize;
@@ -4088,8 +4124,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
         let mut c = idx_data_client
             .query_ids_with_options(
                 schema_id,
-                selection.clone(),
-                Ordering::Backward,
+                selection.clone(), QueryOrdering::Desc,
                 None,
                 Some(limit),
                 None,
@@ -4108,8 +4143,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
         let mut optimized = idx_data_client
             .query_ids_with_options(
                 schema_id,
-                selection.clone(),
-                Ordering::Backward,
+                selection.clone(), QueryOrdering::Desc,
                 None,
                 Some(limit),
                 None,
@@ -4124,7 +4158,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
 
         let t1 = Instant::now();
         let mut baseline = idx_data_client
-            .query_ids(schema_id, selection.clone(), Ordering::Backward)
+            .query_ids(schema_id, selection.clone(), QueryOrdering::Desc)
             .await
             .unwrap();
         let mut baseline_count = 0usize;

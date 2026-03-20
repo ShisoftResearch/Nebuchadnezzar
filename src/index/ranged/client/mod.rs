@@ -227,14 +227,33 @@ impl RangedIndexerClient {
 
     pub async fn next_tree(
         &self,
-        origin_lower: &EntryKey,
+        origin_key: &EntryKey,
         ordering: Ordering,
     ) -> Result<Option<(EntryKey, TreePlacement)>, ExecError> {
         // Next tree for cursor
         // This function must be able to detect tree changes and ensure consistency
+        let (origin_lower, origin_upper) = {
+            let placement = self.placement.read();
+            if let Some((lower, (_placement, upper))) =
+                placement.range(..=origin_key.clone()).last()
+            {
+                if origin_key >= lower && origin_key < upper {
+                    (lower.clone(), upper.clone())
+                } else {
+                    drop(placement);
+                    let (lower, _placement, upper) = self.refresh_key_mapping(origin_key).await?;
+                    (lower, upper)
+                }
+            } else {
+                drop(placement);
+                let (lower, _placement, upper) = self.refresh_key_mapping(origin_key).await?;
+                (lower, upper)
+            }
+        };
+
         {
             let placement = self.placement.read();
-            let (_origin_place, origin_upper) = match placement.get(origin_lower) {
+            let (_origin_place, origin_upper) = match placement.get(&origin_lower) {
                 Some(t) => t,
                 None => {
                     warn!(
@@ -245,14 +264,14 @@ impl RangedIndexerClient {
                 }
             };
             let cached_next = match ordering {
-                Ordering::Forward => placement.range((Excluded(origin_lower), Unbounded)).next(),
-                Ordering::Backward => placement.range((Unbounded, Excluded(origin_lower))).last(),
+                Ordering::Forward => placement.range((Excluded(&origin_lower), Unbounded)).next(),
+                Ordering::Backward => placement.range((Unbounded, Excluded(&origin_lower))).last(),
             };
             // Check cache consistency against origin
             if let Some((cached_lower, (cached_placement, cached_upper))) = cached_next {
                 let matched_with_origin = match ordering {
                     Ordering::Forward => cached_lower == origin_upper,
-                    Ordering::Backward => cached_upper == origin_lower,
+                    Ordering::Backward => cached_upper == &origin_lower,
                 };
                 if matched_with_origin {
                     return Ok(Some((cached_lower.clone(), cached_placement.clone())));
@@ -271,7 +290,7 @@ impl RangedIndexerClient {
         }
         Ok(self
             .sm
-            .next_tree(origin_lower, &ordering)
+            .next_tree(&origin_lower, &ordering)
             .await?
             .map(|next| {
                 self.placement

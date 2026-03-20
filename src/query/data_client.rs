@@ -1,4 +1,4 @@
-use std::{collections::HashSet, io, sync::Arc};
+use std::{cmp::Ordering as CmpOrdering, collections::HashSet, io, sync::Arc};
 
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
@@ -28,7 +28,7 @@ mod cursor;
 mod ids;
 
 pub use cursor::{DataCursor, IdCursor};
-use ids::{clause_execution_order, intersect_ids_ordered, sort_ids_by_ordering, union_ids_ordered};
+use ids::{clause_execution_order, intersect_ids_ordered, sort_ids_by_query_order, union_ids_ordered};
 
 pub use crate::query::planner::{ValueRange, ValueRangeTerm};
 
@@ -48,6 +48,12 @@ pub enum QueryHitType {
 }
 
 pub type QueryHitTable = Option<HashMap<Id, HashMap<(u64, QueryHitType), f32>>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueryOrdering {
+    Asc,
+    Desc,
+}
 
 impl IndexedDataClient {
     pub fn new(
@@ -102,9 +108,9 @@ impl IndexedDataClient {
         projection: Vec<u64>, // Column array
         selection: Expr,      // Checker expression
         proc: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
     ) -> Result<DataCursor, RPCError> {
-        let mut id_cursor = self.query_ids(schema, selection, ordering, &mut None).await?;
+        let mut id_cursor = self.query_ids(schema, selection, ordering).await?;
         let mut ids = vec![];
         while let Some(id) = id_cursor.next().await? {
             ids.push(id);
@@ -127,9 +133,9 @@ impl IndexedDataClient {
         &'a self,
         schema: u32,
         selection: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
     ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, None, None, None, &mut None)
+        self.query_with_options(schema, selection, ordering, None, None, None)
             .await
     }
 
@@ -137,14 +143,35 @@ impl IndexedDataClient {
         &'a self,
         schema: u32,
         selection: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
+        order_by_field: Option<u64>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<DataCursor, RPCError> {
+        self.query_with_options_and_hits(
+            schema,
+            selection,
+            ordering,
+            order_by_field,
+            limit,
+            offset,
+            &mut None,
+        )
+        .await
+    }
+
+    pub async fn query_with_options_and_hits<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: QueryOrdering,
         order_by_field: Option<u64>,
         limit: Option<usize>,
         offset: Option<usize>,
         hit_table: &mut QueryHitTable,
     ) -> Result<DataCursor, RPCError> {
         let mut id_cursor = self
-            .query_ids_with_options(
+            .query_ids_with_options_and_hits(
                 schema,
                 selection.clone(),
                 ordering,
@@ -176,7 +203,7 @@ impl IndexedDataClient {
         &'a self,
         schema: u32,
         selection: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
     ) -> Result<DataCursor, RPCError> {
         self.query(schema, selection, ordering).await
     }
@@ -185,12 +212,12 @@ impl IndexedDataClient {
         &'a self,
         schema: u32,
         selection: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
         order_by_field: Option<u64>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, order_by_field, limit, offset, &mut None)
+        self.query_with_options(schema, selection, ordering, order_by_field, limit, offset)
             .await
     }
 
@@ -210,10 +237,28 @@ impl IndexedDataClient {
         &'a self,
         schema: u32,
         selection: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
+    ) -> Result<IdCursor, RPCError> {
+        self.query_ids_with_options(schema, selection, ordering, None, None, None)
+            .await
+    }
+
+    pub async fn query_ids_and_hits<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(schema, selection, ordering, None, None, None, hit_table)
+        self.query_ids_with_options_and_hits(
+            schema,
+            selection,
+            ordering,
+            None,
+            None,
+            None,
+            hit_table,
+        )
             .await
     }
 
@@ -221,7 +266,28 @@ impl IndexedDataClient {
         &'a self,
         schema: u32,
         selection: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
+        order_by_field: Option<u64>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<IdCursor, RPCError> {
+        self.query_ids_with_options_and_hits(
+            schema,
+            selection,
+            ordering,
+            order_by_field,
+            limit,
+            offset,
+            &mut None,
+        )
+        .await
+    }
+
+    pub async fn query_ids_with_options_and_hits<'a>(
+        &'a self,
+        schema: u32,
+        selection: Expr,
+        ordering: QueryOrdering,
         order_by_field: Option<u64>,
         limit: Option<usize>,
         offset: Option<usize>,
@@ -242,9 +308,14 @@ impl IndexedDataClient {
             self.ensure_orderable_field(schema, field_id).await?;
         }
 
+        let explicit_order_by_field = order_by_field;
         let plan = self
             .indexed_predicate_plan(schema, &selection, order_by_field, effective_limit)
             .await;
+        let inferred_order_field = explicit_order_by_field
+            .is_none()
+            .then(|| plan.as_ref().and_then(Self::infer_query_order_field_from_plan))
+            .flatten();
         let (candidate_ids, requires_selection_filter): (Vec<Id>, bool) = if let Some(plan) = plan {
             if plan.is_impossible() {
                 (vec![], false)
@@ -259,19 +330,24 @@ impl IndexedDataClient {
             (self.scan_schema_ids(schema, ordering).await?, true)
         };
 
-        let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = order_by_field {
+        let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = explicit_order_by_field {
             self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering, effective_limit)
                 .await?
         } else {
             candidate_ids
         };
-
         let mut selected_ids = if requires_selection_filter {
             self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, effective_limit)
                 .await
         } else {
             ordered_candidate_ids
         };
+        if let Some(field_id) = inferred_order_field {
+            self.sort_ids_by_field_postprocessing(field_id, &mut selected_ids, ordering)
+                .await;
+        } else if explicit_order_by_field.is_none() {
+            sort_ids_by_query_order(&mut selected_ids, ordering);
+        }
         if let Some(limit) = effective_limit {
             selected_ids.truncate(limit);
         }
@@ -295,21 +371,21 @@ impl IndexedDataClient {
         &'a self,
         schema: u32,
         selection: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids(schema, selection, ordering, &mut None).await
+        self.query_ids(schema, selection, ordering).await
     }
 
     pub async fn scan_by_expr_ids_with_options<'a>(
         &'a self,
         schema: u32,
         selection: Expr,
-        ordering: Ordering,
+        ordering: QueryOrdering,
         order_by_field: Option<u64>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(schema, selection, ordering, order_by_field, limit, offset, &mut None)
+        self.query_ids_with_options(schema, selection, ordering, order_by_field, limit, offset)
             .await
     }
 
@@ -335,12 +411,16 @@ impl IndexedDataClient {
             .await)
     }
 
-    async fn scan_schema_ids(&self, schema: u32, ordering: Ordering) -> Result<Vec<Id>, RPCError> {
+    async fn scan_schema_ids(
+        &self,
+        schema: u32,
+        ordering: QueryOrdering,
+    ) -> Result<Vec<Id>, RPCError> {
         let key = EntryKey::for_schema(schema);
         let Some(mut index_cursor) = self
             .index_clients
             .range_seek(
-                Range::new_inclusive_opened(key, ordering),
+                Range::new_inclusive_opened(key, query_order_to_scan_order(ordering)),
                 SCAN_BUFFER_SIZE,
                 Some(SCHEMA_SCAN_PATT_SIZE),
             )
@@ -472,7 +552,7 @@ impl IndexedDataClient {
         schema: u32,
         field_id: u64,
         ids: &[Id],
-        ordering: Ordering,
+        ordering: QueryOrdering,
         limit: Option<usize>,
     ) -> Result<Vec<Id>, RPCError> {
         let ordered_scan_ids = self
@@ -483,7 +563,7 @@ impl IndexedDataClient {
                     start: ValueRangeTerm::Open,
                     end: ValueRangeTerm::Open,
                 },
-                ordering,
+                Ordering::Forward,
             )
             .await?;
         let selected: HashSet<Id> = ids.iter().copied().collect();
@@ -491,17 +571,51 @@ impl IndexedDataClient {
             .into_iter()
             .filter(|id| selected.contains(id))
             .collect();
+        if matches!(ordering, QueryOrdering::Desc) {
+            result.reverse();
+        }
         if let Some(limit) = limit {
             result.truncate(limit);
         }
         Ok(result)
     }
 
+    async fn sort_ids_by_field_postprocessing(
+        &self,
+        field_id: u64,
+        ids: &mut [Id],
+        ordering: QueryOrdering,
+    ) {
+        if ids.len() <= 1 {
+            return;
+        }
+
+        let cells = self
+            .read_cells_from_ids(ids, &vec![], &Expr::nothing(), &Expr::nothing())
+            .await;
+        let mut feature_by_id = HashMap::default();
+        for cell in cells {
+            let feature = if matches!(cell[field_id], OwnedValue::Null) {
+                None
+            } else {
+                Some(cell[field_id].feature())
+            };
+            feature_by_id.insert(cell.id(), feature);
+        }
+
+        ids.sort_unstable_by(|left, right| {
+            let left_feature = feature_by_id.get(left).copied().flatten();
+            let right_feature = feature_by_id.get(right).copied().flatten();
+            compare_optional_features(left_feature, right_feature, ordering)
+                .then_with(|| left.cmp(right))
+        });
+    }
+
     async fn execute_clause_ids(
         &self,
         schema: u32,
         clause: &IndexedClausePlan,
-        ordering: Ordering,
+        _ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
     ) -> Result<Vec<Id>, RPCError> {
         match clause {
@@ -512,7 +626,7 @@ impl IndexedDataClient {
                 }
             }
             IndexedClausePlan::Ranged { field_id, range } => {
-                self.range_query_ids(schema, *field_id, range, ordering)
+                self.range_query_ids(schema, *field_id, range, range_index_order_for_range(range))
                     .await
             }
             IndexedClausePlan::VectorSimilarity {
@@ -574,7 +688,7 @@ impl IndexedDataClient {
         &self,
         schema: u32,
         plan: &IndexedPredicatePlan,
-        ordering: Ordering,
+        ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
     ) -> Result<Vec<Id>, RPCError> {
         let mut all_ids = vec![];
@@ -585,7 +699,7 @@ impl IndexedDataClient {
             all_ids = union_ids_ordered(all_ids, &ids);
         }
         if plan.is_disjunction() {
-            sort_ids_by_ordering(&mut all_ids, ordering);
+            sort_ids_by_query_order(&mut all_ids, ordering);
         }
         Ok(all_ids)
     }
@@ -594,7 +708,7 @@ impl IndexedDataClient {
         &self,
         schema: u32,
         disjunct: &IndexedDisjunctPlan,
-        ordering: Ordering,
+        ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
     ) -> Result<Vec<Id>, RPCError> {
         let mut candidate_ids = if disjunct.clauses().is_empty() {
@@ -636,7 +750,7 @@ impl IndexedDataClient {
                 .iter()
                 .any(|candidate| matches!(candidate, IndexedClausePlan::Ranged { .. }))
             {
-                sort_ids_by_ordering(&mut candidate_ids, ordering);
+                sort_ids_by_query_order(&mut candidate_ids, ordering);
             }
             candidate_ids
         };
@@ -875,6 +989,58 @@ impl IndexedDataClient {
         self.index_clients
             .bm25_search(schema, field_id, query, limit, phrase_boost)
             .await
+    }
+
+    fn infer_query_order_field_from_plan(plan: &IndexedPredicatePlan) -> Option<u64> {
+        let mut field_id = None;
+        for clause in plan.all() {
+            let IndexedClausePlan::Ranged {
+                field_id: ranged_field_id,
+                ..
+            } = clause
+            else {
+                continue;
+            };
+            match field_id {
+                None => field_id = Some(*ranged_field_id),
+                Some(existing) if existing == *ranged_field_id => {}
+                Some(_) => return None,
+            }
+        }
+        field_id
+    }
+}
+
+fn query_order_to_scan_order(ordering: QueryOrdering) -> Ordering {
+    match ordering {
+        QueryOrdering::Asc => Ordering::Forward,
+        QueryOrdering::Desc => Ordering::Backward,
+    }
+}
+
+fn range_index_order_for_range(range: &ValueRange) -> Ordering {
+    match (&range.start, &range.end) {
+        (ValueRangeTerm::Inclusive(_) | ValueRangeTerm::Exclusive(_), _) => Ordering::Forward,
+        (ValueRangeTerm::Open, ValueRangeTerm::Inclusive(_) | ValueRangeTerm::Exclusive(_)) => {
+            Ordering::Backward
+        }
+        (ValueRangeTerm::Open, ValueRangeTerm::Open) => Ordering::Forward,
+    }
+}
+
+fn compare_optional_features(
+    left: Option<crate::index::Feature>,
+    right: Option<crate::index::Feature>,
+    ordering: QueryOrdering,
+) -> CmpOrdering {
+    match (left, right) {
+        (Some(left), Some(right)) => match ordering {
+            QueryOrdering::Asc => left.cmp(&right),
+            QueryOrdering::Desc => right.cmp(&left),
+        },
+        (Some(_), None) => CmpOrdering::Less,
+        (None, Some(_)) => CmpOrdering::Greater,
+        (None, None) => CmpOrdering::Equal,
     }
 }
 
