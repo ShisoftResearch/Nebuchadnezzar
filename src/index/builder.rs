@@ -1,4 +1,4 @@
-use super::hash::get_hash_id;
+use super::hash::{get_hash_id, get_null_hash_id};
 // Import required dependencies
 use super::{EntryKey, Feature, IndexerClients};
 use crate::client::AsyncClient;
@@ -30,8 +30,6 @@ use tokio::task::{JoinError, JoinHandle};
 
 use crate::ram::types::OwnedPrimArray;
 
-// Constant representing an unset/empty feature
-const UNSETTLED: Feature = [0u8; 8];
 const COMPOUND_MISSING_PLACEHOLDER: &str = "";
 
 /// Build embedding index metadata from a cell value.
@@ -142,6 +140,12 @@ pub struct HashedIndexMeta {
 }
 
 #[derive(Hash, Debug)]
+pub struct NullIndexMeta {
+    hash_id: Id,
+    cell_id: Id,
+}
+
+#[derive(Hash, Debug)]
 pub struct VectorIndexMeta {
     cell_id: Id,
     schema_id: u32,
@@ -177,6 +181,7 @@ impl Hash for EmbeddingIndexMeta {
 pub enum IndexMeta {
     Ranged(RangedIndexMeta),
     Hashed(HashedIndexMeta),
+    Null(NullIndexMeta),
     Vector(VectorIndexMeta),
     FullText(FullTextIndexMeta),
     Embedding(EmbeddingIndexMeta),
@@ -186,6 +191,7 @@ pub enum IndexMeta {
 pub enum IndexComps {
     Ranged(Feature),
     Hashed(Feature),
+    Null,
     Vector(Id, u32, u64, VectorIndexConfig),
 }
 
@@ -228,6 +234,13 @@ impl IndexMeta {
                     .map_err(|e| IndexError::RPCError(e))?;
             }
             &IndexMeta::Hashed(ref meta) => {
+                indexers
+                    .hashed_client
+                    .insert(&meta.hash_id, &meta.cell_id)
+                    .await
+                    .map_err(|e| IndexError::WriteError(e))?;
+            }
+            &IndexMeta::Null(ref meta) => {
                 indexers
                     .hashed_client
                     .insert(&meta.hash_id, &meta.cell_id)
@@ -285,6 +298,14 @@ impl IndexMeta {
                     .map_err(|e| IndexError::RPCError(e))?;
             }
             &IndexMeta::Hashed(ref meta) => {
+                indexers
+                    .hashed_client
+                    .indexer
+                    .remove_index(&meta.cell_id, &meta.hash_id)
+                    .await
+                    .map_err(|e| IndexError::WriteError(e))?;
+            }
+            &IndexMeta::Null(ref meta) => {
                 indexers
                     .hashed_client
                     .indexer
@@ -605,6 +626,7 @@ where
                                 .map(|vec| IndexComps::Hashed(vec))
                                 .collect(),
                         ),
+                        &IndexType::Null => {}
                         // For vector, only provide its property
                         &IndexType::Vector(config) => components.push(IndexComps::Vector(
                             cell.id(),
@@ -641,31 +663,51 @@ where
                 }
             } else {
                 // Handle scalar data
+                let owned_value = value.to_owned_value();
+                let null_scalar = matches!(
+                    owned_value,
+                    crate::ram::types::OwnedValue::Null | crate::ram::types::OwnedValue::NA
+                );
+                let indexable_scalar = !matches!(
+                    owned_value,
+                    crate::ram::types::OwnedValue::Null | crate::ram::types::OwnedValue::NA
+                );
                 for index in indices {
                     match index {
-                        &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
-                        &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
+                        &IndexType::Ranged => {
+                            if indexable_scalar {
+                                components.push(IndexComps::Ranged(value.feature()))
+                            }
+                        }
+                        &IndexType::Hashed => {
+                            if indexable_scalar {
+                                components.push(IndexComps::Hashed(value.hash()))
+                            }
+                        }
+                        &IndexType::Null => {
+                            if null_scalar {
+                                components.push(IndexComps::Null)
+                            }
+                        }
                         &IndexType::Vector(_config) => {}
                         &IndexType::Fulltext => {
-                            let owned_value = value.to_owned_value();
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
                                 cell.header().version,
                                 schema.id,
                                 *field_id,
-                                owned_value,
+                                owned_value.clone(),
                             ) {
                                 metas.push(IndexMeta::FullText(meta));
                             }
                         }
                         &IndexType::Embedding(ref model) => {
-                            let owned_value = value.to_owned_value();
                             if let Some(meta) = build_embedding_index_meta(
                                 cell.id(),
                                 schema.id,
                                 *field_id,
                                 model.clone(),
-                                owned_value,
+                                owned_value.clone(),
                             ) {
                                 metas.push(IndexMeta::Embedding(meta));
                             }
@@ -680,16 +722,14 @@ where
             for comp in components {
                 match comp {
                     IndexComps::Hashed(feat) => {
-                        if feat == UNSETTLED {
-                            continue;
-                        }
                         let hash_id = get_hash_id(schema.id, *field_id, feat);
                         metas.push(IndexMeta::Hashed(HashedIndexMeta { hash_id, cell_id }));
                     }
+                    IndexComps::Null => {
+                        let hash_id = get_null_hash_id(schema.id, *field_id);
+                        metas.push(IndexMeta::Null(NullIndexMeta { hash_id, cell_id }));
+                    }
                     IndexComps::Ranged(feat) => {
-                        if feat == UNSETTLED {
-                            continue;
-                        }
                         let key = EntryKey::from_props(&cell_id, &feat, *field_id, schema.id);
                         metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                     }

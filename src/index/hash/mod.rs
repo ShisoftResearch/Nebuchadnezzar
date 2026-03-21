@@ -372,6 +372,10 @@ pub fn get_hash_id(schema: u32, field: u64, hash_feat: Feature) -> Id {
     Id::from_obj(&(schema, field, hash_feat))
 }
 
+pub fn get_null_hash_id(schema: u32, field: u64) -> Id {
+    Id::from_obj(&(schema, field, "NULL_BUCKET"))
+}
+
 pub fn get_hash_id_from_value<V: Value>(schema: u32, field: u64, value: &V) -> Id {
     let hash_feat = value.hash();
     get_hash_id(schema, field, hash_feat)

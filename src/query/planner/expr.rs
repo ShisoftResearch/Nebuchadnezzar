@@ -21,9 +21,10 @@ use super::{ValueRange, ValueRangeTerm};
 
 const DNF_CONJUNCTIONS_CAP: usize = 1024;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum ClauseOp {
     Eq,
+    Ne,
     Gt,
     Ge,
     Lt,
@@ -37,6 +38,9 @@ pub(crate) enum IndexedClausePlan {
     HashedEq {
         field_id: u64,
         value: OwnedValue,
+    },
+    NullPresence {
+        field_id: u64,
     },
     Ranged {
         field_id: u64,
@@ -113,6 +117,7 @@ impl ClauseOrderExplain {
     pub fn clause_kind(&self) -> &'static str {
         match self.clause {
             IndexedClausePlan::HashedEq { .. } => "hashed_eq",
+            IndexedClausePlan::NullPresence { .. } => "null_presence",
             IndexedClausePlan::Ranged { .. } => "ranged",
             IndexedClausePlan::VectorSimilarity { .. } => "vector_similarity",
             IndexedClausePlan::EmbeddingSimilarity { .. } => "embedding_similarity",
@@ -518,6 +523,15 @@ fn candidate_plan_cost_for_or(
             limit,
             false,
         )),
+        IndexedClausePlan::NullPresence { .. } => Some(estimate_clause_plan_cost(
+            true,
+            false,
+            false,
+            false,
+            rows.max(marginal_rows),
+            limit,
+            false,
+        )),
         IndexedClausePlan::Ranged { range, .. } => Some(estimate_clause_plan_cost(
             false,
             true,
@@ -554,6 +568,10 @@ fn estimate_candidate_rows(
             let distinct = distinct_estimate_from_stats(stats, *field_id);
             Some(estimate_hashed_eq_rows(stats.count, distinct).estimated_rows)
         }
+        IndexedClausePlan::NullPresence { field_id } => {
+            let distinct = distinct_estimate_from_stats(stats, *field_id);
+            Some(estimate_hashed_eq_rows(stats.count, distinct).estimated_rows)
+        }
         IndexedClausePlan::Ranged { field_id, range } => {
             let histogram = stats.histogram.get(field_id).map(|h| h.as_slice());
             Some(
@@ -584,6 +602,9 @@ fn candidate_plan_cost(
         IndexedClausePlan::HashedEq { .. } => {
             estimate_clause_plan_cost(true, false, false, false, estimated_rows, limit, false)
         }
+        IndexedClausePlan::NullPresence { .. } => {
+            estimate_clause_plan_cost(true, false, false, false, estimated_rows, limit, false)
+        }
         IndexedClausePlan::Ranged { range, .. } => estimate_clause_plan_cost(
             false,
             true,
@@ -604,6 +625,9 @@ fn candidate_plan_cost(
 fn clause_priority(candidate: &IndexedClausePlan) -> u8 {
     match candidate {
         IndexedClausePlan::HashedEq { .. } => {
+            indexed_clause_priority(true, false, true, false, false)
+        }
+        IndexedClausePlan::NullPresence { .. } => {
             indexed_clause_priority(true, false, true, false, false)
         }
         IndexedClausePlan::Ranged { range, .. } => indexed_clause_priority(
@@ -637,6 +661,16 @@ fn normalized_indexed_candidates(schema: &Schema, selection: &Expr) -> Normalize
     let mut extra_candidates = vec![];
 
     for clause in selection_conjuncts(selection) {
+        if clause_constant_truth(schema, clause) == Some(false) {
+            return NormalizedCandidates {
+                candidates: vec![],
+                impossible: true,
+            };
+        }
+        if clause_constant_truth(schema, clause) == Some(true) {
+            continue;
+        }
+
         let Some(candidate) = indexed_clause_candidate(schema, clause) else {
             continue;
         };
@@ -661,6 +695,9 @@ fn normalized_indexed_candidates(schema: &Schema, selection: &Expr) -> Normalize
                         };
                     }
                 }
+            }
+            IndexedClausePlan::NullPresence { field_id } => {
+                extra_candidates.push(IndexedClausePlan::NullPresence { field_id });
             }
             IndexedClausePlan::Ranged { field_id, range } => {
                 if let Some(existing_eq) = hashed_eq_by_field.get(&field_id) {
@@ -714,9 +751,22 @@ fn normalized_indexed_candidates(schema: &Schema, selection: &Expr) -> Normalize
     }
 }
 
+fn clause_constant_truth(schema: &Schema, clause: &Expr) -> Option<bool> {
+    let (is_not_null, field_id) = null_check_clause(clause)?;
+    let field = schema.field_by_id_path(&[field_id])?;
+    if field.nullable {
+        None
+    } else if is_not_null {
+        Some(true)
+    } else {
+        Some(false)
+    }
+}
+
 fn clause_selectivity_cost(candidate: &IndexedClausePlan) -> u8 {
     match candidate {
         IndexedClausePlan::HashedEq { .. } => 1,
+        IndexedClausePlan::NullPresence { .. } => 1,
         IndexedClausePlan::Ranged { range, .. } => {
             let start_open = matches!(range.start, ValueRangeTerm::Open);
             let end_open = matches!(range.end, ValueRangeTerm::Open);
@@ -859,6 +909,10 @@ fn selection_disjuncts(selection: &Expr) -> Option<Vec<&Expr>> {
 }
 
 fn selection_to_dnf_conjunctions(selection: &Expr) -> Vec<Vec<Expr>> {
+    if let Some(expanded) = expand_special_clause(selection) {
+        return selection_to_dnf_conjunctions(&expanded);
+    }
+
     let Expr::List(items) = selection else {
         return vec![vec![selection.clone()]];
     };
@@ -902,7 +956,80 @@ fn selection_to_dnf_conjunctions(selection: &Expr) -> Vec<Vec<Expr>> {
         return disjuncts;
     }
 
+    if is_symbol_named(&items[0], "not") {
+        if items.len() != 2 {
+            return vec![vec![selection.clone()]];
+        }
+        return negated_selection_to_dnf_conjunctions(&items[1]);
+    }
+
     vec![vec![selection.clone()]]
+}
+
+fn negated_selection_to_dnf_conjunctions(selection: &Expr) -> Vec<Vec<Expr>> {
+    if let Some(expanded) = expand_special_clause(selection) {
+        return negated_selection_to_dnf_conjunctions(&expanded);
+    }
+
+    let Expr::List(items) = selection else {
+        return vec![vec![negate_expr(selection.clone())]];
+    };
+
+    if items.is_empty() {
+        return vec![];
+    }
+
+    if is_symbol_named(&items[0], "not") {
+        if items.len() != 2 {
+            return vec![vec![negate_expr(selection.clone())]];
+        }
+        return selection_to_dnf_conjunctions(&items[1]);
+    }
+
+    if is_symbol_named(&items[0], "and") {
+        let mut disjuncts = vec![];
+        for child in items.iter().skip(1) {
+            disjuncts.extend(negated_selection_to_dnf_conjunctions(child));
+        }
+        return disjuncts;
+    }
+
+    if is_symbol_named(&items[0], "or") {
+        let mut conjunctions = vec![Vec::new()];
+        for child in items.iter().skip(1) {
+            let child_dnf = negated_selection_to_dnf_conjunctions(child);
+            if child_dnf.is_empty() {
+                return vec![];
+            }
+
+            let expected_len = conjunctions.len() * child_dnf.len().max(1);
+            if expected_len > DNF_CONJUNCTIONS_CAP {
+                return vec![conjunctions.into_iter().flatten().collect()];
+            }
+
+            let mut next = Vec::with_capacity(conjunctions.len() * child_dnf.len().max(1));
+            for base in &conjunctions {
+                for child_conjunction in &child_dnf {
+                    let mut merged = Vec::with_capacity(base.len() + child_conjunction.len());
+                    merged.extend(base.iter().cloned());
+                    merged.extend(child_conjunction.iter().cloned());
+                    next.push(merged);
+                }
+            }
+            conjunctions = next;
+        }
+        return conjunctions;
+    }
+
+    if let Some(negated) = negate_comparison_expr(selection) {
+        return selection_to_dnf_conjunctions(&negated);
+    }
+
+    if let Some(negated) = negate_null_check_expr(selection) {
+        return selection_to_dnf_conjunctions(&negated);
+    }
+
+    vec![vec![negate_expr(selection.clone())]]
 }
 
 fn conjunction_expr(clauses: &[Expr]) -> Expr {
@@ -917,7 +1044,78 @@ fn conjunction_expr(clauses: &[Expr]) -> Expr {
     }
 }
 
+fn negate_expr(expr: Expr) -> Expr {
+    Expr::List(vec![
+        Expr::Symbol(hash_str("not"), "not".to_string()),
+        expr,
+    ])
+}
+
+fn negate_comparison_expr(expr: &Expr) -> Option<Expr> {
+    let (op, field_id, value) = comparison_clause(expr)?;
+    let field_name = expr_field_name(expr)?;
+
+    match op {
+        ClauseOp::Eq => Some(Expr::List(vec![
+            Expr::Symbol(hash_str("or"), "or".to_string()),
+            comparison_expr(ClauseOp::Lt, field_id, field_name.clone(), value.clone()),
+            comparison_expr(ClauseOp::Gt, field_id, field_name, value),
+        ])),
+        ClauseOp::Ne => Some(comparison_expr(ClauseOp::Eq, field_id, field_name, value)),
+        ClauseOp::Gt => Some(comparison_expr(ClauseOp::Le, field_id, field_name, value)),
+        ClauseOp::Ge => Some(comparison_expr(ClauseOp::Lt, field_id, field_name, value)),
+        ClauseOp::Lt => Some(comparison_expr(ClauseOp::Ge, field_id, field_name, value)),
+        ClauseOp::Le => Some(comparison_expr(ClauseOp::Gt, field_id, field_name, value)),
+        ClauseOp::Similar | ClauseOp::TextMatch => None,
+    }
+}
+
+fn negate_null_check_expr(expr: &Expr) -> Option<Expr> {
+    let (is_not_null, field_id) = null_check_clause(expr)?;
+    let field_name = expr_unary_field_name(expr)?;
+    Some(unary_field_expr(
+        if is_not_null { "is-null" } else { "is-not-null" },
+        field_id,
+        field_name,
+    ))
+}
+
+fn comparison_expr(op: ClauseOp, field_id: u64, field_name: String, value: OwnedValue) -> Expr {
+    Expr::List(vec![
+        Expr::Symbol(hash_str(op_name(op)), op_name(op).to_string()),
+        Expr::Symbol(field_id, field_name),
+        Expr::Value(value),
+    ])
+}
+
+fn unary_field_expr(op_name: &str, field_id: u64, field_name: String) -> Expr {
+    Expr::List(vec![
+        Expr::Symbol(hash_str(op_name), op_name.to_string()),
+        Expr::Symbol(field_id, field_name),
+    ])
+}
+
 fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedClausePlan> {
+    if let Some((is_not_null, field_id)) = null_check_clause(clause) {
+        let indices = schema.index_fields.get(&field_id)?;
+        if !is_not_null {
+            if indices.iter().any(|idx| matches!(idx, IndexType::Null)) {
+                return Some(IndexedClausePlan::NullPresence { field_id });
+            }
+            return None;
+        }
+        if indices.iter().any(|idx| matches!(idx, IndexType::Ranged)) {
+            return Some(IndexedClausePlan::Ranged {
+                field_id,
+                range: ValueRange {
+                    start: ValueRangeTerm::Open,
+                    end: ValueRangeTerm::Open,
+                },
+            });
+        }
+        return None;
+    }
+
     let (op, field_id, value) = comparison_clause(clause)?;
     let indices = schema.index_fields.get(&field_id)?;
 
@@ -941,6 +1139,7 @@ fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedCla
                 start: ValueRangeTerm::Inclusive(value.shared().feature()),
                 end: ValueRangeTerm::Inclusive(value.shared().feature()),
             },
+            ClauseOp::Ne => return None,
             ClauseOp::Gt => ValueRange {
                 start: ValueRangeTerm::Exclusive(value.shared().feature()),
                 end: ValueRangeTerm::Open,
@@ -1019,9 +1218,79 @@ fn comparison_clause(clause: &Expr) -> Option<(ClauseOp, u64, OwnedValue)> {
     None
 }
 
+fn null_check_clause(clause: &Expr) -> Option<(bool, u64)> {
+    let Expr::List(items) = clause else {
+        return None;
+    };
+    if items.len() != 2 {
+        return None;
+    }
+
+    if is_symbol_named(&items[0], "is-null") {
+        expr_field_id(&items[1]).map(|field_id| (false, field_id))
+    } else if is_symbol_named(&items[0], "is-not-null") {
+        expr_field_id(&items[1]).map(|field_id| (true, field_id))
+    } else {
+        None
+    }
+}
+
+fn expand_special_clause(expr: &Expr) -> Option<Expr> {
+    if let Some(expanded) = expand_in_clause(expr) {
+        return Some(expanded);
+    }
+    expand_between_clause(expr)
+}
+
+fn expand_in_clause(expr: &Expr) -> Option<Expr> {
+    let Expr::List(items) = expr else {
+        return None;
+    };
+    if items.len() < 3 || !is_symbol_named(&items[0], "in") {
+        return None;
+    }
+
+    let field_expr = items[1].clone();
+    let mut disjuncts = Vec::with_capacity(items.len() - 1);
+    disjuncts.push(Expr::Symbol(hash_str("or"), "or".to_string()));
+    for value in items.iter().skip(2) {
+        disjuncts.push(Expr::List(vec![
+            Expr::Symbol(hash_str("="), "=".to_string()),
+            field_expr.clone(),
+            value.clone(),
+        ]));
+    }
+    Some(Expr::List(disjuncts))
+}
+
+fn expand_between_clause(expr: &Expr) -> Option<Expr> {
+    let Expr::List(items) = expr else {
+        return None;
+    };
+    if items.len() != 4 || !is_symbol_named(&items[0], "between") {
+        return None;
+    }
+
+    Some(Expr::List(vec![
+        Expr::Symbol(hash_str("and"), "and".to_string()),
+        Expr::List(vec![
+            Expr::Symbol(hash_str(">="), ">=".to_string()),
+            items[1].clone(),
+            items[2].clone(),
+        ]),
+        Expr::List(vec![
+            Expr::Symbol(hash_str("<="), "<=".to_string()),
+            items[1].clone(),
+            items[3].clone(),
+        ]),
+    ]))
+}
+
 fn parse_clause_op(expr: &Expr) -> Option<ClauseOp> {
     if is_symbol_named(expr, "=") {
         Some(ClauseOp::Eq)
+    } else if is_symbol_named(expr, "!=") {
+        Some(ClauseOp::Ne)
     } else if is_symbol_named(expr, ">") {
         Some(ClauseOp::Gt)
     } else if is_symbol_named(expr, ">=") {
@@ -1042,12 +1311,26 @@ fn parse_clause_op(expr: &Expr) -> Option<ClauseOp> {
 fn reverse_op(op: ClauseOp) -> ClauseOp {
     match op {
         ClauseOp::Eq => ClauseOp::Eq,
+        ClauseOp::Ne => ClauseOp::Ne,
         ClauseOp::Gt => ClauseOp::Lt,
         ClauseOp::Ge => ClauseOp::Le,
         ClauseOp::Lt => ClauseOp::Gt,
         ClauseOp::Le => ClauseOp::Ge,
         ClauseOp::Similar => ClauseOp::Similar,
         ClauseOp::TextMatch => ClauseOp::TextMatch,
+    }
+}
+
+fn op_name(op: ClauseOp) -> &'static str {
+    match op {
+        ClauseOp::Eq => "=",
+        ClauseOp::Ne => "!=",
+        ClauseOp::Gt => ">",
+        ClauseOp::Ge => ">=",
+        ClauseOp::Lt => "<",
+        ClauseOp::Le => "<=",
+        ClauseOp::Similar => "~",
+        ClauseOp::TextMatch => "@",
     }
 }
 
@@ -1069,6 +1352,29 @@ fn owned_value_f32_vector(value: &OwnedValue) -> Option<Vec<f32>> {
 fn expr_field_id(expr: &Expr) -> Option<u64> {
     match expr {
         Expr::Symbol(id, _) | Expr::Keyword(id, _) => Some(*id),
+        _ => None,
+    }
+}
+
+fn expr_field_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::List(items) if items.len() == 3 => match (&items[1], &items[2]) {
+            (Expr::Symbol(_, symbol), Expr::Value(_))
+            | (Expr::Keyword(_, symbol), Expr::Value(_)) => Some(symbol.clone()),
+            (Expr::Value(_), Expr::Symbol(_, symbol))
+            | (Expr::Value(_), Expr::Keyword(_, symbol)) => Some(symbol.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn expr_unary_field_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::List(items) if items.len() == 2 => match &items[1] {
+            Expr::Symbol(_, symbol) | Expr::Keyword(_, symbol) => Some(symbol.clone()),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1534,6 +1840,7 @@ mod tests {
             .iter()
             .map(|clause| match clause {
                 IndexedClausePlan::HashedEq { .. } => "hashed_eq",
+                IndexedClausePlan::NullPresence { .. } => "null_presence",
                 IndexedClausePlan::Ranged { .. } => "ranged",
                 IndexedClausePlan::VectorSimilarity { .. } => "vector_similarity",
                 IndexedClausePlan::EmbeddingSimilarity { .. } => "embedding_similarity",
@@ -1586,6 +1893,7 @@ mod tests {
             .iter()
             .map(|clause| match clause {
                 IndexedClausePlan::HashedEq { .. } => "hashed_eq",
+                IndexedClausePlan::NullPresence { .. } => "null_presence",
                 IndexedClausePlan::Ranged { .. } => "ranged",
                 IndexedClausePlan::VectorSimilarity { .. } => "vector_similarity",
                 IndexedClausePlan::EmbeddingSimilarity { .. } => "embedding_similarity",

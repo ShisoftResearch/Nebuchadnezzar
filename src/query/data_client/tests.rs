@@ -1692,6 +1692,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
+            None,
             Some(3),
             None,
         )
@@ -1706,7 +1707,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn scan_by_expr_with_options_rejects_non_indexed_order_by_field() {
+async fn scan_by_expr_with_options_supports_non_indexed_order_by_field() {
     const DATA_1: &str = "DATA_1";
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
@@ -1745,22 +1746,25 @@ async fn scan_by_expr_with_options_rejects_non_indexed_order_by_field() {
         Expr::Symbol(hash_str(DATA_1), DATA_1.to_string()),
         Expr::Value(OwnedValue::U64(1)),
     ]);
-    let err = idx_data_client
+    let mut cursor = idx_data_client
         .scan_by_expr_with_options(
             schema_id,
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
+            None,
             Some(2),
             None,
         )
         .await
-        .err()
-        .expect("expected ORDER BY to fail for non-indexed field");
-    assert!(
-        format!("{err:?}").contains("requires ranged index"),
-        "unexpected error: {err:?}"
-    );
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(cell) = cursor.next().await.unwrap() {
+        ids.push(cell.id());
+    }
+
+    assert_eq!(ids, vec![Id::new(19, 1), Id::new(19, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2076,6 +2080,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
+            None,
             Some(3),
             None,
         )
@@ -2135,6 +2140,7 @@ async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
+            None,
             Some(2),
             Some(1),
         )
@@ -2194,6 +2200,7 @@ async fn scan_by_expr_with_options_supports_offset_and_limit() {
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
+            None,
             Some(2),
             Some(1),
         )
@@ -2254,6 +2261,7 @@ async fn scan_by_expr_ids_with_options_offset_beyond_result_returns_empty() {
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
             None,
+            None,
             Some(10),
         )
         .await
@@ -2308,6 +2316,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
             selection,
             QueryOrdering::Desc,
             Some(hash_str(DATA_2)),
+            None,
             Some(2),
             None,
         )
@@ -2357,7 +2366,15 @@ async fn scan_by_expr_ids_with_inferred_ranged_order_applies_post_sort_before_li
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 3u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query_ids_with_options(schema_id, selection, QueryOrdering::Desc, None, Some(2), None)
+        .query_ids_with_options(
+            schema_id,
+            selection,
+            QueryOrdering::Desc,
+            None,
+            None,
+            Some(2),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2414,6 +2431,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
+            None,
             Some(0),
             None,
         )
@@ -2424,7 +2442,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn scan_by_expr_ids_with_options_rejects_non_indexed_order_by_field() {
+async fn scan_by_expr_ids_with_options_supports_non_indexed_order_by_field() {
     const DATA_1: &str = "DATA_1";
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
@@ -2463,22 +2481,754 @@ async fn scan_by_expr_ids_with_options_rejects_non_indexed_order_by_field() {
         Expr::Symbol(hash_str(DATA_1), DATA_1.to_string()),
         Expr::Value(OwnedValue::U64(1)),
     ]);
-    let err = idx_data_client
+    let mut cursor = idx_data_client
         .query_ids_with_options(
             schema_id,
             selection,
             QueryOrdering::Asc,
             Some(hash_str(DATA_2)),
+            None,
             Some(2),
             None,
         )
         .await
-        .err()
-        .expect("expected ORDER BY to fail for non-indexed field");
-    assert!(
-        format!("{err:?}").contains("requires ranged index"),
-        "unexpected error: {err:?}"
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(15, 1), Id::new(15, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_by_limit() {
+    const RANGE_FIELD: &str = "RANGE_FIELD";
+    const ORDER_FIELD: &str = "ORDER_FIELD";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6762).await;
+    let server_addr = String::from("127.0.0.1:6762");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(RANGE_FIELD, Type::U64, vec![IndexType::Ranged]),
+        Field::new_unindexed(ORDER_FIELD, Type::U64),
+    ]);
+    let schema_id = 762;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "range_min_order_regression",
+        None,
+        fields,
+        false,
+        false,
     );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..96u64 {
+        let id = Id::new(9, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[RANGE_FIELD] = OwnedValue::U64(i);
+        value[ORDER_FIELD] = OwnedValue::U64((i * 3) % 11);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = parse_to_serde_expr(&format!("(>= {} 0u64)", RANGE_FIELD))
+        .unwrap()[0]
+        .clone();
+    let equality_selection = parse_to_serde_expr(&format!("(= {} 0u64)", RANGE_FIELD))
+        .unwrap()[0]
+        .clone();
+
+    let mut equality_cursor = idx_data_client
+        .query_ids_with_options(
+            schema_id,
+            equality_selection,
+            QueryOrdering::Asc,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(equality_cursor.next().await.unwrap(), Some(Id::new(9, 0)));
+    assert!(equality_cursor.next().await.unwrap().is_none());
+
+    let mut plain_cursor = idx_data_client
+        .query_ids_with_options(
+            schema_id,
+            selection.clone(),
+            QueryOrdering::Asc,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut plain_ids = vec![];
+    while let Some(id) = plain_cursor.next().await.unwrap() {
+        plain_ids.push(id);
+    }
+    assert_eq!(plain_ids.first().copied(), Some(Id::new(9, 0)));
+
+    let mut ordered_cursor = idx_data_client
+        .query_ids_with_options(
+            schema_id,
+            selection,
+            QueryOrdering::Asc,
+            Some(hash_str(ORDER_FIELD)),
+            None,
+            Some(8),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut ordered_ids = vec![];
+    while let Some(id) = ordered_cursor.next().await.unwrap() {
+        ordered_ids.push(id);
+    }
+
+    assert_eq!(
+        ordered_ids,
+        vec![
+            Id::new(9, 0),
+            Id::new(9, 11),
+            Id::new(9, 22),
+            Id::new(9, 33),
+            Id::new(9, 44),
+            Id::new(9, 55),
+            Id::new(9, 66),
+            Id::new(9, 77),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_with_options_supports_distinct_fields() {
+    const GROUP_FIELD: &str = "GROUP_FIELD";
+    const SCORE_FIELD: &str = "SCORE_FIELD";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6763).await;
+    let server_addr = String::from("127.0.0.1:6763");
+
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed(GROUP_FIELD, Type::U64),
+        Field::new_indexed(SCORE_FIELD, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 763;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "distinct_query_ids_ordered_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (id_low, group, score) in [
+        (0u64, 1u64, 30u64),
+        (1, 1, 10),
+        (2, 2, 40),
+        (3, 2, 20),
+        (4, 3, 60),
+        (5, 3, 50),
+    ] {
+        let id = Id::new(32, id_low);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[GROUP_FIELD] = OwnedValue::U64(group);
+        value[SCORE_FIELD] = OwnedValue::U64(score);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(>= SCORE_FIELD 0u64)").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids_with_options(
+            schema_id,
+            selection,
+            QueryOrdering::Asc,
+            Some(hash_str(SCORE_FIELD)),
+            Some(vec![hash_str(GROUP_FIELD)]),
+            Some(2),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(32, 1), Id::new(32, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_supports_not_with_schema_scan_fallback() {
+    const DATA_1: &str = "DATA_1";
+    const DATA_2: &str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6765).await;
+    let server_addr = String::from("127.0.0.1:6765");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+        Field::new_unindexed(DATA_2, Type::U64),
+    ]);
+    let schema_id = 765;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_not_schema_scan_fallback",
+        None,
+        fields,
+        false,
+        true,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for i in 0..=5u64 {
+        let id = Id::new(34, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i % 2);
+        value[DATA_2] = OwnedValue::U64(i);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(not (= DATA_1 1u64))").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(34, 0), Id::new(34, 2), Id::new(34, 4)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_supports_not_as_residual_on_indexed_plan() {
+    const TAG: &str = "TAG";
+    const SCORE: &str = "SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6766).await;
+    let server_addr = String::from("127.0.0.1:6766");
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(TAG, Type::U64, vec![IndexType::Hashed]),
+        Field::new_indexed(SCORE, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 766;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_not_residual_indexed_plan",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (id_low, tag, score) in [
+        (0u64, 1u64, 1u64),
+        (1, 0, 2),
+        (2, 1, 3),
+        (3, 0, 4),
+        (4, 1, 5),
+        (5, 0, 6),
+    ] {
+        let id = Id::new(35, id_low);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[TAG] = OwnedValue::U64(tag);
+        value[SCORE] = OwnedValue::U64(score);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(and (>= SCORE 2u64) (not (= TAG 1u64)))")
+        .unwrap()[0]
+        .clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(35, 1), Id::new(35, 3), Id::new(35, 5)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_optimizes_not_equals_on_ranged_field_without_schema_scan() {
+    const SCORE: &str = "SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6767).await;
+    let server_addr = String::from("127.0.0.1:6767");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        SCORE,
+        Type::U64,
+        vec![IndexType::Ranged],
+    )]);
+    let schema_id = 767;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_not_equals_ranged_optimized",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for score in 0..=5u64 {
+        let id = Id::new(36, score);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[SCORE] = OwnedValue::U64(score);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(not (= SCORE 3u64))").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(
+        ids,
+        vec![
+            Id::new(36, 0),
+            Id::new(36, 1),
+            Id::new(36, 2),
+            Id::new(36, 4),
+            Id::new(36, 5),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
+    const TAG: &str = "TAG";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6768).await;
+    let server_addr = String::from("127.0.0.1:6768");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(TAG, Type::U64, vec![IndexType::Hashed])]);
+    let schema_id = 768;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_in_hashed_optimized",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for tag in 0..=5u64 {
+        let id = Id::new(37, tag);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[TAG] = OwnedValue::U64(tag);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(in TAG 1u64 3u64 5u64)").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(37, 1), Id::new(37, 3), Id::new(37, 5)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_optimizes_between_on_ranged_field_without_schema_scan() {
+    const SCORE: &str = "SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6769).await;
+    let server_addr = String::from("127.0.0.1:6769");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        SCORE,
+        Type::U64,
+        vec![IndexType::Ranged],
+    )]);
+    let schema_id = 769;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_between_ranged_optimized",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for score in 0..=7u64 {
+        let id = Id::new(38, score);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[SCORE] = OwnedValue::U64(score);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(between SCORE 2u64 5u64)").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(
+        ids,
+        vec![Id::new(38, 2), Id::new(38, 3), Id::new(38, 4), Id::new(38, 5)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_supports_is_null_with_schema_scan_fallback() {
+    const OPTIONAL_SCORE: &str = "OPTIONAL_SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6770).await;
+    let server_addr = String::from("127.0.0.1:6770");
+
+    let fields = Field::new_schema(vec![Field::new_unindexed_nullable(
+        OPTIONAL_SCORE,
+        Type::U64,
+    )]);
+    let schema_id = 770;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_is_null_scan_fallback",
+        None,
+        fields,
+        false,
+        true,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (id_low, score) in [
+        (0u64, Some(10u64)),
+        (1, None),
+        (2, Some(20)),
+        (3, None),
+    ] {
+        let id = Id::new(39, id_low);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(is-null OPTIONAL_SCORE)").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(39, 1), Id::new(39, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_optimizes_is_null_with_null_index_without_schema_scan() {
+    const OPTIONAL_SCORE: &str = "OPTIONAL_SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6773).await;
+    let server_addr = String::from("127.0.0.1:6773");
+
+    let fields = Field::new_schema(vec![Field::new_indexed_nullable(
+        OPTIONAL_SCORE,
+        Type::U64,
+        vec![IndexType::Null],
+    )]);
+    let schema_id = 773;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_is_null_null_index_optimized",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (id_low, score) in [
+        (0u64, Some(10u64)),
+        (1, None),
+        (2, Some(20)),
+        (3, None),
+    ] {
+        let id = Id::new(42, id_low);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(is-null OPTIONAL_SCORE)").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(42, 1), Id::new(42, 3)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_optimizes_is_not_null_on_nullable_ranged_field_without_schema_scan() {
+    const OPTIONAL_SCORE: &str = "OPTIONAL_SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6771).await;
+    let server_addr = String::from("127.0.0.1:6771");
+
+    let fields = Field::new_schema(vec![Field::new_indexed_nullable(
+        OPTIONAL_SCORE,
+        Type::U64,
+        vec![IndexType::Ranged],
+    )]);
+    let schema_id = 771;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_is_not_null_ranged_optimized",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (id_low, score) in [
+        (0u64, Some(10u64)),
+        (1, None),
+        (2, Some(20)),
+        (3, None),
+        (4, Some(30)),
+    ] {
+        let id = Id::new(40, id_low);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(is-not-null OPTIONAL_SCORE)").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(ids, vec![Id::new(40, 0), Id::new(40, 2), Id::new(40, 4)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ids_optimizes_is_null_on_non_nullable_field_to_empty() {
+    const SCORE: &str = "SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6772).await;
+    let server_addr = String::from("127.0.0.1:6772");
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        SCORE,
+        Type::U64,
+        vec![IndexType::Ranged],
+    )]);
+    let schema_id = 772;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_is_null_non_nullable_impossible",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for score in 0..=3u64 {
+        let id = Id::new(41, score);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[SCORE] = OwnedValue::U64(score);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(is-null SCORE)").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+
+    assert!(cursor.next().await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_by_expr_with_options_applies_distinct_before_offset_and_limit() {
+    const GROUP_FIELD: &str = "GROUP_FIELD";
+    const SCORE_FIELD: &str = "SCORE_FIELD";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6764).await;
+    let server_addr = String::from("127.0.0.1:6764");
+
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed(GROUP_FIELD, Type::U64),
+        Field::new_indexed(SCORE_FIELD, Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema_id = 764;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "distinct_scan_offset_limit_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (id_low, group, score) in [
+        (0u64, 1u64, 30u64),
+        (1, 1, 10),
+        (2, 2, 40),
+        (3, 2, 20),
+        (4, 3, 60),
+        (5, 3, 50),
+    ] {
+        let id = Id::new(33, id_low);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[GROUP_FIELD] = OwnedValue::U64(group);
+        value[SCORE_FIELD] = OwnedValue::U64(score);
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, value))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let selection = parse_to_serde_expr("(>= SCORE_FIELD 0u64)").unwrap()[0].clone();
+    let mut cursor = server
+        .indexed_data_client()
+        .scan_by_expr_with_options(
+            schema_id,
+            selection,
+            QueryOrdering::Desc,
+            Some(hash_str(SCORE_FIELD)),
+            Some(vec![hash_str(GROUP_FIELD)]),
+            Some(1),
+            Some(1),
+        )
+        .await
+        .unwrap();
+
+    let mut ids = vec![];
+    while let Some(cell) = cursor.next().await.unwrap() {
+        ids.push(cell.id());
+    }
+
+    assert_eq!(ids, vec![Id::new(33, 2)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2581,6 +3331,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
             schema_id,
             selection,
             QueryOrdering::Desc,
+            None,
             None,
             Some(3),
             None,
@@ -3315,6 +4066,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
             selection,
             QueryOrdering::Asc,
             Some(hash_str(SCORE_FIELD)),
+            None,
             Some(2),
             None,
         )
@@ -3578,6 +4330,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
             selection,
             QueryOrdering::Asc,
             Some(hash_str(SCORE_FIELD)),
+            None,
             Some(3),
             None,
         )
@@ -4000,6 +4753,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
                 schema_id,
                 selection.clone(), QueryOrdering::Desc,
                 None,
+                None,
                 Some(limit),
                 None,
             )
@@ -4019,6 +4773,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
             .query_ids_with_options(
                 schema_id,
                 selection.clone(), QueryOrdering::Desc,
+                None,
                 None,
                 Some(limit),
                 None,
@@ -4126,6 +4881,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
                 schema_id,
                 selection.clone(), QueryOrdering::Desc,
                 None,
+                None,
                 Some(limit),
                 None,
             )
@@ -4144,6 +4900,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
             .query_ids_with_options(
                 schema_id,
                 selection.clone(), QueryOrdering::Desc,
+                None,
                 None,
                 Some(limit),
                 None,

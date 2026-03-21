@@ -10,7 +10,7 @@ use itertools::Itertools;
 use crate::{
     client::{AsyncClient, SemanticHit, SimilarityHit, client_by_server_name},
     index::{
-        EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE, embedding::EmbeddingHit, full_text::BM25Hit, vector::VectorHit, hash::get_hash_id_from_value, ranged::{
+        EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE, embedding::EmbeddingHit, full_text::BM25Hit, vector::VectorHit, hash::{get_hash_id_from_value, get_null_hash_id}, ranged::{
             client::cursor::ClientCursor,
             tree::{btree::Ordering, service::Range},
         }
@@ -135,7 +135,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
     ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, None, None, None)
+        self.query_with_options(schema, selection, ordering, None, None, None, None)
             .await
     }
 
@@ -145,6 +145,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
+        distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<DataCursor, RPCError> {
@@ -153,6 +154,7 @@ impl IndexedDataClient {
             selection,
             ordering,
             order_by_field,
+            distinct_fields,
             limit,
             offset,
             &mut None,
@@ -166,6 +168,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
+        distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
         hit_table: &mut QueryHitTable,
@@ -176,6 +179,7 @@ impl IndexedDataClient {
                 selection.clone(),
                 ordering,
                 order_by_field,
+                distinct_fields,
                 limit,
                 offset,
                 hit_table,
@@ -214,10 +218,19 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
+        distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, order_by_field, limit, offset)
+        self.query_with_options(
+            schema,
+            selection,
+            ordering,
+            order_by_field,
+            distinct_fields,
+            limit,
+            offset,
+        )
             .await
     }
 
@@ -239,7 +252,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(schema, selection, ordering, None, None, None)
+        self.query_ids_with_options(schema, selection, ordering, None, None, None, None)
             .await
     }
 
@@ -257,6 +270,7 @@ impl IndexedDataClient {
             None,
             None,
             None,
+            None,
             hit_table,
         )
             .await
@@ -268,6 +282,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
+        distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<IdCursor, RPCError> {
@@ -276,6 +291,7 @@ impl IndexedDataClient {
             selection,
             ordering,
             order_by_field,
+            distinct_fields,
             limit,
             offset,
             &mut None,
@@ -289,6 +305,7 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
+        distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
         hit_table: &mut QueryHitTable,
@@ -307,10 +324,18 @@ impl IndexedDataClient {
         if let Some(field_id) = order_by_field {
             self.ensure_orderable_field(schema, field_id).await?;
         }
+        if let Some(field_ids) = distinct_fields.as_ref() {
+            self.ensure_distinct_fields(schema, field_ids).await?;
+        }
 
         let explicit_order_by_field = order_by_field;
+        let plan_limit = if explicit_order_by_field.is_some() || distinct_fields.is_some() {
+            None
+        } else {
+            effective_limit
+        };
         let plan = self
-            .indexed_predicate_plan(schema, &selection, order_by_field, effective_limit)
+            .indexed_predicate_plan(schema, &selection, order_by_field, plan_limit)
             .await;
         let inferred_order_field = explicit_order_by_field
             .is_none()
@@ -331,13 +356,13 @@ impl IndexedDataClient {
         };
 
         let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = explicit_order_by_field {
-            self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering, effective_limit)
+            self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering)
                 .await?
         } else {
             candidate_ids
         };
         let mut selected_ids = if requires_selection_filter {
-            self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, effective_limit)
+            self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, None)
                 .await
         } else {
             ordered_candidate_ids
@@ -347,6 +372,9 @@ impl IndexedDataClient {
                 .await;
         } else if explicit_order_by_field.is_none() {
             sort_ids_by_query_order(&mut selected_ids, ordering);
+        }
+        if let Some(field_ids) = distinct_fields.as_ref() {
+            selected_ids = self.distinct_ids_by_fields(field_ids, selected_ids).await;
         }
         if let Some(limit) = effective_limit {
             selected_ids.truncate(limit);
@@ -382,10 +410,19 @@ impl IndexedDataClient {
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
+        distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> Result<IdCursor, RPCError> {
-        self.query_ids_with_options(schema, selection, ordering, order_by_field, limit, offset)
+        self.query_ids_with_options(
+            schema,
+            selection,
+            ordering,
+            order_by_field,
+            distinct_fields,
+            limit,
+            offset,
+        )
             .await
     }
 
@@ -414,13 +451,16 @@ impl IndexedDataClient {
     async fn scan_schema_ids(
         &self,
         schema: u32,
-        ordering: QueryOrdering,
+        _ordering: QueryOrdering,
     ) -> Result<Vec<Id>, RPCError> {
         let key = EntryKey::for_schema(schema);
         let Some(mut index_cursor) = self
             .index_clients
             .range_seek(
-                Range::new_inclusive_opened(key, query_order_to_scan_order(ordering)),
+                // Schema scans collect the full candidate set first. Final query ordering
+                // is applied after filtering/pagination, so use a stable forward traversal
+                // here instead of coupling correctness to backward cursor behavior.
+                Range::new_inclusive_opened(key, Ordering::Forward),
                 SCAN_BUFFER_SIZE,
                 Some(SCHEMA_SCAN_PATT_SIZE),
             )
@@ -533,16 +573,45 @@ impl IndexedDataClient {
                 ))
             })?;
 
-        let orderable = schema
-            .index_fields
-            .get(&field_id)
-            .map(|indices| indices.iter().any(|idx| matches!(idx, IndexType::Ranged)))
-            .unwrap_or(false);
-        if !orderable {
+        if schema.field_by_id_path(&[field_id]).is_none() {
             return Err(RPCError::IOError(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("ORDER BY field {field_id} requires ranged index"),
+                format!("ORDER BY field {field_id} does not exist in schema {schema_id}"),
             )));
+        }
+        Ok(())
+    }
+
+    async fn ensure_distinct_fields(
+        &self,
+        schema_id: u32,
+        field_ids: &[u64],
+    ) -> Result<(), RPCError> {
+        if field_ids.is_empty() {
+            return Err(RPCError::IOError(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DISTINCT requires at least one field",
+            )));
+        }
+        let schema = self
+            .index_clients
+            .neb_client
+            .schema_by_id(schema_id)
+            .await
+            .map_err(|e| RPCError::IOError(io::Error::new(io::ErrorKind::Other, e.to_string())))?
+            .ok_or_else(|| {
+                RPCError::IOError(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("schema {schema_id} not found"),
+                ))
+            })?;
+        for field_id in field_ids {
+            if schema.field_by_id_path(&[*field_id]).is_none() {
+                return Err(RPCError::IOError(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("DISTINCT field {field_id} does not exist in schema {schema_id}"),
+                )));
+            }
         }
         Ok(())
     }
@@ -553,30 +622,19 @@ impl IndexedDataClient {
         field_id: u64,
         ids: &[Id],
         ordering: QueryOrdering,
-        limit: Option<usize>,
     ) -> Result<Vec<Id>, RPCError> {
-        let ordered_scan_ids = self
-            .range_query_ids(
-                schema,
-                field_id,
-                &ValueRange {
-                    start: ValueRangeTerm::Open,
-                    end: ValueRangeTerm::Open,
-                },
-                Ordering::Forward,
-            )
-            .await?;
-        let selected: HashSet<Id> = ids.iter().copied().collect();
-        let mut result: Vec<Id> = ordered_scan_ids
-            .into_iter()
-            .filter(|id| selected.contains(id))
-            .collect();
-        if matches!(ordering, QueryOrdering::Desc) {
-            result.reverse();
-        }
-        if let Some(limit) = limit {
-            result.truncate(limit);
-        }
+        let _ = schema;
+        let mut result = ids.to_vec();
+        self.sort_ids_by_field(
+            field_id,
+            &mut result,
+            ordering,
+            match ordering {
+                QueryOrdering::Asc => QueryOrdering::Asc,
+                QueryOrdering::Desc => QueryOrdering::Desc,
+            },
+        )
+        .await;
         Ok(result)
     }
 
@@ -586,29 +644,87 @@ impl IndexedDataClient {
         ids: &mut [Id],
         ordering: QueryOrdering,
     ) {
+        self.sort_ids_by_field(field_id, ids, ordering, QueryOrdering::Asc)
+            .await;
+    }
+
+    async fn sort_ids_by_field(
+        &self,
+        field_id: u64,
+        ids: &mut [Id],
+        ordering: QueryOrdering,
+        tie_break_ordering: QueryOrdering,
+    ) {
         if ids.len() <= 1 {
             return;
         }
 
-        let cells = self
-            .read_cells_from_ids(ids, &vec![], &Expr::nothing(), &Expr::nothing())
-            .await;
         let mut feature_by_id = HashMap::default();
-        for cell in cells {
-            let feature = if matches!(cell[field_id], OwnedValue::Null) {
-                None
-            } else {
-                Some(cell[field_id].feature())
-            };
-            feature_by_id.insert(cell.id(), feature);
+        let id_list = ids.to_vec();
+        match self.index_clients.neb_client.read_all_cells(&id_list).await {
+            Ok(cells) => {
+                for (id, cell_res) in id_list.into_iter().zip(cells) {
+                    match cell_res {
+                        Ok(cell) => {
+                            let feature = if matches!(cell[field_id], OwnedValue::Null) {
+                                None
+                            } else {
+                                Some(cell[field_id].feature())
+                            };
+                            feature_by_id.insert(id, feature);
+                        }
+                        Err(e) => {
+                            warn!("Cell read error during sort for id {:?}: {:?}", id, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Bulk cell read error during sort: {:?}", e);
+            }
         }
 
         ids.sort_unstable_by(|left, right| {
             let left_feature = feature_by_id.get(left).copied().flatten();
             let right_feature = feature_by_id.get(right).copied().flatten();
             compare_optional_features(left_feature, right_feature, ordering)
-                .then_with(|| left.cmp(right))
+                .then_with(|| compare_ids_for_query_order(left, right, tie_break_ordering))
         });
+    }
+
+    async fn distinct_ids_by_fields(&self, field_ids: &[u64], ids: Vec<Id>) -> Vec<Id> {
+        if ids.len() <= 1 {
+            return ids;
+        }
+
+        let id_list = ids.clone();
+        let cells = match self.index_clients.neb_client.read_all_cells(&id_list).await {
+            Ok(cells) => cells,
+            Err(e) => {
+                warn!("Bulk cell read error during DISTINCT: {:?}", e);
+                return ids;
+            }
+        };
+
+        let mut seen = HashSet::new();
+        let mut distinct_ids = Vec::with_capacity(ids.len());
+        for (id, cell_res) in id_list.into_iter().zip(cells) {
+            match cell_res {
+                Ok(cell) => {
+                    let key = field_ids
+                        .iter()
+                        .map(|field_id| cell[*field_id].clone())
+                        .collect::<Vec<_>>();
+                    if seen.insert(key) {
+                        distinct_ids.push(id);
+                    }
+                }
+                Err(e) => {
+                    warn!("Cell read error during DISTINCT for id {:?}: {:?}", id, e);
+                }
+            }
+        }
+        distinct_ids
     }
 
     async fn execute_clause_ids(
@@ -621,6 +737,18 @@ impl IndexedDataClient {
         match clause {
             IndexedClausePlan::HashedEq { field_id, value } => {
                 match self.hashed_query(schema, *field_id, value).await? {
+                    Ok(ids) => Ok(ids),
+                    Err(_) => Ok(Vec::new()),
+                }
+            }
+            IndexedClausePlan::NullPresence { field_id } => {
+                let index_id = get_null_hash_id(schema, *field_id);
+                match self
+                    .index_clients
+                    .hashed_client
+                    .query(index_id, *field_id, &OwnedValue::Null)
+                    .await?
+                {
                     Ok(ids) => Ok(ids),
                     Err(_) => Ok(Vec::new()),
                 }
@@ -1044,5 +1172,14 @@ fn compare_optional_features(
     }
 }
 
+fn compare_ids_for_query_order(left: &Id, right: &Id, ordering: QueryOrdering) -> CmpOrdering {
+    match ordering {
+        QueryOrdering::Asc => left.cmp(right),
+        QueryOrdering::Desc => right.cmp(left),
+    }
+}
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod alignment_tests;

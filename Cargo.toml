@@ -77,6 +77,7 @@ env_logger = "*"
 rayon = "*"
 tempfile = "*"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [[bench]]
 name = "inverted_index"

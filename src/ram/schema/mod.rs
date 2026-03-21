@@ -60,6 +60,7 @@ pub struct CompoundIndex {
 pub enum IndexType {
     Ranged,
     Hashed,
+    Null,
     Vector(VectorIndexConfig),
     Fulltext,
     /// Embedding index with configurable model.
