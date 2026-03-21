@@ -23,10 +23,12 @@ mod cursor;
 mod execute;
 mod ids;
 mod plan;
+mod projection;
 mod read;
 mod sort;
 
 pub use cursor::{AggregateResultCursor, AggregateRow, DataCursor, IdCursor};
+pub use projection::{ProjectionField, ProjectionItem, QueryResultCursor, QueryRow};
 use aggregate::{
     AggregateGroupState, collect_aggregate_required_fields, serialize_group_key,
     sort_aggregate_rows,
@@ -176,9 +178,19 @@ impl IndexedDataClient {
         schema: u32,
         selection: Expr,
         ordering: QueryOrdering,
-    ) -> Result<DataCursor, RPCError> {
-        self.query_with_options(schema, selection, ordering, None, None, None, None)
-            .await
+        projection: Vec<ProjectionField>,
+    ) -> Result<QueryResultCursor, RPCError> {
+        self.query_with_options(
+            schema,
+            selection,
+            ordering,
+            None,
+            None,
+            None,
+            None,
+            projection,
+        )
+        .await
     }
 
     pub async fn query_with_options<'a>(
@@ -190,18 +202,24 @@ impl IndexedDataClient {
         distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
-    ) -> Result<DataCursor, RPCError> {
-        self.query_with_options_and_hits(
-            schema,
-            selection,
-            ordering,
-            order_by_field,
-            distinct_fields,
-            limit,
-            offset,
-            &mut None,
-        )
-        .await
+        projection: Vec<ProjectionField>,
+    ) -> Result<QueryResultCursor, RPCError> {
+        let mut id_cursor = self
+            .query_ids_with_options(
+                schema,
+                selection,
+                ordering,
+                order_by_field,
+                distinct_fields,
+                limit,
+                offset,
+            )
+            .await?;
+        let mut ids = vec![];
+        while let Some(id) = id_cursor.next().await? {
+            ids.push(id);
+        }
+        self.project_ids_to_rows(&ids, projection).await
     }
 
     pub async fn query_with_options_and_hits<'a>(
@@ -250,8 +268,9 @@ impl IndexedDataClient {
         schema: u32,
         selection: Expr,
         ordering: QueryOrdering,
-    ) -> Result<DataCursor, RPCError> {
-        self.query(schema, selection, ordering).await
+        projection: Vec<ProjectionField>,
+    ) -> Result<QueryResultCursor, RPCError> {
+        self.query(schema, selection, ordering, projection).await
     }
 
     pub async fn scan_by_expr_with_options<'a>(
@@ -263,7 +282,8 @@ impl IndexedDataClient {
         distinct_fields: Option<Vec<u64>>,
         limit: Option<usize>,
         offset: Option<usize>,
-    ) -> Result<DataCursor, RPCError> {
+        projection: Vec<ProjectionField>,
+    ) -> Result<QueryResultCursor, RPCError> {
         self.query_with_options(
             schema,
             selection,
@@ -272,8 +292,9 @@ impl IndexedDataClient {
             distinct_fields,
             limit,
             offset,
+            projection,
         )
-            .await
+        .await
     }
 
     pub async fn scan_by_expr_plan(
@@ -292,9 +313,10 @@ impl IndexedDataClient {
         &self,
         schema: u32,
         query: AggregateQuery,
-    ) -> Result<AggregateResultCursor, RPCError> {
+        projection: Vec<ProjectionItem>,
+    ) -> Result<QueryResultCursor, RPCError> {
         if matches!(query.limit, Some(0)) {
-            return Ok(AggregateResultCursor {
+            return Ok(QueryResultCursor {
                 buffer: vec![],
                 pos: 0,
             });
@@ -379,10 +401,7 @@ impl IndexedDataClient {
             aggregate_rows.truncate(limit);
         }
 
-        Ok(AggregateResultCursor {
-            buffer: aggregate_rows,
-            pos: 0,
-        })
+        Ok(self.shape_aggregate_rows(aggregate_rows, projection))
     }
 
     pub async fn query_ids<'a>(

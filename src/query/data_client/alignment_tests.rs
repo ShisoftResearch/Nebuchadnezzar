@@ -1,7 +1,7 @@
 use crate::{
     query::data_client::{
         AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateSpec,
-        QueryOrdering,
+        ProjectionField, ProjectionItem, QueryOrdering,
     },
     ram::{
         cell::OwnedCell,
@@ -227,6 +227,18 @@ struct AlignQuery {
 }
 
 #[derive(Clone, Debug)]
+struct AlignProjectionField {
+    field: AlignField,
+    alias: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+struct AlignProjectionQuery {
+    query: AlignQuery,
+    projection: Vec<AlignProjectionField>,
+}
+
+#[derive(Clone, Debug)]
 struct AlignRow {
     id: Id,
     range_a: u64,
@@ -301,6 +313,12 @@ struct AlignAggregateRow {
     aggregate_values: Vec<OwnedValue>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct AlignProjectedRow {
+    id: Id,
+    columns: Vec<(String, OwnedValue)>,
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_alignment_fixed_indexed_corpus_matches_neb() {
     let _ = env_logger::try_init();
@@ -309,6 +327,21 @@ async fn sqlite_alignment_fixed_indexed_corpus_matches_neb() {
     run_alignment_suite(
         server,
         6730,
+        fixed_datasets,
+        AlignSchemaMode::IndexedOnly,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_alignment_fixed_projected_indexed_corpus_matches_neb() {
+    let _ = env_logger::try_init();
+    let fixed_datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), interior_range_dataset()];
+    let server = create_alignment_test_server(6736).await;
+    run_projection_alignment_suite(
+        server,
+        6736,
         fixed_datasets,
         AlignSchemaMode::IndexedOnly,
         false,
@@ -336,11 +369,39 @@ async fn sqlite_alignment_generated_indexed_corpus_matches_neb() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sqlite_alignment_generated_projected_indexed_corpus_matches_neb() {
+    let _ = env_logger::try_init();
+    let datasets = vec![
+        generated_dataset(0xA110_4001, 48),
+        generated_dataset(0xA110_4002, 56),
+        generated_dataset(0xA110_4003, 64),
+    ];
+    let server = create_alignment_test_server(6737).await;
+    run_projection_alignment_suite(
+        server,
+        6737,
+        datasets,
+        AlignSchemaMode::IndexedOnly,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sqlite_alignment_fixed_schema_scan_corpus_matches_neb() {
     let _ = env_logger::try_init();
     let fixed_datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), interior_range_dataset()];
     let server = create_alignment_test_server(6732).await;
     run_alignment_suite(server, 6732, fixed_datasets, AlignSchemaMode::Scannable, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_alignment_fixed_projected_schema_scan_corpus_matches_neb() {
+    let _ = env_logger::try_init();
+    let fixed_datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), interior_range_dataset()];
+    let server = create_alignment_test_server(6738).await;
+    run_projection_alignment_suite(server, 6738, fixed_datasets, AlignSchemaMode::Scannable, false)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -353,6 +414,18 @@ async fn sqlite_alignment_generated_schema_scan_corpus_matches_neb() {
     ];
     let server = create_alignment_test_server(6733).await;
     run_alignment_suite(server, 6733, datasets, AlignSchemaMode::Scannable, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_alignment_generated_projected_schema_scan_corpus_matches_neb() {
+    let _ = env_logger::try_init();
+    let datasets = vec![
+        generated_dataset(0xA110_5001, 48),
+        generated_dataset(0xA110_5002, 56),
+        generated_dataset(0xA110_5003, 64),
+    ];
+    let server = create_alignment_test_server(6739).await;
+    run_projection_alignment_suite(server, 6739, datasets, AlignSchemaMode::Scannable, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -410,6 +483,46 @@ async fn run_alignment_suite(
         };
         for query in queries {
             assert_query_alignment(&idx_client, &sqlite, schema_id, &dataset, &query).await;
+        }
+    }
+}
+
+async fn run_projection_alignment_suite(
+    server: Arc<NebServer>,
+    port: u16,
+    datasets: Vec<AlignDataset>,
+    schema_mode: AlignSchemaMode,
+    generated: bool,
+) {
+    let server_addr = format!("127.0.0.1:{port}");
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    let idx_client = server.indexed_data_client();
+
+    for (dataset_index, dataset) in datasets.into_iter().enumerate() {
+        let schema_id = 45_000 + port as u32 * 10 + dataset_index as u32;
+        let schema = alignment_schema(
+            schema_id,
+            &format!("{}_projected_{}", dataset.name, schema_mode.suffix()),
+            schema_mode.is_scannable(),
+        );
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+        materialize_neb_dataset(&client, schema_id, &dataset.rows).await;
+        let sqlite = materialize_sqlite_dataset(&dataset.rows);
+
+        let base_queries = if schema_mode.is_scannable() {
+            if generated {
+                generated_scan_queries(&dataset)
+            } else {
+                fixed_scan_queries(&dataset)
+            }
+        } else if generated {
+            generated_queries(&dataset)
+        } else {
+            fixed_queries(&dataset)
+        };
+
+        for query in projection_queries(base_queries) {
+            assert_projection_alignment(&idx_client, &sqlite, schema_id, &dataset, &query).await;
         }
     }
 }
@@ -556,6 +669,59 @@ async fn assert_query_alignment(
     }
 }
 
+async fn assert_projection_alignment(
+    idx_client: &crate::query::data_client::IndexedDataClient,
+    sqlite: &Connection,
+    schema_id: u32,
+    dataset: &AlignDataset,
+    query: &AlignProjectionQuery,
+) {
+    let neb_lisp = query.query.predicate.render_lisp();
+    let selection = parse_to_serde_expr(&neb_lisp).unwrap()[0].clone();
+    let mut neb_cursor = idx_client
+        .query_with_options(
+            schema_id,
+            selection,
+            query.query.ordering,
+            query.query.order_by_field.map(AlignField::field_id),
+            None,
+            query.query.limit,
+            query.query.offset,
+            query
+                .projection
+                .iter()
+                .map(|field| ProjectionField {
+                    field_id: field.field.field_id(),
+                    alias: field.alias.map(str::to_string),
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    let mut neb_rows = Vec::new();
+    while let Some(row) = neb_cursor.next().await.unwrap() {
+        neb_rows.push(AlignProjectedRow {
+            id: row.id.expect("query projection rows should carry ids"),
+            columns: row.columns,
+        });
+    }
+
+    let sql_plan = render_sql_projection_query(query);
+    let sqlite_rows = run_sqlite_projection_query(sqlite, &sql_plan, query);
+    if neb_rows != sqlite_rows {
+        panic!(
+            "sqlite projection alignment mismatch\n\
+             dataset={}\n\
+             neb_lisp={}\n\
+             sqlite_sql={}\n\
+             neb_rows={:?}\n\
+             sqlite_rows={:?}",
+            dataset.name, neb_lisp, sql_plan.sql, neb_rows, sqlite_rows
+        );
+    }
+}
+
 fn render_sql_query(query: &AlignQuery) -> SqlPlan {
     let explicit_order_field = query.order_by_field;
     let inferred_order_field = query.predicate.inferred_order_field();
@@ -583,6 +749,26 @@ fn render_sql_query(query: &AlignQuery) -> SqlPlan {
         let _ = write!(sql, " OFFSET {}", offset);
     }
 
+    SqlPlan { sql }
+}
+
+fn render_sql_projection_query(query: &AlignProjectionQuery) -> SqlPlan {
+    let mut sql = String::from("SELECT id_higher, id_lower");
+    for field in &query.projection {
+        let column_name = field.alias.unwrap_or(field.field.sql_name());
+        let _ = write!(
+            sql,
+            ", {} AS {}",
+            field.field.sql_name(),
+            column_name
+        );
+    }
+    let base = render_sql_query(&query.query);
+    let suffix = base
+        .sql
+        .strip_prefix("SELECT id_higher, id_lower ")
+        .expect("base query should start with id select");
+    let _ = write!(sql, " {}", suffix);
     SqlPlan { sql }
 }
 
@@ -638,6 +824,35 @@ fn run_sqlite_query(sqlite: &Connection, sql_plan: &SqlPlan) -> Vec<Id> {
     rows.map(Result::unwrap).collect()
 }
 
+fn run_sqlite_projection_query(
+    sqlite: &Connection,
+    sql_plan: &SqlPlan,
+    query: &AlignProjectionQuery,
+) -> Vec<AlignProjectedRow> {
+    let mut stmt = sqlite.prepare(&sql_plan.sql).unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            let id = Id::new(
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, i64>(1)? as u64,
+            );
+            let columns = query
+                .projection
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    (
+                        field.alias.unwrap_or(field.field.sql_name()).to_string(),
+                        sqlite_value_to_owned_value(row, index + 2, Some(field.field)),
+                    )
+                })
+                .collect();
+            Ok(AlignProjectedRow { id, columns })
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
 async fn assert_aggregate_alignment(
     idx_client: &crate::query::data_client::IndexedDataClient,
     sqlite: &Connection,
@@ -676,6 +891,20 @@ async fn assert_aggregate_alignment(
                 limit: query.limit,
                 offset: query.offset,
             },
+            query
+                .group_by_fields
+                .iter()
+                .map(|field| {
+                    ProjectionItem::Field(ProjectionField {
+                        field_id: field.field_id(),
+                        alias: None,
+                    })
+                })
+                .chain(query.aggregates.iter().map(|aggregate| ProjectionItem::Aggregate {
+                    alias: aggregate.alias.to_string(),
+                    output_name: None,
+                }))
+                .collect(),
         )
         .await
         .unwrap();
@@ -683,11 +912,17 @@ async fn assert_aggregate_alignment(
     let mut neb_rows = Vec::new();
     while let Some(row) = neb_cursor.next().await.unwrap() {
         neb_rows.push(AlignAggregateRow {
-            group_values: row.group_values.into_iter().map(|(_, value)| value).collect(),
+            group_values: row
+                .columns
+                .iter()
+                .take(query.group_by_fields.len())
+                .map(|(_, value)| value.clone())
+                .collect(),
             aggregate_values: row
-                .aggregate_values
-                .into_iter()
-                .map(|(_, value)| value)
+                .columns
+                .iter()
+                .skip(query.group_by_fields.len())
+                .map(|(_, value)| value.clone())
                 .collect(),
         });
     }
@@ -1201,6 +1436,60 @@ fn generated_aggregate_queries(dataset: &AlignDataset) -> Vec<AlignAggregateQuer
             offset: None,
         },
     ]
+}
+
+fn projection_queries(queries: Vec<AlignQuery>) -> Vec<AlignProjectionQuery> {
+    let templates = [
+        vec![
+            AlignProjectionField {
+                field: AlignField::RangeA,
+                alias: Some("ra"),
+            },
+            AlignProjectionField {
+                field: AlignField::PlainValue,
+                alias: Some("pv"),
+            },
+        ],
+        vec![
+            AlignProjectionField {
+                field: AlignField::HashValue,
+                alias: Some("hash_value"),
+            },
+            AlignProjectionField {
+                field: AlignField::NullableValue,
+                alias: Some("nullable"),
+            },
+        ],
+        vec![
+            AlignProjectionField {
+                field: AlignField::RangeB,
+                alias: Some("rb"),
+            },
+        ],
+        vec![
+            AlignProjectionField {
+                field: AlignField::RangeA,
+                alias: Some("range_a"),
+            },
+            AlignProjectionField {
+                field: AlignField::RangeB,
+                alias: Some("range_b"),
+            },
+            AlignProjectionField {
+                field: AlignField::HashValue,
+                alias: Some("hv"),
+            },
+        ],
+    ];
+
+    queries
+        .into_iter()
+        .enumerate()
+        .map(|(index, query)| AlignProjectionQuery {
+            query,
+            projection: templates[index % templates.len()].clone(),
+        })
+        .collect()
 }
 
 fn fixed_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {

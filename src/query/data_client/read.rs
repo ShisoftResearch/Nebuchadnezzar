@@ -212,4 +212,64 @@ impl IndexedDataClient {
             })
             .collect_vec()
     }
+
+    pub(super) async fn read_selected_cells_from_ids(
+        &self,
+        ids: &[Id],
+        fields: &[u64],
+    ) -> Vec<OwnedCell> {
+        let mut all_cells = vec![];
+        let mut tasks = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| self.conshash.get_server_id_by(id).map(|sid| (i, sid, *id)))
+            .sorted_by_key(|(_i, sid, _id)| *sid)
+            .chunk_by(|(_i, sid, _id)| *sid)
+            .into_iter()
+            .map(|(sid, pairs)| {
+                let mut grouped_ids = vec![];
+                let mut idx = vec![];
+                for (i, _, id) in pairs {
+                    idx.push(i);
+                    grouped_ids.push(id);
+                }
+                let fields = fields.to_vec();
+                let server_name = self.conshash.to_server_name(sid);
+                async move {
+                    match client_by_server_name(sid, server_name).await {
+                        Ok(client) => client
+                            .read_all_cells_selected(&grouped_ids, &fields, true)
+                            .await
+                            .map(|cells| {
+                                cells
+                                    .into_iter()
+                                    .zip(idx)
+                                    .filter_map(|(cell_res, original_idx)| match cell_res {
+                                        Ok(cell) => Some((cell, original_idx)),
+                                        Err(e) => {
+                                            warn!(
+                                                "Selected cell read error at index {}: {:?}",
+                                                original_idx, e
+                                            );
+                                            None
+                                        }
+                                    })
+                                    .collect_vec()
+                            }),
+                        Err(e) => Err(e),
+                    }
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        while let Some(task_res) = tasks.next().await {
+            match task_res {
+                Ok(mut cells) => all_cells.append(&mut cells),
+                Err(e) => warn!("Task error in read_selected_cells_from_ids: {:?}", e),
+            }
+        }
+
+        all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
+        all_cells.into_iter().map(|(cell, _)| cell).collect_vec()
+    }
 }

@@ -6,7 +6,8 @@ use crate::{
     index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore},
     query::data_client::{
         AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateSpec,
-        QueryOrdering, ValueRange, ValueRangeTerm,
+        ProjectionField, ProjectionItem, QueryOrdering, QueryResultCursor, QueryRow, ValueRange,
+        ValueRangeTerm,
     },
     ram::{
         cell::OwnedCell,
@@ -1376,13 +1377,18 @@ async fn scan_by_expr_supports_single_ranged_clause() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 95u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc)
+        .query(
+            schema_id,
+            selection,
+            QueryOrdering::Asc,
+            projection_fields(&[DATA_1]),
+        )
         .await
         .unwrap();
 
     for i in 95..=100u64 {
-        let cell = cursor.next().await.unwrap().expect("Expected matching row");
-        assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+        let row = cursor.next().await.unwrap().expect("Expected matching row");
+        assert_eq!(*query_row_value(&row, DATA_1).u64().unwrap(), i);
     }
     assert!(cursor.next().await.unwrap().is_none());
 }
@@ -1425,13 +1431,18 @@ async fn scan_by_expr_supports_reversed_comparison_operands() {
     let selection =
         parse_to_serde_expr("(and (< 10u64 DATA_1) (< DATA_1 15u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc)
+        .query(
+            schema_id,
+            selection,
+            QueryOrdering::Asc,
+            projection_fields(&[DATA_1]),
+        )
         .await
         .unwrap();
 
     for expected in 11..15u64 {
-        let cell = cursor.next().await.unwrap().expect("Expected matching row");
-        assert_eq!(*cell[DATA_1].u64().unwrap(), expected);
+        let row = cursor.next().await.unwrap().expect("Expected matching row");
+        assert_eq!(*query_row_value(&row, DATA_1).u64().unwrap(), expected);
     }
     assert!(cursor.next().await.unwrap().is_none());
 }
@@ -1473,17 +1484,22 @@ async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(= DATA_2 24u32)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc)
+        .query(
+            schema_id,
+            selection,
+            QueryOrdering::Asc,
+            projection_fields(&[DATA_1, DATA_2]),
+        )
         .await
         .unwrap();
 
-    let cell = cursor
+    let row = cursor
         .next()
         .await
         .unwrap()
         .expect("Expected one matching row");
-    assert_eq!(*cell[DATA_1].u64().unwrap(), 12);
-    assert_eq!(*cell[DATA_2].u32().unwrap(), 24);
+    assert_eq!(*query_row_value(&row, DATA_1).u64().unwrap(), 12);
+    assert_eq!(*query_row_value(&row, DATA_2).u32().unwrap(), 24);
     assert!(cursor.next().await.unwrap().is_none());
 }
 
@@ -1531,15 +1547,20 @@ async fn scan_by_expr_intersects_hashed_and_ranged_indexed_clauses() {
     .unwrap()[0]
         .clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc)
+        .query(
+            schema_id,
+            selection,
+            QueryOrdering::Asc,
+            projection_fields(&[DATA_1, DATA_2, DATA_3]),
+        )
         .await
         .unwrap();
 
     let mut values = vec![];
-    while let Some(cell) = cursor.next().await.unwrap() {
-        let v1 = *cell[DATA_1].u64().unwrap();
-        let v2 = *cell[DATA_2].u64().unwrap();
-        let v3 = *cell[DATA_3].u32().unwrap();
+    while let Some(row) = cursor.next().await.unwrap() {
+        let v1 = *query_row_value(&row, DATA_1).u64().unwrap();
+        let v2 = *query_row_value(&row, DATA_2).u64().unwrap();
+        let v3 = *query_row_value(&row, DATA_3).u32().unwrap();
         assert!((40..=80).contains(&v1));
         assert_eq!(v2, 2);
         assert_eq!(v3, 2);
@@ -1589,7 +1610,7 @@ async fn scan_by_expr_multi_index_intersection_can_be_empty() {
             [0]
         .clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc)
+        .query(schema_id, selection, QueryOrdering::Asc, vec![])
         .await
         .unwrap();
 
@@ -1634,13 +1655,13 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 1u64) (= DATA_2 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Desc)
+        .query(schema_id, selection, QueryOrdering::Desc, vec![])
         .await
         .unwrap();
 
     let mut values = vec![];
-    while let Some(cell) = cursor.next().await.unwrap() {
-        values.push(cell.id());
+    while let Some(row) = cursor.next().await.unwrap() {
+        values.push(row.id.unwrap());
     }
 
     assert_eq!(
@@ -1698,13 +1719,14 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
             None,
             Some(3),
             None,
+            vec![],
         )
         .await
         .unwrap();
 
     let mut ids = vec![];
-    while let Some(cell) = cursor.next().await.unwrap() {
-        ids.push(cell.id());
+    while let Some(row) = cursor.next().await.unwrap() {
+        ids.push(row.id.unwrap());
     }
     assert_eq!(ids, vec![Id::new(18, 9), Id::new(18, 7), Id::new(18, 5)]);
 }
@@ -1758,13 +1780,14 @@ async fn scan_by_expr_with_options_supports_non_indexed_order_by_field() {
             None,
             Some(2),
             None,
+            vec![],
         )
         .await
         .unwrap();
 
     let mut ids = vec![];
-    while let Some(cell) = cursor.next().await.unwrap() {
-        ids.push(cell.id());
+    while let Some(row) = cursor.next().await.unwrap() {
+        ids.push(row.id.unwrap());
     }
 
     assert_eq!(ids, vec![Id::new(19, 1), Id::new(19, 3)]);
@@ -1931,7 +1954,7 @@ async fn scan_by_expr_detects_contradictory_hashed_predicates() {
     let selection =
         parse_to_serde_expr("(and (= DATA_1 0u64) (= DATA_1 1u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc)
+        .query(schema_id, selection, QueryOrdering::Asc, vec![])
         .await
         .unwrap();
     assert!(cursor.next().await.unwrap().is_none());
@@ -1974,7 +1997,7 @@ async fn scan_by_expr_detects_contradictory_ranged_predicates() {
     let selection =
         parse_to_serde_expr("(and (> DATA_1 8u64) (< DATA_1 2u64))").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc)
+        .query(schema_id, selection, QueryOrdering::Asc, vec![])
         .await
         .unwrap();
     assert!(cursor.next().await.unwrap().is_none());
@@ -2206,13 +2229,14 @@ async fn scan_by_expr_with_options_supports_offset_and_limit() {
             None,
             Some(2),
             Some(1),
+            vec![],
         )
         .await
         .unwrap();
 
     let mut ids = vec![];
-    while let Some(cell) = cursor.next().await.unwrap() {
-        ids.push(cell.id());
+    while let Some(row) = cursor.next().await.unwrap() {
+        ids.push(row.id.unwrap());
     }
     assert_eq!(ids, vec![Id::new(19, 7), Id::new(19, 5)]);
 }
@@ -3222,13 +3246,14 @@ async fn scan_by_expr_with_options_applies_distinct_before_offset_and_limit() {
             Some(vec![hash_str(GROUP_FIELD)]),
             Some(1),
             Some(1),
+            vec![],
         )
         .await
         .unwrap();
 
     let mut ids = vec![];
-    while let Some(cell) = cursor.next().await.unwrap() {
-        ids.push(cell.id());
+    while let Some(row) = cursor.next().await.unwrap() {
+        ids.push(row.id.unwrap());
     }
 
     assert_eq!(ids, vec![Id::new(33, 2)]);
@@ -3443,7 +3468,7 @@ async fn scan_by_expr_ranged_clause_with_no_hits_returns_empty() {
     let idx_data_client = server.indexed_data_client();
     let selection = parse_to_serde_expr("(>= DATA_1 100u64)").unwrap()[0].clone();
     let mut cursor = idx_data_client
-        .query(schema_id, selection, QueryOrdering::Asc)
+        .query(schema_id, selection, QueryOrdering::Asc, vec![])
         .await
         .unwrap();
 
@@ -4959,14 +4984,30 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
     );
 }
 
-async fn collect_aggregate_rows(
-    mut cursor: crate::query::data_client::AggregateResultCursor,
-) -> Vec<crate::query::data_client::AggregateRow> {
+async fn collect_query_rows(mut cursor: QueryResultCursor) -> Vec<QueryRow> {
     let mut rows = vec![];
     while let Some(row) = cursor.next().await.unwrap() {
         rows.push(row);
     }
     rows
+}
+
+fn projection_fields(fields: &[&str]) -> Vec<ProjectionField> {
+    fields
+        .iter()
+        .map(|field| ProjectionField {
+            field_id: hash_str(field),
+            alias: Some((*field).to_string()),
+        })
+        .collect()
+}
+
+fn query_row_value<'a>(row: &'a QueryRow, name: &str) -> &'a OwnedValue {
+    row.columns
+        .iter()
+        .find(|(column_name, _)| column_name == name)
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| panic!("missing projected column {name}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5002,7 +5043,7 @@ async fn aggregate_groups_and_computes_builtins() {
 
     let region_field = hash_str(REGION);
     let latency_field = hash_str(LATENCY);
-    let rows = collect_aggregate_rows(
+    let rows = collect_query_rows(
         server
             .indexed_data_client()
             .aggregate(
@@ -5049,6 +5090,36 @@ async fn aggregate_groups_and_computes_builtins() {
                     limit: None,
                     offset: None,
                 },
+                vec![
+                    ProjectionItem::Field(ProjectionField {
+                        field_id: region_field,
+                        alias: Some("region".to_string()),
+                    }),
+                    ProjectionItem::Aggregate {
+                        alias: "count_all".to_string(),
+                        output_name: None,
+                    },
+                    ProjectionItem::Aggregate {
+                        alias: "count_latency".to_string(),
+                        output_name: None,
+                    },
+                    ProjectionItem::Aggregate {
+                        alias: "sum_latency".to_string(),
+                        output_name: None,
+                    },
+                    ProjectionItem::Aggregate {
+                        alias: "avg_latency".to_string(),
+                        output_name: None,
+                    },
+                    ProjectionItem::Aggregate {
+                        alias: "min_latency".to_string(),
+                        output_name: None,
+                    },
+                    ProjectionItem::Aggregate {
+                        alias: "max_latency".to_string(),
+                        output_name: None,
+                    },
+                ],
             )
             .await
             .unwrap(),
@@ -5057,21 +5128,168 @@ async fn aggregate_groups_and_computes_builtins() {
 
     assert_eq!(rows.len(), 2);
 
-    assert_eq!(rows[0].group_values[0].1, OwnedValue::String("eu".to_string()));
-    assert_eq!(rows[0].aggregate_values[0].1, OwnedValue::U64(2));
-    assert_eq!(rows[0].aggregate_values[1].1, OwnedValue::U64(1));
-    assert_eq!(rows[0].aggregate_values[2].1, OwnedValue::U64(30));
-    assert_eq!(rows[0].aggregate_values[3].1, OwnedValue::F64(30.0));
-    assert_eq!(rows[0].aggregate_values[4].1, OwnedValue::U64(30));
-    assert_eq!(rows[0].aggregate_values[5].1, OwnedValue::U64(30));
+    assert_eq!(
+        query_row_value(&rows[0], "region"),
+        &OwnedValue::String("eu".to_string())
+    );
+    assert_eq!(query_row_value(&rows[0], "count_all"), &OwnedValue::U64(2));
+    assert_eq!(query_row_value(&rows[0], "count_latency"), &OwnedValue::U64(1));
+    assert_eq!(query_row_value(&rows[0], "sum_latency"), &OwnedValue::U64(30));
+    assert_eq!(query_row_value(&rows[0], "avg_latency"), &OwnedValue::F64(30.0));
+    assert_eq!(query_row_value(&rows[0], "min_latency"), &OwnedValue::U64(30));
+    assert_eq!(query_row_value(&rows[0], "max_latency"), &OwnedValue::U64(30));
 
-    assert_eq!(rows[1].group_values[0].1, OwnedValue::String("us".to_string()));
-    assert_eq!(rows[1].aggregate_values[0].1, OwnedValue::U64(2));
-    assert_eq!(rows[1].aggregate_values[1].1, OwnedValue::U64(2));
-    assert_eq!(rows[1].aggregate_values[2].1, OwnedValue::U64(30));
-    assert_eq!(rows[1].aggregate_values[3].1, OwnedValue::F64(15.0));
-    assert_eq!(rows[1].aggregate_values[4].1, OwnedValue::U64(10));
-    assert_eq!(rows[1].aggregate_values[5].1, OwnedValue::U64(20));
+    assert_eq!(
+        query_row_value(&rows[1], "region"),
+        &OwnedValue::String("us".to_string())
+    );
+    assert_eq!(query_row_value(&rows[1], "count_all"), &OwnedValue::U64(2));
+    assert_eq!(query_row_value(&rows[1], "count_latency"), &OwnedValue::U64(2));
+    assert_eq!(query_row_value(&rows[1], "sum_latency"), &OwnedValue::U64(30));
+    assert_eq!(query_row_value(&rows[1], "avg_latency"), &OwnedValue::F64(15.0));
+    assert_eq!(query_row_value(&rows[1], "min_latency"), &OwnedValue::U64(10));
+    assert_eq!(query_row_value(&rows[1], "max_latency"), &OwnedValue::U64(20));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_shapes_selected_fields() {
+    const NAME: &str = "NAME";
+    const SCORE: &str = "SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6776).await;
+    let server_addr = String::from("127.0.0.1:6776");
+
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed(NAME, Type::String),
+        Field::new_unindexed(SCORE, Type::U64),
+    ]);
+    let schema_id = 1102;
+    let schema = Schema::new_with_id(schema_id, "projection_schema", None, fields, false, true);
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (raw_id, name, score) in [(0, "alice", 10u64), (1, "bob", 20u64)] {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[NAME] = OwnedValue::String(name.to_string());
+        value[SCORE] = OwnedValue::U64(score);
+        let cell = OwnedCell::new_with_id(schema_id, &Id::new(3, raw_id), value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let rows = collect_query_rows(
+        server
+            .indexed_data_client()
+            .query(
+                schema_id,
+                Expr::nothing(),
+                QueryOrdering::Asc,
+                vec![
+                    ProjectionField {
+                        field_id: hash_str(NAME),
+                        alias: Some("name".to_string()),
+                    },
+                    ProjectionField {
+                        field_id: hash_str(SCORE),
+                        alias: Some("score".to_string()),
+                    },
+                ],
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, Some(Id::new(3, 0)));
+    assert_eq!(
+        rows[0].columns,
+        vec![
+            ("name".to_string(), OwnedValue::String("alice".to_string())),
+            ("score".to_string(), OwnedValue::U64(10)),
+        ]
+    );
+    assert_eq!(rows[1].id, Some(Id::new(3, 1)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_shapes_group_and_aggregate_columns() {
+    const REGION: &str = "REGION";
+    const LATENCY: &str = "LATENCY";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6777).await;
+    let server_addr = String::from("127.0.0.1:6777");
+
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed(REGION, Type::String),
+        Field::new_unindexed_nullable(LATENCY, Type::U64),
+    ]);
+    let schema_id = 1103;
+    let schema = Schema::new_with_id(schema_id, "aggregate_projection_schema", None, fields, false, true);
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    for (raw_id, region, latency) in [(0, "us", Some(10u64)), (1, "us", Some(20u64)), (2, "eu", Some(30u64))] {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[REGION] = OwnedValue::String(region.to_string());
+        value[LATENCY] = latency.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
+        let cell = OwnedCell::new_with_id(schema_id, &Id::new(4, raw_id), value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let region_field = hash_str(REGION);
+    let latency_field = hash_str(LATENCY);
+    let rows = collect_query_rows(
+        server
+            .indexed_data_client()
+            .aggregate(
+                schema_id,
+                AggregateQuery {
+                    selection: Expr::nothing(),
+                    group_by_fields: vec![region_field],
+                    aggregates: vec![AggregateSpec {
+                        func: AggregateFunction::Avg,
+                        field_id: Some(latency_field),
+                        alias: "avg_latency".to_string(),
+                    }],
+                    order_by: Some(AggregateOrderBy {
+                        target: AggregateOrderTarget::GroupField(region_field),
+                        ordering: QueryOrdering::Asc,
+                    }),
+                    limit: None,
+                    offset: None,
+                },
+                vec![
+                    ProjectionItem::Field(ProjectionField {
+                        field_id: region_field,
+                        alias: Some("region".to_string()),
+                    }),
+                    ProjectionItem::Aggregate {
+                        alias: "avg_latency".to_string(),
+                        output_name: Some("avg".to_string()),
+                    },
+                ],
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].id, None);
+    assert_eq!(
+        rows[0].columns,
+        vec![
+            ("region".to_string(), OwnedValue::String("eu".to_string())),
+            ("avg".to_string(), OwnedValue::F64(30.0)),
+        ]
+    );
+    assert_eq!(
+        rows[1].columns,
+        vec![
+            ("region".to_string(), OwnedValue::String("us".to_string())),
+            ("avg".to_string(), OwnedValue::F64(15.0)),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5108,7 +5326,7 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
 
     let region_field = hash_str(REGION);
     let score_field = hash_str(SCORE);
-    let rows = collect_aggregate_rows(
+    let rows = collect_query_rows(
         server
             .indexed_data_client()
             .aggregate(
@@ -5128,6 +5346,16 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
                     limit: Some(1),
                     offset: Some(1),
                 },
+                vec![
+                    ProjectionItem::Field(ProjectionField {
+                        field_id: region_field,
+                        alias: Some("region".to_string()),
+                    }),
+                    ProjectionItem::Aggregate {
+                        alias: "total_score".to_string(),
+                        output_name: None,
+                    },
+                ],
             )
             .await
             .unwrap(),
@@ -5136,8 +5364,8 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
 
     assert_eq!(rows.len(), 1);
     assert_eq!(
-        rows[0].group_values[0].1,
-        OwnedValue::String("beta".to_string())
+        query_row_value(&rows[0], "region"),
+        &OwnedValue::String("beta".to_string())
     );
-    assert_eq!(rows[0].aggregate_values[0].1, OwnedValue::U64(20));
+    assert_eq!(query_row_value(&rows[0], "total_score"), &OwnedValue::U64(20));
 }
