@@ -4,7 +4,10 @@ use crate::{
     index::embedding::{EmbeddingHit, EmbeddingIndexerCore, EmbeddingModel, EmbeddingModelInfo},
     index::ranged::tree::btree::Ordering,
     index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore},
-    query::data_client::{QueryOrdering, ValueRange, ValueRangeTerm},
+    query::data_client::{
+        AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateSpec,
+        QueryOrdering, ValueRange, ValueRangeTerm,
+    },
     ram::{
         cell::OwnedCell,
         schema::{Field, IndexType, Schema},
@@ -4954,4 +4957,187 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
         "expected substantial speedup for OR+LIMIT benchmark, got {:.2}x",
         speedup
     );
+}
+
+async fn collect_aggregate_rows(
+    mut cursor: crate::query::data_client::AggregateResultCursor,
+) -> Vec<crate::query::data_client::AggregateRow> {
+    let mut rows = vec![];
+    while let Some(row) = cursor.next().await.unwrap() {
+        rows.push(row);
+    }
+    rows
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_groups_and_computes_builtins() {
+    const REGION: &str = "REGION";
+    const LATENCY: &str = "LATENCY";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6774).await;
+    let server_addr = String::from("127.0.0.1:6774");
+
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed(REGION, Type::String),
+        Field::new_unindexed_nullable(LATENCY, Type::U64),
+    ]);
+    let schema_id = 1100;
+    let schema = Schema::new_with_id(schema_id, "aggregate_schema", None, fields, false, true);
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let rows = vec![
+        (0, "us", Some(10u64)),
+        (1, "us", Some(20u64)),
+        (2, "eu", Some(30u64)),
+        (3, "eu", None),
+    ];
+    for (raw_id, region, latency) in rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[REGION] = OwnedValue::String(region.to_string());
+        value[LATENCY] = latency.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
+        let cell = OwnedCell::new_with_id(schema_id, &Id::new(1, raw_id), value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let region_field = hash_str(REGION);
+    let latency_field = hash_str(LATENCY);
+    let rows = collect_aggregate_rows(
+        server
+            .indexed_data_client()
+            .aggregate(
+                schema_id,
+                AggregateQuery {
+                    selection: Expr::nothing(),
+                    group_by_fields: vec![region_field],
+                    aggregates: vec![
+                        AggregateSpec {
+                            func: AggregateFunction::CountStar,
+                            field_id: None,
+                            alias: "count_all".to_string(),
+                        },
+                        AggregateSpec {
+                            func: AggregateFunction::CountField,
+                            field_id: Some(latency_field),
+                            alias: "count_latency".to_string(),
+                        },
+                        AggregateSpec {
+                            func: AggregateFunction::Sum,
+                            field_id: Some(latency_field),
+                            alias: "sum_latency".to_string(),
+                        },
+                        AggregateSpec {
+                            func: AggregateFunction::Avg,
+                            field_id: Some(latency_field),
+                            alias: "avg_latency".to_string(),
+                        },
+                        AggregateSpec {
+                            func: AggregateFunction::Min,
+                            field_id: Some(latency_field),
+                            alias: "min_latency".to_string(),
+                        },
+                        AggregateSpec {
+                            func: AggregateFunction::Max,
+                            field_id: Some(latency_field),
+                            alias: "max_latency".to_string(),
+                        },
+                    ],
+                    order_by: Some(AggregateOrderBy {
+                        target: AggregateOrderTarget::GroupField(region_field),
+                        ordering: QueryOrdering::Asc,
+                    }),
+                    limit: None,
+                    offset: None,
+                },
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(rows.len(), 2);
+
+    assert_eq!(rows[0].group_values[0].1, OwnedValue::String("eu".to_string()));
+    assert_eq!(rows[0].aggregate_values[0].1, OwnedValue::U64(2));
+    assert_eq!(rows[0].aggregate_values[1].1, OwnedValue::U64(1));
+    assert_eq!(rows[0].aggregate_values[2].1, OwnedValue::U64(30));
+    assert_eq!(rows[0].aggregate_values[3].1, OwnedValue::F64(30.0));
+    assert_eq!(rows[0].aggregate_values[4].1, OwnedValue::U64(30));
+    assert_eq!(rows[0].aggregate_values[5].1, OwnedValue::U64(30));
+
+    assert_eq!(rows[1].group_values[0].1, OwnedValue::String("us".to_string()));
+    assert_eq!(rows[1].aggregate_values[0].1, OwnedValue::U64(2));
+    assert_eq!(rows[1].aggregate_values[1].1, OwnedValue::U64(2));
+    assert_eq!(rows[1].aggregate_values[2].1, OwnedValue::U64(30));
+    assert_eq!(rows[1].aggregate_values[3].1, OwnedValue::F64(15.0));
+    assert_eq!(rows[1].aggregate_values[4].1, OwnedValue::U64(10));
+    assert_eq!(rows[1].aggregate_values[5].1, OwnedValue::U64(20));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aggregate_orders_by_alias_and_applies_offset_limit() {
+    const REGION: &str = "REGION";
+    const SCORE: &str = "SCORE";
+    let _ = env_logger::try_init();
+    let server = create_test_server(6775).await;
+    let server_addr = String::from("127.0.0.1:6775");
+
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed(REGION, Type::String),
+        Field::new_unindexed(SCORE, Type::U64),
+    ]);
+    let schema_id = 1101;
+    let schema = Schema::new_with_id(schema_id, "aggregate_sort_schema", None, fields, false, true);
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let rows = vec![
+        (0, "alpha", 5u64),
+        (1, "alpha", 7u64),
+        (2, "beta", 20u64),
+        (3, "gamma", 12u64),
+        (4, "gamma", 13u64),
+    ];
+    for (raw_id, region, score) in rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[REGION] = OwnedValue::String(region.to_string());
+        value[SCORE] = OwnedValue::U64(score);
+        let cell = OwnedCell::new_with_id(schema_id, &Id::new(1, raw_id), value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    let region_field = hash_str(REGION);
+    let score_field = hash_str(SCORE);
+    let rows = collect_aggregate_rows(
+        server
+            .indexed_data_client()
+            .aggregate(
+                schema_id,
+                AggregateQuery {
+                    selection: Expr::nothing(),
+                    group_by_fields: vec![region_field],
+                    aggregates: vec![AggregateSpec {
+                        func: AggregateFunction::Sum,
+                        field_id: Some(score_field),
+                        alias: "total_score".to_string(),
+                    }],
+                    order_by: Some(AggregateOrderBy {
+                        target: AggregateOrderTarget::AggregateAlias("total_score".to_string()),
+                        ordering: QueryOrdering::Desc,
+                    }),
+                    limit: Some(1),
+                    offset: Some(1),
+                },
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].group_values[0].1,
+        OwnedValue::String("beta".to_string())
+    );
+    assert_eq!(rows[0].aggregate_values[0].1, OwnedValue::U64(20));
 }

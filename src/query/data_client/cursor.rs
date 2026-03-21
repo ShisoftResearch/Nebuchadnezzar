@@ -1,7 +1,7 @@
 use std::mem;
 
 use bifrost::rpc::RPCError;
-use dovahkiin::{expr::serde::Expr, types::Id};
+use dovahkiin::{expr::serde::Expr, types::{Id, OwnedValue}};
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
@@ -27,6 +27,17 @@ pub struct IdCursor {
     pub(super) pos: usize,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateRow {
+    pub group_values: Vec<(u64, OwnedValue)>,
+    pub aggregate_values: Vec<(String, OwnedValue)>,
+}
+
+pub struct AggregateResultCursor {
+    pub(super) buffer: Vec<AggregateRow>,
+    pub(super) pos: usize,
+}
+
 impl IdCursor {
     pub async fn next(&mut self) -> Result<Option<Id>, RPCError> {
         if self.buffer.len() <= self.pos {
@@ -35,6 +46,17 @@ impl IdCursor {
         let id = self.buffer[self.pos];
         self.pos += 1;
         Ok(Some(id))
+    }
+}
+
+impl AggregateResultCursor {
+    pub async fn next(&mut self) -> Result<Option<AggregateRow>, RPCError> {
+        if self.buffer.len() <= self.pos {
+            return Ok(None);
+        }
+        let row = self.buffer[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
     }
 }
 

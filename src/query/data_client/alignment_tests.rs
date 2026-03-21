@@ -1,5 +1,8 @@
 use crate::{
-    query::data_client::QueryOrdering,
+    query::data_client::{
+        AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateSpec,
+        QueryOrdering,
+    },
     ram::{
         cell::OwnedCell,
         schema::{Field, IndexType, Schema},
@@ -263,6 +266,41 @@ struct SqlPlan {
     sql: String,
 }
 
+#[derive(Clone, Debug)]
+struct AlignAggregateQuery {
+    predicate: AlignPredicate,
+    group_by_fields: Vec<AlignField>,
+    aggregates: Vec<AlignAggregateSpec>,
+    order_by: Option<AlignAggregateOrderBy>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct AlignAggregateSpec {
+    func: AggregateFunction,
+    field: Option<AlignField>,
+    alias: &'static str,
+}
+
+#[derive(Clone, Debug)]
+enum AlignAggregateOrderTarget {
+    GroupField(AlignField),
+    AggregateAlias(&'static str),
+}
+
+#[derive(Clone, Debug)]
+struct AlignAggregateOrderBy {
+    target: AlignAggregateOrderTarget,
+    ordering: QueryOrdering,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AlignAggregateRow {
+    group_values: Vec<OwnedValue>,
+    aggregate_values: Vec<OwnedValue>,
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_alignment_fixed_indexed_corpus_matches_neb() {
     let _ = env_logger::try_init();
@@ -317,6 +355,26 @@ async fn sqlite_alignment_generated_schema_scan_corpus_matches_neb() {
     run_alignment_suite(server, 6733, datasets, AlignSchemaMode::Scannable, true).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_alignment_fixed_aggregate_corpus_matches_neb() {
+    let _ = env_logger::try_init();
+    let datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), generated_dataset(0xA110_2001, 48)];
+    let server = create_alignment_test_server(6734).await;
+    run_aggregate_alignment_suite(server, 6734, datasets, AlignSchemaMode::Scannable, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_alignment_generated_aggregate_corpus_matches_neb() {
+    let _ = env_logger::try_init();
+    let datasets = vec![
+        generated_dataset(0xA110_3001, 48),
+        generated_dataset(0xA110_3002, 56),
+        generated_dataset(0xA110_3003, 64),
+    ];
+    let server = create_alignment_test_server(6735).await;
+    run_aggregate_alignment_suite(server, 6735, datasets, AlignSchemaMode::Scannable, true).await;
+}
+
 async fn run_alignment_suite(
     server: Arc<NebServer>,
     port: u16,
@@ -352,6 +410,38 @@ async fn run_alignment_suite(
         };
         for query in queries {
             assert_query_alignment(&idx_client, &sqlite, schema_id, &dataset, &query).await;
+        }
+    }
+}
+
+async fn run_aggregate_alignment_suite(
+    server: Arc<NebServer>,
+    port: u16,
+    datasets: Vec<AlignDataset>,
+    schema_mode: AlignSchemaMode,
+    generated: bool,
+) {
+    let server_addr = format!("127.0.0.1:{port}");
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    let idx_client = server.indexed_data_client();
+
+    for (dataset_index, dataset) in datasets.into_iter().enumerate() {
+        let schema_id = 50_000 + port as u32 * 10 + dataset_index as u32;
+        let schema = alignment_schema(
+            schema_id,
+            &format!("{}_aggregate_{}", dataset.name, schema_mode.suffix()),
+            schema_mode.is_scannable(),
+        );
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+        materialize_neb_dataset(&client, schema_id, &dataset.rows).await;
+        let sqlite = materialize_sqlite_dataset(&dataset.rows);
+        let queries = if generated {
+            generated_aggregate_queries(&dataset)
+        } else {
+            fixed_aggregate_queries(&dataset)
+        };
+        for query in queries {
+            assert_aggregate_alignment(&idx_client, &sqlite, schema_id, &dataset, &query).await;
         }
     }
 }
@@ -548,6 +638,188 @@ fn run_sqlite_query(sqlite: &Connection, sql_plan: &SqlPlan) -> Vec<Id> {
     rows.map(Result::unwrap).collect()
 }
 
+async fn assert_aggregate_alignment(
+    idx_client: &crate::query::data_client::IndexedDataClient,
+    sqlite: &Connection,
+    schema_id: u32,
+    dataset: &AlignDataset,
+    query: &AlignAggregateQuery,
+) {
+    let neb_lisp = query.predicate.render_lisp();
+    let selection = parse_to_serde_expr(&neb_lisp).unwrap()[0].clone();
+    let mut neb_cursor = idx_client
+        .aggregate(
+            schema_id,
+            AggregateQuery {
+                selection,
+                group_by_fields: query.group_by_fields.iter().map(|field| field.field_id()).collect(),
+                aggregates: query
+                    .aggregates
+                    .iter()
+                    .map(|aggregate| AggregateSpec {
+                        func: aggregate.func.clone(),
+                        field_id: aggregate.field.map(AlignField::field_id),
+                        alias: aggregate.alias.to_string(),
+                    })
+                    .collect(),
+                order_by: query.order_by.as_ref().map(|order_by| AggregateOrderBy {
+                    target: match order_by.target {
+                        AlignAggregateOrderTarget::GroupField(field) => {
+                            AggregateOrderTarget::GroupField(field.field_id())
+                        }
+                        AlignAggregateOrderTarget::AggregateAlias(alias) => {
+                            AggregateOrderTarget::AggregateAlias(alias.to_string())
+                        }
+                    },
+                    ordering: order_by.ordering,
+                }),
+                limit: query.limit,
+                offset: query.offset,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut neb_rows = Vec::new();
+    while let Some(row) = neb_cursor.next().await.unwrap() {
+        neb_rows.push(AlignAggregateRow {
+            group_values: row.group_values.into_iter().map(|(_, value)| value).collect(),
+            aggregate_values: row
+                .aggregate_values
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect(),
+        });
+    }
+
+    let sql_plan = render_sql_aggregate_query(query);
+    let sqlite_rows = run_sqlite_aggregate_query(sqlite, &sql_plan, query);
+    if neb_rows != sqlite_rows {
+        panic!(
+            "sqlite aggregate alignment mismatch\n\
+             dataset={}\n\
+             neb_lisp={}\n\
+             sqlite_sql={}\n\
+             neb_rows={:?}\n\
+             sqlite_rows={:?}",
+            dataset.name, neb_lisp, sql_plan.sql, neb_rows, sqlite_rows
+        );
+    }
+}
+
+fn render_sql_aggregate_query(query: &AlignAggregateQuery) -> SqlPlan {
+    let mut select_items = Vec::new();
+    for field in &query.group_by_fields {
+        select_items.push(field.sql_name().to_string());
+    }
+    for aggregate in &query.aggregates {
+        let expr = match (aggregate.func.clone(), aggregate.field) {
+            (AggregateFunction::CountStar, None) => "COUNT(*)".to_string(),
+            (AggregateFunction::CountField, Some(field)) => {
+                format!("COUNT({})", field.sql_name())
+            }
+            (AggregateFunction::Sum, Some(field)) => format!("SUM({})", field.sql_name()),
+            (AggregateFunction::Avg, Some(field)) => format!("AVG({})", field.sql_name()),
+            (AggregateFunction::Min, Some(field)) => format!("MIN({})", field.sql_name()),
+            (AggregateFunction::Max, Some(field)) => format!("MAX({})", field.sql_name()),
+            _ => panic!("invalid aggregate spec for sqlite rendering: {:?}", aggregate),
+        };
+        select_items.push(format!("{expr} AS {}", aggregate.alias));
+    }
+
+    let mut sql = format!(
+        "SELECT {} FROM rows WHERE {}",
+        select_items.join(", "),
+        query.predicate.render_sql()
+    );
+    if !query.group_by_fields.is_empty() {
+        let group_by = query
+            .group_by_fields
+            .iter()
+            .map(|field| field.sql_name())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(sql, " GROUP BY {}", group_by);
+    }
+    if let Some(order_by) = query.order_by.as_ref() {
+        let direction = render_sql_ordering(order_by.ordering);
+        let mut order_exprs = vec![match order_by.target {
+            AlignAggregateOrderTarget::GroupField(field) => {
+                format!("{} {}", field.sql_name(), direction)
+            }
+            AlignAggregateOrderTarget::AggregateAlias(alias) => {
+                format!("{} {}", alias, direction)
+            }
+        }];
+        order_exprs.extend(
+            query
+                .group_by_fields
+                .iter()
+                .map(|field| format!("{} ASC", field.sql_name())),
+        );
+        let _ = write!(sql, " ORDER BY {}", order_exprs.join(", "));
+    }
+    if let Some(limit) = query.limit {
+        let _ = write!(sql, " LIMIT {}", limit);
+    }
+    if let Some(offset) = query.offset {
+        let _ = write!(sql, " OFFSET {}", offset);
+    }
+    SqlPlan { sql }
+}
+
+fn run_sqlite_aggregate_query(
+    sqlite: &Connection,
+    sql_plan: &SqlPlan,
+    query: &AlignAggregateQuery,
+) -> Vec<AlignAggregateRow> {
+    let mut stmt = sqlite.prepare(&sql_plan.sql).unwrap();
+    let rows = stmt
+        .query_map([], |row| {
+            let mut group_values = Vec::new();
+            for (index, field) in query.group_by_fields.iter().enumerate() {
+                group_values.push(sqlite_value_to_owned_value(row, index, Some(*field)));
+            }
+            let mut aggregate_values = Vec::new();
+            for (offset, aggregate) in query.aggregates.iter().enumerate() {
+                aggregate_values.push(sqlite_value_to_owned_value(
+                    row,
+                    query.group_by_fields.len() + offset,
+                    aggregate.field,
+                ));
+            }
+            Ok(AlignAggregateRow {
+                group_values,
+                aggregate_values,
+            })
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+fn sqlite_value_to_owned_value(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    field: Option<AlignField>,
+) -> OwnedValue {
+    let value_ref = row.get_ref(index).unwrap();
+    match value_ref {
+        rusqlite::types::ValueRef::Null => OwnedValue::Null,
+        rusqlite::types::ValueRef::Integer(value) => {
+            if matches!(field, Some(AlignField::NullableValue)) {
+                OwnedValue::U64(value as u64)
+            } else {
+                OwnedValue::U64(value as u64)
+            }
+        }
+        rusqlite::types::ValueRef::Real(value) => OwnedValue::F64(value),
+        rusqlite::types::ValueRef::Text(value) => {
+            OwnedValue::String(std::str::from_utf8(value).unwrap().to_string())
+        }
+        rusqlite::types::ValueRef::Blob(_) => panic!("unexpected blob aggregate value"),
+    }
+}
+
 fn build_alignment_diff(
     dataset: &AlignDataset,
     query: &AlignQuery,
@@ -673,6 +945,262 @@ fn generated_dataset(seed: u64, row_count: usize) -> AlignDataset {
         name: format!("generated_seed_{seed}"),
         rows,
     }
+}
+
+fn fixed_aggregate_queries(dataset: &AlignDataset) -> Vec<AlignAggregateQuery> {
+    let first = &dataset.rows[0];
+    let half = &dataset.rows[dataset.rows.len() / 2];
+    let last = &dataset.rows[dataset.rows.len() - 1];
+
+    vec![
+        AlignAggregateQuery {
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeA,
+                AlignOp::Ge,
+                first.range_a.min(half.range_a),
+            ),
+            group_by_fields: vec![],
+            aggregates: vec![
+                AlignAggregateSpec {
+                    func: AggregateFunction::CountStar,
+                    field: None,
+                    alias: "count_all",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Sum,
+                    field: Some(AlignField::RangeB),
+                    alias: "sum_range_b",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Avg,
+                    field: Some(AlignField::NullableValue),
+                    alias: "avg_nullable",
+                },
+            ],
+            order_by: None,
+            limit: None,
+            offset: None,
+        },
+        AlignAggregateQuery {
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeA,
+                AlignOp::Ge,
+                first.range_a.min(last.range_a),
+            ),
+            group_by_fields: vec![AlignField::HashValue],
+            aggregates: vec![
+                AlignAggregateSpec {
+                    func: AggregateFunction::CountStar,
+                    field: None,
+                    alias: "count_all",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Max,
+                    field: Some(AlignField::RangeB),
+                    alias: "max_range_b",
+                },
+            ],
+            order_by: Some(AlignAggregateOrderBy {
+                target: AlignAggregateOrderTarget::AggregateAlias("max_range_b"),
+                ordering: QueryOrdering::Desc,
+            }),
+            limit: Some(5),
+            offset: Some(1),
+        },
+        AlignAggregateQuery {
+            predicate: AlignPredicate::or(vec![
+                AlignPredicate::eq(AlignField::HashValue, first.hash_value),
+                AlignPredicate::eq(AlignField::HashValue, half.hash_value),
+                AlignPredicate::eq(AlignField::HashValue, last.hash_value),
+            ]),
+            group_by_fields: vec![AlignField::PlainValue],
+            aggregates: vec![
+                AlignAggregateSpec {
+                    func: AggregateFunction::CountField,
+                    field: Some(AlignField::NullableValue),
+                    alias: "count_nullable",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Min,
+                    field: Some(AlignField::RangeA),
+                    alias: "min_range_a",
+                },
+            ],
+            order_by: Some(AlignAggregateOrderBy {
+                target: AlignAggregateOrderTarget::GroupField(AlignField::PlainValue),
+                ordering: QueryOrdering::Asc,
+            }),
+            limit: None,
+            offset: None,
+        },
+    ]
+}
+
+fn generated_aggregate_queries(dataset: &AlignDataset) -> Vec<AlignAggregateQuery> {
+    let rows = &dataset.rows;
+    let first = &rows[0];
+    let quarter = &rows[rows.len() / 4];
+    let half = &rows[rows.len() / 2];
+    let three_quarters = &rows[(rows.len() * 3) / 4];
+    let last = &rows[rows.len() - 1];
+    let max_range_a = rows.iter().map(|row| row.range_a).max().unwrap_or(0);
+
+    vec![
+        AlignAggregateQuery {
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeA,
+                AlignOp::Ge,
+                quarter.range_a.min(half.range_a),
+            ),
+            group_by_fields: vec![],
+            aggregates: vec![
+                AlignAggregateSpec {
+                    func: AggregateFunction::CountStar,
+                    field: None,
+                    alias: "count_all",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Sum,
+                    field: Some(AlignField::RangeB),
+                    alias: "sum_range_b",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Avg,
+                    field: Some(AlignField::NullableValue),
+                    alias: "avg_nullable",
+                },
+            ],
+            order_by: None,
+            limit: None,
+            offset: None,
+        },
+        AlignAggregateQuery {
+            predicate: AlignPredicate::and(vec![
+                AlignPredicate::cmp(
+                    AlignField::RangeA,
+                    AlignOp::Ge,
+                    first.range_a.min(three_quarters.range_a),
+                ),
+                AlignPredicate::cmp(
+                    AlignField::RangeB,
+                    AlignOp::Le,
+                    half.range_b.max(last.range_b),
+                ),
+            ]),
+            group_by_fields: vec![AlignField::HashValue],
+            aggregates: vec![
+                AlignAggregateSpec {
+                    func: AggregateFunction::CountStar,
+                    field: None,
+                    alias: "count_all",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Max,
+                    field: Some(AlignField::RangeB),
+                    alias: "max_range_b",
+                },
+            ],
+            order_by: Some(AlignAggregateOrderBy {
+                target: AlignAggregateOrderTarget::AggregateAlias("max_range_b"),
+                ordering: QueryOrdering::Desc,
+            }),
+            limit: Some(6),
+            offset: Some(1),
+        },
+        AlignAggregateQuery {
+            predicate: AlignPredicate::or(vec![
+                AlignPredicate::eq(AlignField::HashValue, quarter.hash_value),
+                AlignPredicate::eq(AlignField::HashValue, half.hash_value),
+                AlignPredicate::eq(AlignField::HashValue, last.hash_value),
+            ]),
+            group_by_fields: vec![AlignField::PlainValue],
+            aggregates: vec![
+                AlignAggregateSpec {
+                    func: AggregateFunction::CountField,
+                    field: Some(AlignField::NullableValue),
+                    alias: "count_nullable",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Min,
+                    field: Some(AlignField::RangeA),
+                    alias: "min_range_a",
+                },
+            ],
+            order_by: Some(AlignAggregateOrderBy {
+                target: AlignAggregateOrderTarget::GroupField(AlignField::PlainValue),
+                ordering: QueryOrdering::Asc,
+            }),
+            limit: None,
+            offset: None,
+        },
+        AlignAggregateQuery {
+            predicate: AlignPredicate::and(vec![
+                AlignPredicate::cmp(
+                    AlignField::RangeA,
+                    AlignOp::Ge,
+                    quarter.range_a.min(three_quarters.range_a),
+                ),
+                AlignPredicate::cmp(
+                    AlignField::RangeA,
+                    AlignOp::Le,
+                    quarter.range_a.max(three_quarters.range_a),
+                ),
+            ]),
+            group_by_fields: vec![AlignField::PlainValue, AlignField::HashValue],
+            aggregates: vec![
+                AlignAggregateSpec {
+                    func: AggregateFunction::Sum,
+                    field: Some(AlignField::RangeB),
+                    alias: "sum_range_b",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Avg,
+                    field: Some(AlignField::NullableValue),
+                    alias: "avg_nullable",
+                },
+            ],
+            order_by: Some(AlignAggregateOrderBy {
+                target: AlignAggregateOrderTarget::AggregateAlias("sum_range_b"),
+                ordering: QueryOrdering::Desc,
+            }),
+            limit: Some(8),
+            offset: Some(2),
+        },
+        AlignAggregateQuery {
+            predicate: AlignPredicate::cmp(AlignField::RangeA, AlignOp::Gt, max_range_a.saturating_add(1)),
+            group_by_fields: vec![],
+            aggregates: vec![
+                AlignAggregateSpec {
+                    func: AggregateFunction::CountStar,
+                    field: None,
+                    alias: "count_all",
+                },
+                AlignAggregateSpec {
+                    func: AggregateFunction::Max,
+                    field: Some(AlignField::RangeB),
+                    alias: "max_range_b",
+                },
+            ],
+            order_by: None,
+            limit: None,
+            offset: None,
+        },
+        AlignAggregateQuery {
+            predicate: AlignPredicate::cmp(AlignField::RangeA, AlignOp::Gt, max_range_a.saturating_add(1)),
+            group_by_fields: vec![AlignField::HashValue],
+            aggregates: vec![AlignAggregateSpec {
+                func: AggregateFunction::CountStar,
+                field: None,
+                alias: "count_all",
+            }],
+            order_by: Some(AlignAggregateOrderBy {
+                target: AlignAggregateOrderTarget::GroupField(AlignField::HashValue),
+                ordering: QueryOrdering::Asc,
+            }),
+            limit: None,
+            offset: None,
+        },
+    ]
 }
 
 fn fixed_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
