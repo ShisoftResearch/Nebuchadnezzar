@@ -481,11 +481,20 @@ impl LocalSchemasCache {
         group: &str,
         raft_client: &Arc<RaftClient>,
     ) -> Result<LocalSchemasCache, ExecError> {
+        Self::new_for_database(group, group, raft_client).await
+    }
+
+    pub async fn new_for_database(
+        group: &str,
+        database_name: &str,
+        raft_client: &Arc<RaftClient>,
+    ) -> Result<LocalSchemasCache, ExecError> {
         info!("Initializing local schema cache");
         let map = Arc::new(LocalSchemasMap::new());
         let m1 = map.clone();
         let m2 = map.clone();
-        let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft_client);
+        let sm =
+            sm::client::SMClient::new(sm::generate_scoped_sm_id(group, database_name), raft_client);
         let sm_data = sm.get_all().await?;
         {
             debug!("Importing {} schemas from cluster", sm_data.len());

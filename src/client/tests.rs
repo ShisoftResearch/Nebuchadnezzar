@@ -13,6 +13,71 @@ use std::time::Duration;
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+pub async fn database_catalog() {
+    let _ = env_logger::try_init();
+    let server_group = "database_catalog_test";
+    let server_addr = String::from("127.0.0.1:5399");
+    let database_name = "testdb_database_catalog";
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_count: 1,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &server_addr,
+        server_group,
+        database_name,
+        async |_| {},
+    )
+    .await;
+
+    assert_eq!(server.database_name(), database_name);
+
+    let client = Arc::new(
+        client::AsyncClient::new_for_database(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+            database_name,
+        )
+        .await
+        .unwrap(),
+    );
+
+    client.ensure_database().await.unwrap();
+
+    let database = client
+        .get_database(database_name)
+        .await
+        .unwrap()
+        .expect("database should exist");
+    assert_eq!(database.name, database_name);
+
+    client.create_database("another_db").await.unwrap().unwrap();
+    let mut databases = client
+        .get_all_databases()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    databases.sort();
+
+    assert_eq!(
+        databases,
+        vec!["another_db".to_string(), database_name.to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 pub async fn general() {
     let _ = env_logger::try_init();
     let server_group = "general_test";

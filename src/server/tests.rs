@@ -55,6 +55,58 @@ pub async fn init() {
     .await;
 }
 
+#[tokio::test]
+pub async fn explicit_database_binding_scopes_storage_roots() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let backup_root = temp_dir.path().join("backup");
+    let wal_root = temp_dir.path().join("wal");
+    let undo_root = temp_dir.path().join("undo");
+    let raft_root = temp_dir.path().join("raft");
+    let database_name = "analytics/db";
+    let scoped_db_dir = "analytics_db";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_count: 1,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(backup_root.to_string_lossy().to_string()),
+            wal_storage: Some(wal_root.to_string_lossy().to_string()),
+            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
+            raft_storage: Some(raft_root.to_string_lossy().to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5101"),
+        "storage_scope_group",
+        database_name,
+        async |_| {},
+    )
+    .await;
+
+    assert_eq!(server.database_name(), database_name);
+    assert!(
+        backup_root.join("databases").join(scoped_db_dir).exists(),
+        "backup path should be scoped per database"
+    );
+    assert!(
+        wal_root.join("databases").join(scoped_db_dir).exists(),
+        "wal path should be scoped per database"
+    );
+    assert!(
+        undo_root.join("databases").join(scoped_db_dir).exists(),
+        "undo path should be scoped per database"
+    );
+    assert!(
+        raft_root.join("databases").join(scoped_db_dir).exists(),
+        "raft path should be scoped per database"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn smoke_test() {
     let _ = env_logger::try_init();

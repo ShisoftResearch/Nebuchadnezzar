@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod cell_rpc;
+pub mod database;
 pub mod status;
 #[cfg(test)]
 mod tests;
@@ -69,6 +70,7 @@ pub enum ServerError {
     CannotSetServerWeight,
     CannotInitConsistentHashTable,
     CannotLoadMetaClient,
+    CannotInitializeDatabaseCatalog(sm_master::ExecError),
     CannotInitializeSchemaServer(sm_master::ExecError),
     StandaloneMustAlsoBeMetaServer,
 }
@@ -114,6 +116,7 @@ pub struct NebServer {
     pub cleaner: Cleaner,
     pub indexer: Option<Arc<IndexBuilder>>,
     pub group_name: String,
+    pub database_name: String,
     pub neb_client: Arc<AsyncClient>,
     pub undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
     pub txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
@@ -237,6 +240,7 @@ impl NebServer {
         server_addr: &String,
         meta_members: &Vec<String>,
         group_name: &String,
+        database_name: &str,
         rpc_server: &Arc<rpc::Server>,
         raft_service: &Arc<raft::RaftService>,
         raft_client: &Arc<RaftClient>,
@@ -250,7 +254,7 @@ impl NebServer {
         // in new_cluster_from_opts() to allow WAL replay during recovery
 
         // Now we can query the state machine to build the local cache
-        let schemas = LocalSchemasCache::new(group_name, raft_client)
+        let schemas = LocalSchemasCache::new_for_database(group_name, database_name, raft_client)
             .await
             .unwrap();
         let meta_rc = Arc::new(ServerMeta { schemas });
@@ -263,10 +267,20 @@ impl NebServer {
         )
         .await?;
         let neb_client = Arc::new(
-            client::AsyncClient::new(rpc_server, membership_client, &meta_members, group_name)
-                .await
-                .unwrap(),
+            client::AsyncClient::new_for_database(
+                rpc_server,
+                membership_client,
+                &meta_members,
+                group_name,
+                database_name,
+            )
+            .await
+            .unwrap(),
         );
+        neb_client
+            .ensure_database()
+            .await
+            .map_err(ServerError::CannotInitializeDatabaseCatalog)?;
         // Create temporary chunks for index builder initialization
         // Note: chunks will be recreated with index_builder below
         // If indexing is enabled, register inverted index schemas BEFORE recovery
@@ -391,6 +405,7 @@ impl NebServer {
             txn_peer: txn_peer,
             indexer: index_builder,
             group_name: group_name.clone(),
+            database_name: database_name.to_string(),
             neb_client: neb_client.clone(),
             undo_log,
             txn_manager: transaction_manager.clone(),
@@ -438,11 +453,30 @@ impl NebServer {
         group_name: &'a str,
         prepare_raft_service: F,
     ) -> Arc<NebServer> {
-        Self::new_cluster_from_opts(
+        Self::new_cluster_from_opts_in_database(
             opts,
             server_addr,
             &vec![server_addr.to_owned()],
             group_name,
+            group_name,
+            prepare_raft_service,
+        )
+        .await
+    }
+
+    pub async fn new_from_opts_in_database<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
+        opts: &ServerOptions,
+        server_addr: &'a str,
+        group_name: &'a str,
+        database_name: &'a str,
+        prepare_raft_service: F,
+    ) -> Arc<NebServer> {
+        Self::new_cluster_from_opts_in_database(
+            opts,
+            server_addr,
+            &vec![server_addr.to_owned()],
+            group_name,
+            database_name,
             prepare_raft_service,
         )
         .await
@@ -455,9 +489,30 @@ impl NebServer {
         group_name: &'a str,
         prepare_raft_service: F,
     ) -> Arc<NebServer> {
+        Self::new_cluster_from_opts_in_database(
+            opts,
+            server_addr,
+            meta_servers,
+            group_name,
+            group_name,
+            prepare_raft_service,
+        )
+        .await
+    }
+
+    pub async fn new_cluster_from_opts_in_database<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
+        opts: &ServerOptions,
+        server_addr: &'a str,
+        meta_servers: &Vec<String>,
+        group_name: &'a str,
+        database_name: &'a str,
+        prepare_raft_service: F,
+    ) -> Arc<NebServer> {
         debug!("Creating key-value server from options");
         let group_name = &String::from(group_name);
         let server_addr = &String::from(server_addr);
+        let storage_layout =
+            database::DatabaseStorageLayout::from_options(opts, group_name, database_name);
         debug!("Creating RPC server and listen");
         let rpc_server = rpc::Server::new(server_addr);
         let meta_members: Vec<_> = meta_servers
@@ -465,7 +520,7 @@ impl NebServer {
             .filter(|n| *n != server_addr)
             .cloned()
             .collect();
-        let storage = if let Some(ref raft_path) = opts.raft_storage {
+        let storage = if let Some(ref raft_path) = storage_layout.raft_storage {
             raft::Storage::DISK(DiskOptions {
                 path: raft_path.clone(),
                 take_snapshots: true,
@@ -491,9 +546,13 @@ impl NebServer {
         // This is critical: any SM registered after start() won't receive replayed WAL entries
         debug!("Registering state machines before Raft start for WAL replay (recovery mode)");
         raft_service
+            .register_state_machine(Box::new(database::DatabaseCatalogSM::new(group_name)))
+            .await;
+        raft_service
             .register_state_machine(Box::new(
                 schema_sm::SchemasSM::new_with_recovery_flag(
                     group_name,
+                    database_name,
                     &raft_service,
                     recovering_flag.clone(),
                 )
@@ -524,7 +583,7 @@ impl NebServer {
         debug!("Raft recovery complete, schema callbacks enabled for Neb SchemasSM");
 
         // Check if we have existing Raft state on disk
-        let has_existing_state = has_existing_raft_state(&opts.raft_storage);
+        let has_existing_state = has_existing_raft_state(&storage_layout.raft_storage);
 
         if has_existing_state {
             // Existing state found - Raft will automatically resume from disk
@@ -580,11 +639,19 @@ impl NebServer {
         member_service.join_group(group_name).await.unwrap();
         let membership_client = Arc::new(ObserverClient::new(&raft_client));
         debug!("Creating neb server");
+        let effective_opts = ServerOptions {
+            backup_storage: storage_layout.backup_storage,
+            wal_storage: storage_layout.wal_storage,
+            undo_log_storage: storage_layout.undo_log_storage,
+            raft_storage: storage_layout.raft_storage,
+            ..opts.clone()
+        };
         NebServer::new(
-            opts,
+            &effective_opts,
             server_addr,
             &meta_servers,
             group_name,
+            database_name,
             &rpc_server,
             &raft_service,
             &raft_client,
@@ -617,6 +684,9 @@ impl NebServer {
     pub fn raft_client(&self) -> &RaftClient {
         &*self.raft_client
     }
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
     pub fn indexed_data_client(&self) -> IndexedDataClient {
         // Use server's indexer clients if available (for BM25 search support)
         if let Some(ref index_builder) = self.indexer {
@@ -626,7 +696,14 @@ impl NebServer {
         }
     }
     pub async fn data_client(&self, members: &Vec<String>) -> Result<AsyncClient, NebClientError> {
-        AsyncClient::new(&self.rpc, &self.membership, members, &self.group_name).await
+        AsyncClient::new_for_database(
+            &self.rpc,
+            &self.membership,
+            members,
+            &self.group_name,
+            &self.database_name,
+        )
+        .await
     }
 }
 

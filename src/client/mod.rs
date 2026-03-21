@@ -19,9 +19,13 @@ use std::sync::Arc;
 
 use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
-use crate::ram::schema::sm::generate_sm_id;
+use crate::ram::schema::sm::generate_scoped_sm_id;
 use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
 use crate::ram::types::Id;
+use crate::server::database::client::SMClient as DatabaseCatalogClient;
+use crate::server::database::{
+    generate_sm_id as generate_database_catalog_sm_id, CreateDatabaseError, DatabaseCatalogEntry,
+};
 use crate::server::transactions::TxnId;
 use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
 
@@ -52,6 +56,8 @@ pub struct AsyncClient {
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient,
+    pub database_catalog_client: DatabaseCatalogClient,
+    pub database_name: String,
 }
 
 impl AsyncClient {
@@ -60,6 +66,16 @@ impl AsyncClient {
         membership: &Arc<ObserverClient>,
         meta_servers: &Vec<String>,
         group: &'a str,
+    ) -> Result<Self, NebClientError> {
+        Self::new_for_database(subscription_server, membership, meta_servers, group, group).await
+    }
+
+    pub async fn new_for_database<'a>(
+        subscription_server: &Arc<RPCServer>,
+        membership: &Arc<ObserverClient>,
+        meta_servers: &Vec<String>,
+        group: &'a str,
+        database_name: &'a str,
     ) -> Result<Self, NebClientError> {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID).await {
             Ok(raft_client) => {
@@ -76,12 +92,51 @@ impl AsyncClient {
                     Ok(chash) => Ok(Self {
                         conshash: chash,
                         raft_client: raft_client.clone(),
-                        schema_client: SchemaClient::new(generate_sm_id(group), &raft_client),
+                        schema_client: SchemaClient::new(
+                            generate_scoped_sm_id(group, database_name),
+                            &raft_client,
+                        ),
+                        database_catalog_client: DatabaseCatalogClient::new(
+                            generate_database_catalog_sm_id(group),
+                            &raft_client,
+                        ),
+                        database_name: database_name.to_string(),
                     }),
                     Err(err) => Err(NebClientError::ConsistentHashtableError(err)),
                 }
             }
             Err(err) => Err(NebClientError::RaftClientError(err)),
+        }
+    }
+
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    pub async fn get_database(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Option<DatabaseCatalogEntry>, ExecError> {
+        let name = name.into();
+        self.database_catalog_client.get_by_name(&name).await
+    }
+
+    pub async fn get_all_databases(&self) -> Result<Vec<DatabaseCatalogEntry>, ExecError> {
+        self.database_catalog_client.get_all().await
+    }
+
+    pub async fn create_database(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Result<(), CreateDatabaseError>, ExecError> {
+        self.database_catalog_client
+            .create_database(&DatabaseCatalogEntry { name: name.into() })
+            .await
+    }
+
+    pub async fn ensure_database(&self) -> Result<(), ExecError> {
+        match self.create_database(self.database_name.clone()).await? {
+            Ok(()) | Err(CreateDatabaseError::NameExists(_)) => Ok(()),
         }
     }
     pub fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
