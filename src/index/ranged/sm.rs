@@ -8,6 +8,7 @@ use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
 use bifrost::rpc::{RPCError, ServiceClient};
 use bifrost::utils;
+use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::prelude::*;
 use std::collections::BTreeMap;
@@ -18,6 +19,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const DEFAULT_SM_ID: u64 = hash_ident!("RANGED_INDEX_SM_ID") as u64;
+
+pub fn generate_scoped_sm_id(group_name: &str, database_name: &str) -> u64 {
+    if group_name == database_name {
+        DEFAULT_SM_ID
+    } else {
+        hash_str(&format!(
+            "RANGED_INDEX_SM_ID-{}-{}",
+            group_name, database_name
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreePlacement {
@@ -37,6 +49,7 @@ pub struct MasterTreeSM {
     raft_svr: Arc<RaftService>,
     conshash: Arc<ConsistentHashing>,
     persistence_path: Option<PathBuf>,
+    sm_id: u64,
 }
 
 raft_state_machine! {
@@ -139,7 +152,7 @@ impl StateMachineCmds for MasterTreeSM {
 impl StateMachineCtl for MasterTreeSM {
     raft_sm_complete!();
     fn id(&self) -> u64 {
-        DEFAULT_SM_ID
+        self.sm_id
     }
     fn snapshot(&self) -> Vec<u8> {
         utils::serde::serialize(&self.tree)
@@ -157,10 +170,19 @@ impl StateMachineCtl for MasterTreeSM {
 
 impl MasterTreeSM {
     pub fn new(raft_svr: &Arc<RaftService>, conshash: &Arc<ConsistentHashing>) -> Self {
-        Self::new_with_persistence(raft_svr, conshash, None)
+        Self::new_with_id_and_persistence(DEFAULT_SM_ID, raft_svr, conshash, None)
     }
 
     pub fn new_with_persistence(
+        raft_svr: &Arc<RaftService>,
+        conshash: &Arc<ConsistentHashing>,
+        persistence_path: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_id_and_persistence(DEFAULT_SM_ID, raft_svr, conshash, persistence_path)
+    }
+
+    pub fn new_with_id_and_persistence(
+        sm_id: u64,
         raft_svr: &Arc<RaftService>,
         conshash: &Arc<ConsistentHashing>,
         persistence_path: Option<PathBuf>,
@@ -174,6 +196,7 @@ impl MasterTreeSM {
             raft_svr: raft_svr.clone(),
             conshash: conshash.clone(),
             persistence_path: persistence_path.clone(),
+            sm_id,
         };
 
         // Try to recover from disk if persistence path is provided
@@ -603,5 +626,17 @@ mod tests {
 
         assert_eq!(placement.id, test_id);
         assert_eq!(placement.epoch, INITIAL_TREE_EPOCH);
+    }
+
+    #[test]
+    fn scoped_sm_id_differs_across_databases() {
+        assert_eq!(
+            generate_scoped_sm_id("group_a", "group_a"),
+            DEFAULT_SM_ID
+        );
+        assert_ne!(
+            generate_scoped_sm_id("group_a", "db_a"),
+            generate_scoped_sm_id("group_a", "db_b")
+        );
     }
 }

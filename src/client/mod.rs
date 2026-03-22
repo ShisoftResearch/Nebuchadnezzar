@@ -57,6 +57,7 @@ pub struct AsyncClient {
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient,
     pub database_catalog_client: DatabaseCatalogClient,
+    pub group_name: String,
     pub database_name: String,
 }
 
@@ -100,6 +101,7 @@ impl AsyncClient {
                             generate_database_catalog_sm_id(group),
                             &raft_client,
                         ),
+                        group_name: group.to_string(),
                         database_name: database_name.to_string(),
                     }),
                     Err(err) => Err(NebClientError::ConsistentHashtableError(err)),
@@ -111,6 +113,10 @@ impl AsyncClient {
 
     pub fn database_name(&self) -> &str {
         &self.database_name
+    }
+
+    pub fn group_name(&self) -> &str {
+        &self.group_name
     }
 
     pub async fn get_database(
@@ -545,7 +551,12 @@ impl AsyncClient {
     /// }
     /// ```
     pub fn ranged(&self) -> RangedClient {
-        RangedClient::new(self.conshash.clone(), self.raft_client.clone())
+        RangedClient::new_for_database(
+            self.conshash.clone(),
+            self.raft_client.clone(),
+            self.group_name(),
+            self.database_name(),
+        )
     }
 }
 

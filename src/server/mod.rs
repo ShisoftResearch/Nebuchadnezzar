@@ -429,6 +429,8 @@ impl NebServer {
                         raft_service,
                         raft_client,
                         &conshasing,
+                        group_name,
+                        database_name,
                         tree_path,
                     )
                     .await
@@ -788,6 +790,8 @@ pub async fn init_ranged_indexer_service(
     raft_svr: &Arc<raft::RaftService>,
     raft_client: &Arc<RaftClient>,
     cons_hash: &Arc<ConsistentHashing>,
+    group_name: &str,
+    database_name: &str,
     tree_persistence_path: Option<String>,
 ) {
     info!("Initializing range indexer service");
@@ -801,7 +805,7 @@ pub async fn init_ranged_indexer_service(
         .await
         .unwrap();
     let sm_client = Arc::new(ranged::sm::client::SMClient::new(
-        ranged::sm::DEFAULT_SM_ID,
+        ranged::sm::generate_scoped_sm_id(group_name, database_name),
         raft_client,
     ));
     rpc_server
@@ -812,8 +816,12 @@ pub async fn init_ranged_indexer_service(
 
     // Create MasterTreeSM with persistence support
     let persistence_path = tree_persistence_path.map(PathBuf::from);
-    let mut tree_sm =
-        ranged::sm::MasterTreeSM::new_with_persistence(raft_svr, cons_hash, persistence_path);
+    let mut tree_sm = ranged::sm::MasterTreeSM::new_with_id_and_persistence(
+        ranged::sm::generate_scoped_sm_id(group_name, database_name),
+        raft_svr,
+        cons_hash,
+        persistence_path,
+    );
     tree_sm.try_initialize().await;
     raft_svr.register_state_machine(Box::new(tree_sm)).await;
 }

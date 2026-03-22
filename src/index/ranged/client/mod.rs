@@ -33,6 +33,21 @@ impl RangedIndexerClient {
         }
     }
 
+    pub fn new_for_database(
+        conshash: &Arc<ConsistentHashing>,
+        raft_client: &Arc<RaftClient>,
+        group_name: &str,
+        database_name: &str,
+    ) -> Self {
+        let sm_id = crate::index::ranged::sm::generate_scoped_sm_id(group_name, database_name);
+        let sm = SMClient::new(sm_id, raft_client);
+        Self {
+            conshash: conshash.clone(),
+            sm: Arc::new(sm),
+            placement: RwLock::new(BTreeMap::new()),
+        }
+    }
+
     pub async fn seek(
         self_ref: &Arc<Self>,
         range: Range,

@@ -64,7 +64,12 @@ impl IndexerClients {
         server_id: u64,
     ) -> Self {
         IndexerClients {
-            ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
+            ranged_client: Arc::new(RangedIndexerClient::new_for_database(
+                conshash,
+                raft_client,
+                neb_client.group_name(),
+                neb_client.database_name(),
+            )),
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
             embedding_client: Arc::new(EmbeddingIndexClient::new()),
@@ -107,7 +112,12 @@ impl IndexerClients {
         server_id: u64,
     ) -> Self {
         IndexerClients {
-            ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
+            ranged_client: Arc::new(RangedIndexerClient::new_for_database(
+                conshash,
+                raft_client,
+                neb_client.group_name(),
+                neb_client.database_name(),
+            )),
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
             embedding_client: Arc::new(EmbeddingIndexClient::new()),

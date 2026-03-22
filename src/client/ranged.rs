@@ -72,6 +72,22 @@ impl RangedClient {
         }
     }
 
+    pub fn new_for_database(
+        conshash: Arc<ConsistentHashing>,
+        raft_client: Arc<RaftClient>,
+        group_name: &str,
+        database_name: &str,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RangedIndexerClient::new_for_database(
+                &conshash,
+                &raft_client,
+                group_name,
+                database_name,
+            )),
+        }
+    }
+
     /// Scan all documents in a schema
     ///
     /// Returns a cursor that iterates over all document IDs in the schema.
