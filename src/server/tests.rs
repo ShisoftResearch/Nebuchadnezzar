@@ -153,6 +153,80 @@ pub async fn resolves_bound_database_runtime_by_name() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host() {
+    let _ = env_logger::try_init();
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 1,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5103"),
+        "dynamic_database_runtime_group",
+        async |_| {},
+    )
+    .await;
+
+    let default_runtime = server.current_database();
+    let analytics_runtime = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("new database runtime should be created on demand");
+
+    assert_eq!(analytics_runtime.database_name(), "analytics");
+    assert_eq!(
+        analytics_runtime.group_name(),
+        "dynamic_database_runtime_group"
+    );
+    assert!(
+        !Arc::ptr_eq(&default_runtime, &analytics_runtime),
+        "new database runtime should be distinct from the default runtime"
+    );
+    assert!(Arc::ptr_eq(
+        &analytics_runtime,
+        &server
+            .database("analytics")
+            .expect("new runtime should be inserted into the runtime registry")
+    ));
+
+    let all_databases = server
+        .neb_client
+        .get_all_databases()
+        .await
+        .expect("database catalog should stay readable");
+    assert!(
+        all_databases.iter().any(|entry| entry.name == "analytics"),
+        "new runtime creation should settle the database catalog entry"
+    );
+
+    let names = server.database_names();
+    assert!(names.iter().any(|name| name == "dynamic_database_runtime_group"));
+    assert!(names.iter().any(|name| name == "analytics"));
+
+    let analytics_client = analytics_runtime
+        .data_client(&vec![String::from("127.0.0.1:5103")])
+        .await
+        .expect("new database runtime should create a bound client");
+    assert_eq!(analytics_client.database_name(), "analytics");
+
+    let analytics_runtime_again = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("database runtime creation should be idempotent");
+    assert!(Arc::ptr_eq(&analytics_runtime, &analytics_runtime_again));
+
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn smoke_test() {
     let _ = env_logger::try_init();

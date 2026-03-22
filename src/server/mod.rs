@@ -214,6 +214,9 @@ impl DatabaseRuntime {
 pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
     database_runtimes: RwLock<HashMap<String, Arc<DatabaseRuntime>>>,
+    runtime_init_lock: tokio::sync::Mutex<()>,
+    host_options: ServerOptions,
+    meta_servers: Vec<String>,
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
     pub membership: Arc<ObserverClient>,
@@ -251,6 +254,260 @@ pub async fn init_conshash(
 }
 
 impl NebServer {
+    async fn register_schema_state_machine(
+        group_name: &str,
+        database_name: &str,
+        raft_service: &Arc<raft::RaftService>,
+    ) {
+        raft_service
+            .register_state_machine(Box::new(
+                schema_sm::SchemasSM::new_with_recovery_flag(
+                    group_name,
+                    database_name,
+                    raft_service,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+                .await,
+            ))
+            .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_database_runtime(
+        opts: &ServerOptions,
+        server_addr: &String,
+        meta_members: &Vec<String>,
+        group_name: &String,
+        database_name: &str,
+        rpc_server: &Arc<rpc::Server>,
+        raft_service: &Arc<raft::RaftService>,
+        raft_client: &Arc<RaftClient>,
+        membership_client: &Arc<ObserverClient>,
+        conshasing: &Arc<ConsistentHashing>,
+        member_pool: &Arc<rpc::ClientPool>,
+        txn_peer: &Peer,
+        register_schema_state_machine: bool,
+    ) -> Result<Arc<DatabaseRuntime>, ServerError> {
+        if register_schema_state_machine {
+            Self::register_schema_state_machine(group_name, database_name, raft_service).await;
+        }
+
+        let storage_layout =
+            database::DatabaseStorageLayout::from_options(opts, group_name, database_name);
+        let effective_opts = ServerOptions {
+            backup_storage: storage_layout.backup_storage,
+            wal_storage: storage_layout.wal_storage,
+            undo_log_storage: storage_layout.undo_log_storage,
+            raft_storage: storage_layout.raft_storage,
+            ..opts.clone()
+        };
+
+        let schemas = LocalSchemasCache::new_for_database(group_name, database_name, raft_client)
+            .await
+            .unwrap();
+        let meta_rc = Arc::new(ServerMeta { schemas });
+        let neb_client = Arc::new(
+            client::AsyncClient::new_for_database(
+                rpc_server,
+                membership_client,
+                meta_members,
+                group_name,
+                database_name,
+            )
+            .await
+            .unwrap(),
+        );
+        neb_client
+            .ensure_database()
+            .await
+            .map_err(ServerError::CannotInitializeDatabaseCatalog)?;
+
+        if effective_opts.index_enabled {
+            meta_rc
+                .schemas
+                .register_internal_schema(crate::index::full_text::shard::inverted_segment_schema());
+            meta_rc
+                .schemas
+                .register_internal_schema(crate::index::full_text::inverted_stats_schema());
+            debug!(
+                "Registered inverted index schemas before recovery for database {}",
+                database_name
+            );
+        }
+
+        let index_builder = if effective_opts.index_enabled {
+            Some(Arc::new(
+                IndexBuilder::new(&neb_client, conshasing, raft_client, rpc_server.server_id)
+                    .await,
+            ))
+        } else {
+            None
+        };
+
+        let chunks = Chunks::new_with_recovery(
+            effective_opts.chunk_count,
+            effective_opts.total_size,
+            meta_rc.clone(),
+            index_builder.clone(),
+            effective_opts.backup_storage.clone(),
+            effective_opts.wal_storage.clone(),
+            effective_opts
+                .tiered_config
+                .clone()
+                .or_else(|| crate::ram::tiered::TieredConfig::from_env()),
+            effective_opts.enable_recovery,
+            effective_opts.raft_storage.clone(),
+        );
+
+        if let Some(ref index_builder) = index_builder {
+            index_builder.initialize_inverted_indexer(&chunks);
+        }
+
+        let undo_log = if let Some(ref undo_log_path) = effective_opts.undo_log_storage {
+            match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
+                Ok(log) => {
+                    if effective_opts.enable_recovery {
+                        match log.recover() {
+                            Ok(txn_index) => {
+                                if let Err(e) =
+                                    log.rollback_incomplete_transactions(txn_index, &chunks)
+                                {
+                                    error!("Failed to rollback incomplete transactions: {:?}", e);
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to recover undo log: {:?}", e);
+                            }
+                        }
+                    }
+
+                    Some(log)
+                }
+                Err(e) => {
+                    error!("Failed to initialize undo log: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let cleaner = if effective_opts.enable_recovery {
+            debug!(
+                "Recovery enabled: Starting cleaner in PAUSED state for database {}",
+                database_name
+            );
+            Arc::new(Cleaner::new_paused(chunks.clone()))
+        } else {
+            Arc::new(Cleaner::new_and_start(chunks.clone()))
+        };
+
+        let clock = txn_peer.clock.clone();
+        let transaction_runtime = Arc::new(DatabaseRuntime::new(
+            group_name,
+            database_name,
+            chunks.clone(),
+            meta_rc.clone(),
+            cleaner.clone(),
+            index_builder.clone(),
+            undo_log.clone(),
+            None,
+            rpc_server.clone(),
+            conshasing.clone(),
+            membership_client.clone(),
+            raft_client.clone(),
+            neb_client.clone(),
+        ));
+
+        let transaction_manager = if effective_opts.services.contains(&Service::Transaction) {
+            Some(
+                init_txn_manager(
+                    rpc_server,
+                    &transaction_runtime,
+                    &clock,
+                    rpc_server.server_id,
+                    conshasing,
+                    member_pool,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        let database_runtime = Arc::new(DatabaseRuntime::new(
+            group_name,
+            database_name,
+            chunks.clone(),
+            meta_rc.clone(),
+            cleaner,
+            index_builder.clone(),
+            undo_log,
+            transaction_manager,
+            rpc_server.clone(),
+            conshasing.clone(),
+            membership_client.clone(),
+            raft_client.clone(),
+            neb_client.clone(),
+        ));
+
+        let servs = proc_services(&effective_opts.services);
+        for service in servs {
+            match service {
+                Service::Cell => {
+                    init_cell_rpc_service(
+                        rpc_server,
+                        database_runtime.clone(),
+                        database_runtime.neb_client.clone(),
+                    )
+                    .await
+                }
+                Service::Transaction | Service::HashIndexer => {
+                    init_txn_data_site_service(
+                        rpc_server,
+                        database_runtime.clone(),
+                        txn_peer.clone(),
+                    )
+                    .await
+                }
+                Service::RangedIndexer => {
+                    let tree_path = effective_opts
+                        .raft_storage
+                        .as_ref()
+                        .map(|p| format!("{}/master_tree.dat", p));
+                    init_ranged_indexer_service(
+                        rpc_server,
+                        &database_runtime.neb_client,
+                        raft_service,
+                        raft_client,
+                        conshasing,
+                        group_name,
+                        database_name,
+                        tree_path,
+                    )
+                    .await
+                }
+                Service::Query => {}
+            }
+        }
+
+        if effective_opts.index_enabled {
+            init_inverted_index_rpc_service(
+                rpc_server,
+                database_runtime.group_name(),
+                database_runtime.database_name(),
+                database_runtime.indexer.clone(),
+            )
+            .await;
+        }
+
+        debug!(
+            "Built database runtime {} for group {} on host {}",
+            database_name, group_name, server_addr
+        );
+        Ok(database_runtime)
+    }
+
     pub fn database(&self, database_name: &str) -> Option<Arc<DatabaseRuntime>> {
         self.database_runtimes
             .read()
@@ -260,6 +517,44 @@ impl NebServer {
 
     pub fn current_database(&self) -> Arc<DatabaseRuntime> {
         self.database_runtime.clone()
+    }
+
+    pub async fn ensure_database_runtime(
+        &self,
+        database_name: &str,
+    ) -> Result<Arc<DatabaseRuntime>, ServerError> {
+        if let Some(runtime) = self.database(database_name) {
+            return Ok(runtime);
+        }
+
+        let _guard = self.runtime_init_lock.lock().await;
+        if let Some(runtime) = self.database(database_name) {
+            return Ok(runtime);
+        }
+
+        let database_runtime = Self::build_database_runtime(
+            &self.host_options,
+            &self.rpc.address,
+            &self.meta_servers,
+            &self.group_name,
+            database_name,
+            &self.rpc,
+            &self.raft_service,
+            &self.raft_client,
+            &self.membership,
+            &self.consh,
+            &self.member_pool,
+            &self.txn_peer,
+            true,
+        )
+        .await?;
+
+        self.database_runtimes
+            .write()
+            .expect("database runtime registry lock poisoned")
+            .insert(database_name.to_string(), database_runtime.clone());
+
+        Ok(database_runtime)
     }
 
     pub fn database_names(&self) -> Vec<String> {
@@ -407,14 +702,6 @@ impl NebServer {
             "Creating key-value server instance, group name {}",
             group_name
         );
-        // State machines are already registered before RaftService::start()
-        // in new_cluster_from_opts() to allow WAL replay during recovery
-
-        // Now we can query the state machine to build the local cache
-        let schemas = LocalSchemasCache::new_for_database(group_name, database_name, raft_client)
-            .await
-            .unwrap();
-        let meta_rc = Arc::new(ServerMeta { schemas });
         let conshasing = init_conshash(
             group_name,
             server_addr,
@@ -423,161 +710,24 @@ impl NebServer {
             membership_client,
         )
         .await?;
-        let neb_client = Arc::new(
-            client::AsyncClient::new_for_database(
-                rpc_server,
-                membership_client,
-                &meta_members,
-                group_name,
-                database_name,
-            )
-            .await
-            .unwrap(),
-        );
-        neb_client
-            .ensure_database()
-            .await
-            .map_err(ServerError::CannotInitializeDatabaseCatalog)?;
-        // Create temporary chunks for index builder initialization
-        // Note: chunks will be recreated with index_builder below
-        // If indexing is enabled, register inverted index schemas BEFORE recovery
-        // These schemas are needed for recovery to recognize inverted index cells
-        // Note: These internal schemas have fixed, hash-based IDs so all nodes
-        // register identical schemas independently without raft consensus
-        if opts.index_enabled {
-            meta_rc
-                .schemas
-                .register_internal_schema(crate::index::full_text::shard::inverted_segment_schema());
-            meta_rc
-                .schemas
-                .register_internal_schema(crate::index::full_text::inverted_stats_schema());
-            debug!("Registered inverted index schemas before recovery");
-        }
-
-        // Create IndexBuilder first (without inverted indexer initialization)
-        let index_builder = if opts.index_enabled {
-            Some(Arc::new(
-                IndexBuilder::new(&neb_client, &conshasing, &raft_client, rpc_server.server_id)
-                    .await,
-            ))
-        } else {
-            None
-        };
-
-        // Create chunks with index_builder
-        let chunks = Chunks::new_with_recovery(
-            opts.chunk_count,
-            opts.total_size,
-            meta_rc.clone(),
-            index_builder.clone(),
-            opts.backup_storage.clone(),
-            opts.wal_storage.clone(),
-            opts.tiered_config
-                .clone()
-                .or_else(|| crate::ram::tiered::TieredConfig::from_env()),
-            opts.enable_recovery,
-            opts.raft_storage.clone(),
-        );
-
-        // Initialize the inverted indexer with chunks (lazy initialization)
-        if let Some(ref index_builder) = index_builder {
-            index_builder.initialize_inverted_indexer(&chunks);
-        }
-
-        // Initialize undo log if storage path is provided and perform rollback
-        // This must happen AFTER segment recovery but BEFORE cleaner starts
-        let undo_log = if let Some(ref undo_log_path) = opts.undo_log_storage {
-            match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
-                Ok(log) => {
-                    // Recover undo log from disk and get incomplete transactions
-                    // Only perform recovery if enable_recovery is true
-                    if opts.enable_recovery {
-                        match log.recover() {
-                            Ok(txn_index) => {
-                                // Perform rollback for incomplete transactions
-                                // Segments are already in memory, so we can read directly from them
-                                if let Err(e) =
-                                    log.rollback_incomplete_transactions(txn_index, &chunks)
-                                {
-                                    error!("Failed to rollback incomplete transactions: {:?}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to recover undo log: {:?}", e);
-                            }
-                        }
-                    }
-
-                    Some(log)
-                }
-                Err(e) => {
-                    error!("Failed to initialize undo log: {:?}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // Start cleaner AFTER all recovery (segments + transactions) is complete
-        // This ensures segments with old cell data needed for rollback aren't cleaned
-        // Note: If recovery is enabled, we start cleaner in PAUSED state to prevent
-        // interference/hangs during recovery. It must be explicitly resumed later.
-        let cleaner = if opts.enable_recovery {
-            debug!("Recovery enabled: Starting cleaner in PAUSED state");
-            Arc::new(Cleaner::new_paused(chunks.clone()))
-        } else {
-            Arc::new(Cleaner::new_and_start(chunks.clone()))
-        };
-        let mut transaction_manager = None;
         let member_pool = Arc::new(rpc::ClientPool::new());
         let txn_peer = Peer::new(server_addr);
-        let clock = txn_peer.clock.clone();
-        let transaction_runtime = Arc::new(DatabaseRuntime::new(
+        let database_runtime = Self::build_database_runtime(
+            opts,
+            server_addr,
+            &meta_members,
             group_name,
             database_name,
-            chunks.clone(),
-            meta_rc.clone(),
-            cleaner.clone(),
-            index_builder.clone(),
-            undo_log.clone(),
-            None,
-            rpc_server.clone(),
-            conshasing.clone(),
-            membership_client.clone(),
-            raft_client.clone(),
-            neb_client.clone(),
-        ));
-
-        if opts.services.contains(&Service::Transaction) {
-            transaction_manager = Some(
-                init_txn_manager(
-                    rpc_server,
-                    &transaction_runtime,
-                    &clock,
-                    rpc_server.server_id,
-                    &conshasing,
-                    &member_pool,
-                )
-                .await,
-            );
-        }
-
-        let database_runtime = Arc::new(DatabaseRuntime::new(
-            group_name,
-            database_name,
-            chunks.clone(),
-            meta_rc.clone(),
-            cleaner,
-            index_builder.clone(),
-            undo_log.clone(),
-            transaction_manager.clone(),
-            rpc_server.clone(),
-            conshasing.clone(),
-            membership_client.clone(),
-            raft_client.clone(),
-            neb_client.clone(),
-        ));
+            rpc_server,
+            raft_service,
+            raft_client,
+            membership_client,
+            &conshasing,
+            &member_pool,
+            &txn_peer,
+            false,
+        )
+        .await?;
 
         let server = Arc::new(NebServer {
             database_runtime: database_runtime.clone(),
@@ -585,6 +735,9 @@ impl NebServer {
                 database_name.to_string(),
                 database_runtime.clone(),
             )])),
+            runtime_init_lock: tokio::sync::Mutex::new(()),
+            host_options: opts.clone(),
+            meta_servers: meta_members.clone(),
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),
             membership: membership_client.clone(),
@@ -595,61 +748,8 @@ impl NebServer {
             txn_peer: txn_peer,
             group_name: group_name.clone(),
             database_name: database_name.to_string(),
-            neb_client: neb_client.clone(),
+            neb_client: database_runtime.neb_client.clone(),
         });
-        let servs = proc_services(&opts.services);
-        for service in servs {
-            match service {
-                Service::Cell => {
-                    init_cell_rpc_service(
-                        rpc_server,
-                        server.database_runtime.clone(),
-                        server.neb_client.clone(),
-                    )
-                    .await
-                }
-                Service::Transaction | Service::HashIndexer => {
-                    init_txn_data_site_service(
-                        rpc_server,
-                        server.database_runtime.clone(),
-                        server.txn_peer.clone(),
-                    )
-                    .await
-                }
-                Service::RangedIndexer => {
-                    // Use raft storage path for tree persistence if available
-                    let tree_path = opts
-                        .raft_storage
-                        .as_ref()
-                        .map(|p| format!("{}/master_tree.dat", p));
-                    init_ranged_indexer_service(
-                        rpc_server,
-                        &neb_client,
-                        raft_service,
-                        raft_client,
-                        &conshasing,
-                        group_name,
-                        database_name,
-                        tree_path,
-                    )
-                    .await
-                }
-                Service::Query => {
-                    // todo!()
-                }
-            }
-        }
-
-        // Register inverted index RPC service if indexing is enabled
-        if opts.index_enabled {
-            init_inverted_index_rpc_service(
-                rpc_server,
-                database_runtime.group_name(),
-                database_runtime.database_name(),
-                server.database_runtime.indexer.clone(),
-            )
-            .await;
-        }
 
         Ok(server)
     }
