@@ -2003,7 +2003,9 @@ mod tests {
         );
         server.meta().schemas.debug_only_new_schema(schema.clone());
 
-        let txn = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn = transactions::new_async_client_for_database(&server_addr, "test", "test")
+            .await
+            .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         // Write a new cell in transaction (but don't commit)
@@ -2177,7 +2179,9 @@ mod tests {
         }
 
         // Now update it in a transaction (but don't commit)
-        let txn = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn = transactions::new_async_client_for_database(&server_addr, "test", "test")
+            .await
+            .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         let mut data_map2 = OwnedMap::new();
@@ -2342,7 +2346,9 @@ mod tests {
         }
 
         // Now remove it in a transaction (but don't commit)
-        let txn = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn = transactions::new_async_client_for_database(&server_addr, "test", "test")
+            .await
+            .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         match txn.remove(txn_id.clone(), cell_id).await.unwrap().unwrap() {
@@ -2460,7 +2466,13 @@ mod tests {
         );
         server.meta().schemas.debug_only_new_schema(schema.clone());
 
-        let txn = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn = transactions::new_async_client_for_database(
+            &server_addr,
+            group_name,
+            group_name,
+        )
+        .await
+        .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         // Write a new cell in transaction and commit

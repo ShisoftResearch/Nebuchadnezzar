@@ -7,6 +7,15 @@ use crate::server::transactions;
 use crate::server::*;
 use env_logger;
 
+async fn scoped_txn_client(
+    address: &String,
+    group_name: &str,
+) -> Arc<transactions::manager::AsyncServiceClient> {
+    transactions::new_async_client_for_database(address, group_name, group_name)
+        .await
+        .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn workspace_wr() {
     let _ = env_logger::try_init();
@@ -38,7 +47,7 @@ pub async fn workspace_wr() {
         false,
     );
     server.meta().schemas.debug_only_new_schema(schema.clone());
-    let txn = transactions::new_async_client(&server_addr).await.unwrap();
+    let txn = scoped_txn_client(&server_addr, "test").await;
     let txn_id = txn.begin().await.unwrap().unwrap();
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
@@ -181,7 +190,7 @@ pub async fn data_site_wr() {
         false,
     );
     server.meta().schemas.debug_only_new_schema(schema.clone());
-    let txn = transactions::new_async_client(&server_addr).await.unwrap();
+    let txn = scoped_txn_client(&server_addr, "test").await;
     let txn_id = txn.begin().await.unwrap().unwrap();
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
@@ -281,7 +290,7 @@ pub async fn multi_transaction() {
         false,
     );
     server.meta().schemas.debug_only_new_schema(schema.clone());
-    let txn = transactions::new_async_client(&server_addr).await.unwrap();
+    let txn = scoped_txn_client(&server_addr, "test").await;
     let txn_1_id = txn.begin().await.unwrap().unwrap();
     let txn_2_id = txn.begin().await.unwrap().unwrap();
     let mut data_map_1 = OwnedMap::new();
@@ -390,7 +399,7 @@ pub async fn smoke_rw() {
         false,
     );
     server.meta().schemas.debug_only_new_schema(schema.clone());
-    let txn = transactions::new_async_client(&server_addr).await.unwrap();
+    let txn = scoped_txn_client(&server_addr, "test").await;
     let mut data_map_1 = OwnedMap::new();
     data_map_1.insert(&String::from("id"), OwnedValue::I64(100));
     data_map_1.insert(&String::from("score"), OwnedValue::U64(0));

@@ -10,6 +10,15 @@ use crate::server::*;
 use env_logger;
 use tokio::time::{sleep, Duration};
 
+async fn scoped_txn_client(
+    address: &String,
+    group_name: &str,
+) -> Arc<transactions::manager::AsyncServiceClient> {
+    transactions::new_async_client_for_database(address, group_name, group_name)
+        .await
+        .unwrap()
+}
+
 /// Test rapid concurrent updates to the same cell
 /// This can trigger race conditions in cell location tracking
 #[allow(unused_variables)]
@@ -66,7 +75,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
         let sid = schema.id;
 
@@ -173,7 +182,7 @@ async fn test_varying_size_concurrent_updates() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
         let sid = schema.id;
 
@@ -279,7 +288,7 @@ async fn test_multi_cell_concurrent_transactions() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cells = cell_ids.clone();
 
         tasks.push(tokio::spawn(async move {
@@ -375,7 +384,7 @@ async fn test_rapid_commit_sequence() {
 
     // Execute transactions sequentially but with minimal delays
     for i in 0..50 {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let txn_id = txn_client.begin().await.unwrap().unwrap();
 
         if let Ok(Ok(TxnExecResult::Accepted(mut cell))) =
@@ -467,7 +476,7 @@ async fn test_interleaved_prepare_commit() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_ids[i % cell_count].clone();
 
         tasks.push(tokio::spawn(async move {
@@ -568,7 +577,7 @@ async fn test_maximum_concurrency_stress() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
 
         tasks.push(tokio::spawn(async move {
@@ -670,7 +679,7 @@ async fn test_wikidata_import_scenario() {
 
         // Each batch processes multiple items concurrently
         for item in 0..items_per_batch {
-            let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+            let txn_client = scoped_txn_client(&server_addr, "test").await;
             let sid = schema.id;
 
             batch_tasks.push(tokio::spawn(async move {
@@ -812,7 +821,7 @@ async fn test_update_cell_by_stress() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
 
         tasks.push(tokio::spawn(async move {
