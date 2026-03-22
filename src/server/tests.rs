@@ -289,6 +289,69 @@ pub async fn unload_database_runtime_evicts_non_default_runtime() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+pub async fn delete_database_storage_removes_scoped_paths() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let backup_root = temp_dir.path().join("backup");
+    let wal_root = temp_dir.path().join("wal");
+    let undo_root = temp_dir.path().join("undo");
+    let raft_root = temp_dir.path().join("raft");
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_count: 1,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(backup_root.to_string_lossy().to_string()),
+            wal_storage: Some(wal_root.to_string_lossy().to_string()),
+            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
+            raft_storage: Some(raft_root.to_string_lossy().to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5105"),
+        "runtime_delete_storage_group",
+        "runtime_delete_storage_group",
+        async |_| {},
+    )
+    .await;
+
+    server
+        .ensure_database_runtime("analytics/db")
+        .await
+        .expect("database runtime should be created before deleting storage");
+    assert!(server.unload_database_runtime("analytics/db").await);
+
+    let scoped_db_dir = "analytics_db";
+    let backup_path = backup_root.join("databases").join(scoped_db_dir);
+    let wal_path = wal_root.join("databases").join(scoped_db_dir);
+    let undo_path = undo_root.join("databases").join(scoped_db_dir);
+    let raft_path = raft_root.join("databases").join(scoped_db_dir);
+
+    std::fs::create_dir_all(&backup_path).unwrap();
+    std::fs::create_dir_all(&wal_path).unwrap();
+    std::fs::create_dir_all(&undo_path).unwrap();
+    std::fs::create_dir_all(&raft_path).unwrap();
+
+    assert!(backup_path.exists());
+    assert!(wal_path.exists());
+    assert!(undo_path.exists());
+    assert!(raft_path.exists());
+
+    server
+        .delete_database_storage("analytics/db")
+        .expect("storage delete should succeed for scoped runtime");
+
+    assert!(!backup_path.exists());
+    assert!(!wal_path.exists());
+    assert!(!undo_path.exists());
+    assert!(!raft_path.exists());
+
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn smoke_test() {
     let _ = env_logger::try_init();

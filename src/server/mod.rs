@@ -612,6 +612,34 @@ impl NebServer {
         true
     }
 
+    pub fn delete_database_storage(&self, database_name: &str) -> Result<(), String> {
+        if database_name == self.database_name() {
+            return Err("cannot delete storage for the default database runtime".to_string());
+        }
+
+        let layout = database::DatabaseStorageLayout::from_options(
+            &self.host_options,
+            &self.group_name,
+            database_name,
+        );
+        let mut storage_roots = HashSet::new();
+        storage_roots.extend(layout.backup_storage);
+        storage_roots.extend(layout.wal_storage);
+        storage_roots.extend(layout.undo_log_storage);
+        storage_roots.extend(layout.raft_storage);
+
+        for storage_root in storage_roots {
+            if !Path::new(&storage_root).exists() {
+                continue;
+            }
+
+            std::fs::remove_dir_all(&storage_root)
+                .map_err(|e| format!("failed to remove database storage {storage_root}: {e}"))?;
+        }
+
+        Ok(())
+    }
+
     pub fn database_names(&self) -> Vec<String> {
         self.database_runtimes
             .read()
