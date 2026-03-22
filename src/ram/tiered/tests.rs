@@ -19,6 +19,15 @@ use std::sync::Mutex;
 // Global mutex to prevent test interference
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
+async fn tiered_txn_client(
+    address: &String,
+    group_name: &str,
+) -> Arc<transactions::manager::AsyncServiceClient> {
+    transactions::new_async_client_for_database(address, group_name, group_name)
+        .await
+        .unwrap()
+}
+
 /// Helper to create default test fields
 fn default_fields() -> Field {
     use dovahkiin::types::Type;
@@ -566,7 +575,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     let num_batches = (num_cells + batch_size - 1) / batch_size;
 
     let large_blob = "X".repeat(cell_size - 512); // Leave room for other fields
-    let client = transactions::new_async_client(&server_addr).await.unwrap();
+    let client = tiered_txn_client(&server_addr, "large_scale_test").await;
 
     let mut all_ids = Vec::with_capacity(num_cells);
     let insert_start = std::time::Instant::now();
@@ -684,7 +693,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         let schema_id = schema.id;
 
         update_handles.push(tokio::spawn(async move {
-            let client = transactions::new_async_client(&server_addr).await.unwrap();
+            let client = tiered_txn_client(&server_addr, "large_scale_test").await;
             let mut local_success = 0u64;
             let mut local_conflict = 0u64;
 
@@ -900,7 +909,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
 
     // Initialize 2000 cells (reduced from 10000 for faster test)
     info!("Initializing 2000 cells");
-    let client = transactions::new_async_client(&server_addr).await.unwrap();
+    let client = tiered_txn_client(&server_addr, "stress_test").await;
     let num_keys = 2000;
     let mut ids = Vec::with_capacity(num_keys);
 
@@ -944,7 +953,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
         let ids = ids.clone();
 
         handles.push(tokio::spawn(async move {
-            let client = transactions::new_async_client(&server_addr).await.unwrap();
+            let client = tiered_txn_client(&server_addr, "stress_test").await;
             let mut reads = 0u64;
             let mut counter: u64 = reader_id as u64 * 777;
 
@@ -976,7 +985,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
         let schema_id = schema.id;
 
         handles.push(tokio::spawn(async move {
-            let client = transactions::new_async_client(&server_addr).await.unwrap();
+            let client = tiered_txn_client(&server_addr, "stress_test").await;
             let mut writes = 0u64;
             let mut counter: u64 = writer_id as u64 * 999;
 
