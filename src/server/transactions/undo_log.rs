@@ -2001,7 +2001,7 @@ mod tests {
             false,
             false,
         );
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         let txn = transactions::new_async_client(&server_addr).await.unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
@@ -2043,7 +2043,7 @@ mod tests {
         }
 
         // Archive segments before shutdown
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2072,10 +2072,10 @@ mod tests {
         )
         .await;
 
-        server2.meta.schemas.debug_only_new_schema(schema.clone());
+        server2.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Cell should NOT exist after rollback
-        let cell_read_result = server2.chunks.read_cell(&cell_id);
+        let cell_read_result = server2.chunks().read_cell(&cell_id);
         if let Ok(ref cell) = cell_read_result {
             eprintln!("ERROR: Cell still exists after rollback!");
             eprintln!("Cell header: {:?}", cell.header);
@@ -2166,11 +2166,11 @@ mod tests {
 
         let mut cell = OwnedCell::new_with_id(schema.id, &random_id(), OwnedValue::Map(data_map));
         let cell_id = cell.id();
-        server.chunks.write_cell(&mut cell).unwrap();
+        server.chunks().write_cell(&mut cell).unwrap();
         let original_name = cell.data["name"].string().unwrap().clone();
 
         // Archive before transaction
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2214,7 +2214,7 @@ mod tests {
         }
 
         // Archive segments before shutdown
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2244,7 +2244,7 @@ mod tests {
         .await;
 
         // Cell should have original value after rollback
-        let restored_cell = server2.chunks.read_cell(&cell_id).unwrap();
+        let restored_cell = server2.chunks().read_cell(&cell_id).unwrap();
         assert_eq!(
             restored_cell.data["name"].string().unwrap(),
             &original_name,
@@ -2331,11 +2331,11 @@ mod tests {
 
         let mut cell = OwnedCell::new_with_id(schema.id, &random_id(), OwnedValue::Map(data_map));
         let cell_id = cell.id();
-        server.chunks.write_cell(&mut cell).unwrap();
+        server.chunks().write_cell(&mut cell).unwrap();
         let original_name = cell.data["name"].string().unwrap().clone();
 
         // Archive before transaction
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2363,7 +2363,7 @@ mod tests {
         }
 
         // Archive segments before shutdown
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2393,7 +2393,7 @@ mod tests {
         .await;
 
         // Cell should exist after rollback
-        let restored_cell = server2.chunks.read_cell(&cell_id).unwrap();
+        let restored_cell = server2.chunks().read_cell(&cell_id).unwrap();
         assert_eq!(
             restored_cell.data["name"].string().unwrap(),
             &original_name,
@@ -2458,7 +2458,7 @@ mod tests {
             false,
             false,
         );
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         let txn = transactions::new_async_client(&server_addr).await.unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
@@ -2491,7 +2491,7 @@ mod tests {
         );
 
         // Archive segments before shutdown
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2523,10 +2523,10 @@ mod tests {
         // Wait for Raft to stabilize after recovery restart
         sleep(Duration::from_millis(500)).await;
 
-        server2.meta.schemas.debug_only_new_schema(schema.clone());
+        server2.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Cell should still exist after recovery (committed transaction)
-        let read_cell = server2.chunks.read_cell(&cell_id).unwrap();
+        let read_cell = server2.chunks().read_cell(&cell_id).unwrap();
         assert_eq!(
             read_cell.data["name"].string().unwrap(),
             "committed_name",

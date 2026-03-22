@@ -44,7 +44,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -56,7 +56,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
     );
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!("Starting rapid concurrent updates on cell: {:?}", cell_id);
@@ -155,7 +155,7 @@ async fn test_varying_size_concurrent_updates() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -164,7 +164,7 @@ async fn test_varying_size_concurrent_updates() {
     data_map.insert(&String::from("name"), OwnedValue::String(String::from("X")));
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!("Starting varying-size updates on cell: {:?}", cell_id);
@@ -254,7 +254,7 @@ async fn test_multi_cell_concurrent_transactions() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create multiple cells
     let cell_count = 20;
@@ -269,7 +269,7 @@ async fn test_multi_cell_concurrent_transactions() {
             OwnedValue::String(format!("Cell{}", i)),
         );
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
-        server.chunks.write_cell(&mut cell).unwrap();
+        server.chunks().write_cell(&mut cell).unwrap();
         cell_ids.push(cell.id());
     }
 
@@ -356,7 +356,7 @@ async fn test_rapid_commit_sequence() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -368,7 +368,7 @@ async fn test_rapid_commit_sequence() {
     );
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!("Starting rapid commit sequence test on cell: {:?}", cell_id);
@@ -442,7 +442,7 @@ async fn test_interleaved_prepare_commit() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create multiple cells
     let cell_count = 10;
@@ -457,7 +457,7 @@ async fn test_interleaved_prepare_commit() {
             OwnedValue::String(format!("Cell{}", i)),
         );
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
-        server.chunks.write_cell(&mut cell).unwrap();
+        server.chunks().write_cell(&mut cell).unwrap();
         cell_ids.push(cell.id());
     }
 
@@ -544,7 +544,7 @@ async fn test_maximum_concurrency_stress() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -556,7 +556,7 @@ async fn test_maximum_concurrency_stress() {
     );
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!(
@@ -654,7 +654,7 @@ async fn test_wikidata_import_scenario() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     println!("Starting wikidata import scenario test");
     println!("This test mimics high-concurrency batch imports");
@@ -783,7 +783,7 @@ async fn test_update_cell_by_stress() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -795,7 +795,7 @@ async fn test_update_cell_by_stress() {
     );
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!("Testing update_cell_by path that triggers mark_dead_entry_with_cell");
