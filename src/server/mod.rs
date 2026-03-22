@@ -469,9 +469,21 @@ impl NebServer {
         let servs = proc_services(&opts.services);
         for service in servs {
             match service {
-                Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
+                Service::Cell => {
+                    init_cell_rpc_service(
+                        rpc_server,
+                        server.database_runtime.clone(),
+                        server.neb_client.clone(),
+                    )
+                    .await
+                }
                 Service::Transaction | Service::HashIndexer => {
-                    init_txn_data_site_service(rpc_server, &server).await
+                    init_txn_data_site_service(
+                        rpc_server,
+                        server.database_runtime.clone(),
+                        server.txn_peer.clone(),
+                    )
+                    .await
                 }
                 Service::RangedIndexer => {
                     // Use raft storage path for tree persistence if available
@@ -499,7 +511,8 @@ impl NebServer {
 
         // Register inverted index RPC service if indexing is enabled
         if opts.index_enabled {
-            init_inverted_index_rpc_service(rpc_server, &server).await;
+            init_inverted_index_rpc_service(rpc_server, server.database_runtime.indexer.clone())
+                .await;
         }
 
         Ok(server)
@@ -773,11 +786,14 @@ impl NebServer {
 // In production: use signal handlers (SIGTERM, SIGINT) to call shutdown()
 // In tests: always call server.shutdown().await at the end
 
-pub async fn rpc_client_by_id(id: &Id, neb: &Arc<NebServer>) -> Result<Arc<RPCClient>, RPCError> {
-    let server_id = neb.get_server_id_by_id(id).unwrap();
-    let neb = neb.clone();
+pub async fn rpc_client_by_id(
+    id: &Id,
+    conshash: &Arc<ConsistentHashing>,
+) -> Result<Arc<RPCClient>, RPCError> {
+    let server_id = conshash.get_server_id(id.higher).unwrap();
+    let conshash = conshash.clone();
     DEFAULT_CLIENT_POOL
-        .get_by_id(server_id, move |sid| neb.conshash().to_server_name(sid))
+        .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
         .await
         .map_err(|e| RPCError::IOError(e))
 }
@@ -796,12 +812,13 @@ impl Peer {
     }
 }
 
-pub async fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+pub async fn init_cell_rpc_service(
+    rpc_server: &Arc<Server>,
+    database_runtime: Arc<DatabaseRuntime>,
+    neb_client: Arc<AsyncClient>,
+) {
     rpc_server
-        .register_service(&cell_rpc::NebRPCService::new(
-            neb_server.database_runtime.clone(),
-            neb_server.neb_client.clone(),
-        ))
+        .register_service(&cell_rpc::NebRPCService::new(database_runtime, neb_client))
         .await;
 }
 
@@ -824,20 +841,24 @@ pub async fn init_txn_manager(
     rpc_server.register_service(&txn_manager).await;
     return txn_manager;
 }
-pub async fn init_txn_data_site_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+pub async fn init_txn_data_site_service(
+    rpc_server: &Arc<Server>,
+    database_runtime: Arc<DatabaseRuntime>,
+    txn_peer: Peer,
+) {
     rpc_server
         .register_service(&transactions::data_site::DataManager::new(
-            neb_server.database_runtime.clone(),
-            neb_server.txn_peer.clone(),
+            database_runtime,
+            txn_peer,
         ))
         .await;
 }
 
 pub async fn init_inverted_index_rpc_service(
     rpc_server: &Arc<Server>,
-    neb_server: &Arc<NebServer>,
+    index_builder: Option<Arc<IndexBuilder>>,
 ) {
-    if let Some(index_builder) = neb_server.indexer() {
+    if let Some(index_builder) = index_builder.as_ref() {
         if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
             use crate::index::full_text::rpc::InvertedIndexRPCService;
             let service = InvertedIndexRPCService::new(inverted_indexer.clone());
