@@ -1029,15 +1029,8 @@ impl NebServer {
         member_service.join_group(group_name).await.unwrap();
         let membership_client = Arc::new(ObserverClient::new(&raft_client));
         debug!("Creating neb server");
-        let effective_opts = ServerOptions {
-            backup_storage: storage_layout.backup_storage,
-            wal_storage: storage_layout.wal_storage,
-            undo_log_storage: storage_layout.undo_log_storage,
-            raft_storage: storage_layout.raft_storage,
-            ..opts.clone()
-        };
         NebServer::new(
-            &effective_opts,
+            opts,
             server_addr,
             &meta_servers,
             group_name,
