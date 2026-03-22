@@ -12,7 +12,7 @@ use std::mem;
 use crate::index::embedding::EmbeddingModel;
 use crate::index::vector::VectorIndexConfig;
 use crate::ram::io::align_address;
-use crate::server::NebServer;
+use crate::server::DatabaseRuntime;
 use crate::utils::thread_id;
 
 use super::types;
@@ -700,14 +700,17 @@ impl<O, T: ?Sized> Deref for ReadingRef<O, T> {
     }
 }
 
-pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Result<(), String> {
+pub async fn post_schema_add(
+    schema: &Schema,
+    database_runtime: &Arc<DatabaseRuntime>,
+) -> Result<(), String> {
     for (field, indices) in &schema.index_fields {
         for index in indices {
             let field_id = *field;
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    if let Some(indexer) = neb_server.indexer() {
+                    if let Some(indexer) = database_runtime.indexer.as_ref() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -719,7 +722,7 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
                     }
                 }
                 IndexType::Embedding(model) => {
-                    if let Some(indexer) = neb_server.indexer() {
+                    if let Some(indexer) = database_runtime.indexer.as_ref() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -740,7 +743,7 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    if let Some(indexer) = neb_server.indexer() {
+                    if let Some(indexer) = database_runtime.indexer.as_ref() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -752,7 +755,7 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
                     }
                 }
                 IndexType::Embedding(model) => {
-                    if let Some(indexer) = neb_server.indexer() {
+                    if let Some(indexer) = database_runtime.indexer.as_ref() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -772,7 +775,7 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
 
 pub async fn post_schema_delete(
     schema: &Schema,
-    neb_server: &Arc<NebServer>,
+    database_runtime: &Arc<DatabaseRuntime>,
 ) -> Result<(), String> {
     for (field, indices) in &schema.index_fields {
         for index in indices {
@@ -780,7 +783,7 @@ pub async fn post_schema_delete(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(_config) => {
-                    if let Some(indexer) = neb_server.indexer() {
+                    if let Some(indexer) = database_runtime.indexer.as_ref() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -792,7 +795,7 @@ pub async fn post_schema_delete(
                     }
                 }
                 IndexType::Embedding(_model) => {
-                    if let Some(indexer) = neb_server.indexer() {
+                    if let Some(indexer) = database_runtime.indexer.as_ref() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -813,7 +816,7 @@ pub async fn post_schema_delete(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(_config) => {
-                    if let Some(indexer) = neb_server.indexer() {
+                    if let Some(indexer) = database_runtime.indexer.as_ref() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -825,7 +828,7 @@ pub async fn post_schema_delete(
                     }
                 }
                 IndexType::Embedding(_model) => {
-                    if let Some(indexer) = neb_server.indexer() {
+                    if let Some(indexer) = database_runtime.indexer.as_ref() {
                         let _ = indexer
                             .clients
                             .embedding_client
