@@ -26,16 +26,7 @@ const STRIPE_MASK: usize = STRIPE_COUNT - 1;
 #[repr(align(64))]
 struct CachePadded(AtomicUsize);
 
-use std::cell::Cell;
 use std::thread;
-
-static NEXT_STRIPE: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    /// Each thread gets a stripe index assigned lazily on first use.
-    /// After that it is a single TLS register read — faster than sched_getcpu.
-    static THREAD_STRIPE: Cell<usize> = Cell::new(usize::MAX);
-}
 
 /// Returns this thread's stripe index, assigning one on first call.
 #[inline]
