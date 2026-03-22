@@ -1,13 +1,19 @@
 use bifrost::rpc::RPCError;
-use dovahkiin::{expr::serde::Expr, types::{Id, OwnedValue}};
+use dovahkiin::{
+    expr::serde::Expr,
+    types::{Id, OwnedValue},
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-    client::client_by_server_name,
+    client::client_by_server_name_for_database,
     index::{
+        ranged::{
+            client::cursor::ClientCursor,
+            tree::{btree::Ordering, service::Range},
+        },
         EntryKey, SCHEMA_SCAN_PATT_SIZE,
-        ranged::{client::cursor::ClientCursor, tree::{btree::Ordering, service::Range}},
     },
     ram::cell::OwnedCell,
 };
@@ -80,7 +86,10 @@ impl IndexedDataClient {
                     &Expr::nothing(),
                 )
                 .await;
-            return selected_cells.into_iter().map(|cell| cell.id()).collect_vec();
+            return selected_cells
+                .into_iter()
+                .map(|cell| cell.id())
+                .collect_vec();
         };
         if limit == 0 || candidate_ids.is_empty() {
             return vec![];
@@ -146,9 +155,18 @@ impl IndexedDataClient {
                 let projection = projection.clone();
                 let selection = selection.clone();
                 let proc = proc.clone();
+                let group_name = self.group_name.clone();
+                let database_name = self.database_name.clone();
                 let server_name = self.conshash.to_server_name(sid);
                 async move {
-                    match client_by_server_name(sid, server_name).await {
+                    match client_by_server_name_for_database(
+                        sid,
+                        server_name,
+                        &group_name,
+                        &database_name,
+                    )
+                    .await
+                    {
                         Ok(client) => {
                             let read_res = client
                                 .read_all_cells_proced(&grouped_ids, &projection, &selection, &proc)
@@ -234,9 +252,18 @@ impl IndexedDataClient {
                     grouped_ids.push(id);
                 }
                 let fields = fields.to_vec();
+                let group_name = self.group_name.clone();
+                let database_name = self.database_name.clone();
                 let server_name = self.conshash.to_server_name(sid);
                 async move {
-                    match client_by_server_name(sid, server_name).await {
+                    match client_by_server_name_for_database(
+                        sid,
+                        server_name,
+                        &group_name,
+                        &database_name,
+                    )
+                    .await
+                    {
                         Ok(client) => client
                             .read_all_cells_selected(&grouped_ids, &fields, true)
                             .await

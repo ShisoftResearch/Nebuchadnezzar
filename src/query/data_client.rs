@@ -2,19 +2,19 @@ use std::sync::Arc;
 
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
-    ahash::HashMap, expr::serde::Expr, types::{Id, OwnedValue}
+    ahash::HashMap,
+    expr::serde::Expr,
+    types::{Id, OwnedValue},
 };
 use itertools::Itertools;
 
 use crate::{
     client::AsyncClient,
     index::{
-        IndexerClients, full_text::BM25Hit, hash::get_hash_id_from_value,
-        ranged::tree::btree::Ordering,
+        full_text::BM25Hit, hash::get_hash_id_from_value, ranged::tree::btree::Ordering,
+        IndexerClients,
     },
-    query::planner::{
-        IndexedPredicatePlan, QueryPlanExplain,
-    },
+    query::planner::{IndexedPredicatePlan, QueryPlanExplain},
     ram::cell::ReadError,
 };
 
@@ -27,13 +27,13 @@ mod projection;
 mod read;
 mod sort;
 
-pub use cursor::{AggregateResultCursor, AggregateRow, DataCursor, IdCursor};
-pub use projection::{ProjectionField, ProjectionItem, QueryResultCursor, QueryRow};
 use aggregate::{
-    AggregateGroupState, collect_aggregate_required_fields, serialize_group_key,
-    sort_aggregate_rows,
+    collect_aggregate_required_fields, serialize_group_key, sort_aggregate_rows,
+    AggregateGroupState,
 };
+pub use cursor::{AggregateResultCursor, AggregateRow, DataCursor, IdCursor};
 use ids::sort_ids_by_query_order;
+pub use projection::{ProjectionField, ProjectionItem, QueryResultCursor, QueryRow};
 
 pub use crate::query::planner::{ValueRange, ValueRangeTerm};
 
@@ -43,6 +43,8 @@ const SCAN_BUFFER_SIZE: u16 = 64;
 pub struct IndexedDataClient {
     conshash: Arc<ConsistentHashing>,
     index_clients: Arc<IndexerClients>,
+    group_name: String,
+    database_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -114,6 +116,8 @@ impl IndexedDataClient {
                 raft_client,
                 0,
             )),
+            group_name: neb_client.group_name().to_string(),
+            database_name: neb_client.database_name().to_string(),
         }
     }
 
@@ -123,6 +127,8 @@ impl IndexedDataClient {
         conshash: Arc<ConsistentHashing>,
     ) -> Self {
         Self {
+            group_name: index_clients.neb_client.group_name().to_string(),
+            database_name: index_clients.neb_client.database_name().to_string(),
             conshash,
             index_clients,
         }
@@ -181,14 +187,7 @@ impl IndexedDataClient {
         projection: Vec<ProjectionField>,
     ) -> Result<QueryResultCursor, RPCError> {
         self.query_with_options(
-            schema,
-            selection,
-            ordering,
-            None,
-            None,
-            None,
-            None,
-            projection,
+            schema, selection, ordering, None, None, None, None, projection,
         )
         .await
     }
@@ -422,16 +421,9 @@ impl IndexedDataClient {
         hit_table: &mut QueryHitTable,
     ) -> Result<IdCursor, RPCError> {
         self.query_ids_with_options_and_hits(
-            schema,
-            selection,
-            ordering,
-            None,
-            None,
-            None,
-            None,
-            hit_table,
+            schema, selection, ordering, None, None, None, None, hit_table,
         )
-            .await
+        .await
     }
 
     pub async fn query_ids_with_options<'a>(
@@ -497,7 +489,10 @@ impl IndexedDataClient {
             .await;
         let inferred_order_field = explicit_order_by_field
             .is_none()
-            .then(|| plan.as_ref().and_then(Self::infer_query_order_field_from_plan))
+            .then(|| {
+                plan.as_ref()
+                    .and_then(Self::infer_query_order_field_from_plan)
+            })
             .flatten();
         let (candidate_ids, requires_selection_filter): (Vec<Id>, bool) = if let Some(plan) = plan {
             if plan.is_impossible() {
@@ -581,7 +576,7 @@ impl IndexedDataClient {
             limit,
             offset,
         )
-            .await
+        .await
     }
 
     pub fn hashed_index_id(schema: u32, field: u64, value: &OwnedValue) -> Id {
@@ -612,10 +607,9 @@ impl IndexedDataClient {
             .bm25_search(schema, field_id, query, limit, phrase_boost)
             .await
     }
-
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod alignment_tests;
+#[cfg(test)]
+mod tests;
