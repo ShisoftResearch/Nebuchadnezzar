@@ -1496,10 +1496,10 @@ mod tests {
                     OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
                 // Write cell
-                server_clone.chunks.write_cell(&mut cell).unwrap();
+                server_clone.chunks().write_cell(&mut cell).unwrap();
 
                 // Index cell
-                if let Some(ref index_builder) = server_clone.indexer {
+                if let Some(index_builder) = server_clone.indexer() {
                     index_builder.ensure_indices(&cell, &schema_clone, None);
                 }
 
@@ -1521,7 +1521,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify all documents are searchable
-        if let Some(ref index_builder) = server_arc.indexer {
+        if let Some(index_builder) = server_arc.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let stats = indexer.get_field_stats(schema_id, content_field_id);
                 assert_eq!(
@@ -1664,9 +1664,9 @@ mod tests {
                     let mut cell =
                         OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
-                    server_clone.chunks.write_cell(&mut cell).unwrap();
+                    server_clone.chunks().write_cell(&mut cell).unwrap();
 
-                    if let Some(ref index_builder) = server_clone.indexer {
+                    if let Some(index_builder) = server_clone.indexer() {
                         index_builder.ensure_indices(&cell, &schema_clone, None);
                     }
 
@@ -1689,7 +1689,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify all documents are searchable
-        if let Some(ref index_builder) = server_arc.indexer {
+        if let Some(index_builder) = server_arc.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let stats = indexer.get_field_stats(schema_id, content_field_id);
                 info!(
@@ -2740,11 +2740,11 @@ mod tests {
 
         // Register inverted index schemas BEFORE flushing (needed for flush operations)
         server1
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(inverted_segment_schema());
         server1
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
@@ -3036,11 +3036,11 @@ mod tests {
         // Re-register schemas (needed for recovery)
         server2.meta().schemas.debug_only_new_schema(schema.clone());
         server2
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(inverted_segment_schema());
         server2
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
