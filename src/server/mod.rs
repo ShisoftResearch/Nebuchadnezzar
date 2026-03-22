@@ -783,6 +783,7 @@ pub async fn rpc_client_by_id(id: &Id, neb: &Arc<NebServer>) -> Result<Arc<RPCCl
 }
 
 // Peer have a clock, meant to update with other servers in the cluster
+#[derive(Clone)]
 pub struct Peer {
     pub clock: Arc<ServerVectorClock>,
 }
