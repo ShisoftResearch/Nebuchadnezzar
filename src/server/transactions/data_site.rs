@@ -786,7 +786,10 @@ impl Service for DataManager {
                         }; // SharedCell dropped here, lock released
 
                         // Now protect the segment without holding cell lock
-                        let chunk = self.server.chunks().locate_chunk_by_partition(cell_id.higher);
+                        let chunk = self
+                            .server
+                            .chunks()
+                            .locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
 
@@ -869,7 +872,10 @@ impl Service for DataManager {
                             }; // SharedCell dropped here, lock released
 
                         // Now protect the segment without holding cell lock
-                        let chunk = self.server.chunks().locate_chunk_by_partition(cell_id.higher);
+                        let chunk = self
+                            .server
+                            .chunks()
+                            .locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
 
