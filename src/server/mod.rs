@@ -103,15 +103,30 @@ pub struct ServerMeta {
 }
 
 pub struct DatabaseRuntime {
+    pub group_name: String,
+    pub database_name: String,
     pub chunks: Arc<Chunks>,
     pub meta: Arc<ServerMeta>,
     pub cleaner: Arc<Cleaner>,
     pub indexer: Option<Arc<IndexBuilder>>,
     pub undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
     pub txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
+    pub rpc: Arc<rpc::Server>,
+    pub consh: Arc<ConsistentHashing>,
+    pub membership: Arc<ObserverClient>,
+    pub raft_client: Arc<RaftClient>,
+    pub neb_client: Arc<AsyncClient>,
 }
 
 impl DatabaseRuntime {
+    pub fn group_name(&self) -> &str {
+        &self.group_name
+    }
+
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
     pub fn chunks(&self) -> &Arc<Chunks> {
         &self.chunks
     }
@@ -134,6 +149,28 @@ impl DatabaseRuntime {
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.txn_manager.as_ref()
+    }
+
+    pub fn indexed_data_client(&self) -> IndexedDataClient {
+        if let Some(index_builder) = self.indexer() {
+            IndexedDataClient::new_with_indexers(index_builder.clients.clone(), self.consh.clone())
+        } else {
+            IndexedDataClient::new(&self.neb_client, &self.consh, &self.raft_client)
+        }
+    }
+
+    pub async fn data_client(
+        &self,
+        members: &Vec<String>,
+    ) -> Result<AsyncClient, NebClientError> {
+        AsyncClient::new_for_database(
+            &self.rpc,
+            &self.membership,
+            members,
+            &self.group_name,
+            &self.database_name,
+        )
+        .await
     }
 }
 
@@ -443,12 +480,19 @@ impl NebServer {
         let txn_peer = Peer::new(server_addr);
         let clock = txn_peer.clock.clone();
         let transaction_runtime = Arc::new(DatabaseRuntime {
+            group_name: group_name.clone(),
+            database_name: database_name.to_string(),
             chunks: chunks.clone(),
             meta: meta_rc.clone(),
             cleaner: cleaner.clone(),
             indexer: index_builder.clone(),
             undo_log: undo_log.clone(),
             txn_manager: None,
+            rpc: rpc_server.clone(),
+            consh: conshasing.clone(),
+            membership: membership_client.clone(),
+            raft_client: raft_client.clone(),
+            neb_client: neb_client.clone(),
         });
 
         if opts.services.contains(&Service::Transaction) {
@@ -466,12 +510,19 @@ impl NebServer {
         }
 
         let database_runtime = Arc::new(DatabaseRuntime {
+            group_name: group_name.clone(),
+            database_name: database_name.to_string(),
             chunks: chunks.clone(),
             meta: meta_rc.clone(),
             cleaner,
             indexer: index_builder.clone(),
             undo_log: undo_log.clone(),
             txn_manager: transaction_manager.clone(),
+            rpc: rpc_server.clone(),
+            consh: conshasing.clone(),
+            membership: membership_client.clone(),
+            raft_client: raft_client.clone(),
+            neb_client: neb_client.clone(),
         });
 
         let server = Arc::new(NebServer {
@@ -785,22 +836,10 @@ impl NebServer {
         &self.database_name
     }
     pub fn indexed_data_client(&self) -> IndexedDataClient {
-        // Use server's indexer clients if available (for BM25 search support)
-        if let Some(index_builder) = self.indexer() {
-            IndexedDataClient::new_with_indexers(index_builder.clients.clone(), self.consh.clone())
-        } else {
-            IndexedDataClient::new(&self.neb_client, &self.consh, &self.raft_client)
-        }
+        self.database_runtime.indexed_data_client()
     }
     pub async fn data_client(&self, members: &Vec<String>) -> Result<AsyncClient, NebClientError> {
-        AsyncClient::new_for_database(
-            &self.rpc,
-            &self.membership,
-            members,
-            &self.group_name,
-            &self.database_name,
-        )
-        .await
+        self.database_runtime.data_client(members).await
     }
 }
 
