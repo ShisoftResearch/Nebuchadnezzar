@@ -9,6 +9,7 @@ use crate::{
 };
 use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
+use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use lightning::linked_list::LinkedList;
@@ -20,6 +21,13 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
+
+pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
+    hash_str(&format!(
+        "TXN_DATA_MANAGER_RPC_SERVICE-{}-{}",
+        group, database_name
+    ))
+}
 
 // Lock timeout in milliseconds - locks held longer than this are considered stale
 // and can be reclaimed (default: 30 seconds)
@@ -471,6 +479,20 @@ impl DataManager {
         }
 
         (released_count, failures)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_data_manager_service_ids_differ_between_databases() {
+        let group = "group_a";
+        assert_ne!(
+            generate_scoped_service_id(group, "db_a"),
+            generate_scoped_service_id(group, "db_b")
+        );
     }
 }
 

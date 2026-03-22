@@ -931,7 +931,13 @@ pub async fn init_cell_rpc_service(
     neb_client: Arc<AsyncClient>,
 ) {
     rpc_server
-        .register_service(&cell_rpc::NebRPCService::new(database_runtime, neb_client))
+        .register_service_with_id(
+            cell_rpc::generate_scoped_service_id(
+                database_runtime.group_name(),
+                database_runtime.database_name(),
+            ),
+            &cell_rpc::NebRPCService::new(database_runtime, neb_client),
+        )
         .await;
 }
 
@@ -951,7 +957,15 @@ pub async fn init_txn_manager(
         member_pool: member_pool.clone(),
     });
     let txn_manager = transactions::manager::TransactionManager::new(deps);
-    rpc_server.register_service(&txn_manager).await;
+    rpc_server
+        .register_service_with_id(
+            transactions::manager::generate_scoped_service_id(
+                database_runtime.group_name(),
+                database_runtime.database_name(),
+            ),
+            &txn_manager,
+        )
+        .await;
     return txn_manager;
 }
 pub async fn init_txn_data_site_service(
@@ -960,10 +974,13 @@ pub async fn init_txn_data_site_service(
     txn_peer: Peer,
 ) {
     rpc_server
-        .register_service(&transactions::data_site::DataManager::new(
-            database_runtime,
-            txn_peer,
-        ))
+        .register_service_with_id(
+            transactions::data_site::generate_scoped_service_id(
+                database_runtime.group_name(),
+                database_runtime.database_name(),
+            ),
+            &transactions::data_site::DataManager::new(database_runtime, txn_peer),
+        )
         .await;
 }
 

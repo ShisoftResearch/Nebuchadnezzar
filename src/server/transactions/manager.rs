@@ -6,6 +6,7 @@ use bifrost::conshash::ConsistentHashing;
 use bifrost::rpc::{ClientPool, RPCClient};
 use bifrost::utils::time::get_time;
 use bifrost::vector_clock::{ServerVectorClock, StandardVectorClock};
+use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
@@ -25,6 +26,13 @@ type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
 type DataSitesMap = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
+
+pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
+    hash_str(&format!(
+        "TXN_MANAGER_RPC_SERVICE-{}-{}",
+        group, database_name
+    ))
+}
 
 /// Dependencies needed by TransactionManager, extracted from NebServer to break cyclic dependency
 pub struct TransactionManagerDeps {
@@ -516,7 +524,15 @@ impl TransactionManager {
             let client = self.deps.get_member_by_server_id(server_id).await?;
             return Ok(self
                 .data_sites
-                .get_or_insert(server_id, || data_site::AsyncServiceClient::new(&client)));
+                .get_or_insert(server_id, || {
+                    data_site::AsyncServiceClient::new_with_service_id(
+                        data_site::generate_scoped_service_id(
+                            self.deps.database_runtime.group_name(),
+                            self.deps.database_runtime.database_name(),
+                        ),
+                        &client,
+                    )
+                }));
         }
         self.data_sites.get(&server_id).ok_or(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1059,6 +1075,20 @@ impl TransactionManager {
             result
         };
         Ok(conclusion)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_transaction_manager_service_ids_differ_between_databases() {
+        let group = "group_a";
+        assert_ne!(
+            generate_scoped_service_id(group, "db_a"),
+            generate_scoped_service_id(group, "db_b")
+        );
     }
 }
 

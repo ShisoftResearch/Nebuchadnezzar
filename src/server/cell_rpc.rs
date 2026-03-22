@@ -8,6 +8,7 @@ use crate::{
     ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
 };
 use bifrost::rpc::*;
+use bifrost_hasher::hash_str;
 use dovahkiin::expr::serde::Expr;
 use dovahkiin::expr::symbols::utils::is_true;
 use dovahkiin::integrated::lisp;
@@ -18,6 +19,13 @@ use futures::prelude::*;
 use bifrost_plugins::hash_ident;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
+
+pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
+    hash_str(&format!(
+        "NEB_CELL_RPC_SERVICE-{}-{}",
+        group, database_name
+    ))
+}
 
 service! {
     rpc read_cell(key: Id) -> Result<OwnedCell, ReadError>;
@@ -42,6 +50,24 @@ service_with_id!(NebRPCService, DEFAULT_SERVICE_ID);
 pub struct NebRPCService {
     database_runtime: Arc<DatabaseRuntime>,
     neb_client: Arc<AsyncClient>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_cell_service_ids_differ_between_databases() {
+        let group = "group_a";
+        assert_ne!(
+            generate_scoped_service_id(group, "db_a"),
+            generate_scoped_service_id(group, "db_b")
+        );
+        assert_eq!(
+            generate_scoped_service_id(group, group),
+            generate_scoped_service_id(group, group)
+        );
+    }
 }
 
 impl Service for NebRPCService {

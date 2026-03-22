@@ -4,7 +4,7 @@ use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost::rpc::{
-    RPCClient, RPCError, Server as RPCServer, ServiceClientWithId, DEFAULT_CLIENT_POOL,
+    RPCClient, RPCError, Server as RPCServer, ServiceClient, DEFAULT_CLIENT_POOL,
 };
 use dovahkiin::types::OwnedValue;
 use futures::prelude::*;
@@ -162,7 +162,12 @@ impl AsyncClient {
         &'a self,
         server_id: u64,
     ) -> impl Future<Output = Result<Arc<plain_server::AsyncServiceClient>, RPCError>> + 'a {
-        client_by_server_id(&self.conshash, server_id)
+        client_by_server_id_for_database(
+            &self.conshash,
+            server_id,
+            self.group_name(),
+            self.database_name(),
+        )
     }
 
     pub async fn locate_plain_server(
@@ -316,7 +321,13 @@ impl AsyncClient {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer),
         };
-        let txn_client = match txn_server::new_async_client(&server_name).await {
+        let txn_client = match txn_server::new_async_client_for_database(
+            &server_name,
+            self.group_name(),
+            self.database_name(),
+        )
+        .await
+        {
             Ok(client) => client,
             Err(e) => return Err(TxnError::IoError(e)),
         };
@@ -561,27 +572,58 @@ impl AsyncClient {
 }
 
 pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
-    plain_server::AsyncServiceClient::new(rpc)
+    client_by_rpc_client_for_database(rpc, "", "")
+}
+
+pub fn client_by_rpc_client_for_database(
+    rpc: &Arc<RPCClient>,
+    group_name: &str,
+    database_name: &str,
+) -> Arc<plain_server::AsyncServiceClient> {
+    let service_id = if group_name.is_empty() && database_name.is_empty() {
+        plain_server::DEFAULT_SERVICE_ID
+    } else {
+        plain_server::generate_scoped_service_id(group_name, database_name)
+    };
+    plain_server::AsyncServiceClient::new_with_service_id(service_id, rpc)
 }
 
 pub async fn client_by_server_id(
     conshash: &Arc<ConsistentHashing>,
     server_id: u64,
 ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+    client_by_server_id_for_database(conshash, server_id, "", "").await
+}
+
+pub async fn client_by_server_id_for_database(
+    conshash: &Arc<ConsistentHashing>,
+    server_id: u64,
+    group_name: &str,
+    database_name: &str,
+) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
         .await
         .map_err(|e| RPCError::IOError(e))
-        .map(|c| client_by_rpc_client(&c))
+        .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))
 }
 
 pub async fn client_by_server_name(
     server_id: u64,
     server_name: String,
 ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+    client_by_server_name_for_database(server_id, server_name, "", "").await
+}
+
+pub async fn client_by_server_name_for_database(
+    server_id: u64,
+    server_name: String,
+    group_name: &str,
+    database_name: &str,
+) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |_sid| server_name)
         .await
         .map_err(|e| RPCError::IOError(e))
-        .map(|c| client_by_rpc_client(&c))
+        .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))
 }
