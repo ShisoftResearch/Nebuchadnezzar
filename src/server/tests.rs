@@ -107,6 +107,43 @@ pub async fn explicit_database_binding_scopes_storage_roots() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+pub async fn resolves_bound_database_runtime_by_name() {
+    let _ = env_logger::try_init();
+    let database_name = "analytics";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_count: 1,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5102"),
+        "database_runtime_lookup_group",
+        database_name,
+        async |_| {},
+    )
+    .await;
+
+    let looked_up_runtime = server
+        .database(database_name)
+        .expect("database runtime should be registered under its database name");
+    assert!(Arc::ptr_eq(&looked_up_runtime, &server.database_runtime));
+    assert!(
+        server.database("missing").is_none(),
+        "unknown database names must not resolve to a runtime"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn smoke_test() {
     let _ = env_logger::try_init();

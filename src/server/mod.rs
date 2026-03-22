@@ -23,10 +23,10 @@ use crate::ram::cleaner::Cleaner;
 use crate::ram::schema::sm as schema_sm;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 pub mod cell_rpc;
 pub mod database;
@@ -139,6 +139,7 @@ impl DatabaseRuntime {
 
 pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
+    database_runtimes: RwLock<HashMap<String, Arc<DatabaseRuntime>>>,
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
     pub membership: Arc<ObserverClient>,
@@ -176,6 +177,13 @@ pub async fn init_conshash(
 }
 
 impl NebServer {
+    pub fn database(&self, database_name: &str) -> Option<Arc<DatabaseRuntime>> {
+        self.database_runtimes
+            .read()
+            .ok()
+            .and_then(|runtimes| runtimes.get(database_name).cloned())
+    }
+
     pub fn database_runtime(&self) -> &DatabaseRuntime {
         self.database_runtime.as_ref()
     }
@@ -468,6 +476,10 @@ impl NebServer {
 
         let server = Arc::new(NebServer {
             database_runtime: database_runtime.clone(),
+            database_runtimes: RwLock::new(HashMap::from([(
+                database_name.to_string(),
+                database_runtime.clone(),
+            )])),
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),
             membership: membership_client.clone(),
