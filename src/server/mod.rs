@@ -119,6 +119,39 @@ pub struct DatabaseRuntime {
 }
 
 impl DatabaseRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        group_name: &str,
+        database_name: &str,
+        chunks: Arc<Chunks>,
+        meta: Arc<ServerMeta>,
+        cleaner: Arc<Cleaner>,
+        indexer: Option<Arc<IndexBuilder>>,
+        undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
+        txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
+        rpc: Arc<rpc::Server>,
+        consh: Arc<ConsistentHashing>,
+        membership: Arc<ObserverClient>,
+        raft_client: Arc<RaftClient>,
+        neb_client: Arc<AsyncClient>,
+    ) -> Self {
+        Self {
+            group_name: group_name.to_string(),
+            database_name: database_name.to_string(),
+            chunks,
+            meta,
+            cleaner,
+            indexer,
+            undo_log,
+            txn_manager,
+            rpc,
+            consh,
+            membership,
+            raft_client,
+            neb_client,
+        }
+    }
+
     pub fn group_name(&self) -> &str {
         &self.group_name
     }
@@ -479,21 +512,21 @@ impl NebServer {
         let member_pool = Arc::new(rpc::ClientPool::new());
         let txn_peer = Peer::new(server_addr);
         let clock = txn_peer.clock.clone();
-        let transaction_runtime = Arc::new(DatabaseRuntime {
-            group_name: group_name.clone(),
-            database_name: database_name.to_string(),
-            chunks: chunks.clone(),
-            meta: meta_rc.clone(),
-            cleaner: cleaner.clone(),
-            indexer: index_builder.clone(),
-            undo_log: undo_log.clone(),
-            txn_manager: None,
-            rpc: rpc_server.clone(),
-            consh: conshasing.clone(),
-            membership: membership_client.clone(),
-            raft_client: raft_client.clone(),
-            neb_client: neb_client.clone(),
-        });
+        let transaction_runtime = Arc::new(DatabaseRuntime::new(
+            group_name,
+            database_name,
+            chunks.clone(),
+            meta_rc.clone(),
+            cleaner.clone(),
+            index_builder.clone(),
+            undo_log.clone(),
+            None,
+            rpc_server.clone(),
+            conshasing.clone(),
+            membership_client.clone(),
+            raft_client.clone(),
+            neb_client.clone(),
+        ));
 
         if opts.services.contains(&Service::Transaction) {
             transaction_manager = Some(
@@ -509,21 +542,21 @@ impl NebServer {
             );
         }
 
-        let database_runtime = Arc::new(DatabaseRuntime {
-            group_name: group_name.clone(),
-            database_name: database_name.to_string(),
-            chunks: chunks.clone(),
-            meta: meta_rc.clone(),
+        let database_runtime = Arc::new(DatabaseRuntime::new(
+            group_name,
+            database_name,
+            chunks.clone(),
+            meta_rc.clone(),
             cleaner,
-            indexer: index_builder.clone(),
-            undo_log: undo_log.clone(),
-            txn_manager: transaction_manager.clone(),
-            rpc: rpc_server.clone(),
-            consh: conshasing.clone(),
-            membership: membership_client.clone(),
-            raft_client: raft_client.clone(),
-            neb_client: neb_client.clone(),
-        });
+            index_builder.clone(),
+            undo_log.clone(),
+            transaction_manager.clone(),
+            rpc_server.clone(),
+            conshasing.clone(),
+            membership_client.clone(),
+            raft_client.clone(),
+            neb_client.clone(),
+        ));
 
         let server = Arc::new(NebServer {
             database_runtime: database_runtime.clone(),
