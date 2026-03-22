@@ -113,8 +113,6 @@ pub struct DatabaseRuntime {
 
 pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
-    pub chunks: Arc<Chunks>,
-    pub meta: Arc<ServerMeta>,
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
     pub membership: Arc<ObserverClient>,
@@ -123,13 +121,9 @@ pub struct NebServer {
     pub raft_service: Arc<raft::RaftService>,
     pub raft_client: Arc<RaftClient>,
     pub server_id: u64,
-    pub cleaner: Arc<Cleaner>,
-    pub indexer: Option<Arc<IndexBuilder>>,
     pub group_name: String,
     pub database_name: String,
     pub neb_client: Arc<AsyncClient>,
-    pub undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
-    pub txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
 }
 
 pub async fn init_conshash(
@@ -448,8 +442,6 @@ impl NebServer {
 
         let server = Arc::new(NebServer {
             database_runtime: database_runtime.clone(),
-            chunks,
-            meta: meta_rc,
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),
             membership: membership_client.clone(),
@@ -458,13 +450,9 @@ impl NebServer {
             raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
             txn_peer: txn_peer,
-            cleaner: database_runtime.cleaner.clone(),
-            indexer: database_runtime.indexer.clone(),
             group_name: group_name.clone(),
             database_name: database_name.to_string(),
             neb_client: neb_client.clone(),
-            undo_log: database_runtime.undo_log.clone(),
-            txn_manager: database_runtime.txn_manager.clone(),
         });
         let servs = proc_services(&opts.services);
         for service in servs {

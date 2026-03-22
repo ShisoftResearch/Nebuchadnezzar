@@ -1944,8 +1944,7 @@ mod tests {
 
         // Get the indexer from the server
         let indexer = server
-            .indexer
-            .as_ref()
+            .indexer()
             .and_then(|ib| ib.clients.fulltext_indexer())
             .expect("Indexer should be available");
 
@@ -2053,8 +2052,7 @@ mod tests {
 
         // Get the indexer from the server
         let indexer = server
-            .indexer
-            .as_ref()
+            .indexer()
             .and_then(|ib| ib.clients.fulltext_indexer())
             .expect("Indexer should be available");
 
@@ -2133,8 +2131,7 @@ mod tests {
 
         // Get the indexer from the server
         let indexer = server
-            .indexer
-            .as_ref()
+            .indexer()
             .and_then(|ib| ib.clients.fulltext_indexer())
             .expect("Indexer should be available");
 
@@ -2218,8 +2215,7 @@ mod tests {
 
         // Get the indexer from the server
         let indexer = server
-            .indexer
-            .as_ref()
+            .indexer()
             .and_then(|ib| ib.clients.fulltext_indexer())
             .expect("Indexer should be available");
 
@@ -3226,11 +3222,11 @@ mod tests {
 
         // Register inverted index schemas
         server1
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(inverted_segment_schema());
         server1
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
@@ -3314,11 +3310,11 @@ mod tests {
 
         server2.meta().schemas.debug_only_new_schema(schema.clone());
         server2
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(inverted_segment_schema());
         server2
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
         tokio::time::sleep(Duration::from_millis(1000)).await;

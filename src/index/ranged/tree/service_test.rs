@@ -1101,7 +1101,8 @@ mod test {
                 schema_id,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(), QueryOrdering::Asc,
+                Expr::nothing(),
+                QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -1165,7 +1166,7 @@ mod test {
         // Re-register the schema after recovery (schemas are recovered from Raft but need to be loaded into cache)
         println!("Re-registering schema...");
         server_recovered
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(schema.clone());
 
@@ -1211,7 +1212,8 @@ mod test {
                 schema_id,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(), QueryOrdering::Asc,
+                Expr::nothing(),
+                QueryOrdering::Asc,
             )
             .await
             .unwrap();
