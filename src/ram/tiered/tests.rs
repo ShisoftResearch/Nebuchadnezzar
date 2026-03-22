@@ -550,7 +550,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         schema.is_dynamic,
         schema.is_scannable,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     info!("Server started, schema created");
 
@@ -648,7 +648,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     );
 
     // Check tiered memory stats
-    for chunk in &server.chunks.list {
+    for chunk in &server.chunks().list {
         if let Some(ref manager) = chunk.tiered_manager {
             let stats = manager.stats(chunk);
             info!("After insert - Hot: {} segments ({} MB), Cold: {} segments ({} MB), Total: {} segments",
@@ -782,7 +782,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         let id = all_ids[i];
         let expected = success_counters[i].load(AtomicOrdering::Relaxed);
 
-        match server.chunks.read_cell(&id) {
+        match server.chunks().read_cell(&id) {
             Ok(cell) => {
                 let actual = *cell.data["score"].u64().unwrap();
                 if actual != expected {
@@ -815,7 +815,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     );
 
     // Final tiered memory stats
-    for chunk in &server.chunks.list {
+    for chunk in &server.chunks().list {
         if let Some(ref manager) = chunk.tiered_manager {
             let stats = manager.stats(chunk);
             info!("Final stats - Hot: {} segments ({} MB), Cold: {} segments ({} MB), Total: {} segments",
@@ -896,7 +896,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
         schema.is_dynamic,
         schema.is_scannable,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Initialize 2000 cells (reduced from 10000 for faster test)
     info!("Initializing 2000 cells");
@@ -1037,7 +1037,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     for i in (0..ids.len()).step_by(ids.len() / 100) {
         let id = ids[i];
         let expected = success_counters[i].load(AtomicOrdering::Relaxed);
-        if let Ok(cell) = server.chunks.read_cell(&id) {
+        if let Ok(cell) = server.chunks().read_cell(&id) {
             let actual = *cell.data["score"].u64().unwrap();
             assert_eq!(actual, expected, "Mismatch at key {}", i);
             verified += 1;
@@ -1108,7 +1108,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
         false,
     );
 
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Initialize cells in batches (single-threaded setup)
     info!("Initializing 10,000 cells directly");
@@ -1130,7 +1130,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
 
             let mut cell = OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(m));
 
-            match server.chunks.write_cell(&mut cell) {
+            match server.chunks().write_cell(&mut cell) {
                 Ok(_) => ids.push(id),
                 Err(e) => {
                     error!("Failed to write cell {}: {:?}", i, e);
@@ -1150,7 +1150,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
     let success_counters: Arc<Vec<AtomicU64>> =
         Arc::new((0..num_keys).map(|_| AtomicU64::new(0)).collect());
 
-    let chunks = server.chunks.clone();
+    let chunks = server.chunks().clone();
     let start_time = std::time::Instant::now();
     let mut handles = Vec::new();
 
@@ -1256,7 +1256,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
 
     // Trigger GC
     use crate::ram::cleaner::Cleaner;
-    let _ = Cleaner::clean(&server.chunks.list[0], true, true);
+    let _ = Cleaner::clean(&server.chunks().list[0], true, true);
 
     info!("GC complete, verifying data");
 
@@ -1268,7 +1268,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
     for i in (0..ids.len()).step_by(ids.len() / 100) {
         let id = ids[i];
         let expected = success_counters[i].load(AtomicOrdering::Relaxed);
-        if let Ok(cell) = server.chunks.read_cell(&id) {
+        if let Ok(cell) = server.chunks().read_cell(&id) {
             let owned_cell = cell.to_owned();
             if let Some(actual) = owned_cell.data["score"].u64() {
                 // Without transactions, concurrent updates can cause lost updates
@@ -1311,7 +1311,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
 
     // Cleanup
     // Stop cleaner explicitly before dropping server to ensure background tasks stop
-    server.cleaner.stop();
+    server.cleaner().stop();
 
     // Wait for cleaner to fully stop
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -1391,11 +1391,11 @@ async fn test_direct_writes_with_tiered_memory() {
         false,
     );
 
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Start cleaner (this triggers eviction/promotion automatically)
     use crate::ram::cleaner::Cleaner;
-    let cleaner = Cleaner::new_and_start(server.chunks.clone());
+    let cleaner = Cleaner::new_and_start(server.chunks().clone());
     info!("Cleaner started");
 
     // Initialize cells in batches (single-threaded setup)
@@ -1418,7 +1418,7 @@ async fn test_direct_writes_with_tiered_memory() {
 
             let mut cell = OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(m));
 
-            match server.chunks.write_cell(&mut cell) {
+            match server.chunks().write_cell(&mut cell) {
                 Ok(_) => ids.push(id),
                 Err(e) => {
                     error!("Failed to write cell {}: {:?}", i, e);
@@ -1438,7 +1438,7 @@ async fn test_direct_writes_with_tiered_memory() {
     let success_counters: Arc<Vec<AtomicU64>> =
         Arc::new((0..num_keys).map(|_| AtomicU64::new(0)).collect());
 
-    let chunks = server.chunks.clone();
+    let chunks = server.chunks().clone();
     let start_time = std::time::Instant::now();
     let mut handles = Vec::new();
 
@@ -1561,7 +1561,7 @@ async fn test_direct_writes_with_tiered_memory() {
 
     // Trigger GC with timeout
     let gc_result = tokio::task::spawn_blocking({
-        let chunks = server.chunks.clone();
+        let chunks = server.chunks().clone();
         move || {
             let _ = Cleaner::clean(&chunks.list[0], true, true);
         }
@@ -1597,7 +1597,7 @@ async fn test_direct_writes_with_tiered_memory() {
         // Retry reading in case of segment lookup errors (cleaner may have moved cells)
         let mut cell_result = None;
         for _retry in 0..3 {
-            match server.chunks.read_cell(&id) {
+            match server.chunks().read_cell(&id) {
                 Ok(cell) => {
                     cell_result = Some(cell.to_owned());
                     break;
@@ -1660,7 +1660,7 @@ async fn test_direct_writes_with_tiered_memory() {
 
     // Cleanup
     // Stop cleaner explicitly before dropping server
-    server.cleaner.stop();
+    server.cleaner().stop();
 
     // Wait for cleaner to fully stop
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
