@@ -14,7 +14,6 @@ use log::error;
 
 use crate::ram::cell::ReadError;
 use crate::ram::types::Id;
-use crate::server::NebServer;
 use std::sync::Arc;
 
 use super::rpc::{
@@ -383,10 +382,10 @@ impl CoordinatorBuilder {
         self
     }
 
-    pub fn from_server(server: &Arc<NebServer>) -> Self {
+    pub fn from_parts(conshash: Arc<ConsistentHashing>, client_pool: Arc<ClientPool>) -> Self {
         Self {
-            conshash: Some(server.consh.clone()),
-            client_pool: Some(server.member_pool.clone()),
+            conshash: Some(conshash),
+            client_pool: Some(client_pool),
         }
     }
 

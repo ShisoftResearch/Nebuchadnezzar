@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::server::NebServer;
+use crate::server::ServerMeta;
 
 use super::{planner::ValueRange, statistics::SchemaStatistics};
 
@@ -54,7 +54,7 @@ impl Default for CostResult {
 fn row_bytes(
     schema: u32,
     projection: &Vec<u64>,
-    server: &Arc<NebServer>,
+    meta: &Arc<ServerMeta>,
     stat: &Arc<SchemaStatistics>,
 ) -> Option<usize> {
     if projection.is_empty() {
@@ -63,11 +63,6 @@ fn row_bytes(
         }
         Some(((stat.bytes as f64) / (stat.count as f64)) as usize)
     } else {
-        Some(
-            server
-                .meta()
-                .schemas
-                .fields_size(&schema, projection.as_slice())?,
-        )
+        Some(meta.schemas.fields_size(&schema, projection.as_slice())?)
     }
 }
