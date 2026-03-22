@@ -102,7 +102,17 @@ pub struct ServerMeta {
     pub schemas: LocalSchemasCache,
 }
 
+pub struct DatabaseRuntime {
+    pub chunks: Arc<Chunks>,
+    pub meta: Arc<ServerMeta>,
+    pub cleaner: Arc<Cleaner>,
+    pub indexer: Option<Arc<IndexBuilder>>,
+    pub undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
+    pub txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
+}
+
 pub struct NebServer {
+    pub database_runtime: Arc<DatabaseRuntime>,
     pub chunks: Arc<Chunks>,
     pub meta: Arc<ServerMeta>,
     pub rpc: Arc<rpc::Server>,
@@ -113,7 +123,7 @@ pub struct NebServer {
     pub raft_service: Arc<raft::RaftService>,
     pub raft_client: Arc<RaftClient>,
     pub server_id: u64,
-    pub cleaner: Cleaner,
+    pub cleaner: Arc<Cleaner>,
     pub indexer: Option<Arc<IndexBuilder>>,
     pub group_name: String,
     pub database_name: String,
@@ -146,6 +156,34 @@ pub async fn init_conshash(
 }
 
 impl NebServer {
+    pub fn database_runtime(&self) -> &DatabaseRuntime {
+        self.database_runtime.as_ref()
+    }
+
+    pub fn chunks(&self) -> &Arc<Chunks> {
+        &self.database_runtime.chunks
+    }
+
+    pub fn meta(&self) -> &Arc<ServerMeta> {
+        &self.database_runtime.meta
+    }
+
+    pub fn cleaner(&self) -> &Arc<Cleaner> {
+        &self.database_runtime.cleaner
+    }
+
+    pub fn indexer(&self) -> Option<&Arc<IndexBuilder>> {
+        self.database_runtime.indexer.as_ref()
+    }
+
+    pub fn undo_log(&self) -> Option<&Arc<transactions::undo_log::UndoLogger>> {
+        self.database_runtime.undo_log.as_ref()
+    }
+
+    pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
+        self.database_runtime.txn_manager.as_ref()
+    }
+
     /// Gracefully shutdown the server, flushing all data to disk
     pub async fn shutdown(&self) {
         info!("Starting graceful server shutdown");
@@ -155,7 +193,7 @@ impl NebServer {
         // before we flush LSM trees, otherwise the flush will have incomplete data!
         // This fixes the bug where index tasks spawned on different threads were lost.
         info!("Waiting for all pending index tasks to complete...");
-        if self.indexer.is_some() {
+        if self.indexer().is_some() {
             use crate::index::builder::IndexBuilder;
             let _ = IndexBuilder::await_all_indices().await;
             info!("All pending index tasks completed");
@@ -203,14 +241,14 @@ impl NebServer {
         // Step 1.5: Ensure all WAL data is synced to disk
         // This is critical after LSM flush to ensure root cells and new pages are persisted
         info!("Syncing WAL for all chunks...");
-        self.chunks.sync_all();
+        self.chunks().sync_all();
         info!("WAL sync completed");
 
         // Step 1.6: Archive all dirty segments to backup storage
         // This ensures all in-memory data (including LSM B-Tree pages) is written to backup files
         // Recovery reads from backup files, not WAL, so this is critical for proper recovery
         info!("Archiving all dirty segments to backup storage...");
-        self.chunks.archive_all();
+        self.chunks().archive_all();
         info!("Segment archiving completed");
 
         // Step 2: Shutdown Raft (triggers backup creation)
@@ -368,9 +406,9 @@ impl NebServer {
         // interference/hangs during recovery. It must be explicitly resumed later.
         let cleaner = if opts.enable_recovery {
             debug!("Recovery enabled: Starting cleaner in PAUSED state");
-            Cleaner::new_paused(chunks.clone())
+            Arc::new(Cleaner::new_paused(chunks.clone()))
         } else {
-            Cleaner::new_and_start(chunks.clone())
+            Arc::new(Cleaner::new_and_start(chunks.clone()))
         };
         let mut transaction_manager = None;
         let member_pool = Arc::new(rpc::ClientPool::new());
@@ -391,9 +429,18 @@ impl NebServer {
             );
         }
 
-        let server = Arc::new(NebServer {
-            chunks,
+        let database_runtime = Arc::new(DatabaseRuntime {
+            chunks: chunks.clone(),
+            meta: meta_rc.clone(),
             cleaner,
+            indexer: index_builder.clone(),
+            undo_log: undo_log.clone(),
+            txn_manager: transaction_manager.clone(),
+        });
+
+        let server = Arc::new(NebServer {
+            database_runtime: database_runtime.clone(),
+            chunks,
             meta: meta_rc,
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),
@@ -403,12 +450,13 @@ impl NebServer {
             raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
             txn_peer: txn_peer,
-            indexer: index_builder,
+            cleaner: database_runtime.cleaner.clone(),
+            indexer: database_runtime.indexer.clone(),
             group_name: group_name.clone(),
             database_name: database_name.to_string(),
             neb_client: neb_client.clone(),
-            undo_log,
-            txn_manager: transaction_manager.clone(),
+            undo_log: database_runtime.undo_log.clone(),
+            txn_manager: database_runtime.txn_manager.clone(),
         });
         let servs = proc_services(&opts.services);
         for service in servs {
@@ -691,7 +739,7 @@ impl NebServer {
     }
     pub fn indexed_data_client(&self) -> IndexedDataClient {
         // Use server's indexer clients if available (for BM25 search support)
-        if let Some(ref index_builder) = self.indexer {
+        if let Some(index_builder) = self.indexer() {
             IndexedDataClient::new_with_indexers(index_builder.clients.clone(), self.consh.clone())
         } else {
             IndexedDataClient::new(&self.neb_client, &self.consh, &self.raft_client)

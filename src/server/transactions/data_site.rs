@@ -138,12 +138,12 @@ impl DataManager {
         });
 
         // Spawn undo log trimming task if undo log is enabled
-        if server.undo_log.is_some() {
+        if server.undo_log().is_some() {
             let server_clone = server.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(300)).await; // Trim every 5 minutes
-                    if let Some(ref undo_log) = server_clone.undo_log {
+                    if let Some(undo_log) = server_clone.undo_log() {
                         if let Err(e) = undo_log.trim_old_logs() {
                             error!("Failed to trim undo logs: {:?}", e);
                         } else {

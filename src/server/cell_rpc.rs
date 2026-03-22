@@ -44,12 +44,12 @@ pub struct NebRPCService {
 
 impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
-        future::ready(self.server.chunks.read_cell(&key).map(|c| c.to_owned())).boxed()
+        future::ready(self.server.chunks().read_cell(&key).map(|c| c.to_owned())).boxed()
     }
     fn read_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         future::ready(
             keys.into_iter()
-                .map(|id| self.server.chunks.read_cell(&id).map(|c| c.to_owned()))
+                .map(|id| self.server.chunks().read_cell(&id).map(|c| c.to_owned()))
                 .collect(),
         )
         .boxed()
@@ -64,7 +64,7 @@ impl Service for NebRPCService {
             keys.into_iter()
                 .map(|id| {
                     self.server
-                        .chunks
+                        .chunks()
                         .read_selected(&id, colums.as_slice(), need_header)
                         .map(|c| c.to_owned())
                 })
@@ -80,27 +80,27 @@ impl Service for NebRPCService {
     ) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
         future::ready(
             self.server
-                .chunks
+                .chunks()
                 .read_selected(&id, fields.as_slice(), need_header)
                 .map(|c| c.to_owned()),
         )
         .boxed()
     }
     fn head_cell(&self, key: Id) -> BoxFuture<'_, Result<CellHeader, ReadError>> {
-        future::ready(self.server.chunks.head_cell(&key)).boxed()
+        future::ready(self.server.chunks().head_cell(&key)).boxed()
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.server.chunks.write_cell(&mut cell))
+        self.with_indices_ensured(self.server.chunks().write_cell(&mut cell))
     }
 
     fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.server.chunks.update_cell(&mut cell))
+        self.with_indices_ensured(self.server.chunks().update_cell(&mut cell))
     }
     fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
-        self.with_indices_ensured(self.server.chunks.remove_cell(&key))
+        self.with_indices_ensured(self.server.chunks().remove_cell(&key))
     }
     fn upsert_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.server.chunks.upsert_cell(&mut cell))
+        self.with_indices_ensured(self.server.chunks().upsert_cell(&mut cell))
     }
     fn compare_version_and_update_cell(
         &self,
@@ -110,7 +110,7 @@ impl Service for NebRPCService {
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(
             self.server
-                .chunks
+                .chunks()
                 .compare_version_and_update_cell(&key, version, &mut cell),
         )
     }
@@ -123,12 +123,12 @@ impl Service for NebRPCService {
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(
             self.server
-                .chunks
+                .chunks()
                 .compare_version_and_set_field(&key, version, field, value),
         )
     }
     fn count(&self) -> BoxFuture<'_, u64> {
-        future::ready(self.server.chunks.count() as u64).boxed()
+        future::ready(self.server.chunks().count() as u64).boxed()
     }
 
     fn read_all_cells_proced(
@@ -159,10 +159,10 @@ impl Service for NebRPCService {
         let mut cells: Vec<Result<OwnedCell, ReadError>> = Vec::with_capacity(keys.len());
         for id in keys.iter() {
             let cell_res = if colums.is_empty() {
-                self.server.chunks.read_cell(id)
+                self.server.chunks().read_cell(id)
             } else {
                 self.server
-                    .chunks
+                    .chunks()
                     .read_selected(id, colums.as_slice(), true)
             };
             let owned = cell_res.and_then(|cell| {
