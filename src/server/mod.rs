@@ -642,8 +642,13 @@ impl NebServer {
 
         // Register inverted index RPC service if indexing is enabled
         if opts.index_enabled {
-            init_inverted_index_rpc_service(rpc_server, server.database_runtime.indexer.clone())
-                .await;
+            init_inverted_index_rpc_service(
+                rpc_server,
+                database_runtime.group_name(),
+                database_runtime.database_name(),
+                server.database_runtime.indexer.clone(),
+            )
+            .await;
         }
 
         Ok(server)
@@ -992,13 +997,23 @@ pub async fn init_txn_data_site_service(
 
 pub async fn init_inverted_index_rpc_service(
     rpc_server: &Arc<Server>,
+    group_name: &str,
+    database_name: &str,
     index_builder: Option<Arc<IndexBuilder>>,
 ) {
     if let Some(index_builder) = index_builder.as_ref() {
         if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
             use crate::index::full_text::rpc::InvertedIndexRPCService;
             let service = InvertedIndexRPCService::new(inverted_indexer.clone());
-            rpc_server.register_service(&service).await;
+            rpc_server
+                .register_service_with_id(
+                    crate::index::full_text::rpc::generate_scoped_service_id(
+                        group_name,
+                        database_name,
+                    ),
+                    &service,
+                )
+                .await;
             info!("Registered inverted index RPC service");
         }
     }

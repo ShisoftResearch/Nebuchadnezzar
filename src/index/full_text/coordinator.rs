@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use bifrost::conshash::ConsistentHashing;
-use bifrost::rpc::{ClientPool, RPCClient, RPCError};
+use bifrost::rpc::{ClientPool, RPCClient, RPCError, ServiceClient};
 use futures::future::join_all;
 use log::error;
 
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use super::rpc::{
     AsyncServiceClient, FieldStatsRequest, FieldStatsResponse, InvertedIndexError,
     InvertedSearchRequest, InvertedSearchResponse, TermPostingsRequest, TermPostingsResponse,
-    DEFAULT_SERVICE_ID,
+    generate_scoped_service_id,
 };
 use super::{bm25_score, compute_idf, tokenize_query, BM25Hit};
 
@@ -30,13 +30,22 @@ use super::{bm25_score, compute_idf, tokenize_query, BM25Hit};
 pub struct DistributedInvertedIndexCoordinator {
     conshash: Arc<ConsistentHashing>,
     client_pool: Arc<ClientPool>,
+    group_name: String,
+    database_name: String,
 }
 
 impl DistributedInvertedIndexCoordinator {
-    pub fn new(conshash: Arc<ConsistentHashing>, client_pool: Arc<ClientPool>) -> Self {
+    pub fn new(
+        conshash: Arc<ConsistentHashing>,
+        client_pool: Arc<ClientPool>,
+        group_name: impl Into<String>,
+        database_name: impl Into<String>,
+    ) -> Self {
         Self {
             conshash,
             client_pool,
+            group_name: group_name.into(),
+            database_name: database_name.into(),
         }
     }
 
@@ -65,7 +74,8 @@ impl DistributedInvertedIndexCoordinator {
             .map_err(|e| RPCError::IOError(e))?;
 
         // Create the async service client using helper function
-        let service_client = client_by_rpc_client(&rpc_client);
+        let service_client =
+            client_by_rpc_client(&rpc_client, &self.group_name, &self.database_name);
 
         Ok(service_client)
     }
@@ -343,25 +353,33 @@ impl DistributedInvertedIndexCoordinator {
 /// Similar to the pattern used in ranged indexer  
 /// Note: The macro generates AsyncServiceClient but may not generate ::new
 /// We'll use ServiceClientWithId directly - it returns Arc already
-fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<AsyncServiceClient> {
-    use bifrost::rpc::ServiceClientWithId;
-    // ServiceClientWithId::new returns Arc<ServiceClientWithId<InvertedIndexRPCService>>
-    // AsyncServiceClient should be a type alias for ServiceClientWithId<InvertedIndexRPCService>
-    ServiceClientWithId::new(rpc)
+fn client_by_rpc_client(
+    rpc: &Arc<RPCClient>,
+    group_name: &str,
+    database_name: &str,
+) -> Arc<AsyncServiceClient> {
+    AsyncServiceClient::new_with_service_id(
+        generate_scoped_service_id(group_name, database_name),
+        rpc,
+    )
 }
 
 /// Helper function to create a coordinator from server components
 pub async fn create_coordinator_from_server(
     conshash: Arc<ConsistentHashing>,
     client_pool: Arc<ClientPool>,
+    group_name: impl Into<String>,
+    database_name: impl Into<String>,
 ) -> DistributedInvertedIndexCoordinator {
-    DistributedInvertedIndexCoordinator::new(conshash, client_pool)
+    DistributedInvertedIndexCoordinator::new(conshash, client_pool, group_name, database_name)
 }
 
 /// Builder for creating a coordinator instance
 pub struct CoordinatorBuilder {
     conshash: Option<Arc<ConsistentHashing>>,
     client_pool: Option<Arc<ClientPool>>,
+    group_name: Option<String>,
+    database_name: Option<String>,
 }
 
 impl CoordinatorBuilder {
@@ -369,6 +387,8 @@ impl CoordinatorBuilder {
         Self {
             conshash: None,
             client_pool: None,
+            group_name: None,
+            database_name: None,
         }
     }
 
@@ -382,10 +402,22 @@ impl CoordinatorBuilder {
         self
     }
 
+    pub fn with_database_scope(
+        mut self,
+        group_name: impl Into<String>,
+        database_name: impl Into<String>,
+    ) -> Self {
+        self.group_name = Some(group_name.into());
+        self.database_name = Some(database_name.into());
+        self
+    }
+
     pub fn from_parts(conshash: Arc<ConsistentHashing>, client_pool: Arc<ClientPool>) -> Self {
         Self {
             conshash: Some(conshash),
             client_pool: Some(client_pool),
+            group_name: None,
+            database_name: None,
         }
     }
 
@@ -400,6 +432,8 @@ impl CoordinatorBuilder {
         Ok(DistributedInvertedIndexCoordinator::new(
             conshash,
             client_pool,
+            self.group_name.unwrap_or_default(),
+            self.database_name.unwrap_or_default(),
         ))
     }
 }
@@ -594,6 +628,8 @@ mod tests {
         let coord1 = DistributedInvertedIndexCoordinator::new(
             shard1.consh.clone(),
             shard1.member_pool.clone(),
+            shard1.database_runtime().group_name(),
+            shard1.database_name(),
         );
 
         let stats1 = coord1
@@ -617,6 +653,8 @@ mod tests {
         let coord2 = DistributedInvertedIndexCoordinator::new(
             shard2.consh.clone(),
             shard2.member_pool.clone(),
+            shard2.database_runtime().group_name(),
+            shard2.database_name(),
         );
 
         let stats2 = coord2
@@ -786,6 +824,8 @@ mod tests {
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
         );
 
         // Search
@@ -828,6 +868,8 @@ mod tests {
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
         );
 
         // Empty query should return empty results

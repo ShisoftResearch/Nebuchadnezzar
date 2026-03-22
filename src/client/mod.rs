@@ -543,7 +543,11 @@ impl AsyncClient {
     /// let hits = ft.search(schema_id, field_id, "rust programming", 10).await?;
     /// ```
     pub fn full_text(&self) -> FullTextClient {
-        FullTextClient::new(self.conshash.clone())
+        FullTextClient::new_for_database(
+            self.conshash.clone(),
+            self.group_name(),
+            self.database_name(),
+        )
     }
 
     /// Get a ranged index query client

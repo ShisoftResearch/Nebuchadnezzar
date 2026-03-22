@@ -2400,6 +2400,8 @@ mod tests {
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
         );
 
         // Verify field statistics using coordinator
@@ -2566,6 +2568,8 @@ mod tests {
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
         );
 
         // Verify initial indexing
@@ -2971,6 +2975,8 @@ mod tests {
         let coordinator1 = DistributedInvertedIndexCoordinator::new(
             server1.consh.clone(),
             server1.member_pool.clone(),
+            server1.database_runtime().group_name(),
+            server1.database_name(),
         );
 
         let stats1 = coordinator1
@@ -3053,6 +3059,8 @@ mod tests {
         let coordinator2 = DistributedInvertedIndexCoordinator::new(
             server2.consh.clone(),
             server2.member_pool.clone(),
+            server2.database_runtime().group_name(),
+            server2.database_name(),
         );
 
         // Stats should be recovered (loaded on-demand from disk)
@@ -3324,6 +3332,8 @@ mod tests {
         let coordinator2 = DistributedInvertedIndexCoordinator::new(
             server2.consh.clone(),
             server2.member_pool.clone(),
+            server2.database_runtime().group_name(),
+            server2.database_name(),
         );
 
         let stats_before = coordinator2
