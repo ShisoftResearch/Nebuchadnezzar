@@ -136,6 +136,8 @@ pub async fn resolves_bound_database_runtime_by_name() {
         .database(database_name)
         .expect("database runtime should be registered under its database name");
     assert!(Arc::ptr_eq(&looked_up_runtime, &server.database_runtime));
+    assert!(Arc::ptr_eq(&server.current_database(), &server.database_runtime));
+    assert_eq!(server.database_names(), vec![database_name.to_string()]);
     assert_eq!(looked_up_runtime.database_name(), database_name);
     assert_eq!(looked_up_runtime.group_name(), "database_runtime_lookup_group");
     let _ = looked_up_runtime

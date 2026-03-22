@@ -168,6 +168,10 @@ impl DatabaseRuntime {
         &self.meta
     }
 
+    pub fn schemas(&self) -> &LocalSchemasCache {
+        &self.meta.schemas
+    }
+
     pub fn cleaner(&self) -> &Arc<Cleaner> {
         &self.cleaner
     }
@@ -254,32 +258,43 @@ impl NebServer {
             .and_then(|runtimes| runtimes.get(database_name).cloned())
     }
 
+    pub fn current_database(&self) -> Arc<DatabaseRuntime> {
+        self.database_runtime.clone()
+    }
+
+    pub fn database_names(&self) -> Vec<String> {
+        self.database_runtimes
+            .read()
+            .map(|runtimes| runtimes.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn database_runtime(&self) -> &DatabaseRuntime {
         self.database_runtime.as_ref()
     }
 
     pub fn chunks(&self) -> &Arc<Chunks> {
-        &self.database_runtime.chunks
+        self.database_runtime.chunks()
     }
 
     pub fn meta(&self) -> &Arc<ServerMeta> {
-        &self.database_runtime.meta
+        self.database_runtime.meta()
     }
 
     pub fn cleaner(&self) -> &Arc<Cleaner> {
-        &self.database_runtime.cleaner
+        self.database_runtime.cleaner()
     }
 
     pub fn indexer(&self) -> Option<&Arc<IndexBuilder>> {
-        self.database_runtime.indexer.as_ref()
+        self.database_runtime.indexer()
     }
 
     pub fn undo_log(&self) -> Option<&Arc<transactions::undo_log::UndoLogger>> {
-        self.database_runtime.undo_log.as_ref()
+        self.database_runtime.undo_log()
     }
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
-        self.database_runtime.txn_manager.as_ref()
+        self.database_runtime.txn_manager()
     }
 
     /// Gracefully shutdown the server, flushing all data to disk

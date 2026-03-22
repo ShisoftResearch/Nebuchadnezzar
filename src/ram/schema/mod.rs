@@ -710,7 +710,7 @@ pub async fn post_schema_add(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    if let Some(indexer) = database_runtime.indexer.as_ref() {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -722,7 +722,7 @@ pub async fn post_schema_add(
                     }
                 }
                 IndexType::Embedding(model) => {
-                    if let Some(indexer) = database_runtime.indexer.as_ref() {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -743,7 +743,7 @@ pub async fn post_schema_add(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    if let Some(indexer) = database_runtime.indexer.as_ref() {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -755,7 +755,7 @@ pub async fn post_schema_add(
                     }
                 }
                 IndexType::Embedding(model) => {
-                    if let Some(indexer) = database_runtime.indexer.as_ref() {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -783,7 +783,7 @@ pub async fn post_schema_delete(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(_config) => {
-                    if let Some(indexer) = database_runtime.indexer.as_ref() {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -795,7 +795,7 @@ pub async fn post_schema_delete(
                     }
                 }
                 IndexType::Embedding(_model) => {
-                    if let Some(indexer) = database_runtime.indexer.as_ref() {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -816,7 +816,7 @@ pub async fn post_schema_delete(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(_config) => {
-                    if let Some(indexer) = database_runtime.indexer.as_ref() {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -828,7 +828,7 @@ pub async fn post_schema_delete(
                     }
                 }
                 IndexType::Embedding(_model) => {
-                    if let Some(indexer) = database_runtime.indexer.as_ref() {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client

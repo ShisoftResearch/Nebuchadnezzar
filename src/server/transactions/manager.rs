@@ -48,7 +48,7 @@ impl TransactionManagerDeps {
     }
 
     pub fn schemas(&self) -> &crate::ram::schema::LocalSchemasCache {
-        &self.database_runtime.meta.schemas
+        self.database_runtime.schemas()
     }
 }
 
