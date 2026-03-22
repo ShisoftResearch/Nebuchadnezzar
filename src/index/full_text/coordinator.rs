@@ -17,9 +17,9 @@ use crate::ram::types::Id;
 use std::sync::Arc;
 
 use super::rpc::{
-    AsyncServiceClient, FieldStatsRequest, FieldStatsResponse, InvertedIndexError,
-    InvertedSearchRequest, InvertedSearchResponse, TermPostingsRequest, TermPostingsResponse,
-    generate_scoped_service_id,
+    generate_scoped_service_id, AsyncServiceClient, FieldStatsRequest, FieldStatsResponse,
+    InvertedIndexError, InvertedSearchRequest, InvertedSearchResponse, TermPostingsRequest,
+    TermPostingsResponse,
 };
 use super::{bm25_score, compute_idf, tokenize_query, BM25Hit};
 

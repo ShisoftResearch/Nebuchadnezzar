@@ -3,7 +3,9 @@ use std::io;
 use bifrost::rpc::RPCError;
 use dovahkiin::expr::serde::Expr;
 
-use crate::query::planner::{IndexedClausePlan, IndexedPredicatePlan, build_indexed_predicate_plan};
+use crate::query::planner::{
+    build_indexed_predicate_plan, IndexedClausePlan, IndexedPredicatePlan,
+};
 
 use super::IndexedDataClient;
 

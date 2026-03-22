@@ -1,19 +1,24 @@
 use std::io;
 
 use bifrost::rpc::RPCError;
-use dovahkiin::{ahash::HashMap, types::{Id, OwnedValue}};
+use dovahkiin::{
+    ahash::HashMap,
+    types::{Id, OwnedValue},
+};
 use itertools::Itertools;
 
 use crate::{
     index::{
-        embedding::EmbeddingHit, full_text::BM25Hit, hash::get_null_hash_id, vector::VectorHit,
-        ranged::tree::btree::Ordering,
+        embedding::EmbeddingHit, full_text::BM25Hit, hash::get_null_hash_id,
+        ranged::tree::btree::Ordering, vector::VectorHit,
     },
     query::planner::{IndexedClausePlan, IndexedDisjunctPlan, IndexedPredicatePlan},
 };
 
 use super::{
-    ids::{clause_execution_order, intersect_ids_ordered, sort_ids_by_query_order, union_ids_ordered},
+    ids::{
+        clause_execution_order, intersect_ids_ordered, sort_ids_by_query_order, union_ids_ordered,
+    },
     sort::range_index_order_for_range,
     IndexedDataClient, QueryHitTable, QueryHitType, QueryOrdering, ValueRange,
 };
@@ -148,7 +153,10 @@ impl IndexedDataClient {
             let Some(first) = candidates.next() else {
                 return Ok(vec![]);
             };
-            let mut candidate_ids = match self.execute_clause_ids(schema, first, ordering, hit_table).await {
+            let mut candidate_ids = match self
+                .execute_clause_ids(schema, first, ordering, hit_table)
+                .await
+            {
                 Ok(ids) => ids,
                 Err(e) => {
                     if Self::is_special_clause(first) {
@@ -159,7 +167,10 @@ impl IndexedDataClient {
             };
 
             for candidate in candidates {
-                let ids = match self.execute_clause_ids(schema, candidate, ordering, hit_table).await {
+                let ids = match self
+                    .execute_clause_ids(schema, candidate, ordering, hit_table)
+                    .await
+                {
                     Ok(ids) => ids,
                     Err(e) => {
                         if Self::is_special_clause(candidate) {

@@ -522,17 +522,15 @@ impl TransactionManager {
     ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
         if !self.data_sites.contains_key(&server_id) {
             let client = self.deps.get_member_by_server_id(server_id).await?;
-            return Ok(self
-                .data_sites
-                .get_or_insert(server_id, || {
-                    data_site::AsyncServiceClient::new_with_service_id(
-                        data_site::generate_scoped_service_id(
-                            self.deps.database_runtime.group_name(),
-                            self.deps.database_runtime.database_name(),
-                        ),
-                        &client,
-                    )
-                }));
+            return Ok(self.data_sites.get_or_insert(server_id, || {
+                data_site::AsyncServiceClient::new_with_service_id(
+                    data_site::generate_scoped_service_id(
+                        self.deps.database_runtime.group_name(),
+                        self.deps.database_runtime.database_name(),
+                    ),
+                    &client,
+                )
+            }));
         }
         self.data_sites.get(&server_id).ok_or(io::Error::new(
             io::ErrorKind::NotFound,

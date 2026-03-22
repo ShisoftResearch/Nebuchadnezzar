@@ -1045,10 +1045,7 @@ fn conjunction_expr(clauses: &[Expr]) -> Expr {
 }
 
 fn negate_expr(expr: Expr) -> Expr {
-    Expr::List(vec![
-        Expr::Symbol(hash_str("not"), "not".to_string()),
-        expr,
-    ])
+    Expr::List(vec![Expr::Symbol(hash_str("not"), "not".to_string()), expr])
 }
 
 fn negate_comparison_expr(expr: &Expr) -> Option<Expr> {
@@ -1074,7 +1071,11 @@ fn negate_null_check_expr(expr: &Expr) -> Option<Expr> {
     let (is_not_null, field_id) = null_check_clause(expr)?;
     let field_name = expr_unary_field_name(expr)?;
     Some(unary_field_expr(
-        if is_not_null { "is-null" } else { "is-not-null" },
+        if is_not_null {
+            "is-null"
+        } else {
+            "is-not-null"
+        },
         field_id,
         field_name,
     ))

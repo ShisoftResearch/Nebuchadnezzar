@@ -273,7 +273,8 @@ impl MasterTreeSM {
         self.tree
             .insert(min_entry_key(), TreePlacement::new(genesis_id));
 
-        if let Err(e) = self.locate_tree_server(&genesis_id)
+        if let Err(e) = self
+            .locate_tree_server(&genesis_id)
             .await
             .unwrap()
             .crate_tree(
@@ -421,9 +422,7 @@ impl MasterTreeSM {
                 .map_err(|e| RPCError::IOError(e))
                 .map(|rpc| LSMServiceClient::new_with_service_id(self.tree_service_id, &rpc))
         } else {
-            Err(RPCError::RequestError(
-                bifrost::rpc::RPCRequestError::Other,
-            ))
+            Err(RPCError::RequestError(bifrost::rpc::RPCRequestError::Other))
         }
     }
 }
@@ -655,10 +654,7 @@ mod tests {
 
     #[test]
     fn scoped_sm_id_differs_across_databases() {
-        assert_eq!(
-            generate_scoped_sm_id("group_a", "group_a"),
-            DEFAULT_SM_ID
-        );
+        assert_eq!(generate_scoped_sm_id("group_a", "group_a"), DEFAULT_SM_ID);
         assert_ne!(
             generate_scoped_sm_id("group_a", "db_a"),
             generate_scoped_sm_id("group_a", "db_b")

@@ -50,11 +50,12 @@ impl IndexedDataClient {
                 for (id, cell_res) in id_list.into_iter().zip(cells) {
                     match cell_res {
                         Ok(cell) => {
-                            let feature = if matches!(cell[field_id], dovahkiin::types::OwnedValue::Null) {
-                                None
-                            } else {
-                                Some(cell[field_id].feature())
-                            };
+                            let feature =
+                                if matches!(cell[field_id], dovahkiin::types::OwnedValue::Null) {
+                                    None
+                                } else {
+                                    Some(cell[field_id].feature())
+                                };
                             feature_by_id.insert(id, feature);
                         }
                         Err(e) => {

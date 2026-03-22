@@ -21,10 +21,7 @@ use bifrost_plugins::hash_ident;
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 
 pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
-    hash_str(&format!(
-        "NEB_CELL_RPC_SERVICE-{}-{}",
-        group, database_name
-    ))
+    hash_str(&format!("NEB_CELL_RPC_SERVICE-{}-{}", group, database_name))
 }
 
 service! {
