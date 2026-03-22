@@ -111,6 +111,32 @@ pub struct DatabaseRuntime {
     pub txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
 }
 
+impl DatabaseRuntime {
+    pub fn chunks(&self) -> &Arc<Chunks> {
+        &self.chunks
+    }
+
+    pub fn meta(&self) -> &Arc<ServerMeta> {
+        &self.meta
+    }
+
+    pub fn cleaner(&self) -> &Arc<Cleaner> {
+        &self.cleaner
+    }
+
+    pub fn indexer(&self) -> Option<&Arc<IndexBuilder>> {
+        self.indexer.as_ref()
+    }
+
+    pub fn undo_log(&self) -> Option<&Arc<transactions::undo_log::UndoLogger>> {
+        self.undo_log.as_ref()
+    }
+
+    pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
+        self.txn_manager.as_ref()
+    }
+}
+
 pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
     pub rpc: Arc<rpc::Server>,

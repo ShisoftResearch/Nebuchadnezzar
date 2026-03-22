@@ -16,7 +16,7 @@ impl CostFunction for RangeIndexCost {
         range: Option<&ValueRange>,
         projection: Vec<u64>,
     ) -> Option<CostResult> {
-        let stat = self.database_runtime.chunks.overall_statistics(schema);
+        let stat = self.database_runtime.chunks().overall_statistics(schema);
         let field = field?;
         let field_histo = stat.histogram.get(&field)?;
         let num_all_rows = stat.count;
@@ -26,7 +26,7 @@ impl CostFunction for RangeIndexCost {
         let width = end_index.saturating_sub(start_index);
         let ratio = (width as f64) / (field_histo.len() as f64);
         let row_count = (ratio * (num_all_rows as f64)) as usize;
-        let row_bytes = row_bytes(schema, &projection, &self.database_runtime.meta, &stat)?;
+        let row_bytes = row_bytes(schema, &projection, self.database_runtime.meta(), &stat)?;
         Some(CostResult {
             row_count,
             row_bytes,

@@ -219,12 +219,12 @@ impl DataManager {
 
     #[inline]
     fn chunks(&self) -> &Arc<crate::ram::chunk::Chunks> {
-        &self.database_runtime.chunks
+        self.database_runtime.chunks()
     }
 
     #[inline]
     fn undo_log(&self) -> Option<&Arc<super::undo_log::UndoLogger>> {
-        self.database_runtime.undo_log.as_ref()
+        self.database_runtime.undo_log()
     }
 
     /// Create a segment reference guard to prevent eviction during transaction.

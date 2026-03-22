@@ -16,9 +16,9 @@ impl CostFunction for ScanIndexCost {
         _range: Option<&ValueRange>,
         projection: Vec<u64>,
     ) -> Option<CostResult> {
-        let stat = self.database_runtime.chunks.overall_statistics(schema);
+        let stat = self.database_runtime.chunks().overall_statistics(schema);
         let row_count = stat.count;
-        let row_bytes = row_bytes(schema, &projection, &self.database_runtime.meta, &stat)?;
+        let row_bytes = row_bytes(schema, &projection, self.database_runtime.meta(), &stat)?;
         Some(CostResult {
             row_count,
             row_bytes,
