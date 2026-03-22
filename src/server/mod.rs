@@ -798,7 +798,10 @@ impl Peer {
 
 pub async fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server
-        .register_service(&cell_rpc::NebRPCService::new(&neb_server))
+        .register_service(&cell_rpc::NebRPCService::new(
+            neb_server.database_runtime.clone(),
+            neb_server.neb_client.clone(),
+        ))
         .await;
 }
 
@@ -823,7 +826,10 @@ pub async fn init_txn_manager(
 }
 pub async fn init_txn_data_site_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server
-        .register_service(&transactions::data_site::DataManager::new(&neb_server))
+        .register_service(&transactions::data_site::DataManager::new(
+            neb_server.database_runtime.clone(),
+            neb_server.txn_peer.clone(),
+        ))
         .await;
 }
 

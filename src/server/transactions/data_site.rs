@@ -2,7 +2,7 @@ use super::*;
 use crate::ram::cell::{header_from_chunk_raw, OwnedCellRef};
 use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
-use crate::server::{DatabaseRuntime, NebServer, Peer};
+use crate::server::{DatabaseRuntime, Peer};
 use crate::{
     index::builder::IndexBuilder,
     ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
@@ -117,15 +117,15 @@ dispatch_rpc_service_functions!(DataManager);
 service_with_id!(DataManager, DEFAULT_SERVICE_ID);
 
 impl DataManager {
-    pub fn new(server: &Arc<NebServer>) -> Arc<Self> {
+    pub fn new(database_runtime: Arc<DatabaseRuntime>, txn_peer: Peer) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             cells: LFMap::with_capacity(256),
             txns: LFMap::with_capacity(128),
             cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
-            database_runtime: server.database_runtime.clone(),
-            txn_peer: server.txn_peer.clone(),
+            database_runtime,
+            txn_peer,
             cleanup_signal: cleanup_signal.clone(),
         });
         let manager_clone = manager.clone();
@@ -140,12 +140,12 @@ impl DataManager {
         });
 
         // Spawn undo log trimming task if undo log is enabled
-        if server.undo_log().is_some() {
-            let server_clone = server.clone();
+        if manager.undo_log().is_some() {
+            let manager_clone = manager.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(300)).await; // Trim every 5 minutes
-                    if let Some(undo_log) = server_clone.undo_log() {
+                    if let Some(undo_log) = manager_clone.undo_log() {
                         if let Err(e) = undo_log.trim_old_logs() {
                             error!("Failed to trim undo logs: {:?}", e);
                         } else {

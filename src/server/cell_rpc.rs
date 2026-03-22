@@ -1,7 +1,7 @@
 use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete};
 use crate::ram::types::Id;
-use crate::server::{DatabaseRuntime, NebServer};
+use crate::server::DatabaseRuntime;
 use crate::{
     client::AsyncClient,
     index::builder::IndexBuilder,
@@ -272,10 +272,13 @@ impl Service for NebRPCService {
 dispatch_rpc_service_functions!(NebRPCService);
 
 impl NebRPCService {
-    pub fn new(server: &Arc<NebServer>) -> Arc<NebRPCService> {
+    pub fn new(
+        database_runtime: Arc<DatabaseRuntime>,
+        neb_client: Arc<AsyncClient>,
+    ) -> Arc<NebRPCService> {
         Arc::new(NebRPCService {
-            database_runtime: server.database_runtime.clone(),
-            neb_client: server.neb_client.clone(),
+            database_runtime,
+            neb_client,
         })
     }
     fn with_indices_ensured<'a, R>(&'a self, res: R) -> BoxFuture<'a, R>
