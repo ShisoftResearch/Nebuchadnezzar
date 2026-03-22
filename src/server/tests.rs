@@ -136,10 +136,16 @@ pub async fn resolves_bound_database_runtime_by_name() {
         .database(database_name)
         .expect("database runtime should be registered under its database name");
     assert!(Arc::ptr_eq(&looked_up_runtime, &server.database_runtime));
-    assert!(Arc::ptr_eq(&server.current_database(), &server.database_runtime));
+    assert!(Arc::ptr_eq(
+        &server.current_database(),
+        &server.database_runtime
+    ));
     assert_eq!(server.database_names(), vec![database_name.to_string()]);
     assert_eq!(looked_up_runtime.database_name(), database_name);
-    assert_eq!(looked_up_runtime.group_name(), "database_runtime_lookup_group");
+    assert_eq!(
+        looked_up_runtime.group_name(),
+        "database_runtime_lookup_group"
+    );
     let _ = looked_up_runtime
         .data_client(&vec![String::from("127.0.0.1:5102")])
         .await
@@ -209,7 +215,9 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
     );
 
     let names = server.database_names();
-    assert!(names.iter().any(|name| name == "dynamic_database_runtime_group"));
+    assert!(names
+        .iter()
+        .any(|name| name == "dynamic_database_runtime_group"));
     assert!(names.iter().any(|name| name == "analytics"));
 
     let analytics_client = analytics_runtime
@@ -223,6 +231,60 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
         .await
         .expect("database runtime creation should be idempotent");
     assert!(Arc::ptr_eq(&analytics_runtime, &analytics_runtime_again));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+pub async fn unload_database_runtime_evicts_non_default_runtime() {
+    let _ = env_logger::try_init();
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 1,
+            total_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction, Service::RangedIndexer],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5104"),
+        "runtime_unload_group",
+        async |_| {},
+    )
+    .await;
+
+    let analytics_runtime = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("database runtime should be created before unload");
+    assert!(server.database("analytics").is_some());
+
+    assert!(
+        server.unload_database_runtime("analytics").await,
+        "unload should return true for a registered non-default runtime"
+    );
+    assert!(
+        server.database("analytics").is_none(),
+        "runtime should be removed from the registry after unload"
+    );
+    assert!(
+        !server.unload_database_runtime("runtime_unload_group").await,
+        "default runtime must not be unloaded"
+    );
+
+    let analytics_runtime_reloaded = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("database runtime should be recreated after unload");
+    assert!(
+        !Arc::ptr_eq(&analytics_runtime, &analytics_runtime_reloaded),
+        "reloaded runtime should be a fresh Arc after unload"
+    );
 
     server.shutdown().await;
 }

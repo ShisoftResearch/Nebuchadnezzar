@@ -196,10 +196,7 @@ impl DatabaseRuntime {
         }
     }
 
-    pub async fn data_client(
-        &self,
-        members: &Vec<String>,
-    ) -> Result<AsyncClient, NebClientError> {
+    pub async fn data_client(&self, members: &Vec<String>) -> Result<AsyncClient, NebClientError> {
         AsyncClient::new_for_database(
             &self.rpc,
             &self.membership,
@@ -337,8 +334,7 @@ impl NebServer {
 
         let index_builder = if effective_opts.index_enabled {
             Some(Arc::new(
-                IndexBuilder::new(&neb_client, conshasing, raft_client, rpc_server.server_id)
-                    .await,
+                IndexBuilder::new(&neb_client, conshasing, raft_client, rpc_server.server_id).await,
             ))
         } else {
             None
@@ -555,6 +551,65 @@ impl NebServer {
             .insert(database_name.to_string(), database_runtime.clone());
 
         Ok(database_runtime)
+    }
+
+    pub async fn unload_database_runtime(&self, database_name: &str) -> bool {
+        if database_name == self.database_name() {
+            return false;
+        }
+
+        let runtime = self
+            .database_runtimes
+            .write()
+            .expect("database runtime registry lock poisoned")
+            .remove(database_name);
+
+        let Some(runtime) = runtime else {
+            return false;
+        };
+
+        if runtime.indexer().is_some() {
+            let _ = IndexBuilder::await_all_indices().await;
+        }
+
+        runtime.cleaner().stop();
+
+        self.rpc
+            .remove_service(cell_rpc::generate_scoped_service_id(
+                runtime.group_name(),
+                runtime.database_name(),
+            ))
+            .await;
+
+        self.rpc
+            .remove_service(transactions::manager::generate_scoped_service_id(
+                runtime.group_name(),
+                runtime.database_name(),
+            ))
+            .await;
+
+        self.rpc
+            .remove_service(transactions::data_site::generate_scoped_service_id(
+                runtime.group_name(),
+                runtime.database_name(),
+            ))
+            .await;
+
+        self.rpc
+            .remove_service(ranged::tree::service::generate_scoped_service_id(
+                runtime.group_name(),
+                runtime.database_name(),
+            ))
+            .await;
+
+        self.rpc
+            .remove_service(crate::index::full_text::rpc::generate_scoped_service_id(
+                runtime.group_name(),
+                runtime.database_name(),
+            ))
+            .await;
+
+        true
     }
 
     pub fn database_names(&self) -> Vec<String> {
@@ -1146,7 +1201,9 @@ pub async fn init_ranged_indexer_service(
     rpc_server
         .register_service_with_id(
             ranged::tree::service::generate_scoped_service_id(group_name, database_name),
-            &Arc::new(ranged::tree::service::TreeService::new(neb_client, &sm_client)),
+            &Arc::new(ranged::tree::service::TreeService::new(
+                neb_client, &sm_client,
+            )),
         )
         .await;
 
