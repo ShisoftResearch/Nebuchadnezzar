@@ -37,7 +37,7 @@ pub async fn workspace_wr() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_id = txn.begin().await.unwrap().unwrap();
     let mut data_map = OwnedMap::new();
@@ -180,7 +180,7 @@ pub async fn data_site_wr() {
         true,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_id = txn.begin().await.unwrap().unwrap();
     let mut data_map = OwnedMap::new();
@@ -234,7 +234,7 @@ pub async fn data_site_wr() {
         TxnExecResult::Accepted(()) => {}
         _ => panic!("Wrong feedback {:?}", cell_1_w_res),
     }
-    assert!(server.chunks.read_cell(&cell_1.id()).is_err()); // isolation test
+    assert!(server.chunks().read_cell(&cell_1.id()).is_err()); // isolation test
     assert_eq!(
         txn.prepare(txn_id.to_owned()).await.unwrap().unwrap(),
         TMPrepareResult::Success
@@ -243,7 +243,7 @@ pub async fn data_site_wr() {
         txn.commit(txn_id.to_owned()).await.unwrap().unwrap(),
         EndResult::Success
     );
-    let cell_r2 = server.chunks.read_cell(&cell_1.id()).unwrap();
+    let cell_r2 = server.chunks().read_cell(&cell_1.id()).unwrap();
     assert_eq!(cell_r2.id(), cell_1.id());
     assert_eq!(cell_r2.data["id"].i64().unwrap(), &100);
     assert_eq!(cell_r2.data["name"].string().unwrap(), "Jack");
@@ -280,7 +280,7 @@ pub async fn multi_transaction() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_1_id = txn.begin().await.unwrap().unwrap();
     let txn_2_id = txn.begin().await.unwrap().unwrap();
@@ -389,7 +389,7 @@ pub async fn smoke_rw() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let mut data_map_1 = OwnedMap::new();
     data_map_1.insert(&String::from("id"), OwnedValue::I64(100));
@@ -400,7 +400,7 @@ pub async fn smoke_rw() {
     );
     let mut cell_1 =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
-    server.chunks.write_cell(&mut cell_1).unwrap();
+    server.chunks().write_cell(&mut cell_1).unwrap();
     let cell_id = cell_1.id();
     let thread_count = 200;
     let mut futs: Vec<_> = Vec::with_capacity(thread_count);

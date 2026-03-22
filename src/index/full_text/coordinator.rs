@@ -505,8 +505,8 @@ mod tests {
             false,
         );
 
-        shard1.meta.schemas.debug_only_new_schema(schema.clone());
-        shard2.meta.schemas.debug_only_new_schema(schema.clone());
+        shard1.meta().schemas.debug_only_new_schema(schema.clone());
+        shard2.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find documents owned by each shard
         let mut shard1_docs = Vec::new();
@@ -556,9 +556,9 @@ mod tests {
         let mut cell2 =
             OwnedCell::new_with_id(schema_id, &shard1_docs[1], OwnedValue::Map(cell2_data));
 
-        shard1.chunks.write_cell(&mut cell1).unwrap();
-        shard1.chunks.write_cell(&mut cell2).unwrap();
-        if let Some(ref ib) = shard1.indexer {
+        shard1.chunks().write_cell(&mut cell1).unwrap();
+        shard1.chunks().write_cell(&mut cell2).unwrap();
+        if let Some(ib) = shard1.indexer() {
             ib.ensure_indices(&cell1, &schema, None);
             ib.ensure_indices(&cell2, &schema, None);
         }
@@ -580,9 +580,9 @@ mod tests {
         let mut cell4 =
             OwnedCell::new_with_id(schema_id, &shard2_docs[1], OwnedValue::Map(cell4_data));
 
-        shard2.chunks.write_cell(&mut cell3).unwrap();
-        shard2.chunks.write_cell(&mut cell4).unwrap();
-        if let Some(ref ib) = shard2.indexer {
+        shard2.chunks().write_cell(&mut cell3).unwrap();
+        shard2.chunks().write_cell(&mut cell4).unwrap();
+        if let Some(ib) = shard2.indexer() {
             ib.ensure_indices(&cell3, &schema, None);
             ib.ensure_indices(&cell4, &schema, None);
         }
@@ -749,7 +749,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find owned document
         let mut doc_id = None;
@@ -775,8 +775,8 @@ mod tests {
         );
         let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
-        server.chunks.write_cell(&mut cell).unwrap();
-        if let Some(ref index_builder) = server.indexer {
+        server.chunks().write_cell(&mut cell).unwrap();
+        if let Some(index_builder) = server.indexer() {
             index_builder.ensure_indices(&cell, &schema, None);
         }
 
