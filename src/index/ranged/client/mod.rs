@@ -20,6 +20,8 @@ pub mod cursor;
 pub struct RangedIndexerClient {
     conshash: Arc<ConsistentHashing>,
     sm: Arc<SMClient>,
+    group_name: String,
+    database_name: String,
     placement: RwLock<BTreeMap<EntryKey, (TreePlacement, EntryKey)>>,
 }
 
@@ -29,6 +31,8 @@ impl RangedIndexerClient {
         Self {
             conshash: conshash.clone(),
             sm: Arc::new(sm),
+            group_name: String::new(),
+            database_name: String::new(),
             placement: RwLock::new(BTreeMap::new()),
         }
     }
@@ -44,6 +48,8 @@ impl RangedIndexerClient {
         Self {
             conshash: conshash.clone(),
             sm: Arc::new(sm),
+            group_name: group_name.to_string(),
+            database_name: database_name.to_string(),
             placement: RwLock::new(BTreeMap::new()),
         }
     }
@@ -122,7 +128,13 @@ impl RangedIndexerClient {
         let mut res = vec![];
         for tree_placement in self.placement.read().values().map(|(id, _)| id) {
             let tree_id = tree_placement.id;
-            let tree_client = locate_tree_server_from_conshash(&tree_id, &self.conshash).await?;
+            let tree_client = locate_tree_server_from_conshash(
+                &tree_id,
+                &self.conshash,
+                &self.group_name,
+                &self.database_name,
+            )
+            .await?;
             match tree_client.stat(tree_id).await? {
                 OpResult::Successful(stat_res) => {
                     res.push(stat_res);
@@ -217,8 +229,13 @@ impl RangedIndexerClient {
             );
         }
         let (lower, tree_placement, upper) = tree_prop.unwrap();
-        let tree_client =
-            locate_tree_server_from_conshash(&tree_placement.id, &self.conshash).await?;
+        let tree_client = locate_tree_server_from_conshash(
+            &tree_placement.id,
+            &self.conshash,
+            &self.group_name,
+            &self.database_name,
+        )
+        .await?;
         Ok((tree_placement, tree_client, lower, upper))
     }
 

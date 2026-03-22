@@ -7,6 +7,7 @@ use crate::client::AsyncClient;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
 use bifrost::conshash::ConsistentHashing;
+use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -18,6 +19,17 @@ use std::time::Duration;
 
 pub type IdBlock = [Id; MIGRATE_SIZE]; // Fixed size for ID arrays (not related to tree node size)
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(RANGED_TREE_RPC_SERVICE) as u64;
+
+pub fn generate_scoped_service_id(group_name: &str, database_name: &str) -> u64 {
+    if group_name == database_name || group_name.is_empty() || database_name.is_empty() {
+        DEFAULT_SERVICE_ID
+    } else {
+        hash_str(&format!(
+            "RANGED_TREE_RPC_SERVICE-{}-{}",
+            group_name, database_name
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Boundary {
@@ -638,20 +650,29 @@ dispatch_rpc_service_functions!(TreeService);
 unsafe impl Send for DistTree {}
 unsafe impl Sync for DistTree {}
 
-pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<AsyncServiceClient> {
-    AsyncServiceClient::new(rpc)
+pub fn client_by_rpc_client(
+    rpc: &Arc<RPCClient>,
+    group_name: &str,
+    database_name: &str,
+) -> Arc<AsyncServiceClient> {
+    AsyncServiceClient::new_with_service_id(
+        generate_scoped_service_id(group_name, database_name),
+        rpc,
+    )
 }
 
 pub async fn locate_tree_server_from_conshash(
     id: &Id,
     conshash: &Arc<ConsistentHashing>,
+    group_name: &str,
+    database_name: &str,
 ) -> Result<Arc<AsyncServiceClient>, RPCError> {
     if let Some(server_id) = conshash.get_server_id_by(id) {
         DEFAULT_CLIENT_POOL
             .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
             .await
             .map_err(|e| RPCError::IOError(e))
-            .map(|c| client_by_rpc_client(&c))
+            .map(|c| client_by_rpc_client(&c, group_name, database_name))
     } else {
         Err(RPCError::RequestError(RPCRequestError::Other))
     }

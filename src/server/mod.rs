@@ -383,7 +383,13 @@ impl NebServer {
     ) -> Result<Arc<ranged::tree::service::AsyncServiceClient>, bifrost::rpc::RPCError> {
         // Use a dummy ID to locate the local LSM tree service via consistent hashing
         let dummy_id = Id::new(0, 1);
-        ranged::tree::service::locate_tree_server_from_conshash(&dummy_id, &self.consh).await
+        ranged::tree::service::locate_tree_server_from_conshash(
+            &dummy_id,
+            &self.consh,
+            &self.group_name,
+            &self.database_name,
+        )
+        .await
     }
 
     pub async fn new(
@@ -1023,15 +1029,17 @@ pub async fn init_ranged_indexer_service(
         raft_client,
     ));
     rpc_server
-        .register_service(&Arc::new(ranged::tree::service::TreeService::new(
-            neb_client, &sm_client,
-        )))
+        .register_service_with_id(
+            ranged::tree::service::generate_scoped_service_id(group_name, database_name),
+            &Arc::new(ranged::tree::service::TreeService::new(neb_client, &sm_client)),
+        )
         .await;
 
     // Create MasterTreeSM with persistence support
     let persistence_path = tree_persistence_path.map(PathBuf::from);
     let mut tree_sm = ranged::sm::MasterTreeSM::new_with_id_and_persistence(
         ranged::sm::generate_scoped_sm_id(group_name, database_name),
+        ranged::tree::service::generate_scoped_service_id(group_name, database_name),
         raft_svr,
         cons_hash,
         persistence_path,

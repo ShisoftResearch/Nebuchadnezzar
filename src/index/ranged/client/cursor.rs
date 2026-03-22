@@ -137,7 +137,13 @@ impl ClientCursor {
                     current_key, tree, tree_key, self.range.ordering
                 );
                 let tree_client =
-                    locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
+                    locate_tree_server_from_conshash(
+                        &tree.id,
+                        &self.query_client.conshash,
+                        &self.query_client.group_name,
+                        &self.query_client.database_name,
+                    )
+                    .await?;
                 let range = Range {
                     start: RangeTerm::Inclusive(min_entry_key()),
                     end: RangeTerm::Inclusive(max_entry_key()),
