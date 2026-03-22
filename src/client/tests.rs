@@ -20,8 +20,8 @@ pub async fn database_catalog() {
     let database_name = "testdb_database_catalog";
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -85,8 +85,8 @@ pub async fn general() {
     debug!("Creating new neb server");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -236,8 +236,8 @@ pub async fn multi_cell_update() {
     let server_addr = String::from("127.0.0.1:5401");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -335,8 +335,8 @@ pub async fn write_skew() {
     let server_addr = String::from("127.0.0.1:5402");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -435,8 +435,8 @@ pub async fn server_isolation() {
 
     let server_1 = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -464,8 +464,8 @@ pub async fn server_isolation() {
 
     let server_2 = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

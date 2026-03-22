@@ -2039,8 +2039,8 @@ async fn create_alignment_test_server(port: u16) -> Arc<NebServer> {
     let server_group = format!("sqlite_alignment_test_{port}");
     NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

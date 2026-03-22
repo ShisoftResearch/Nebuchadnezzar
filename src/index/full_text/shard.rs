@@ -1286,8 +1286,8 @@ mod tests {
         // Use a full NebServer for proper AsyncClient setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1408,8 +1408,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1572,8 +1572,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1771,8 +1771,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1922,8 +1922,8 @@ mod tests {
         // Use a full NebServer for proper setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2030,8 +2030,8 @@ mod tests {
         // Use a full NebServer for proper setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2109,8 +2109,8 @@ mod tests {
         // Use a full NebServer for proper setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2193,8 +2193,8 @@ mod tests {
         // Use a full NebServer for proper setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 2, // Multiple chunks to test per-chunk behavior
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 32 * 1024 * 1024, // Multiple chunks to test per-chunk behavior
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2270,8 +2270,8 @@ mod tests {
         let group_name = "e2e_indexing_test";
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024, // 64MB
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024, // 64MB
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2478,8 +2478,8 @@ mod tests {
             Duration::from_secs(30),
             crate::server::NebServer::new_from_opts(
                 &crate::server::ServerOptions {
-                    chunk_count: 1,
-                    total_size: 64 * 1024 * 1024,
+                    chunk_size: 64 * 1024 * 1024,
+                    db_size: 64 * 1024 * 1024,
                     tiered_config: None,
                     backup_storage: None,
                     wal_storage: None,
@@ -2695,8 +2695,8 @@ mod tests {
         info!("Phase 1: Creating initial server...");
         let server1 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024, // 64MB
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024, // 64MB
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3014,8 +3014,8 @@ mod tests {
         info!("Phase 2: Creating server with recovery enabled...");
         let server2 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024, // 64MB
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024, // 64MB
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3186,8 +3186,8 @@ mod tests {
         info!("Phase 1: Creating initial server and indexing documents...");
         let server1 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3296,8 +3296,8 @@ mod tests {
         info!("Phase 2: Recovering server and adding new documents...");
         let server2 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3419,8 +3419,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

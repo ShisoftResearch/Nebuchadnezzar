@@ -3,29 +3,29 @@ use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::tiered::eviction::evict_segment;
 use crate::ram::tiered::promotion::promote_segment;
-use crate::ram::tiered::TieredConfig;
+use crate::ram::tiered::SharedMemoryPool;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Manages tiered memory for a chunk
+/// Manages tiered memory for a single chunk.
 ///
-/// Coordinates eviction of hot segments to cold storage and promotion of cold segments
-/// back to hot storage based on access patterns and memory pressure.
+/// All chunks across all databases share one `SharedMemoryPool` whose stripe
+/// counter is indexed by the calling thread's CPU ID — zero cross-chunk
+/// contention on the hot path, no per-chunk registration required.
+///
+/// `last_known_count` tracks how many hot segments this chunk last reported to
+/// the pool so that the periodic reconciliation scan can apply a signed delta
+/// rather than overwriting the global total.
 pub struct TieredMemoryManager {
-    /// Physical memory limit in bytes (hot segments cannot exceed this)
-    /// When hot segment memory usage exceeds this limit, eviction is triggered
-    pub physical_memory_limit: usize,
+    /// Shared server-wide memory budget and CPU-striped counter.
+    shared_pool: Arc<SharedMemoryPool>,
 
-    /// Eviction threshold as percentage of physical memory limit (0.0 to 1.0)
-    /// Default: 0.8 (80%)
-    eviction_threshold_percent: f32,
-
-    /// Lower watermark percentage we evict down to when crossing the threshold
-    lower_watermark_percent: f32,
-
-    /// Cooldown after promotion during which eviction should skip the segment
-    promotion_cooldown_ms: u64,
+    /// Last hot-segment count reported by this chunk to the shared pool.
+    /// Updated only during periodic reconciliation (every 10 s), not on the
+    /// hot path.
+    last_known_count: AtomicUsize,
 
     /// CLOCK eviction policy for victim selection
     clock_policy: ClockEvictionPolicy,
@@ -37,36 +37,28 @@ pub struct TieredMemoryManager {
     /// When true, cold segments remain cold even when accessed
     pub disable_promotion: AtomicBool,
 
-    /// Cached count of hot segments (updated incrementally)
-    /// This avoids scanning all segments on every check
-    cached_hot_count: AtomicUsize,
-
     /// Metrics counters
     promotion_count: AtomicU64,
     eviction_count: AtomicU64,
     churn_count: AtomicU64,
     lower_watermark_evictions: AtomicU64,
 
-    /// Last time we did a full scan to verify the cached count
+    /// Last time we did a full scan to reconcile this chunk's contribution
     last_full_scan: parking_lot::Mutex<Instant>,
 }
 
 impl TieredMemoryManager {
-    /// Create a new tiered memory manager
+    /// Create a new tiered memory manager for a single chunk.
     ///
-    /// # Arguments
-    /// * `physical_memory_limit` - Physical memory limit in bytes for hot segments
-    /// * `eviction_threshold_percent` - Percentage (0.0-1.0) of limit before eviction
-    pub fn new(config: TieredConfig) -> Self {
+    /// `shared_pool` is the server-wide stripe counter shared across all chunks
+    /// and all databases.  A new slot is claimed from the pool here.
+    pub fn new(shared_pool: Arc<SharedMemoryPool>) -> Self {
         TieredMemoryManager {
-            physical_memory_limit: config.physical_memory_limit,
-            eviction_threshold_percent: config.threshold.clamp(0.0, 1.0),
-            lower_watermark_percent: config.lower_watermark.clamp(0.0, 1.0),
-            promotion_cooldown_ms: config.promotion_cooldown_ms,
-            clock_policy: ClockEvictionPolicy::new(config.promotion_cooldown_ms),
+            clock_policy: ClockEvictionPolicy::new(shared_pool.promotion_cooldown_ms),
+            shared_pool,
+            last_known_count: AtomicUsize::new(0),
             enabled: true,
             disable_promotion: AtomicBool::new(false),
-            cached_hot_count: AtomicUsize::new(0),
             last_full_scan: parking_lot::Mutex::new(Instant::now() - Duration::from_secs(100)),
             promotion_count: AtomicU64::new(0),
             eviction_count: AtomicU64::new(0),
@@ -75,25 +67,21 @@ impl TieredMemoryManager {
         }
     }
 
-    /// Get the threshold-adjusted memory limit
-    ///
-    /// This is `physical_memory_limit * eviction_threshold_percent`, the point
-    /// at which eviction will be triggered.
     #[inline]
     pub fn threshold_limit(&self) -> usize {
-        (self.physical_memory_limit as f64 * self.eviction_threshold_percent as f64) as usize
+        self.shared_pool.threshold_limit()
     }
 
     #[inline]
     fn lower_watermark_limit(&self) -> usize {
-        (self.physical_memory_limit as f64 * self.lower_watermark_percent as f64) as usize
+        self.shared_pool.lower_watermark_limit()
     }
 
     #[inline]
     fn hot_memory_bytes(&self, hot_segments_count: usize) -> usize {
         hot_segments_count
             .checked_mul(SEGMENT_SIZE)
-            .unwrap_or_else(|| self.physical_memory_limit * 2)
+            .unwrap_or_else(|| self.shared_pool.physical_memory_limit * 2)
     }
 
     /// Check if eviction is needed and evict segments if necessary (legacy/test-only)
@@ -229,7 +217,7 @@ impl TieredMemoryManager {
                 .checked_add(SEGMENT_SIZE)
                 .unwrap_or_else(|| {
                     warn!("Overflow calculating after-alloc memory");
-                    self.physical_memory_limit * 2 // Force eviction
+                    self.shared_pool.physical_memory_limit * 2 // Force eviction
                 });
 
         // Check if allocating one more segment would exceed the threshold-adjusted limit
@@ -246,8 +234,8 @@ impl TieredMemoryManager {
                 current_hot_memory / (1024 * 1024),
                 after_alloc_memory / (1024 * 1024),
                 threshold_limit / (1024 * 1024),
-                (self.eviction_threshold_percent * 100.0) as u32,
-                self.physical_memory_limit / (1024 * 1024),
+                (self.shared_pool.threshold * 100.0) as u32,
+                self.shared_pool.physical_memory_limit / (1024 * 1024),
                 segments_to_evict
             );
 
@@ -287,12 +275,13 @@ impl TieredMemoryManager {
             let _ = self.evict_down_to_lower(chunk, hot_segments_count)?;
         }
 
-        let churn_candidate = segment.recently_evicted_within(self.promotion_cooldown_ms);
+        let churn_candidate =
+            segment.recently_evicted_within(self.shared_pool.promotion_cooldown_ms);
 
         promote_segment(segment);
         segment.reset_access_count();
 
-        self.cached_hot_count.fetch_add(1, Ordering::Relaxed);
+        self.shared_pool.increment();
         self.promotion_count.fetch_add(1, Ordering::Relaxed);
         if churn_candidate {
             self.churn_count.fetch_add(1, Ordering::Relaxed);
@@ -325,12 +314,12 @@ impl TieredMemoryManager {
         Ok(evicted)
     }
 
-    /// Get hot segment count using cached value with periodic full scans
+    /// Return the server-wide hot segment count, reconciling this chunk's
+    /// contribution via `last_known_count` every 10 seconds to correct drift.
     ///
-    /// This avoids scanning all segments on every check, only doing full scans
-    /// every 10 seconds to verify/update the cached count.
+    /// The returned value is the **global** total across all chunks and
+    /// databases, which is what threshold checks must compare against.
     pub fn hot_count_cached(&self, chunk: &Chunk) -> usize {
-        // Check if we need to do a full scan (every 10 seconds)
         let should_full_scan = if let Some(mut last_scan) = self.last_full_scan.try_lock() {
             if last_scan.elapsed() >= Duration::from_secs(10) {
                 *last_scan = Instant::now();
@@ -339,66 +328,51 @@ impl TieredMemoryManager {
                 false
             }
         } else {
-            // Another thread is doing a full scan, use cached value
             false
         };
 
         if should_full_scan {
-            // Do a full scan and update cache
-            let actual_count = self.count_hot_segments(chunk);
-            self.cached_hot_count.store(actual_count, Ordering::Relaxed);
-            trace!("Full scan updated hot segment count: {}", actual_count);
-            actual_count
-        } else {
-            // Use cached value
-            let count = self.cached_hot_count.load(Ordering::Relaxed);
-            let total_segments = chunk.segments().len();
-            if count == 0 || count > total_segments {
-                let actual_count = self.count_hot_segments(chunk);
-                if count > total_segments {
-                    warn!(
-                        "Cached hot count out of range: cached={}, total_segments={}, recalculated={}",
-                        count,
-                        total_segments,
-                        actual_count
-                    );
-                }
-                self.cached_hot_count.store(actual_count, Ordering::Relaxed);
-                trace!("Full scan updated hot segment count: {}", actual_count);
-                return actual_count;
+            // Scan this chunk's actual hot count and apply a signed delta so the
+            // global total corrects for any drift without touching other chunks.
+            let actual = self.count_hot_segments(chunk);
+            let prev = self.last_known_count.swap(actual, Ordering::Relaxed);
+            let delta = actual as isize - prev as isize;
+            if delta != 0 {
+                self.shared_pool.adjust_delta(delta);
+                trace!("Full scan reconciled: prev={}, actual={}, delta={}", prev, actual, delta);
             }
-            trace!("Using cached hot segment count: {}", count);
-            count
+        } else {
+            // Sanity-check: if last_known_count exceeds this chunk's segment
+            // count something has drifted badly — resync immediately.
+            let known = self.last_known_count.load(Ordering::Relaxed);
+            let total_segments = chunk.segments().len();
+            if known > total_segments {
+                let actual = self.count_hot_segments(chunk);
+                warn!(
+                    "last_known_count out of range: known={}, total_segments={}, recalculated={}",
+                    known, total_segments, actual
+                );
+                let prev = self.last_known_count.swap(actual, Ordering::Relaxed);
+                self.shared_pool.adjust_delta(actual as isize - prev as isize);
+            }
         }
+
+        self.shared_pool.total_hot_segments()
     }
 
-    /// Increment the cached hot segment count
-    /// Called when a new hot segment is created
+    /// Increment the server-wide hot-segment count.
     pub fn increment_hot_count(&self) {
-        self.cached_hot_count.fetch_add(1, Ordering::Relaxed);
+        self.shared_pool.increment();
     }
 
-    /// Decrement the cached hot segment count
-    /// Called when a hot segment is removed or evicted
+    /// Decrement the server-wide hot-segment count by 1.
     pub fn decrement_hot_count(&self) {
         self.decrement_hot_count_by(1);
     }
 
-    /// Decrement the cached hot segment count by N, saturating at zero
+    /// Decrement the server-wide hot-segment count by `by`, saturating at zero.
     fn decrement_hot_count_by(&self, by: usize) {
-        let res =
-            self.cached_hot_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some(current.saturating_sub(by))
-                });
-        if let Ok(previous) = res {
-            if previous < by {
-                warn!(
-                    "Hot count underflow avoided: previous={}, decrement_by={}",
-                    previous, by
-                );
-            }
-        }
+        self.shared_pool.decrement_by(by);
     }
 
     /// Count hot segments in the chunk
@@ -422,12 +396,18 @@ impl TieredMemoryManager {
             total_segments: total,
             hot_segments: hot,
             cold_segments: cold,
-            threshold: (chunk.capacity / SEGMENT_SIZE) as f32 * self.eviction_threshold_percent,
+            threshold: (chunk.capacity / SEGMENT_SIZE) as f32 * self.shared_pool.threshold,
+
             promotions: self.promotion_count.load(Ordering::Relaxed),
             evictions: self.eviction_count.load(Ordering::Relaxed),
             churns: self.churn_count.load(Ordering::Relaxed),
             lower_watermark_evictions: self.lower_watermark_evictions.load(Ordering::Relaxed),
         }
+    }
+
+    /// Access the shared server-wide memory pool.
+    pub fn shared_pool(&self) -> &Arc<SharedMemoryPool> {
+        &self.shared_pool
     }
 
     /// Enable or disable tiered memory
@@ -457,32 +437,44 @@ pub struct TieredMemoryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ram::tiered::TieredConfig;
+
+    fn make_pool(threshold: f32, limit: usize) -> Arc<SharedMemoryPool> {
+        SharedMemoryPool::new(&TieredConfig {
+            threshold,
+            lower_watermark: 0.72,
+            physical_memory_limit: limit,
+            promotion_cooldown_ms: 2000,
+        })
+    }
 
     #[test]
     fn test_manager_creation() {
         let limit = 1024 * 1024 * 1024; // 1GB
-        let manager = TieredMemoryManager::new(TieredConfig::with_threshold(0.8, limit));
+        let pool = make_pool(0.8, limit);
+        let manager = TieredMemoryManager::new(pool.clone());
         assert!(manager.is_enabled());
-        assert_eq!(manager.eviction_threshold_percent, 0.8);
-        assert_eq!(manager.physical_memory_limit, limit);
+        assert_eq!(pool.threshold, 0.8);
+        assert_eq!(pool.physical_memory_limit, limit);
     }
 
     #[test]
     fn test_threshold_clamping() {
         let limit = 1024 * 1024 * 1024; // 1GB
-        let manager = TieredMemoryManager::new(TieredConfig::with_threshold(1.5, limit));
-        assert_eq!(manager.eviction_threshold_percent, 1.0);
+        let pool = make_pool(1.5_f32.clamp(0.0, 1.0), limit);
+        assert_eq!(pool.threshold, 1.0);
 
-        let manager = TieredMemoryManager::new(TieredConfig::with_threshold(-0.5, limit));
-        assert_eq!(manager.eviction_threshold_percent, 0.0);
+        let pool = make_pool((-0.5_f32).clamp(0.0, 1.0), limit);
+        assert_eq!(pool.threshold, 0.0);
     }
 
     #[test]
     fn test_manager_with_memory_limit() {
         let limit = 64 * 1024 * 1024; // 64MB
-        let manager = TieredMemoryManager::new(TieredConfig::with_threshold(0.9, limit));
+        let pool = make_pool(0.9, limit);
+        let manager = TieredMemoryManager::new(pool.clone());
         assert!(manager.is_enabled());
-        assert_eq!(manager.physical_memory_limit, limit);
-        assert_eq!(manager.eviction_threshold_percent, 0.9);
+        assert_eq!(pool.physical_memory_limit, limit);
+        assert_eq!(pool.threshold, 0.9);
     }
 }

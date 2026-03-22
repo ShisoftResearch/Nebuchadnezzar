@@ -82,7 +82,8 @@ fn test_eviction_on_memory_overflow() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env(),
+        crate::ram::tiered::TieredConfig::from_env()
+            .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c)),
     );
 
     // Verify tiered manager is enabled in at least one chunk
@@ -261,7 +262,8 @@ fn test_cold_segment_promotion() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env(),
+        crate::ram::tiered::TieredConfig::from_env()
+            .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c)),
     );
 
     // Write cells
@@ -387,7 +389,8 @@ fn test_metrics_and_churn_counters() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env(),
+        crate::ram::tiered::TieredConfig::from_env()
+            .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c)),
     );
 
     let manager = chunks
@@ -531,8 +534,8 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: virtual_capacity,
+            chunk_size: virtual_capacity,
+            db_size: virtual_capacity,
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
@@ -878,8 +881,8 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024, // Reduced from 256MB
+            chunk_size: 64 * 1024 * 1024, // Reduced from 256MB
+            db_size: 64 * 1024 * 1024,
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
@@ -1091,8 +1094,8 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: chunk_capacity,
+            chunk_size: chunk_capacity,
+            db_size: chunk_capacity,
             tiered_config: None, // No tiered memory
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
@@ -1374,8 +1377,8 @@ async fn test_direct_writes_with_tiered_memory() {
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: chunk_capacity,
+            chunk_size: chunk_capacity,
+            db_size: chunk_capacity,
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),

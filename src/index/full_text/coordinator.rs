@@ -479,8 +479,8 @@ mod tests {
         info!("Creating shard 1...");
         let shard1 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -499,8 +499,8 @@ mod tests {
         info!("Creating shard 2...");
         let shard2 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -750,8 +750,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -848,8 +848,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

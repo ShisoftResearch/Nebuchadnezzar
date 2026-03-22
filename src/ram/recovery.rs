@@ -204,7 +204,7 @@ fn should_recover_as_cold(
     hot_memory_used: &HashMap<usize, usize>,
 ) -> bool {
     if let Some(ref tiered_manager) = chunk.tiered_manager {
-        let physical_limit = tiered_manager.physical_memory_limit;
+        let physical_limit = tiered_manager.shared_pool().physical_memory_limit;
         let chunk_hot_used = hot_memory_used
             .get(&file_info.chunk_id)
             .copied()

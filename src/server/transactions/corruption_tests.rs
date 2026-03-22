@@ -28,8 +28,8 @@ async fn test_rapid_concurrent_updates_same_cell() {
     let server_addr = String::from("127.0.0.1:5300");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -139,8 +139,8 @@ async fn test_varying_size_concurrent_updates() {
     let server_addr = String::from("127.0.0.1:5301");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -238,8 +238,8 @@ async fn test_multi_cell_concurrent_transactions() {
     let server_addr = String::from("127.0.0.1:5302");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 128 * 1024 * 1024,
+            chunk_size: 128 * 1024 * 1024,
+            db_size: 128 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -340,8 +340,8 @@ async fn test_rapid_commit_sequence() {
     let server_addr = String::from("127.0.0.1:5303");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -426,8 +426,8 @@ async fn test_interleaved_prepare_commit() {
     let server_addr = String::from("127.0.0.1:5304");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -528,8 +528,8 @@ async fn test_maximum_concurrency_stress() {
     let server_addr = String::from("127.0.0.1:5305");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 128 * 1024 * 1024,
+            chunk_size: 128 * 1024 * 1024,
+            db_size: 128 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -638,8 +638,8 @@ async fn test_wikidata_import_scenario() {
     let server_addr = String::from("127.0.0.1:5306");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,                // Multiple chunks like production
-            total_size: 512 * 1024 * 1024, // Larger memory pool
+            chunk_size: 128 * 1024 * 1024, // Multiple chunks like production
+            db_size: 512 * 1024 * 1024, // Larger memory pool
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -763,8 +763,8 @@ async fn test_update_cell_by_stress() {
     let group_name = "test_update_cell_by_stress";
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

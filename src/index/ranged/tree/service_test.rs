@@ -512,8 +512,8 @@ mod test {
         let server_addr = String::from("127.0.0.1:5610");
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -769,8 +769,8 @@ mod test {
         let server_addr = String::from("127.0.0.1:5611");
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -986,8 +986,8 @@ mod test {
         // Create initial server with ranged indexer and persistent storage
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: Some(backup_dir.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_dir.to_str().unwrap().to_string()),
@@ -1146,8 +1146,8 @@ mod test {
         println!("Recovery server will use address: {}", server_addr);
         let server_recovered = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: Some(backup_dir.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_dir.to_str().unwrap().to_string()),

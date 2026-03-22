@@ -22,8 +22,8 @@ pub async fn workspace_wr() {
     let server_addr = String::from("127.0.0.1:5200");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE,
+            chunk_size: SEGMENT_SIZE,
+            db_size: SEGMENT_SIZE,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -165,8 +165,8 @@ pub async fn data_site_wr() {
     let server_addr = String::from("127.0.0.1:5201");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -265,8 +265,8 @@ pub async fn multi_transaction() {
     let server_addr = String::from("127.0.0.1:5202");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -374,8 +374,8 @@ pub async fn smoke_rw() {
     let server_addr = String::from("127.0.0.1:5203");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

@@ -267,7 +267,7 @@ impl Chunk {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        tiered_config: Option<crate::ram::tiered::TieredConfig>,
+        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
     ) -> Chunk {
         // Call new_with_base with base_addr=0 to use old allocation behavior
         Self::new_with_base(
@@ -278,7 +278,7 @@ impl Chunk {
             index_builder,
             backup_storage,
             wal_storage,
-            tiered_config,
+            shared_pool,
         )
     }
 
@@ -290,7 +290,7 @@ impl Chunk {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        tiered_config: Option<crate::ram::tiered::TieredConfig>,
+        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -318,15 +318,15 @@ impl Chunk {
             }
         };
         assert!(
-            !(base_addr == 0 && tiered_config.is_some()),
+            !(base_addr == 0 && shared_pool.is_some()),
             "Should not enable tiered memory if the memory is not allocated by Chunks"
         );
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = SegmentList::new(num_segs);
         let index = WordMap::with_capacity(64);
         // Create tiered memory manager if enabled
-        let tiered_manager = tiered_config
-            .map(|config| crate::ram::tiered::manager::TieredMemoryManager::new(config));
+        let tiered_manager = shared_pool
+            .map(|pool| crate::ram::tiered::manager::TieredMemoryManager::new(pool));
 
         let chunk = Chunk {
             id,
@@ -1293,7 +1293,7 @@ impl Chunks {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        tiered_config: Option<crate::ram::tiered::TieredConfig>,
+        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
     ) -> Arc<Chunks> {
         Self::new_with_recovery(
             count,
@@ -1302,7 +1302,7 @@ impl Chunks {
             index_builder,
             backup_storage,
             wal_storage,
-            tiered_config,
+            shared_pool,
             false,
             None,
         )
@@ -1315,7 +1315,7 @@ impl Chunks {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        tiered_config: Option<crate::ram::tiered::TieredConfig>,
+        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
         enable_recovery: bool,
         raft_storage: Option<String>,
     ) -> Arc<Chunks> {
@@ -1367,33 +1367,12 @@ impl Chunks {
             global_base_addr, chunk_size, chunk_size_bits, count, total_size
         );
 
-        // Divide memory limit among chunks
-        // Each chunk gets an equal share of the total physical memory limit
-        let per_chunk_tiered_config = tiered_config.map(|config| {
-            let per_chunk_limit = config.physical_memory_limit / count;
-            warn!(
-                "Dividing physical memory limit among {} chunks: total {} MB → {} MB per chunk",
-                count,
-                config.physical_memory_limit / (1024 * 1024),
-                per_chunk_limit / (1024 * 1024)
-            );
-            crate::ram::tiered::TieredConfig {
-                threshold: config.threshold,
-                lower_watermark: config.lower_watermark,
-                physical_memory_limit: per_chunk_limit,
-                promotion_cooldown_ms: config.promotion_cooldown_ms,
-            }
-        });
-
-        // Log tiered memory configuration if enabled
-        if let Some(ref config) = per_chunk_tiered_config {
+        if let Some(ref pool) = shared_pool {
             info!(
-                "Tiered memory enabled with threshold: {}, physical memory limit per chunk: {} MB ({} chunks × {} MB = {} MB total)",
-                config.threshold,
-                config.physical_memory_limit / (1024 * 1024),
+                "Tiered memory enabled: threshold={}, limit={} MB, shared across all {} chunks",
+                pool.threshold,
+                pool.physical_memory_limit / (1024 * 1024),
                 count,
-                config.physical_memory_limit / (1024 * 1024),
-                (config.physical_memory_limit * count) / (1024 * 1024)
             );
         }
 
@@ -1416,7 +1395,7 @@ impl Chunks {
                 index_builder.clone(),
                 backup_storage,
                 wal_storage,
-                per_chunk_tiered_config.clone(),
+                shared_pool.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;

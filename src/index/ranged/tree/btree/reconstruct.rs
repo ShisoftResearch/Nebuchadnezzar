@@ -252,8 +252,8 @@ mod test {
         let server_addr = String::from("127.0.0.1:5600");
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 16 * 12024 * 1024,
+                chunk_size: 16 * 12024 * 1024,
+                db_size: 16 * 12024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

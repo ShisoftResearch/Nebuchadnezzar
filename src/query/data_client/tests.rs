@@ -198,8 +198,8 @@ async fn scan_all() {
     let server_group = String::from("indexed_scan_all_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -421,8 +421,8 @@ async fn range_query_scan() {
     let server_group = String::from("indexed_scan_all_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -499,8 +499,8 @@ async fn create_test_server(port: u16) -> Arc<NebServer> {
     let server_group = format!("ranged_query_test_{}", port);
     NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3488,8 +3488,8 @@ async fn hashed_query_test() {
     let server_group = String::from("hashed_query_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3700,8 +3700,8 @@ async fn bm25_search_returns_ranked_results() {
     let server_group = String::from("bm25_search_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3806,8 +3806,8 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
     let server_group = String::from("query_text_match_operator_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3912,8 +3912,8 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
     let server_group = String::from("query_text_match_or_predicate_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4018,8 +4018,8 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
     let server_group = String::from("query_text_match_order_by_field_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4123,8 +4123,8 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
     let server_group = String::from("query_nested_and_or_text_match_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4259,8 +4259,8 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
     let server_group = String::from("query_nested_or_and_order_limit_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4386,8 +4386,8 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
     let server_group = String::from("query_vector_similarity_and_filter_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4516,8 +4516,8 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
     let server_group = String::from("query_embedding_similarity_nested_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4652,8 +4652,8 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
     let server_group = String::from("query_vector_similarity_failure_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

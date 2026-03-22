@@ -37,8 +37,8 @@ pub async fn init() {
     let _ = env_logger::try_init();
     NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024, // 64 MB - must be >= SEGMENT_SIZE (8 MB)
+            chunk_size: 64 * 1024 * 1024, // 64 MB - must be >= SEGMENT_SIZE (8 MB)
+            db_size: 64 * 1024 * 1024
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -68,8 +68,8 @@ pub async fn explicit_database_binding_scopes_storage_roots() {
 
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: Some(backup_root.to_string_lossy().to_string()),
             wal_storage: Some(wal_root.to_string_lossy().to_string()),
@@ -114,8 +114,8 @@ pub async fn resolves_bound_database_runtime_by_name() {
 
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -165,8 +165,8 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -241,8 +241,8 @@ pub async fn unload_database_runtime_evicts_non_default_runtime() {
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -300,8 +300,8 @@ pub async fn delete_database_storage_removes_scoped_paths() {
 
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: Some(backup_root.to_string_lossy().to_string()),
             wal_storage: Some(wal_root.to_string_lossy().to_string()),
@@ -364,8 +364,8 @@ pub async fn smoke_test() {
     let server_group = String::from("smoke_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 512 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -445,8 +445,8 @@ pub async fn smoke_test_parallel() {
     let server_group = String::from("smoke_parallel_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 16 * 1024 * 1024 * 1024,
+            chunk_size: 4 * 1024 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -545,8 +545,8 @@ pub async fn txn() {
     let server_group = String::from("bench_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 512 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -617,8 +617,8 @@ pub async fn schema_wal_recovery_test() {
     {
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -731,8 +731,8 @@ pub async fn schema_wal_recovery_test() {
     {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -821,8 +821,8 @@ pub async fn schema_snapshot_recovery_test() {
     {
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -956,8 +956,8 @@ pub async fn schema_snapshot_recovery_test() {
     {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1067,8 +1067,8 @@ pub async fn schema_persistence_multiple_restarts() {
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1136,8 +1136,8 @@ pub async fn schema_persistence_multiple_restarts() {
         let server_addr = String::from("127.0.0.1:19004"); // Unique port for final verification
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1189,8 +1189,8 @@ pub async fn memory_status_test() {
     // Create server with tiered memory enabled
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 128 * 1024 * 1024, // 128 MB
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 128 * 1024 * 1024, // 128 MB
             tiered_config: Some(crate::ram::tiered::TieredConfig::with_memory_limit(
                 64 * 1024 * 1024, // 64 MB physical limit
             )),

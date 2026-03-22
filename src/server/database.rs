@@ -184,8 +184,8 @@ mod tests {
 
     fn base_opts() -> ServerOptions {
         ServerOptions {
-            chunk_count: 1,
-            total_size: 1024,
+            chunk_size: 1024,
+            db_size: 1024,
             tiered_config: None,
             backup_storage: Some("/tmp/backup".to_string()),
             wal_storage: Some("/tmp/wal".to_string()),

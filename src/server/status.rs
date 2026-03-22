@@ -181,21 +181,20 @@ impl NebServer {
             total_cells += cell_count;
         }
 
-        // Get physical memory limit from first chunk's tiered manager (all chunks have the same per-chunk limit)
-        let (physical_memory_limit_per_chunk, tiered_enabled) = if let Some(ref manager) = self
+        // The shared pool holds the server-wide limit directly — no per-chunk multiplication.
+        let (total_physical_limit, tiered_enabled) = if let Some(ref manager) = self
             .chunks()
             .list
             .first()
             .and_then(|c| c.tiered_manager.as_ref())
         {
-            (Some(manager.physical_memory_limit), manager.is_enabled())
+            (
+                Some(manager.shared_pool().physical_memory_limit),
+                manager.is_enabled(),
+            )
         } else {
             (None, false)
         };
-
-        // Calculate total limit across all chunks
-        let total_physical_limit =
-            physical_memory_limit_per_chunk.map(|limit| limit * total_chunks);
 
         let living_transactions = self
             .txn_manager()

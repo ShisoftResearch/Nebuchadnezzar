@@ -77,8 +77,8 @@ pub enum ServerError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerOptions {
-    pub chunk_count: usize,
-    pub total_size: usize,
+    pub chunk_size: usize,
+    pub db_size: usize,
     pub tiered_config: Option<crate::ram::tiered::TieredConfig>,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
@@ -213,6 +213,9 @@ pub struct NebServer {
     database_runtimes: RwLock<HashMap<String, Arc<DatabaseRuntime>>>,
     runtime_init_lock: tokio::sync::Mutex<()>,
     host_options: ServerOptions,
+    /// Shared physical-memory budget for all databases on this server.
+    /// `None` when tiered memory is disabled.
+    shared_memory_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
     meta_servers: Vec<String>,
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
@@ -276,6 +279,7 @@ impl NebServer {
         meta_members: &Vec<String>,
         group_name: &String,
         database_name: &str,
+        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
         rpc_server: &Arc<rpc::Server>,
         raft_service: &Arc<raft::RaftService>,
         raft_client: &Arc<RaftClient>,
@@ -341,16 +345,13 @@ impl NebServer {
         };
 
         let chunks = Chunks::new_with_recovery(
-            effective_opts.chunk_count,
-            effective_opts.total_size,
+            effective_opts.db_size / effective_opts.chunk_size,
+            effective_opts.chunk_size,
             meta_rc.clone(),
             index_builder.clone(),
             effective_opts.backup_storage.clone(),
             effective_opts.wal_storage.clone(),
-            effective_opts
-                .tiered_config
-                .clone()
-                .or_else(|| crate::ram::tiered::TieredConfig::from_env()),
+            shared_pool,
             effective_opts.enable_recovery,
             effective_opts.raft_storage.clone(),
         );
@@ -534,6 +535,7 @@ impl NebServer {
             &self.meta_servers,
             &self.group_name,
             database_name,
+            self.shared_memory_pool.clone(),
             &self.rpc,
             &self.raft_service,
             &self.raft_client,
@@ -788,19 +790,30 @@ impl NebServer {
         let conshasing = init_conshash(
             group_name,
             server_addr,
-            opts.total_size as u64,
+            opts.db_size as u64,
             raft_client,
             membership_client,
         )
         .await?;
         let member_pool = Arc::new(rpc::ClientPool::new());
         let txn_peer = Peer::new(server_addr);
+        let shared_memory_pool = opts
+            .tiered_config
+            .as_ref()
+            .or_else(|| None) // placeholder so or_else chain compiles cleanly
+            .map(|c| crate::ram::tiered::SharedMemoryPool::new(c))
+            .or_else(|| {
+                crate::ram::tiered::TieredConfig::from_env()
+                    .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c))
+            });
+
         let database_runtime = Self::build_database_runtime(
             opts,
             server_addr,
             &meta_members,
             group_name,
             database_name,
+            shared_memory_pool.clone(),
             rpc_server,
             raft_service,
             raft_client,
@@ -820,6 +833,7 @@ impl NebServer {
             )])),
             runtime_init_lock: tokio::sync::Mutex::new(()),
             host_options: opts.clone(),
+            shared_memory_pool,
             meta_servers: meta_members.clone(),
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),

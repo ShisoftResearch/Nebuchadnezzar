@@ -177,8 +177,8 @@ fn bench_hot_segment_reads() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        Some(crate::ram::tiered::TieredConfig::with_memory_limit(
-            chunk_capacity / 2,
+        Some(crate::ram::tiered::SharedMemoryPool::new(
+            &crate::ram::tiered::TieredConfig::with_memory_limit(chunk_capacity / 2),
         )),
     );
 
@@ -282,8 +282,8 @@ fn bench_cold_segment_reads() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        Some(crate::ram::tiered::TieredConfig::with_memory_limit(
-            chunk_capacity / 2,
+        Some(crate::ram::tiered::SharedMemoryPool::new(
+            &crate::ram::tiered::TieredConfig::with_memory_limit(chunk_capacity / 2),
         )),
     );
 
@@ -430,8 +430,8 @@ fn bench_mixed_uniform() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        Some(crate::ram::tiered::TieredConfig::with_memory_limit(
-            chunk_capacity / 2,
+        Some(crate::ram::tiered::SharedMemoryPool::new(
+            &crate::ram::tiered::TieredConfig::with_memory_limit(chunk_capacity / 2),
         )),
     );
 
@@ -570,8 +570,8 @@ fn bench_mixed_zipf() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        Some(crate::ram::tiered::TieredConfig::with_memory_limit(
-            chunk_capacity / 2,
+        Some(crate::ram::tiered::SharedMemoryPool::new(
+            &crate::ram::tiered::TieredConfig::with_memory_limit(chunk_capacity / 2),
         )),
     );
 

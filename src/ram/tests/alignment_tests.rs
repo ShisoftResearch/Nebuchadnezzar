@@ -68,8 +68,8 @@ async fn test_cell_location_alignment_after_write() {
     let server_addr = String::from("127.0.0.1:6000");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE,
+            chunk_size: SEGMENT_SIZE,
+            db_size: SEGMENT_SIZE,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -141,8 +141,8 @@ async fn test_cell_location_alignment_after_update() {
     let server_addr = String::from("127.0.0.1:6001");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE * 4,
+            chunk_size: SEGMENT_SIZE * 4,
+            db_size: SEGMENT_SIZE * 4,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -237,8 +237,8 @@ async fn test_varying_size_alignment() {
     let server_addr = String::from("127.0.0.1:6002");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE * 8,
+            chunk_size: SEGMENT_SIZE * 8,
+            db_size: SEGMENT_SIZE * 8,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -421,8 +421,8 @@ async fn test_alignment_after_multiple_segments() {
     let server_addr = String::from("127.0.0.1:6003");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE * 4, // Multiple segments
+            chunk_size: SEGMENT_SIZE * 4,
+            db_size: SEGMENT_SIZE * 4, // Multiple segments
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

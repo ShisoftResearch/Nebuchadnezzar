@@ -1976,8 +1976,8 @@ mod tests {
         let server_addr = String::from("127.0.0.1:5310"); // Unique port for this test
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2057,8 +2057,8 @@ mod tests {
         // Restart server with recovery enabled
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2124,8 +2124,8 @@ mod tests {
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2230,8 +2230,8 @@ mod tests {
         // Restart server with recovery enabled
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2291,8 +2291,8 @@ mod tests {
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2381,8 +2381,8 @@ mod tests {
         // Restart server with recovery enabled
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2435,8 +2435,8 @@ mod tests {
         let group_name = "test_e2e_txn_committed_no_rollback";
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2515,8 +2515,8 @@ mod tests {
         // Restart server with recovery enabled
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
