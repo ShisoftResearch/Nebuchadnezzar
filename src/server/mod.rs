@@ -414,12 +414,20 @@ impl NebServer {
         let member_pool = Arc::new(rpc::ClientPool::new());
         let txn_peer = Peer::new(server_addr);
         let clock = txn_peer.clock.clone();
+        let transaction_runtime = Arc::new(DatabaseRuntime {
+            chunks: chunks.clone(),
+            meta: meta_rc.clone(),
+            cleaner: cleaner.clone(),
+            indexer: index_builder.clone(),
+            undo_log: undo_log.clone(),
+            txn_manager: None,
+        });
 
         if opts.services.contains(&Service::Transaction) {
             transaction_manager = Some(
                 init_txn_manager(
                     rpc_server,
-                    &meta_rc,
+                    &transaction_runtime,
                     &clock,
                     rpc_server.server_id,
                     &conshasing,
@@ -795,14 +803,14 @@ pub async fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<Ne
 
 pub async fn init_txn_manager(
     rpc_server: &Arc<Server>,
-    meta: &Arc<ServerMeta>,
+    database_runtime: &Arc<DatabaseRuntime>,
     clock: &Arc<ServerVectorClock>,
     server_id: u64,
     consh: &Arc<ConsistentHashing>,
     member_pool: &Arc<ClientPool>,
 ) -> Arc<TransactionManager> {
     let deps = Arc::new(transactions::manager::TransactionManagerDeps {
-        meta: meta.clone(),
+        database_runtime: database_runtime.clone(),
         clock: clock.clone(),
         server_id: server_id,
         consh: consh.clone(),

@@ -28,7 +28,7 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64
 
 /// Dependencies needed by TransactionManager, extracted from NebServer to break cyclic dependency
 pub struct TransactionManagerDeps {
-    pub meta: Arc<crate::server::ServerMeta>,
+    pub database_runtime: Arc<crate::server::DatabaseRuntime>,
     pub clock: Arc<ServerVectorClock>,
     pub server_id: u64,
     pub consh: Arc<ConsistentHashing>,
@@ -45,6 +45,10 @@ impl TransactionManagerDeps {
         self.member_pool
             .get_by_id(server_id, move |_| consh.to_server_name(server_id))
             .await
+    }
+
+    pub fn schemas(&self) -> &crate::ram::schema::LocalSchemasCache {
+        &self.database_runtime.meta.schemas
     }
 }
 
@@ -250,7 +254,7 @@ impl Service for TransactionManager {
                 match data_obj.cell {
                     Some(ref cell) => {
                         let schema_id = cell.header.schema;
-                        if let Some(schema) = self.deps.meta.schemas.get(&schema_id) {
+                        if let Some(schema) = self.deps.schemas().get(&schema_id) {
                             if let OwnedValue::Map(map) = &cell.data {
                                 let mut res = vec![];
                                 'SEARCH: for field in &fields {

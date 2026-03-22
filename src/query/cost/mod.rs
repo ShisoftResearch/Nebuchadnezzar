@@ -65,7 +65,7 @@ fn row_bytes(
     } else {
         Some(
             server
-                .meta
+                .meta()
                 .schemas
                 .fields_size(&schema, projection.as_slice())?,
         )
