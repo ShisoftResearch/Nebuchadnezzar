@@ -822,7 +822,7 @@ pub async fn init_inverted_index_rpc_service(
     rpc_server: &Arc<Server>,
     neb_server: &Arc<NebServer>,
 ) {
-    if let Some(ref index_builder) = neb_server.indexer {
+    if let Some(index_builder) = neb_server.indexer() {
         if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
             use crate::index::full_text::rpc::InvertedIndexRPCService;
             let service = InvertedIndexRPCService::new(inverted_indexer.clone());

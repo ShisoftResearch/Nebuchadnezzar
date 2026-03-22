@@ -224,7 +224,7 @@ impl DataManager {
         chunk_idx: usize,
         segment_id: u64,
     ) -> Option<SegmentReferenceGuard> {
-        if let Some(chunk) = self.server.chunks.list.get(chunk_idx) {
+        if let Some(chunk) = self.server.chunks().list.get(chunk_idx) {
             if let Some(segment) = chunk.segs.get(&(segment_id as usize)) {
                 return Some(SegmentReferenceGuard::new(segment));
             }
@@ -244,13 +244,13 @@ impl DataManager {
             let error = if cell.is_none() {
                 // the cell was created, need to remove
                 self.server
-                    .chunks
+                    .chunks()
                     .remove_cell_by(id, |cell| cell.header.version == current_ver)
                     .err()
             } else if current_ver > 0 {
                 // the cell was updated, need to update back
                 self.server
-                    .chunks
+                    .chunks()
                     .update_cell_by(id, |cell_to_update| {
                         if cell_to_update.header.version == current_ver {
                             cell.as_ref().map(|r| r.clone_referred())
@@ -262,7 +262,7 @@ impl DataManager {
             } else {
                 // the cell was removed, need to put back
                 let mut cell = cell.as_ref().unwrap().clone_referred();
-                self.server.chunks.write_cell(&mut cell).err()
+                self.server.chunks().write_cell(&mut cell).err()
             };
             if let Some(error) = error {
                 failures.push(RollbackFailure { id: *id, error });
@@ -479,7 +479,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             r
         } else {
-            match self.server.chunks.read_cell(&id) {
+            match self.server.chunks().read_cell(&id) {
                 Ok(cell) => self.response_with(TxnExecResult::Accepted(cell.to_owned())),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
             }
@@ -496,7 +496,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        match self.server.chunks.read_selected(&id, &fields[..], true) {
+        match self.server.chunks().read_selected(&id, &fields[..], true) {
             // Need header for version check
             Ok(values) => self.response_with(TxnExecResult::Accepted(values.to_owned())),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
@@ -512,7 +512,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        match self.server.chunks.head_cell(&id) {
+        match self.server.chunks().head_cell(&id) {
             Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
@@ -530,7 +530,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        match self.server.chunks.read_partial_raw(&id, offset, len) {
+        match self.server.chunks().read_partial_raw(&id, offset, len) {
             Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
@@ -740,12 +740,12 @@ impl Service for DataManager {
                             continue;
                         }
 
-                        let write_result = self.server.chunks.write_cell(&mut cell);
+                        let write_result = self.server.chunks().write_cell(&mut cell);
                         match write_result {
                             Ok(header) => {
                                 // Log the new cell creation with its version for rollback
                                 // During recovery, if cell exists with this version, it will be deleted
-                                if let Some(ref undo_log) = self.server.undo_log {
+                                if let Some(undo_log) = self.server.undo_log() {
                                     let undo_entry = super::undo_log::UndoLogEntry::new_write(
                                         tid.clone(),
                                         cell_id,
@@ -772,7 +772,7 @@ impl Service for DataManager {
                     CommitOp::Remove(ref cell_id) => {
                         // Read cell and extract information while holding lock
                         let (cell_addr, orig_version, old_cell_ref) = {
-                            let shared_cell = match self.server.chunks.read_cell(cell_id) {
+                            let shared_cell = match self.server.chunks().read_cell(cell_id) {
                                 Ok(cell) => cell,
                                 Err(re) => {
                                     write_error = Some((*cell_id, WriteError::ReadError(re)));
@@ -786,7 +786,7 @@ impl Service for DataManager {
                         }; // SharedCell dropped here, lock released
 
                         // Now protect the segment without holding cell lock
-                        let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
+                        let chunk = self.server.chunks().locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
 
@@ -810,7 +810,7 @@ impl Service for DataManager {
                         // Write undo log entry before performing the remove
                         // Store old version and exact offset for verification during recovery
                         // Note: only seq_id is stored, not seg_id (which changes across recoveries)
-                        if let Some(ref undo_log) = self.server.undo_log {
+                        if let Some(undo_log) = self.server.undo_log() {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 *cell_id,
@@ -828,7 +828,7 @@ impl Service for DataManager {
 
                         let write_result = self
                             .server
-                            .chunks
+                            .chunks()
                             .remove_cell_by(cell_id, |cell| cell.header.version == orig_version);
                         match write_result {
                             Ok(()) => {
@@ -850,7 +850,7 @@ impl Service for DataManager {
                         // Read cell and extract information while holding lock
                         let (cell_addr, orig_version) =
                             {
-                                match self.server.chunks.location_for_read(&cell_id).and_then(
+                                match self.server.chunks().location_for_read(&cell_id).and_then(
                                     |loc| {
                                         let addr = *loc;
                                         let header = header_from_chunk_raw(addr);
@@ -869,7 +869,7 @@ impl Service for DataManager {
                             }; // SharedCell dropped here, lock released
 
                         // Now protect the segment without holding cell lock
-                        let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
+                        let chunk = self.server.chunks().locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
 
@@ -893,7 +893,7 @@ impl Service for DataManager {
                         // Write undo log entry before performing the update
                         // Store old version and exact offset for verification during recovery
                         // Note: only seq_id is stored, not seg_id (which changes across recoveries)
-                        if let Some(ref undo_log) = self.server.undo_log {
+                        if let Some(undo_log) = self.server.undo_log() {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 cell_id,
@@ -912,7 +912,7 @@ impl Service for DataManager {
                         let mut old_cell_ref = None;
                         let write_result =
                             self.server
-                                .chunks
+                                .chunks()
                                 .update_cell_by(&cell_id, |cell_to_update| {
                                     if cell_to_update.header.version == orig_version {
                                         old_cell_ref =
@@ -978,7 +978,7 @@ impl Service for DataManager {
             for guard in &txn.segment_guards {
                 let chunk_idx = guard.chunk_id();
                 let seg_id = guard.segment_id();
-                let chunk = &self.server.chunks.list[chunk_idx];
+                let chunk = &self.server.chunks().list[chunk_idx];
                 if let Some(segment) = chunk.segs.get(&(seg_id as usize)) {
                     // Use force_wal_sync to ensure WAL is persisted and counters are reset
                     if let Err(e) = segment.force_wal_sync() {
@@ -1135,7 +1135,7 @@ impl Service for DataManager {
             drop(guards_to_drop); // Drop guards, releasing all segment references
 
             // Write commit/abort marker to undo log based on transaction state
-            if let Some(ref undo_log) = self.server.undo_log {
+            if let Some(undo_log) = self.server.undo_log() {
                 let log_result = match txn_state {
                     TxnState::Committed => undo_log.write_commit_marker(&tid),
                     TxnState::Aborted => undo_log.write_abort_marker(&tid),

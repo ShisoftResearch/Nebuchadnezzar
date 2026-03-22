@@ -16,7 +16,7 @@ impl CostFunction for RangeIndexCost {
         range: Option<&ValueRange>,
         projection: Vec<u64>,
     ) -> Option<CostResult> {
-        let stat = self.server.chunks.overall_statistics(schema);
+        let stat = self.server.chunks().overall_statistics(schema);
         let field = field?;
         let field_histo = stat.histogram.get(&field)?;
         let num_all_rows = stat.count;

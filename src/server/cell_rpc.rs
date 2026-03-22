@@ -270,7 +270,7 @@ impl NebRPCService {
     where
         R: Send + 'a,
     {
-        if self.server.indexer.is_some() {
+        if self.server.indexer().is_some() {
             IndexBuilder::await_indices().map(|_| res).boxed()
         } else {
             future::ready(res).boxed()
