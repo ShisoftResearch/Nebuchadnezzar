@@ -1294,6 +1294,196 @@ mod tests {
         assert_eq!(analytics_runtime.txn_manager().unwrap().transaction_count(), 0);
         server.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_failure_racing_with_explicit_abort_leaves_manager_empty() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5295";
+        let group = "txn_manager_prepare_abort_race";
+        let server = start_manager_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_basic_schema(&runtime);
+        let hot_cell = Id::new(0, 3001);
+        seed_counter_cell(&runtime, schema.id, hot_cell, 1).await;
+
+        let txn_client = scoped_txn_client_for_database(address, group, group).await;
+        for iteration in 0..48 {
+            let writer_tid = txn_client.begin().await.unwrap().unwrap();
+            let reader_tid = txn_client.begin().await.unwrap().unwrap();
+
+            match txn_client
+                .read(reader_tid.clone(), hot_cell)
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                TxnExecResult::Accepted(_) => {}
+                other => panic!("unexpected reader result: {:?}", other),
+            }
+
+            let mut data = OwnedMap::new();
+            data.insert(&String::from("id"), OwnedValue::I64(hot_cell.lower as i64));
+            data.insert(
+                &String::from("score"),
+                OwnedValue::U64((iteration + 2) as u64),
+            );
+            data.insert(
+                &String::from("name"),
+                OwnedValue::String(format!("writer-{iteration}")),
+            );
+            let updated_cell = crate::ram::cell::OwnedCell::new_with_id(
+                schema.id,
+                &hot_cell,
+                OwnedValue::Map(data),
+            );
+            match txn_client
+                .update(writer_tid.clone(), updated_cell)
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                TxnExecResult::Accepted(()) => {}
+                other => panic!("unexpected writer update result: {:?}", other),
+            }
+
+            let prepare_client = txn_client.clone();
+            let abort_client = txn_client.clone();
+            let prepare_tid = writer_tid.clone();
+            let abort_tid = writer_tid.clone();
+
+            let (prepare_result, abort_result) = tokio::join!(
+                async move { prepare_client.prepare(prepare_tid).await.unwrap() },
+                async move { abort_client.abort(abort_tid).await.unwrap() }
+            );
+
+            match prepare_result {
+                Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
+                | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))
+                | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::TransactionNotExisted))
+                | Err(TMError::TransactionNotFound) => {}
+                other => panic!("unexpected prepare result in race: {:?}", other),
+            }
+
+            match abort_result {
+                Ok(AbortResult::Success(_))
+                | Ok(AbortResult::CheckFailed(CheckError::AlreadyAborted))
+                | Err(TMError::TransactionNotFound) => {}
+                other => panic!("unexpected abort result in race: {:?}", other),
+            }
+
+            let _ = txn_client.abort(reader_tid.clone()).await;
+        }
+
+        assert_eq!(
+            runtime.txn_manager().unwrap().transaction_count(),
+            0,
+            "prepare/abort races should not leak manager transaction state"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_database_prepare_abort_races_stay_isolated() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5296";
+        let group = "txn_manager_prepare_abort_multi_db";
+        let server = start_manager_test_server(address, group).await;
+        let analytics_runtime = server.ensure_database_runtime("analytics").await.unwrap();
+        let default_runtime = server.current_database();
+        let default_schema = install_basic_schema(&default_runtime);
+        let analytics_schema = install_basic_schema(&analytics_runtime);
+        let default_cell = Id::new(0, 4001);
+        let analytics_cell = Id::new(0, 4002);
+        seed_counter_cell(&default_runtime, default_schema.id, default_cell, 1).await;
+        seed_counter_cell(&analytics_runtime, analytics_schema.id, analytics_cell, 1).await;
+
+        let results = join_all((0..48).map(|iteration| {
+            let address = address.to_string();
+            let group = group.to_string();
+            async move {
+                let (database_name, schema_id, hot_cell) = if iteration % 2 == 0 {
+                    (group.clone(), default_schema.id, default_cell)
+                } else {
+                    ("analytics".to_string(), analytics_schema.id, analytics_cell)
+                };
+                let txn_client =
+                    scoped_txn_client_for_database(&address, &group, &database_name).await;
+                let writer_tid = txn_client.begin().await.unwrap().unwrap();
+                let reader_tid = txn_client.begin().await.unwrap().unwrap();
+
+                match txn_client
+                    .read(reader_tid.clone(), hot_cell)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    TxnExecResult::Accepted(_) => {}
+                    other => panic!("unexpected reader result: {:?}", other),
+                }
+
+                let mut data = OwnedMap::new();
+                data.insert(&String::from("id"), OwnedValue::I64(hot_cell.lower as i64));
+                data.insert(
+                    &String::from("score"),
+                    OwnedValue::U64((iteration + 10) as u64),
+                );
+                data.insert(
+                    &String::from("name"),
+                    OwnedValue::String(format!("{database_name}-{iteration}")),
+                );
+                let updated_cell = crate::ram::cell::OwnedCell::new_with_id(
+                    schema_id,
+                    &hot_cell,
+                    OwnedValue::Map(data),
+                );
+                match txn_client
+                    .update(writer_tid.clone(), updated_cell)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    TxnExecResult::Accepted(()) => {}
+                    other => panic!("unexpected update result: {:?}", other),
+                }
+
+                let prepare_client = txn_client.clone();
+                let abort_client = txn_client.clone();
+                let prepare_tid = writer_tid.clone();
+                let abort_tid = writer_tid.clone();
+
+                let (prepare_result, abort_result) = tokio::join!(
+                    async move { prepare_client.prepare(prepare_tid).await.unwrap() },
+                    async move { abort_client.abort(abort_tid).await.unwrap() }
+                );
+
+                match prepare_result {
+                    Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
+                    | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))
+                    | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::TransactionNotExisted))
+                    | Err(TMError::TransactionNotFound) => {}
+                    other => panic!("unexpected prepare result in race: {:?}", other),
+                }
+
+                match abort_result {
+                    Ok(AbortResult::Success(_))
+                    | Ok(AbortResult::CheckFailed(CheckError::AlreadyAborted))
+                    | Err(TMError::TransactionNotFound) => {}
+                    other => panic!("unexpected abort result in race: {:?}", other),
+                }
+
+                let _ = txn_client.abort(reader_tid.clone()).await;
+            }
+        }))
+        .await;
+
+        for result in results {
+            result;
+        }
+
+        assert_eq!(default_runtime.txn_manager().unwrap().transaction_count(), 0);
+        assert_eq!(analytics_runtime.txn_manager().unwrap().transaction_count(), 0);
+        server.shutdown().await;
+    }
 }
 
 impl Drop for TransactionManager {

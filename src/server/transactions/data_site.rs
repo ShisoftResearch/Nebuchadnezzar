@@ -170,7 +170,7 @@ impl DataManager {
         self.txn_peer.clock.merge_with(clock);
     }
     #[inline]
-    fn get_transaction(&self, tid: &TxnId) -> TxnMutex {
+    fn get_or_create_transaction(&self, tid: &TxnId) -> TxnMutex {
         // Fast path: transaction already exists
         if let Some(txn) = self.txns.get(tid) {
             return txn;
@@ -178,6 +178,10 @@ impl DataManager {
 
         // Slow path: create new transaction
         self.create_transaction(tid)
+    }
+    #[inline]
+    fn find_transaction(&self, tid: &TxnId) -> Option<TxnMutex> {
+        self.txns.get(tid)
     }
 
     #[cold]
@@ -362,7 +366,7 @@ impl DataManager {
         T: 'static + Clone,
     {
         self.update_clock(clock);
-        let txn_lock = self.get_transaction(tid);
+        let txn_lock = self.get_or_create_transaction(tid);
         let mut txn = txn_lock.lock();
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
@@ -552,7 +556,7 @@ mod tests {
             let manager = manager.clone();
             let tid = tid.clone();
             async move {
-                let txn = manager.get_transaction(&tid);
+                let txn = manager.get_or_create_transaction(&tid);
                 Arc::as_ptr(&txn) as usize
             }
         }))
@@ -582,7 +586,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for tid in &tids {
-            let txn = manager.get_transaction(tid);
+            let txn = manager.get_or_create_transaction(tid);
             txn.lock().state = TxnState::Committed;
         }
         assert_eq!(manager.txns.len(), tids.len());
@@ -613,9 +617,12 @@ mod tests {
         let analytics_manager = data_manager_for_database(&server, address, "analytics").await;
         let shared_tid = default_manager.txn_peer.clock.inc();
 
-        default_manager.get_transaction(&shared_tid).lock().state = TxnState::Committed;
+        default_manager
+            .get_or_create_transaction(&shared_tid)
+            .lock()
+            .state = TxnState::Committed;
         analytics_manager
-            .get_transaction(&shared_tid)
+            .get_or_create_transaction(&shared_tid)
             .lock()
             .state = TxnState::Committed;
 
@@ -649,6 +656,58 @@ mod tests {
         assert_eq!(analytics_end, EndResult::Success);
         assert!(analytics_manager.txns.get(&shared_tid).is_none());
         assert!(!analytics_manager.txns_sorted.lock().contains(&shared_tid));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_end_calls_on_same_transaction_cleanup_idempotently() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5297";
+        let group = "txn_data_site_end_race";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = manager.txn_peer.clock.inc();
+        manager.get_or_create_transaction(&tid).lock().state = TxnState::Aborted;
+
+        let end_clock = manager.txn_peer.clock.to_clock();
+        let left_manager = manager.clone();
+        let right_manager = manager.clone();
+        let left_tid = tid.clone();
+        let right_tid = tid.clone();
+        let left_clock = end_clock.clone();
+        let right_clock = end_clock.clone();
+
+        let (left, right) = tokio::join!(
+            async move {
+                <DataManager as Service>::end(&left_manager, left_clock, left_tid)
+                    .await
+                    .payload
+            },
+            async move {
+                <DataManager as Service>::end(&right_manager, right_clock, right_tid)
+                    .await
+                    .payload
+            }
+        );
+
+        for result in [left, right] {
+            assert!(
+                matches!(
+                    result,
+                    EndResult::Success
+                        | EndResult::CheckFailed(CheckError::NotExisted)
+                        | EndResult::CheckFailed(CheckError::CannotEnd)
+                        | EndResult::LockReleaseRetriesExhausted { .. }
+                        | EndResult::SomeLocksNotReleased { .. }
+                ),
+                "unexpected end result in duplicate end race: {:?}",
+                result
+            );
+        }
+
+        assert!(manager.txns.get(&tid).is_none());
+        assert!(!manager.txns_sorted.lock().contains(&tid));
 
         server.shutdown().await;
     }
@@ -756,7 +815,9 @@ impl Service for DataManager {
         debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
         self.update_clock(&clock);
 
-        let txn_lock = self.get_transaction(&tid);
+        let Some(txn_lock) = self.find_transaction(&tid) else {
+            return self.response_with(DMPrepareResult::TransactionNotExisted);
+        };
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
             return self.response_with(DMPrepareResult::StateError(txn.state));
@@ -872,7 +933,9 @@ impl Service for DataManager {
         // Use the more recent timestamp between the transaction ID and the incoming clock
         let effective_ts = if &clock > &tid { &clock } else { &tid };
 
-        let txn_lock = self.get_transaction(&tid);
+        let Some(txn_lock) = self.find_transaction(&tid) else {
+            return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted));
+        };
         let mut txn = txn_lock.lock();
         txn.last_activity = get_time();
         // check state
@@ -1190,7 +1253,9 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
         self.update_clock(&clock);
-        let txn_lock = self.get_transaction(&tid);
+        let Some(txn_lock) = self.find_transaction(&tid) else {
+            return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted));
+        };
         let mut txn = txn_lock.lock();
         if txn.state == TxnState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
@@ -1231,7 +1296,9 @@ impl Service for DataManager {
 
         // Option 6: Two-Phase Lock Release with Verification and Retry
         let (affected_cell_ids, txn_state) = {
-            let txn_lock = self.get_transaction(&tid);
+            let Some(txn_lock) = self.find_transaction(&tid) else {
+                return self.response_with(EndResult::CheckFailed(CheckError::NotExisted));
+            };
             let txn = txn_lock.lock();
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
                 return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
@@ -1311,9 +1378,12 @@ impl Service for DataManager {
         async move {
             // Release all segment references before wiping out transaction
             let guards_to_drop = {
-                let txn_lock = self.get_transaction(&tid);
-                let mut txn = txn_lock.lock();
-                std::mem::take(&mut txn.segment_guards)
+                if let Some(txn_lock) = self.find_transaction(&tid) {
+                    let mut txn = txn_lock.lock();
+                    std::mem::take(&mut txn.segment_guards)
+                } else {
+                    Vec::new()
+                }
             };
             drop(guards_to_drop); // Drop guards, releasing all segment references
 
