@@ -300,13 +300,7 @@ impl DataManager {
     }
     #[inline]
     fn wipe_out_transaction(&self, tid: &TxnId) {
-        #[cfg(debug_assertions)]
-        {
-            let tid = tid.clone();
-        }
-        if let Some(txn) = self.txns.lock(tid) {
-            txn.remove();
-        }
+        let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
     }
     async fn cell_meta_cleanup(&self) {
