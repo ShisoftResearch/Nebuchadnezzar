@@ -38,7 +38,7 @@ pub async fn init() {
     NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024, // 64 MB - must be >= SEGMENT_SIZE (8 MB)
-            db_size: 64 * 1024 * 1024
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

@@ -1079,6 +1079,14 @@ impl TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ram::schema::Schema;
+    use crate::ram::tests::default_fields;
+    use crate::ram::types::{OwnedMap, OwnedValue};
+    use crate::server::{NebServer, ServerOptions, Service};
+    use crate::server::transactions;
+    use dovahkiin::types::custom_types::id::Id;
+    use dovahkiin::types::Map;
+    use futures::future::join_all;
 
     #[test]
     fn scoped_transaction_manager_service_ids_differ_between_databases() {
@@ -1087,6 +1095,204 @@ mod tests {
             generate_scoped_service_id(group, "db_a"),
             generate_scoped_service_id(group, "db_b")
         );
+    }
+
+    async fn scoped_txn_client_for_database(
+        address: &str,
+        group_name: &str,
+        database_name: &str,
+    ) -> Arc<transactions::manager::AsyncServiceClient> {
+        transactions::new_async_client_for_database(
+            &address.to_string(),
+            group_name,
+            database_name,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn start_manager_test_server(address: &str, group: &str) -> Arc<NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: crate::ram::segs::SEGMENT_SIZE,
+                db_size: crate::ram::segs::SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell, Service::Transaction],
+                enable_recovery: false,
+            },
+            &address.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+    }
+
+    fn install_basic_schema(runtime: &Arc<crate::server::DatabaseRuntime>) -> Schema {
+        let schema = Schema::new_with_id(
+            1,
+            &String::from("txn_test"),
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        runtime.meta().schemas.debug_only_new_schema(schema.clone());
+        schema
+    }
+
+    async fn seed_counter_cell(
+        runtime: &Arc<crate::server::DatabaseRuntime>,
+        schema_id: u32,
+        id: Id,
+        score: u64,
+    ) {
+        let mut data = OwnedMap::new();
+        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("score"), OwnedValue::U64(score));
+        data.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("cell-{score}")),
+        );
+        let mut cell = crate::ram::cell::OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data));
+        runtime.chunks().write_cell(&mut cell).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_transaction_commits_leave_manager_empty() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5293";
+        let group = "txn_manager_cleanup_single_db";
+        let server = start_manager_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_basic_schema(&runtime);
+        let cell_ids = (0..8)
+            .map(|index| Id::new(0, (index + 1) as u64))
+            .collect::<Vec<_>>();
+
+        for (index, cell_id) in cell_ids.iter().enumerate() {
+            seed_counter_cell(&runtime, schema.id, *cell_id, index as u64).await;
+        }
+
+        let results = join_all((0..48).map(|worker| {
+            let cell_ids = cell_ids.clone();
+            let address = address.to_string();
+            let group = group.to_string();
+            async move {
+                let txn_client = scoped_txn_client_for_database(&address, &group, &group).await;
+                let txn_id = txn_client.begin().await.unwrap().unwrap();
+                let target = cell_ids[worker % cell_ids.len()];
+                match txn_client.read(txn_id.clone(), target).await.unwrap().unwrap() {
+                    TxnExecResult::Accepted(mut cell) => {
+                        let mut data = cell.data.Map().unwrap().clone();
+                        let next_score = *data.get("score").u64().unwrap() + 1;
+                        data.insert(&String::from("score"), OwnedValue::U64(next_score));
+                        cell.data = OwnedValue::Map(data);
+                        txn_client
+                            .update(txn_id.clone(), cell)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        match txn_client.prepare(txn_id.clone()).await.unwrap().unwrap() {
+                            TMPrepareResult::Success => {
+                                let end = txn_client.commit(txn_id.clone()).await.unwrap().unwrap();
+                                assert!(
+                                    matches!(end, EndResult::Success | EndResult::SomeLocksNotReleased { .. }),
+                                    "unexpected commit result: {:?}",
+                                    end
+                                );
+                            }
+                            other => panic!("unexpected prepare result: {:?}", other),
+                        }
+                    }
+                    other => panic!("unexpected read result: {:?}", other),
+                }
+            }
+        }))
+        .await;
+
+        for result in results {
+            result;
+        }
+
+        assert_eq!(
+            runtime.txn_manager().unwrap().transaction_count(),
+            0,
+            "all committed transactions should be cleaned from manager state"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_database_transaction_cleanup_stays_database_local() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5294";
+        let group = "txn_manager_cleanup_multi_db";
+        let server = start_manager_test_server(address, group).await;
+        let analytics_runtime = server.ensure_database_runtime("analytics").await.unwrap();
+        let default_runtime = server.current_database();
+        let default_schema = install_basic_schema(&default_runtime);
+        let analytics_schema = install_basic_schema(&analytics_runtime);
+        let default_cell = Id::new(0, 1001);
+        let analytics_cell = Id::new(0, 2001);
+
+        seed_counter_cell(&default_runtime, default_schema.id, default_cell, 1).await;
+        seed_counter_cell(&analytics_runtime, analytics_schema.id, analytics_cell, 1).await;
+
+        let tasks = join_all((0..40).map(|index| {
+            let address = address.to_string();
+            let group = group.to_string();
+            let database_name = if index % 2 == 0 { group.to_string() } else { "analytics".to_string() };
+            let cell_id = if index % 2 == 0 { default_cell } else { analytics_cell };
+            async move {
+                let txn_client =
+                    scoped_txn_client_for_database(&address, &group, &database_name).await;
+                let txn_id = txn_client.begin().await.unwrap().unwrap();
+                match txn_client.read(txn_id.clone(), cell_id).await.unwrap().unwrap() {
+                    TxnExecResult::Accepted(mut cell) => {
+                        let mut data = cell.data.Map().unwrap().clone();
+                        let next_score = *data.get("score").u64().unwrap() + 1;
+                        data.insert(&String::from("score"), OwnedValue::U64(next_score));
+                        cell.data = OwnedValue::Map(data);
+                        txn_client
+                            .update(txn_id.clone(), cell)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if index % 3 == 0 {
+                            let abort_result = txn_client.abort(txn_id.clone()).await.unwrap().unwrap();
+                            assert!(matches!(abort_result, AbortResult::Success(_)));
+                        } else {
+                            match txn_client.prepare(txn_id.clone()).await.unwrap().unwrap() {
+                                TMPrepareResult::Success => {
+                                    let end = txn_client.commit(txn_id.clone()).await.unwrap().unwrap();
+                                    assert!(
+                                        matches!(end, EndResult::Success | EndResult::SomeLocksNotReleased { .. }),
+                                        "unexpected commit result: {:?}",
+                                        end
+                                    );
+                                }
+                                other => panic!("unexpected prepare result: {:?}", other),
+                            }
+                        }
+                    }
+                    other => panic!("unexpected read result: {:?}", other),
+                }
+            }
+        }))
+        .await;
+
+        for task in tasks {
+            task;
+        }
+
+        assert_eq!(default_runtime.txn_manager().unwrap().transaction_count(), 0);
+        assert_eq!(analytics_runtime.txn_manager().unwrap().transaction_count(), 0);
+        server.shutdown().await;
     }
 }
 

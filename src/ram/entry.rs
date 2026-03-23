@@ -8,7 +8,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use super::mem_cursor::{release_cursor, Endian};
 
 bitflags! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
     pub struct EntryType: u32 {
         const UNDECIDED =   0b0000;
         const CELL =        0b0001;

@@ -296,6 +296,10 @@ impl DataManager {
     }
     #[inline]
     fn wipe_out_transaction(&self, tid: &TxnId) {
+        #[cfg(debug_assertions)]
+        {
+            let tid = tid.clone();
+        }
         if let Some(txn) = self.txns.lock(tid) {
             txn.remove();
         }
@@ -485,6 +489,10 @@ impl DataManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ram::segs::SEGMENT_SIZE;
+    use crate::server::{NebServer, ServerOptions, Service as NebService};
+    use futures::future::join_all;
+    use std::sync::Arc;
 
     #[test]
     fn scoped_data_manager_service_ids_differ_between_databases() {
@@ -493,6 +501,156 @@ mod tests {
             generate_scoped_service_id(group, "db_a"),
             generate_scoped_service_id(group, "db_b")
         );
+    }
+
+    async fn start_transaction_test_server(
+        address: &str,
+        group: &str,
+    ) -> Arc<crate::server::NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: SEGMENT_SIZE,
+                db_size: SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![NebService::Cell, NebService::Transaction],
+                enable_recovery: false,
+            },
+            &address.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+    }
+
+    async fn data_manager_for_database(
+        server: &Arc<NebServer>,
+        address: &str,
+        database_name: &str,
+    ) -> Arc<DataManager> {
+        let runtime = server
+            .ensure_database_runtime(database_name)
+            .await
+            .expect("database runtime");
+        DataManager::new(runtime, crate::server::Peer::new(&address.to_string()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_get_transaction_returns_single_shared_entry_per_tid() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5290";
+        let group = "txn_data_site_same_tid";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = manager.txn_peer.clock.inc();
+
+        let results = join_all((0..32).map(|_| {
+            let manager = manager.clone();
+            let tid = tid.clone();
+            async move {
+                let txn = manager.get_transaction(&tid);
+                Arc::as_ptr(&txn) as usize
+            }
+        }))
+        .await;
+
+        let first = results[0];
+        assert!(
+            results.iter().all(|ptr| *ptr == first),
+            "all concurrent lookups of the same txn id should return the same transaction entry"
+        );
+        assert_eq!(manager.txns.len(), 1);
+        assert_eq!(manager.txns_sorted.lock().len(), 1);
+        assert!(manager.txns.get(&tid).is_some());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_cleans_up_many_active_transactions_without_leaking_bookkeeping() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5291";
+        let group = "txn_data_site_cleanup";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tids = (0..64)
+            .map(|_| manager.txn_peer.clock.inc())
+            .collect::<Vec<_>>();
+
+        for tid in &tids {
+            let txn = manager.get_transaction(tid);
+            txn.lock().state = TxnState::Committed;
+        }
+        assert_eq!(manager.txns.len(), tids.len());
+        assert_eq!(manager.txns_sorted.lock().len(), tids.len());
+
+        let results = join_all(tids.iter().cloned().map(|tid| {
+            let manager = manager.clone();
+            async move { <DataManager as Service>::end(&manager, tid.clone(), tid).await.payload }
+        }))
+        .await;
+
+        for result in results {
+            assert_eq!(result, EndResult::Success);
+        }
+        assert_eq!(manager.txns.len(), 0);
+        assert!(manager.txns_sorted.lock().is_empty());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ending_one_database_transaction_does_not_wipe_same_tid_in_another_database() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5292";
+        let group = "txn_data_site_multidb";
+        let server = start_transaction_test_server(address, group).await;
+        let default_manager = data_manager_for_database(&server, address, group).await;
+        let analytics_manager = data_manager_for_database(&server, address, "analytics").await;
+        let shared_tid = default_manager.txn_peer.clock.inc();
+
+        default_manager.get_transaction(&shared_tid).lock().state = TxnState::Committed;
+        analytics_manager
+            .get_transaction(&shared_tid)
+            .lock()
+            .state = TxnState::Committed;
+
+        let end_result = <DataManager as Service>::end(
+            &default_manager,
+            shared_tid.clone(),
+            shared_tid.clone(),
+        )
+            .await
+            .payload;
+        assert_eq!(end_result, EndResult::Success);
+        assert!(default_manager.txns.get(&shared_tid).is_none());
+        assert!(!default_manager.txns_sorted.lock().contains(&shared_tid));
+
+        assert!(
+            analytics_manager.txns.get(&shared_tid).is_some(),
+            "ending one database transaction must not remove another database's transaction entry"
+        );
+        assert!(
+            analytics_manager.txns_sorted.lock().contains(&shared_tid),
+            "ending one database transaction must not remove another database's sorted bookkeeping"
+        );
+
+        let analytics_end = <DataManager as Service>::end(
+            &analytics_manager,
+            shared_tid.clone(),
+            shared_tid.clone(),
+        )
+            .await
+            .payload;
+        assert_eq!(analytics_end, EndResult::Success);
+        assert!(analytics_manager.txns.get(&shared_tid).is_none());
+        assert!(!analytics_manager.txns_sorted.lock().contains(&shared_tid));
+
+        server.shutdown().await;
     }
 }
 
@@ -1107,8 +1265,8 @@ impl Service for DataManager {
             if failed_releases.is_empty() {
                 // All locks released successfully
                 debug!(
-                    "Successfully released all {} locks for {:?}",
-                    released_count, tid
+                    "Successfully released all {} locks for {:?}, total locks: {}",
+                    released_count, tid, self.txns.len()
                 );
                 lock_release_result = Some(Ok(()));
                 break;
