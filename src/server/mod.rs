@@ -559,7 +559,12 @@ impl NebServer {
         if database_name == self.database_name() {
             return false;
         }
+        self.unload_database_runtime_unchecked(database_name).await
+    }
 
+    /// Unload a database runtime, bypassing the default-database protection.
+    /// Used when intentionally resetting the default database.
+    pub async fn unload_database_runtime_unchecked(&self, database_name: &str) -> bool {
         let runtime = self
             .database_runtimes
             .write()
@@ -618,7 +623,12 @@ impl NebServer {
         if database_name == self.database_name() {
             return Err("cannot delete storage for the default database runtime".to_string());
         }
+        self.delete_database_storage_unchecked(database_name)
+    }
 
+    /// Delete database storage, bypassing the default-database protection.
+    /// Used when intentionally resetting the default database.
+    pub fn delete_database_storage_unchecked(&self, database_name: &str) -> Result<(), String> {
         let layout = database::DatabaseStorageLayout::from_options(
             &self.host_options,
             &self.group_name,

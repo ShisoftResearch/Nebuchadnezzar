@@ -25,7 +25,6 @@ bincode_derive = "2"
 byteorder = "*"
 parking_lot = "*"
 rand = { version = "*", features = ["small_rng"] }
-bitflags = "*"
 itertools = "*"
 smallvec = { version = "*", features = ["serde", "union"] }
 num_cpus = "*"

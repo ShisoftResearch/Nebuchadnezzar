@@ -1892,7 +1892,6 @@ dependencies = [
  "bifrost_proc_macro",
  "bincode 2.0.1",
  "bincode_derive",
- "bitflags 2.11.0",
  "byteorder",
  "core_affinity",
  "crc-fast",

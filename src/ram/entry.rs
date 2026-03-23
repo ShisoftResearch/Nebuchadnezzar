@@ -7,12 +7,27 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 
 use super::mem_cursor::{release_cursor, Endian};
 
-bitflags! {
-    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct EntryType: u32 {
-        const UNDECIDED =   0b0000;
-        const CELL =        0b0001;
-        const TOMBSTONE =   0b0010;
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum EntryType {
+    #[default]
+    UNDECIDED = 0,
+    CELL = 1,
+    TOMBSTONE = 2,
+}
+
+impl EntryType {
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        match bits {
+            0 => Some(Self::UNDECIDED),
+            1 => Some(Self::CELL),
+            2 => Some(Self::TOMBSTONE),
+            _ => None,
+        }
+    }
+
+    pub fn bits(self) -> u32 {
+        self as u32
     }
 }
 

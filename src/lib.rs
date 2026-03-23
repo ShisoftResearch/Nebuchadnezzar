@@ -18,9 +18,6 @@ extern crate bifrost_plugins;
 pub extern crate dovahkiin;
 #[macro_use]
 extern crate serde_derive;
-#[macro_use]
-extern crate bitflags;
-
 extern crate bincode;
 extern crate byteorder;
 extern crate core;

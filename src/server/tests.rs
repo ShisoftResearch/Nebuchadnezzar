@@ -352,6 +352,119 @@ pub async fn delete_database_storage_removes_scoped_paths() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+pub async fn unload_database_runtime_unchecked_allows_default() {
+    let _ = env_logger::try_init();
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5106"),
+        "runtime_unchecked_unload_group",
+        async |_| {},
+    )
+    .await;
+
+    let default_name = server.database_name().to_string();
+
+    // Regular unload must be blocked for the default database
+    assert!(
+        !server.unload_database_runtime(&default_name).await,
+        "regular unload must not evict the default runtime"
+    );
+    assert!(
+        server.database(&default_name).is_some(),
+        "default runtime must still be present after blocked unload"
+    );
+
+    // Unchecked unload must succeed
+    assert!(
+        server.unload_database_runtime_unchecked(&default_name).await,
+        "unchecked unload must evict the default runtime"
+    );
+    assert!(
+        server.database(&default_name).is_none(),
+        "default runtime must be gone after unchecked unload"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+pub async fn delete_database_storage_unchecked_allows_default() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let backup_root = temp_dir.path().join("backup");
+    let wal_root = temp_dir.path().join("wal");
+    let undo_root = temp_dir.path().join("undo");
+    let raft_root = temp_dir.path().join("raft");
+
+    let group = "default_storage_unchecked_group";
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(backup_root.to_string_lossy().to_string()),
+            wal_storage: Some(wal_root.to_string_lossy().to_string()),
+            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
+            raft_storage: Some(raft_root.to_string_lossy().to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5107"),
+        group,
+        group,
+        async |_| {},
+    )
+    .await;
+
+    let default_name = server.database_name().to_string();
+
+    // Regular delete must be blocked for the default database
+    assert!(
+        server.delete_database_storage(&default_name).is_err(),
+        "regular storage delete must be blocked for the default database"
+    );
+
+    // Unload the default runtime first so storage can be wiped
+    server.unload_database_runtime_unchecked(&default_name).await;
+
+    // Create the scoped storage directories as the runtime would have
+    let scoped_db_dir = default_name.replace('/', "_");
+    let backup_path = backup_root.join("databases").join(&scoped_db_dir);
+    let wal_path = wal_root.join("databases").join(&scoped_db_dir);
+    std::fs::create_dir_all(&backup_path).unwrap();
+    std::fs::create_dir_all(&wal_path).unwrap();
+
+    // Unchecked delete must succeed
+    server
+        .delete_database_storage_unchecked(&default_name)
+        .expect("unchecked storage delete must succeed for the default database");
+
+    assert!(
+        !backup_path.exists(),
+        "backup storage should be removed after unchecked delete"
+    );
+    assert!(
+        !wal_path.exists(),
+        "WAL storage should be removed after unchecked delete"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn smoke_test() {
     let _ = env_logger::try_init();
