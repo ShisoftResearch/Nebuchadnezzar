@@ -1323,7 +1323,7 @@ impl Chunks {
         use std::ptr;
 
         // Calculate exact chunk size
-        let chunk_size = (size / count).next_power_of_two();
+        let chunk_size = size.next_power_of_two();
         let chunk_size_bits = chunk_size.trailing_zeros() as usize;
 
         // Allocate one giant mmap for all chunks
@@ -1378,7 +1378,7 @@ impl Chunks {
 
         let mut chunks = Vec::new();
         assert!(size >= SEGMENT_SIZE);
-        debug!("Creating chunks, count {} , total {} bytes", count, size);
+        debug!("Creating chunks, count {} , chunk_size {} bytes", count, size);
         for i in 0..count {
             let chunk_base = global_base_addr + (i * chunk_size);
             let backup_storage = backup_storage
