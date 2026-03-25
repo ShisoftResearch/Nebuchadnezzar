@@ -17,6 +17,17 @@ use std::time::Duration;
 
 pub mod cursor;
 
+pub(super) const MAX_RETRY_ATTEMPTS: i32 = 300;
+pub(super) const RETRY_BACKOFF_MS: u64 = 500;
+
+pub(super) fn too_many_retry_error(last_retry_reason: Option<&str>) -> RPCError {
+    let message = match last_retry_reason {
+        Some(reason) => format!("Too many retry; last retry reason: {reason}"),
+        None => "Too many retry; last retry reason: unknown".to_string(),
+    };
+    RPCError::IOError(io::Error::new(io::ErrorKind::Other, message))
+}
+
 pub struct RangedIndexerClient {
     conshash: Arc<ConsistentHashing>,
     sm: Arc<SMClient>,
@@ -168,13 +179,17 @@ impl RangedIndexerClient {
     {
         let mut ensure_updated = false;
         let mut retried: i32 = 0;
+        let mut last_retry_reason: Option<String> = None;
         loop {
-            if retried >= 300 {
+            if retried >= MAX_RETRY_ATTEMPTS {
                 // Retry attempts all failed
-                return Result::Err(RPCError::IOError(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Too many retry",
-                )));
+                warn!(
+                    "Ranged client exhausted retries for key {:?} after {} attempts; last reason: {}",
+                    key,
+                    retried,
+                    last_retry_reason.as_deref().unwrap_or("unknown")
+                );
+                return Err(too_many_retry_error(last_retry_reason.as_deref()));
             }
             let (placement, tree_client, lower, upper) =
                 self.locate_key_server(&key, ensure_updated).await?;
@@ -190,15 +205,57 @@ impl RangedIndexerClient {
                     if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await? {
                         return Ok(proc_res);
                     }
+                    last_retry_reason = Some(
+                        "successful tree operation requested another retry".to_string(),
+                    );
+                    debug!(
+                        "Ranged client retry {} for key {:?}: {}",
+                        retried + 1,
+                        key,
+                        last_retry_reason.as_deref().unwrap_or("unknown")
+                    );
                 }
                 OpResult::Migrating => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    last_retry_reason = Some("tree is migrating".to_string());
+                    debug!(
+                        "Ranged client retry {} for key {:?}: {}",
+                        retried + 1,
+                        key,
+                        last_retry_reason.as_deref().unwrap_or("unknown")
+                    );
+                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
                 }
-                OpResult::OutOfBound | OpResult::NotFound => {
+                OpResult::OutOfBound => {
+                    last_retry_reason = Some("tree placement was out of bound".to_string());
+                    debug!(
+                        "Ranged client retry {} for key {:?}: {}",
+                        retried + 1,
+                        key,
+                        last_retry_reason.as_deref().unwrap_or("unknown")
+                    );
+                    ensure_updated = true;
+                }
+                OpResult::NotFound => {
+                    last_retry_reason = Some("tree placement was not found".to_string());
+                    debug!(
+                        "Ranged client retry {} for key {:?}: {}",
+                        retried + 1,
+                        key,
+                        last_retry_reason.as_deref().unwrap_or("unknown")
+                    );
                     ensure_updated = true;
                 }
                 OpResult::EpochMissMatch(expect, actual) => {
                     debug!("Epoch mismatch, expect {}, actual {}", expect, actual);
+                    last_retry_reason = Some(format!(
+                        "tree epoch mismatch (expected {expect}, actual {actual})"
+                    ));
+                    debug!(
+                        "Ranged client retry {} for key {:?}: {}",
+                        retried + 1,
+                        key,
+                        last_retry_reason.as_deref().unwrap_or("unknown")
+                    );
                     ensure_updated = true;
                 }
             }
