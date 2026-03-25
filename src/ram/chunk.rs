@@ -1147,8 +1147,7 @@ impl Chunk {
                 // Real entries are always 8-byte aligned; non-aligned sizes indicate corruption
                 debug_assert!(entry_meta.entry_size % 8 == 0);
                 debug_assert!(entry_meta.entry_size >= ENTRY_HEAD_SIZE);
-                match entry_header.entry_type {
-                    EntryType::CELL => {
+                if entry_header.entry_type == EntryType::CELL {
                         trace!("Entry at {} is a cell", entry_meta.entry_pos);
                         let cell_header =
                             cell_header_from_entry_content_addr(entry_meta.body_pos);
@@ -1169,8 +1168,7 @@ impl Chunk {
                                 cell_header.id(), expect, actual
                             );
                         }
-                    },
-                    EntryType::TOMBSTONE => {
+                } else if entry_header.entry_type == EntryType::TOMBSTONE {
                         trace!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
@@ -1185,11 +1183,15 @@ impl Chunk {
                         } else {
                             trace!("Tombstone target at seq_id {} have been removed, will be ditched", tombstone.segment_seq_id)
                         }
-                    },
-                    _ => unreachable!("Unexpected cell type on getting live entries at {}: type {:?}, size {}, append header {}, ends at {}",
-                                entry_meta.entry_pos, entry_header.entry_type.bits(), entry_size,
-                                seg.append_header.load(Ordering::Relaxed),
-                                entry_meta.entry_pos + entry_size)
+                } else {
+                    unreachable!(
+                        "Unexpected cell type on getting live entries at {}: type {:?}, size {}, append header {}, ends at {}",
+                        entry_meta.entry_pos,
+                        entry_header.entry_type.bits(),
+                        entry_size,
+                        seg.append_header.load(Ordering::Relaxed),
+                        entry_meta.entry_pos + entry_size
+                    )
                 }
                 return None
             })

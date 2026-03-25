@@ -316,8 +316,7 @@ fn scan_segment_from_data(
         let offset = cursor - data_base;
         let virtual_cursor = segment_base + offset;
 
-        match entry_header.entry_type {
-            EntryType::CELL => {
+        if entry_header.entry_type == EntryType::CELL {
                 let content_addr = Entry::content_pos(cursor);
                 let cell_header = cell_header_from_entry_content_addr(content_addr);
                 let hash = cell_header.hash;
@@ -358,9 +357,7 @@ fn scan_segment_from_data(
                     // Existing version is newer, this entry is dead
                     dead_space += entry_header.content_length as u64;
                 }
-            }
-
-            EntryType::TOMBSTONE => {
+        } else if entry_header.entry_type == EntryType::TOMBSTONE {
                 let content_addr = Entry::content_pos(cursor);
                 let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
                 let hash = tombstone.hash;
@@ -400,9 +397,7 @@ fn scan_segment_from_data(
                         chunk_id: chunk.id,
                     });
                 }
-            }
-
-            _ => {}
+        } else {
         }
 
         append_header = prev_cursor + entry_size;
@@ -467,8 +462,7 @@ fn scan_segment_and_update_index_with_versions(
             break;
         }
 
-        match entry_header.entry_type {
-            EntryType::CELL => {
+        if entry_header.entry_type == EntryType::CELL {
                 let content_addr = Entry::content_pos(cursor);
                 let cell_header = cell_header_from_entry_content_addr(content_addr);
                 let hash = cell_header.hash;
@@ -505,9 +499,7 @@ fn scan_segment_and_update_index_with_versions(
                     drop(version_guard);
                     dead_space += entry_header.content_length as u64;
                 }
-            }
-
-            EntryType::TOMBSTONE => {
+        } else if entry_header.entry_type == EntryType::TOMBSTONE {
                 let content_addr = Entry::content_pos(cursor);
                 let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
                 let hash = tombstone.hash;
@@ -544,9 +536,7 @@ fn scan_segment_and_update_index_with_versions(
                         chunk_id: chunk.id,
                     });
                 }
-            }
-
-            _ => {}
+        } else {
         }
 
         let new_cursor = prev_cursor + entry_size;
