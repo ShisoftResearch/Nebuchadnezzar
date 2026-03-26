@@ -3693,6 +3693,82 @@ async fn hashed_query_test() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn hashed_query_rejects_map_values() {
+    const DATA_1: &'static str = "DATA_1";
+    let _ = env_logger::try_init();
+    let server_addr = String::from("127.0.0.1:6713");
+    let server_group = String::from("hashed_query_rejects_map_values");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        DATA_1,
+        Type::U64,
+        vec![IndexType::Hashed],
+    )]);
+    let schema_id = 12613;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "hashed_query_rejects_map_values",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let idx_data_client = server.indexed_data_client();
+    let err = idx_data_client
+        .hashed_query(
+            schema_id,
+            hash_str(DATA_1),
+            &OwnedValue::Map(OwnedMap::new()),
+        )
+        .await
+        .expect_err("map hashed query value should be rejected");
+
+    match err {
+        bifrost::rpc::RPCError::IOError(inner) => {
+            assert_eq!(inner.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                inner
+                    .to_string()
+                    .contains("hashed equality requires a scalar value"),
+                "unexpected error: {inner}"
+            );
+            assert!(
+                inner.to_string().contains("map"),
+                "unexpected error: {inner}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn bm25_search_returns_ranked_results() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";

@@ -453,6 +453,9 @@ impl AsyncClient {
         &self,
         schema: Schema,
     ) -> Result<Result<(), NewSchemaError>, ExecError> {
+        if let Err(err) = schema.validate_for_registration() {
+            return Ok(Err(err));
+        }
         let res = self.schema_client.new_schema(&schema).await;
         let schema_id = schema.id;
         match res {

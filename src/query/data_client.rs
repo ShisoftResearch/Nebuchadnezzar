@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
@@ -102,6 +102,33 @@ pub struct AggregateQuery {
 }
 
 impl IndexedDataClient {
+    fn hashed_query_rejects_value(value: &OwnedValue) -> bool {
+        matches!(value, OwnedValue::Map(_) | OwnedValue::Array(_) | OwnedValue::PrimArray(_))
+    }
+
+    fn hashed_query_value_kind(value: &OwnedValue) -> &'static str {
+        match value {
+            OwnedValue::Map(_) => "map",
+            OwnedValue::Array(_) => "array",
+            OwnedValue::PrimArray(_) => "primitive array",
+            _ => "scalar",
+        }
+    }
+
+    fn hashed_query_invalid_input_error(
+        schema: u32,
+        field_id: u64,
+        value: &OwnedValue,
+    ) -> RPCError {
+        RPCError::IOError(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "hashed equality requires a scalar value for schema {schema} field {field_id}, got {}",
+                Self::hashed_query_value_kind(value)
+            ),
+        ))
+    }
+
     pub fn new(
         neb_client: &Arc<AsyncClient>,
         conshash: &Arc<ConsistentHashing>,
@@ -589,6 +616,11 @@ impl IndexedDataClient {
         field_id: u64,
         value: &OwnedValue,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+        if Self::hashed_query_rejects_value(value) {
+            return Err(Self::hashed_query_invalid_input_error(
+                schema, field_id, value,
+            ));
+        }
         let index_id = Self::hashed_index_id(schema, field_id, value);
         self.index_clients
             .hashed_query(index_id, field_id, value)

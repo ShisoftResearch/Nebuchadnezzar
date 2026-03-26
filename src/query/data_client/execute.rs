@@ -159,7 +159,7 @@ impl IndexedDataClient {
             {
                 Ok(ids) => ids,
                 Err(e) => {
-                    if Self::is_special_clause(first) {
+                    if Self::is_special_clause(first) || Self::is_invalid_input_error(&e) {
                         return Err(e);
                     }
                     self.scan_schema_ids(schema, ordering).await?
@@ -173,7 +173,9 @@ impl IndexedDataClient {
                 {
                     Ok(ids) => ids,
                     Err(e) => {
-                        if Self::is_special_clause(candidate) {
+                        if Self::is_special_clause(candidate)
+                            || Self::is_invalid_input_error(&e)
+                        {
                             return Err(e);
                         }
                         candidate_ids = self.scan_schema_ids(schema, ordering).await?;
@@ -210,6 +212,13 @@ impl IndexedDataClient {
                 | IndexedClausePlan::EmbeddingSimilarity { .. }
                 | IndexedClausePlan::FullTextMatch { .. }
         )
+    }
+
+    fn is_invalid_input_error(err: &RPCError) -> bool {
+        match err {
+            RPCError::IOError(inner) => inner.kind() == io::ErrorKind::InvalidInput,
+            _ => false,
+        }
     }
 
     async fn vector_query_hits(
