@@ -151,11 +151,19 @@ impl AlignPredicate {
             ),
             Self::And(parts) => format!(
                 "(and {})",
-                parts.iter().map(Self::render_lisp).collect::<Vec<_>>().join(" ")
+                parts
+                    .iter()
+                    .map(Self::render_lisp)
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
             Self::Or(parts) => format!(
                 "(or {})",
-                parts.iter().map(Self::render_lisp).collect::<Vec<_>>().join(" ")
+                parts
+                    .iter()
+                    .map(Self::render_lisp)
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
         }
     }
@@ -170,11 +178,19 @@ impl AlignPredicate {
             ),
             Self::And(parts) => format!(
                 "({})",
-                parts.iter().map(Self::render_sql).collect::<Vec<_>>().join(" AND ")
+                parts
+                    .iter()
+                    .map(Self::render_sql)
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
             ),
             Self::Or(parts) => format!(
                 "({})",
-                parts.iter().map(Self::render_sql).collect::<Vec<_>>().join(" OR ")
+                parts
+                    .iter()
+                    .map(Self::render_sql)
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
             ),
         }
     }
@@ -322,7 +338,11 @@ struct AlignProjectedRow {
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_alignment_fixed_indexed_corpus_matches_neb() {
     let _ = env_logger::try_init();
-    let fixed_datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), interior_range_dataset()];
+    let fixed_datasets = vec![
+        edge_case_dataset(),
+        duplicate_heavy_dataset(),
+        interior_range_dataset(),
+    ];
     let server = create_alignment_test_server(6730).await;
     run_alignment_suite(
         server,
@@ -337,7 +357,11 @@ async fn sqlite_alignment_fixed_indexed_corpus_matches_neb() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_alignment_fixed_projected_indexed_corpus_matches_neb() {
     let _ = env_logger::try_init();
-    let fixed_datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), interior_range_dataset()];
+    let fixed_datasets = vec![
+        edge_case_dataset(),
+        duplicate_heavy_dataset(),
+        interior_range_dataset(),
+    ];
     let server = create_alignment_test_server(6736).await;
     run_projection_alignment_suite(
         server,
@@ -358,14 +382,7 @@ async fn sqlite_alignment_generated_indexed_corpus_matches_neb() {
         generated_dataset(0xA110_0003, 64),
     ];
     let server = create_alignment_test_server(6731).await;
-    run_alignment_suite(
-        server,
-        6731,
-        datasets,
-        AlignSchemaMode::IndexedOnly,
-        true,
-    )
-    .await;
+    run_alignment_suite(server, 6731, datasets, AlignSchemaMode::IndexedOnly, true).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -377,31 +394,46 @@ async fn sqlite_alignment_generated_projected_indexed_corpus_matches_neb() {
         generated_dataset(0xA110_4003, 64),
     ];
     let server = create_alignment_test_server(6737).await;
-    run_projection_alignment_suite(
-        server,
-        6737,
-        datasets,
-        AlignSchemaMode::IndexedOnly,
-        true,
-    )
-    .await;
+    run_projection_alignment_suite(server, 6737, datasets, AlignSchemaMode::IndexedOnly, true)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_alignment_fixed_schema_scan_corpus_matches_neb() {
     let _ = env_logger::try_init();
-    let fixed_datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), interior_range_dataset()];
+    let fixed_datasets = vec![
+        edge_case_dataset(),
+        duplicate_heavy_dataset(),
+        interior_range_dataset(),
+    ];
     let server = create_alignment_test_server(6732).await;
-    run_alignment_suite(server, 6732, fixed_datasets, AlignSchemaMode::Scannable, false).await;
+    run_alignment_suite(
+        server,
+        6732,
+        fixed_datasets,
+        AlignSchemaMode::Scannable,
+        false,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_alignment_fixed_projected_schema_scan_corpus_matches_neb() {
     let _ = env_logger::try_init();
-    let fixed_datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), interior_range_dataset()];
+    let fixed_datasets = vec![
+        edge_case_dataset(),
+        duplicate_heavy_dataset(),
+        interior_range_dataset(),
+    ];
     let server = create_alignment_test_server(6738).await;
-    run_projection_alignment_suite(server, 6738, fixed_datasets, AlignSchemaMode::Scannable, false)
-        .await;
+    run_projection_alignment_suite(
+        server,
+        6738,
+        fixed_datasets,
+        AlignSchemaMode::Scannable,
+        false,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -431,7 +463,11 @@ async fn sqlite_alignment_generated_projected_schema_scan_corpus_matches_neb() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_alignment_fixed_aggregate_corpus_matches_neb() {
     let _ = env_logger::try_init();
-    let datasets = vec![edge_case_dataset(), duplicate_heavy_dataset(), generated_dataset(0xA110_2001, 48)];
+    let datasets = vec![
+        edge_case_dataset(),
+        duplicate_heavy_dataset(),
+        generated_dataset(0xA110_2001, 48),
+    ];
     let server = create_alignment_test_server(6734).await;
     run_aggregate_alignment_suite(server, 6734, datasets, AlignSchemaMode::Scannable, false).await;
 }
@@ -665,7 +701,17 @@ async fn assert_query_alignment(
     let sql_plan = render_sql_query(query);
     let sqlite_ids = run_sqlite_query(sqlite, &sql_plan);
     if neb_ids != sqlite_ids {
-        panic!("{}", build_alignment_diff(dataset, query, &neb_lisp, &sql_plan.sql, &neb_ids, &sqlite_ids));
+        panic!(
+            "{}",
+            build_alignment_diff(
+                dataset,
+                query,
+                &neb_lisp,
+                &sql_plan.sql,
+                &neb_ids,
+                &sqlite_ids
+            )
+        );
     }
 }
 
@@ -756,12 +802,7 @@ fn render_sql_projection_query(query: &AlignProjectionQuery) -> SqlPlan {
     let mut sql = String::from("SELECT id_higher, id_lower");
     for field in &query.projection {
         let column_name = field.alias.unwrap_or(field.field.sql_name());
-        let _ = write!(
-            sql,
-            ", {} AS {}",
-            field.field.sql_name(),
-            column_name
-        );
+        let _ = write!(sql, ", {} AS {}", field.field.sql_name(), column_name);
     }
     let base = render_sql_query(&query.query);
     let suffix = base
@@ -832,10 +873,7 @@ fn run_sqlite_projection_query(
     let mut stmt = sqlite.prepare(&sql_plan.sql).unwrap();
     let rows = stmt
         .query_map([], |row| {
-            let id = Id::new(
-                row.get::<_, i64>(0)? as u64,
-                row.get::<_, i64>(1)? as u64,
-            );
+            let id = Id::new(row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64);
             let columns = query
                 .projection
                 .iter()
@@ -867,7 +905,11 @@ async fn assert_aggregate_alignment(
             schema_id,
             AggregateQuery {
                 selection,
-                group_by_fields: query.group_by_fields.iter().map(|field| field.field_id()).collect(),
+                group_by_fields: query
+                    .group_by_fields
+                    .iter()
+                    .map(|field| field.field_id())
+                    .collect(),
                 aggregates: query
                     .aggregates
                     .iter()
@@ -900,10 +942,15 @@ async fn assert_aggregate_alignment(
                         alias: None,
                     })
                 })
-                .chain(query.aggregates.iter().map(|aggregate| ProjectionItem::Aggregate {
-                    alias: aggregate.alias.to_string(),
-                    output_name: None,
-                }))
+                .chain(
+                    query
+                        .aggregates
+                        .iter()
+                        .map(|aggregate| ProjectionItem::Aggregate {
+                            alias: aggregate.alias.to_string(),
+                            output_name: None,
+                        }),
+                )
                 .collect(),
         )
         .await
@@ -957,7 +1004,10 @@ fn render_sql_aggregate_query(query: &AlignAggregateQuery) -> SqlPlan {
             (AggregateFunction::Avg, Some(field)) => format!("AVG({})", field.sql_name()),
             (AggregateFunction::Min, Some(field)) => format!("MIN({})", field.sql_name()),
             (AggregateFunction::Max, Some(field)) => format!("MAX({})", field.sql_name()),
-            _ => panic!("invalid aggregate spec for sqlite rendering: {:?}", aggregate),
+            _ => panic!(
+                "invalid aggregate spec for sqlite rendering: {:?}",
+                aggregate
+            ),
         };
         select_items.push(format!("{expr} AS {}", aggregate.alias));
     }
@@ -1116,14 +1166,70 @@ fn edge_case_dataset() -> AlignDataset {
     AlignDataset {
         name: "fixed_edge_cases".to_string(),
         rows: vec![
-            AlignRow { id: Id::new(7, 1), range_a: 1, range_b: 7, hash_value: 10, plain_value: 3, nullable_value: None },
-            AlignRow { id: Id::new(7, 2), range_a: 1, range_b: 4, hash_value: 10, plain_value: 9, nullable_value: Some(8) },
-            AlignRow { id: Id::new(7, 3), range_a: 2, range_b: 9, hash_value: 11, plain_value: 3, nullable_value: Some(1) },
-            AlignRow { id: Id::new(7, 4), range_a: 5, range_b: 2, hash_value: 12, plain_value: 6, nullable_value: None },
-            AlignRow { id: Id::new(7, 5), range_a: 5, range_b: 2, hash_value: 13, plain_value: 6, nullable_value: Some(5) },
-            AlignRow { id: Id::new(7, 6), range_a: 8, range_b: 8, hash_value: 13, plain_value: 1, nullable_value: Some(13) },
-            AlignRow { id: Id::new(7, 7), range_a: 9, range_b: 3, hash_value: 14, plain_value: 4, nullable_value: None },
-            AlignRow { id: Id::new(7, 8), range_a: 9, range_b: 5, hash_value: 15, plain_value: 4, nullable_value: Some(2) },
+            AlignRow {
+                id: Id::new(7, 1),
+                range_a: 1,
+                range_b: 7,
+                hash_value: 10,
+                plain_value: 3,
+                nullable_value: None,
+            },
+            AlignRow {
+                id: Id::new(7, 2),
+                range_a: 1,
+                range_b: 4,
+                hash_value: 10,
+                plain_value: 9,
+                nullable_value: Some(8),
+            },
+            AlignRow {
+                id: Id::new(7, 3),
+                range_a: 2,
+                range_b: 9,
+                hash_value: 11,
+                plain_value: 3,
+                nullable_value: Some(1),
+            },
+            AlignRow {
+                id: Id::new(7, 4),
+                range_a: 5,
+                range_b: 2,
+                hash_value: 12,
+                plain_value: 6,
+                nullable_value: None,
+            },
+            AlignRow {
+                id: Id::new(7, 5),
+                range_a: 5,
+                range_b: 2,
+                hash_value: 13,
+                plain_value: 6,
+                nullable_value: Some(5),
+            },
+            AlignRow {
+                id: Id::new(7, 6),
+                range_a: 8,
+                range_b: 8,
+                hash_value: 13,
+                plain_value: 1,
+                nullable_value: Some(13),
+            },
+            AlignRow {
+                id: Id::new(7, 7),
+                range_a: 9,
+                range_b: 3,
+                hash_value: 14,
+                plain_value: 4,
+                nullable_value: None,
+            },
+            AlignRow {
+                id: Id::new(7, 8),
+                range_a: 9,
+                range_b: 5,
+                hash_value: 15,
+                plain_value: 4,
+                nullable_value: Some(2),
+            },
         ],
     }
 }
@@ -1132,13 +1238,62 @@ fn duplicate_heavy_dataset() -> AlignDataset {
     AlignDataset {
         name: "fixed_duplicate_heavy".to_string(),
         rows: vec![
-            AlignRow { id: Id::new(8, 10), range_a: 3, range_b: 4, hash_value: 20, plain_value: 1, nullable_value: None },
-            AlignRow { id: Id::new(8, 11), range_a: 3, range_b: 4, hash_value: 20, plain_value: 1, nullable_value: Some(7) },
-            AlignRow { id: Id::new(8, 12), range_a: 3, range_b: 4, hash_value: 21, plain_value: 5, nullable_value: None },
-            AlignRow { id: Id::new(8, 13), range_a: 6, range_b: 4, hash_value: 22, plain_value: 5, nullable_value: Some(9) },
-            AlignRow { id: Id::new(8, 14), range_a: 6, range_b: 7, hash_value: 23, plain_value: 5, nullable_value: None },
-            AlignRow { id: Id::new(8, 15), range_a: 6, range_b: 7, hash_value: 23, plain_value: 6, nullable_value: Some(3) },
-            AlignRow { id: Id::new(8, 16), range_a: 8, range_b: 9, hash_value: 24, plain_value: 6, nullable_value: Some(12) },
+            AlignRow {
+                id: Id::new(8, 10),
+                range_a: 3,
+                range_b: 4,
+                hash_value: 20,
+                plain_value: 1,
+                nullable_value: None,
+            },
+            AlignRow {
+                id: Id::new(8, 11),
+                range_a: 3,
+                range_b: 4,
+                hash_value: 20,
+                plain_value: 1,
+                nullable_value: Some(7),
+            },
+            AlignRow {
+                id: Id::new(8, 12),
+                range_a: 3,
+                range_b: 4,
+                hash_value: 21,
+                plain_value: 5,
+                nullable_value: None,
+            },
+            AlignRow {
+                id: Id::new(8, 13),
+                range_a: 6,
+                range_b: 4,
+                hash_value: 22,
+                plain_value: 5,
+                nullable_value: Some(9),
+            },
+            AlignRow {
+                id: Id::new(8, 14),
+                range_a: 6,
+                range_b: 7,
+                hash_value: 23,
+                plain_value: 5,
+                nullable_value: None,
+            },
+            AlignRow {
+                id: Id::new(8, 15),
+                range_a: 6,
+                range_b: 7,
+                hash_value: 23,
+                plain_value: 6,
+                nullable_value: Some(3),
+            },
+            AlignRow {
+                id: Id::new(8, 16),
+                range_a: 8,
+                range_b: 9,
+                hash_value: 24,
+                plain_value: 6,
+                nullable_value: Some(12),
+            },
         ],
     }
 }
@@ -1402,7 +1557,11 @@ fn generated_aggregate_queries(dataset: &AlignDataset) -> Vec<AlignAggregateQuer
             offset: Some(2),
         },
         AlignAggregateQuery {
-            predicate: AlignPredicate::cmp(AlignField::RangeA, AlignOp::Gt, max_range_a.saturating_add(1)),
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeA,
+                AlignOp::Gt,
+                max_range_a.saturating_add(1),
+            ),
             group_by_fields: vec![],
             aggregates: vec![
                 AlignAggregateSpec {
@@ -1421,7 +1580,11 @@ fn generated_aggregate_queries(dataset: &AlignDataset) -> Vec<AlignAggregateQuer
             offset: None,
         },
         AlignAggregateQuery {
-            predicate: AlignPredicate::cmp(AlignField::RangeA, AlignOp::Gt, max_range_a.saturating_add(1)),
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeA,
+                AlignOp::Gt,
+                max_range_a.saturating_add(1),
+            ),
             group_by_fields: vec![AlignField::HashValue],
             aggregates: vec![AlignAggregateSpec {
                 func: AggregateFunction::CountStar,
@@ -1460,12 +1623,10 @@ fn projection_queries(queries: Vec<AlignQuery>) -> Vec<AlignProjectionQuery> {
                 alias: Some("nullable"),
             },
         ],
-        vec![
-            AlignProjectionField {
-                field: AlignField::RangeB,
-                alias: Some("rb"),
-            },
-        ],
+        vec![AlignProjectionField {
+            field: AlignField::RangeB,
+            alias: Some("rb"),
+        }],
         vec![
             AlignProjectionField {
                 field: AlignField::RangeA,
@@ -1543,7 +1704,11 @@ fn fixed_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
                     AlignPredicate::eq(AlignField::HashValue, dataset.rows[0].hash_value),
                     AlignPredicate::eq(AlignField::HashValue, tail.hash_value),
                 ]),
-                AlignPredicate::cmp(AlignField::RangeB, AlignOp::Gt, dataset.rows[0].range_b.saturating_sub(1)),
+                AlignPredicate::cmp(
+                    AlignField::RangeB,
+                    AlignOp::Gt,
+                    dataset.rows[0].range_b.saturating_sub(1),
+                ),
             ]),
             ordering: QueryOrdering::Desc,
             order_by_field: None,
@@ -1552,7 +1717,11 @@ fn fixed_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
         },
         AlignQuery {
             predicate: AlignPredicate::and(vec![
-                AlignPredicate::cmp(AlignField::RangeA, AlignOp::Ge, mid.range_a.saturating_sub(1)),
+                AlignPredicate::cmp(
+                    AlignField::RangeA,
+                    AlignOp::Ge,
+                    mid.range_a.saturating_sub(1),
+                ),
                 AlignPredicate::cmp(AlignField::RangeA, AlignOp::Le, tail.range_a),
                 AlignPredicate::eq(AlignField::PlainValue, mid.plain_value),
             ]),
@@ -1562,21 +1731,33 @@ fn fixed_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
             offset: None,
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::RangeA, AlignOp::Ge, dataset.rows[0].range_a),
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeA,
+                AlignOp::Ge,
+                dataset.rows[0].range_a,
+            ),
             ordering: QueryOrdering::Asc,
             order_by_field: Some(AlignField::PlainValue),
             limit: Some(8),
             offset: None,
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::RangeB, AlignOp::Ge, dataset.rows[0].range_b.min(mid.range_b)),
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeB,
+                AlignOp::Ge,
+                dataset.rows[0].range_b.min(mid.range_b),
+            ),
             ordering: QueryOrdering::Desc,
             order_by_field: Some(AlignField::NullableValue),
             limit: Some(7),
             offset: Some(1),
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::RangeA, AlignOp::Ge, dataset.rows[0].range_a),
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeA,
+                AlignOp::Ge,
+                dataset.rows[0].range_a,
+            ),
             ordering: QueryOrdering::Desc,
             order_by_field: Some(AlignField::HashValue),
             limit: Some(6),
@@ -1616,7 +1797,11 @@ fn generated_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
             offset: None,
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp_reversed(AlignField::RangeB, AlignOp::Lt, three_quarters.range_b.saturating_add(1)),
+            predicate: AlignPredicate::cmp_reversed(
+                AlignField::RangeB,
+                AlignOp::Lt,
+                three_quarters.range_b.saturating_add(1),
+            ),
             ordering: QueryOrdering::Asc,
             order_by_field: None,
             limit: Some(10),
@@ -1624,8 +1809,16 @@ fn generated_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
         },
         AlignQuery {
             predicate: AlignPredicate::and(vec![
-                AlignPredicate::cmp(AlignField::RangeA, AlignOp::Ge, first.range_a.min(half.range_a)),
-                AlignPredicate::cmp(AlignField::RangeA, AlignOp::Le, last.range_a.max(half.range_a)),
+                AlignPredicate::cmp(
+                    AlignField::RangeA,
+                    AlignOp::Ge,
+                    first.range_a.min(half.range_a),
+                ),
+                AlignPredicate::cmp(
+                    AlignField::RangeA,
+                    AlignOp::Le,
+                    last.range_a.max(half.range_a),
+                ),
                 AlignPredicate::eq(AlignField::PlainValue, half.plain_value),
             ]),
             ordering: QueryOrdering::Asc,
@@ -1635,7 +1828,11 @@ fn generated_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
         },
         AlignQuery {
             predicate: AlignPredicate::and(vec![
-                AlignPredicate::cmp(AlignField::RangeB, AlignOp::Gt, quarter.range_b.saturating_sub(1)),
+                AlignPredicate::cmp(
+                    AlignField::RangeB,
+                    AlignOp::Gt,
+                    quarter.range_b.saturating_sub(1),
+                ),
                 AlignPredicate::eq(AlignField::PlainValue, three_quarters.plain_value),
             ]),
             ordering: QueryOrdering::Desc,
@@ -1677,14 +1874,22 @@ fn generated_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
             offset: None,
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::RangeA, AlignOp::Ge, first.range_a.min(quarter.range_a)),
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeA,
+                AlignOp::Ge,
+                first.range_a.min(quarter.range_a),
+            ),
             ordering: QueryOrdering::Asc,
             order_by_field: Some(AlignField::PlainValue),
             limit: Some(10),
             offset: Some(1),
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::RangeB, AlignOp::Ge, quarter.range_b.min(half.range_b)),
+            predicate: AlignPredicate::cmp(
+                AlignField::RangeB,
+                AlignOp::Ge,
+                quarter.range_b.min(half.range_b),
+            ),
             ordering: QueryOrdering::Desc,
             order_by_field: Some(AlignField::NullableValue),
             limit: Some(9),
@@ -1730,14 +1935,22 @@ fn fixed_scan_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
             offset: Some(1),
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::PlainValue, AlignOp::Ge, first.plain_value.min(mid.plain_value)),
+            predicate: AlignPredicate::cmp(
+                AlignField::PlainValue,
+                AlignOp::Ge,
+                first.plain_value.min(mid.plain_value),
+            ),
             ordering: QueryOrdering::Desc,
             order_by_field: Some(AlignField::PlainValue),
             limit: Some(8),
             offset: Some(1),
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::PlainValue, AlignOp::Ge, first.plain_value.min(last.plain_value)),
+            predicate: AlignPredicate::cmp(
+                AlignField::PlainValue,
+                AlignOp::Ge,
+                first.plain_value.min(last.plain_value),
+            ),
             ordering: QueryOrdering::Asc,
             order_by_field: Some(AlignField::NullableValue),
             limit: Some(7),
@@ -1787,14 +2000,22 @@ fn generated_scan_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
             offset: None,
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::PlainValue, AlignOp::Ge, first.plain_value.min(quarter.plain_value)),
+            predicate: AlignPredicate::cmp(
+                AlignField::PlainValue,
+                AlignOp::Ge,
+                first.plain_value.min(quarter.plain_value),
+            ),
             ordering: QueryOrdering::Asc,
             order_by_field: Some(AlignField::PlainValue),
             limit: Some(10),
             offset: Some(2),
         },
         AlignQuery {
-            predicate: AlignPredicate::cmp(AlignField::PlainValue, AlignOp::Ge, quarter.plain_value.min(half.plain_value)),
+            predicate: AlignPredicate::cmp(
+                AlignField::PlainValue,
+                AlignOp::Ge,
+                quarter.plain_value.min(half.plain_value),
+            ),
             ordering: QueryOrdering::Desc,
             order_by_field: Some(AlignField::NullableValue),
             limit: Some(9),
@@ -1818,8 +2039,8 @@ async fn create_alignment_test_server(port: u16) -> Arc<NebServer> {
     let server_group = format!("sqlite_alignment_test_{port}");
     NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

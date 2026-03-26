@@ -25,16 +25,27 @@ pub(super) struct ValidatedAggregateSpec {
 
 #[derive(Clone, Debug)]
 enum AggregateState {
-    CountStar { count: u64 },
-    CountField { count: u64 },
+    CountStar {
+        count: u64,
+    },
+    CountField {
+        count: u64,
+    },
     Sum {
         sum: NumericAccum,
         value_type: AggregateValueType,
         seen: bool,
     },
-    Avg { sum: f64, count: u64 },
-    Min { value: Option<OwnedValue> },
-    Max { value: Option<OwnedValue> },
+    Avg {
+        sum: f64,
+        count: u64,
+    },
+    Min {
+        value: Option<OwnedValue>,
+    },
+    Max {
+        value: Option<OwnedValue>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -120,7 +131,9 @@ impl IndexedDataClient {
                     schema.field_by_id_path(&[field_id]).ok_or_else(|| {
                         RPCError::IOError(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("aggregate field {field_id} does not exist in schema {schema_id}"),
+                            format!(
+                                "aggregate field {field_id} does not exist in schema {schema_id}"
+                            ),
                         ))
                     })?;
                     None
@@ -135,7 +148,9 @@ impl IndexedDataClient {
                     let field = schema.field_by_id_path(&[field_id]).ok_or_else(|| {
                         RPCError::IOError(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("aggregate field {field_id} does not exist in schema {schema_id}"),
+                            format!(
+                                "aggregate field {field_id} does not exist in schema {schema_id}"
+                            ),
                         ))
                     })?;
                     Some(numeric_value_type(field).ok_or_else(|| {
@@ -158,14 +173,20 @@ impl IndexedDataClient {
                     let field = schema.field_by_id_path(&[field_id]).ok_or_else(|| {
                         RPCError::IOError(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("aggregate field {field_id} does not exist in schema {schema_id}"),
+                            format!(
+                                "aggregate field {field_id} does not exist in schema {schema_id}"
+                            ),
                         ))
                     })?;
-                    if field.is_array || matches!(field.data_type, Type::Map | Type::Null | Type::NA)
+                    if field.is_array
+                        || matches!(field.data_type, Type::Map | Type::Null | Type::NA)
                     {
                         return Err(RPCError::IOError(io::Error::new(
                             io::ErrorKind::InvalidInput,
-                            format!("aggregate field {field_id} must be scalar for {:?}", aggregate.func),
+                            format!(
+                                "aggregate field {field_id} must be scalar for {:?}",
+                                aggregate.func
+                            ),
                         )));
                     }
                     Some(AggregateValueType::Scalar)
@@ -237,10 +258,11 @@ impl AggregateGroupState {
         specs: &[ValidatedAggregateSpec],
     ) {
         for (state, spec) in self.states.iter_mut().zip(specs.iter()) {
-            let value = spec
-                .spec
-                .field_id
-                .and_then(|field_id| field_positions.get(&field_id).and_then(|index| row.get(*index)));
+            let value = spec.spec.field_id.and_then(|field_id| {
+                field_positions
+                    .get(&field_id)
+                    .and_then(|index| row.get(*index))
+            });
             state.accumulate(value);
         }
     }
@@ -437,7 +459,8 @@ pub(super) fn sort_aggregate_rows(rows: &mut [AggregateRow], order_by: &Aggregat
 }
 
 fn compare_aggregate_group_values(left: &AggregateRow, right: &AggregateRow) -> CmpOrdering {
-    for ((_, left_value), (_, right_value)) in left.group_values.iter().zip(right.group_values.iter())
+    for ((_, left_value), (_, right_value)) in
+        left.group_values.iter().zip(right.group_values.iter())
     {
         let ordering = compare_owned_values(left_value, right_value, QueryOrdering::Asc);
         if ordering != CmpOrdering::Equal {
@@ -452,10 +475,13 @@ fn aggregate_row_value<'a>(
     target: &AggregateOrderTarget,
 ) -> Option<&'a OwnedValue> {
     match target {
-        AggregateOrderTarget::GroupField(field_id) => row
-            .group_values
-            .iter()
-            .find_map(|(candidate_field_id, value)| (*candidate_field_id == *field_id).then_some(value)),
+        AggregateOrderTarget::GroupField(field_id) => {
+            row.group_values
+                .iter()
+                .find_map(|(candidate_field_id, value)| {
+                    (*candidate_field_id == *field_id).then_some(value)
+                })
+        }
         AggregateOrderTarget::AggregateAlias(alias) => row
             .aggregate_values
             .iter()
@@ -476,7 +502,11 @@ fn compare_optional_owned_values(
     }
 }
 
-fn compare_owned_values(left: &OwnedValue, right: &OwnedValue, ordering: QueryOrdering) -> CmpOrdering {
+fn compare_owned_values(
+    left: &OwnedValue,
+    right: &OwnedValue,
+    ordering: QueryOrdering,
+) -> CmpOrdering {
     let cmp = left.partial_cmp(right).unwrap_or(CmpOrdering::Equal);
     match ordering {
         QueryOrdering::Asc => cmp,

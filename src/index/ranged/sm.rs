@@ -8,6 +8,7 @@ use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
 use bifrost::rpc::{RPCError, ServiceClient};
 use bifrost::utils;
+use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::prelude::*;
 use std::collections::BTreeMap;
@@ -18,6 +19,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const DEFAULT_SM_ID: u64 = hash_ident!("RANGED_INDEX_SM_ID") as u64;
+
+pub fn generate_scoped_sm_id(group_name: &str, database_name: &str) -> u64 {
+    if group_name == database_name {
+        DEFAULT_SM_ID
+    } else {
+        hash_str(&format!(
+            "RANGED_INDEX_SM_ID-{}-{}",
+            group_name, database_name
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreePlacement {
@@ -36,7 +48,9 @@ pub struct MasterTreeSM {
     tree: BTreeMap<EntryKey, TreePlacement>,
     raft_svr: Arc<RaftService>,
     conshash: Arc<ConsistentHashing>,
+    tree_service_id: u64,
     persistence_path: Option<PathBuf>,
+    sm_id: u64,
 }
 
 raft_state_machine! {
@@ -139,7 +153,7 @@ impl StateMachineCmds for MasterTreeSM {
 impl StateMachineCtl for MasterTreeSM {
     raft_sm_complete!();
     fn id(&self) -> u64 {
-        DEFAULT_SM_ID
+        self.sm_id
     }
     fn snapshot(&self) -> Vec<u8> {
         utils::serde::serialize(&self.tree)
@@ -157,10 +171,32 @@ impl StateMachineCtl for MasterTreeSM {
 
 impl MasterTreeSM {
     pub fn new(raft_svr: &Arc<RaftService>, conshash: &Arc<ConsistentHashing>) -> Self {
-        Self::new_with_persistence(raft_svr, conshash, None)
+        Self::new_with_id_and_persistence(
+            DEFAULT_SM_ID,
+            DEFAULT_SERVICE_ID,
+            raft_svr,
+            conshash,
+            None,
+        )
     }
 
     pub fn new_with_persistence(
+        raft_svr: &Arc<RaftService>,
+        conshash: &Arc<ConsistentHashing>,
+        persistence_path: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_id_and_persistence(
+            DEFAULT_SM_ID,
+            DEFAULT_SERVICE_ID,
+            raft_svr,
+            conshash,
+            persistence_path,
+        )
+    }
+
+    pub fn new_with_id_and_persistence(
+        sm_id: u64,
+        tree_service_id: u64,
         raft_svr: &Arc<RaftService>,
         conshash: &Arc<ConsistentHashing>,
         persistence_path: Option<PathBuf>,
@@ -173,7 +209,9 @@ impl MasterTreeSM {
             tree: BTreeMap::new(),
             raft_svr: raft_svr.clone(),
             conshash: conshash.clone(),
+            tree_service_id,
             persistence_path: persistence_path.clone(),
+            sm_id,
         };
 
         // Try to recover from disk if persistence path is provided
@@ -235,7 +273,8 @@ impl MasterTreeSM {
         self.tree
             .insert(min_entry_key(), TreePlacement::new(genesis_id));
 
-        if let Err(e) = locate_tree_server_from_conshash(&genesis_id, &self.conshash)
+        if let Err(e) = self
+            .locate_tree_server(&genesis_id)
             .await
             .unwrap()
             .crate_tree(
@@ -376,7 +415,15 @@ impl MasterTreeSM {
     }
 
     async fn locate_tree_server(&self, id: &Id) -> Result<Arc<LSMServiceClient>, RPCError> {
-        locate_tree_server_from_conshash(id, &self.conshash).await
+        if let Some(server_id) = self.conshash.get_server_id_by(id) {
+            bifrost::rpc::DEFAULT_CLIENT_POOL
+                .get_by_id(server_id, move |sid| self.conshash.to_server_name(sid))
+                .await
+                .map_err(|e| RPCError::IOError(e))
+                .map(|rpc| LSMServiceClient::new_with_service_id(self.tree_service_id, &rpc))
+        } else {
+            Err(RPCError::RequestError(bifrost::rpc::RPCRequestError::Other))
+        }
     }
 }
 
@@ -603,5 +650,14 @@ mod tests {
 
         assert_eq!(placement.id, test_id);
         assert_eq!(placement.epoch, INITIAL_TREE_EPOCH);
+    }
+
+    #[test]
+    fn scoped_sm_id_differs_across_databases() {
+        assert_eq!(generate_scoped_sm_id("group_a", "group_a"), DEFAULT_SM_ID);
+        assert_ne!(
+            generate_scoped_sm_id("group_a", "db_a"),
+            generate_scoped_sm_id("group_a", "db_b")
+        );
     }
 }

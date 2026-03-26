@@ -13,6 +13,71 @@ use std::time::Duration;
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+pub async fn database_catalog() {
+    let _ = env_logger::try_init();
+    let server_group = "database_catalog_test";
+    let server_addr = String::from("127.0.0.1:5399");
+    let database_name = "testdb_database_catalog";
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &server_addr,
+        server_group,
+        database_name,
+        async |_| {},
+    )
+    .await;
+
+    assert_eq!(server.database_name(), database_name);
+
+    let client = Arc::new(
+        client::AsyncClient::new_for_database(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+            database_name,
+        )
+        .await
+        .unwrap(),
+    );
+
+    client.ensure_database().await.unwrap();
+
+    let database = client
+        .get_database(database_name)
+        .await
+        .unwrap()
+        .expect("database should exist");
+    assert_eq!(database.name, database_name);
+
+    client.create_database("another_db").await.unwrap().unwrap();
+    let mut databases = client
+        .get_all_databases()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    databases.sort();
+
+    assert_eq!(
+        databases,
+        vec!["another_db".to_string(), database_name.to_string()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 pub async fn general() {
     let _ = env_logger::try_init();
     let server_group = "general_test";
@@ -20,8 +85,8 @@ pub async fn general() {
     debug!("Creating new neb server");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -171,8 +236,8 @@ pub async fn multi_cell_update() {
     let server_addr = String::from("127.0.0.1:5401");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -263,6 +328,356 @@ pub async fn multi_cell_update() {
     assert_eq!(cell_1_score + cell_2_score, (thread_count * 2) as u64);
 }
 
+fn schema_validation_server_options() -> ServerOptions {
+    ServerOptions {
+        chunk_size: 16 * 1024 * 1024,
+        db_size: 16 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: None,
+        wal_storage: None,
+        undo_log_storage: None,
+        raft_storage: None,
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: false,
+    }
+}
+
+async fn schema_validation_context(
+    server_group: &str,
+    port: u16,
+) -> (Arc<NebServer>, Arc<client::AsyncClient>) {
+    let server_addr = format!("127.0.0.1:{port}");
+    let server = NebServer::new_from_opts(
+        &schema_validation_server_options(),
+        &server_addr,
+        server_group,
+        async |_| {},
+    )
+    .await;
+
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+        )
+        .await
+        .unwrap(),
+    );
+
+    (server, client)
+}
+
+async fn expect_schema_registration_ok(client: &Arc<client::AsyncClient>, schema: Schema) {
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+    let schemas = client.get_all_schema().await.unwrap();
+    assert_eq!(schemas.len(), 1, "schema should pass pre-SM validation");
+}
+
+async fn expect_invalid_schema_registration(
+    client: &Arc<client::AsyncClient>,
+    schema: Schema,
+) -> String {
+    let res = client.new_schema_with_id(schema).await.unwrap();
+    let msg = match res {
+        Err(NewSchemaError::InvalidSchema(msg)) => msg,
+        other => panic!("unexpected result: {other:?}"),
+    };
+
+    let schemas = client.get_all_schema().await.unwrap();
+    assert!(schemas.is_empty(), "schema should be rejected before SM call");
+    msg
+}
+
+fn cosine_vector_index() -> IndexType {
+    IndexType::Vector(crate::index::vector::VectorIndexConfig::new(
+        crate::index::vector::MetricEncoding::Cosine,
+    ))
+}
+
+fn test_embedding_index() -> IndexType {
+    IndexType::Embedding(crate::index::embedding::EmbeddingModel::from(
+        "test-model",
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn rejects_indexed_map_schema_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) =
+        schema_validation_context("rejects_indexed_map_schema_before_state_machine", 5411).await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "invalid_indexed_map",
+        None,
+        Field::new_schema(vec![Field::new(
+            "payload",
+            Type::Map,
+            false,
+            false,
+            Some(vec![Field::new_unindexed("value", Type::U64)]),
+            vec![IndexType::Hashed],
+        )]),
+        false,
+        false,
+    );
+
+    let msg = expect_invalid_schema_registration(&client, schema).await;
+    assert!(msg.contains("payload"), "unexpected message: {msg}");
+    assert!(
+        msg.contains("only supports null indexing"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn allows_null_index_on_map_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) =
+        schema_validation_context("allows_null_index_on_map_before_state_machine", 5413).await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "null_indexed_map",
+        None,
+        Field::new_schema(vec![Field::new(
+            "payload",
+            Type::Map,
+            false,
+            false,
+            Some(vec![Field::new_unindexed("value", Type::U64)]),
+            vec![IndexType::Null],
+        )]),
+        false,
+        false,
+    );
+
+    expect_schema_registration_ok(&client, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn rejects_ranged_string_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) =
+        schema_validation_context("rejects_ranged_string_before_state_machine", 5414).await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "invalid_ranged_string",
+        None,
+        Field::new_schema(vec![Field::new_indexed(
+            "name",
+            Type::String,
+            vec![IndexType::Ranged],
+        )]),
+        false,
+        false,
+    );
+
+    let msg = expect_invalid_schema_registration(&client, schema).await;
+    assert!(msg.contains("name"), "unexpected message: {msg}");
+    assert!(
+        msg.contains("does not support ranged indexing"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn allows_string_hash_and_embedding_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) = schema_validation_context(
+        "allows_string_hash_and_embedding_before_state_machine",
+        5415,
+    )
+    .await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "valid_string_indices",
+        None,
+        Field::new_schema(vec![
+            Field::new_indexed("tag", Type::String, vec![IndexType::Hashed]),
+            Field::new_indexed("body", Type::String, vec![test_embedding_index()]),
+        ]),
+        false,
+        false,
+    );
+
+    expect_schema_registration_ok(&client, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn allows_string_fulltext_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) =
+        schema_validation_context("allows_string_fulltext_before_state_machine", 5416).await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "valid_string_fulltext",
+        None,
+        Field::new_schema(vec![Field::new_indexed(
+            "body",
+            Type::String,
+            vec![IndexType::Fulltext],
+        )]),
+        false,
+        false,
+    );
+
+    expect_schema_registration_ok(&client, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn rejects_non_string_fulltext_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) = schema_validation_context(
+        "rejects_non_string_fulltext_before_state_machine",
+        5417,
+    )
+    .await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "invalid_u64_fulltext",
+        None,
+        Field::new_schema(vec![Field::new_indexed(
+            "body",
+            Type::U64,
+            vec![IndexType::Fulltext],
+        )]),
+        false,
+        false,
+    );
+
+    let msg = expect_invalid_schema_registration(&client, schema).await;
+    assert!(msg.contains("body"), "unexpected message: {msg}");
+    assert!(
+        msg.contains("does not support Fulltext indexing"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn allows_vector_field_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) =
+        schema_validation_context("allows_vector_field_before_state_machine", 5418).await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "valid_vector_field",
+        None,
+        Field::new_schema(vec![Field::new_indexed_vector(
+            "embedding",
+            Type::F32,
+            8,
+            vec![cosine_vector_index()],
+        )]),
+        false,
+        false,
+    );
+
+    expect_schema_registration_ok(&client, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn rejects_non_vector_field_with_vector_index_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) = schema_validation_context(
+        "rejects_non_vector_field_with_vector_index_before_state_machine",
+        5419,
+    )
+    .await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "invalid_vector_field",
+        None,
+        Field::new_schema(vec![Field::new_indexed(
+            "embedding",
+            Type::F32,
+            vec![cosine_vector_index()],
+        )]),
+        false,
+        false,
+    );
+
+    let msg = expect_invalid_schema_registration(&client, schema).await;
+    assert!(msg.contains("embedding"), "unexpected message: {msg}");
+    assert!(
+        msg.contains("requires vector_size for vector indexing"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn rejects_non_numeric_vector_field_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) = schema_validation_context(
+        "rejects_non_numeric_vector_field_before_state_machine",
+        5420,
+    )
+    .await;
+
+    let schema = Schema::new_with_id(
+        1,
+        "invalid_string_vector_field",
+        None,
+        Field::new_schema(vec![Field::new_indexed_vector(
+            "embedding",
+            Type::String,
+            8,
+            vec![cosine_vector_index()],
+        )]),
+        false,
+        false,
+    );
+
+    let msg = expect_invalid_schema_registration(&client, schema).await;
+    assert!(msg.contains("embedding"), "unexpected message: {msg}");
+    assert!(
+        msg.contains("does not support vector indexing"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn rejects_non_embedding_compound_index_before_state_machine() {
+    let _ = env_logger::try_init();
+    let (_server, client) = schema_validation_context(
+        "rejects_non_embedding_compound_index_before_state_machine",
+        5412,
+    )
+    .await;
+
+    let mut schema = Schema::new_with_id(
+        1,
+        "invalid_compound_index",
+        None,
+        Field::new_schema(vec![
+            Field::new_unindexed("title", Type::String),
+            Field::new_unindexed("body", Type::String),
+        ]),
+        false,
+        false,
+    );
+    schema.add_compound_index(
+        "title_body_hash",
+        vec!["title".to_string(), "body".to_string()],
+        vec![IndexType::Hashed],
+    );
+
+    let msg = expect_invalid_schema_registration(&client, schema).await;
+    assert!(
+        msg.contains("only supports embedding indices"),
+        "unexpected message: {msg}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn write_skew() {
     let _ = env_logger::try_init();
@@ -270,8 +685,8 @@ pub async fn write_skew() {
     let server_addr = String::from("127.0.0.1:5402");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -370,8 +785,8 @@ pub async fn server_isolation() {
 
     let server_1 = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -399,8 +814,8 @@ pub async fn server_isolation() {
 
     let server_2 = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 16 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

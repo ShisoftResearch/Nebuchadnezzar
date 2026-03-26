@@ -3,9 +3,7 @@ use bifrost::membership::client::ObserverClient;
 use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::master::ExecError;
-use bifrost::rpc::{
-    RPCClient, RPCError, Server as RPCServer, ServiceClientWithId, DEFAULT_CLIENT_POOL,
-};
+use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, ServiceClient, DEFAULT_CLIENT_POOL};
 use dovahkiin::types::OwnedValue;
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
@@ -19,9 +17,14 @@ use std::sync::Arc;
 
 use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
-use crate::ram::schema::sm::generate_sm_id;
+use crate::ram::schema::sm::generate_scoped_sm_id;
 use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
 use crate::ram::types::Id;
+use crate::server::database::client::SMClient as DatabaseCatalogClient;
+use crate::server::database::{
+    generate_sm_id as generate_database_catalog_sm_id, CreateDatabaseError, DatabaseCatalogEntry,
+    DeleteDatabaseError,
+};
 use crate::server::transactions::TxnId;
 use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
 
@@ -52,6 +55,9 @@ pub struct AsyncClient {
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient,
+    pub database_catalog_client: DatabaseCatalogClient,
+    pub group_name: String,
+    pub database_name: String,
 }
 
 impl AsyncClient {
@@ -60,6 +66,16 @@ impl AsyncClient {
         membership: &Arc<ObserverClient>,
         meta_servers: &Vec<String>,
         group: &'a str,
+    ) -> Result<Self, NebClientError> {
+        Self::new_for_database(subscription_server, membership, meta_servers, group, group).await
+    }
+
+    pub async fn new_for_database<'a>(
+        subscription_server: &Arc<RPCServer>,
+        membership: &Arc<ObserverClient>,
+        meta_servers: &Vec<String>,
+        group: &'a str,
+        database_name: &'a str,
     ) -> Result<Self, NebClientError> {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID).await {
             Ok(raft_client) => {
@@ -76,12 +92,64 @@ impl AsyncClient {
                     Ok(chash) => Ok(Self {
                         conshash: chash,
                         raft_client: raft_client.clone(),
-                        schema_client: SchemaClient::new(generate_sm_id(group), &raft_client),
+                        schema_client: SchemaClient::new(
+                            generate_scoped_sm_id(group, database_name),
+                            &raft_client,
+                        ),
+                        database_catalog_client: DatabaseCatalogClient::new(
+                            generate_database_catalog_sm_id(group),
+                            &raft_client,
+                        ),
+                        group_name: group.to_string(),
+                        database_name: database_name.to_string(),
                     }),
                     Err(err) => Err(NebClientError::ConsistentHashtableError(err)),
                 }
             }
             Err(err) => Err(NebClientError::RaftClientError(err)),
+        }
+    }
+
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    pub fn group_name(&self) -> &str {
+        &self.group_name
+    }
+
+    pub async fn get_database(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Option<DatabaseCatalogEntry>, ExecError> {
+        let name = name.into();
+        self.database_catalog_client.get_by_name(&name).await
+    }
+
+    pub async fn get_all_databases(&self) -> Result<Vec<DatabaseCatalogEntry>, ExecError> {
+        self.database_catalog_client.get_all().await
+    }
+
+    pub async fn create_database(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Result<(), CreateDatabaseError>, ExecError> {
+        self.database_catalog_client
+            .create_database(&DatabaseCatalogEntry { name: name.into() })
+            .await
+    }
+
+    pub async fn delete_database(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<Result<(), DeleteDatabaseError>, ExecError> {
+        let name = name.into();
+        self.database_catalog_client.delete_database(&name).await
+    }
+
+    pub async fn ensure_database(&self) -> Result<(), ExecError> {
+        match self.create_database(self.database_name.clone()).await? {
+            Ok(()) | Err(CreateDatabaseError::NameExists(_)) => Ok(()),
         }
     }
     pub fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
@@ -101,7 +169,12 @@ impl AsyncClient {
         &'a self,
         server_id: u64,
     ) -> impl Future<Output = Result<Arc<plain_server::AsyncServiceClient>, RPCError>> + 'a {
-        client_by_server_id(&self.conshash, server_id)
+        client_by_server_id_for_database(
+            &self.conshash,
+            server_id,
+            self.group_name(),
+            self.database_name(),
+        )
     }
 
     pub async fn locate_plain_server(
@@ -255,7 +328,13 @@ impl AsyncClient {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer),
         };
-        let txn_client = match txn_server::new_async_client(&server_name).await {
+        let txn_client = match txn_server::new_async_client_for_database(
+            &server_name,
+            self.group_name(),
+            self.database_name(),
+        )
+        .await
+        {
             Ok(client) => client,
             Err(e) => return Err(TxnError::IoError(e)),
         };
@@ -374,6 +453,9 @@ impl AsyncClient {
         &self,
         schema: Schema,
     ) -> Result<Result<(), NewSchemaError>, ExecError> {
+        if let Err(err) = schema.validate_for_registration() {
+            return Ok(Err(err));
+        }
         let res = self.schema_client.new_schema(&schema).await;
         let schema_id = schema.id;
         match res {
@@ -471,7 +553,11 @@ impl AsyncClient {
     /// let hits = ft.search(schema_id, field_id, "rust programming", 10).await?;
     /// ```
     pub fn full_text(&self) -> FullTextClient {
-        FullTextClient::new(self.conshash.clone())
+        FullTextClient::new_for_database(
+            self.conshash.clone(),
+            self.group_name(),
+            self.database_name(),
+        )
     }
 
     /// Get a ranged index query client
@@ -490,32 +576,68 @@ impl AsyncClient {
     /// }
     /// ```
     pub fn ranged(&self) -> RangedClient {
-        RangedClient::new(self.conshash.clone(), self.raft_client.clone())
+        RangedClient::new_for_database(
+            self.conshash.clone(),
+            self.raft_client.clone(),
+            self.group_name(),
+            self.database_name(),
+        )
     }
 }
 
 pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
-    plain_server::AsyncServiceClient::new(rpc)
+    client_by_rpc_client_for_database(rpc, "", "")
+}
+
+pub fn client_by_rpc_client_for_database(
+    rpc: &Arc<RPCClient>,
+    group_name: &str,
+    database_name: &str,
+) -> Arc<plain_server::AsyncServiceClient> {
+    let service_id = if group_name.is_empty() && database_name.is_empty() {
+        plain_server::DEFAULT_SERVICE_ID
+    } else {
+        plain_server::generate_scoped_service_id(group_name, database_name)
+    };
+    plain_server::AsyncServiceClient::new_with_service_id(service_id, rpc)
 }
 
 pub async fn client_by_server_id(
     conshash: &Arc<ConsistentHashing>,
     server_id: u64,
 ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+    client_by_server_id_for_database(conshash, server_id, "", "").await
+}
+
+pub async fn client_by_server_id_for_database(
+    conshash: &Arc<ConsistentHashing>,
+    server_id: u64,
+    group_name: &str,
+    database_name: &str,
+) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
         .await
         .map_err(|e| RPCError::IOError(e))
-        .map(|c| client_by_rpc_client(&c))
+        .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))
 }
 
 pub async fn client_by_server_name(
     server_id: u64,
     server_name: String,
 ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+    client_by_server_name_for_database(server_id, server_name, "", "").await
+}
+
+pub async fn client_by_server_name_for_database(
+    server_id: u64,
+    server_name: String,
+    group_name: &str,
+    database_name: &str,
+) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |_sid| server_name)
         .await
         .map_err(|e| RPCError::IOError(e))
-        .map(|c| client_by_rpc_client(&c))
+        .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))
 }

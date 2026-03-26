@@ -1,6 +1,6 @@
 use super::super::tree::service::*;
 use crate::index::ranged::{
-    client::RangedIndexerClient,
+    client::{too_many_retry_error, RangedIndexerClient, MAX_RETRY_ATTEMPTS, RETRY_BACKOFF_MS},
     trees::{max_entry_key, min_entry_key},
 };
 use crate::index::EntryKey;
@@ -119,7 +119,18 @@ impl ClientCursor {
     }
 
     async fn refill_by_next_tree(&mut self) -> Result<(), RPCError> {
+        let mut retried: i32 = 0;
+        let mut last_retry_reason: Option<String> = None;
         loop {
+            if retried >= MAX_RETRY_ATTEMPTS {
+                warn!(
+                    "Ranged cursor exhausted retries for key {:?} after {} attempts; last reason: {}",
+                    self.range.key(),
+                    retried,
+                    last_retry_reason.as_deref().unwrap_or("unknown")
+                );
+                return Err(too_many_retry_error(last_retry_reason.as_deref()));
+            }
             let current_key = self.range.key();
             debug!(
                 "Refill by next tree, key {:?}, ordering {:?}",
@@ -136,8 +147,13 @@ impl ClientCursor {
                     "Next tree for {:?} returns {:?}, lower key {:?}, ordering {:?}",
                     current_key, tree, tree_key, self.range.ordering
                 );
-                let tree_client =
-                    locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
+                let tree_client = locate_tree_server_from_conshash(
+                    &tree.id,
+                    &self.query_client.conshash,
+                    &self.query_client.group_name,
+                    &self.query_client.database_name,
+                )
+                .await?;
                 let range = Range {
                     start: RangeTerm::Inclusive(min_entry_key()),
                     end: RangeTerm::Inclusive(max_entry_key()),
@@ -173,13 +189,25 @@ impl ClientCursor {
                         return Ok(());
                     }
                     OpResult::Migrating => {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        last_retry_reason = Some("tree is migrating during cursor refill".to_string());
+                        debug!(
+                            "Ranged cursor retry {} for key {:?}: {}",
+                            retried + 1,
+                            current_key,
+                            last_retry_reason.as_deref().unwrap_or("unknown")
+                        );
+                        tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
                     }
                     OpResult::OutOfBound | OpResult::NotFound => unreachable!(),
                     OpResult::EpochMissMatch(expect, actual) => {
+                        last_retry_reason = Some(format!(
+                            "tree epoch mismatch during cursor refill (expected {expect}, actual {actual})"
+                        ));
                         debug!(
-                            "Epoch mismatch on refill, expected {}, actual {}",
-                            expect, actual
+                            "Ranged cursor retry {} for key {:?}: {}",
+                            retried + 1,
+                            current_key,
+                            last_retry_reason.as_deref().unwrap_or("unknown")
                         );
                     }
                 }
@@ -193,6 +221,7 @@ impl ClientCursor {
                 self.pos = 0;
                 return Ok(());
             }
+            retried += 1;
         }
     }
 }

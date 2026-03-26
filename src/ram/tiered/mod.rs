@@ -10,6 +10,121 @@ mod tests;
 #[cfg(test)]
 mod bench;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// Number of cache-line-padded stripes in the shared hot-segment counter.
+/// Must be a power of two.  64 covers systems up to 64 logical CPUs without
+/// any cross-stripe contention; on systems with more CPUs a few stripes will
+/// be shared, which is still far better than a single global atomic.
+const STRIPE_COUNT: usize = 64;
+const STRIPE_MASK: usize = STRIPE_COUNT - 1;
+
+/// A cache-line-padded atomic counter.
+/// `#[repr(align(64))]` puts each stripe on its own 64-byte cache line so
+/// concurrent writes to different stripes never cause false sharing.
+#[repr(align(64))]
+struct CachePadded(AtomicUsize);
+
+use std::thread;
+
+/// Returns this thread's stripe index, assigning one on first call.
+#[inline]
+fn thread_stripe() -> usize {
+    thread::current().id().as_u64().get() as usize & STRIPE_MASK
+}
+
+/// Server-wide physical memory budget shared across all databases.
+///
+/// Writes (increment / decrement) go to the stripe indexed by the calling
+/// thread's current CPU ID, so concurrent writers on different CPUs never
+/// touch the same cache line.  No per-chunk registration is required.
+///
+/// Reads (total_hot_segments) sum all stripes and are only triggered at
+/// segment-allocation boundaries (~every 8 MB of new data per chunk).
+pub struct SharedMemoryPool {
+    /// Total server-wide physical memory limit for hot segments, in bytes.
+    pub physical_memory_limit: usize,
+    /// Fraction of the limit at which eviction is triggered (0.0–1.0).
+    pub threshold: f32,
+    /// Fraction of the limit to evict down to once the threshold is crossed.
+    pub lower_watermark: f32,
+    /// Cooldown in milliseconds after promotion during which eviction skips the segment.
+    pub promotion_cooldown_ms: u64,
+    /// CPU-indexed stripe counters.
+    stripes: [CachePadded; STRIPE_COUNT],
+}
+
+impl SharedMemoryPool {
+    pub fn new(config: &TieredConfig) -> Arc<Self> {
+        Arc::new(Self {
+            physical_memory_limit: config.physical_memory_limit,
+            threshold: config.threshold,
+            lower_watermark: config.lower_watermark,
+            promotion_cooldown_ms: config.promotion_cooldown_ms,
+            stripes: std::array::from_fn(|_| CachePadded(AtomicUsize::new(0))),
+        })
+    }
+
+    /// Increment the server-wide hot-segment count by 1.
+    /// Routes to this thread's assigned stripe — a single TLS read.
+    #[inline]
+    pub fn increment(&self) {
+        self.stripes[thread_stripe()].0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement the server-wide hot-segment count by `n`, saturating at zero.
+    #[inline]
+    pub fn decrement_by(&self, n: usize) {
+        self.stripes[thread_stripe()]
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            })
+            .ok();
+    }
+
+    /// Apply a signed delta to this thread's stripe.
+    /// Used by the periodic per-chunk reconciliation scan.
+    #[inline]
+    pub fn adjust_delta(&self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let idx = thread_stripe();
+        if delta > 0 {
+            self.stripes[idx].0.fetch_add(delta as usize, Ordering::Relaxed);
+        } else {
+            self.stripes[idx]
+                .0
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub((-delta) as usize))
+                })
+                .ok();
+        }
+    }
+
+    /// Sum all stripes to get the server-wide hot segment count.
+    /// O(STRIPE_COUNT) — only called at segment-allocation boundaries.
+    #[inline]
+    pub fn total_hot_segments(&self) -> usize {
+        self.stripes
+            .iter()
+            .map(|s| s.0.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    #[inline]
+    pub fn threshold_limit(&self) -> usize {
+        (self.physical_memory_limit as f64 * self.threshold as f64) as usize
+    }
+
+    #[inline]
+    pub fn lower_watermark_limit(&self) -> usize {
+        (self.physical_memory_limit as f64 * self.lower_watermark as f64) as usize
+    }
+}
+
 /// Configuration for tiered memory management
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TieredConfig {

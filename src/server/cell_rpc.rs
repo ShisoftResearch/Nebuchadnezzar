@@ -1,12 +1,14 @@
 use crate::ram::cell::Cell;
 use crate::ram::schema::{post_schema_add, post_schema_delete};
 use crate::ram::types::Id;
-use crate::server::NebServer;
+use crate::server::DatabaseRuntime;
 use crate::{
+    client::AsyncClient,
     index::builder::IndexBuilder,
     ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
 };
 use bifrost::rpc::*;
+use bifrost_hasher::hash_str;
 use dovahkiin::expr::serde::Expr;
 use dovahkiin::expr::symbols::utils::is_true;
 use dovahkiin::integrated::lisp;
@@ -17,6 +19,10 @@ use futures::prelude::*;
 use bifrost_plugins::hash_ident;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
+
+pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
+    hash_str(&format!("NEB_CELL_RPC_SERVICE-{}-{}", group, database_name))
+}
 
 service! {
     rpc read_cell(key: Id) -> Result<OwnedCell, ReadError>;
@@ -39,17 +45,47 @@ service! {
 service_with_id!(NebRPCService, DEFAULT_SERVICE_ID);
 
 pub struct NebRPCService {
-    server: Arc<NebServer>,
+    database_runtime: Arc<DatabaseRuntime>,
+    neb_client: Arc<AsyncClient>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_cell_service_ids_differ_between_databases() {
+        let group = "group_a";
+        assert_ne!(
+            generate_scoped_service_id(group, "db_a"),
+            generate_scoped_service_id(group, "db_b")
+        );
+        assert_eq!(
+            generate_scoped_service_id(group, group),
+            generate_scoped_service_id(group, group)
+        );
+    }
 }
 
 impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
-        future::ready(self.server.chunks.read_cell(&key).map(|c| c.to_owned())).boxed()
+        future::ready(
+            self.database_runtime
+                .chunks()
+                .read_cell(&key)
+                .map(|c| c.to_owned()),
+        )
+        .boxed()
     }
     fn read_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         future::ready(
             keys.into_iter()
-                .map(|id| self.server.chunks.read_cell(&id).map(|c| c.to_owned()))
+                .map(|id| {
+                    self.database_runtime
+                        .chunks()
+                        .read_cell(&id)
+                        .map(|c| c.to_owned())
+                })
                 .collect(),
         )
         .boxed()
@@ -63,8 +99,8 @@ impl Service for NebRPCService {
         future::ready(
             keys.into_iter()
                 .map(|id| {
-                    self.server
-                        .chunks
+                    self.database_runtime
+                        .chunks()
                         .read_selected(&id, colums.as_slice(), need_header)
                         .map(|c| c.to_owned())
                 })
@@ -79,28 +115,28 @@ impl Service for NebRPCService {
         need_header: bool,
     ) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
         future::ready(
-            self.server
-                .chunks
+            self.database_runtime
+                .chunks()
                 .read_selected(&id, fields.as_slice(), need_header)
                 .map(|c| c.to_owned()),
         )
         .boxed()
     }
     fn head_cell(&self, key: Id) -> BoxFuture<'_, Result<CellHeader, ReadError>> {
-        future::ready(self.server.chunks.head_cell(&key)).boxed()
+        future::ready(self.database_runtime.chunks().head_cell(&key)).boxed()
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.server.chunks.write_cell(&mut cell))
+        self.with_indices_ensured(self.database_runtime.chunks().write_cell(&mut cell))
     }
 
     fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.server.chunks.update_cell(&mut cell))
+        self.with_indices_ensured(self.database_runtime.chunks().update_cell(&mut cell))
     }
     fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
-        self.with_indices_ensured(self.server.chunks.remove_cell(&key))
+        self.with_indices_ensured(self.database_runtime.chunks().remove_cell(&key))
     }
     fn upsert_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.server.chunks.upsert_cell(&mut cell))
+        self.with_indices_ensured(self.database_runtime.chunks().upsert_cell(&mut cell))
     }
     fn compare_version_and_update_cell(
         &self,
@@ -109,8 +145,8 @@ impl Service for NebRPCService {
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(
-            self.server
-                .chunks
+            self.database_runtime
+                .chunks()
                 .compare_version_and_update_cell(&key, version, &mut cell),
         )
     }
@@ -122,13 +158,13 @@ impl Service for NebRPCService {
         value: OwnedValue,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(
-            self.server
-                .chunks
+            self.database_runtime
+                .chunks()
                 .compare_version_and_set_field(&key, version, field, value),
         )
     }
     fn count(&self) -> BoxFuture<'_, u64> {
-        future::ready(self.server.chunks.count() as u64).boxed()
+        future::ready(self.database_runtime.chunks().count() as u64).boxed()
     }
 
     fn read_all_cells_proced(
@@ -159,10 +195,10 @@ impl Service for NebRPCService {
         let mut cells: Vec<Result<OwnedCell, ReadError>> = Vec::with_capacity(keys.len());
         for id in keys.iter() {
             let cell_res = if colums.is_empty() {
-                self.server.chunks.read_cell(id)
+                self.database_runtime.chunks.read_cell(id)
             } else {
-                self.server
-                    .chunks
+                self.database_runtime
+                    .chunks()
                     .read_selected(id, colums.as_slice(), true)
             };
             let owned = cell_res.and_then(|cell| {
@@ -220,13 +256,12 @@ impl Service for NebRPCService {
     fn post_schema_add<'a>(&'a self, schema_id: u32) -> BoxFuture<'a, Result<(), String>> {
         async move {
             let schema = self
-                .server
                 .neb_client
                 .schema_by_id(schema_id)
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(schema) = schema {
-                post_schema_add(&schema, &self.server).await
+                post_schema_add(&schema, &self.database_runtime).await
             } else {
                 Err(format!(
                     "Schema not found for post_schema_add {}",
@@ -240,13 +275,12 @@ impl Service for NebRPCService {
     fn post_schema_delete<'a>(&'a self, schema_id: u32) -> BoxFuture<'a, Result<(), String>> {
         async move {
             let schema = self
-                .server
                 .neb_client
                 .schema_by_id(schema_id)
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(schema) = schema {
-                post_schema_delete(&schema, &self.server).await
+                post_schema_delete(&schema, &self.database_runtime).await
             } else {
                 Err(format!(
                     "Schema not found for post_schema_delete {}",
@@ -261,16 +295,20 @@ impl Service for NebRPCService {
 dispatch_rpc_service_functions!(NebRPCService);
 
 impl NebRPCService {
-    pub fn new(server: &Arc<NebServer>) -> Arc<NebRPCService> {
+    pub fn new(
+        database_runtime: Arc<DatabaseRuntime>,
+        neb_client: Arc<AsyncClient>,
+    ) -> Arc<NebRPCService> {
         Arc::new(NebRPCService {
-            server: server.clone(),
+            database_runtime,
+            neb_client,
         })
     }
     fn with_indices_ensured<'a, R>(&'a self, res: R) -> BoxFuture<'a, R>
     where
         R: Send + 'a,
     {
-        if self.server.indexer.is_some() {
+        if self.database_runtime.indexer().is_some() {
             IndexBuilder::await_indices().map(|_| res).boxed()
         } else {
             future::ready(res).boxed()

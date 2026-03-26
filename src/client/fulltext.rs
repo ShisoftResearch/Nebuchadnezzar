@@ -36,20 +36,37 @@ use crate::index::full_text::BM25Hit;
 pub struct FullTextClient {
     conshash: Arc<ConsistentHashing>,
     client_pool: Arc<ClientPool>,
+    group_name: String,
+    database_name: String,
 }
 
 impl FullTextClient {
     /// Create a new full-text client
     pub fn new(conshash: Arc<ConsistentHashing>) -> Self {
+        Self::new_for_database(conshash, "", "")
+    }
+
+    pub fn new_for_database(
+        conshash: Arc<ConsistentHashing>,
+        group_name: &str,
+        database_name: &str,
+    ) -> Self {
         Self {
             conshash,
             client_pool: Arc::new(ClientPool::new()),
+            group_name: group_name.to_string(),
+            database_name: database_name.to_string(),
         }
     }
 
     /// Create the coordinator for search operations
     fn coordinator(&self) -> DistributedInvertedIndexCoordinator {
-        DistributedInvertedIndexCoordinator::new(self.conshash.clone(), self.client_pool.clone())
+        DistributedInvertedIndexCoordinator::new(
+            self.conshash.clone(),
+            self.client_pool.clone(),
+            self.group_name.clone(),
+            self.database_name.clone(),
+        )
     }
 
     /// Search for documents matching the query

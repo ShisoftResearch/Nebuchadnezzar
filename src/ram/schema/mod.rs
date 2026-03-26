@@ -12,7 +12,7 @@ use std::mem;
 use crate::index::embedding::EmbeddingModel;
 use crate::index::vector::VectorIndexConfig;
 use crate::ram::io::align_address;
-use crate::server::NebServer;
+use crate::server::DatabaseRuntime;
 use crate::utils::thread_id;
 
 use super::types;
@@ -205,6 +205,30 @@ impl Schema {
     pub fn refresh_compression_plan(&mut self) {
         self.compression_plan = SchemaCompressionPlan::from_schema(self);
     }
+
+    pub fn validate_for_registration(&self) -> Result<(), NewSchemaError> {
+        self.fields.validate_for_registration("*")?;
+
+        for (compound_id, compound) in &self.compound_index_fields {
+            for field_id in &compound.field_ids {
+                if !self.id_index.contains_key(field_id) {
+                    return Err(NewSchemaError::InvalidSchema(format!(
+                        "compound index {compound_id} references unknown field {field_id}"
+                    )));
+                }
+            }
+
+            for index in &compound.indices {
+                if !matches!(index, IndexType::Embedding(_)) {
+                    return Err(NewSchemaError::InvalidSchema(format!(
+                        "compound index {compound_id} only supports embedding indices"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -318,6 +342,99 @@ impl Field {
     pub fn new_unindexed_vector_nullable(name: &str, data_type: Type, vector_size: u16) -> Field {
         Self::new_vector(name, data_type, vector_size, vec![], true)
     }
+
+    fn validate_for_registration(&self, path: &str) -> Result<(), NewSchemaError> {
+        for index in &self.indices {
+            self.validate_index_for_registration(path, index)?;
+        }
+
+        if let Some(sub_fields) = self.sub_fields.as_ref() {
+            for field in sub_fields {
+                let child_path = if path == "*" {
+                    field.name.clone()
+                } else {
+                    format!("{path}.{}", field.name)
+                };
+                field.validate_for_registration(&child_path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_index_for_registration(
+        &self,
+        path: &str,
+        index: &IndexType,
+    ) -> Result<(), NewSchemaError> {
+        match index {
+            IndexType::Null => Ok(()),
+            IndexType::Hashed => {
+                if self.data_type == Type::Map {
+                    Err(NewSchemaError::InvalidSchema(format!(
+                        "field {path} is a map and only supports null indexing"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            IndexType::Ranged => {
+                if self.data_type == Type::Map {
+                    Err(NewSchemaError::InvalidSchema(format!(
+                        "field {path} is a map and only supports null indexing"
+                    )))
+                } else if self.data_type == Type::String {
+                    Err(NewSchemaError::InvalidSchema(format!(
+                        "field {path} with type String does not support ranged indexing"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            IndexType::Embedding(_) | IndexType::Fulltext => {
+                if self.data_type != Type::String {
+                    Err(NewSchemaError::InvalidSchema(format!(
+                        "field {path} with type {:?} does not support {:?} indexing",
+                        self.data_type, index
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            IndexType::Vector(_) => {
+                if self.vector_size.is_none() {
+                    Err(NewSchemaError::InvalidSchema(format!(
+                        "field {path} requires vector_size for vector indexing"
+                    )))
+                } else if !Self::supports_vector_element_type(self.data_type) {
+                    Err(NewSchemaError::InvalidSchema(format!(
+                        "field {path} with type {:?} does not support vector indexing",
+                        self.data_type
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            IndexType::Statistics => Ok(()),
+        }
+    }
+
+    fn supports_vector_element_type(data_type: Type) -> bool {
+        matches!(
+            data_type,
+            Type::I8
+                | Type::I16
+                | Type::I32
+                | Type::I64
+                | Type::U8
+                | Type::U16
+                | Type::U32
+                | Type::U64
+                | Type::F32
+                | Type::F64
+        )
+    }
+
     pub fn new_vector(
         name: &str,
         data_type: Type,
@@ -481,11 +598,20 @@ impl LocalSchemasCache {
         group: &str,
         raft_client: &Arc<RaftClient>,
     ) -> Result<LocalSchemasCache, ExecError> {
+        Self::new_for_database(group, group, raft_client).await
+    }
+
+    pub async fn new_for_database(
+        group: &str,
+        database_name: &str,
+        raft_client: &Arc<RaftClient>,
+    ) -> Result<LocalSchemasCache, ExecError> {
         info!("Initializing local schema cache");
         let map = Arc::new(LocalSchemasMap::new());
         let m1 = map.clone();
         let m2 = map.clone();
-        let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft_client);
+        let sm =
+            sm::client::SMClient::new(sm::generate_scoped_sm_id(group, database_name), raft_client);
         let sm_data = sm.get_all().await?;
         {
             debug!("Importing {} schemas from cluster", sm_data.len());
@@ -587,6 +713,7 @@ impl LocalSchemasCache {
 pub enum NewSchemaError {
     NameExists(String),
     IdExists(u32),
+    InvalidSchema(String),
     NotifyError(NotifyError),
     PostProcessError(String),
 }
@@ -691,14 +818,17 @@ impl<O, T: ?Sized> Deref for ReadingRef<O, T> {
     }
 }
 
-pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Result<(), String> {
+pub async fn post_schema_add(
+    schema: &Schema,
+    database_runtime: &Arc<DatabaseRuntime>,
+) -> Result<(), String> {
     for (field, indices) in &schema.index_fields {
         for index in indices {
             let field_id = *field;
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    if let Some(indexer) = &neb_server.indexer {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -710,7 +840,7 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
                     }
                 }
                 IndexType::Embedding(model) => {
-                    if let Some(indexer) = &neb_server.indexer {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -731,7 +861,7 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    if let Some(indexer) = &neb_server.indexer {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -743,7 +873,7 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
                     }
                 }
                 IndexType::Embedding(model) => {
-                    if let Some(indexer) = &neb_server.indexer {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -763,7 +893,7 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
 
 pub async fn post_schema_delete(
     schema: &Schema,
-    neb_server: &Arc<NebServer>,
+    database_runtime: &Arc<DatabaseRuntime>,
 ) -> Result<(), String> {
     for (field, indices) in &schema.index_fields {
         for index in indices {
@@ -771,7 +901,7 @@ pub async fn post_schema_delete(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(_config) => {
-                    if let Some(indexer) = &neb_server.indexer {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -783,7 +913,7 @@ pub async fn post_schema_delete(
                     }
                 }
                 IndexType::Embedding(_model) => {
-                    if let Some(indexer) = &neb_server.indexer {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client
@@ -804,7 +934,7 @@ pub async fn post_schema_delete(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(_config) => {
-                    if let Some(indexer) = &neb_server.indexer {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
@@ -816,7 +946,7 @@ pub async fn post_schema_delete(
                     }
                 }
                 IndexType::Embedding(_model) => {
-                    if let Some(indexer) = &neb_server.indexer {
+                    if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client

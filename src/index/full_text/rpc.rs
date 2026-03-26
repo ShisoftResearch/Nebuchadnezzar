@@ -5,6 +5,7 @@
 /// 2. Aggregate results from multiple nodes
 /// 3. Return partial results for distributed BM25 scoring
 use bifrost::rpc::*;
+use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -14,6 +15,17 @@ use super::{shard::InvertedIndexer, BM25Hit};
 use crate::ram::types::Id;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_INVERTED_INDEX_RPC_SERVICE) as u64;
+
+pub fn generate_scoped_service_id(group_name: &str, database_name: &str) -> u64 {
+    if group_name == database_name || group_name.is_empty() || database_name.is_empty() {
+        DEFAULT_SERVICE_ID
+    } else {
+        hash_str(&format!(
+            "NEB_INVERTED_INDEX_RPC_SERVICE-{}-{}",
+            group_name, database_name
+        ))
+    }
+}
 
 /// Error type for inverted index RPC operations
 #[derive(Debug, Clone, Serialize, Deserialize)]

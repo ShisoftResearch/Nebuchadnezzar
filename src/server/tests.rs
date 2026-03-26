@@ -37,8 +37,8 @@ pub async fn init() {
     let _ = env_logger::try_init();
     NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024, // 64 MB - must be >= SEGMENT_SIZE (8 MB)
+            chunk_size: 64 * 1024 * 1024, // 64 MB - must be >= SEGMENT_SIZE (8 MB)
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -55,6 +55,416 @@ pub async fn init() {
     .await;
 }
 
+#[tokio::test]
+pub async fn explicit_database_binding_scopes_storage_roots() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let backup_root = temp_dir.path().join("backup");
+    let wal_root = temp_dir.path().join("wal");
+    let undo_root = temp_dir.path().join("undo");
+    let raft_root = temp_dir.path().join("raft");
+    let database_name = "analytics/db";
+    let scoped_db_dir = "analytics_db";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(backup_root.to_string_lossy().to_string()),
+            wal_storage: Some(wal_root.to_string_lossy().to_string()),
+            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
+            raft_storage: Some(raft_root.to_string_lossy().to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5101"),
+        "storage_scope_group",
+        database_name,
+        async |_| {},
+    )
+    .await;
+
+    assert_eq!(server.database_name(), database_name);
+    assert!(
+        backup_root.join("databases").join(scoped_db_dir).exists(),
+        "backup path should be scoped per database"
+    );
+    assert!(
+        wal_root.join("databases").join(scoped_db_dir).exists(),
+        "wal path should be scoped per database"
+    );
+    assert!(
+        undo_root.join("databases").join(scoped_db_dir).exists(),
+        "undo path should be scoped per database"
+    );
+    assert!(
+        raft_root.join("databases").join(scoped_db_dir).exists(),
+        "raft path should be scoped per database"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+pub async fn resolves_bound_database_runtime_by_name() {
+    let _ = env_logger::try_init();
+    let database_name = "analytics";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5102"),
+        "database_runtime_lookup_group",
+        database_name,
+        async |_| {},
+    )
+    .await;
+
+    let looked_up_runtime = server
+        .database(database_name)
+        .expect("database runtime should be registered under its database name");
+    assert!(Arc::ptr_eq(&looked_up_runtime, &server.database_runtime));
+    assert!(Arc::ptr_eq(
+        &server.current_database(),
+        &server.database_runtime
+    ));
+    assert_eq!(server.database_names(), vec![database_name.to_string()]);
+    assert_eq!(looked_up_runtime.database_name(), database_name);
+    assert_eq!(
+        looked_up_runtime.group_name(),
+        "database_runtime_lookup_group"
+    );
+    let _ = looked_up_runtime
+        .data_client(&vec![String::from("127.0.0.1:5102")])
+        .await
+        .expect("database runtime should create a bound async client");
+    let _ = looked_up_runtime.indexed_data_client();
+    assert!(
+        server.database("missing").is_none(),
+        "unknown database names must not resolve to a runtime"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host() {
+    let _ = env_logger::try_init();
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5103"),
+        "dynamic_database_runtime_group",
+        async |_| {},
+    )
+    .await;
+
+    let default_runtime = server.current_database();
+    let analytics_runtime = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("new database runtime should be created on demand");
+
+    assert_eq!(analytics_runtime.database_name(), "analytics");
+    assert_eq!(
+        analytics_runtime.group_name(),
+        "dynamic_database_runtime_group"
+    );
+    assert!(
+        !Arc::ptr_eq(&default_runtime, &analytics_runtime),
+        "new database runtime should be distinct from the default runtime"
+    );
+    assert!(Arc::ptr_eq(
+        &analytics_runtime,
+        &server
+            .database("analytics")
+            .expect("new runtime should be inserted into the runtime registry")
+    ));
+
+    let all_databases = server
+        .neb_client
+        .get_all_databases()
+        .await
+        .expect("database catalog should stay readable");
+    assert!(
+        all_databases.iter().any(|entry| entry.name == "analytics"),
+        "new runtime creation should settle the database catalog entry"
+    );
+
+    let names = server.database_names();
+    assert!(names
+        .iter()
+        .any(|name| name == "dynamic_database_runtime_group"));
+    assert!(names.iter().any(|name| name == "analytics"));
+
+    let analytics_client = analytics_runtime
+        .data_client(&vec![String::from("127.0.0.1:5103")])
+        .await
+        .expect("new database runtime should create a bound client");
+    assert_eq!(analytics_client.database_name(), "analytics");
+
+    let analytics_runtime_again = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("database runtime creation should be idempotent");
+    assert!(Arc::ptr_eq(&analytics_runtime, &analytics_runtime_again));
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+pub async fn unload_database_runtime_evicts_non_default_runtime() {
+    let _ = env_logger::try_init();
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction, Service::RangedIndexer],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5104"),
+        "runtime_unload_group",
+        async |_| {},
+    )
+    .await;
+
+    let analytics_runtime = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("database runtime should be created before unload");
+    assert!(server.database("analytics").is_some());
+
+    assert!(
+        server.unload_database_runtime("analytics").await,
+        "unload should return true for a registered non-default runtime"
+    );
+    assert!(
+        server.database("analytics").is_none(),
+        "runtime should be removed from the registry after unload"
+    );
+    assert!(
+        !server.unload_database_runtime("runtime_unload_group").await,
+        "default runtime must not be unloaded"
+    );
+
+    let analytics_runtime_reloaded = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("database runtime should be recreated after unload");
+    assert!(
+        !Arc::ptr_eq(&analytics_runtime, &analytics_runtime_reloaded),
+        "reloaded runtime should be a fresh Arc after unload"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+pub async fn delete_database_storage_removes_scoped_paths() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let backup_root = temp_dir.path().join("backup");
+    let wal_root = temp_dir.path().join("wal");
+    let undo_root = temp_dir.path().join("undo");
+    let raft_root = temp_dir.path().join("raft");
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(backup_root.to_string_lossy().to_string()),
+            wal_storage: Some(wal_root.to_string_lossy().to_string()),
+            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
+            raft_storage: Some(raft_root.to_string_lossy().to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5105"),
+        "runtime_delete_storage_group",
+        "runtime_delete_storage_group",
+        async |_| {},
+    )
+    .await;
+
+    server
+        .ensure_database_runtime("analytics/db")
+        .await
+        .expect("database runtime should be created before deleting storage");
+    assert!(server.unload_database_runtime("analytics/db").await);
+
+    let scoped_db_dir = "analytics_db";
+    let backup_path = backup_root.join("databases").join(scoped_db_dir);
+    let wal_path = wal_root.join("databases").join(scoped_db_dir);
+    let undo_path = undo_root.join("databases").join(scoped_db_dir);
+    let raft_path = raft_root.join("databases").join(scoped_db_dir);
+
+    std::fs::create_dir_all(&backup_path).unwrap();
+    std::fs::create_dir_all(&wal_path).unwrap();
+    std::fs::create_dir_all(&undo_path).unwrap();
+    std::fs::create_dir_all(&raft_path).unwrap();
+
+    assert!(backup_path.exists());
+    assert!(wal_path.exists());
+    assert!(undo_path.exists());
+    assert!(raft_path.exists());
+
+    server
+        .delete_database_storage("analytics/db")
+        .expect("storage delete should succeed for scoped runtime");
+
+    assert!(!backup_path.exists());
+    assert!(!wal_path.exists());
+    assert!(!undo_path.exists());
+    assert!(!raft_path.exists());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+pub async fn unload_database_runtime_unchecked_allows_default() {
+    let _ = env_logger::try_init();
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5106"),
+        "runtime_unchecked_unload_group",
+        async |_| {},
+    )
+    .await;
+
+    let default_name = server.database_name().to_string();
+
+    // Regular unload must be blocked for the default database
+    assert!(
+        !server.unload_database_runtime(&default_name).await,
+        "regular unload must not evict the default runtime"
+    );
+    assert!(
+        server.database(&default_name).is_some(),
+        "default runtime must still be present after blocked unload"
+    );
+
+    // Unchecked unload must succeed
+    assert!(
+        server.unload_database_runtime_unchecked(&default_name).await,
+        "unchecked unload must evict the default runtime"
+    );
+    assert!(
+        server.database(&default_name).is_none(),
+        "default runtime must be gone after unchecked unload"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+pub async fn delete_database_storage_unchecked_allows_default() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let backup_root = temp_dir.path().join("backup");
+    let wal_root = temp_dir.path().join("wal");
+    let undo_root = temp_dir.path().join("undo");
+    let raft_root = temp_dir.path().join("raft");
+
+    let group = "default_storage_unchecked_group";
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: Some(backup_root.to_string_lossy().to_string()),
+            wal_storage: Some(wal_root.to_string_lossy().to_string()),
+            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
+            raft_storage: Some(raft_root.to_string_lossy().to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5107"),
+        group,
+        group,
+        async |_| {},
+    )
+    .await;
+
+    let default_name = server.database_name().to_string();
+
+    // Regular delete must be blocked for the default database
+    assert!(
+        server.delete_database_storage(&default_name).is_err(),
+        "regular storage delete must be blocked for the default database"
+    );
+
+    // Unload the default runtime first so storage can be wiped
+    server.unload_database_runtime_unchecked(&default_name).await;
+
+    // Create the scoped storage directories as the runtime would have
+    let scoped_db_dir = default_name.replace('/', "_");
+    let backup_path = backup_root.join("databases").join(&scoped_db_dir);
+    let wal_path = wal_root.join("databases").join(&scoped_db_dir);
+    std::fs::create_dir_all(&backup_path).unwrap();
+    std::fs::create_dir_all(&wal_path).unwrap();
+
+    // Unchecked delete must succeed
+    server
+        .delete_database_storage_unchecked(&default_name)
+        .expect("unchecked storage delete must succeed for the default database");
+
+    assert!(
+        !backup_path.exists(),
+        "backup storage should be removed after unchecked delete"
+    );
+    assert!(
+        !wal_path.exists(),
+        "WAL storage should be removed after unchecked delete"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn smoke_test() {
     let _ = env_logger::try_init();
@@ -67,8 +477,8 @@ pub async fn smoke_test() {
     let server_group = String::from("smoke_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 512 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -148,8 +558,8 @@ pub async fn smoke_test_parallel() {
     let server_group = String::from("smoke_parallel_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 16 * 1024 * 1024 * 1024,
+            chunk_size: 4 * 1024 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -248,8 +658,8 @@ pub async fn txn() {
     let server_group = String::from("bench_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 512 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -320,8 +730,8 @@ pub async fn schema_wal_recovery_test() {
     {
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -434,8 +844,8 @@ pub async fn schema_wal_recovery_test() {
     {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -524,8 +934,8 @@ pub async fn schema_snapshot_recovery_test() {
     {
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -659,8 +1069,8 @@ pub async fn schema_snapshot_recovery_test() {
     {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -770,8 +1180,8 @@ pub async fn schema_persistence_multiple_restarts() {
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -839,8 +1249,8 @@ pub async fn schema_persistence_multiple_restarts() {
         let server_addr = String::from("127.0.0.1:19004"); // Unique port for final verification
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -892,8 +1302,8 @@ pub async fn memory_status_test() {
     // Create server with tiered memory enabled
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 128 * 1024 * 1024, // 128 MB
+            chunk_size: 32 * 1024 * 1024,
+            db_size: 128 * 1024 * 1024, // 128 MB
             tiered_config: Some(crate::ram::tiered::TieredConfig::with_memory_limit(
                 64 * 1024 * 1024, // 64 MB physical limit
             )),

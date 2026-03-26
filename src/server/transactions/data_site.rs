@@ -2,13 +2,14 @@ use super::*;
 use crate::ram::cell::{header_from_chunk_raw, OwnedCellRef};
 use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
-use crate::server::NebServer;
+use crate::server::{DatabaseRuntime, Peer};
 use crate::{
     index::builder::IndexBuilder,
     ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
 };
 use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
+use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use lightning::linked_list::LinkedList;
@@ -20,6 +21,13 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
+
+pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
+    hash_str(&format!(
+        "TXN_DATA_MANAGER_RPC_SERVICE-{}-{}",
+        group, database_name
+    ))
+}
 
 // Lock timeout in milliseconds - locks held longer than this are considered stale
 // and can be reclaimed (default: 30 seconds)
@@ -90,7 +98,8 @@ pub struct DataManager {
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: LinkedList<Id>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
-    server: Arc<NebServer>,
+    database_runtime: Arc<DatabaseRuntime>,
+    txn_peer: Peer,
     cleanup_signal: Arc<AtomicBool>,
 }
 
@@ -116,14 +125,15 @@ dispatch_rpc_service_functions!(DataManager);
 service_with_id!(DataManager, DEFAULT_SERVICE_ID);
 
 impl DataManager {
-    pub fn new(server: &Arc<NebServer>) -> Arc<Self> {
+    pub fn new(database_runtime: Arc<DatabaseRuntime>, txn_peer: Peer) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             cells: LFMap::with_capacity(256),
             txns: LFMap::with_capacity(128),
             cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
-            server: server.clone(),
+            database_runtime,
+            txn_peer,
             cleanup_signal: cleanup_signal.clone(),
         });
         let manager_clone = manager.clone();
@@ -138,12 +148,12 @@ impl DataManager {
         });
 
         // Spawn undo log trimming task if undo log is enabled
-        if server.undo_log.is_some() {
-            let server_clone = server.clone();
+        if manager.undo_log().is_some() {
+            let manager_clone = manager.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(300)).await; // Trim every 5 minutes
-                    if let Some(ref undo_log) = server_clone.undo_log {
+                    if let Some(undo_log) = manager_clone.undo_log() {
                         if let Err(e) = undo_log.trim_old_logs() {
                             error!("Failed to trim undo logs: {:?}", e);
                         } else {
@@ -157,10 +167,10 @@ impl DataManager {
         return manager;
     }
     fn update_clock(&self, clock: &StandardVectorClock) {
-        self.server.txn_peer.clock.merge_with(clock);
+        self.txn_peer.clock.merge_with(clock);
     }
     #[inline]
-    fn get_transaction(&self, tid: &TxnId) -> TxnMutex {
+    fn get_or_create_transaction(&self, tid: &TxnId) -> TxnMutex {
         // Fast path: transaction already exists
         if let Some(txn) = self.txns.get(tid) {
             return txn;
@@ -168,6 +178,10 @@ impl DataManager {
 
         // Slow path: create new transaction
         self.create_transaction(tid)
+    }
+    #[inline]
+    fn find_transaction(&self, tid: &TxnId) -> Option<TxnMutex> {
+        self.txns.get(tid)
     }
 
     #[cold]
@@ -212,7 +226,17 @@ impl DataManager {
     where
         T: 'static,
     {
-        future::ready(DataSiteResponse::new(&self.server.txn_peer, data)).boxed()
+        future::ready(DataSiteResponse::new(&self.txn_peer, data)).boxed()
+    }
+
+    #[inline]
+    fn chunks(&self) -> &Arc<crate::ram::chunk::Chunks> {
+        self.database_runtime.chunks()
+    }
+
+    #[inline]
+    fn undo_log(&self) -> Option<&Arc<super::undo_log::UndoLogger>> {
+        self.database_runtime.undo_log()
     }
 
     /// Create a segment reference guard to prevent eviction during transaction.
@@ -224,7 +248,7 @@ impl DataManager {
         chunk_idx: usize,
         segment_id: u64,
     ) -> Option<SegmentReferenceGuard> {
-        if let Some(chunk) = self.server.chunks.list.get(chunk_idx) {
+        if let Some(chunk) = self.chunks().list.get(chunk_idx) {
             if let Some(segment) = chunk.segs.get(&(segment_id as usize)) {
                 return Some(SegmentReferenceGuard::new(segment));
             }
@@ -243,14 +267,12 @@ impl DataManager {
             let current_ver = history.current_version;
             let error = if cell.is_none() {
                 // the cell was created, need to remove
-                self.server
-                    .chunks
+                self.chunks()
                     .remove_cell_by(id, |cell| cell.header.version == current_ver)
                     .err()
             } else if current_ver > 0 {
                 // the cell was updated, need to update back
-                self.server
-                    .chunks
+                self.chunks()
                     .update_cell_by(id, |cell_to_update| {
                         if cell_to_update.header.version == current_ver {
                             cell.as_ref().map(|r| r.clone_referred())
@@ -262,7 +284,7 @@ impl DataManager {
             } else {
                 // the cell was removed, need to put back
                 let mut cell = cell.as_ref().unwrap().clone_referred();
-                self.server.chunks.write_cell(&mut cell).err()
+                self.chunks().write_cell(&mut cell).err()
             };
             if let Some(error) = error {
                 failures.push(RollbackFailure { id: *id, error });
@@ -278,9 +300,7 @@ impl DataManager {
     }
     #[inline]
     fn wipe_out_transaction(&self, tid: &TxnId) {
-        if let Some(txn) = self.txns.lock(tid) {
-            txn.remove();
-        }
+        let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
     }
     async fn cell_meta_cleanup(&self) {
@@ -290,7 +310,7 @@ impl DataManager {
                 .iter()
                 .next()
                 .cloned()
-                .unwrap_or_else(|| self.server.txn_peer.clock.to_clock())
+                .unwrap_or_else(|| self.txn_peer.clock.to_clock())
         };
         let mut cells_to_evict = Vec::new();
 
@@ -340,7 +360,7 @@ impl DataManager {
         T: 'static + Clone,
     {
         self.update_clock(clock);
-        let txn_lock = self.get_transaction(tid);
+        let txn_lock = self.get_or_create_transaction(tid);
         let mut txn = txn_lock.lock();
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
@@ -464,6 +484,229 @@ impl DataManager {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ram::segs::SEGMENT_SIZE;
+    use crate::server::{NebServer, ServerOptions, Service as NebService};
+    use futures::future::join_all;
+    use std::sync::Arc;
+
+    #[test]
+    fn scoped_data_manager_service_ids_differ_between_databases() {
+        let group = "group_a";
+        assert_ne!(
+            generate_scoped_service_id(group, "db_a"),
+            generate_scoped_service_id(group, "db_b")
+        );
+    }
+
+    async fn start_transaction_test_server(
+        address: &str,
+        group: &str,
+    ) -> Arc<crate::server::NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: SEGMENT_SIZE,
+                db_size: SEGMENT_SIZE,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![NebService::Cell, NebService::Transaction],
+                enable_recovery: false,
+            },
+            &address.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+    }
+
+    async fn data_manager_for_database(
+        server: &Arc<NebServer>,
+        address: &str,
+        database_name: &str,
+    ) -> Arc<DataManager> {
+        let runtime = server
+            .ensure_database_runtime(database_name)
+            .await
+            .expect("database runtime");
+        DataManager::new(runtime, crate::server::Peer::new(&address.to_string()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_get_transaction_returns_single_shared_entry_per_tid() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5290";
+        let group = "txn_data_site_same_tid";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = manager.txn_peer.clock.inc();
+
+        let results = join_all((0..32).map(|_| {
+            let manager = manager.clone();
+            let tid = tid.clone();
+            async move {
+                let txn = manager.get_or_create_transaction(&tid);
+                Arc::as_ptr(&txn) as usize
+            }
+        }))
+        .await;
+
+        let first = results[0];
+        assert!(
+            results.iter().all(|ptr| *ptr == first),
+            "all concurrent lookups of the same txn id should return the same transaction entry"
+        );
+        assert_eq!(manager.txns.len(), 1);
+        assert_eq!(manager.txns_sorted.lock().len(), 1);
+        assert!(manager.txns.get(&tid).is_some());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_cleans_up_many_active_transactions_without_leaking_bookkeeping() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5291";
+        let group = "txn_data_site_cleanup";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tids = (0..64)
+            .map(|_| manager.txn_peer.clock.inc())
+            .collect::<Vec<_>>();
+
+        for tid in &tids {
+            let txn = manager.get_or_create_transaction(tid);
+            txn.lock().state = TxnState::Committed;
+        }
+        assert_eq!(manager.txns.len(), tids.len());
+        assert_eq!(manager.txns_sorted.lock().len(), tids.len());
+
+        let results = join_all(tids.iter().cloned().map(|tid| {
+            let manager = manager.clone();
+            async move { <DataManager as Service>::end(&manager, tid.clone(), tid).await.payload }
+        }))
+        .await;
+
+        for result in results {
+            assert_eq!(result, EndResult::Success);
+        }
+        assert_eq!(manager.txns.len(), 0);
+        assert!(manager.txns_sorted.lock().is_empty());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ending_one_database_transaction_does_not_wipe_same_tid_in_another_database() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5292";
+        let group = "txn_data_site_multidb";
+        let server = start_transaction_test_server(address, group).await;
+        let default_manager = data_manager_for_database(&server, address, group).await;
+        let analytics_manager = data_manager_for_database(&server, address, "analytics").await;
+        let shared_tid = default_manager.txn_peer.clock.inc();
+
+        default_manager
+            .get_or_create_transaction(&shared_tid)
+            .lock()
+            .state = TxnState::Committed;
+        analytics_manager
+            .get_or_create_transaction(&shared_tid)
+            .lock()
+            .state = TxnState::Committed;
+
+        let end_result = <DataManager as Service>::end(
+            &default_manager,
+            shared_tid.clone(),
+            shared_tid.clone(),
+        )
+            .await
+            .payload;
+        assert_eq!(end_result, EndResult::Success);
+        assert!(default_manager.txns.get(&shared_tid).is_none());
+        assert!(!default_manager.txns_sorted.lock().contains(&shared_tid));
+
+        assert!(
+            analytics_manager.txns.get(&shared_tid).is_some(),
+            "ending one database transaction must not remove another database's transaction entry"
+        );
+        assert!(
+            analytics_manager.txns_sorted.lock().contains(&shared_tid),
+            "ending one database transaction must not remove another database's sorted bookkeeping"
+        );
+
+        let analytics_end = <DataManager as Service>::end(
+            &analytics_manager,
+            shared_tid.clone(),
+            shared_tid.clone(),
+        )
+            .await
+            .payload;
+        assert_eq!(analytics_end, EndResult::Success);
+        assert!(analytics_manager.txns.get(&shared_tid).is_none());
+        assert!(!analytics_manager.txns_sorted.lock().contains(&shared_tid));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_end_calls_on_same_transaction_cleanup_idempotently() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5297";
+        let group = "txn_data_site_end_race";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = manager.txn_peer.clock.inc();
+        manager.get_or_create_transaction(&tid).lock().state = TxnState::Aborted;
+
+        let end_clock = manager.txn_peer.clock.to_clock();
+        let left_manager = manager.clone();
+        let right_manager = manager.clone();
+        let left_tid = tid.clone();
+        let right_tid = tid.clone();
+        let left_clock = end_clock.clone();
+        let right_clock = end_clock.clone();
+
+        let (left, right) = tokio::join!(
+            async move {
+                <DataManager as Service>::end(&left_manager, left_clock, left_tid)
+                    .await
+                    .payload
+            },
+            async move {
+                <DataManager as Service>::end(&right_manager, right_clock, right_tid)
+                    .await
+                    .payload
+            }
+        );
+
+        for result in [left, right] {
+            assert!(
+                matches!(
+                    result,
+                    EndResult::Success
+                        | EndResult::CheckFailed(CheckError::NotExisted)
+                        | EndResult::CheckFailed(CheckError::CannotEnd)
+                        | EndResult::LockReleaseRetriesExhausted { .. }
+                        | EndResult::SomeLocksNotReleased { .. }
+                ),
+                "unexpected end result in duplicate end race: {:?}",
+                result
+            );
+        }
+
+        assert!(manager.txns.get(&tid).is_none());
+        assert!(!manager.txns_sorted.lock().contains(&tid));
+
+        server.shutdown().await;
+    }
+}
+
 impl Service for DataManager {
     /////////////////////////////////////
     ///        Implement Services    ///
@@ -479,7 +722,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             r
         } else {
-            match self.server.chunks.read_cell(&id) {
+            match self.chunks().read_cell(&id) {
                 Ok(cell) => self.response_with(TxnExecResult::Accepted(cell.to_owned())),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
             }
@@ -496,7 +739,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        match self.server.chunks.read_selected(&id, &fields[..], true) {
+        match self.chunks().read_selected(&id, &fields[..], true) {
             // Need header for version check
             Ok(values) => self.response_with(TxnExecResult::Accepted(values.to_owned())),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
@@ -512,7 +755,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        match self.server.chunks.head_cell(&id) {
+        match self.chunks().head_cell(&id) {
             Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
@@ -530,7 +773,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        match self.server.chunks.read_partial_raw(&id, offset, len) {
+        match self.chunks().read_partial_raw(&id, offset, len) {
             Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
@@ -566,7 +809,9 @@ impl Service for DataManager {
         debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
         self.update_clock(&clock);
 
-        let txn_lock = self.get_transaction(&tid);
+        let Some(txn_lock) = self.find_transaction(&tid) else {
+            return self.response_with(DMPrepareResult::TransactionNotExisted);
+        };
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
             return self.response_with(DMPrepareResult::StateError(txn.state));
@@ -682,7 +927,9 @@ impl Service for DataManager {
         // Use the more recent timestamp between the transaction ID and the incoming clock
         let effective_ts = if &clock > &tid { &clock } else { &tid };
 
-        let txn_lock = self.get_transaction(&tid);
+        let Some(txn_lock) = self.find_transaction(&tid) else {
+            return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted));
+        };
         let mut txn = txn_lock.lock();
         txn.last_activity = get_time();
         // check state
@@ -740,12 +987,12 @@ impl Service for DataManager {
                             continue;
                         }
 
-                        let write_result = self.server.chunks.write_cell(&mut cell);
+                        let write_result = self.chunks().write_cell(&mut cell);
                         match write_result {
                             Ok(header) => {
                                 // Log the new cell creation with its version for rollback
                                 // During recovery, if cell exists with this version, it will be deleted
-                                if let Some(ref undo_log) = self.server.undo_log {
+                                if let Some(undo_log) = self.undo_log() {
                                     let undo_entry = super::undo_log::UndoLogEntry::new_write(
                                         tid.clone(),
                                         cell_id,
@@ -772,7 +1019,7 @@ impl Service for DataManager {
                     CommitOp::Remove(ref cell_id) => {
                         // Read cell and extract information while holding lock
                         let (cell_addr, orig_version, old_cell_ref) = {
-                            let shared_cell = match self.server.chunks.read_cell(cell_id) {
+                            let shared_cell = match self.chunks().read_cell(cell_id) {
                                 Ok(cell) => cell,
                                 Err(re) => {
                                     write_error = Some((*cell_id, WriteError::ReadError(re)));
@@ -786,7 +1033,7 @@ impl Service for DataManager {
                         }; // SharedCell dropped here, lock released
 
                         // Now protect the segment without holding cell lock
-                        let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
+                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
 
@@ -810,7 +1057,7 @@ impl Service for DataManager {
                         // Write undo log entry before performing the remove
                         // Store old version and exact offset for verification during recovery
                         // Note: only seq_id is stored, not seg_id (which changes across recoveries)
-                        if let Some(ref undo_log) = self.server.undo_log {
+                        if let Some(undo_log) = self.undo_log() {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 *cell_id,
@@ -827,8 +1074,7 @@ impl Service for DataManager {
                         }
 
                         let write_result = self
-                            .server
-                            .chunks
+                            .chunks()
                             .remove_cell_by(cell_id, |cell| cell.header.version == orig_version);
                         match write_result {
                             Ok(()) => {
@@ -848,28 +1094,25 @@ impl Service for DataManager {
                     CommitOp::Update(mut cell) => {
                         let cell_id = cell.id();
                         // Read cell and extract information while holding lock
-                        let (cell_addr, orig_version) =
-                            {
-                                match self.server.chunks.location_for_read(&cell_id).and_then(
-                                    |loc| {
-                                        let addr = *loc;
-                                        let header = header_from_chunk_raw(addr);
-                                        header.map(|(header, _)| (header, addr))
-                                    },
-                                ) {
-                                    Ok((header, addr)) => {
-                                        let version = header.version;
-                                        (addr, version)
-                                    }
-                                    Err(re) => {
-                                        write_error = Some((cell_id, WriteError::ReadError(re)));
-                                        break;
-                                    }
+                        let (cell_addr, orig_version) = {
+                            match self.chunks().location_for_read(&cell_id).and_then(|loc| {
+                                let addr = *loc;
+                                let header = header_from_chunk_raw(addr);
+                                header.map(|(header, _)| (header, addr))
+                            }) {
+                                Ok((header, addr)) => {
+                                    let version = header.version;
+                                    (addr, version)
                                 }
-                            }; // SharedCell dropped here, lock released
+                                Err(re) => {
+                                    write_error = Some((cell_id, WriteError::ReadError(re)));
+                                    break;
+                                }
+                            }
+                        }; // SharedCell dropped here, lock released
 
                         // Now protect the segment without holding cell lock
-                        let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
+                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
 
@@ -893,7 +1136,7 @@ impl Service for DataManager {
                         // Write undo log entry before performing the update
                         // Store old version and exact offset for verification during recovery
                         // Note: only seq_id is stored, not seg_id (which changes across recoveries)
-                        if let Some(ref undo_log) = self.server.undo_log {
+                        if let Some(undo_log) = self.undo_log() {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 cell_id,
@@ -911,17 +1154,14 @@ impl Service for DataManager {
                         cell.header.version = orig_version; // Enforce version consistency
                         let mut old_cell_ref = None;
                         let write_result =
-                            self.server
-                                .chunks
-                                .update_cell_by(&cell_id, |cell_to_update| {
-                                    if cell_to_update.header.version == orig_version {
-                                        old_cell_ref =
-                                            Some((*cell_to_update).to_owned().into_ref());
-                                        Some(cell)
-                                    } else {
-                                        None
-                                    }
-                                });
+                            self.chunks().update_cell_by(&cell_id, |cell_to_update| {
+                                if cell_to_update.header.version == orig_version {
+                                    old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
+                                    Some(cell)
+                                } else {
+                                    None
+                                }
+                            });
                         match write_result {
                             Ok(cell) => {
                                 debug_assert!(old_cell_ref.is_some());
@@ -978,7 +1218,7 @@ impl Service for DataManager {
             for guard in &txn.segment_guards {
                 let chunk_idx = guard.chunk_id();
                 let seg_id = guard.segment_id();
-                let chunk = &self.server.chunks.list[chunk_idx];
+                let chunk = &self.chunks().list[chunk_idx];
                 if let Some(segment) = chunk.segs.get(&(seg_id as usize)) {
                     // Use force_wal_sync to ensure WAL is persisted and counters are reset
                     if let Err(e) = segment.force_wal_sync() {
@@ -996,7 +1236,7 @@ impl Service for DataManager {
             }
 
             // Commit all indices
-            let response = DataSiteResponse::new(&self.server.txn_peer, DMCommitResult::Success);
+            let response = DataSiteResponse::new(&self.txn_peer, DMCommitResult::Success);
             return IndexBuilder::await_indices().map(|_| response).boxed();
         }
     }
@@ -1007,7 +1247,9 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
         self.update_clock(&clock);
-        let txn_lock = self.get_transaction(&tid);
+        let Some(txn_lock) = self.find_transaction(&tid) else {
+            return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted));
+        };
         let mut txn = txn_lock.lock();
         if txn.state == TxnState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
@@ -1048,7 +1290,9 @@ impl Service for DataManager {
 
         // Option 6: Two-Phase Lock Release with Verification and Retry
         let (affected_cell_ids, txn_state) = {
-            let txn_lock = self.get_transaction(&tid);
+            let Some(txn_lock) = self.find_transaction(&tid) else {
+                return self.response_with(EndResult::CheckFailed(CheckError::NotExisted));
+            };
             let txn = txn_lock.lock();
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
                 return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
@@ -1082,8 +1326,8 @@ impl Service for DataManager {
             if failed_releases.is_empty() {
                 // All locks released successfully
                 debug!(
-                    "Successfully released all {} locks for {:?}",
-                    released_count, tid
+                    "Successfully released all {} locks for {:?}, total locks: {}",
+                    released_count, tid, self.txns.len()
                 );
                 lock_release_result = Some(Ok(()));
                 break;
@@ -1128,14 +1372,17 @@ impl Service for DataManager {
         async move {
             // Release all segment references before wiping out transaction
             let guards_to_drop = {
-                let txn_lock = self.get_transaction(&tid);
-                let mut txn = txn_lock.lock();
-                std::mem::take(&mut txn.segment_guards)
+                if let Some(txn_lock) = self.find_transaction(&tid) {
+                    let mut txn = txn_lock.lock();
+                    std::mem::take(&mut txn.segment_guards)
+                } else {
+                    Vec::new()
+                }
             };
             drop(guards_to_drop); // Drop guards, releasing all segment references
 
             // Write commit/abort marker to undo log based on transaction state
-            if let Some(ref undo_log) = self.server.undo_log {
+            if let Some(undo_log) = self.undo_log() {
                 let log_result = match txn_state {
                     TxnState::Committed => undo_log.write_commit_marker(&tid),
                     TxnState::Aborted => undo_log.write_abort_marker(&tid),

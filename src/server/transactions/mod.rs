@@ -157,6 +157,21 @@ pub enum TMError {
 }
 
 pub async fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
+    new_async_client_for_database(address, "", "").await
+}
+
+pub async fn new_async_client_for_database(
+    address: &String,
+    group_name: &str,
+    database_name: &str,
+) -> io::Result<Arc<manager::AsyncServiceClient>> {
     let client = DEFAULT_CLIENT_POOL.get(address).await?;
-    Ok(manager::AsyncServiceClient::new(&client))
+    let service_id = if group_name.is_empty() && database_name.is_empty() {
+        manager::DEFAULT_SERVICE_ID
+    } else {
+        manager::generate_scoped_service_id(group_name, database_name)
+    };
+    Ok(manager::AsyncServiceClient::new_with_service_id(
+        service_id, &client,
+    ))
 }

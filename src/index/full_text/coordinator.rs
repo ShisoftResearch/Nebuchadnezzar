@@ -8,19 +8,18 @@
 use std::collections::HashMap;
 
 use bifrost::conshash::ConsistentHashing;
-use bifrost::rpc::{ClientPool, RPCClient, RPCError};
+use bifrost::rpc::{ClientPool, RPCClient, RPCError, ServiceClient};
 use futures::future::join_all;
 use log::error;
 
 use crate::ram::cell::ReadError;
 use crate::ram::types::Id;
-use crate::server::NebServer;
 use std::sync::Arc;
 
 use super::rpc::{
-    AsyncServiceClient, FieldStatsRequest, FieldStatsResponse, InvertedIndexError,
-    InvertedSearchRequest, InvertedSearchResponse, TermPostingsRequest, TermPostingsResponse,
-    DEFAULT_SERVICE_ID,
+    generate_scoped_service_id, AsyncServiceClient, FieldStatsRequest, FieldStatsResponse,
+    InvertedIndexError, InvertedSearchRequest, InvertedSearchResponse, TermPostingsRequest,
+    TermPostingsResponse,
 };
 use super::{bm25_score, compute_idf, tokenize_query, BM25Hit};
 
@@ -31,13 +30,22 @@ use super::{bm25_score, compute_idf, tokenize_query, BM25Hit};
 pub struct DistributedInvertedIndexCoordinator {
     conshash: Arc<ConsistentHashing>,
     client_pool: Arc<ClientPool>,
+    group_name: String,
+    database_name: String,
 }
 
 impl DistributedInvertedIndexCoordinator {
-    pub fn new(conshash: Arc<ConsistentHashing>, client_pool: Arc<ClientPool>) -> Self {
+    pub fn new(
+        conshash: Arc<ConsistentHashing>,
+        client_pool: Arc<ClientPool>,
+        group_name: impl Into<String>,
+        database_name: impl Into<String>,
+    ) -> Self {
         Self {
             conshash,
             client_pool,
+            group_name: group_name.into(),
+            database_name: database_name.into(),
         }
     }
 
@@ -66,7 +74,8 @@ impl DistributedInvertedIndexCoordinator {
             .map_err(|e| RPCError::IOError(e))?;
 
         // Create the async service client using helper function
-        let service_client = client_by_rpc_client(&rpc_client);
+        let service_client =
+            client_by_rpc_client(&rpc_client, &self.group_name, &self.database_name);
 
         Ok(service_client)
     }
@@ -344,25 +353,33 @@ impl DistributedInvertedIndexCoordinator {
 /// Similar to the pattern used in ranged indexer  
 /// Note: The macro generates AsyncServiceClient but may not generate ::new
 /// We'll use ServiceClientWithId directly - it returns Arc already
-fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<AsyncServiceClient> {
-    use bifrost::rpc::ServiceClientWithId;
-    // ServiceClientWithId::new returns Arc<ServiceClientWithId<InvertedIndexRPCService>>
-    // AsyncServiceClient should be a type alias for ServiceClientWithId<InvertedIndexRPCService>
-    ServiceClientWithId::new(rpc)
+fn client_by_rpc_client(
+    rpc: &Arc<RPCClient>,
+    group_name: &str,
+    database_name: &str,
+) -> Arc<AsyncServiceClient> {
+    AsyncServiceClient::new_with_service_id(
+        generate_scoped_service_id(group_name, database_name),
+        rpc,
+    )
 }
 
 /// Helper function to create a coordinator from server components
 pub async fn create_coordinator_from_server(
     conshash: Arc<ConsistentHashing>,
     client_pool: Arc<ClientPool>,
+    group_name: impl Into<String>,
+    database_name: impl Into<String>,
 ) -> DistributedInvertedIndexCoordinator {
-    DistributedInvertedIndexCoordinator::new(conshash, client_pool)
+    DistributedInvertedIndexCoordinator::new(conshash, client_pool, group_name, database_name)
 }
 
 /// Builder for creating a coordinator instance
 pub struct CoordinatorBuilder {
     conshash: Option<Arc<ConsistentHashing>>,
     client_pool: Option<Arc<ClientPool>>,
+    group_name: Option<String>,
+    database_name: Option<String>,
 }
 
 impl CoordinatorBuilder {
@@ -370,6 +387,8 @@ impl CoordinatorBuilder {
         Self {
             conshash: None,
             client_pool: None,
+            group_name: None,
+            database_name: None,
         }
     }
 
@@ -383,10 +402,22 @@ impl CoordinatorBuilder {
         self
     }
 
-    pub fn from_server(server: &Arc<NebServer>) -> Self {
+    pub fn with_database_scope(
+        mut self,
+        group_name: impl Into<String>,
+        database_name: impl Into<String>,
+    ) -> Self {
+        self.group_name = Some(group_name.into());
+        self.database_name = Some(database_name.into());
+        self
+    }
+
+    pub fn from_parts(conshash: Arc<ConsistentHashing>, client_pool: Arc<ClientPool>) -> Self {
         Self {
-            conshash: Some(server.consh.clone()),
-            client_pool: Some(server.member_pool.clone()),
+            conshash: Some(conshash),
+            client_pool: Some(client_pool),
+            group_name: None,
+            database_name: None,
         }
     }
 
@@ -401,6 +432,8 @@ impl CoordinatorBuilder {
         Ok(DistributedInvertedIndexCoordinator::new(
             conshash,
             client_pool,
+            self.group_name.unwrap_or_default(),
+            self.database_name.unwrap_or_default(),
         ))
     }
 }
@@ -446,8 +479,8 @@ mod tests {
         info!("Creating shard 1...");
         let shard1 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -466,8 +499,8 @@ mod tests {
         info!("Creating shard 2...");
         let shard2 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -506,8 +539,8 @@ mod tests {
             false,
         );
 
-        shard1.meta.schemas.debug_only_new_schema(schema.clone());
-        shard2.meta.schemas.debug_only_new_schema(schema.clone());
+        shard1.meta().schemas.debug_only_new_schema(schema.clone());
+        shard2.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find documents owned by each shard
         let mut shard1_docs = Vec::new();
@@ -557,9 +590,9 @@ mod tests {
         let mut cell2 =
             OwnedCell::new_with_id(schema_id, &shard1_docs[1], OwnedValue::Map(cell2_data));
 
-        shard1.chunks.write_cell(&mut cell1).unwrap();
-        shard1.chunks.write_cell(&mut cell2).unwrap();
-        if let Some(ref ib) = shard1.indexer {
+        shard1.chunks().write_cell(&mut cell1).unwrap();
+        shard1.chunks().write_cell(&mut cell2).unwrap();
+        if let Some(ib) = shard1.indexer() {
             ib.ensure_indices(&cell1, &schema, None);
             ib.ensure_indices(&cell2, &schema, None);
         }
@@ -581,9 +614,9 @@ mod tests {
         let mut cell4 =
             OwnedCell::new_with_id(schema_id, &shard2_docs[1], OwnedValue::Map(cell4_data));
 
-        shard2.chunks.write_cell(&mut cell3).unwrap();
-        shard2.chunks.write_cell(&mut cell4).unwrap();
-        if let Some(ref ib) = shard2.indexer {
+        shard2.chunks().write_cell(&mut cell3).unwrap();
+        shard2.chunks().write_cell(&mut cell4).unwrap();
+        if let Some(ib) = shard2.indexer() {
             ib.ensure_indices(&cell3, &schema, None);
             ib.ensure_indices(&cell4, &schema, None);
         }
@@ -595,6 +628,8 @@ mod tests {
         let coord1 = DistributedInvertedIndexCoordinator::new(
             shard1.consh.clone(),
             shard1.member_pool.clone(),
+            shard1.database_runtime().group_name(),
+            shard1.database_name(),
         );
 
         let stats1 = coord1
@@ -618,6 +653,8 @@ mod tests {
         let coord2 = DistributedInvertedIndexCoordinator::new(
             shard2.consh.clone(),
             shard2.member_pool.clone(),
+            shard2.database_runtime().group_name(),
+            shard2.database_name(),
         );
 
         let stats2 = coord2
@@ -713,8 +750,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -750,7 +787,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find owned document
         let mut doc_id = None;
@@ -776,8 +813,8 @@ mod tests {
         );
         let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
-        server.chunks.write_cell(&mut cell).unwrap();
-        if let Some(ref index_builder) = server.indexer {
+        server.chunks().write_cell(&mut cell).unwrap();
+        if let Some(index_builder) = server.indexer() {
             index_builder.ensure_indices(&cell, &schema, None);
         }
 
@@ -787,6 +824,8 @@ mod tests {
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
         );
 
         // Search
@@ -809,8 +848,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -829,6 +868,8 @@ mod tests {
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
         );
 
         // Empty query should return empty results

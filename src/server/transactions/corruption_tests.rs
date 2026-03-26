@@ -10,6 +10,15 @@ use crate::server::*;
 use env_logger;
 use tokio::time::{sleep, Duration};
 
+async fn scoped_txn_client(
+    address: &String,
+    group_name: &str,
+) -> Arc<transactions::manager::AsyncServiceClient> {
+    transactions::new_async_client_for_database(address, group_name, group_name)
+        .await
+        .unwrap()
+}
+
 /// Test rapid concurrent updates to the same cell
 /// This can trigger race conditions in cell location tracking
 #[allow(unused_variables)]
@@ -19,8 +28,8 @@ async fn test_rapid_concurrent_updates_same_cell() {
     let server_addr = String::from("127.0.0.1:5300");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -44,7 +53,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -56,7 +65,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
     );
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!("Starting rapid concurrent updates on cell: {:?}", cell_id);
@@ -66,7 +75,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
         let sid = schema.id;
 
@@ -130,8 +139,8 @@ async fn test_varying_size_concurrent_updates() {
     let server_addr = String::from("127.0.0.1:5301");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -155,7 +164,7 @@ async fn test_varying_size_concurrent_updates() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -164,7 +173,7 @@ async fn test_varying_size_concurrent_updates() {
     data_map.insert(&String::from("name"), OwnedValue::String(String::from("X")));
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!("Starting varying-size updates on cell: {:?}", cell_id);
@@ -173,7 +182,7 @@ async fn test_varying_size_concurrent_updates() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
         let sid = schema.id;
 
@@ -229,8 +238,8 @@ async fn test_multi_cell_concurrent_transactions() {
     let server_addr = String::from("127.0.0.1:5302");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 128 * 1024 * 1024,
+            chunk_size: 128 * 1024 * 1024,
+            db_size: 128 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -254,7 +263,7 @@ async fn test_multi_cell_concurrent_transactions() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create multiple cells
     let cell_count = 20;
@@ -269,7 +278,7 @@ async fn test_multi_cell_concurrent_transactions() {
             OwnedValue::String(format!("Cell{}", i)),
         );
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
-        server.chunks.write_cell(&mut cell).unwrap();
+        server.chunks().write_cell(&mut cell).unwrap();
         cell_ids.push(cell.id());
     }
 
@@ -279,7 +288,7 @@ async fn test_multi_cell_concurrent_transactions() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cells = cell_ids.clone();
 
         tasks.push(tokio::spawn(async move {
@@ -331,8 +340,8 @@ async fn test_rapid_commit_sequence() {
     let server_addr = String::from("127.0.0.1:5303");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -356,7 +365,7 @@ async fn test_rapid_commit_sequence() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -368,14 +377,14 @@ async fn test_rapid_commit_sequence() {
     );
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!("Starting rapid commit sequence test on cell: {:?}", cell_id);
 
     // Execute transactions sequentially but with minimal delays
     for i in 0..50 {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let txn_id = txn_client.begin().await.unwrap().unwrap();
 
         if let Ok(Ok(TxnExecResult::Accepted(mut cell))) =
@@ -417,8 +426,8 @@ async fn test_interleaved_prepare_commit() {
     let server_addr = String::from("127.0.0.1:5304");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -442,7 +451,7 @@ async fn test_interleaved_prepare_commit() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create multiple cells
     let cell_count = 10;
@@ -457,7 +466,7 @@ async fn test_interleaved_prepare_commit() {
             OwnedValue::String(format!("Cell{}", i)),
         );
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
-        server.chunks.write_cell(&mut cell).unwrap();
+        server.chunks().write_cell(&mut cell).unwrap();
         cell_ids.push(cell.id());
     }
 
@@ -467,7 +476,7 @@ async fn test_interleaved_prepare_commit() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_ids[i % cell_count].clone();
 
         tasks.push(tokio::spawn(async move {
@@ -519,8 +528,8 @@ async fn test_maximum_concurrency_stress() {
     let server_addr = String::from("127.0.0.1:5305");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 128 * 1024 * 1024,
+            chunk_size: 128 * 1024 * 1024,
+            db_size: 128 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -544,7 +553,7 @@ async fn test_maximum_concurrency_stress() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -556,7 +565,7 @@ async fn test_maximum_concurrency_stress() {
     );
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!(
@@ -568,7 +577,7 @@ async fn test_maximum_concurrency_stress() {
     let mut tasks = Vec::with_capacity(txn_count);
 
     for i in 0..txn_count {
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
 
         tasks.push(tokio::spawn(async move {
@@ -629,8 +638,8 @@ async fn test_wikidata_import_scenario() {
     let server_addr = String::from("127.0.0.1:5306");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,                // Multiple chunks like production
-            total_size: 512 * 1024 * 1024, // Larger memory pool
+            chunk_size: 128 * 1024 * 1024, // Multiple chunks like production
+            db_size: 512 * 1024 * 1024, // Larger memory pool
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -654,7 +663,7 @@ async fn test_wikidata_import_scenario() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     println!("Starting wikidata import scenario test");
     println!("This test mimics high-concurrency batch imports");
@@ -670,7 +679,7 @@ async fn test_wikidata_import_scenario() {
 
         // Each batch processes multiple items concurrently
         for item in 0..items_per_batch {
-            let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+            let txn_client = scoped_txn_client(&server_addr, "test").await;
             let sid = schema.id;
 
             batch_tasks.push(tokio::spawn(async move {
@@ -754,8 +763,8 @@ async fn test_update_cell_by_stress() {
     let group_name = "test_update_cell_by_stress";
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -783,7 +792,7 @@ async fn test_update_cell_by_stress() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     // Create initial cell
     let mut data_map = OwnedMap::new();
@@ -795,7 +804,7 @@ async fn test_update_cell_by_stress() {
     );
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
-    server.chunks.write_cell(&mut cell).unwrap();
+    server.chunks().write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
     println!("Testing update_cell_by path that triggers mark_dead_entry_with_cell");
@@ -812,7 +821,7 @@ async fn test_update_cell_by_stress() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn_client = scoped_txn_client(&server_addr, "test").await;
         let cid = cell_id.clone();
 
         tasks.push(tokio::spawn(async move {

@@ -1286,8 +1286,8 @@ mod tests {
         // Use a full NebServer for proper AsyncClient setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1324,7 +1324,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
@@ -1362,11 +1362,11 @@ mod tests {
         let mut cell2 =
             OwnedCell::new_with_id(schema_id, &owned_doc_ids[1], OwnedValue::Map(cell2_data));
 
-        server.chunks.write_cell(&mut cell1).unwrap();
-        server.chunks.write_cell(&mut cell2).unwrap();
+        server.chunks().write_cell(&mut cell1).unwrap();
+        server.chunks().write_cell(&mut cell2).unwrap();
 
         // Trigger indexing
-        if let Some(ref index_builder) = server.indexer {
+        if let Some(index_builder) = server.indexer() {
             index_builder.ensure_indices(&cell1, &schema, None);
             index_builder.ensure_indices(&cell2, &schema, None);
 
@@ -1408,8 +1408,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1445,7 +1445,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find many owned document IDs for concurrent testing
         let mut owned_doc_ids = Vec::new();
@@ -1496,10 +1496,10 @@ mod tests {
                     OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
                 // Write cell
-                server_clone.chunks.write_cell(&mut cell).unwrap();
+                server_clone.chunks().write_cell(&mut cell).unwrap();
 
                 // Index cell
-                if let Some(ref index_builder) = server_clone.indexer {
+                if let Some(index_builder) = server_clone.indexer() {
                     index_builder.ensure_indices(&cell, &schema_clone, None);
                 }
 
@@ -1521,7 +1521,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify all documents are searchable
-        if let Some(ref index_builder) = server_arc.indexer {
+        if let Some(index_builder) = server_arc.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let stats = indexer.get_field_stats(schema_id, content_field_id);
                 assert_eq!(
@@ -1572,8 +1572,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1609,7 +1609,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find many owned document IDs - enough to cause segment overflow
         // SEGMENT_SIZE is 1000, so we need > 1000 docs with the same term
@@ -1664,9 +1664,9 @@ mod tests {
                     let mut cell =
                         OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
 
-                    server_clone.chunks.write_cell(&mut cell).unwrap();
+                    server_clone.chunks().write_cell(&mut cell).unwrap();
 
-                    if let Some(ref index_builder) = server_clone.indexer {
+                    if let Some(index_builder) = server_clone.indexer() {
                         index_builder.ensure_indices(&cell, &schema_clone, None);
                     }
 
@@ -1689,7 +1689,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Verify all documents are searchable
-        if let Some(ref index_builder) = server_arc.indexer {
+        if let Some(index_builder) = server_arc.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let stats = indexer.get_field_stats(schema_id, content_field_id);
                 info!(
@@ -1771,8 +1771,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1808,7 +1808,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
@@ -1847,9 +1847,9 @@ mod tests {
             cell_data.insert(content_field, OwnedValue::String(texts[i].to_string()));
             let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
 
-            server.chunks.write_cell(&mut cell).unwrap();
+            server.chunks().write_cell(&mut cell).unwrap();
 
-            if let Some(ref index_builder) = server.indexer {
+            if let Some(index_builder) = server.indexer() {
                 index_builder.ensure_indices(&cell, &schema, None);
             }
         }
@@ -1858,7 +1858,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Search for "rust programming" - docs with both terms should rank higher
-        if let Some(ref index_builder) = server.indexer {
+        if let Some(index_builder) = server.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 let hits = indexer
                     .bm25_search(schema_id, content_field_id, "rust programming", 10, false)
@@ -1922,8 +1922,8 @@ mod tests {
         // Use a full NebServer for proper setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1944,8 +1944,7 @@ mod tests {
 
         // Get the indexer from the server
         let indexer = server
-            .indexer
-            .as_ref()
+            .indexer()
             .and_then(|ib| ib.clients.fulltext_indexer())
             .expect("Indexer should be available");
 
@@ -2031,8 +2030,8 @@ mod tests {
         // Use a full NebServer for proper setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2053,8 +2052,7 @@ mod tests {
 
         // Get the indexer from the server
         let indexer = server
-            .indexer
-            .as_ref()
+            .indexer()
             .and_then(|ib| ib.clients.fulltext_indexer())
             .expect("Indexer should be available");
 
@@ -2111,8 +2109,8 @@ mod tests {
         // Use a full NebServer for proper setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2133,8 +2131,7 @@ mod tests {
 
         // Get the indexer from the server
         let indexer = server
-            .indexer
-            .as_ref()
+            .indexer()
             .and_then(|ib| ib.clients.fulltext_indexer())
             .expect("Indexer should be available");
 
@@ -2196,8 +2193,8 @@ mod tests {
         // Use a full NebServer for proper setup
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 2, // Multiple chunks to test per-chunk behavior
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 32 * 1024 * 1024, // Multiple chunks to test per-chunk behavior
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2218,8 +2215,7 @@ mod tests {
 
         // Get the indexer from the server
         let indexer = server
-            .indexer
-            .as_ref()
+            .indexer()
             .and_then(|ib| ib.clients.fulltext_indexer())
             .expect("Indexer should be available");
 
@@ -2274,8 +2270,8 @@ mod tests {
         let group_name = "e2e_indexing_test";
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024, // 64MB
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024, // 64MB
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2313,7 +2309,7 @@ mod tests {
         );
 
         // Register schema
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Create test documents with text content
         let doc1_id = Id::new(1, 1);
@@ -2385,12 +2381,12 @@ mod tests {
         );
 
         // Write cells to database (this should trigger indexing)
-        server.chunks.write_cell(&mut cell1).unwrap();
-        server.chunks.write_cell(&mut cell2).unwrap();
-        server.chunks.write_cell(&mut cell3).unwrap();
+        server.chunks().write_cell(&mut cell1).unwrap();
+        server.chunks().write_cell(&mut cell2).unwrap();
+        server.chunks().write_cell(&mut cell3).unwrap();
 
         // Trigger indexing by calling ensure_indices
-        if let Some(ref index_builder) = server.indexer {
+        if let Some(index_builder) = server.indexer() {
             index_builder.ensure_indices(&cell1, &schema, None);
             index_builder.ensure_indices(&cell2, &schema, None);
             index_builder.ensure_indices(&cell3, &schema, None);
@@ -2404,6 +2400,8 @@ mod tests {
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
         );
 
         // Verify field statistics using coordinator
@@ -2480,8 +2478,8 @@ mod tests {
             Duration::from_secs(30),
             crate::server::NebServer::new_from_opts(
                 &crate::server::ServerOptions {
-                    chunk_count: 1,
-                    total_size: 64 * 1024 * 1024,
+                    chunk_size: 64 * 1024 * 1024,
+                    db_size: 64 * 1024 * 1024,
                     tiered_config: None,
                     backup_storage: None,
                     wal_storage: None,
@@ -2527,7 +2525,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find an owned document ID
         info!("Finding owned document ID...");
@@ -2557,8 +2555,8 @@ mod tests {
 
         // Write and index
         info!("Writing initial cell...");
-        server.chunks.write_cell(&mut cell).unwrap();
-        if let Some(ref index_builder) = server.indexer {
+        server.chunks().write_cell(&mut cell).unwrap();
+        if let Some(index_builder) = server.indexer() {
             info!("Ensuring indices for initial cell...");
             index_builder.ensure_indices(&cell, &schema, None);
         }
@@ -2570,6 +2568,8 @@ mod tests {
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),
             server.member_pool.clone(),
+            server.database_runtime().group_name(),
+            server.database_name(),
         );
 
         // Verify initial indexing
@@ -2594,8 +2594,8 @@ mod tests {
 
         // Update cell and ensure indices
         info!("Updating cell...");
-        server.chunks.update_cell(&mut updated_cell).unwrap();
-        if let Some(ref index_builder) = server.indexer {
+        server.chunks().update_cell(&mut updated_cell).unwrap();
+        if let Some(index_builder) = server.indexer() {
             info!("Ensuring indices for updated cell...");
             index_builder.ensure_indices(&updated_cell, &schema, None);
         }
@@ -2631,7 +2631,7 @@ mod tests {
         info!("Preparing cell removal...");
 
         // Manually remove from inverted indexer using the updated cell metadata
-        if let Some(ref index_builder) = server.indexer {
+        if let Some(index_builder) = server.indexer() {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
                 let removal_meta = create_test_meta(
                     schema_id,
@@ -2645,7 +2645,7 @@ mod tests {
         }
 
         info!("Removing cell...");
-        server.chunks.remove_cell(&doc_id).unwrap();
+        server.chunks().remove_cell(&doc_id).unwrap();
         info!("Cell removed successfully");
 
         // Give time for any async cleanup
@@ -2695,8 +2695,8 @@ mod tests {
         info!("Phase 1: Creating initial server...");
         let server1 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024, // 64MB
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024, // 64MB
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -2736,15 +2736,15 @@ mod tests {
             false,
         );
 
-        server1.meta.schemas.debug_only_new_schema(schema.clone());
+        server1.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Register inverted index schemas BEFORE flushing (needed for flush operations)
         server1
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(inverted_segment_schema());
         server1
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
@@ -2793,9 +2793,9 @@ mod tests {
             );
             let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
 
-            server1.chunks.write_cell(&mut cell).unwrap();
+            server1.chunks().write_cell(&mut cell).unwrap();
 
-            if let Some(ref index_builder) = server1.indexer {
+            if let Some(index_builder) = server1.indexer() {
                 index_builder.ensure_indices(&cell, &schema, None);
             }
         }
@@ -2806,7 +2806,7 @@ mod tests {
         // Verify cells exist before archiving
         info!("Verifying cells exist before archiving...");
         for doc_id in &owned_doc_ids {
-            let cell_result = server1.chunks.read_cell(doc_id);
+            let cell_result = server1.chunks().read_cell(doc_id);
             assert!(
                 cell_result.is_ok(),
                 "Cell should exist before archiving for doc_id: {:?}",
@@ -2816,7 +2816,7 @@ mod tests {
 
         // Sync all segments to ensure WAL is persisted before archiving
         info!("Syncing segments before archiving...");
-        for chunk in &server1.chunks.list {
+        for chunk in &server1.chunks().list {
             for seg in chunk.segments() {
                 if let Err(e) = seg.force_wal_sync() {
                     warn!("Failed to sync segment {}: {:?}", seg.id, e);
@@ -2826,7 +2826,7 @@ mod tests {
 
         // Verify stats exist in memory before flushing
         info!("Verifying stats exist in memory before flushing...");
-        if let Some(ref index_builder) = server1.indexer {
+        if let Some(index_builder) = server1.indexer() {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
                 let stats_before_flush =
                     inverted_indexer.get_field_stats(schema_id, content_field_id);
@@ -2860,7 +2860,7 @@ mod tests {
 
         // Manually flush indices to disk
         info!("Flushing indices to disk...");
-        if let Some(ref index_builder) = server1.indexer {
+        if let Some(index_builder) = server1.indexer() {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
                 let flush_result = inverted_indexer.flush_to_disk().await;
                 match flush_result {
@@ -2880,7 +2880,7 @@ mod tests {
 
         // Sync all segments to ensure stats cells are persisted to WAL
         info!("Syncing all segments after flushing indices...");
-        for chunk in &server1.chunks.list {
+        for chunk in &server1.chunks().list {
             for seg in chunk.segments() {
                 if let Err(e) = seg.force_wal_sync() {
                     warn!("Failed to sync segment {} after flush: {:?}", seg.id, e);
@@ -2896,7 +2896,7 @@ mod tests {
         // but we can verify that segments contain data
         info!("Verifying segments contain data before archiving...");
         let mut segments_with_data = 0;
-        for chunk in &server1.chunks.list {
+        for chunk in &server1.chunks().list {
             for seg in chunk.segments() {
                 let data_size = seg.append_header.load(Ordering::Relaxed) - seg.addr;
                 if data_size > 0 {
@@ -2924,7 +2924,7 @@ mod tests {
 
         // Try to read stats cell before archiving to verify it exists
         info!("Attempting to read stats cell before archiving...");
-        match server1.chunks.read_cell(&stats_id) {
+        match server1.chunks().read_cell(&stats_id) {
             Ok(cell) => {
                 info!("SUCCESS: Stats cell readable before archiving! partition={}, hash={}, version={}", 
                       cell.header().partition, cell.header().hash, cell.header().version);
@@ -2941,7 +2941,7 @@ mod tests {
         info!("Archiving segments for recovery...");
         let mut archived_count = 0;
         let mut total_segments = 0;
-        for chunk in &server1.chunks.list {
+        for chunk in &server1.chunks().list {
             for seg in chunk.segments() {
                 total_segments += 1;
                 let seg_data_size = seg.append_header.load(Ordering::Relaxed) - seg.addr;
@@ -2975,6 +2975,8 @@ mod tests {
         let coordinator1 = DistributedInvertedIndexCoordinator::new(
             server1.consh.clone(),
             server1.member_pool.clone(),
+            server1.database_runtime().group_name(),
+            server1.database_name(),
         );
 
         let stats1 = coordinator1
@@ -3012,8 +3014,8 @@ mod tests {
         info!("Phase 2: Creating server with recovery enabled...");
         let server2 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024, // 64MB
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024, // 64MB
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3034,13 +3036,13 @@ mod tests {
 
         info!("Server 2 created with recovery, registering schemas...");
         // Re-register schemas (needed for recovery)
-        server2.meta.schemas.debug_only_new_schema(schema.clone());
+        server2.meta().schemas.debug_only_new_schema(schema.clone());
         server2
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(inverted_segment_schema());
         server2
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
@@ -3057,6 +3059,8 @@ mod tests {
         let coordinator2 = DistributedInvertedIndexCoordinator::new(
             server2.consh.clone(),
             server2.member_pool.clone(),
+            server2.database_runtime().group_name(),
+            server2.database_name(),
         );
 
         // Stats should be recovered (loaded on-demand from disk)
@@ -3082,7 +3086,7 @@ mod tests {
 
             // Try to manually verify if stats cell exists after recovery
             let stats_id = InvertedIndexer::stats_cell_id(schema_id, content_field_id);
-            match server2.chunks.read_cell(&stats_id) {
+            match server2.chunks().read_cell(&stats_id) {
                 Ok(cell) => {
                     info!("Stats cell found after recovery: {:?}", stats_id);
                     // Try to load stats from the cell
@@ -3182,8 +3186,8 @@ mod tests {
         info!("Phase 1: Creating initial server and indexing documents...");
         let server1 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3222,15 +3226,15 @@ mod tests {
             false,
         );
 
-        server1.meta.schemas.debug_only_new_schema(schema.clone());
+        server1.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Register inverted index schemas
         server1
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(inverted_segment_schema());
         server1
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
 
@@ -3262,9 +3266,9 @@ mod tests {
             );
             let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
 
-            server1.chunks.write_cell(&mut cell).unwrap();
+            server1.chunks().write_cell(&mut cell).unwrap();
 
-            if let Some(ref index_builder) = server1.indexer {
+            if let Some(index_builder) = server1.indexer() {
                 index_builder.ensure_indices(&cell, &schema, None);
             }
         }
@@ -3272,13 +3276,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Flush and archive
-        if let Some(ref index_builder) = server1.indexer {
+        if let Some(index_builder) = server1.indexer() {
             if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
                 inverted_indexer.flush_to_disk().await.unwrap();
             }
         }
 
-        for chunk in &server1.chunks.list {
+        for chunk in &server1.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -3292,8 +3296,8 @@ mod tests {
         info!("Phase 2: Recovering server and adding new documents...");
         let server2 = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3312,13 +3316,13 @@ mod tests {
         )
         .await;
 
-        server2.meta.schemas.debug_only_new_schema(schema.clone());
+        server2.meta().schemas.debug_only_new_schema(schema.clone());
         server2
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(inverted_segment_schema());
         server2
-            .meta
+            .meta()
             .schemas
             .debug_only_new_schema(crate::index::full_text::inverted_stats_schema());
         tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -3328,6 +3332,8 @@ mod tests {
         let coordinator2 = DistributedInvertedIndexCoordinator::new(
             server2.consh.clone(),
             server2.member_pool.clone(),
+            server2.database_runtime().group_name(),
+            server2.database_name(),
         );
 
         let stats_before = coordinator2
@@ -3364,9 +3370,9 @@ mod tests {
             );
             let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
 
-            server2.chunks.write_cell(&mut cell).unwrap();
+            server2.chunks().write_cell(&mut cell).unwrap();
 
-            if let Some(ref index_builder) = server2.indexer {
+            if let Some(index_builder) = server2.indexer() {
                 index_builder.ensure_indices(&cell, &schema, None);
             }
         }
@@ -3413,8 +3419,8 @@ mod tests {
 
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
-                chunk_count: 1,
-                total_size: 64 * 1024 * 1024,
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -3450,7 +3456,7 @@ mod tests {
             false,
         );
 
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
@@ -3489,17 +3495,17 @@ mod tests {
         let mut cell2 = OwnedCell::new_with_id(schema_id, &doc2_id, OwnedValue::Map(cell2_data));
 
         // Index documents
-        server.chunks.write_cell(&mut cell1).unwrap();
-        server.chunks.write_cell(&mut cell2).unwrap();
+        server.chunks().write_cell(&mut cell1).unwrap();
+        server.chunks().write_cell(&mut cell2).unwrap();
 
-        if let Some(ref index_builder) = server.indexer {
+        if let Some(index_builder) = server.indexer() {
             index_builder.ensure_indices(&cell1, &schema, None);
             index_builder.ensure_indices(&cell2, &schema, None);
         }
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        if let Some(ref index_builder) = server.indexer {
+        if let Some(index_builder) = server.indexer() {
             if let Some(indexer) = index_builder.clients.fulltext_indexer() {
                 // Search WITHOUT re-ranking
                 let hits_no_rerank = indexer

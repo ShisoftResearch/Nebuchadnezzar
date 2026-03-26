@@ -11,7 +11,11 @@ use std::sync::Arc;
 pub static SM_ID_PREFIX: &'static str = "NEB_SCHEMAS_SM";
 
 pub fn generate_sm_id(group: &str) -> u64 {
-    hash_str(&format!("{}-{}", SM_ID_PREFIX, group))
+    generate_scoped_sm_id(group, group)
+}
+
+pub fn generate_scoped_sm_id(group: &str, database_name: &str) -> u64 {
+    hash_str(&format!("{}-{}-{}", SM_ID_PREFIX, group, database_name))
 }
 
 struct SchemasMap {
@@ -167,13 +171,15 @@ impl SchemasSM {
     /// The flag should be set to false after server initialization completes
     pub async fn new_with_recovery_flag<'a>(
         group: &'a str,
+        database_name: &'a str,
         raft_service: &Arc<RaftService>,
         recovering: Arc<AtomicBool>,
     ) -> SchemasSM {
-        let sm_id = generate_sm_id(group);
+        let sm_id = generate_scoped_sm_id(group, database_name);
         trace!(
-            "Creating SchemasSM for group '{}' with SM ID: {} (recovery mode: {})",
+            "Creating SchemasSM for group '{}' and database '{}' with SM ID: {} (recovery mode: {})",
             group,
+            database_name,
             sm_id,
             recovering.load(Ordering::Relaxed)
         );
@@ -188,7 +194,8 @@ impl SchemasSM {
 
     /// Create a new state machine (legacy method, defaults to not recovering)
     pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
-        Self::new_with_recovery_flag(group, raft_service, Arc::new(AtomicBool::new(false))).await
+        Self::new_with_recovery_flag(group, group, raft_service, Arc::new(AtomicBool::new(false)))
+            .await
     }
 }
 
@@ -242,5 +249,23 @@ impl SchemasMap {
     }
     fn id_of_name(&self, name: &str) -> Option<u32> {
         self.name_map.get(name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_schema_sm_ids_differ_between_databases() {
+        let group = "shared_group";
+        let db_a = "db_a";
+        let db_b = "db_b";
+
+        assert_eq!(generate_sm_id(group), generate_scoped_sm_id(group, group));
+        assert_ne!(
+            generate_scoped_sm_id(group, db_a),
+            generate_scoped_sm_id(group, db_b)
+        );
     }
 }

@@ -143,7 +143,8 @@ impl NebServer {
     /// - Total cell count across all chunks
     /// - Physical memory limit configuration
     pub fn memory_status(&self) -> ServerMemoryStatus {
-        let total_chunks = self.chunks.list.len();
+        let chunks = self.chunks();
+        let total_chunks = chunks.list.len();
         let mut chunk_details = Vec::with_capacity(total_chunks);
 
         let mut total_hot_segments = 0;
@@ -152,7 +153,7 @@ impl NebServer {
         let mut total_cells = 0;
 
         // Collect statistics for each chunk
-        for chunk in &self.chunks.list {
+        for chunk in &chunks.list {
             let segments = chunk.segments();
             let hot_count = segments.iter().filter(|s| s.is_hot()).count();
             let cold_count = segments.iter().filter(|s| s.is_cold()).count();
@@ -180,24 +181,23 @@ impl NebServer {
             total_cells += cell_count;
         }
 
-        // Get physical memory limit from first chunk's tiered manager (all chunks have the same per-chunk limit)
-        let (physical_memory_limit_per_chunk, tiered_enabled) = if let Some(ref manager) = self
-            .chunks
+        // The shared pool holds the server-wide limit directly — no per-chunk multiplication.
+        let (total_physical_limit, tiered_enabled) = if let Some(ref manager) = self
+            .chunks()
             .list
             .first()
             .and_then(|c| c.tiered_manager.as_ref())
         {
-            (Some(manager.physical_memory_limit), manager.is_enabled())
+            (
+                Some(manager.shared_pool().physical_memory_limit),
+                manager.is_enabled(),
+            )
         } else {
             (None, false)
         };
 
-        // Calculate total limit across all chunks
-        let total_physical_limit =
-            physical_memory_limit_per_chunk.map(|limit| limit * total_chunks);
-
         let living_transactions = self
-            .txn_manager
+            .txn_manager()
             .as_ref()
             .map(|tm| tm.transaction_count())
             .unwrap_or(0);

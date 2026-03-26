@@ -68,8 +68,8 @@ async fn test_cell_location_alignment_after_write() {
     let server_addr = String::from("127.0.0.1:6000");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE,
+            chunk_size: SEGMENT_SIZE,
+            db_size: SEGMENT_SIZE,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -93,7 +93,7 @@ async fn test_cell_location_alignment_after_write() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     println!("Writing 100 cells and checking alignment of stored addresses");
 
@@ -107,7 +107,7 @@ async fn test_cell_location_alignment_after_write() {
         );
 
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
-        let result = server.chunks.write_cell(&mut cell);
+        let result = server.chunks().write_cell(&mut cell);
 
         assert!(
             result.is_ok(),
@@ -118,7 +118,7 @@ async fn test_cell_location_alignment_after_write() {
 
         // Now try to read it back - this will fail if the address is misaligned
         let cell_id = cell.id();
-        let read_result = server.chunks.read_cell(&cell_id);
+        let read_result = server.chunks().read_cell(&cell_id);
 
         match read_result {
             Ok(read_cell) => {
@@ -141,8 +141,8 @@ async fn test_cell_location_alignment_after_update() {
     let server_addr = String::from("127.0.0.1:6001");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE * 4,
+            chunk_size: SEGMENT_SIZE * 4,
+            db_size: SEGMENT_SIZE * 4,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -166,7 +166,7 @@ async fn test_cell_location_alignment_after_update() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     println!("Testing alignment through updates");
 
@@ -182,7 +182,7 @@ async fn test_cell_location_alignment_after_update() {
     let mut cell =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server
-        .chunks
+        .chunks()
         .write_cell(&mut cell)
         .expect("Failed to write initial cell");
 
@@ -205,7 +205,7 @@ async fn test_cell_location_alignment_after_update() {
         let mut updated_cell =
             OwnedCell::new_with_id(schema.id, &cell_id, OwnedValue::Map(data_map.clone()));
 
-        let update_result = server.chunks.update_cell(&mut updated_cell);
+        let update_result = server.chunks().update_cell(&mut updated_cell);
         assert!(
             update_result.is_ok(),
             "Failed to update cell iteration {}: {:?}",
@@ -214,7 +214,7 @@ async fn test_cell_location_alignment_after_update() {
         );
 
         // Read it back to ensure alignment is correct
-        let read_result = server.chunks.read_cell(&cell_id);
+        let read_result = server.chunks().read_cell(&cell_id);
         match read_result {
             Ok(read_cell) => {
                 assert_eq!(read_cell.id(), cell_id);
@@ -237,8 +237,8 @@ async fn test_varying_size_alignment() {
     let server_addr = String::from("127.0.0.1:6002");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE * 8,
+            chunk_size: SEGMENT_SIZE * 8,
+            db_size: SEGMENT_SIZE * 8,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -262,7 +262,7 @@ async fn test_varying_size_alignment() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     println!("Testing alignment with dramatically varying cell sizes");
 
@@ -283,7 +283,7 @@ async fn test_varying_size_alignment() {
 
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
 
-        let write_result = server.chunks.write_cell(&mut cell);
+        let write_result = server.chunks().write_cell(&mut cell);
         assert!(
             write_result.is_ok(),
             "Failed to write cell with size {}: {:?}",
@@ -293,7 +293,7 @@ async fn test_varying_size_alignment() {
 
         // Immediately read it back
         let cell_id = cell.id();
-        let read_result = server.chunks.read_cell(&cell_id);
+        let read_result = server.chunks().read_cell(&cell_id);
 
         match read_result {
             Ok(read_cell) => {
@@ -421,8 +421,8 @@ async fn test_alignment_after_multiple_segments() {
     let server_addr = String::from("127.0.0.1:6003");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            total_size: SEGMENT_SIZE * 4, // Multiple segments
+            chunk_size: SEGMENT_SIZE * 4,
+            db_size: SEGMENT_SIZE * 4, // Multiple segments
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -446,7 +446,7 @@ async fn test_alignment_after_multiple_segments() {
         false,
         false,
     );
-    server.meta.schemas.debug_only_new_schema(schema.clone());
+    server.meta().schemas.debug_only_new_schema(schema.clone());
 
     println!("Testing alignment across multiple segment allocations");
 
@@ -466,7 +466,7 @@ async fn test_alignment_after_multiple_segments() {
 
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
 
-        match server.chunks.write_cell(&mut cell) {
+        match server.chunks().write_cell(&mut cell) {
             Ok(_) => {
                 cell_ids.push(cell.id());
                 if i % 20 == 0 {
@@ -487,7 +487,7 @@ async fn test_alignment_after_multiple_segments() {
 
     // Read all cells back to verify alignment
     for (idx, cell_id) in cell_ids.iter().enumerate() {
-        match server.chunks.read_cell(cell_id) {
+        match server.chunks().read_cell(cell_id) {
             Ok(cell) => {
                 assert_eq!(cell.id(), *cell_id);
                 if idx % 20 == 0 {

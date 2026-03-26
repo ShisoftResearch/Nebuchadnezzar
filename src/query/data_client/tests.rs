@@ -198,8 +198,8 @@ async fn scan_all() {
     let server_group = String::from("indexed_scan_all_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -256,7 +256,8 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(), QueryOrdering::Asc,
+                Expr::nothing(),
+                QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -293,7 +294,8 @@ async fn scan_all() {
                 schema_id_2,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(), QueryOrdering::Asc,
+                Expr::nothing(),
+                QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -316,7 +318,8 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 Expr::nothing(),
-                Expr::nothing(), QueryOrdering::Asc,
+                Expr::nothing(),
+                QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -335,7 +338,8 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 select_expr,
-                Expr::nothing(), QueryOrdering::Asc,
+                Expr::nothing(),
+                QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -362,7 +366,8 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 select_expr,
-                Expr::nothing(), QueryOrdering::Asc,
+                Expr::nothing(),
+                QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -388,7 +393,8 @@ async fn scan_all() {
                 schema_id_1,
                 vec![],
                 Expr::nothing(),
-                proc_expr, QueryOrdering::Asc,
+                proc_expr,
+                QueryOrdering::Asc,
             )
             .await
             .unwrap();
@@ -415,8 +421,8 @@ async fn range_query_scan() {
     let server_group = String::from("indexed_scan_all_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -493,8 +499,8 @@ async fn create_test_server(port: u16) -> Arc<NebServer> {
     let server_group = format!("ranged_query_test_{}", port);
     NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -845,7 +851,8 @@ async fn range_query_scan_backward_ordering() {
             val_range,
             vec![],
             Expr::nothing(),
-            Expr::nothing(), Ordering::Backward,
+            Expr::nothing(),
+            Ordering::Backward,
         )
         .await
         .unwrap();
@@ -1276,7 +1283,8 @@ async fn scan_all_auto_uses_ranged_clause_from_selection() {
             schema_id,
             vec![],
             selection,
-            Expr::nothing(), QueryOrdering::Asc,
+            Expr::nothing(),
+            QueryOrdering::Asc,
         )
         .await
         .unwrap();
@@ -1326,7 +1334,8 @@ async fn scan_all_auto_uses_hashed_equality_clause_from_selection() {
             schema_id,
             vec![],
             selection,
-            Expr::nothing(), QueryOrdering::Asc,
+            Expr::nothing(),
+            QueryOrdering::Asc,
         )
         .await
         .unwrap();
@@ -2564,12 +2573,9 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
     }
 
     let idx_data_client = server.indexed_data_client();
-    let selection = parse_to_serde_expr(&format!("(>= {} 0u64)", RANGE_FIELD))
-        .unwrap()[0]
-        .clone();
-    let equality_selection = parse_to_serde_expr(&format!("(= {} 0u64)", RANGE_FIELD))
-        .unwrap()[0]
-        .clone();
+    let selection = parse_to_serde_expr(&format!("(>= {} 0u64)", RANGE_FIELD)).unwrap()[0].clone();
+    let equality_selection =
+        parse_to_serde_expr(&format!("(= {} 0u64)", RANGE_FIELD)).unwrap()[0].clone();
 
     let mut equality_cursor = idx_data_client
         .query_ids_with_options(
@@ -2799,9 +2805,8 @@ async fn query_ids_supports_not_as_residual_on_indexed_plan() {
             .unwrap();
     }
 
-    let selection = parse_to_serde_expr("(and (>= SCORE 2u64) (not (= TAG 1u64)))")
-        .unwrap()[0]
-        .clone();
+    let selection =
+        parse_to_serde_expr("(and (>= SCORE 2u64) (not (= TAG 1u64)))").unwrap()[0].clone();
     let mut cursor = server
         .indexed_data_client()
         .query_ids(schema_id, selection, QueryOrdering::Asc)
@@ -2883,7 +2888,11 @@ async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
     let server = create_test_server(6768).await;
     let server_addr = String::from("127.0.0.1:6768");
 
-    let fields = Field::new_schema(vec![Field::new_indexed(TAG, Type::U64, vec![IndexType::Hashed])]);
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        TAG,
+        Type::U64,
+        vec![IndexType::Hashed],
+    )]);
     let schema_id = 768;
     let schema = Schema::new_with_id(
         schema_id,
@@ -2973,7 +2982,12 @@ async fn query_ids_optimizes_between_on_ranged_field_without_schema_scan() {
 
     assert_eq!(
         ids,
-        vec![Id::new(38, 2), Id::new(38, 3), Id::new(38, 4), Id::new(38, 5)]
+        vec![
+            Id::new(38, 2),
+            Id::new(38, 3),
+            Id::new(38, 4),
+            Id::new(38, 5)
+        ]
     );
 }
 
@@ -3001,12 +3015,7 @@ async fn query_ids_supports_is_null_with_schema_scan_fallback() {
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
-    for (id_low, score) in [
-        (0u64, Some(10u64)),
-        (1, None),
-        (2, Some(20)),
-        (3, None),
-    ] {
+    for (id_low, score) in [(0u64, Some(10u64)), (1, None), (2, Some(20)), (3, None)] {
         let id = Id::new(39, id_low);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
@@ -3057,12 +3066,7 @@ async fn query_ids_optimizes_is_null_with_null_index_without_schema_scan() {
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
-    for (id_low, score) in [
-        (0u64, Some(10u64)),
-        (1, None),
-        (2, Some(20)),
-        (3, None),
-    ] {
+    for (id_low, score) in [(0u64, Some(10u64)), (1, None), (2, Some(20)), (3, None)] {
         let id = Id::new(42, id_low);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
@@ -3484,8 +3488,8 @@ async fn hashed_query_test() {
     let server_group = String::from("hashed_query_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 8,
-            total_size: 512 * 1024 * 1024,
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3689,6 +3693,82 @@ async fn hashed_query_test() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn hashed_query_rejects_map_values() {
+    const DATA_1: &'static str = "DATA_1";
+    let _ = env_logger::try_init();
+    let server_addr = String::from("127.0.0.1:6713");
+    let server_group = String::from("hashed_query_rejects_map_values");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        DATA_1,
+        Type::U64,
+        vec![IndexType::Hashed],
+    )]);
+    let schema_id = 12613;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "hashed_query_rejects_map_values",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let idx_data_client = server.indexed_data_client();
+    let err = idx_data_client
+        .hashed_query(
+            schema_id,
+            hash_str(DATA_1),
+            &OwnedValue::Map(OwnedMap::new()),
+        )
+        .await
+        .expect_err("map hashed query value should be rejected");
+
+    match err {
+        bifrost::rpc::RPCError::IOError(inner) => {
+            assert_eq!(inner.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(
+                inner
+                    .to_string()
+                    .contains("hashed equality requires a scalar value"),
+                "unexpected error: {inner}"
+            );
+            assert!(
+                inner.to_string().contains("map"),
+                "unexpected error: {inner}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn bm25_search_returns_ranked_results() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";
@@ -3696,8 +3776,8 @@ async fn bm25_search_returns_ranked_results() {
     let server_group = String::from("bm25_search_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3802,8 +3882,8 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
     let server_group = String::from("query_text_match_operator_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3908,8 +3988,8 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
     let server_group = String::from("query_text_match_or_predicate_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4014,8 +4094,8 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
     let server_group = String::from("query_text_match_order_by_field_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4119,8 +4199,8 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
     let server_group = String::from("query_nested_and_or_text_match_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4255,8 +4335,8 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
     let server_group = String::from("query_nested_or_and_order_limit_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4382,8 +4462,8 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
     let server_group = String::from("query_vector_similarity_and_filter_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4420,8 +4500,7 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
         ],
     );
     assert!(server
-        .indexer
-        .as_ref()
+        .indexer()
         .unwrap()
         .clients
         .vector_client
@@ -4513,8 +4592,8 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
     let server_group = String::from("query_embedding_similarity_nested_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4551,8 +4630,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
         ],
     );
     assert!(server
-        .indexer
-        .as_ref()
+        .indexer()
         .unwrap()
         .clients
         .embedding_client
@@ -4650,8 +4728,8 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
     let server_group = String::from("query_vector_similarity_failure_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,
-            total_size: 64 * 1024 * 1024,
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4673,8 +4751,7 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
     .await;
 
     assert!(server
-        .indexer
-        .as_ref()
+        .indexer()
         .unwrap()
         .clients
         .vector_client
@@ -4779,7 +4856,8 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
         let mut c = idx_data_client
             .query_ids_with_options(
                 schema_id,
-                selection.clone(), QueryOrdering::Desc,
+                selection.clone(),
+                QueryOrdering::Desc,
                 None,
                 None,
                 Some(limit),
@@ -4800,7 +4878,8 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
         let mut optimized = idx_data_client
             .query_ids_with_options(
                 schema_id,
-                selection.clone(), QueryOrdering::Desc,
+                selection.clone(),
+                QueryOrdering::Desc,
                 None,
                 None,
                 Some(limit),
@@ -4907,7 +4986,8 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
         let mut c = idx_data_client
             .query_ids_with_options(
                 schema_id,
-                selection.clone(), QueryOrdering::Desc,
+                selection.clone(),
+                QueryOrdering::Desc,
                 None,
                 None,
                 Some(limit),
@@ -4927,7 +5007,8 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
         let mut optimized = idx_data_client
             .query_ids_with_options(
                 schema_id,
-                selection.clone(), QueryOrdering::Desc,
+                selection.clone(),
+                QueryOrdering::Desc,
                 None,
                 None,
                 Some(limit),
@@ -5133,22 +5214,52 @@ async fn aggregate_groups_and_computes_builtins() {
         &OwnedValue::String("eu".to_string())
     );
     assert_eq!(query_row_value(&rows[0], "count_all"), &OwnedValue::U64(2));
-    assert_eq!(query_row_value(&rows[0], "count_latency"), &OwnedValue::U64(1));
-    assert_eq!(query_row_value(&rows[0], "sum_latency"), &OwnedValue::U64(30));
-    assert_eq!(query_row_value(&rows[0], "avg_latency"), &OwnedValue::F64(30.0));
-    assert_eq!(query_row_value(&rows[0], "min_latency"), &OwnedValue::U64(30));
-    assert_eq!(query_row_value(&rows[0], "max_latency"), &OwnedValue::U64(30));
+    assert_eq!(
+        query_row_value(&rows[0], "count_latency"),
+        &OwnedValue::U64(1)
+    );
+    assert_eq!(
+        query_row_value(&rows[0], "sum_latency"),
+        &OwnedValue::U64(30)
+    );
+    assert_eq!(
+        query_row_value(&rows[0], "avg_latency"),
+        &OwnedValue::F64(30.0)
+    );
+    assert_eq!(
+        query_row_value(&rows[0], "min_latency"),
+        &OwnedValue::U64(30)
+    );
+    assert_eq!(
+        query_row_value(&rows[0], "max_latency"),
+        &OwnedValue::U64(30)
+    );
 
     assert_eq!(
         query_row_value(&rows[1], "region"),
         &OwnedValue::String("us".to_string())
     );
     assert_eq!(query_row_value(&rows[1], "count_all"), &OwnedValue::U64(2));
-    assert_eq!(query_row_value(&rows[1], "count_latency"), &OwnedValue::U64(2));
-    assert_eq!(query_row_value(&rows[1], "sum_latency"), &OwnedValue::U64(30));
-    assert_eq!(query_row_value(&rows[1], "avg_latency"), &OwnedValue::F64(15.0));
-    assert_eq!(query_row_value(&rows[1], "min_latency"), &OwnedValue::U64(10));
-    assert_eq!(query_row_value(&rows[1], "max_latency"), &OwnedValue::U64(20));
+    assert_eq!(
+        query_row_value(&rows[1], "count_latency"),
+        &OwnedValue::U64(2)
+    );
+    assert_eq!(
+        query_row_value(&rows[1], "sum_latency"),
+        &OwnedValue::U64(30)
+    );
+    assert_eq!(
+        query_row_value(&rows[1], "avg_latency"),
+        &OwnedValue::F64(15.0)
+    );
+    assert_eq!(
+        query_row_value(&rows[1], "min_latency"),
+        &OwnedValue::U64(10)
+    );
+    assert_eq!(
+        query_row_value(&rows[1], "max_latency"),
+        &OwnedValue::U64(20)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5224,11 +5335,22 @@ async fn aggregate_shapes_group_and_aggregate_columns() {
         Field::new_unindexed_nullable(LATENCY, Type::U64),
     ]);
     let schema_id = 1103;
-    let schema = Schema::new_with_id(schema_id, "aggregate_projection_schema", None, fields, false, true);
+    let schema = Schema::new_with_id(
+        schema_id,
+        "aggregate_projection_schema",
+        None,
+        fields,
+        false,
+        true,
+    );
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
-    for (raw_id, region, latency) in [(0, "us", Some(10u64)), (1, "us", Some(20u64)), (2, "eu", Some(30u64))] {
+    for (raw_id, region, latency) in [
+        (0, "us", Some(10u64)),
+        (1, "us", Some(20u64)),
+        (2, "eu", Some(30u64)),
+    ] {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[REGION] = OwnedValue::String(region.to_string());
         value[LATENCY] = latency.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
@@ -5305,7 +5427,14 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
         Field::new_unindexed(SCORE, Type::U64),
     ]);
     let schema_id = 1101;
-    let schema = Schema::new_with_id(schema_id, "aggregate_sort_schema", None, fields, false, true);
+    let schema = Schema::new_with_id(
+        schema_id,
+        "aggregate_sort_schema",
+        None,
+        fields,
+        false,
+        true,
+    );
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
@@ -5367,5 +5496,8 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
         query_row_value(&rows[0], "region"),
         &OwnedValue::String("beta".to_string())
     );
-    assert_eq!(query_row_value(&rows[0], "total_score"), &OwnedValue::U64(20));
+    assert_eq!(
+        query_row_value(&rows[0], "total_score"),
+        &OwnedValue::U64(20)
+    );
 }

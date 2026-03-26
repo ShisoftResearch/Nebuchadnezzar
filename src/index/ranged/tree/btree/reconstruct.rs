@@ -4,6 +4,7 @@ use super::node::{write_node, Node, NodeWriteGuard};
 use super::*;
 use super::{max_entry_key, BPlusTree, NodeCellRef};
 use crate::client::AsyncClient;
+use std::collections::HashSet;
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::mem;
@@ -132,16 +133,24 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    let resolved_head_id = resolve_chain_head_id::<KS, PS>(head_id, neb).await;
+    if resolved_head_id != head_id {
+        info!(
+            "[B-TREE RECONSTRUCTION] Resolved non-head start {:?} -> real head {:?}",
+            head_id, resolved_head_id
+        );
+    }
+
     info!(
         "[B-TREE RECONSTRUCTION] Starting reconstruction of level {} tree from head cell {:?}",
-        level, head_id
+        level, resolved_head_id
     );
     let mut len = 0;
     let mut page_count = 0;
     let (root, height) = {
         let mut constructor = TreeConstructor::<KS, PS>::new();
         let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
-        let mut id = head_id;
+        let mut id = resolved_head_id;
         let mut at_end = false;
         while !at_end {
             page_count += 1;
@@ -201,7 +210,9 @@ where
                 *prev_lock.right_bound_mut() = first_key.clone();
                 *prev_lock.right_ref_mut().unwrap() = node_ref.clone();
             } else {
-                error!("Previous page is unit id, this is the first page in the chain");
+                debug!(
+                    "Previous page is unit id; this is the first page in the chain (expected)"
+                );
             }
             constructor.push_extnode(&node_ref, first_key);
             prev_ref = node_ref;
@@ -209,8 +220,8 @@ where
         }
         (constructor.root(), constructor.levels())
     };
-    info!("[B-TREE RECONSTRUCTION] Completed reconstruction of tree {:?} at level {} with {} keys, height {}", head_id, level, len, height);
-    let tree = BPlusTree::from_root(root, head_id, len, height, deletion);
+    info!("[B-TREE RECONSTRUCTION] Completed reconstruction of tree {:?} at level {} with {} keys, height {}", resolved_head_id, level, len, height);
+    let tree = BPlusTree::from_root(root, resolved_head_id, len, height, deletion);
     debug!(
         "[B-TREE RECONSTRUCTION] Verifying reconstruction at level {}",
         level
@@ -222,6 +233,50 @@ where
         level
     );
     tree
+}
+
+async fn resolve_chain_head_id<KS, PS>(start_id: Id, neb: &AsyncClient) -> Id
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let mut current = start_id;
+    let mut seen = HashSet::new();
+
+    loop {
+        if !seen.insert(current) {
+            warn!(
+                "[B-TREE RECONSTRUCTION] Detected cycle while resolving head from {:?}; using {:?}",
+                start_id, current
+            );
+            return current;
+        }
+
+        let cell = match neb.read_cell(current).await {
+            Ok(Ok(cell)) => cell,
+            Ok(Err(e)) => {
+                warn!(
+                    "[B-TREE RECONSTRUCTION] Failed to read candidate head {:?}: {:?}; using original {:?}",
+                    current, e, start_id
+                );
+                return start_id;
+            }
+            Err(e) => {
+                warn!(
+                    "[B-TREE RECONSTRUCTION] RPC error reading candidate head {:?}: {:?}; using original {:?}",
+                    current, e, start_id
+                );
+                return start_id;
+            }
+        };
+
+        let page = ExtNode::<KS, PS>::from_cell(&cell);
+        if page.prev_id.is_unit_id() {
+            return current;
+        }
+
+        current = page.prev_id;
+    }
 }
 
 unsafe impl<KS, PS> Send for TreeConstructor<KS, PS>
@@ -252,8 +307,8 @@ mod test {
         let server_addr = String::from("127.0.0.1:5600");
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: 16 * 12024 * 1024,
+                chunk_size: 16 * 12024 * 1024,
+                db_size: 16 * 12024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

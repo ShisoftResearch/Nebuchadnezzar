@@ -1976,8 +1976,8 @@ mod tests {
         let server_addr = String::from("127.0.0.1:5310"); // Unique port for this test
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2001,9 +2001,11 @@ mod tests {
             false,
             false,
         );
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
-        let txn = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn = transactions::new_async_client_for_database(&server_addr, "test", "test")
+            .await
+            .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         // Write a new cell in transaction (but don't commit)
@@ -2043,7 +2045,7 @@ mod tests {
         }
 
         // Archive segments before shutdown
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2055,8 +2057,8 @@ mod tests {
         // Restart server with recovery enabled
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2072,10 +2074,10 @@ mod tests {
         )
         .await;
 
-        server2.meta.schemas.debug_only_new_schema(schema.clone());
+        server2.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Cell should NOT exist after rollback
-        let cell_read_result = server2.chunks.read_cell(&cell_id);
+        let cell_read_result = server2.chunks().read_cell(&cell_id);
         if let Ok(ref cell) = cell_read_result {
             eprintln!("ERROR: Cell still exists after rollback!");
             eprintln!("Cell header: {:?}", cell.header);
@@ -2122,8 +2124,8 @@ mod tests {
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2166,18 +2168,20 @@ mod tests {
 
         let mut cell = OwnedCell::new_with_id(schema.id, &random_id(), OwnedValue::Map(data_map));
         let cell_id = cell.id();
-        server.chunks.write_cell(&mut cell).unwrap();
+        server.chunks().write_cell(&mut cell).unwrap();
         let original_name = cell.data["name"].string().unwrap().clone();
 
         // Archive before transaction
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
         }
 
         // Now update it in a transaction (but don't commit)
-        let txn = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn = transactions::new_async_client_for_database(&server_addr, "test", "test")
+            .await
+            .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         let mut data_map2 = OwnedMap::new();
@@ -2214,7 +2218,7 @@ mod tests {
         }
 
         // Archive segments before shutdown
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2226,8 +2230,8 @@ mod tests {
         // Restart server with recovery enabled
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2244,7 +2248,7 @@ mod tests {
         .await;
 
         // Cell should have original value after rollback
-        let restored_cell = server2.chunks.read_cell(&cell_id).unwrap();
+        let restored_cell = server2.chunks().read_cell(&cell_id).unwrap();
         assert_eq!(
             restored_cell.data["name"].string().unwrap(),
             &original_name,
@@ -2287,8 +2291,8 @@ mod tests {
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2331,18 +2335,20 @@ mod tests {
 
         let mut cell = OwnedCell::new_with_id(schema.id, &random_id(), OwnedValue::Map(data_map));
         let cell_id = cell.id();
-        server.chunks.write_cell(&mut cell).unwrap();
+        server.chunks().write_cell(&mut cell).unwrap();
         let original_name = cell.data["name"].string().unwrap().clone();
 
         // Archive before transaction
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
         }
 
         // Now remove it in a transaction (but don't commit)
-        let txn = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn = transactions::new_async_client_for_database(&server_addr, "test", "test")
+            .await
+            .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         match txn.remove(txn_id.clone(), cell_id).await.unwrap().unwrap() {
@@ -2363,7 +2369,7 @@ mod tests {
         }
 
         // Archive segments before shutdown
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2375,8 +2381,8 @@ mod tests {
         // Restart server with recovery enabled
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2393,7 +2399,7 @@ mod tests {
         .await;
 
         // Cell should exist after rollback
-        let restored_cell = server2.chunks.read_cell(&cell_id).unwrap();
+        let restored_cell = server2.chunks().read_cell(&cell_id).unwrap();
         assert_eq!(
             restored_cell.data["name"].string().unwrap(),
             &original_name,
@@ -2429,8 +2435,8 @@ mod tests {
         let group_name = "test_e2e_txn_committed_no_rollback";
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2458,9 +2464,15 @@ mod tests {
             false,
             false,
         );
-        server.meta.schemas.debug_only_new_schema(schema.clone());
+        server.meta().schemas.debug_only_new_schema(schema.clone());
 
-        let txn = transactions::new_async_client(&server_addr).await.unwrap();
+        let txn = transactions::new_async_client_for_database(
+            &server_addr,
+            group_name,
+            group_name,
+        )
+        .await
+        .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         // Write a new cell in transaction and commit
@@ -2491,7 +2503,7 @@ mod tests {
         );
 
         // Archive segments before shutdown
-        for chunk in &server.chunks.list {
+        for chunk in &server.chunks().list {
             for seg in chunk.segments() {
                 seg.archive().unwrap();
             }
@@ -2503,8 +2515,8 @@ mod tests {
         // Restart server with recovery enabled
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
-                total_size: SEGMENT_SIZE * 4,
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2523,10 +2535,10 @@ mod tests {
         // Wait for Raft to stabilize after recovery restart
         sleep(Duration::from_millis(500)).await;
 
-        server2.meta.schemas.debug_only_new_schema(schema.clone());
+        server2.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Cell should still exist after recovery (committed transaction)
-        let read_cell = server2.chunks.read_cell(&cell_id).unwrap();
+        let read_cell = server2.chunks().read_cell(&cell_id).unwrap();
         assert_eq!(
             read_cell.data["name"].string().unwrap(),
             "committed_name",
