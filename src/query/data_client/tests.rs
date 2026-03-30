@@ -112,12 +112,21 @@ impl VectorIndexerCore for MockVectorIndexerCore {
 #[derive(Clone)]
 struct MockEmbeddingIndexerCore {
     hits_by_field: Arc<HashMap<(u32, u64), Vec<EmbeddingHit>>>,
+    should_fail: bool,
 }
 
 impl MockEmbeddingIndexerCore {
     fn successful(hits_by_field: HashMap<(u32, u64), Vec<EmbeddingHit>>) -> Self {
         Self {
             hits_by_field: Arc::new(hits_by_field),
+            should_fail: false,
+        }
+    }
+
+    fn failing() -> Self {
+        Self {
+            hits_by_field: Arc::new(HashMap::new()),
+            should_fail: true,
         }
     }
 }
@@ -162,6 +171,14 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
         _query: &str,
         limit: usize,
     ) -> BoxFuture<'_, Result<Vec<EmbeddingHit>, IndexError>> {
+        if self.should_fail {
+            return async {
+                Err(IndexError::Other(
+                    "mock embedding similarity failure".to_string(),
+                ))
+            }
+            .boxed();
+        }
         let hits = self
             .hits_by_field
             .get(&(schema_id, field_id))
@@ -4453,13 +4470,13 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
+async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
     let _ = env_logger::try_init();
-    const VEC_FIELD: &str = "VEC";
+    const EMB_FIELD: &str = "EMB";
     const TAG_FIELD: &str = "TAG";
     let schema_id = 783;
     let server_addr = String::from("127.0.0.1:6745");
-    let server_group = String::from("query_vector_similarity_and_filter_test");
+    let server_group = String::from("query_embedding_similarity_and_filter_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
@@ -4484,16 +4501,16 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
     )
     .await;
 
-    let vector_field_id = hash_str(VEC_FIELD);
-    let mut vector_hits = HashMap::new();
-    vector_hits.insert(
-        (schema_id, vector_field_id),
+    let embedding_field_id = hash_str(EMB_FIELD);
+    let mut embedding_hits = HashMap::new();
+    embedding_hits.insert(
+        (schema_id, embedding_field_id),
         vec![
-            VectorHit {
+            EmbeddingHit {
                 id: Id::new(11, 1),
                 score: 0.98,
             },
-            VectorHit {
+            EmbeddingHit {
                 id: Id::new(11, 2),
                 score: 0.90,
             },
@@ -4503,22 +4520,22 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
         .indexer()
         .unwrap()
         .clients
-        .vector_client
-        .set_vector_index_core(MockVectorIndexerCore::successful(vector_hits)));
+        .embedding_client
+        .set_embedding_index_core(MockEmbeddingIndexerCore::successful(
+            embedding_hits,
+        )));
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(
-            VEC_FIELD,
+            EMB_FIELD,
             Type::String,
-            vec![IndexType::Vector(VectorIndexConfig::new(
-                MetricEncoding::Cosine,
-            ))],
+            vec![IndexType::Embedding(EmbeddingModel::default_model())],
         ),
         Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
     ]);
     let schema = Schema::new_with_id(
         schema_id,
-        "query_vector_similarity_schema",
+        "query_embedding_similarity_schema",
         None,
         fields,
         false,
@@ -4536,7 +4553,7 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
         (Id::new(11, 3), "infra"),
     ] {
         let mut value = OwnedValue::Map(OwnedMap::new());
-        value[VEC_FIELD] = OwnedValue::String("placeholder".to_string());
+        value[EMB_FIELD] = OwnedValue::String("placeholder".to_string());
         value[TAG_FIELD] = OwnedValue::String((*tag).to_string());
         client
             .write_cell(OwnedCell::new_with_id(schema_id, id, value))
@@ -4556,10 +4573,8 @@ async fn query_ids_supports_vector_similarity_operator_with_and_filter() {
         Expr::Symbol(hash_str("and"), "and".to_string()),
         Expr::List(vec![
             Expr::Symbol(hash_str("~"), "~".to_string()),
-            Expr::Symbol(vector_field_id, VEC_FIELD.to_string()),
-            Expr::Value(OwnedValue::PrimArray(OwnedPrimArray::F32(vec![
-                0.1, 0.2, 0.3,
-            ]))),
+            Expr::Symbol(embedding_field_id, EMB_FIELD.to_string()),
+            Expr::Value(OwnedValue::String("semantic ranking".to_string())),
         ]),
         Expr::List(vec![
             Expr::Symbol(hash_str("="), "=".to_string()),
@@ -4720,12 +4735,12 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn query_ids_returns_error_when_vector_similarity_search_fails() {
+async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
     let _ = env_logger::try_init();
-    const VEC_FIELD: &str = "VEC";
+    const EMB_FIELD: &str = "EMB";
     let schema_id = 785;
     let server_addr = String::from("127.0.0.1:6747");
-    let server_group = String::from("query_vector_similarity_failure_test");
+    let server_group = String::from("query_embedding_similarity_failure_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
@@ -4754,19 +4769,17 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
         .indexer()
         .unwrap()
         .clients
-        .vector_client
-        .set_vector_index_core(MockVectorIndexerCore::failing()));
+        .embedding_client
+        .set_embedding_index_core(MockEmbeddingIndexerCore::failing()));
 
     let fields = Field::new_schema(vec![Field::new_indexed(
-        VEC_FIELD,
+        EMB_FIELD,
         Type::String,
-        vec![IndexType::Vector(VectorIndexConfig::new(
-            MetricEncoding::Cosine,
-        ))],
+        vec![IndexType::Embedding(EmbeddingModel::default_model())],
     )]);
     let schema = Schema::new_with_id(
         schema_id,
-        "query_vector_similarity_failure_schema",
+        "query_embedding_similarity_failure_schema",
         None,
         fields,
         false,
@@ -4779,7 +4792,7 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     let mut value = OwnedValue::Map(OwnedMap::new());
-    value[VEC_FIELD] = OwnedValue::String("placeholder".to_string());
+    value[EMB_FIELD] = OwnedValue::String("placeholder".to_string());
     client
         .write_cell(OwnedCell::new_with_id(schema_id, &Id::new(13, 1), value))
         .await
@@ -4795,8 +4808,8 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
 
     let selection = Expr::List(vec![
         Expr::Symbol(hash_str("~"), "~".to_string()),
-        Expr::Symbol(hash_str(VEC_FIELD), VEC_FIELD.to_string()),
-        Expr::Value(OwnedValue::PrimArray(OwnedPrimArray::F32(vec![0.1, 0.2]))),
+        Expr::Symbol(hash_str(EMB_FIELD), EMB_FIELD.to_string()),
+        Expr::Value(OwnedValue::String("semantic ranking".to_string())),
     ]);
 
     let query_res = server
@@ -4805,7 +4818,7 @@ async fn query_ids_returns_error_when_vector_similarity_search_fails() {
         .await;
     assert!(
         query_res.is_err(),
-        "expected vector similarity query failure"
+        "expected embedding similarity query failure"
     );
 }
 

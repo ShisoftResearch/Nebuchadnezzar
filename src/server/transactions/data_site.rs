@@ -809,9 +809,9 @@ impl Service for DataManager {
         debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
         self.update_clock(&clock);
 
-        let Some(txn_lock) = self.find_transaction(&tid) else {
-            return self.response_with(DMPrepareResult::TransactionNotExisted);
-        };
+        // A write-only transaction may reach a data site for the first time at prepare.
+        // In that case we still need local state to acquire locks and track commit history.
+        let txn_lock = self.get_or_create_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
             return self.response_with(DMPrepareResult::StateError(txn.state));

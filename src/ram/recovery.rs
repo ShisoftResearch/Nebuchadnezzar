@@ -201,23 +201,30 @@ fn phase1_5_set_initial_seq_ids(chunks: &[Chunk], files: &[SegmentFileInfo]) {
 fn should_recover_as_cold(
     chunk: &Chunk,
     file_info: &SegmentFileInfo,
-    hot_memory_used: &HashMap<usize, usize>,
+    current_hot_segments: usize,
 ) -> bool {
     if let Some(ref tiered_manager) = chunk.tiered_manager {
         let physical_limit = tiered_manager.shared_pool().physical_memory_limit;
-        let chunk_hot_used = hot_memory_used
-            .get(&file_info.chunk_id)
-            .copied()
-            .unwrap_or(0);
-        let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
+        let existing_hot = chunk
+            .segs
+            .get(&(file_info.seg_id as usize))
+            .map(|segment| segment.is_hot())
+            .unwrap_or(false);
+        let additional_hot_segments = usize::from(!existing_hot);
+        let would_exceed_limit = current_hot_segments
+            .checked_add(additional_hot_segments)
+            .and_then(|segments| segments.checked_mul(SEGMENT_SIZE))
+            .map(|bytes| bytes > physical_limit)
+            .unwrap_or(true);
 
         // Recover as cold if: backup file and would exceed hot memory limit
         // Compressed files are now supported via Vec-based recovery
         let recover_as_cold = file_info.is_backup && would_exceed_limit;
 
         debug!(
-            "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
-            chunk_hot_used / (1024 * 1024),
+            "Recovery decision: global_hot_segments={}, existing_hot={}, limit={} MB, would_exceed={}, recover_as_cold={}",
+            current_hot_segments,
+            existing_hot,
             physical_limit / (1024 * 1024),
             would_exceed_limit,
             recover_as_cold
@@ -679,8 +686,6 @@ pub fn recover_chunks(
 
     info!("Processing {} segment files...", files.len());
 
-    // Track hot memory usage per chunk to decide hot vs cold
-    let hot_memory_used: Mutex<HashMap<usize, usize>> = Mutex::new(HashMap::new());
     let all_stashed_tombstones: Mutex<Vec<StashedTombstone>> = Mutex::new(Vec::new());
     let hot_count = std::sync::atomic::AtomicUsize::new(0);
     let cold_count = std::sync::atomic::AtomicUsize::new(0);
@@ -688,14 +693,32 @@ pub fn recover_chunks(
 
     // Pre-compute hot vs cold decisions to avoid lock contention during parallel processing
     let recovery_decisions: Vec<(SegmentFileInfo, bool)> = {
-        let mut hot_used: HashMap<usize, usize> = HashMap::new();
+        let mut planned_global_hot_segments = chunks
+            .iter()
+            .find_map(|chunk| {
+                chunk.tiered_manager
+                    .as_ref()
+                    .map(|manager| manager.shared_pool().total_hot_segments())
+            })
+            .unwrap_or(0);
         files
             .iter()
             .map(|file_info| {
                 let chunk = &chunks[file_info.chunk_id];
-                let is_cold = should_recover_as_cold(chunk, file_info, &hot_used);
-                if !is_cold {
-                    *hot_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
+                let existing_hot = chunk
+                    .segs
+                    .get(&(file_info.seg_id as usize))
+                    .map(|segment| segment.is_hot())
+                    .unwrap_or(false);
+                let is_cold =
+                    should_recover_as_cold(chunk, file_info, planned_global_hot_segments);
+                if is_cold {
+                    if existing_hot {
+                        planned_global_hot_segments =
+                            planned_global_hot_segments.saturating_sub(1);
+                    }
+                } else if !existing_hot {
+                    planned_global_hot_segments += 1;
                 }
                 (file_info.clone(), is_cold)
             })
@@ -810,6 +833,9 @@ pub fn recover_chunks(
             // Mark as cold/archived BEFORE scanning
             segment.set_cold();
             segment.clear_dirty(); // Recovered segments should not be archived again
+            if let Some(ref tiered_manager) = chunk.tiered_manager {
+                tiered_manager.decrement_hot_count();
+            }
 
             // Load data to heap memory (temporary)
             let file_data = load_file_to_memory(&file_info.path)?;
@@ -940,6 +966,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().to_str().unwrap().to_string();
         (dir, path)
+    }
+
+    fn total_hot_segments(chunks: &Arc<Chunks>) -> usize {
+        chunks
+            .list
+            .iter()
+            .map(|chunk| chunk.segments().iter().filter(|seg| seg.is_hot()).count())
+            .sum()
+    }
+
+    fn total_cold_segments(chunks: &Arc<Chunks>) -> usize {
+        chunks
+            .list
+            .iter()
+            .map(|chunk| chunk.segments().iter().filter(|seg| seg.is_cold()).count())
+            .sum()
+    }
+
+    fn write_until_segment_count(chunks: &Arc<Chunks>, partition: u64, target_segments: usize) {
+        let mut next_id = 0_u64;
+        while chunks.list[0].segments().len() < target_segments {
+            let mut cell = default_cell(&Id::new(partition, next_id));
+            chunks.write_cell(&mut cell).unwrap();
+            next_id += 1;
+        }
     }
 
     // Purpose: Validate parsing of segment filenames `{chunk}-{seg}-{seq}.{nlog|nbackup}`
@@ -2227,5 +2278,122 @@ mod tests {
                 assert!(cell.is_ok(), "Cell {} should exist", i);
             }
         }
+    }
+
+    #[test]
+    fn test_multi_database_recovery_respects_shared_hot_limit() {
+        let _ = env_logger::try_init();
+
+        let db1_wal_dir = TempDir::new().unwrap();
+        let db1_backup_dir = TempDir::new().unwrap();
+        let db2_wal_dir = TempDir::new().unwrap();
+        let db2_backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let shared_pool =
+            crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+                threshold: 0.75,
+                lower_watermark: 0.5,
+                physical_memory_limit: 4 * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            });
+        let shared_manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            shared_pool,
+        ));
+
+        {
+            let db1_chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 8,
+                Arc::new(ServerMeta {
+                    schemas: setup_test_schema(),
+                }),
+                None,
+                Some(db1_backup_dir.path().to_str().unwrap().to_string()),
+                Some(db1_wal_dir.path().to_str().unwrap().to_string()),
+                Some(shared_manager.clone()),
+                false,
+                Some(raft_path.clone()),
+            );
+            let db2_chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 8,
+                Arc::new(ServerMeta {
+                    schemas: setup_test_schema(),
+                }),
+                None,
+                Some(db2_backup_dir.path().to_str().unwrap().to_string()),
+                Some(db2_wal_dir.path().to_str().unwrap().to_string()),
+                Some(shared_manager.clone()),
+                false,
+                Some(raft_path.clone()),
+            );
+
+            write_until_segment_count(&db1_chunks, 0, 3);
+            write_until_segment_count(&db2_chunks, 0, 3);
+
+            for chunks in [&db1_chunks, &db2_chunks] {
+                for chunk in &chunks.list {
+                    for seg in chunk.segments() {
+                        seg.archive().unwrap();
+                    }
+                }
+            }
+        }
+
+        let recovery_manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+                threshold: 0.75,
+                lower_watermark: 0.5,
+                physical_memory_limit: 4 * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            }),
+        ));
+
+        let recovered_db1 = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 8,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(db1_backup_dir.path().to_str().unwrap().to_string()),
+            Some(db1_wal_dir.path().to_str().unwrap().to_string()),
+            Some(recovery_manager.clone()),
+            true,
+            Some(raft_path.clone()),
+        );
+        let recovered_db2 = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 8,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(db2_backup_dir.path().to_str().unwrap().to_string()),
+            Some(db2_wal_dir.path().to_str().unwrap().to_string()),
+            Some(recovery_manager.clone()),
+            true,
+            Some(raft_path.clone()),
+        );
+
+        let combined_hot = total_hot_segments(&recovered_db1) + total_hot_segments(&recovered_db2);
+        let combined_cold =
+            total_cold_segments(&recovered_db1) + total_cold_segments(&recovered_db2);
+
+        assert_eq!(
+            combined_hot,
+            4,
+            "recovery should keep total hot segments within the shared server-wide physical limit"
+        );
+        assert!(
+            combined_cold >= 2,
+            "the second recovered database should spill segments to cold storage when the shared hot budget is exhausted"
+        );
+        assert_eq!(
+            recovery_manager.shared_pool().total_hot_segments(),
+            combined_hot,
+            "shared pool accounting should match recovered hot segments across databases"
+        );
     }
 }
