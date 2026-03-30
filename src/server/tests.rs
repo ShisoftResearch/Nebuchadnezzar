@@ -1344,6 +1344,18 @@ pub async fn memory_status_test() {
         Some(64 * 1024 * 1024),
         "Physical limit should be 64 MB"
     );
+    assert_eq!(
+        status.shared_hot_segments, status.total_hot_segments,
+        "shared hot counter should match scanned hot segments in the initial steady state"
+    );
+    assert_eq!(
+        status.hot_segment_counter_drift, 0,
+        "initial memory status should report no hot-segment counter drift"
+    );
+    assert_eq!(
+        status.shared_hot_memory_bytes, status.total_hot_memory_bytes,
+        "shared hot memory bytes should match scanned hot memory bytes when there is no drift"
+    );
 
     // Each chunk should start with at least one hot segment (bootstrap)
     for chunk_status in &status.chunk_details {
@@ -1371,6 +1383,10 @@ pub async fn memory_status_test() {
     assert!(
         json.contains("tiered_memory_enabled"),
         "JSON should contain tiered_memory_enabled"
+    );
+    assert!(
+        json.contains("shared_hot_segments"),
+        "JSON should contain shared_hot_segments"
     );
 
     info!("Memory status test completed successfully");

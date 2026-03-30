@@ -1,5 +1,5 @@
 use crate::ram::chunk::{Chunk, Chunks};
-use crate::ram::segs::{Segment, SEGMENT_SIZE};
+use crate::ram::segs::Segment;
 use rayon::prelude::*;
 use std::env;
 use std::ops::Deref;
@@ -87,7 +87,7 @@ impl Cleaner {
                         // Background eviction: check and evict if memory limit exceeded
                         #[cfg(feature = "tiered_memory")]
                         if let Some(ref tiered_manager) = checks_ref_clone.tiered_manager {
-                            evict_pool.install(|| match tiered_manager.evict_for_allocation() {
+                            evict_pool.install(|| match tiered_manager.evict_for_allocation_reconciled() {
                                 Ok(evicted) => {
                                     if evicted > 0 {
                                         progress.store(true, Ordering::Relaxed);

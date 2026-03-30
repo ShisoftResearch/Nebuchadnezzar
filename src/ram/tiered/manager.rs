@@ -211,9 +211,16 @@ impl TieredMemoryManager {
         live
     }
 
-    fn reconcile_chunk(&self, chunk: &Chunk) {
+    fn reconcile_chunk_with_mode(&self, chunk: &Chunk, force_full_scan: bool) {
         let state = self.ensure_chunk_state(chunk);
-        let should_full_scan = if let Some(mut last_scan) = state.last_full_scan.try_lock() {
+        let should_full_scan = if force_full_scan {
+            if let Some(mut last_scan) = state.last_full_scan.try_lock() {
+                *last_scan = Instant::now();
+                true
+            } else {
+                false
+            }
+        } else if let Some(mut last_scan) = state.last_full_scan.try_lock() {
             if last_scan.elapsed() >= Duration::from_secs(10) {
                 *last_scan = Instant::now();
                 true
@@ -247,6 +254,10 @@ impl TieredMemoryManager {
         }
     }
 
+    fn reconcile_chunk(&self, chunk: &Chunk) {
+        self.reconcile_chunk_with_mode(chunk, false);
+    }
+
     fn total_hot_segments_cached(&self) -> usize {
         let registered = self.collect_registered_chunk_sets();
         for chunk_set in &registered {
@@ -255,6 +266,26 @@ impl TieredMemoryManager {
             }
         }
         self.shared_pool.total_hot_segments()
+    }
+
+    fn force_reconcile_all_chunks(&self) -> usize {
+        let registered = self.collect_registered_chunk_sets();
+        let mut scanned_total = 0usize;
+        for chunk_set in &registered {
+            for chunk in &chunk_set.list {
+                let state = self.ensure_chunk_state(chunk);
+                let actual = self.count_hot_segments(chunk);
+                state.last_known_count.store(actual, Ordering::Relaxed);
+                if let Some(mut last_scan) = state.last_full_scan.try_lock() {
+                    *last_scan = Instant::now();
+                }
+                scanned_total = scanned_total.saturating_add(actual);
+            }
+        }
+        let shared_total = self.shared_pool.total_hot_segments();
+        let delta = scanned_total as isize - shared_total as isize;
+        self.shared_pool.adjust_delta(delta);
+        scanned_total
     }
 
     fn all_registered_chunks<'a>(&self, sets: &'a [Arc<Chunks>]) -> Vec<&'a Chunk> {
@@ -457,7 +488,6 @@ impl TieredMemoryManager {
                 .checked_add(SEGMENT_SIZE)
                 .unwrap_or_else(|| self.shared_pool.physical_memory_limit * 2);
             let threshold_limit = self.threshold_limit();
-            let lower_limit = self.lower_watermark_limit();
 
             debug!(
                 "Global eviction before allocation: current {} global hot segments ({} MB), would be {} MB after allocation, threshold {} MB ({}% of {} MB), evicting {} segments",
@@ -467,6 +497,42 @@ impl TieredMemoryManager {
                 threshold_limit / (1024 * 1024),
                 (self.shared_pool.threshold * 100.0) as u32,
                 self.shared_pool.physical_memory_limit / (1024 * 1024),
+                segments_to_evict
+            );
+
+            self.evict_globally_until_target(segments_to_evict)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Check if allocating a new segment would exceed the threshold after forcing a
+    /// full global reconcile. This is intended for low-frequency background callers
+    /// such as the cleaner to avoid acting on a stale shared counter.
+    pub fn evict_for_allocation_reconciled(&self) -> Result<usize, io::Error> {
+        if !self.enabled {
+            return Ok(0);
+        }
+
+        let hot_segments_count = self.force_reconcile_all_chunks();
+        let max_reasonable_segments = usize::MAX / SEGMENT_SIZE;
+        let hot_segments_count = hot_segments_count.min(max_reasonable_segments);
+        if let Some(segments_to_evict) = self.allocation_eviction_target(hot_segments_count) {
+            let current_hot_memory = self.hot_memory_bytes(hot_segments_count);
+            let after_alloc_memory = current_hot_memory
+                .checked_add(SEGMENT_SIZE)
+                .unwrap_or_else(|| self.shared_pool.physical_memory_limit * 2);
+            let threshold_limit = self.threshold_limit();
+            let scanned_hot_segments = self.scanned_hot_segments();
+            let shared_counter_segments = self.shared_pool.total_hot_segments();
+
+            debug!(
+                "Global eviction before allocation after forced reconcile: shared_counter={} scanned={} hot={} MB, would be {} MB after allocation, threshold {} MB, evicting {} segments",
+                shared_counter_segments,
+                scanned_hot_segments,
+                current_hot_memory / (1024 * 1024),
+                after_alloc_memory / (1024 * 1024),
+                threshold_limit / (1024 * 1024),
                 segments_to_evict
             );
 
@@ -535,6 +601,21 @@ impl TieredMemoryManager {
     pub fn hot_count_cached(&self, chunk: &Chunk) -> usize {
         self.reconcile_chunk(chunk);
         self.shared_pool.total_hot_segments()
+    }
+
+    /// Return the current shared-pool hot-segment counter without performing any reconciliation.
+    pub fn shared_hot_segments(&self) -> usize {
+        self.shared_pool.total_hot_segments()
+    }
+
+    /// Return the scanned hot-segment count across all registered chunks.
+    pub fn scanned_hot_segments(&self) -> usize {
+        let registered = self.collect_registered_chunk_sets();
+        registered
+            .iter()
+            .flat_map(|chunk_set| chunk_set.list.iter())
+            .map(|chunk| self.count_hot_segments(chunk))
+            .sum()
     }
 
     /// Increment the server-wide hot-segment count.

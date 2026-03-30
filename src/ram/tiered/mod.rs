@@ -10,7 +10,7 @@ mod tests;
 #[cfg(test)]
 mod bench;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Number of cache-line-padded stripes in the shared hot-segment counter.
@@ -53,6 +53,8 @@ pub struct SharedMemoryPool {
     pub promotion_cooldown_ms: u64,
     /// CPU-indexed stripe counters.
     stripes: [CachePadded; STRIPE_COUNT],
+    /// Global signed correction applied by reconciliation logic.
+    correction: AtomicIsize,
 }
 
 impl SharedMemoryPool {
@@ -63,6 +65,7 @@ impl SharedMemoryPool {
             lower_watermark: config.lower_watermark,
             promotion_cooldown_ms: config.promotion_cooldown_ms,
             stripes: std::array::from_fn(|_| CachePadded(AtomicUsize::new(0))),
+            correction: AtomicIsize::new(0),
         })
     }
 
@@ -84,34 +87,29 @@ impl SharedMemoryPool {
             .ok();
     }
 
-    /// Apply a signed delta to this thread's stripe.
-    /// Used by the periodic per-chunk reconciliation scan.
+    /// Apply a signed delta globally.
+    /// Used by reconciliation scans to correct drift regardless of which stripes
+    /// previous increments landed on.
     #[inline]
     pub fn adjust_delta(&self, delta: isize) {
         if delta == 0 {
             return;
         }
-        let idx = thread_stripe();
-        if delta > 0 {
-            self.stripes[idx].0.fetch_add(delta as usize, Ordering::Relaxed);
-        } else {
-            self.stripes[idx]
-                .0
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub((-delta) as usize))
-                })
-                .ok();
-        }
+        self.correction.fetch_add(delta, Ordering::Relaxed);
     }
 
     /// Sum all stripes to get the server-wide hot segment count.
     /// O(STRIPE_COUNT) — only called at segment-allocation boundaries.
     #[inline]
     pub fn total_hot_segments(&self) -> usize {
-        self.stripes
+        let striped_total: isize = self
+            .stripes
             .iter()
-            .map(|s| s.0.load(Ordering::Relaxed))
-            .sum()
+            .map(|s| s.0.load(Ordering::Relaxed) as isize)
+            .sum();
+        striped_total
+            .saturating_add(self.correction.load(Ordering::Relaxed))
+            .max(0) as usize
     }
 
     #[inline]

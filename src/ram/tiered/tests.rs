@@ -94,6 +94,44 @@ fn total_cold_segments(chunks: &Arc<Chunks>) -> usize {
         .sum()
 }
 
+fn total_hot_segments_across_sets(chunk_sets: &[&Arc<Chunks>]) -> usize {
+    chunk_sets.iter().map(|chunks| total_hot_segments(chunks)).sum()
+}
+
+fn total_cold_segments_across_sets(chunk_sets: &[&Arc<Chunks>]) -> usize {
+    chunk_sets.iter().map(|chunks| total_cold_segments(chunks)).sum()
+}
+
+fn assert_shared_counter_matches_scanned_total(
+    manager: &crate::ram::tiered::manager::TieredMemoryManager,
+    chunk_sets: &[&Arc<Chunks>],
+) {
+    let scanned_total = total_hot_segments_across_sets(chunk_sets);
+    let shared_total = manager.shared_hot_segments();
+    assert_eq!(
+        shared_total, scanned_total,
+        "shared hot-segment counter should match scanned hot segments across all registered databases"
+    );
+}
+
+async fn wait_for_shared_counter_alignment(
+    manager: &crate::ram::tiered::manager::TieredMemoryManager,
+    chunk_sets: &[&Arc<Chunks>],
+    timeout_ms: u64,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if manager.shared_hot_segments() == total_hot_segments_across_sets(chunk_sets) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_shared_counter_matches_scanned_total(manager, chunk_sets);
+}
+
 fn reconcile_global_hot_segments(
     manager: &crate::ram::tiered::manager::TieredMemoryManager,
     chunk_sets: &[&Arc<Chunks>],
@@ -747,6 +785,421 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
     let _ = std::fs::remove_dir_all("/tmp/neb_single_db_threshold_gate_schema");
+}
+
+#[test]
+fn test_reconciled_background_eviction_ignores_stale_shared_counter_drift() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let physical_memory_limit = 8 * SEGMENT_SIZE;
+    let threshold = 0.75;
+    let schema = Schema::new("reconciled_threshold_gate", None, default_fields(), false, false);
+    let schemas = LocalSchemasCache::new_local("/tmp/neb_reconciled_threshold_gate_schema");
+    schemas.debug_only_new_schema(schema.clone());
+
+    let backup_dir = "/tmp/neb_reconciled_threshold_gate_bk";
+    let wal_dir = "/tmp/neb_reconciled_threshold_gate_wal";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold,
+            lower_watermark: 0.5,
+            physical_memory_limit,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+    let chunks = Chunks::new(
+        1,
+        4 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+        Some(manager.clone()),
+    );
+
+    let payload = "s".repeat(2048);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment, &payload);
+
+    let scanned_hot_segments = total_hot_segments(&chunks);
+    assert!(
+        scanned_hot_segments < 6,
+        "setup should stay materially below the 0.75 threshold for an 8-segment limit"
+    );
+
+    manager.shared_pool().adjust_delta(64);
+    assert!(
+        manager.shared_hot_segments() > scanned_hot_segments,
+        "test setup should create an artificial positive drift in the shared counter"
+    );
+
+    let stale_path_result = manager
+        .evict_for_allocation()
+        .expect("non-reconciled allocation path should still return cleanly");
+    assert!(
+        stale_path_result > 0 || manager.shared_hot_segments() > scanned_hot_segments,
+        "without forced reconcile the stale shared counter should remain observable"
+    );
+
+    let evicted_reconciled = manager
+        .evict_for_allocation_reconciled()
+        .expect("reconciled allocation path should succeed");
+    assert_eq!(
+        evicted_reconciled, 0,
+        "forced reconciliation should prevent background eviction while scanned hot memory is still below threshold"
+    );
+    assert_eq!(
+        manager.shared_hot_segments(),
+        total_hot_segments(&chunks),
+        "forced reconciliation should pull the shared counter back to the scanned hot-segment total"
+    );
+
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all("/tmp/neb_reconciled_threshold_gate_schema");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+    std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
+
+    let backup_dir = "/tmp/neb_single_db_cleaner_drift_bk";
+    let wal_dir = "/tmp/neb_single_db_cleaner_drift_wal";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 8 * SEGMENT_SIZE,
+            db_size: 8 * SEGMENT_SIZE,
+            tiered_config: Some(crate::ram::tiered::TieredConfig {
+                threshold: 0.75,
+                lower_watermark: 0.5,
+                physical_memory_limit: 6 * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            }),
+            backup_storage: Some(backup_dir.to_string()),
+            wal_storage: Some(wal_dir.to_string()),
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5412"),
+        "tiered_single_db_cleaner_drift",
+        async |_| {},
+    )
+    .await;
+
+    let schema = Schema::new_with_id(
+        9021,
+        &String::from("single_db_cleaner_drift_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    server.meta().schemas.debug_only_new_schema(schema.clone());
+
+    let manager = server
+        .chunks()
+        .tiered_manager
+        .as_ref()
+        .expect("single database should have a tiered manager")
+        .clone();
+
+    let payload = "cleaner-single-db".repeat(170);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    for round in 0..8 {
+        write_cells_for_partition(
+            server.chunks(),
+            schema.id,
+            (round % 2) as u64,
+            round * (cells_per_segment / 2),
+            cells_per_segment / 2,
+            &payload,
+        );
+        wait_for_shared_counter_alignment(&manager, &[&server.chunks()], 500).await;
+    }
+
+    wait_for_shared_counter_alignment(&manager, &[&server.chunks()], 500).await;
+
+    server.cleaner().stop();
+    server.shutdown().await;
+    std::env::remove_var("NEB_CLEANER_SLEEP_INTERVAL_MS");
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+    std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
+
+    let backup_dir = "/tmp/neb_multi_db_cleaner_drift_bk";
+    let wal_dir = "/tmp/neb_multi_db_cleaner_drift_wal";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 8 * SEGMENT_SIZE,
+            db_size: 8 * SEGMENT_SIZE,
+            tiered_config: Some(crate::ram::tiered::TieredConfig {
+                threshold: 0.75,
+                lower_watermark: 0.5,
+                physical_memory_limit: 8 * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            }),
+            backup_storage: Some(backup_dir.to_string()),
+            wal_storage: Some(wal_dir.to_string()),
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5413"),
+        "tiered_multi_db_cleaner_drift",
+        async |_| {},
+    )
+    .await;
+
+    let analytics = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("analytics runtime should be created");
+
+    let default_schema = Schema::new_with_id(
+        9022,
+        &String::from("default_cleaner_drift_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let analytics_schema = Schema::new_with_id(
+        9023,
+        &String::from("analytics_cleaner_drift_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    server.meta().schemas.debug_only_new_schema(default_schema.clone());
+    analytics.meta().schemas.debug_only_new_schema(analytics_schema.clone());
+
+    let manager = server
+        .chunks()
+        .tiered_manager
+        .as_ref()
+        .expect("default runtime should have a tiered manager")
+        .clone();
+
+    let payload = "cleaner-multi-db".repeat(170);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    for round in 0..8 {
+        write_cells_for_partition(
+            server.chunks(),
+            default_schema.id,
+            (round % 2) as u64,
+            round * (cells_per_segment / 3),
+            cells_per_segment / 3,
+            &payload,
+        );
+        write_cells_for_partition(
+            analytics.chunks(),
+            analytics_schema.id,
+            (round % 2) as u64,
+            round * (cells_per_segment / 3),
+            cells_per_segment / 3,
+            &payload,
+        );
+
+        let read_id = Id::new((round % 2) as u64, 0);
+        let _ = server.chunks().read_cell(&read_id);
+        let _ = analytics.chunks().read_cell(&read_id);
+
+        wait_for_shared_counter_alignment(
+            &manager,
+            &[&server.chunks(), &analytics.chunks()],
+            750,
+        )
+        .await;
+    }
+
+    wait_for_shared_counter_alignment(&manager, &[&server.chunks(), &analytics.chunks()], 750)
+        .await;
+    assert!(
+        total_cold_segments_across_sets(&[&server.chunks(), &analytics.chunks()]) > 0,
+        "multi-database churn should eventually create cold segments under the shared cleaner-managed budget"
+    );
+
+    analytics.cleaner().stop();
+    server.cleaner().stop();
+    server.shutdown().await;
+    std::env::remove_var("NEB_CLEANER_SLEEP_INTERVAL_MS");
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+    std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
+
+    let backup_dir = "/tmp/neb_reload_recovery_drift_bk";
+    let wal_dir = "/tmp/neb_reload_recovery_drift_wal";
+    let undo_dir = "/tmp/neb_reload_recovery_drift_undo";
+    let raft_dir = "/tmp/neb_reload_recovery_drift_raft";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(undo_dir);
+    let _ = std::fs::remove_dir_all(raft_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(undo_dir);
+    let _ = std::fs::create_dir_all(raft_dir);
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 8 * SEGMENT_SIZE,
+            db_size: 8 * SEGMENT_SIZE,
+            tiered_config: Some(crate::ram::tiered::TieredConfig {
+                threshold: 0.75,
+                lower_watermark: 0.5,
+                physical_memory_limit: 8 * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            }),
+            backup_storage: Some(backup_dir.to_string()),
+            wal_storage: Some(wal_dir.to_string()),
+            undo_log_storage: Some(undo_dir.to_string()),
+            raft_storage: Some(raft_dir.to_string()),
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: true,
+        },
+        &String::from("127.0.0.1:5414"),
+        "tiered_unload_reload_drift",
+        async |_| {},
+    )
+    .await;
+
+    let analytics = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("analytics runtime should be created");
+
+    let default_schema = Schema::new_with_id(
+        9024,
+        &String::from("default_reload_recovery_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let analytics_schema = Schema::new_with_id(
+        9025,
+        &String::from("analytics_reload_recovery_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    server.meta().schemas.debug_only_new_schema(default_schema.clone());
+    analytics.meta().schemas.debug_only_new_schema(analytics_schema.clone());
+
+    let manager = server
+        .chunks()
+        .tiered_manager
+        .as_ref()
+        .expect("default runtime should have a tiered manager")
+        .clone();
+
+    let payload = "reload-recovery".repeat(170);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    write_cells_for_partition(
+        server.chunks(),
+        default_schema.id,
+        0,
+        0,
+        cells_per_segment,
+        &payload,
+    );
+    write_cells_for_partition(
+        analytics.chunks(),
+        analytics_schema.id,
+        0,
+        0,
+        cells_per_segment,
+        &payload,
+    );
+    wait_for_shared_counter_alignment(&manager, &[&server.chunks(), &analytics.chunks()], 750)
+        .await;
+
+    analytics.chunks().sync_all();
+    analytics.chunks().archive_all();
+    assert!(server.unload_database_runtime("analytics").await);
+    wait_for_shared_counter_alignment(&manager, &[&server.chunks()], 750).await;
+
+    let analytics_reloaded = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("analytics runtime should reload with recovery enabled");
+    analytics_reloaded
+        .meta()
+        .schemas
+        .debug_only_new_schema(analytics_schema.clone());
+    wait_for_shared_counter_alignment(
+        &manager,
+        &[&server.chunks(), &analytics_reloaded.chunks()],
+        750,
+    )
+    .await;
+    assert!(
+        total_hot_segments(analytics_reloaded.chunks()) > 0,
+        "reloaded analytics runtime should recover hot segments from storage"
+    );
+    assert_shared_counter_matches_scanned_total(&manager, &[&server.chunks(), &analytics_reloaded.chunks()]);
+
+    write_cells_for_partition(
+        analytics_reloaded.chunks(),
+        analytics_schema.id,
+        1,
+        cells_per_segment,
+        cells_per_segment / 2,
+        &payload,
+    );
+    wait_for_shared_counter_alignment(
+        &manager,
+        &[&server.chunks(), &analytics_reloaded.chunks()],
+        750,
+    )
+    .await;
+
+    analytics_reloaded.cleaner().stop();
+    server.cleaner().stop();
+    server.shutdown().await;
+    std::env::remove_var("NEB_CLEANER_SLEEP_INTERVAL_MS");
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(undo_dir);
+    let _ = std::fs::remove_dir_all(raft_dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]

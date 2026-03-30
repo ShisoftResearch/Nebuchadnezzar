@@ -19,9 +19,12 @@ pub struct ServerMemoryStatus {
     pub total_chunks: usize,
     pub chunk_details: Vec<ChunkMemoryStatus>,
     pub total_hot_segments: usize,
+    pub shared_hot_segments: usize,
+    pub hot_segment_counter_drift: isize,
     pub total_cold_segments: usize,
     pub total_segments: usize,
     pub total_hot_memory_bytes: usize,
+    pub shared_hot_memory_bytes: usize,
     pub total_cold_memory_bytes: usize,
     pub total_memory_bytes: usize,
     pub total_cells: usize,
@@ -62,11 +65,17 @@ impl ServerMemoryStatus {
             "  • Total Segments:      {} (Hot: {}, Cold: {})",
             self.total_segments, self.total_hot_segments, self.total_cold_segments
         );
+        println!("  • Shared Hot Counter:  {}", self.shared_hot_segments);
+        println!("  • Counter Drift:       {}", self.hot_segment_counter_drift);
 
         println!("\n💾 Memory Usage:");
         println!(
             "  • Hot Memory:          {}",
             Self::format_bytes(self.total_hot_memory_bytes)
+        );
+        println!(
+            "  • Shared Hot Memory:   {}",
+            Self::format_bytes(self.shared_hot_memory_bytes)
         );
         println!(
             "  • Cold Memory:         {}",
@@ -191,6 +200,13 @@ impl NebServer {
         } else {
             (None, false)
         };
+        let shared_hot_segments = self
+            .chunks()
+            .tiered_manager
+            .as_ref()
+            .map(|manager| manager.shared_hot_segments())
+            .unwrap_or(total_hot_segments);
+        let hot_segment_counter_drift = shared_hot_segments as isize - total_hot_segments as isize;
 
         let living_transactions = self
             .txn_manager()
@@ -202,9 +218,12 @@ impl NebServer {
             total_chunks,
             chunk_details,
             total_hot_segments,
+            shared_hot_segments,
+            hot_segment_counter_drift,
             total_cold_segments,
             total_segments,
             total_hot_memory_bytes: total_hot_segments * SEGMENT_SIZE,
+            shared_hot_memory_bytes: shared_hot_segments * SEGMENT_SIZE,
             total_cold_memory_bytes: total_cold_segments * SEGMENT_SIZE,
             total_memory_bytes: total_segments * SEGMENT_SIZE,
             total_cells,
