@@ -93,6 +93,27 @@ impl TieredMemoryManager {
     }
 
     #[inline]
+    fn allocation_eviction_target(&self, hot_segments_count: usize) -> Option<usize> {
+        let current_hot_memory = self.hot_memory_bytes(hot_segments_count);
+        let after_alloc_memory =
+            current_hot_memory
+                .checked_add(SEGMENT_SIZE)
+                .unwrap_or_else(|| {
+                    warn!("Overflow calculating after-alloc memory");
+                    self.shared_pool.physical_memory_limit * 2
+                });
+
+        let threshold_limit = self.threshold_limit();
+        if after_alloc_memory > threshold_limit {
+            let lower_limit = self.lower_watermark_limit();
+            let target_bytes = after_alloc_memory.saturating_sub(lower_limit);
+            Some((target_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     fn cap_eviction_target_to_counts(
         &self,
         chunk_hot_segments: usize,
@@ -430,21 +451,13 @@ impl TieredMemoryManager {
         let hot_segments_count = self.total_hot_segments_cached();
         let max_reasonable_segments = usize::MAX / SEGMENT_SIZE;
         let hot_segments_count = hot_segments_count.min(max_reasonable_segments);
-
-        let current_hot_memory = self.hot_memory_bytes(hot_segments_count);
-        let after_alloc_memory =
-            current_hot_memory
+        if let Some(segments_to_evict) = self.allocation_eviction_target(hot_segments_count) {
+            let current_hot_memory = self.hot_memory_bytes(hot_segments_count);
+            let after_alloc_memory = current_hot_memory
                 .checked_add(SEGMENT_SIZE)
-                .unwrap_or_else(|| {
-                    warn!("Overflow calculating after-alloc memory");
-                    self.shared_pool.physical_memory_limit * 2
-                });
-
-        let threshold_limit = self.threshold_limit();
-        if after_alloc_memory > threshold_limit {
+                .unwrap_or_else(|| self.shared_pool.physical_memory_limit * 2);
+            let threshold_limit = self.threshold_limit();
             let lower_limit = self.lower_watermark_limit();
-            let target_bytes = after_alloc_memory.saturating_sub(lower_limit);
-            let segments_to_evict = (target_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
 
             debug!(
                 "Global eviction before allocation: current {} global hot segments ({} MB), would be {} MB after allocation, threshold {} MB ({}% of {} MB), evicting {} segments",
@@ -652,5 +665,27 @@ mod tests {
         assert_eq!(manager.cap_eviction_target_to_counts(1, true, 10), 0);
         assert_eq!(manager.cap_eviction_target_to_counts(0, false, 10), 0);
         assert_eq!(manager.cap_eviction_target_to_counts(10, false, 4), 4);
+    }
+
+    #[test]
+    fn test_eviction_starts_only_after_threshold_is_exceeded() {
+        let pool = SharedMemoryPool::new(&TieredConfig {
+            threshold: 0.75,
+            lower_watermark: 0.5,
+            physical_memory_limit: 8 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        });
+        let manager = TieredMemoryManager::new(pool);
+
+        assert_eq!(
+            manager.allocation_eviction_target(5),
+            None,
+            "eviction should not trigger when the next allocation only reaches the threshold"
+        );
+        assert_eq!(
+            manager.allocation_eviction_target(6),
+            Some(3),
+            "eviction should trigger when the next allocation would exceed the threshold"
+        );
     }
 }

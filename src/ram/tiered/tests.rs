@@ -94,6 +94,55 @@ fn total_cold_segments(chunks: &Arc<Chunks>) -> usize {
         .sum()
 }
 
+fn reconcile_global_hot_segments(
+    manager: &crate::ram::tiered::manager::TieredMemoryManager,
+    chunk_sets: &[&Arc<Chunks>],
+) -> usize {
+    let mut total = 0;
+    for chunks in chunk_sets {
+        for chunk in &chunks.list {
+            total = manager.hot_count_cached(chunk);
+        }
+    }
+    total
+}
+
+fn append_round_robin_until_reconciled_hot_segments(
+    chunks: &Arc<Chunks>,
+    schema_id: u32,
+    partitions: &[u64],
+    next_indices: &mut [usize],
+    manager: &crate::ram::tiered::manager::TieredMemoryManager,
+    observed_chunk_sets: &[&Arc<Chunks>],
+    target_hot_segments: usize,
+    payload: &str,
+) {
+    assert_eq!(
+        partitions.len(),
+        next_indices.len(),
+        "partitions and next_indices must stay aligned"
+    );
+    assert!(
+        !partitions.is_empty(),
+        "round-robin writes need at least one partition"
+    );
+
+    let mut cursor = 0;
+    while reconcile_global_hot_segments(manager, observed_chunk_sets) < target_hot_segments {
+        let slot = cursor % partitions.len();
+        write_cells_for_partition(
+            chunks,
+            schema_id,
+            partitions[slot],
+            next_indices[slot],
+            1,
+            payload,
+        );
+        next_indices[slot] += 1;
+        cursor += 1;
+    }
+}
+
 /// Test automatic eviction when physical memory limit is exceeded
 #[test]
 fn test_eviction_on_memory_overflow() {
@@ -599,6 +648,107 @@ fn test_global_eviction_across_chunks_in_single_database() {
     let _ = std::fs::remove_dir_all("/tmp/neb_single_db_global_eviction_schema");
 }
 
+#[test]
+fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let physical_memory_limit = 8 * SEGMENT_SIZE;
+    let threshold = 0.75;
+    let threshold_hot_segments =
+        ((physical_memory_limit as f64 * threshold as f64) / SEGMENT_SIZE as f64) as usize;
+    let schema = Schema::new("single_db_threshold_gate", None, default_fields(), false, false);
+    let schemas = LocalSchemasCache::new_local("/tmp/neb_single_db_threshold_gate_schema");
+    schemas.debug_only_new_schema(schema.clone());
+
+    let backup_dir = "/tmp/neb_single_db_threshold_gate_bk";
+    let wal_dir = "/tmp/neb_single_db_threshold_gate_wal";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold,
+            lower_watermark: 0.5,
+            physical_memory_limit,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+    let chunks = Chunks::new(
+        2,
+        4 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+        Some(manager.clone()),
+    );
+
+    let payload = "s".repeat(2048);
+    let partitions = [0_u64, 1_u64];
+    let mut next_indices = [0_usize, 0_usize];
+    append_round_robin_until_reconciled_hot_segments(
+        &chunks,
+        schema.id,
+        &partitions,
+        &mut next_indices,
+        &manager,
+        &[&chunks],
+        threshold_hot_segments.saturating_sub(1),
+        &payload,
+    );
+
+    let hot_before_threshold = reconcile_global_hot_segments(&manager, &[&chunks]);
+    assert!(
+        hot_before_threshold == threshold_hot_segments.saturating_sub(1),
+        "single database should remain exactly one hot segment below the trigger point before the final segment is added"
+    );
+    let evicted_before_threshold = manager
+        .evict_for_allocation()
+        .expect("single-database threshold check below the limit should succeed");
+    assert_eq!(
+        evicted_before_threshold, 0,
+        "single-database eviction must not trigger before total hot memory exceeds the threshold"
+    );
+    assert_eq!(
+        total_cold_segments(&chunks),
+        0,
+        "single database should have no cold segments before the threshold is exceeded"
+    );
+
+    append_round_robin_until_reconciled_hot_segments(
+        &chunks,
+        schema.id,
+        &partitions,
+        &mut next_indices,
+        &manager,
+        &[&chunks],
+        threshold_hot_segments,
+        &payload,
+    );
+    let hot_at_trigger = reconcile_global_hot_segments(&manager, &[&chunks]);
+    assert_eq!(
+        hot_at_trigger, threshold_hot_segments,
+        "single database should reach the exact hot-segment threshold before eviction is triggered for the next allocation"
+    );
+
+    let cold_before_crossing = total_cold_segments(&chunks);
+    let evicted_after_threshold = manager
+        .evict_for_allocation()
+        .expect("single-database threshold check at the boundary should succeed");
+    let cold_after_crossing = total_cold_segments(&chunks);
+    assert!(
+        evicted_after_threshold > 0 || cold_after_crossing > cold_before_crossing,
+        "single-database eviction should trigger once total hot memory reaches the threshold boundary for the next allocation"
+    );
+
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all("/tmp/neb_single_db_threshold_gate_schema");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_global_eviction_across_multiple_databases() {
     let _guard = TEST_MUTEX.lock().unwrap();
@@ -722,6 +872,159 @@ async fn test_global_eviction_across_multiple_databases() {
     assert!(
         total_cold > 0,
         "global eviction should produce cold segments across the shared server-wide budget"
+    );
+
+    analytics.cleaner().stop();
+    server.cleaner().stop();
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let physical_memory_limit = 8 * SEGMENT_SIZE;
+    let threshold = 0.75;
+    let threshold_hot_segments =
+        ((physical_memory_limit as f64 * threshold as f64) / SEGMENT_SIZE as f64) as usize;
+    let backup_dir = "/tmp/neb_multi_db_threshold_gate_bk";
+    let wal_dir = "/tmp/neb_multi_db_threshold_gate_wal";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 8 * SEGMENT_SIZE,
+            db_size: 8 * SEGMENT_SIZE,
+            tiered_config: Some(crate::ram::tiered::TieredConfig {
+                threshold,
+                lower_watermark: 0.5,
+                physical_memory_limit,
+                promotion_cooldown_ms: 0,
+            }),
+            backup_storage: Some(backup_dir.to_string()),
+            wal_storage: Some(wal_dir.to_string()),
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5411"),
+        "tiered_multi_db_threshold_gate",
+        async |_| {},
+    )
+    .await;
+
+    let analytics = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("analytics runtime should be created");
+    server.cleaner().stop();
+    analytics.cleaner().stop();
+
+    let default_schema = Schema::new_with_id(
+        9011,
+        &String::from("default_threshold_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let analytics_schema = Schema::new_with_id(
+        9012,
+        &String::from("analytics_threshold_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    server.meta().schemas.debug_only_new_schema(default_schema.clone());
+    analytics.meta().schemas.debug_only_new_schema(analytics_schema.clone());
+
+    let manager = server
+        .chunks()
+        .tiered_manager
+        .as_ref()
+        .expect("default runtime should have a tiered manager")
+        .clone();
+
+    let payload = "m".repeat(2048);
+    let mut default_next_indices = [0_usize];
+    let mut analytics_next_indices = [0_usize];
+    append_round_robin_until_reconciled_hot_segments(
+        server.chunks(),
+        default_schema.id,
+        &[0_u64],
+        &mut default_next_indices,
+        &manager,
+        &[&server.chunks(), &analytics.chunks()],
+        threshold_hot_segments.saturating_sub(3),
+        &payload,
+    );
+    append_round_robin_until_reconciled_hot_segments(
+        analytics.chunks(),
+        analytics_schema.id,
+        &[0_u64],
+        &mut analytics_next_indices,
+        &manager,
+        &[&server.chunks(), &analytics.chunks()],
+        threshold_hot_segments.saturating_sub(1),
+        &payload,
+    );
+
+    let combined_hot_before_threshold =
+        reconcile_global_hot_segments(&manager, &[&server.chunks(), &analytics.chunks()]);
+    assert_eq!(
+        combined_hot_before_threshold,
+        threshold_hot_segments.saturating_sub(1),
+        "combined databases should remain exactly one hot segment below the shared trigger point before the final segment is added"
+    );
+    let evicted_before_threshold = manager
+        .evict_for_allocation()
+        .expect("multi-database threshold check below the limit should succeed");
+    assert_eq!(
+        evicted_before_threshold, 0,
+        "shared eviction must not trigger before combined hot memory exceeds the threshold"
+    );
+    assert_eq!(
+        total_cold_segments(server.chunks()) + total_cold_segments(analytics.chunks()),
+        0,
+        "no database should have cold segments before the combined threshold is exceeded"
+    );
+
+    append_round_robin_until_reconciled_hot_segments(
+        analytics.chunks(),
+        analytics_schema.id,
+        &[0_u64],
+        &mut analytics_next_indices,
+        &manager,
+        &[&server.chunks(), &analytics.chunks()],
+        threshold_hot_segments,
+        &payload,
+    );
+    let combined_hot_at_trigger =
+        reconcile_global_hot_segments(&manager, &[&server.chunks(), &analytics.chunks()]);
+    assert_eq!(
+        combined_hot_at_trigger, threshold_hot_segments,
+        "combined databases should reach the exact shared hot-segment threshold before eviction is triggered for the next allocation"
+    );
+
+    let cold_before_crossing =
+        total_cold_segments(server.chunks()) + total_cold_segments(analytics.chunks());
+    let evicted_after_threshold = manager
+        .evict_for_allocation()
+        .expect("multi-database threshold check at the boundary should succeed");
+    let cold_after_crossing =
+        total_cold_segments(server.chunks()) + total_cold_segments(analytics.chunks());
+    assert!(
+        evicted_after_threshold > 0 || cold_after_crossing > cold_before_crossing,
+        "shared eviction should trigger once combined hot memory reaches the threshold boundary for the next allocation"
     );
 
     analytics.cleaner().stop();
