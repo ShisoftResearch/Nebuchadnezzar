@@ -86,43 +86,19 @@ impl Cleaner {
 
                         // Background eviction: check and evict if memory limit exceeded
                         #[cfg(feature = "tiered_memory")]
-                        evict_pool.install(|| {
-                            checks_ref_clone.list.par_iter().for_each(|chunk| {
-                                if let Some(ref tiered_manager) = chunk.tiered_manager {
-                                    // Cheap skip: only evict if we're above threshold-adjusted limit
-                                    let hot = tiered_manager.hot_count_cached(chunk);
-                                    let threshold_limit = tiered_manager.threshold_limit();
-                                    let hot_bytes = if hot > usize::MAX / SEGMENT_SIZE {
-                                        warn!(
-                                            "Hot segment count overflow risk: hot={}, seg_size={}",
-                                            hot, SEGMENT_SIZE
-                                        );
-                                        usize::MAX
-                                    } else {
-                                        hot * SEGMENT_SIZE
-                                    };
-                                    if hot_bytes > threshold_limit {
-                                        match tiered_manager.evict_for_allocation(chunk) {
-                                            Ok(evicted) => {
-                                                if evicted > 0 {
-                                                    progress.store(true, Ordering::Relaxed);
-                                                    debug!(
-                                                        "Background eviction: evicted {} segments from chunk {}",
-                                                        evicted, chunk.id
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Background eviction failed for chunk {}: {}",
-                                                    chunk.id, e
-                                                );
-                                            }
-                                        }
+                        if let Some(ref tiered_manager) = checks_ref_clone.tiered_manager {
+                            evict_pool.install(|| match tiered_manager.evict_for_allocation() {
+                                Ok(evicted) => {
+                                    if evicted > 0 {
+                                        progress.store(true, Ordering::Relaxed);
+                                        debug!("Background global eviction: evicted {} segments", evicted);
                                     }
                                 }
+                                Err(e) => {
+                                    warn!("Background global eviction failed: {}", e);
+                                }
                             });
-                        });
+                        }
 
                         if progress.load(Ordering::Relaxed) {
                             idle_rounds = 0;

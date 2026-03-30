@@ -162,8 +162,8 @@ pub struct Chunk {
     pub allocator: SegmentAllocator,
     pub index_builder: Option<Arc<IndexBuilder>>,
     pub statistics: ChunkStatistics,
-    /// Tiered memory manager for eviction/promotion
-    pub tiered_manager: Option<crate::ram::tiered::manager::TieredMemoryManager>,
+    /// Shared tiered memory manager for eviction/promotion
+    pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
 }
 
 impl Chunk {
@@ -267,7 +267,7 @@ impl Chunk {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     ) -> Chunk {
         // Call new_with_base with base_addr=0 to use old allocation behavior
         Self::new_with_base(
@@ -278,7 +278,7 @@ impl Chunk {
             index_builder,
             backup_storage,
             wal_storage,
-            shared_pool,
+            tiered_manager,
         )
     }
 
@@ -290,7 +290,7 @@ impl Chunk {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -318,16 +318,12 @@ impl Chunk {
             }
         };
         assert!(
-            !(base_addr == 0 && shared_pool.is_some()),
+            !(base_addr == 0 && tiered_manager.is_some()),
             "Should not enable tiered memory if the memory is not allocated by Chunks"
         );
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = SegmentList::new(num_segs);
         let index = WordMap::with_capacity(64);
-        // Create tiered memory manager if enabled
-        let tiered_manager = shared_pool
-            .map(|pool| crate::ram::tiered::manager::TieredMemoryManager::new(pool));
-
         let chunk = Chunk {
             id,
             segs,
@@ -1285,6 +1281,7 @@ impl Drop for PendingEntry {
 pub struct Chunks {
     pub list: Vec<Chunk>,
     pub statistics: TTLCache<Arc<SchemaStatistics>>,
+    pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
 }
 
 impl Chunks {
@@ -1295,7 +1292,7 @@ impl Chunks {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     ) -> Arc<Chunks> {
         Self::new_with_recovery(
             count,
@@ -1304,7 +1301,7 @@ impl Chunks {
             index_builder,
             backup_storage,
             wal_storage,
-            shared_pool,
+            tiered_manager,
             false,
             None,
         )
@@ -1317,7 +1314,7 @@ impl Chunks {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         enable_recovery: bool,
         raft_storage: Option<String>,
     ) -> Arc<Chunks> {
@@ -1369,11 +1366,11 @@ impl Chunks {
             global_base_addr, chunk_size, chunk_size_bits, count, total_size
         );
 
-        if let Some(ref pool) = shared_pool {
+        if let Some(ref manager) = tiered_manager {
             info!(
                 "Tiered memory enabled: threshold={}, limit={} MB, shared across all {} chunks",
-                pool.threshold,
-                pool.physical_memory_limit / (1024 * 1024),
+                manager.shared_pool().threshold,
+                manager.shared_pool().physical_memory_limit / (1024 * 1024),
                 count,
             );
         }
@@ -1397,14 +1394,19 @@ impl Chunks {
                 index_builder.clone(),
                 backup_storage,
                 wal_storage,
-                shared_pool.clone(),
+                tiered_manager.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
         let chunks_arc = Arc::new(Chunks {
             list: chunks,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
+            tiered_manager,
         });
+
+        if let Some(ref manager) = chunks_arc.tiered_manager {
+            manager.register_chunks(&chunks_arc);
+        }
 
         // Store global pointer for signal handler access
         set_global_chunks(&chunks_arc);

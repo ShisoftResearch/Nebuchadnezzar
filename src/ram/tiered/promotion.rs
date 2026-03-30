@@ -265,11 +265,6 @@ pub fn promote_segment(segment: &Segment) {
     // Step 11: Buffer cleanup
     // temp_buffer will be automatically dropped and deallocated when it goes out of scope
     debug!("Cleaned up temporary buffer for segment {}", segment.id);
-
-    info!(
-        "Successfully promoted segment {} to hot storage with cell locking",
-        segment.id
-    );
     debug!(
         "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
         segment.id, segment.chunk_id, segment.seq_id

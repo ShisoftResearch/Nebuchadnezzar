@@ -182,12 +182,8 @@ impl NebServer {
         }
 
         // The shared pool holds the server-wide limit directly — no per-chunk multiplication.
-        let (total_physical_limit, tiered_enabled) = if let Some(ref manager) = self
-            .chunks()
-            .list
-            .first()
-            .and_then(|c| c.tiered_manager.as_ref())
-        {
+        let (total_physical_limit, tiered_enabled) =
+            if let Some(ref manager) = self.chunks().tiered_manager {
             (
                 Some(manager.shared_pool().physical_memory_limit),
                 manager.is_enabled(),

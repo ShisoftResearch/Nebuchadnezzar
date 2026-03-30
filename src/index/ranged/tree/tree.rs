@@ -82,10 +82,20 @@ impl RangedTree {
             }
             Ok(Err(e)) => {
                 error!(
-                    "[TREE RECOVERY] Failed to read tree root cell {:?}: {:?}",
+                    "[TREE RECOVERY] Failed to read tree root cell {:?}: {:?} - creating fresh tree",
                     tree_id, e
                 );
-                panic!("Tree root cell not found");
+                // Cell doesn't exist in NEB (WAL/backup loss after SM recorded this tree).
+                // Create a fresh empty tree and write the metadata cell for the first time.
+                let tree = DiskTree::new(&deletion_set);
+                tree.persist_root(neb_client).await;
+                let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
+                match neb_client.write_cell(tree_cell).await {
+                    Ok(Ok(_)) => info!("[TREE RECOVERY] Created replacement tree root cell for {:?}", tree_id),
+                    Ok(Err(e2)) => error!("[TREE RECOVERY] Failed to create replacement cell for {:?}: {:?}", tree_id, e2),
+                    Err(e2) => error!("[TREE RECOVERY] RPC error creating replacement cell for {:?}: {:?}", tree_id, e2),
+                }
+                return Self { tree };
             }
             Err(e) => {
                 error!(
@@ -96,7 +106,26 @@ impl RangedTree {
             }
         };
 
-        let head_id = cell.data[*RANGED_TREE_HEAD_HASH].id().unwrap();
+        let head_id = match cell.data[*RANGED_TREE_HEAD_HASH].id() {
+            Some(id) => *id,
+            None => {
+                error!(
+                    "[TREE RECOVERY] Tree root cell {:?} exists but head pointer is missing \
+                     (corrupt cell). Creating a fresh empty tree.",
+                    tree_id
+                );
+                let tree = DiskTree::new(&deletion_set);
+                tree.persist_root(neb_client).await;
+                let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
+                // Cell already exists (we read it above), so use update_cell not write_cell
+                match neb_client.update_cell(tree_cell).await {
+                    Ok(Ok(_)) => info!("[TREE RECOVERY] Repaired corrupt tree root cell {:?}", tree_id),
+                    Ok(Err(e)) => error!("[TREE RECOVERY] Failed to repair corrupt cell {:?}: {:?}", tree_id, e),
+                    Err(e) => error!("[TREE RECOVERY] RPC error repairing corrupt cell {:?}: {:?}", tree_id, e),
+                }
+                return Self { tree };
+            }
+        };
         info!("[TREE RECOVERY] Recovering B-tree from head {:?}", head_id);
 
         let tree = DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0).await;

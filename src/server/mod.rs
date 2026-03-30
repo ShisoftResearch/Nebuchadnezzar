@@ -216,6 +216,8 @@ pub struct NebServer {
     /// Shared physical-memory budget for all databases on this server.
     /// `None` when tiered memory is disabled.
     shared_memory_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
+    /// Shared tiered-memory manager coordinating global eviction.
+    shared_tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     meta_servers: Vec<String>,
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
@@ -279,7 +281,7 @@ impl NebServer {
         meta_members: &Vec<String>,
         group_name: &String,
         database_name: &str,
-        shared_pool: Option<Arc<crate::ram::tiered::SharedMemoryPool>>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         rpc_server: &Arc<rpc::Server>,
         raft_service: &Arc<raft::RaftService>,
         raft_client: &Arc<RaftClient>,
@@ -351,7 +353,7 @@ impl NebServer {
             index_builder.clone(),
             effective_opts.backup_storage.clone(),
             effective_opts.wal_storage.clone(),
-            shared_pool,
+            tiered_manager,
             effective_opts.enable_recovery,
             effective_opts.raft_storage.clone(),
         );
@@ -535,7 +537,7 @@ impl NebServer {
             &self.meta_servers,
             &self.group_name,
             database_name,
-            self.shared_memory_pool.clone(),
+            self.shared_tiered_manager.clone(),
             &self.rpc,
             &self.raft_service,
             &self.raft_client,
@@ -574,6 +576,10 @@ impl NebServer {
         let Some(runtime) = runtime else {
             return false;
         };
+
+        if let Some(ref manager) = runtime.chunks().tiered_manager {
+            manager.unregister_chunks(runtime.chunks());
+        }
 
         if runtime.indexer().is_some() {
             let _ = IndexBuilder::await_all_indices().await;
@@ -816,6 +822,9 @@ impl NebServer {
                 crate::ram::tiered::TieredConfig::from_env()
                     .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c))
             });
+        let shared_tiered_manager = shared_memory_pool
+            .as_ref()
+            .map(|pool| Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(pool.clone())));
 
         let database_runtime = Self::build_database_runtime(
             opts,
@@ -823,7 +832,7 @@ impl NebServer {
             &meta_members,
             group_name,
             database_name,
-            shared_memory_pool.clone(),
+            shared_tiered_manager.clone(),
             rpc_server,
             raft_service,
             raft_client,
@@ -844,6 +853,7 @@ impl NebServer {
             runtime_init_lock: tokio::sync::Mutex::new(()),
             host_options: opts.clone(),
             shared_memory_pool,
+            shared_tiered_manager,
             meta_servers: meta_members.clone(),
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),

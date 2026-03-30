@@ -231,7 +231,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
 
     // Locks are automatically dropped when _cell_locks and tiered_guard go out of scope
 
-    info!(
+    debug!(
         "Successfully evicted segment {} to cold storage with cell locking",
         segment.id
     );

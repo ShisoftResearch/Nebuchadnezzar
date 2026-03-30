@@ -260,7 +260,7 @@ fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
     }
 
     // Note: We don't have chunk_id in this function, but segment addresses are unique per chunk
-    info!(
+    debug!(
         "HOT recovery: copied {} bytes to segment {} at address {:#x} (first 8 bytes: {:02x?})",
         file_data.len(),
         segment.id,

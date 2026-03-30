@@ -49,6 +49,51 @@ fn fields_with_score() -> Field {
     ])
 }
 
+fn write_cells_for_partition(
+    chunks: &Arc<Chunks>,
+    schema_id: u32,
+    partition: u64,
+    start_idx: usize,
+    count: usize,
+    payload: &str,
+) {
+    for i in 0..count {
+        let logical_idx = start_idx + i;
+        let id = Id::new(partition, logical_idx as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(logical_idx as i64));
+        data_map.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("cell_{}_{}", partition, logical_idx)),
+        );
+        data_map.insert(
+            &String::from("data"),
+            OwnedValue::String(payload.to_string()),
+        );
+
+        let mut cell = OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data_map));
+        chunks
+            .write_cell(&mut cell)
+            .expect("direct write for eviction test should succeed");
+    }
+}
+
+fn total_hot_segments(chunks: &Arc<Chunks>) -> usize {
+    chunks
+        .list
+        .iter()
+        .map(|chunk| chunk.segments().iter().filter(|seg| seg.is_hot()).count())
+        .sum()
+}
+
+fn total_cold_segments(chunks: &Arc<Chunks>) -> usize {
+    chunks
+        .list
+        .iter()
+        .map(|chunk| chunk.segments().iter().filter(|seg| seg.is_cold()).count())
+        .sum()
+}
+
 /// Test automatic eviction when physical memory limit is exceeded
 #[test]
 fn test_eviction_on_memory_overflow() {
@@ -82,8 +127,11 @@ fn test_eviction_on_memory_overflow() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env()
-            .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c)),
+        crate::ram::tiered::TieredConfig::from_env().map(|c| {
+            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+                crate::ram::tiered::SharedMemoryPool::new(&c),
+            ))
+        }),
     );
 
     // Verify tiered manager is enabled in at least one chunk
@@ -262,8 +310,11 @@ fn test_cold_segment_promotion() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env()
-            .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c)),
+        crate::ram::tiered::TieredConfig::from_env().map(|c| {
+            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+                crate::ram::tiered::SharedMemoryPool::new(&c),
+            ))
+        }),
     );
 
     // Write cells
@@ -389,8 +440,11 @@ fn test_metrics_and_churn_counters() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
-        crate::ram::tiered::TieredConfig::from_env()
-            .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c)),
+        crate::ram::tiered::TieredConfig::from_env().map(|c| {
+            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+                crate::ram::tiered::SharedMemoryPool::new(&c),
+            ))
+        }),
     );
 
     let manager = chunks
@@ -465,6 +519,407 @@ fn test_metrics_and_churn_counters() {
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
     let _ = std::fs::remove_dir_all("/tmp/neb_test_metrics_schema");
+}
+
+#[test]
+fn test_global_eviction_across_chunks_in_single_database() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let chunk_capacity = 4 * SEGMENT_SIZE;
+    let schema = Schema::new("single_db_global_eviction", None, default_fields(), false, false);
+    let schemas = LocalSchemasCache::new_local("/tmp/neb_single_db_global_eviction_schema");
+    schemas.debug_only_new_schema(schema.clone());
+
+    let backup_dir = "/tmp/neb_single_db_global_eviction_bk";
+    let wal_dir = "/tmp/neb_single_db_global_eviction_wal";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.75,
+            lower_watermark: 0.5,
+            physical_memory_limit: 3 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let chunks = Chunks::new(
+        2,
+        chunk_capacity,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+        Some(manager.clone()),
+    );
+
+    let payload = "x".repeat(1024);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment * 2, &payload);
+    write_cells_for_partition(
+        &chunks,
+        schema.id,
+        1,
+        cells_per_segment * 2,
+        cells_per_segment * 2,
+        &payload,
+    );
+
+    let hot_before: usize = chunks
+        .list
+        .iter()
+        .map(|chunk| chunk.segments().iter().filter(|seg| seg.is_hot()).count())
+        .sum();
+    assert!(
+        hot_before >= 4,
+        "setup should produce at least four hot segments across both chunks"
+    );
+
+    let evicted = manager
+        .evict_for_allocation()
+        .expect("global eviction across chunks should succeed");
+    assert!(evicted > 0, "global pressure across two chunks should trigger eviction");
+
+    let cold_after: usize = chunks
+        .list
+        .iter()
+        .map(|chunk| chunk.segments().iter().filter(|seg| seg.is_cold()).count())
+        .sum();
+    assert!(
+        cold_after > 0,
+        "at least one segment should be evicted when combined chunk pressure exceeds the shared limit"
+    );
+
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all("/tmp/neb_single_db_global_eviction_schema");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_global_eviction_across_multiple_databases() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let backup_dir = "/tmp/neb_multi_db_global_eviction_bk";
+    let wal_dir = "/tmp/neb_multi_db_global_eviction_wal";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 8 * SEGMENT_SIZE,
+            db_size: 8 * SEGMENT_SIZE,
+            tiered_config: Some(crate::ram::tiered::TieredConfig {
+                threshold: 0.75,
+                lower_watermark: 0.5,
+                physical_memory_limit: 4 * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            }),
+            backup_storage: Some(backup_dir.to_string()),
+            wal_storage: Some(wal_dir.to_string()),
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &String::from("127.0.0.1:5410"),
+        "tiered_multi_db_global",
+        async |_| {},
+    )
+    .await;
+
+    let analytics = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("analytics runtime should be created");
+    server.cleaner().stop();
+    analytics.cleaner().stop();
+
+    let default_schema = Schema::new_with_id(
+        9001,
+        &String::from("default_eviction_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let analytics_schema = Schema::new_with_id(
+        9002,
+        &String::from("analytics_eviction_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    server.meta().schemas.debug_only_new_schema(default_schema.clone());
+    analytics.meta().schemas.debug_only_new_schema(analytics_schema.clone());
+
+    let default_manager = server
+        .chunks()
+        .tiered_manager
+        .as_ref()
+        .expect("default runtime should have a tiered manager")
+        .clone();
+    let analytics_manager = analytics
+        .chunks()
+        .tiered_manager
+        .as_ref()
+        .expect("analytics runtime should have a tiered manager")
+        .clone();
+    assert!(
+        Arc::ptr_eq(&default_manager, &analytics_manager),
+        "database runtimes should share one global tiered manager"
+    );
+
+    let payload = "y".repeat(2048);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    write_cells_for_partition(
+        server.chunks(),
+        default_schema.id,
+        0,
+        0,
+        cells_per_segment,
+        &payload,
+    );
+
+    let hot_after_default_only = total_hot_segments(server.chunks());
+    assert!(
+        hot_after_default_only <= 2,
+        "first database should stay under the shared trigger budget by itself"
+    );
+
+    let cold_after_default_only =
+        total_cold_segments(server.chunks()) + total_cold_segments(analytics.chunks());
+    assert_eq!(
+        cold_after_default_only, 0,
+        "one database below the shared limit should not evict yet"
+    );
+
+    write_cells_for_partition(
+        analytics.chunks(),
+        analytics_schema.id,
+        0,
+        cells_per_segment,
+        cells_per_segment * 2,
+        &payload,
+    );
+
+    let evicted = default_manager
+        .evict_for_allocation()
+        .expect("global eviction across databases should succeed");
+    let total_cold = total_cold_segments(server.chunks()) + total_cold_segments(analytics.chunks());
+    assert!(
+        evicted > 0 || total_cold > 0,
+        "combined pressure from two databases should trigger shared global eviction"
+    );
+    assert!(
+        total_cold > 0,
+        "global eviction should produce cold segments across the shared server-wide budget"
+    );
+
+    analytics.cleaner().stop();
+    server.cleaner().stop();
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+}
+
+#[test]
+fn test_equal_sized_databases_evict_down_to_shared_limit() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let physical_memory_limit = 6 * SEGMENT_SIZE;
+    let lower_watermark = 0.5;
+    let desired_hot_segments =
+        ((physical_memory_limit as f64 * lower_watermark as f64) / SEGMENT_SIZE as f64) as usize;
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.75,
+            lower_watermark,
+            physical_memory_limit,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let payload = "q".repeat(2048);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    let mut databases = Vec::new();
+
+    for db_idx in 0..3 {
+        let schema = Schema::new(
+            &format!("equal_db_eviction_{}", db_idx),
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        let schema_dir = format!("/tmp/neb_equal_db_eviction_schema_{}", db_idx);
+        let backup_dir = format!("/tmp/neb_equal_db_eviction_bk_{}", db_idx);
+        let wal_dir = format!("/tmp/neb_equal_db_eviction_wal_{}", db_idx);
+
+        let _ = std::fs::remove_dir_all(&schema_dir);
+        let _ = std::fs::remove_dir_all(&backup_dir);
+        let _ = std::fs::remove_dir_all(&wal_dir);
+
+        let schemas = LocalSchemasCache::new_local(&schema_dir);
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            4 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.clone()),
+            Some(wal_dir.clone()),
+            Some(manager.clone()),
+        );
+
+        write_cells_for_partition(
+            &chunks,
+            schema.id,
+            0,
+            0,
+            cells_per_segment * 2,
+            &payload,
+        );
+
+        databases.push((chunks, schema_dir, backup_dir, wal_dir));
+    }
+
+    let hot_before: usize = databases
+        .iter()
+        .map(|(chunks, _, _, _)| total_hot_segments(chunks))
+        .sum();
+    assert!(
+        hot_before > desired_hot_segments,
+        "equal-sized databases should exceed the shared lower watermark before eviction"
+    );
+
+    let mut evicted_total = 0;
+    for _ in 0..4 {
+        let hot_now: usize = databases
+            .iter()
+            .map(|(chunks, _, _, _)| total_hot_segments(chunks))
+            .sum();
+        if hot_now <= desired_hot_segments {
+            break;
+        }
+
+        let evicted = manager
+            .evict_for_allocation()
+            .expect("shared eviction across equal-sized databases should succeed");
+        evicted_total += evicted;
+        if evicted == 0 {
+            break;
+        }
+    }
+
+    let hot_after: usize = databases
+        .iter()
+        .map(|(chunks, _, _, _)| total_hot_segments(chunks))
+        .sum();
+    assert!(evicted_total > 0, "equal-sized databases should trigger eviction");
+    assert!(
+        hot_after <= desired_hot_segments,
+        "shared eviction should converge to the configured lower watermark"
+    );
+
+    let databases_with_cold = databases
+        .iter()
+        .filter(|(chunks, _, _, _)| total_cold_segments(chunks) > 0)
+        .count();
+    assert!(
+        databases_with_cold >= 2,
+        "eviction should reclaim memory from more than one equally sized database"
+    );
+
+    for (_, schema_dir, backup_dir, wal_dir) in databases {
+        let _ = std::fs::remove_dir_all(schema_dir);
+        let _ = std::fs::remove_dir_all(backup_dir);
+        let _ = std::fs::remove_dir_all(wal_dir);
+    }
+}
+
+#[test]
+fn test_global_eviction_ignores_unregistered_database() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.75,
+            lower_watermark: 0.5,
+            physical_memory_limit: 4 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema_a = Schema::new("db_a_eviction", None, default_fields(), false, false);
+    let schemas_a = LocalSchemasCache::new_local("/tmp/neb_db_a_eviction_schema");
+    schemas_a.debug_only_new_schema(schema_a.clone());
+    let chunks_a = Chunks::new(
+        1,
+        4 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas: schemas_a }),
+        None,
+        Some("/tmp/neb_db_a_eviction_bk".to_string()),
+        Some("/tmp/neb_db_a_eviction_wal".to_string()),
+        Some(manager.clone()),
+    );
+
+    let schema_b = Schema::new("db_b_eviction", None, default_fields(), false, false);
+    let schemas_b = LocalSchemasCache::new_local("/tmp/neb_db_b_eviction_schema");
+    schemas_b.debug_only_new_schema(schema_b.clone());
+    let chunks_b = Chunks::new(
+        1,
+        4 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas: schemas_b }),
+        None,
+        Some("/tmp/neb_db_b_eviction_bk".to_string()),
+        Some("/tmp/neb_db_b_eviction_wal".to_string()),
+        Some(manager.clone()),
+    );
+
+    let payload = "z".repeat(2048);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    write_cells_for_partition(
+        &chunks_a,
+        schema_a.id,
+        0,
+        0,
+        cells_per_segment / 2,
+        &payload,
+    );
+    write_cells_for_partition(&chunks_b, schema_b.id, 0, 0, cells_per_segment * 2, &payload);
+
+    manager.unregister_chunks(&chunks_b);
+
+    let evicted_after_unregistration = manager
+        .evict_for_allocation()
+        .expect("eviction check after unregistering one database should succeed");
+    assert_eq!(
+        evicted_after_unregistration, 0,
+        "unregistered database chunks should no longer contribute to shared eviction pressure"
+    );
+    assert_eq!(
+        total_cold_segments(&chunks_a),
+        0,
+        "remaining registered database should stay hot when it is below the shared limit"
+    );
+
+    let _ = std::fs::remove_dir_all("/tmp/neb_db_a_eviction_bk");
+    let _ = std::fs::remove_dir_all("/tmp/neb_db_a_eviction_wal");
+    let _ = std::fs::remove_dir_all("/tmp/neb_db_a_eviction_schema");
+    let _ = std::fs::remove_dir_all("/tmp/neb_db_b_eviction_bk");
+    let _ = std::fs::remove_dir_all("/tmp/neb_db_b_eviction_wal");
+    let _ = std::fs::remove_dir_all("/tmp/neb_db_b_eviction_schema");
 }
 
 #[test]

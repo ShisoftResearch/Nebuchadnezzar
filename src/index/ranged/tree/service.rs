@@ -439,8 +439,23 @@ impl TreeService {
         let client = client.clone();
         let sm_client = sm_client.clone();
         tokio::spawn(async move {
+            // Periodic checkpoint: flush B-tree pages and update tree root cells
+            // every ~60 seconds to ensure durability even without explicit shutdown.
+            const CHECKPOINT_INTERVAL_LOOPS: u32 = 120; // 120 * 500ms = 60s
+            let mut checkpoint_counter: u32 = 0;
+
             loop {
                 let mut fast_mode = false;
+                checkpoint_counter = checkpoint_counter.wrapping_add(1);
+                let do_checkpoint = checkpoint_counter % CHECKPOINT_INTERVAL_LOOPS == 0;
+
+                if do_checkpoint {
+                    // Ensure all pending B-tree node writes are flushed, then update
+                    // tree root cells. This limits the recovery window to ~60 seconds
+                    // of writes even if the server is killed without a clean shutdown.
+                    storage::wait_until_updated().await;
+                }
+
                 for (_, dist_tree) in trees_map.entries() {
                     let tree = &dist_tree.tree;
                     let merged = tree.merge_levels().await;
@@ -453,6 +468,11 @@ impl TreeService {
                         // Now update the cell with the new head IDs
                         if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
                             warn!("Failed to mark LSM tree migration after merge: {:?}", e);
+                        }
+                    } else if do_checkpoint {
+                        // Periodic checkpoint: update tree root cell to reflect current state
+                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
+                            warn!("Failed to checkpoint tree {:?}: {:?}", dist_tree.id, e);
                         }
                     }
 
