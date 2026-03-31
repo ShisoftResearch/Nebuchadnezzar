@@ -1,6 +1,9 @@
 use super::super::tree::service::*;
 use crate::index::ranged::{
-    client::{too_many_retry_error, RangedIndexerClient, MAX_RETRY_ATTEMPTS, RETRY_BACKOFF_MS},
+    client::{
+        migration_retry_delay_ms, too_many_retry_error, RangedIndexerClient,
+        MAX_RETRY_ATTEMPTS, MIGRATION_REFRESH_INTERVAL,
+    },
     trees::{max_entry_key, min_entry_key},
 };
 use crate::index::EntryKey;
@@ -8,7 +11,6 @@ use crate::ram::types::Id;
 use bifrost::rpc::RPCError;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct ClientCursor {
     pub ids: Vec<Id>,
@@ -191,13 +193,19 @@ impl ClientCursor {
                     OpResult::Migrating => {
                         last_retry_reason =
                             Some("tree is migrating during cursor refill".to_string());
+                        if (retried + 1) % MIGRATION_REFRESH_INTERVAL == 0 {
+                            let _ = self.query_client.refresh_key_mapping(current_key).await;
+                        }
                         debug!(
                             "Ranged cursor retry {} for key {:?}: {}",
                             retried + 1,
                             current_key,
                             last_retry_reason.as_deref().unwrap_or("unknown")
                         );
-                        tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            migration_retry_delay_ms(retried, current_key),
+                        ))
+                        .await;
                     }
                     OpResult::OutOfBound | OpResult::NotFound => unreachable!(),
                     OpResult::EpochMissMatch(expect, actual) => {

@@ -19,6 +19,7 @@ pub mod cursor;
 
 pub(super) const MAX_RETRY_ATTEMPTS: i32 = 300;
 pub(super) const RETRY_BACKOFF_MS: u64 = 500;
+pub(super) const MIGRATION_REFRESH_INTERVAL: i32 = 8;
 
 pub(super) fn too_many_retry_error(last_retry_reason: Option<&str>) -> RPCError {
     let message = match last_retry_reason {
@@ -26,6 +27,15 @@ pub(super) fn too_many_retry_error(last_retry_reason: Option<&str>) -> RPCError 
         None => "Too many retry; last retry reason: unknown".to_string(),
     };
     RPCError::IOError(io::Error::new(io::ErrorKind::Other, message))
+}
+
+pub(super) fn migration_retry_delay_ms(retried: i32, key: &EntryKey) -> u64 {
+    // Use exponential backoff with deterministic jitter so concurrent writers do
+    // not wake up in lockstep and stampede the same migrating tree.
+    let capped_shift = retried.clamp(0, 4) as u32;
+    let base = 50u64.saturating_mul(1u64 << capped_shift).min(RETRY_BACKOFF_MS);
+    let jitter = u64::from(key.as_slice()[key.len() - 1] % 37);
+    (base + jitter).min(RETRY_BACKOFF_MS)
 }
 
 pub struct RangedIndexerClient {
@@ -216,13 +226,19 @@ impl RangedIndexerClient {
                 }
                 OpResult::Migrating => {
                     last_retry_reason = Some("tree is migrating".to_string());
+                    // Keep retrying, but periodically force a fresh placement lookup so
+                    // clients converge on the new tree promptly once the split commits.
+                    ensure_updated = (retried + 1) % MIGRATION_REFRESH_INTERVAL == 0;
                     debug!(
                         "Ranged client retry {} for key {:?}: {}",
                         retried + 1,
                         key,
                         last_retry_reason.as_deref().unwrap_or("unknown")
                     );
-                    tokio::time::sleep(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                    tokio::time::sleep(Duration::from_millis(migration_retry_delay_ms(
+                        retried, key,
+                    )))
+                    .await;
                 }
                 OpResult::OutOfBound => {
                     last_retry_reason = Some("tree placement was out of bound".to_string());
