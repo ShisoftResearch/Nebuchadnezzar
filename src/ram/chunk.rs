@@ -1377,7 +1377,10 @@ impl Chunks {
 
         let mut chunks = Vec::new();
         assert!(size >= SEGMENT_SIZE);
-        debug!("Creating chunks, count {} , chunk_size {} bytes", count, size);
+        debug!(
+            "Creating chunks, count {} , chunk_size {} bytes",
+            count, size
+        );
         for i in 0..count {
             let chunk_base = global_base_addr + (i * chunk_size);
             let backup_storage = backup_storage

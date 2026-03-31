@@ -387,7 +387,10 @@ async fn expect_invalid_schema_registration(
     };
 
     let schemas = client.get_all_schema().await.unwrap();
-    assert!(schemas.is_empty(), "schema should be rejected before SM call");
+    assert!(
+        schemas.is_empty(),
+        "schema should be rejected before SM call"
+    );
     msg
 }
 
@@ -398,9 +401,7 @@ fn cosine_vector_index() -> IndexType {
 }
 
 fn test_embedding_index() -> IndexType {
-    IndexType::Embedding(crate::index::embedding::EmbeddingModel::from(
-        "test-model",
-    ))
+    IndexType::Embedding(crate::index::embedding::EmbeddingModel::from("test-model"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -534,11 +535,8 @@ pub async fn allows_string_fulltext_before_state_machine() {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn rejects_non_string_fulltext_before_state_machine() {
     let _ = env_logger::try_init();
-    let (_server, client) = schema_validation_context(
-        "rejects_non_string_fulltext_before_state_machine",
-        5417,
-    )
-    .await;
+    let (_server, client) =
+        schema_validation_context("rejects_non_string_fulltext_before_state_machine", 5417).await;
 
     let schema = Schema::new_with_id(
         1,

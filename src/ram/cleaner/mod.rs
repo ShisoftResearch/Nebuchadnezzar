@@ -87,15 +87,20 @@ impl Cleaner {
                         // Background eviction: check and evict if memory limit exceeded
                         #[cfg(feature = "tiered_memory")]
                         if let Some(ref tiered_manager) = checks_ref_clone.tiered_manager {
-                            evict_pool.install(|| match tiered_manager.evict_for_allocation_reconciled() {
-                                Ok(evicted) => {
-                                    if evicted > 0 {
-                                        progress.store(true, Ordering::Relaxed);
-                                        debug!("Background global eviction: evicted {} segments", evicted);
+                            evict_pool.install(|| {
+                                match tiered_manager.evict_for_allocation_reconciled() {
+                                    Ok(evicted) => {
+                                        if evicted > 0 {
+                                            progress.store(true, Ordering::Relaxed);
+                                            debug!(
+                                                "Background global eviction: evicted {} segments",
+                                                evicted
+                                            );
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    warn!("Background global eviction failed: {}", e);
+                                    Err(e) => {
+                                        warn!("Background global eviction failed: {}", e);
+                                    }
                                 }
                             });
                         }

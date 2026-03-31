@@ -2466,13 +2466,9 @@ mod tests {
         );
         server.meta().schemas.debug_only_new_schema(schema.clone());
 
-        let txn = transactions::new_async_client_for_database(
-            &server_addr,
-            group_name,
-            group_name,
-        )
-        .await
-        .unwrap();
+        let txn = transactions::new_async_client_for_database(&server_addr, group_name, group_name)
+            .await
+            .unwrap();
         let txn_id = txn.begin().await.unwrap().unwrap();
 
         // Write a new cell in transaction and commit

@@ -126,17 +126,17 @@ impl Service for NebRPCService {
         future::ready(self.database_runtime.chunks().head_cell(&key)).boxed()
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.database_runtime.chunks().write_cell(&mut cell))
+        self.with_indices_ensured(move || self.database_runtime.chunks().write_cell(&mut cell))
     }
 
     fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.database_runtime.chunks().update_cell(&mut cell))
+        self.with_indices_ensured(move || self.database_runtime.chunks().update_cell(&mut cell))
     }
     fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
-        self.with_indices_ensured(self.database_runtime.chunks().remove_cell(&key))
+        self.with_indices_ensured(move || self.database_runtime.chunks().remove_cell(&key))
     }
     fn upsert_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(self.database_runtime.chunks().upsert_cell(&mut cell))
+        self.with_indices_ensured(move || self.database_runtime.chunks().upsert_cell(&mut cell))
     }
     fn compare_version_and_update_cell(
         &self,
@@ -144,11 +144,11 @@ impl Service for NebRPCService {
         version: u64,
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(
+        self.with_indices_ensured(move || {
             self.database_runtime
                 .chunks()
-                .compare_version_and_update_cell(&key, version, &mut cell),
-        )
+                .compare_version_and_update_cell(&key, version, &mut cell)
+        })
     }
     fn compare_version_and_set_field(
         &self,
@@ -157,11 +157,11 @@ impl Service for NebRPCService {
         field: u64,
         value: OwnedValue,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(
+        self.with_indices_ensured(move || {
             self.database_runtime
                 .chunks()
-                .compare_version_and_set_field(&key, version, field, value),
-        )
+                .compare_version_and_set_field(&key, version, field, value)
+        })
     }
     fn count(&self) -> BoxFuture<'_, u64> {
         future::ready(self.database_runtime.chunks().count() as u64).boxed()
@@ -304,14 +304,17 @@ impl NebRPCService {
             neb_client,
         })
     }
-    fn with_indices_ensured<'a, R>(&'a self, res: R) -> BoxFuture<'a, R>
+    fn with_indices_ensured<'a, R, F>(&'a self, op: F) -> BoxFuture<'a, R>
     where
         R: Send + 'a,
+        F: FnOnce() -> R + Send + 'a,
     {
         if self.database_runtime.indexer().is_some() {
-            IndexBuilder::await_indices().map(|_| res).boxed()
+            IndexBuilder::with_request_index_scope(op)
+                .map(|(res, _)| res)
+                .boxed()
         } else {
-            future::ready(res).boxed()
+            future::ready(op()).boxed()
         }
     }
 }

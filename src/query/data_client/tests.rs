@@ -4521,9 +4521,7 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
         .unwrap()
         .clients
         .embedding_client
-        .set_embedding_index_core(MockEmbeddingIndexerCore::successful(
-            embedding_hits,
-        )));
+        .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits,)));
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(

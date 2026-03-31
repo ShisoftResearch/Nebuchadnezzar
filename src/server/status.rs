@@ -66,7 +66,10 @@ impl ServerMemoryStatus {
             self.total_segments, self.total_hot_segments, self.total_cold_segments
         );
         println!("  • Shared Hot Counter:  {}", self.shared_hot_segments);
-        println!("  • Counter Drift:       {}", self.hot_segment_counter_drift);
+        println!(
+            "  • Counter Drift:       {}",
+            self.hot_segment_counter_drift
+        );
 
         println!("\n💾 Memory Usage:");
         println!(
@@ -193,13 +196,13 @@ impl NebServer {
         // The shared pool holds the server-wide limit directly — no per-chunk multiplication.
         let (total_physical_limit, tiered_enabled) =
             if let Some(ref manager) = self.chunks().tiered_manager {
-            (
-                Some(manager.shared_pool().physical_memory_limit),
-                manager.is_enabled(),
-            )
-        } else {
-            (None, false)
-        };
+                (
+                    Some(manager.shared_pool().physical_memory_limit),
+                    manager.is_enabled(),
+                )
+            } else {
+                (None, false)
+            };
         let shared_hot_segments = self
             .chunks()
             .tiered_manager

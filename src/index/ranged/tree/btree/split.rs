@@ -39,7 +39,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    retain_by_node::<KS, PS>(tree, &tree.get_root(), mid_key, 0);
+    let _ = retain_by_node::<KS, PS>(tree, &tree.get_root(), mid_key, 0);
 }
 
 fn retain_by_node<KS, PS>(
@@ -47,7 +47,8 @@ fn retain_by_node<KS, PS>(
     node_ref: &NodeCellRef,
     mid_key: &EntryKey,
     level: usize,
-) where
+) -> bool
+where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
@@ -65,26 +66,33 @@ fn retain_by_node<KS, PS>(
             let key_index = n.search(mid_key);
             if key_index >= n.len {
                 // Pivot is beyond reach, nothing to do
-                return;
+                return true;
             }
             let selected_key = &n.keys.as_slice_immute()[key_index];
             let origin_node_len = n.len;
+            let prev_node_ref = n.prev.clone();
+            let node_id = n.id;
             debug_assert!(
                 selected_key >= mid_key,
                 "Selected {:?}, mid {:?}",
                 selected_key,
                 mid_key
             );
-            n.len = key_index; // All others will be ignored
-            debug_assert_ne!(
-                n.len, 0,
-                "No keys left in page, selected {:?}, mid {:?}, left ref {:?}",
-                selected_key, mid_key, &n.prev
-            ); // Assert no empty node after cut
-               // Cut out the right half of the node in this tree
             let mut right_node_ref = mem::take(&mut n.next);
             let mut num_removed_keys = origin_node_len - key_index;
+            if key_index == 0 {
+                *node = NodeData::Empty(Box::new(Default::default()));
+            } else {
+                n.len = key_index; // All others will be ignored
+            }
             drop(node);
+            if key_index == 0 {
+                make_deleted::<KS, PS>(&node_id);
+                if !prev_node_ref.is_default() {
+                    let mut prev_node = write_node::<KS, PS>(&prev_node_ref);
+                    prev_node.extnode_mut(tree).next = Default::default();
+                }
+            }
             while !right_node_ref.is_default() {
                 trace!("Obtaining right node lock for {:?}", right_node_ref);
                 let mut node = write_node::<KS, PS>(&right_node_ref);
@@ -97,41 +105,60 @@ fn retain_by_node<KS, PS>(
             }
             tree.len.fetch_sub(num_removed_keys, Release);
             info!("LSM tree retention removed {} keys", num_removed_keys);
+            key_index > 0
         }
         &NodeData::Internal(ref n) => {
             let index = n.search(mid_key);
-            retain_by_node::<KS, PS>(tree, &n.ptrs.as_slice_immute()[index], mid_key, level + 1);
-            if index >= n.len {
-                return;
+            let child_kept = retain_by_node::<KS, PS>(
+                tree,
+                &n.ptrs.as_slice_immute()[index],
+                mid_key,
+                level + 1,
+            );
+            if index >= n.len && child_kept {
+                return true;
             }
-            assert_ne!(index, 0, "This case is not possible and not handled");
             debug!("Retaining keys at internal level {}", level);
             let mut node = write_node::<KS, PS>(node_ref);
-            debug_assert_eq!(
-                // Ensure two searches have the same result
-                index,
+            let expected_index = Some(
                 node.keys()
                     .binary_search(mid_key)
                     .map(|i| i + 1)
-                    .unwrap_or_else(|i| i)
+                    .unwrap_or_else(|i| i),
             );
-            debug_assert_ne!(index, 0);
-            let innode = node.innode_mut();
-            for ptr in innode.ptrs.as_slice()[index + 1..=innode.len].iter_mut() {
-                *ptr = Default::default();
-            }
-            innode.len = index;
-            let mut right_node_ref = mem::take(&mut innode.right);
+            let mut right_node_ref = {
+                let innode = node.innode_mut();
+                let original_len = innode.len;
+                let kept_children = if child_kept { index + 1 } else { index };
+                for ptr in innode.ptrs.as_slice()[kept_children..=original_len].iter_mut() {
+                    *ptr = Default::default();
+                }
+                let right_node_ref = mem::take(&mut innode.right);
+                if kept_children == 0 {
+                    *node = NodeData::Empty(Box::new(Default::default()));
+                } else if kept_children == 1 {
+                    // This internal node now has a single live child and no separator
+                    // keys. Represent it as a bypass Empty node, matching merge behavior.
+                    let child = innode.ptrs.as_slice_immute()[0].clone();
+                    *node = NodeData::Empty(Box::new(EmptyNode {
+                        left: Some(child.clone()),
+                        right: child,
+                    }));
+                } else {
+                    debug_assert_eq!(Some(index), expected_index);
+                    innode.len = kept_children - 1;
+                }
+                right_node_ref
+            };
             drop(node);
             while !right_node_ref.is_default() {
                 let mut node = write_node::<KS, PS>(&right_node_ref);
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
                 *node = NodeData::Empty(Box::new(Default::default()));
             }
+            child_kept || index > 0
         }
-        &NodeData::Empty(ref n) => {
-            retain_by_node::<KS, PS>(tree, &n.right, mid_key, level);
-        }
+        &NodeData::Empty(ref n) => retain_by_node::<KS, PS>(tree, &n.right, mid_key, level),
         &NodeData::None => unreachable!(),
     }
 }

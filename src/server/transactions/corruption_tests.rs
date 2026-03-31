@@ -639,7 +639,7 @@ async fn test_wikidata_import_scenario() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 128 * 1024 * 1024, // Multiple chunks like production
-            db_size: 512 * 1024 * 1024, // Larger memory pool
+            db_size: 512 * 1024 * 1024,    // Larger memory pool
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

@@ -324,86 +324,85 @@ fn scan_segment_from_data(
         let virtual_cursor = segment_base + offset;
 
         if entry_header.entry_type == EntryType::CELL {
-                let content_addr = Entry::content_pos(cursor);
-                let cell_header = cell_header_from_entry_content_addr(content_addr);
-                let hash = cell_header.hash;
-                let new_version = cell_header.version;
+            let content_addr = Entry::content_pos(cursor);
+            let cell_header = cell_header_from_entry_content_addr(content_addr);
+            let hash = cell_header.hash;
+            let new_version = cell_header.version;
 
-                // Use version_map to check existing version (concurrent-safe)
-                let mut version_guard =
-                    version_map.lock_or_insert(hash as usize, new_version as usize);
-                let existing_version = *version_guard as u64;
+            // Use version_map to check existing version (concurrent-safe)
+            let mut version_guard = version_map.lock_or_insert(hash as usize, new_version as usize);
+            let existing_version = *version_guard as u64;
 
-                if new_version >= existing_version {
-                    // Our version is newer or equal, update cell_index and version_map
-                    *version_guard = new_version as usize;
-                    drop(version_guard);
+            if new_version >= existing_version {
+                // Our version is newer or equal, update cell_index and version_map
+                *version_guard = new_version as usize;
+                drop(version_guard);
 
-                    let mut cell_guard = chunk
-                        .cell_index
-                        .lock_or_insert(hash as usize, virtual_cursor);
-                    if *cell_guard != virtual_cursor {
-                        let existing_addr = *cell_guard;
-                        if existing_addr == 0 {
-                            *cell_guard = virtual_cursor;
-                        } else {
-                            // Update dead space for old entry if in hot segment
-                            if let Some(old_seg) = chunk.locate_segment(existing_addr) {
-                                if !old_seg.is_cold() {
-                                    let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                                    old_seg
-                                        .dead_space
-                                        .fetch_add(entry.content_length, Ordering::Relaxed);
-                                    old_seg.note_dead_bytes_change();
-                                }
+                let mut cell_guard = chunk
+                    .cell_index
+                    .lock_or_insert(hash as usize, virtual_cursor);
+                if *cell_guard != virtual_cursor {
+                    let existing_addr = *cell_guard;
+                    if existing_addr == 0 {
+                        *cell_guard = virtual_cursor;
+                    } else {
+                        // Update dead space for old entry if in hot segment
+                        if let Some(old_seg) = chunk.locate_segment(existing_addr) {
+                            if !old_seg.is_cold() {
+                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                                old_seg
+                                    .dead_space
+                                    .fetch_add(entry.content_length, Ordering::Relaxed);
+                                old_seg.note_dead_bytes_change();
                             }
-                            *cell_guard = virtual_cursor;
                         }
+                        *cell_guard = virtual_cursor;
                     }
-                } else {
-                    // Existing version is newer, this entry is dead
-                    dead_space += entry_header.content_length as u64;
                 }
+            } else {
+                // Existing version is newer, this entry is dead
+                dead_space += entry_header.content_length as u64;
+            }
         } else if entry_header.entry_type == EntryType::TOMBSTONE {
-                let content_addr = Entry::content_pos(cursor);
-                let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
-                let hash = tombstone.hash;
-                tombstone_count += 1;
+            let content_addr = Entry::content_pos(cursor);
+            let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
+            let hash = tombstone.hash;
+            tombstone_count += 1;
 
-                // Use lock_or_insert to handle case where no version exists yet
-                let mut version_guard =
-                    version_map.lock_or_insert(hash as usize, tombstone.version as usize);
-                let existing_version = *version_guard as u64;
+            // Use lock_or_insert to handle case where no version exists yet
+            let mut version_guard =
+                version_map.lock_or_insert(hash as usize, tombstone.version as usize);
+            let existing_version = *version_guard as u64;
 
-                if tombstone.version >= existing_version {
-                    // Update version_map BEFORE releasing lock (prevents race)
-                    *version_guard = tombstone.version as usize;
-                    drop(version_guard);
+            if tombstone.version >= existing_version {
+                // Update version_map BEFORE releasing lock (prevents race)
+                *version_guard = tombstone.version as usize;
+                drop(version_guard);
 
-                    // Tombstone is newer, delete cell from index
-                    if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
-                        let existing_addr = *cell_guard;
-                        if existing_addr != 0 {
-                            *cell_guard = 0;
-                            if let Some(target_seg) = chunk.locate_segment(existing_addr) {
-                                if !target_seg.is_cold() {
-                                    let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                                    target_seg
-                                        .dead_space
-                                        .fetch_add(entry.content_length, Ordering::Relaxed);
-                                    target_seg.note_dead_bytes_change();
-                                }
+                // Tombstone is newer, delete cell from index
+                if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
+                    let existing_addr = *cell_guard;
+                    if existing_addr != 0 {
+                        *cell_guard = 0;
+                        if let Some(target_seg) = chunk.locate_segment(existing_addr) {
+                            if !target_seg.is_cold() {
+                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                                target_seg
+                                    .dead_space
+                                    .fetch_add(entry.content_length, Ordering::Relaxed);
+                                target_seg.note_dead_bytes_change();
                             }
                         }
                     }
-                } else {
-                    drop(version_guard);
-                    stashed_tombstones.push(StashedTombstone {
-                        hash,
-                        version: tombstone.version,
-                        chunk_id: chunk.id,
-                    });
                 }
+            } else {
+                drop(version_guard);
+                stashed_tombstones.push(StashedTombstone {
+                    hash,
+                    version: tombstone.version,
+                    chunk_id: chunk.id,
+                });
+            }
         } else {
         }
 
@@ -470,79 +469,78 @@ fn scan_segment_and_update_index_with_versions(
         }
 
         if entry_header.entry_type == EntryType::CELL {
-                let content_addr = Entry::content_pos(cursor);
-                let cell_header = cell_header_from_entry_content_addr(content_addr);
-                let hash = cell_header.hash;
-                let new_version = cell_header.version;
+            let content_addr = Entry::content_pos(cursor);
+            let cell_header = cell_header_from_entry_content_addr(content_addr);
+            let hash = cell_header.hash;
+            let new_version = cell_header.version;
 
-                // Update version_map (for cold segment comparison later)
-                let mut version_guard =
-                    version_map.lock_or_insert(hash as usize, new_version as usize);
-                let existing_version = *version_guard as u64;
+            // Update version_map (for cold segment comparison later)
+            let mut version_guard = version_map.lock_or_insert(hash as usize, new_version as usize);
+            let existing_version = *version_guard as u64;
 
-                if new_version >= existing_version {
-                    *version_guard = new_version as usize;
-                    drop(version_guard);
+            if new_version >= existing_version {
+                *version_guard = new_version as usize;
+                drop(version_guard);
 
-                    // Update cell_index
-                    let mut cell_guard = chunk.cell_index.lock_or_insert(hash as usize, cursor);
-                    if *cell_guard != cursor {
-                        let existing_addr = *cell_guard;
-                        if existing_addr == 0 {
-                            *cell_guard = cursor;
-                        } else {
-                            // Mark old entry as dead
-                            if let Some(old_seg) = chunk.locate_segment(existing_addr) {
-                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                                old_seg
-                                    .dead_space
-                                    .fetch_add(entry.content_length, Ordering::Relaxed);
-                                old_seg.note_dead_bytes_change();
-                            }
-                            *cell_guard = cursor;
+                // Update cell_index
+                let mut cell_guard = chunk.cell_index.lock_or_insert(hash as usize, cursor);
+                if *cell_guard != cursor {
+                    let existing_addr = *cell_guard;
+                    if existing_addr == 0 {
+                        *cell_guard = cursor;
+                    } else {
+                        // Mark old entry as dead
+                        if let Some(old_seg) = chunk.locate_segment(existing_addr) {
+                            let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                            old_seg
+                                .dead_space
+                                .fetch_add(entry.content_length, Ordering::Relaxed);
+                            old_seg.note_dead_bytes_change();
                         }
+                        *cell_guard = cursor;
                     }
-                } else {
-                    drop(version_guard);
-                    dead_space += entry_header.content_length as u64;
                 }
+            } else {
+                drop(version_guard);
+                dead_space += entry_header.content_length as u64;
+            }
         } else if entry_header.entry_type == EntryType::TOMBSTONE {
-                let content_addr = Entry::content_pos(cursor);
-                let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
-                let hash = tombstone.hash;
-                tombstone_count += 1;
+            let content_addr = Entry::content_pos(cursor);
+            let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
+            let hash = tombstone.hash;
+            tombstone_count += 1;
 
-                // Update version_map with tombstone version
-                let mut version_guard =
-                    version_map.lock_or_insert(hash as usize, tombstone.version as usize);
-                let existing_version = *version_guard as u64;
+            // Update version_map with tombstone version
+            let mut version_guard =
+                version_map.lock_or_insert(hash as usize, tombstone.version as usize);
+            let existing_version = *version_guard as u64;
 
-                if tombstone.version >= existing_version {
-                    *version_guard = tombstone.version as usize;
-                    drop(version_guard);
+            if tombstone.version >= existing_version {
+                *version_guard = tombstone.version as usize;
+                drop(version_guard);
 
-                    // Delete from cell_index
-                    if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
-                        let existing_addr = *cell_guard;
-                        if existing_addr != 0 {
-                            *cell_guard = 0;
-                            if let Some(target_seg) = chunk.locate_segment(existing_addr) {
-                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                                target_seg
-                                    .dead_space
-                                    .fetch_add(entry.content_length, Ordering::Relaxed);
-                                target_seg.note_dead_bytes_change();
-                            }
+                // Delete from cell_index
+                if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
+                    let existing_addr = *cell_guard;
+                    if existing_addr != 0 {
+                        *cell_guard = 0;
+                        if let Some(target_seg) = chunk.locate_segment(existing_addr) {
+                            let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                            target_seg
+                                .dead_space
+                                .fetch_add(entry.content_length, Ordering::Relaxed);
+                            target_seg.note_dead_bytes_change();
                         }
                     }
-                } else {
-                    drop(version_guard);
-                    stashed_tombstones.push(StashedTombstone {
-                        hash,
-                        version: tombstone.version,
-                        chunk_id: chunk.id,
-                    });
                 }
+            } else {
+                drop(version_guard);
+                stashed_tombstones.push(StashedTombstone {
+                    hash,
+                    version: tombstone.version,
+                    chunk_id: chunk.id,
+                });
+            }
         } else {
         }
 
@@ -696,7 +694,8 @@ pub fn recover_chunks(
         let mut planned_global_hot_segments = chunks
             .iter()
             .find_map(|chunk| {
-                chunk.tiered_manager
+                chunk
+                    .tiered_manager
                     .as_ref()
                     .map(|manager| manager.shared_pool().total_hot_segments())
             })
@@ -710,12 +709,10 @@ pub fn recover_chunks(
                     .get(&(file_info.seg_id as usize))
                     .map(|segment| segment.is_hot())
                     .unwrap_or(false);
-                let is_cold =
-                    should_recover_as_cold(chunk, file_info, planned_global_hot_segments);
+                let is_cold = should_recover_as_cold(chunk, file_info, planned_global_hot_segments);
                 if is_cold {
                     if existing_hot {
-                        planned_global_hot_segments =
-                            planned_global_hot_segments.saturating_sub(1);
+                        planned_global_hot_segments = planned_global_hot_segments.saturating_sub(1);
                     }
                 } else if !existing_hot {
                     planned_global_hot_segments += 1;
@@ -2382,8 +2379,7 @@ mod tests {
             total_cold_segments(&recovered_db1) + total_cold_segments(&recovered_db2);
 
         assert_eq!(
-            combined_hot,
-            4,
+            combined_hot, 4,
             "recovery should keep total hot segments within the shared server-wide physical limit"
         );
         assert!(

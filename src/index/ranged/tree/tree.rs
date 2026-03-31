@@ -91,9 +91,18 @@ impl RangedTree {
                 tree.persist_root(neb_client).await;
                 let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
                 match neb_client.write_cell(tree_cell).await {
-                    Ok(Ok(_)) => info!("[TREE RECOVERY] Created replacement tree root cell for {:?}", tree_id),
-                    Ok(Err(e2)) => error!("[TREE RECOVERY] Failed to create replacement cell for {:?}: {:?}", tree_id, e2),
-                    Err(e2) => error!("[TREE RECOVERY] RPC error creating replacement cell for {:?}: {:?}", tree_id, e2),
+                    Ok(Ok(_)) => info!(
+                        "[TREE RECOVERY] Created replacement tree root cell for {:?}",
+                        tree_id
+                    ),
+                    Ok(Err(e2)) => error!(
+                        "[TREE RECOVERY] Failed to create replacement cell for {:?}: {:?}",
+                        tree_id, e2
+                    ),
+                    Err(e2) => error!(
+                        "[TREE RECOVERY] RPC error creating replacement cell for {:?}: {:?}",
+                        tree_id, e2
+                    ),
                 }
                 return Self { tree };
             }
@@ -119,9 +128,18 @@ impl RangedTree {
                 let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
                 // Cell already exists (we read it above), so use update_cell not write_cell
                 match neb_client.update_cell(tree_cell).await {
-                    Ok(Ok(_)) => info!("[TREE RECOVERY] Repaired corrupt tree root cell {:?}", tree_id),
-                    Ok(Err(e)) => error!("[TREE RECOVERY] Failed to repair corrupt cell {:?}: {:?}", tree_id, e),
-                    Err(e) => error!("[TREE RECOVERY] RPC error repairing corrupt cell {:?}: {:?}", tree_id, e),
+                    Ok(Ok(_)) => info!(
+                        "[TREE RECOVERY] Repaired corrupt tree root cell {:?}",
+                        tree_id
+                    ),
+                    Ok(Err(e)) => error!(
+                        "[TREE RECOVERY] Failed to repair corrupt cell {:?}: {:?}",
+                        tree_id, e
+                    ),
+                    Err(e) => error!(
+                        "[TREE RECOVERY] RPC error repairing corrupt cell {:?}: {:?}",
+                        tree_id, e
+                    ),
                 }
                 return Self { tree };
             }
@@ -348,7 +366,9 @@ mod tests {
         for i in 0..n {
             tree.insert(&make_key(i));
         }
-        let pivot = tree.pivot_key().expect("pivot_key must return Some for 100 keys");
+        let pivot = tree
+            .pivot_key()
+            .expect("pivot_key must return Some for 100 keys");
         assert!(
             pivot >= make_key(0) && pivot <= make_key(n - 1),
             "pivot {:?} must be within the inserted key range [0, {}]",
@@ -365,7 +385,9 @@ mod tests {
             tree.insert(&make_key(i));
         }
 
-        let pivot = tree.pivot_key().expect("pivot_key must return Some for 200 keys");
+        let pivot = tree
+            .pivot_key()
+            .expect("pivot_key must return Some for 200 keys");
 
         // Count keys strictly less than pivot (left side after split).
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
@@ -395,6 +417,54 @@ mod tests {
             left,
             left * 100 / total
         );
+    }
+
+    #[test]
+    fn retain_handles_leftmost_internal_subtree() {
+        let tree = make_tree();
+        let n = 1_000u64;
+        for i in 0..n {
+            tree.insert(&make_key(i));
+        }
+
+        // A very small pivot forces retain() down the leftmost internal path,
+        // which used to panic with "This case is not possible and not handled".
+        let pivot = make_key(1);
+        tree.retain(&pivot);
+
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut retained = Vec::new();
+        while let Some(key) = cursor.next() {
+            retained.push(key);
+        }
+
+        assert_eq!(retained, vec![make_key(0)]);
+        assert_eq!(tree.count(), 1);
+    }
+
+    #[test]
+    fn retain_handles_pivot_equal_to_first_key_in_leaf() {
+        let tree = make_tree();
+        let n = 1_000u64;
+        for i in 0..n {
+            tree.insert(&make_key(i));
+        }
+
+        // With BTREE_NODE_SIZE=128, key 128 should be the first key in the second
+        // leaf for monotonically inserted data. Retaining below this pivot used to
+        // panic because that pivot leaf kept zero keys.
+        let pivot = make_key(128);
+        tree.retain(&pivot);
+
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut retained = Vec::new();
+        while let Some(key) = cursor.next() {
+            retained.push(key);
+        }
+
+        let expected: Vec<_> = (0..128u64).map(make_key).collect();
+        assert_eq!(retained, expected);
+        assert_eq!(tree.count(), 128);
     }
 
     // ---- oversized detection ------------------------------------------------

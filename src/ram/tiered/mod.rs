@@ -73,7 +73,9 @@ impl SharedMemoryPool {
     /// Routes to this thread's assigned stripe — a single TLS read.
     #[inline]
     pub fn increment(&self) {
-        self.stripes[thread_stripe()].0.fetch_add(1, Ordering::Relaxed);
+        self.stripes[thread_stripe()]
+            .0
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Decrement the server-wide hot-segment count by `n`, saturating at zero.

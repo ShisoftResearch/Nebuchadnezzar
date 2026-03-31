@@ -588,7 +588,11 @@ mod tests {
 
         let results = join_all(tids.iter().cloned().map(|tid| {
             let manager = manager.clone();
-            async move { <DataManager as Service>::end(&manager, tid.clone(), tid).await.payload }
+            async move {
+                <DataManager as Service>::end(&manager, tid.clone(), tid)
+                    .await
+                    .payload
+            }
         }))
         .await;
 
@@ -620,13 +624,10 @@ mod tests {
             .lock()
             .state = TxnState::Committed;
 
-        let end_result = <DataManager as Service>::end(
-            &default_manager,
-            shared_tid.clone(),
-            shared_tid.clone(),
-        )
-            .await
-            .payload;
+        let end_result =
+            <DataManager as Service>::end(&default_manager, shared_tid.clone(), shared_tid.clone())
+                .await
+                .payload;
         assert_eq!(end_result, EndResult::Success);
         assert!(default_manager.txns.get(&shared_tid).is_none());
         assert!(!default_manager.txns_sorted.lock().contains(&shared_tid));
@@ -645,8 +646,8 @@ mod tests {
             shared_tid.clone(),
             shared_tid.clone(),
         )
-            .await
-            .payload;
+        .await
+        .payload;
         assert_eq!(analytics_end, EndResult::Success);
         assert!(analytics_manager.txns.get(&shared_tid).is_none());
         assert!(!analytics_manager.txns_sorted.lock().contains(&shared_tid));
@@ -1327,7 +1328,9 @@ impl Service for DataManager {
                 // All locks released successfully
                 debug!(
                     "Successfully released all {} locks for {:?}, total locks: {}",
-                    released_count, tid, self.txns.len()
+                    released_count,
+                    tid,
+                    self.txns.len()
                 );
                 lock_release_result = Some(Ok(()));
                 break;

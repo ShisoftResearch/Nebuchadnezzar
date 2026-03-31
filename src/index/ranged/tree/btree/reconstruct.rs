@@ -4,8 +4,8 @@ use super::node::{write_node, Node, NodeWriteGuard};
 use super::*;
 use super::{max_entry_key, BPlusTree, NodeCellRef};
 use crate::client::AsyncClient;
-use std::collections::HashSet;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::mem;
 use std::rc::Rc;
@@ -210,9 +210,7 @@ where
                 *prev_lock.right_bound_mut() = first_key.clone();
                 *prev_lock.right_ref_mut().unwrap() = node_ref.clone();
             } else {
-                debug!(
-                    "Previous page is unit id; this is the first page in the chain (expected)"
-                );
+                debug!("Previous page is unit id; this is the first page in the chain (expected)");
             }
             constructor.push_extnode(&node_ref, first_key);
             prev_ref = node_ref;

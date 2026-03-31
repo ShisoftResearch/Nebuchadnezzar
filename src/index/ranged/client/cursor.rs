@@ -189,7 +189,8 @@ impl ClientCursor {
                         return Ok(());
                     }
                     OpResult::Migrating => {
-                        last_retry_reason = Some("tree is migrating during cursor refill".to_string());
+                        last_retry_reason =
+                            Some("tree is migrating during cursor refill".to_string());
                         debug!(
                             "Ranged cursor retry {} for key {:?}: {}",
                             retried + 1,

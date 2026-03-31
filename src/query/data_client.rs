@@ -103,7 +103,10 @@ pub struct AggregateQuery {
 
 impl IndexedDataClient {
     fn hashed_query_rejects_value(value: &OwnedValue) -> bool {
-        matches!(value, OwnedValue::Map(_) | OwnedValue::Array(_) | OwnedValue::PrimArray(_))
+        matches!(
+            value,
+            OwnedValue::Map(_) | OwnedValue::Array(_) | OwnedValue::PrimArray(_)
+        )
     }
 
     fn hashed_query_value_kind(value: &OwnedValue) -> &'static str {

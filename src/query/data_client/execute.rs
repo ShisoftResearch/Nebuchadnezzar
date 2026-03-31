@@ -173,9 +173,7 @@ impl IndexedDataClient {
                 {
                     Ok(ids) => ids,
                     Err(e) => {
-                        if Self::is_special_clause(candidate)
-                            || Self::is_invalid_input_error(&e)
-                        {
+                        if Self::is_special_clause(candidate) || Self::is_invalid_input_error(&e) {
                             return Err(e);
                         }
                         candidate_ids = self.scan_schema_ids(schema, ordering).await?;

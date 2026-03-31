@@ -205,9 +205,8 @@ impl RangedIndexerClient {
                     if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await? {
                         return Ok(proc_res);
                     }
-                    last_retry_reason = Some(
-                        "successful tree operation requested another retry".to_string(),
-                    );
+                    last_retry_reason =
+                        Some("successful tree operation requested another retry".to_string());
                     debug!(
                         "Ranged client retry {} for key {:?}: {}",
                         retried + 1,

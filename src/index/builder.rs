@@ -22,6 +22,7 @@ use futures::{
 };
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
+use std::cell::RefCell;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -346,9 +347,24 @@ lazy_static! {
         Arc::new(Mutex::new(Vec::new()));
 }
 
+tokio::task_local! {
+    static REQUEST_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), IndexError>>>>;
+}
+
 fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
-    let handle = tokio::spawn(task);
-    PENDING_INDEX_TASKS.lock().push(handle);
+    let mut handle = Some(tokio::spawn(task));
+    let stored_locally = REQUEST_INDEX_TASKS
+        .try_with(|tasks| {
+            tasks
+                .borrow_mut()
+                .push(handle.take().expect("index task handle should exist"));
+        })
+        .is_ok();
+    if !stored_locally {
+        PENDING_INDEX_TASKS
+            .lock()
+            .push(handle.expect("index task handle should exist"));
+    }
 }
 
 // Main struct for building and managing indices
@@ -482,6 +498,33 @@ impl IndexBuilder {
                 .into_iter()
                 .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
                 .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
+                .await
+        }
+        .boxed()
+    }
+
+    // Scope index tasks spawned by a single request so callers can wait only on
+    // the work that their own write generated instead of draining the global backlog.
+    pub fn with_request_index_scope<'a, R, F>(
+        op: F,
+    ) -> BoxFuture<'a, (R, Vec<Result<Result<(), IndexError>, JoinError>>)>
+    where
+        R: Send + 'a,
+        F: FnOnce() -> R + Send + 'a,
+    {
+        async move {
+            REQUEST_INDEX_TASKS
+                .scope(RefCell::new(Vec::new()), async move {
+                    let res = op();
+                    let tasks = REQUEST_INDEX_TASKS
+                        .with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+                    let results = tasks
+                        .into_iter()
+                        .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
+                        .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
+                        .await;
+                    (res, results)
+                })
                 .await
         }
         .boxed()
@@ -782,6 +825,7 @@ mod tests {
     use crate::ram::schema::{Field, IndexType, Schema};
     use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
     use bifrost_hasher::hash_str;
+    use std::time::{Duration, Instant};
 
     fn collect_embedding_metas(indices: Vec<IndexRes>) -> Vec<EmbeddingIndexMeta> {
         let mut embedding_metas = Vec::new();
@@ -861,5 +905,46 @@ mod tests {
         assert_eq!(meta.field_id, hash_str("title_body"));
         assert_eq!(meta.text, "hello there. world");
         assert_eq!(meta.model, EmbeddingModel::from("test-model"));
+    }
+
+    #[tokio::test]
+    async fn request_index_scope_does_not_wait_for_unrelated_global_tasks() {
+        let _ = IndexBuilder::await_indices().await;
+
+        new_index_task(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(())
+        });
+
+        let started = Instant::now();
+        let (value, local_results) = IndexBuilder::with_request_index_scope(|| {
+            new_index_task(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(())
+            });
+            42usize
+        })
+        .await;
+
+        assert_eq!(value, 42);
+        assert_eq!(
+            local_results.len(),
+            1,
+            "request scope should await only the local index task"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "request scope should not block on unrelated global index work"
+        );
+
+        let global_results =
+            tokio::time::timeout(Duration::from_secs(1), IndexBuilder::await_indices())
+                .await
+                .expect("global index backlog should drain");
+        assert_eq!(
+            global_results.len(),
+            1,
+            "the unrelated global task should remain pending until explicitly drained"
+        );
     }
 }

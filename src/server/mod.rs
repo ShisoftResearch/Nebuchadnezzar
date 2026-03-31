@@ -822,9 +822,11 @@ impl NebServer {
                 crate::ram::tiered::TieredConfig::from_env()
                     .map(|c| crate::ram::tiered::SharedMemoryPool::new(&c))
             });
-        let shared_tiered_manager = shared_memory_pool
-            .as_ref()
-            .map(|pool| Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(pool.clone())));
+        let shared_tiered_manager = shared_memory_pool.as_ref().map(|pool| {
+            Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+                pool.clone(),
+            ))
+        });
 
         let database_runtime = Self::build_database_runtime(
             opts,

@@ -138,7 +138,9 @@ impl TieredMemoryManager {
         let mut states = self.chunk_states.write();
         states
             .entry(key)
-            .or_insert_with(|| Arc::new(ChunkTierState::new(self.shared_pool.promotion_cooldown_ms)))
+            .or_insert_with(|| {
+                Arc::new(ChunkTierState::new(self.shared_pool.promotion_cooldown_ms))
+            })
             .clone()
     }
 
@@ -237,7 +239,12 @@ impl TieredMemoryManager {
             let delta = actual as isize - prev as isize;
             if delta != 0 {
                 self.shared_pool.adjust_delta(delta);
-                trace!("Full scan reconciled: prev={}, actual={}, delta={}", prev, actual, delta);
+                trace!(
+                    "Full scan reconciled: prev={}, actual={}, delta={}",
+                    prev,
+                    actual,
+                    delta
+                );
             }
         } else {
             let known = state.last_known_count.load(Ordering::Relaxed);
@@ -249,7 +256,8 @@ impl TieredMemoryManager {
                     known, total_segments, actual
                 );
                 let prev = state.last_known_count.swap(actual, Ordering::Relaxed);
-                self.shared_pool.adjust_delta(actual as isize - prev as isize);
+                self.shared_pool
+                    .adjust_delta(actual as isize - prev as isize);
             }
         }
     }
@@ -458,7 +466,10 @@ impl TieredMemoryManager {
         }
 
         if evicted_count == 0 && target > 0 {
-            let hot_segments: usize = chunks.iter().map(|chunk| self.count_hot_segments(chunk)).sum();
+            let hot_segments: usize = chunks
+                .iter()
+                .map(|chunk| self.count_hot_segments(chunk))
+                .sum();
             warn!(
                 "Failed to evict any segments globally (target was {}). Hot segments: {}, all may be protected or have active references",
                 target, hot_segments
@@ -741,8 +752,14 @@ mod tests {
         let pool = make_pool(0.9, limit);
         let manager = TieredMemoryManager::new(pool);
 
-        assert_eq!(manager.cap_eviction_target_to_counts(138, false, 387_294), 138);
-        assert_eq!(manager.cap_eviction_target_to_counts(138, true, 387_294), 137);
+        assert_eq!(
+            manager.cap_eviction_target_to_counts(138, false, 387_294),
+            138
+        );
+        assert_eq!(
+            manager.cap_eviction_target_to_counts(138, true, 387_294),
+            137
+        );
         assert_eq!(manager.cap_eviction_target_to_counts(1, true, 10), 0);
         assert_eq!(manager.cap_eviction_target_to_counts(0, false, 10), 0);
         assert_eq!(manager.cap_eviction_target_to_counts(10, false, 4), 4);

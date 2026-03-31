@@ -95,11 +95,17 @@ fn total_cold_segments(chunks: &Arc<Chunks>) -> usize {
 }
 
 fn total_hot_segments_across_sets(chunk_sets: &[&Arc<Chunks>]) -> usize {
-    chunk_sets.iter().map(|chunks| total_hot_segments(chunks)).sum()
+    chunk_sets
+        .iter()
+        .map(|chunks| total_hot_segments(chunks))
+        .sum()
 }
 
 fn total_cold_segments_across_sets(chunk_sets: &[&Arc<Chunks>]) -> usize {
-    chunk_sets.iter().map(|chunks| total_cold_segments(chunks)).sum()
+    chunk_sets
+        .iter()
+        .map(|chunks| total_cold_segments(chunks))
+        .sum()
 }
 
 fn assert_shared_counter_matches_scanned_total(
@@ -614,7 +620,13 @@ fn test_global_eviction_across_chunks_in_single_database() {
     let _ = env_logger::try_init();
 
     let chunk_capacity = 4 * SEGMENT_SIZE;
-    let schema = Schema::new("single_db_global_eviction", None, default_fields(), false, false);
+    let schema = Schema::new(
+        "single_db_global_eviction",
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     let schemas = LocalSchemasCache::new_local("/tmp/neb_single_db_global_eviction_schema");
     schemas.debug_only_new_schema(schema.clone());
 
@@ -669,7 +681,10 @@ fn test_global_eviction_across_chunks_in_single_database() {
     let evicted = manager
         .evict_for_allocation()
         .expect("global eviction across chunks should succeed");
-    assert!(evicted > 0, "global pressure across two chunks should trigger eviction");
+    assert!(
+        evicted > 0,
+        "global pressure across two chunks should trigger eviction"
+    );
 
     let cold_after: usize = chunks
         .list
@@ -695,7 +710,13 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
     let threshold = 0.75;
     let threshold_hot_segments =
         ((physical_memory_limit as f64 * threshold as f64) / SEGMENT_SIZE as f64) as usize;
-    let schema = Schema::new("single_db_threshold_gate", None, default_fields(), false, false);
+    let schema = Schema::new(
+        "single_db_threshold_gate",
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     let schemas = LocalSchemasCache::new_local("/tmp/neb_single_db_threshold_gate_schema");
     schemas.debug_only_new_schema(schema.clone());
 
@@ -794,7 +815,13 @@ fn test_reconciled_background_eviction_ignores_stale_shared_counter_drift() {
 
     let physical_memory_limit = 8 * SEGMENT_SIZE;
     let threshold = 0.75;
-    let schema = Schema::new("reconciled_threshold_gate", None, default_fields(), false, false);
+    let schema = Schema::new(
+        "reconciled_threshold_gate",
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     let schemas = LocalSchemasCache::new_local("/tmp/neb_reconciled_threshold_gate_schema");
     schemas.debug_only_new_schema(schema.clone());
 
@@ -1000,8 +1027,14 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
         false,
         false,
     );
-    server.meta().schemas.debug_only_new_schema(default_schema.clone());
-    analytics.meta().schemas.debug_only_new_schema(analytics_schema.clone());
+    server
+        .meta()
+        .schemas
+        .debug_only_new_schema(default_schema.clone());
+    analytics
+        .meta()
+        .schemas
+        .debug_only_new_schema(analytics_schema.clone());
 
     let manager = server
         .chunks()
@@ -1034,12 +1067,8 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
         let _ = server.chunks().read_cell(&read_id);
         let _ = analytics.chunks().read_cell(&read_id);
 
-        wait_for_shared_counter_alignment(
-            &manager,
-            &[&server.chunks(), &analytics.chunks()],
-            750,
-        )
-        .await;
+        wait_for_shared_counter_alignment(&manager, &[&server.chunks(), &analytics.chunks()], 750)
+            .await;
     }
 
     wait_for_shared_counter_alignment(&manager, &[&server.chunks(), &analytics.chunks()], 750)
@@ -1121,8 +1150,14 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
         false,
         false,
     );
-    server.meta().schemas.debug_only_new_schema(default_schema.clone());
-    analytics.meta().schemas.debug_only_new_schema(analytics_schema.clone());
+    server
+        .meta()
+        .schemas
+        .debug_only_new_schema(default_schema.clone());
+    analytics
+        .meta()
+        .schemas
+        .debug_only_new_schema(analytics_schema.clone());
 
     let manager = server
         .chunks()
@@ -1175,7 +1210,10 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
         total_hot_segments(analytics_reloaded.chunks()) > 0,
         "reloaded analytics runtime should recover hot segments from storage"
     );
-    assert_shared_counter_matches_scanned_total(&manager, &[&server.chunks(), &analytics_reloaded.chunks()]);
+    assert_shared_counter_matches_scanned_total(
+        &manager,
+        &[&server.chunks(), &analytics_reloaded.chunks()],
+    );
 
     write_cells_for_partition(
         analytics_reloaded.chunks(),
@@ -1261,8 +1299,14 @@ async fn test_global_eviction_across_multiple_databases() {
         false,
         false,
     );
-    server.meta().schemas.debug_only_new_schema(default_schema.clone());
-    analytics.meta().schemas.debug_only_new_schema(analytics_schema.clone());
+    server
+        .meta()
+        .schemas
+        .debug_only_new_schema(default_schema.clone());
+    analytics
+        .meta()
+        .schemas
+        .debug_only_new_schema(analytics_schema.clone());
 
     let default_manager = server
         .chunks()
@@ -1397,8 +1441,14 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
         false,
         false,
     );
-    server.meta().schemas.debug_only_new_schema(default_schema.clone());
-    analytics.meta().schemas.debug_only_new_schema(analytics_schema.clone());
+    server
+        .meta()
+        .schemas
+        .debug_only_new_schema(default_schema.clone());
+    analytics
+        .meta()
+        .schemas
+        .debug_only_new_schema(analytics_schema.clone());
 
     let manager = server
         .chunks()
@@ -1537,14 +1587,7 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
             Some(manager.clone()),
         );
 
-        write_cells_for_partition(
-            &chunks,
-            schema.id,
-            0,
-            0,
-            cells_per_segment * 2,
-            &payload,
-        );
+        write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment * 2, &payload);
 
         databases.push((chunks, schema_dir, backup_dir, wal_dir));
     }
@@ -1581,7 +1624,10 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
         .iter()
         .map(|(chunks, _, _, _)| total_hot_segments(chunks))
         .sum();
-    assert!(evicted_total > 0, "equal-sized databases should trigger eviction");
+    assert!(
+        evicted_total > 0,
+        "equal-sized databases should trigger eviction"
+    );
     assert!(
         hot_after <= desired_hot_segments,
         "shared eviction should converge to the configured lower watermark"
@@ -1653,7 +1699,14 @@ fn test_global_eviction_ignores_unregistered_database() {
         cells_per_segment / 2,
         &payload,
     );
-    write_cells_for_partition(&chunks_b, schema_b.id, 0, 0, cells_per_segment * 2, &payload);
+    write_cells_for_partition(
+        &chunks_b,
+        schema_b.id,
+        0,
+        0,
+        cells_per_segment * 2,
+        &payload,
+    );
 
     manager.unregister_chunks(&chunks_b);
 

@@ -1082,8 +1082,8 @@ mod tests {
     use crate::ram::schema::Schema;
     use crate::ram::tests::default_fields;
     use crate::ram::types::{OwnedMap, OwnedValue};
-    use crate::server::{NebServer, ServerOptions, Service};
     use crate::server::transactions;
+    use crate::server::{NebServer, ServerOptions, Service};
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::Map;
     use futures::future::join_all;
@@ -1102,13 +1102,9 @@ mod tests {
         group_name: &str,
         database_name: &str,
     ) -> Arc<transactions::manager::AsyncServiceClient> {
-        transactions::new_async_client_for_database(
-            &address.to_string(),
-            group_name,
-            database_name,
-        )
-        .await
-        .unwrap()
+        transactions::new_async_client_for_database(&address.to_string(), group_name, database_name)
+            .await
+            .unwrap()
     }
 
     async fn start_manager_test_server(address: &str, group: &str) -> Arc<NebServer> {
@@ -1158,7 +1154,8 @@ mod tests {
             &String::from("name"),
             OwnedValue::String(format!("cell-{score}")),
         );
-        let mut cell = crate::ram::cell::OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data));
+        let mut cell =
+            crate::ram::cell::OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data));
         runtime.chunks().write_cell(&mut cell).unwrap();
     }
 
@@ -1186,7 +1183,12 @@ mod tests {
                 let txn_client = scoped_txn_client_for_database(&address, &group, &group).await;
                 let txn_id = txn_client.begin().await.unwrap().unwrap();
                 let target = cell_ids[worker % cell_ids.len()];
-                match txn_client.read(txn_id.clone(), target).await.unwrap().unwrap() {
+                match txn_client
+                    .read(txn_id.clone(), target)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
                     TxnExecResult::Accepted(mut cell) => {
                         let mut data = cell.data.Map().unwrap().clone();
                         let next_score = *data.get("score").u64().unwrap() + 1;
@@ -1201,7 +1203,10 @@ mod tests {
                             TMPrepareResult::Success => {
                                 let end = txn_client.commit(txn_id.clone()).await.unwrap().unwrap();
                                 assert!(
-                                    matches!(end, EndResult::Success | EndResult::SomeLocksNotReleased { .. }),
+                                    matches!(
+                                        end,
+                                        EndResult::Success | EndResult::SomeLocksNotReleased { .. }
+                                    ),
                                     "unexpected commit result: {:?}",
                                     end
                                 );
@@ -1246,13 +1251,26 @@ mod tests {
         let tasks = join_all((0..40).map(|index| {
             let address = address.to_string();
             let group = group.to_string();
-            let database_name = if index % 2 == 0 { group.to_string() } else { "analytics".to_string() };
-            let cell_id = if index % 2 == 0 { default_cell } else { analytics_cell };
+            let database_name = if index % 2 == 0 {
+                group.to_string()
+            } else {
+                "analytics".to_string()
+            };
+            let cell_id = if index % 2 == 0 {
+                default_cell
+            } else {
+                analytics_cell
+            };
             async move {
                 let txn_client =
                     scoped_txn_client_for_database(&address, &group, &database_name).await;
                 let txn_id = txn_client.begin().await.unwrap().unwrap();
-                match txn_client.read(txn_id.clone(), cell_id).await.unwrap().unwrap() {
+                match txn_client
+                    .read(txn_id.clone(), cell_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
                     TxnExecResult::Accepted(mut cell) => {
                         let mut data = cell.data.Map().unwrap().clone();
                         let next_score = *data.get("score").u64().unwrap() + 1;
@@ -1264,14 +1282,20 @@ mod tests {
                             .unwrap()
                             .unwrap();
                         if index % 3 == 0 {
-                            let abort_result = txn_client.abort(txn_id.clone()).await.unwrap().unwrap();
+                            let abort_result =
+                                txn_client.abort(txn_id.clone()).await.unwrap().unwrap();
                             assert!(matches!(abort_result, AbortResult::Success(_)));
                         } else {
                             match txn_client.prepare(txn_id.clone()).await.unwrap().unwrap() {
                                 TMPrepareResult::Success => {
-                                    let end = txn_client.commit(txn_id.clone()).await.unwrap().unwrap();
+                                    let end =
+                                        txn_client.commit(txn_id.clone()).await.unwrap().unwrap();
                                     assert!(
-                                        matches!(end, EndResult::Success | EndResult::SomeLocksNotReleased { .. }),
+                                        matches!(
+                                            end,
+                                            EndResult::Success
+                                                | EndResult::SomeLocksNotReleased { .. }
+                                        ),
                                         "unexpected commit result: {:?}",
                                         end
                                     );
@@ -1290,8 +1314,14 @@ mod tests {
             task;
         }
 
-        assert_eq!(default_runtime.txn_manager().unwrap().transaction_count(), 0);
-        assert_eq!(analytics_runtime.txn_manager().unwrap().transaction_count(), 0);
+        assert_eq!(
+            default_runtime.txn_manager().unwrap().transaction_count(),
+            0
+        );
+        assert_eq!(
+            analytics_runtime.txn_manager().unwrap().transaction_count(),
+            0
+        );
         server.shutdown().await;
     }
 
@@ -1480,8 +1510,14 @@ mod tests {
             result;
         }
 
-        assert_eq!(default_runtime.txn_manager().unwrap().transaction_count(), 0);
-        assert_eq!(analytics_runtime.txn_manager().unwrap().transaction_count(), 0);
+        assert_eq!(
+            default_runtime.txn_manager().unwrap().transaction_count(),
+            0
+        );
+        assert_eq!(
+            analytics_runtime.txn_manager().unwrap().transaction_count(),
+            0
+        );
         server.shutdown().await;
     }
 }

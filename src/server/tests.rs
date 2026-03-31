@@ -389,7 +389,9 @@ pub async fn unload_database_runtime_unchecked_allows_default() {
 
     // Unchecked unload must succeed
     assert!(
-        server.unload_database_runtime_unchecked(&default_name).await,
+        server
+            .unload_database_runtime_unchecked(&default_name)
+            .await,
         "unchecked unload must evict the default runtime"
     );
     assert!(
@@ -439,7 +441,9 @@ pub async fn delete_database_storage_unchecked_allows_default() {
     );
 
     // Unload the default runtime first so storage can be wiped
-    server.unload_database_runtime_unchecked(&default_name).await;
+    server
+        .unload_database_runtime_unchecked(&default_name)
+        .await;
 
     // Create the scoped storage directories as the runtime would have
     let scoped_db_dir = default_name.replace('/', "_");
@@ -708,6 +712,95 @@ pub async fn txn() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier() {
+    let _ = env_logger::try_init();
+    const CONTENT: &'static str = "content";
+    let server_addr = String::from("127.0.0.1:5311");
+    let server_group = String::from("indexed_parallel_rpc_test");
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 128 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let schema_id = 321;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "indexed_parallel_schema",
+        None,
+        Field::new_schema(vec![Field::new_indexed(
+            CONTENT,
+            Type::String,
+            vec![crate::ram::schema::IndexType::Fulltext],
+        )]),
+        false,
+        false,
+    );
+
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr.clone()],
+            &server_group,
+        )
+        .await
+        .unwrap(),
+    );
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
+    let num_tasks = 128u64;
+    let writes_per_task = 16u64;
+
+    for worker in 0..num_tasks {
+        let client_clone = client.clone();
+        tasks.push(tokio::spawn(async move {
+            for seq in 0..writes_per_task {
+                let id = Id::new(worker + 1, seq + 1);
+                let mut value = OwnedValue::Map(OwnedMap::new());
+                value[CONTENT] = OwnedValue::String(format!(
+                    "shared-term worker-{worker} sequence-{seq} shared-term"
+                ));
+                let cell = OwnedCell::new_with_id(schema_id, &id, value);
+                client_clone.upsert_cell(cell).await.unwrap().unwrap();
+            }
+            true
+        }));
+    }
+
+    tokio::time::timeout(tokio::time::Duration::from_secs(20), async {
+        while let Some(res) = tasks.next().await {
+            assert!(res.unwrap());
+        }
+    })
+    .await
+    .expect(
+        "concurrent indexed RPC writes should finish without stalling on unrelated index backlog",
+    );
+
+    let sample = client.read_cell(Id::new(1, 1)).await.unwrap().unwrap();
+    let content = sample.data[CONTENT].string().unwrap();
+    assert!(content.contains("shared-term"));
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
