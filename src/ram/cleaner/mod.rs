@@ -194,7 +194,7 @@ impl Cleaner {
             .total_space
             .fetch_sub(combiner_cleaned_space, Ordering::Relaxed); // only subtract combiner cleaned space, compacter cleaned does not reclaim segments
         if combined_cleaned_space > 0 {
-            info!(
+            debug!(
                 "Chunk {} cleaned total {} bytes, reduced {} segments (combiner {} bytes)",
                 chunk.id, combined_cleaned_space, reduced_segments_count, combiner_cleaned_space
             );
