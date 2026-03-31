@@ -178,15 +178,24 @@ impl RangedTree {
 
     /// Get pivot key for tree splitting
     pub fn pivot_key(&self) -> Option<EntryKey> {
-        let root = self.tree.get_root();
-        let scale = self.ideal_capacity() / 16;
-
-        if let Some((node_len, _, mid_key)) = self.tree.last_node_digest(&root) {
-            if node_len > scale {
-                return Some(mid_key);
+        let count = self.count();
+        if count < 2 {
+            return None;
+        }
+        // Seek to the approximate midpoint by advancing count/2 steps from the start.
+        // The seek-based traversal is O(N) but acceptable since migration itself is O(N),
+        // and it produces a balanced split unlike the old last-leaf heuristic which
+        // always returned None (scale = ideal_capacity/16 = 32768 > BTREE_NODE_SIZE = 512).
+        let target = count / 2;
+        let mut cursor = self.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut result = cursor.current().cloned();
+        for _ in 0..target {
+            match cursor.next() {
+                Some(k) => result = Some(k),
+                None => break,
             }
         }
-        None
+        result
     }
 
     /// Retain only keys less than pivot (for tree splitting)
@@ -285,3 +294,143 @@ impl_btree_level!(BTREE_NODE_SIZE);
 
 unsafe impl Send for RangedTree {}
 unsafe impl Sync for RangedTree {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{Feature, FEATURE_SIZE};
+    use crate::ram::types::Id;
+    use byteorder::{BigEndian, WriteBytesExt};
+    use lightning::map::HashSet as LFHashSet;
+    use std::sync::Arc;
+
+    fn make_tree() -> RangedTree {
+        let ds = Arc::new(LFHashSet::<EntryKey>::with_capacity(0));
+        RangedTree {
+            tree: DiskTree::new(&ds),
+        }
+    }
+
+    fn make_key(n: u64) -> EntryKey {
+        let mut feature: Feature = [0u8; FEATURE_SIZE];
+        let mut c = std::io::Cursor::new(&mut feature[..]);
+        c.write_u64::<BigEndian>(n).unwrap();
+        EntryKey::from_props(&Id::new(1, n), &feature, 100, 1)
+    }
+
+    // ---- pivot_key correctness tests ----------------------------------------
+
+    #[test]
+    fn pivot_key_empty_tree_is_none() {
+        assert!(make_tree().pivot_key().is_none());
+    }
+
+    #[test]
+    fn pivot_key_single_key_is_none() {
+        let tree = make_tree();
+        tree.insert(&make_key(42));
+        assert!(tree.pivot_key().is_none());
+    }
+
+    #[test]
+    fn pivot_key_two_keys_returns_some() {
+        let tree = make_tree();
+        tree.insert(&make_key(1));
+        tree.insert(&make_key(2));
+        // Any tree with >=2 keys must produce a pivot; used to always return None (the bug).
+        assert!(tree.pivot_key().is_some());
+    }
+
+    #[test]
+    fn pivot_key_lies_within_key_range() {
+        let tree = make_tree();
+        let n = 100u64;
+        for i in 0..n {
+            tree.insert(&make_key(i));
+        }
+        let pivot = tree.pivot_key().expect("pivot_key must return Some for 100 keys");
+        assert!(
+            pivot >= make_key(0) && pivot <= make_key(n - 1),
+            "pivot {:?} must be within the inserted key range [0, {}]",
+            pivot,
+            n - 1
+        );
+    }
+
+    #[test]
+    fn pivot_key_splits_tree_roughly_in_half() {
+        let tree = make_tree();
+        let n = 200u64;
+        for i in 0..n {
+            tree.insert(&make_key(i));
+        }
+
+        let pivot = tree.pivot_key().expect("pivot_key must return Some for 200 keys");
+
+        // Count keys strictly less than pivot (left side after split).
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut left = 0usize;
+        if let Some(k) = cursor.current() {
+            if k < &pivot {
+                left += 1;
+            }
+        }
+        loop {
+            match cursor.next() {
+                Some(k) => {
+                    if k < pivot {
+                        left += 1;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        let total = n as usize;
+        let min_acceptable = total / 4;
+        let max_acceptable = 3 * total / 4;
+        assert!(
+            left >= min_acceptable && left <= max_acceptable,
+            "Pivot should produce a balanced split: {} keys left of pivot ({}%), expected 25–75%",
+            left,
+            left * 100 / total
+        );
+    }
+
+    // ---- oversized detection ------------------------------------------------
+
+    #[test]
+    fn oversized_false_for_empty_tree() {
+        assert!(!make_tree().oversized());
+    }
+
+    #[test]
+    fn oversized_false_below_ideal_capacity() {
+        let tree = make_tree();
+        // ideal_capacity = BTREE_NODE_SIZE^2 * 2, far more than 10 keys.
+        for i in 0..10u64 {
+            tree.insert(&make_key(i));
+        }
+        assert!(!tree.oversized());
+    }
+
+    // ---- regression: old code always returned None --------------------------
+
+    /// Verify that the old scale guard (node_len > ideal_capacity/16) would have
+    /// rejected every possible node_len, confirming the bug was real.
+    #[test]
+    fn old_scale_guard_was_always_false() {
+        // BTREE_NODE_SIZE is the maximum number of keys in a single leaf node.
+        // ideal_capacity() = BTREE_NODE_SIZE^2 * 2, so scale = BTREE_NODE_SIZE^2 / 8.
+        // A single leaf holds at most BTREE_NODE_SIZE keys, which is always < scale.
+        let max_leaf_keys = BTREE_NODE_SIZE;
+        let ideal_cap = BTREE_NODE_SIZE * BTREE_NODE_SIZE * 2; // mirrors RangedTree::ideal_capacity
+        let old_scale = ideal_cap / 16;
+        assert!(
+            max_leaf_keys < old_scale,
+            "old scale guard (node_len > {}) can never be true for a leaf with at most {} keys — confirms the bug",
+            old_scale,
+            max_leaf_keys
+        );
+    }
+}
