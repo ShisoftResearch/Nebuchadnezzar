@@ -15,8 +15,8 @@ async fn main() {
 
     // Configure server options
     let opts = ServerOptions {
-        chunk_count: 4,
-        total_size: 1024 * 1024 * 1024, // 1 GB total
+        chunk_size: 256 * 1024 * 1024, // 256 MB per chunk
+        db_size: 1024 * 1024 * 1024,   // 1 GB total
         tiered_config: Some(neb::ram::tiered::TieredConfig::with_memory_limit(
             512 * 1024 * 1024, // 512 MB physical limit
         )),

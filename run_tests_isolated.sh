@@ -4,10 +4,17 @@
 # Example: ./run_tests_isolated.sh hnsw
 # Example: ./run_tests_isolated.sh apps::hnsw::recovery
 
+# Enable pipefail so pipeline returns exit code of first failed command
+set -o pipefail
+
 # Handle Ctrl+C and other signals
 CURRENT_TEST_PID=""
+CURRENT_TEST_NAME=""
 cleanup() {
     echo ""
+    if [ -n "$CURRENT_TEST_NAME" ]; then
+        echo "In-progress test: $CURRENT_TEST_NAME"
+    fi
     echo "=========================================="
     echo "Interrupted! Cleaning up..."
     echo "=========================================="
@@ -50,16 +57,32 @@ echo "Timeout per test: ${TIMEOUT}s"
 echo "=========================================="
 echo ""
 
-# Build tests once
+# Build tests once and stop immediately on compilation failure.
+BUILD_LOG=$(mktemp /tmp/neb-isolated-build.XXXXXX.log)
+BUILD_STAMP=$(mktemp /tmp/neb-isolated-build.XXXXXX.stamp)
+touch "$BUILD_STAMP"
+
 echo "Building tests..."
 if [ -z "$FILTER" ]; then
-    cargo test --lib --no-run  --target x86_64-unknown-linux-gnu 2>&1 | grep -E "Compiling|Finished"
+    cargo test --lib --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
+    BUILD_EXIT_CODE=$?
 else
-    cargo test --lib "$FILTER" --no-run --target x86_64-unknown-linux-gnu 2>&1 | grep -E "Compiling|Finished"
+    cargo test --lib "$FILTER" --no-run --target x86_64-unknown-linux-gnu >"$BUILD_LOG" 2>&1
+    BUILD_EXIT_CODE=$?
 fi
 
+if [ $BUILD_EXIT_CODE -ne 0 ]; then
+    echo -e "${RED}Compilation failed. Aborting without running stale test binaries.${NC}"
+    echo ""
+    cat "$BUILD_LOG"
+    rm -f "$BUILD_LOG" "$BUILD_STAMP"
+    exit $BUILD_EXIT_CODE
+fi
+
+grep -E "Compiling|Finished" "$BUILD_LOG" || true
+
 # Find the test binary
-# Try to use jq if available, otherwise fall back to find
+# Try to use jq if available, otherwise fall back to binaries built after BUILD_STAMP
 if command -v jq >/dev/null 2>&1; then
     TEST_BINARY=$(cargo test --lib --no-run --target x86_64-unknown-linux-gnu --message-format=json 2>/dev/null | \
         jq -r 'select(.profile.test == true) | select(.target.kind | contains(["lib"])) | .executable' | \
@@ -67,16 +90,19 @@ if command -v jq >/dev/null 2>&1; then
 fi
 
 if [ -z "$TEST_BINARY" ] || [ ! -f "$TEST_BINARY" ]; then
-    # Fallback: find the most recently modified test binary
-    TEST_BINARY=$(find target/debug/deps -name 'neb-*' -type f -executable -not -name '*.d' | \
+    # Fallback: find the most recently modified binary produced by this build.
+    TEST_BINARY=$(find target/x86_64-unknown-linux-gnu/debug/deps -name 'neb-*' -type f -executable -not -name '*.d' -newer "$BUILD_STAMP" | \
         xargs ls -t 2>/dev/null | head -1)
     
     if [ -z "$TEST_BINARY" ] || [ ! -f "$TEST_BINARY" ]; then
-        echo "Error: Could not find test binary in target/debug/deps"
-        echo "Please run 'cargo test --lib --target x86_64-unknown-linux-gnu --no-run' first"
+        echo "Error: Could not find a freshly built test binary in target/x86_64-unknown-linux-gnu/debug/deps"
+        echo "Compilation succeeded, but no current test executable was discovered"
+        rm -f "$BUILD_LOG" "$BUILD_STAMP"
         exit 1
     fi
 fi
+
+rm -f "$BUILD_LOG" "$BUILD_STAMP"
 
 echo "Using test binary: $TEST_BINARY"
 echo ""
@@ -93,6 +119,9 @@ fi
 TOTAL_TESTS=$(echo "$TEST_LIST" | wc -l)
 echo "Found $TOTAL_TESTS tests to run"
 echo ""
+
+TEST_LIST_FILE=$(mktemp)
+printf '%s\n' "$TEST_LIST" > "$TEST_LIST_FILE"
 
 # Track results
 PASSED=0
@@ -116,11 +145,13 @@ while IFS= read -r test_name; do
     # Run in background so we can track PID and handle signals
     # Use PIPESTATUS to capture the test exit code, not tee's exit code
     (timeout "$TIMEOUT" "$TEST_BINARY" "$test_name" --test-threads="$TEST_THREADS" --nocapture 2>&1; echo $? > /tmp/test_exit_code.txt) | tee /tmp/test_output.log &
+    CURRENT_TEST_NAME="$test_name"
     CURRENT_TEST_PID=$!
     
      # Wait for background process to complete
     wait $CURRENT_TEST_PID
     CURRENT_TEST_PID=""
+    CURRENT_TEST_NAME=""
     
     # Read the actual test exit code (captured by the subprocess)
     TEST_EXIT_CODE=$(cat /tmp/test_exit_code.txt 2>/dev/null || echo "1")
@@ -157,7 +188,7 @@ while IFS= read -r test_name; do
     
     # Clean up temp files
     rm -f /tmp/test_output.log /tmp/test_exit_code.txt
-done <<< "$TEST_LIST"
+done < "$TEST_LIST_FILE"
 
 # Print summary
 echo ""
@@ -189,7 +220,7 @@ fi
 echo ""
 
 # Clean up temp files
-rm -f /tmp/test_output.log /tmp/test_exit_code.txt
+rm -f /tmp/test_output.log /tmp/test_exit_code.txt "$TEST_LIST_FILE"
 
 # Exit with error if any tests failed
 if [ $FAILED -gt 0 ] || [ $TIMED_OUT -gt 0 ]; then
