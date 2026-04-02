@@ -15,6 +15,7 @@ use crate::{
         },
         EntryKey, SCHEMA_SCAN_PATT_SIZE,
     },
+    query::planner::normalize_selection_for_eval,
     ram::cell::OwnedCell,
 };
 
@@ -76,18 +77,13 @@ impl IndexedDataClient {
         selection: &Expr,
         limit: Option<usize>,
     ) -> Vec<Id> {
-        let empty_projection: Vec<u64> = vec![];
         let Some(limit) = limit else {
-            let selected_cells = self
-                .read_cells_from_ids(
-                    candidate_ids,
-                    &empty_projection,
-                    selection,
-                    &Expr::nothing(),
-                )
+            let cells = self
+                .read_cells_from_ids(candidate_ids, &vec![], &Expr::nothing(), &Expr::nothing())
                 .await;
-            return selected_cells
+            return cells
                 .into_iter()
+                .filter(|cell| cell_matches_selection(cell, selection))
                 .map(|cell| cell.id())
                 .collect_vec();
         };
@@ -98,10 +94,15 @@ impl IndexedDataClient {
         let mut selected_ids = Vec::with_capacity(limit);
         let batch = usize::from(SCAN_BUFFER_SIZE.max(1));
         for chunk in candidate_ids.chunks(batch) {
-            let selected_cells = self
-                .read_cells_from_ids(chunk, &empty_projection, selection, &Expr::nothing())
+            let cells = self
+                .read_cells_from_ids(chunk, &vec![], &Expr::nothing(), &Expr::nothing())
                 .await;
-            selected_ids.extend(selected_cells.into_iter().map(|cell| cell.id()));
+            selected_ids.extend(
+                cells
+                    .into_iter()
+                    .filter(|cell| cell_matches_selection(cell, selection))
+                    .map(|cell| cell.id()),
+            );
             if selected_ids.len() >= limit {
                 selected_ids.truncate(limit);
                 break;
@@ -137,6 +138,7 @@ impl IndexedDataClient {
         selection: &Expr,
         proc: &Expr,
     ) -> Vec<OwnedCell> {
+        let normalized_selection = normalize_selection_for_eval(selection);
         let mut all_cells = vec![];
         let mut tasks = ids
             .iter()
@@ -153,7 +155,7 @@ impl IndexedDataClient {
                     grouped_ids.push(id);
                 }
                 let projection = projection.clone();
-                let selection = selection.clone();
+                let selection = normalized_selection.clone();
                 let proc = proc.clone();
                 let group_name = self.group_name.clone();
                 let database_name = self.database_name.clone();
@@ -299,4 +301,171 @@ impl IndexedDataClient {
         all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
         all_cells.into_iter().map(|(cell, _)| cell).collect_vec()
     }
+}
+
+fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
+    let Expr::List(items) = selection else {
+        return true;
+    };
+
+    if items.is_empty() {
+        return true;
+    }
+
+    if is_symbol_named(&items[0], "and") {
+        return items
+            .iter()
+            .skip(1)
+            .all(|child| cell_matches_selection(cell, child));
+    }
+
+    if is_symbol_named(&items[0], "or") {
+        return items
+            .iter()
+            .skip(1)
+            .any(|child| cell_matches_selection(cell, child));
+    }
+
+    if is_symbol_named(&items[0], "not") {
+        return items
+            .get(1)
+            .map(|child| !cell_matches_selection(cell, child))
+            .unwrap_or(false);
+    }
+
+    if is_symbol_named(&items[0], "is-null") {
+        return items
+            .get(1)
+            .and_then(expr_field_id)
+            .map(|field_id| matches!(cell[field_id], OwnedValue::Null | OwnedValue::NA))
+            .unwrap_or(false);
+    }
+
+    if is_symbol_named(&items[0], "is-not-null") {
+        return items
+            .get(1)
+            .and_then(expr_field_id)
+            .map(|field_id| !matches!(cell[field_id], OwnedValue::Null | OwnedValue::NA))
+            .unwrap_or(false);
+    }
+
+    if is_symbol_named(&items[0], "in") {
+        let Some(field_id) = items.get(1).and_then(expr_field_id) else {
+            return false;
+        };
+        let field_value = &cell[field_id];
+        return items
+            .iter()
+            .skip(2)
+            .filter_map(expr_owned_value)
+            .any(|value| field_value == value);
+    }
+
+    if is_symbol_named(&items[0], "between") {
+        let (Some(field_id), Some(lower), Some(upper)) = (
+            items.get(1).and_then(expr_field_id),
+            items.get(2).and_then(expr_owned_value),
+            items.get(3).and_then(expr_owned_value),
+        ) else {
+            return false;
+        };
+        let field_value = &cell[field_id];
+        return compare_values(field_value, lower, CompareOp::Ge)
+            && compare_values(field_value, upper, CompareOp::Le);
+    }
+
+    if let Some((op, field_id, value)) = comparison_clause(selection) {
+        return compare_values(&cell[field_id], &value, op);
+    }
+
+    false
+}
+
+#[derive(Clone, Copy)]
+enum CompareOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+fn comparison_clause(selection: &Expr) -> Option<(CompareOp, u64, OwnedValue)> {
+    let Expr::List(items) = selection else {
+        return None;
+    };
+    if items.len() != 3 {
+        return None;
+    }
+
+    let mut op = parse_compare_op(&items[0])?;
+    if let (Some(field_id), Some(value)) = (expr_field_id(&items[1]), expr_owned_value(&items[2])) {
+        return Some((op, field_id, value.clone()));
+    }
+
+    if let (Some(value), Some(field_id)) = (expr_owned_value(&items[1]), expr_field_id(&items[2])) {
+        op = reverse_compare_op(op);
+        return Some((op, field_id, value.clone()));
+    }
+
+    None
+}
+
+fn parse_compare_op(expr: &Expr) -> Option<CompareOp> {
+    if is_symbol_named(expr, "=") {
+        Some(CompareOp::Eq)
+    } else if is_symbol_named(expr, "!=") {
+        Some(CompareOp::Ne)
+    } else if is_symbol_named(expr, ">") {
+        Some(CompareOp::Gt)
+    } else if is_symbol_named(expr, ">=") {
+        Some(CompareOp::Ge)
+    } else if is_symbol_named(expr, "<") {
+        Some(CompareOp::Lt)
+    } else if is_symbol_named(expr, "<=") {
+        Some(CompareOp::Le)
+    } else {
+        None
+    }
+}
+
+fn reverse_compare_op(op: CompareOp) -> CompareOp {
+    match op {
+        CompareOp::Eq => CompareOp::Eq,
+        CompareOp::Ne => CompareOp::Ne,
+        CompareOp::Gt => CompareOp::Lt,
+        CompareOp::Ge => CompareOp::Le,
+        CompareOp::Lt => CompareOp::Gt,
+        CompareOp::Le => CompareOp::Ge,
+    }
+}
+
+fn compare_values(left: &OwnedValue, right: &OwnedValue, op: CompareOp) -> bool {
+    match op {
+        CompareOp::Eq => left == right,
+        CompareOp::Ne => left != right,
+        CompareOp::Gt => left.partial_cmp(right).is_some_and(|ord| ord.is_gt()),
+        CompareOp::Ge => left.partial_cmp(right).is_some_and(|ord| ord.is_ge()),
+        CompareOp::Lt => left.partial_cmp(right).is_some_and(|ord| ord.is_lt()),
+        CompareOp::Le => left.partial_cmp(right).is_some_and(|ord| ord.is_le()),
+    }
+}
+
+fn expr_field_id(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::Symbol(field_id, _) => Some(*field_id),
+        _ => None,
+    }
+}
+
+fn expr_owned_value(expr: &Expr) -> Option<&OwnedValue> {
+    match expr {
+        Expr::Value(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn is_symbol_named(expr: &Expr, expected: &str) -> bool {
+    matches!(expr, Expr::Symbol(_, name) if name == expected)
 }

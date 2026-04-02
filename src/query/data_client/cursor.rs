@@ -10,7 +10,7 @@ use itertools::Itertools;
 
 use crate::{
     client::client_by_server_name_for_database, index::ranged::client::cursor::ClientCursor,
-    ram::cell::OwnedCell,
+    query::planner::normalize_selection_for_eval, ram::cell::OwnedCell,
 };
 
 use super::IndexedDataClient;
@@ -96,6 +96,7 @@ impl DataCursor {
 
     pub async fn refresh_batch(&mut self) -> bool {
         if self.index_cursor.is_some() {
+            let normalized_selection = normalize_selection_for_eval(&self.selection);
             let mut all_cells = vec![];
             loop {
                 {
@@ -121,7 +122,7 @@ impl DataCursor {
                                 ids.push(*id);
                             }
                             let projection = &self.projection;
-                            let selection = &self.selection;
+                            let selection = &normalized_selection;
                             let proc = &self.proc;
                             let group_name = self.client.group_name.clone();
                             let database_name = self.client.database_name.clone();

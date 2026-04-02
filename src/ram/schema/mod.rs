@@ -51,6 +51,8 @@ pub struct Schema {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CompoundIndex {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub fields: Vec<String>,
     pub field_ids: Vec<u64>,
     pub indices: Vec<IndexType>,
@@ -178,6 +180,7 @@ impl Schema {
         self.compound_index_fields.insert(
             name_id,
             CompoundIndex {
+                name: name.to_string(),
                 fields,
                 field_ids,
                 indices,
@@ -195,6 +198,7 @@ impl Schema {
         self.compound_index_fields.insert(
             name_id,
             CompoundIndex {
+                name: name.to_string(),
                 fields: vec![],
                 field_ids,
                 indices,

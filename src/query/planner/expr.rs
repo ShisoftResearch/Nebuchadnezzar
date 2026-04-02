@@ -323,6 +323,41 @@ pub(crate) fn build_indexed_predicate_plan(
     ))
 }
 
+pub(crate) fn normalize_selection_for_eval(selection: &Expr) -> Expr {
+    if selection.is_empty() {
+        return Expr::nothing();
+    }
+
+    let disjuncts = selection_to_dnf_conjunctions(selection);
+    if disjuncts.is_empty() {
+        return Expr::nothing();
+    }
+
+    let normalized_disjuncts = disjuncts
+        .into_iter()
+        .map(|conjunction| {
+            let normalized_clauses = conjunction
+                .into_iter()
+                .map(normalize_clause_for_eval)
+                .collect::<Vec<_>>();
+            conjunction_expr(&normalized_clauses)
+        })
+        .collect::<Vec<_>>();
+
+    match normalized_disjuncts.len() {
+        0 => Expr::nothing(),
+        1 => normalized_disjuncts
+            .into_iter()
+            .next()
+            .unwrap_or_else(Expr::nothing),
+        _ => {
+            let mut exprs = vec![Expr::Symbol(hash_str("or"), "or".to_string())];
+            exprs.extend(normalized_disjuncts);
+            Expr::List(exprs)
+        }
+    }
+}
+
 fn build_simple_disjunction_plan(
     schema: &Schema,
     selection: &Expr,
@@ -1115,6 +1150,22 @@ fn unary_field_expr(op_name: &str, field_id: u64, field_name: String) -> Expr {
     ])
 }
 
+fn normalize_clause_for_eval(expr: Expr) -> Expr {
+    if let Some((is_not_null, field_id)) = null_check_clause(&expr) {
+        let field_name = expr_unary_field_name(&expr).unwrap_or_else(|| field_id.to_string());
+        return Expr::List(vec![
+            Expr::Symbol(
+                hash_str(if is_not_null { "!=" } else { "=" }),
+                if is_not_null { "!=" } else { "=" }.to_string(),
+            ),
+            Expr::Symbol(field_id, field_name),
+            Expr::Value(OwnedValue::Null),
+        ]);
+    }
+
+    expr
+}
+
 fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedClausePlan> {
     if let Some((is_not_null, field_id)) = null_check_clause(clause) {
         let indices = schema.index_fields.get(&field_id)?;
@@ -1137,7 +1188,13 @@ fn indexed_clause_candidate(schema: &Schema, clause: &Expr) -> Option<IndexedCla
     }
 
     let (op, field_id, value) = comparison_clause(clause)?;
-    let indices = schema.index_fields.get(&field_id)?;
+    let indices = if let Some(indices) = schema.index_fields.get(&field_id) {
+        indices
+    } else if let Some(compound) = schema.compound_index_fields.get(&field_id) {
+        &compound.indices
+    } else {
+        return None;
+    };
 
     let supports_hashed = indices.iter().any(|idx| matches!(idx, IndexType::Hashed));
     let supports_ranged = indices.iter().any(|idx| matches!(idx, IndexType::Ranged));
@@ -1614,6 +1671,36 @@ mod tests {
         let selection = Expr::List(vec![
             Expr::Symbol(hash_str("~"), "~".to_string()),
             Expr::Symbol(hash_str(field), field.to_string()),
+            Expr::Value(OwnedValue::String("semantic query".to_string())),
+        ]);
+
+        let plan = build_indexed_predicate_plan(&schema, &selection, None, None, None).unwrap();
+        assert_eq!(plan.explain()[0].clause_kind(), "embedding_similarity");
+    }
+
+    #[test]
+    fn plan_supports_compound_embedding_similarity_operator() {
+        let compound_name = "title_body";
+        let mut schema = Schema::new_with_id(
+            3015,
+            "planner_compound_embedding_operator",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("title", Type::String),
+                Field::new_unindexed("body", Type::String),
+            ]),
+            false,
+            false,
+        );
+        schema.add_compound_index(
+            compound_name,
+            vec!["title".to_string(), "body".to_string()],
+            vec![IndexType::Embedding(EmbeddingModel::default_model())],
+        );
+
+        let selection = Expr::List(vec![
+            Expr::Symbol(hash_str("~"), "~".to_string()),
+            Expr::Symbol(hash_str(compound_name), compound_name.to_string()),
             Expr::Value(OwnedValue::String("semantic query".to_string())),
         ]);
 
