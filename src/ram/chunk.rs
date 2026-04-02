@@ -323,7 +323,13 @@ impl Chunk {
         );
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = SegmentList::new(num_segs);
-        let index = WordMap::with_capacity(64);
+        // Recovery rebuilds this index very aggressively; starting too small causes
+        // repeated lock-free migration storms during startup.
+        let index_capacity = num_segs
+            .saturating_mul(64)
+            .clamp(4_096, 1 << 20)
+            .next_power_of_two();
+        let index = WordMap::with_capacity(index_capacity);
         let chunk = Chunk {
             id,
             segs,
@@ -1421,7 +1427,7 @@ impl Chunks {
             let config = crate::ram::recovery::RecoveryConfig {
                 num_chunks: count,
                 chunk_size,
-                max_threads: None, // Use default (number of CPU cores)
+                max_threads: Some(64), // Cap recovery parallelism to reduce contention storms
             };
 
             match crate::ram::recovery::recover_chunks(

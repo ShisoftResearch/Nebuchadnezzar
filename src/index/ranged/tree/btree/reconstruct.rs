@@ -10,6 +10,12 @@ use std::fmt::Debug;
 use std::mem;
 use std::rc::Rc;
 
+#[derive(Debug, Clone)]
+pub enum ReconstructError {
+    MissingPage { page_id: Id, pages_read: usize },
+    RpcReadFailed { page_id: Id, error: String },
+}
+
 pub struct TreeConstructor<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -128,7 +134,7 @@ pub async fn reconstruct_from_head_id<KS, PS>(
     neb: &AsyncClient,
     deletion: &Arc<DeletionSet>,
     level: usize,
-) -> BPlusTree<KS, PS>
+) -> Result<BPlusTree<KS, PS>, ReconstructError>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -171,14 +177,20 @@ where
                         "[B-TREE RECONSTRUCTION] Total pages read before failure: {}",
                         page_count - 1
                     );
-                    panic!("B-tree reconstruction failed: page {:?} does not exist", id);
+                    return Err(ReconstructError::MissingPage {
+                        page_id: id,
+                        pages_read: page_count - 1,
+                    });
                 }
                 Err(e) => {
                     eprintln!(
                         "[B-TREE RECONSTRUCTION] RPC error reading page {} (id={:?}): {:?}",
                         page_count, id, e
                     );
-                    panic!("B-tree reconstruction failed: RPC error for page {:?}", id);
+                    return Err(ReconstructError::RpcReadFailed {
+                        page_id: id,
+                        error: format!("{:?}", e),
+                    });
                 }
             };
             let page = ExtNode::<KS, PS>::from_cell(&cell);
@@ -230,7 +242,7 @@ where
         "[B-TREE RECONSTRUCTION] Reconstruction verification completed at level {}",
         level
     );
-    tree
+    Ok(tree)
 }
 
 async fn resolve_chain_head_id<KS, PS>(start_id: Id, neb: &AsyncClient) -> Id
@@ -368,8 +380,11 @@ mod test {
             last_id = new_id;
         }
         let deletion = Arc::new(HashSet::with_capacity(8));
-        let tree =
-            Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion, 0).await);
+        let tree = Arc::new(
+            LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion, 0)
+                .await
+                .expect("reconstruct from head id should succeed"),
+        );
         let threads = all_keys
             .clone()
             .into_iter()

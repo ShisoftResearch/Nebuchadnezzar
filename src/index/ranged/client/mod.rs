@@ -33,7 +33,9 @@ pub(super) fn migration_retry_delay_ms(retried: i32, key: &EntryKey) -> u64 {
     // Use exponential backoff with deterministic jitter so concurrent writers do
     // not wake up in lockstep and stampede the same migrating tree.
     let capped_shift = retried.clamp(0, 4) as u32;
-    let base = 50u64.saturating_mul(1u64 << capped_shift).min(RETRY_BACKOFF_MS);
+    let base = 50u64
+        .saturating_mul(1u64 << capped_shift)
+        .min(RETRY_BACKOFF_MS);
     let jitter = u64::from(key.as_slice()[key.len() - 1] % 37);
     (base + jitter).min(RETRY_BACKOFF_MS)
 }

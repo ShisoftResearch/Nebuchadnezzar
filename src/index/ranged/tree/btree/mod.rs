@@ -133,7 +133,7 @@ where
         neb: &AsyncClient,
         deletion: &Arc<DeletionSet>,
         level: usize,
-    ) -> Self {
+    ) -> Result<Self, reconstruct::ReconstructError> {
         reconstruct::reconstruct_from_head_id(*head_id, neb, deletion, level).await
     }
 

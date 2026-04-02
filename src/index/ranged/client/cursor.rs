@@ -1,8 +1,8 @@
 use super::super::tree::service::*;
 use crate::index::ranged::{
     client::{
-        migration_retry_delay_ms, too_many_retry_error, RangedIndexerClient,
-        MAX_RETRY_ATTEMPTS, MIGRATION_REFRESH_INTERVAL,
+        migration_retry_delay_ms, too_many_retry_error, RangedIndexerClient, MAX_RETRY_ATTEMPTS,
+        MIGRATION_REFRESH_INTERVAL,
     },
     trees::{max_entry_key, min_entry_key},
 };

@@ -146,7 +146,33 @@ impl RangedTree {
         };
         info!("[TREE RECOVERY] Recovering B-tree from head {:?}", head_id);
 
-        let tree = DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0).await;
+        let tree = match DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0).await {
+            Ok(tree) => tree,
+            Err(e) => {
+                error!(
+                    "[TREE RECOVERY] Failed to reconstruct B-tree for {:?} from head {:?}: {:?}. Creating a fresh empty tree.",
+                    tree_id, head_id, e
+                );
+                let tree = DiskTree::new(&deletion_set);
+                tree.persist_root(neb_client).await;
+                let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
+                match neb_client.update_cell(tree_cell).await {
+                    Ok(Ok(_)) => info!(
+                        "[TREE RECOVERY] Replaced corrupt tree metadata for {:?}",
+                        tree_id
+                    ),
+                    Ok(Err(e2)) => error!(
+                        "[TREE RECOVERY] Failed to replace corrupt metadata for {:?}: {:?}",
+                        tree_id, e2
+                    ),
+                    Err(e2) => error!(
+                        "[TREE RECOVERY] RPC error replacing corrupt metadata for {:?}: {:?}",
+                        tree_id, e2
+                    ),
+                }
+                return Self { tree };
+            }
+        };
         info!(
             "[TREE RECOVERY] B-tree recovered with {} keys",
             tree.count()

@@ -24,6 +24,7 @@ use crate::ram::schema::sm as schema_sm;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -59,6 +60,94 @@ fn has_existing_raft_state(raft_storage: &Option<String>) -> bool {
         has_logs || has_snapshot
     } else {
         false
+    }
+}
+
+fn discover_known_databases_from_raft_storage(
+    raft_storage_root: Option<&str>,
+    default_database_name: &str,
+) -> Vec<String> {
+    let mut names = HashSet::new();
+    names.insert(default_database_name.to_string());
+
+    if let Some(root) = raft_storage_root {
+        let db_root = Path::new(root).join("databases");
+        if let Ok(entries) = fs::read_dir(db_root) {
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    if !name.is_empty() {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = names.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+async fn register_schema_sms_for_known_databases(
+    group_name: &str,
+    default_database_name: &str,
+    raft_storage_root: Option<&str>,
+    raft_service: &Arc<raft::RaftService>,
+    recovering_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let databases =
+        discover_known_databases_from_raft_storage(raft_storage_root, default_database_name);
+    info!(
+        "Pre-registering Neb SchemasSM for databases before replay: {:?}",
+        databases
+    );
+
+    for database_name in databases {
+        raft_service
+            .register_state_machine(Box::new(
+                schema_sm::SchemasSM::new_with_recovery_flag(
+                    group_name,
+                    &database_name,
+                    raft_service,
+                    recovering_flag.clone(),
+                )
+                .await,
+            ))
+            .await;
+    }
+}
+
+#[cfg(test)]
+mod startup_discovery_tests {
+    use super::discover_known_databases_from_raft_storage;
+
+    #[test]
+    fn discovers_default_and_scoped_databases_from_raft_root() {
+        let temp = tempfile::TempDir::new().expect("tempdir should be created");
+        let raft_root = temp.path();
+        std::fs::create_dir_all(raft_root.join("databases/default"))
+            .expect("default db dir should be created");
+        std::fs::create_dir_all(raft_root.join("databases/wikidata"))
+            .expect("wikidata db dir should be created");
+
+        let discovered = discover_known_databases_from_raft_storage(raft_root.to_str(), "default");
+
+        assert_eq!(
+            discovered,
+            vec!["default".to_string(), "wikidata".to_string()]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_default_database_when_raft_root_missing() {
+        let discovered = discover_known_databases_from_raft_storage(None, "default");
+        assert_eq!(discovered, vec!["default".to_string()]);
     }
 }
 
@@ -707,12 +796,11 @@ impl NebServer {
             let _ = IndexBuilder::await_all_indices().await;
             info!("All pending index tasks completed");
 
-            // CRITICAL DELAY: The RPC insert calls complete when sent to Raft,
-            // but Raft must commit them before the data appears in LSM mem_tree.
-            // Without this delay, flush_all() sees empty mem_tree and persists nothing!
-            info!("Waiting for Raft to commit index inserts before flushing...");
-            tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-            info!("Index Raft commit grace period complete");
+            // IndexBuilder::await_all_indices() joins the spawned index tasks, and ranged
+            // tree inserts are applied directly by TreeService before the RPC resolves.
+            // There is no separate Raft commit barrier to wait on here, so a fixed sleep
+            // only makes shutdown liveness depend on timer scheduling.
+            info!("Index tasks drained; proceeding to LSM flush");
         } else {
             debug!("No index builder, skipping index task await");
         }
@@ -740,12 +828,8 @@ impl NebServer {
             debug!("LSM tree service not available (likely not enabled)");
         }
 
-        // Step 1.4.5: Allow time for mark_migration() RPCs to complete
-        // mark_migration() updates LSM tree cells via client.update_cell() which is async
-        // We need to ensure these RPCs complete and cells are written before archiving
-        info!("Waiting for mark_migration() RPCs to complete...");
-        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-        info!("Mark migration wait completed");
+        // flush_all() already awaits mark_migration() for each tree before returning, so
+        // there is no additional asynchronous migration work to wait for here.
 
         // Step 1.5: Ensure all WAL data is synced to disk
         // This is critical after LSM flush to ensure root cells and new pages are persisted
@@ -974,17 +1058,14 @@ impl NebServer {
         raft_service
             .register_state_machine(Box::new(database::DatabaseCatalogSM::new(group_name)))
             .await;
-        raft_service
-            .register_state_machine(Box::new(
-                schema_sm::SchemasSM::new_with_recovery_flag(
-                    group_name,
-                    database_name,
-                    &raft_service,
-                    recovering_flag.clone(),
-                )
-                .await,
-            ))
-            .await;
+        register_schema_sms_for_known_databases(
+            group_name,
+            database_name,
+            opts.raft_storage.as_deref(),
+            &raft_service,
+            recovering_flag.clone(),
+        )
+        .await;
         Weights::new_with_id(CONS_HASH_ID, &raft_service).await;
 
         // TODO: If RangedIndexer service is enabled, MasterTreeSM should also be

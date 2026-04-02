@@ -4,9 +4,10 @@ use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
 use super::segs::{Segment, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
-use lightning::map::{Map, WordMap};
+use lightning::map::WordMap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -104,8 +105,49 @@ pub struct RecoveryConfig {
     pub num_chunks: usize,
     pub chunk_size: usize,
     /// Maximum number of threads to use for parallel recovery operations.
-    /// If None, defaults to 32 threads.
+    /// If None, defaults to 64 threads.
     pub max_threads: Option<usize>,
+}
+
+const DEFAULT_RECOVERY_THREADS: usize = 64;
+const MIN_RECOVERY_WORD_MAP_CAPACITY: usize = 4_096;
+const MAX_RECOVERY_WORD_MAP_CAPACITY: usize = 1 << 22;
+const RECOVERY_ENTRY_BYTES_ESTIMATE: u64 = 16 * 1024;
+const RECOVERY_SEGMENT_CAPACITY_FACTOR: usize = 2_048;
+
+fn recovery_parallelism(config: &RecoveryConfig) -> usize {
+    config
+        .max_threads
+        .unwrap_or(DEFAULT_RECOVERY_THREADS)
+        .max(1)
+}
+
+fn estimate_recovery_word_map_capacity(files: &[SegmentFileInfo]) -> usize {
+    let total_bytes: u64 = files.iter().map(|file| file.size).sum();
+    let bytes_estimate = (total_bytes / RECOVERY_ENTRY_BYTES_ESTIMATE)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let segment_estimate = files.len().saturating_mul(RECOVERY_SEGMENT_CAPACITY_FACTOR);
+
+    bytes_estimate
+        .max(segment_estimate)
+        .max(MIN_RECOVERY_WORD_MAP_CAPACITY)
+        .min(MAX_RECOVERY_WORD_MAP_CAPACITY)
+        .next_power_of_two()
+}
+
+fn group_files_by_chunk(
+    files: Vec<(SegmentFileInfo, bool)>,
+    num_chunks: usize,
+) -> Vec<Vec<SegmentFileInfo>> {
+    let mut grouped = vec![Vec::new(); num_chunks];
+    for (file_info, _) in files {
+        grouped[file_info.chunk_id].push(file_info);
+    }
+    for chunk_files in &mut grouped {
+        chunk_files.sort_unstable_by_key(|file| (file.seg_id, file.seq_id));
+    }
+    grouped
 }
 
 impl RecoveryConfig {
@@ -722,22 +764,33 @@ pub fn recover_chunks(
             .collect()
     };
 
-    // Separate hot and cold files for two-phase processing
+    // Separate hot and cold files for two-phase processing, but keep work grouped by chunk
+    // so recovery workers do not all contend on the same few per-chunk maps.
     let (hot_files, cold_files): (Vec<_>, Vec<_>) = recovery_decisions
         .into_iter()
         .partition(|(_, is_cold)| !is_cold);
+    let hot_files_by_chunk = group_files_by_chunk(hot_files, chunks.len());
+    let cold_files_by_chunk = group_files_by_chunk(cold_files, chunks.len());
 
+    let hot_segments: usize = hot_files_by_chunk.iter().map(Vec::len).sum();
+    let cold_segments: usize = cold_files_by_chunk.iter().map(Vec::len).sum();
     info!(
-        "Processing {} hot segments, {} cold segments",
-        hot_files.len(),
-        cold_files.len()
+        "Processing {} hot segments, {} cold segments with up to {} recovery threads",
+        hot_segments,
+        cold_segments,
+        recovery_parallelism(config)
     );
 
-    // Create per-chunk version maps for comparing versions during cold segment recovery
-    // This allows cold segments to be scanned without loading data into segment memory
-    let version_maps: Vec<WordMap> = chunks
+    // Create per-chunk version maps sized from the actual recovery footprint.
+    let version_maps: Vec<WordMap> = hot_files_by_chunk
         .iter()
-        .map(|_| WordMap::with_capacity(1024))
+        .zip(cold_files_by_chunk.iter())
+        .map(|(hot_chunk_files, cold_chunk_files)| {
+            let mut combined = Vec::with_capacity(hot_chunk_files.len() + cold_chunk_files.len());
+            combined.extend(hot_chunk_files.iter().cloned());
+            combined.extend(cold_chunk_files.iter().cloned());
+            WordMap::with_capacity(estimate_recovery_word_map_capacity(&combined))
+        })
         .collect();
 
     // Track max seq_id per chunk to update allocators after recovery
@@ -747,117 +800,149 @@ pub fn recover_chunks(
         .map(|_| std::sync::atomic::AtomicU64::new(0))
         .collect();
 
-    // Phase 1: Process HOT segments in parallel (keep in memory)
-    // These also populate the version_maps for later cold segment comparison
-    let total_files = hot_files.len() + cold_files.len();
-    hot_files
-        .into_par_iter()
-        .try_for_each(|(file_info, _)| -> io::Result<()> {
-            let chunk = &chunks[file_info.chunk_id];
-            let version_map = &version_maps[file_info.chunk_id];
-
-            let segment = if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
-                existing_seg
-            } else {
-                let new_seg = chunk
-                    .allocator
-                    .alloc_seg_at_id(file_info.seg_id, file_info.seq_id, &chunk.file_manager)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::OutOfMemory, "Cannot allocate segment")
-                    })?;
-                let seg_id = new_seg.id as usize;
-                chunk.put_segment(new_seg);
-                chunk.segs.get(&seg_id).unwrap()
-            };
-
-            let file_data = load_file_to_memory(&file_info.path)?;
-            if file_data.len() > SEGMENT_SIZE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
-            }
-
-            // Copy to segment memory
-            recover_segment_as_hot(&segment, &file_data);
-            let append_header = find_append_header(segment.addr, file_data.len());
-            segment
-                .append_header
-                .store(append_header, Ordering::Release);
-            drop(file_data);
-
-            // Scan and update both cell_index and version_map
-            let stashed = scan_segment_and_update_index_with_versions(
-                chunk,
-                &segment,
-                append_header,
-                version_map,
-            );
-            all_stashed_tombstones.lock().extend(stashed);
-            segment.clear_dirty(); // Recovered segments should not be archived again
-            hot_count.fetch_add(1, Ordering::Relaxed);
-
-            // Track max seq_id for this chunk
-            max_seq_ids[file_info.chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
-
-            let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
-            if processed % 100 == 0 {
-                info!("Recovery progress: {}/{} segments", processed, total_files);
-            }
-            Ok(())
+    let total_files = hot_segments + cold_segments;
+    let recovery_pool = ThreadPoolBuilder::new()
+        .num_threads(recovery_parallelism(config))
+        .thread_name(|idx| format!("recovery-{}", idx))
+        .build()
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to build recovery thread pool: {e}"),
+            )
         })?;
 
-    // Phase 2: Process COLD segments in parallel
-    // NO segment memory allocation - scan directly from Vec using version_map
-    cold_files
-        .into_par_iter()
-        .try_for_each(|(file_info, _)| -> io::Result<()> {
-            let chunk = &chunks[file_info.chunk_id];
-            let version_map = &version_maps[file_info.chunk_id];
+    recovery_pool.install(|| -> io::Result<()> {
+        // Phase 1: Process HOT segments in parallel across chunks.
+        hot_files_by_chunk
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(chunk_id, chunk_files)| -> io::Result<()> {
+                let chunk = &chunks[chunk_id];
+                let version_map = &version_maps[chunk_id];
+                let mut local_stashed = Vec::new();
 
-            // Allocate segment (virtual address only - no physical memory used)
-            let segment = if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
-                existing_seg
-            } else {
-                let new_seg = chunk
-                    .allocator
-                    .alloc_seg_at_id(file_info.seg_id, file_info.seq_id, &chunk.file_manager)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::OutOfMemory, "Cannot allocate segment")
-                    })?;
-                let seg_id = new_seg.id as usize;
-                chunk.put_segment(new_seg);
-                chunk.segs.get(&seg_id).unwrap()
-            };
+                for file_info in chunk_files {
+                    let segment =
+                        if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
+                            existing_seg
+                        } else {
+                            let new_seg = chunk
+                                .allocator
+                                .alloc_seg_at_id(
+                                    file_info.seg_id,
+                                    file_info.seq_id,
+                                    &chunk.file_manager,
+                                )
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::OutOfMemory,
+                                        "Cannot allocate segment",
+                                    )
+                                })?;
+                            let seg_id = new_seg.id as usize;
+                            chunk.put_segment(new_seg);
+                            chunk.segs.get(&seg_id).unwrap()
+                        };
 
-            // Mark as cold/archived BEFORE scanning
-            segment.set_cold();
-            segment.clear_dirty(); // Recovered segments should not be archived again
-            if let Some(ref tiered_manager) = chunk.tiered_manager {
-                tiered_manager.decrement_hot_count();
-            }
+                    let file_data = load_file_to_memory(&file_info.path)?;
+                    if file_data.len() > SEGMENT_SIZE {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
+                    }
 
-            // Load data to heap memory (temporary)
-            let file_data = load_file_to_memory(&file_info.path)?;
-            if file_data.len() > SEGMENT_SIZE {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
-            }
+                    recover_segment_as_hot(&segment, &file_data);
+                    let append_header = find_append_header(segment.addr, file_data.len());
+                    segment
+                        .append_header
+                        .store(append_header, Ordering::Release);
+                    drop(file_data);
 
-            // Scan from Vec - NO COPY to segment memory
-            // Uses version_map for comparing versions instead of reading segment memory
-            let stashed = scan_segment_from_data(chunk, &segment, &file_data, version_map);
-            all_stashed_tombstones.lock().extend(stashed);
-            cold_count.fetch_add(1, Ordering::Relaxed);
+                    local_stashed.extend(scan_segment_and_update_index_with_versions(
+                        chunk,
+                        &segment,
+                        append_header,
+                        version_map,
+                    ));
+                    segment.clear_dirty();
+                    hot_count.fetch_add(1, Ordering::Relaxed);
+                    max_seq_ids[chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
 
-            // Vec is dropped here - heap memory freed immediately
-            // Segment has no physical memory committed
+                    let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if processed % 100 == 0 {
+                        info!("Recovery progress: {}/{} segments", processed, total_files);
+                    }
+                }
 
-            // Track max seq_id for this chunk
-            max_seq_ids[file_info.chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
+                if !local_stashed.is_empty() {
+                    all_stashed_tombstones.lock().extend(local_stashed);
+                }
+                Ok(())
+            })?;
 
-            let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
-            if processed % 100 == 0 || processed == total_files {
-                info!("Recovery progress: {}/{} segments", processed, total_files);
-            }
-            Ok(())
-        })?;
+        // Phase 2: Process COLD segments in parallel across chunks.
+        cold_files_by_chunk
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(chunk_id, chunk_files)| -> io::Result<()> {
+                let chunk = &chunks[chunk_id];
+                let version_map = &version_maps[chunk_id];
+                let mut local_stashed = Vec::new();
+
+                for file_info in chunk_files {
+                    let segment =
+                        if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
+                            existing_seg
+                        } else {
+                            let new_seg = chunk
+                                .allocator
+                                .alloc_seg_at_id(
+                                    file_info.seg_id,
+                                    file_info.seq_id,
+                                    &chunk.file_manager,
+                                )
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::OutOfMemory,
+                                        "Cannot allocate segment",
+                                    )
+                                })?;
+                            let seg_id = new_seg.id as usize;
+                            chunk.put_segment(new_seg);
+                            chunk.segs.get(&seg_id).unwrap()
+                        };
+
+                    segment.set_cold();
+                    segment.clear_dirty();
+                    if let Some(ref tiered_manager) = chunk.tiered_manager {
+                        tiered_manager.decrement_hot_count();
+                    }
+
+                    let file_data = load_file_to_memory(&file_info.path)?;
+                    if file_data.len() > SEGMENT_SIZE {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
+                    }
+
+                    local_stashed.extend(scan_segment_from_data(
+                        chunk,
+                        &segment,
+                        &file_data,
+                        version_map,
+                    ));
+                    cold_count.fetch_add(1, Ordering::Relaxed);
+                    max_seq_ids[chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
+
+                    let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if processed % 100 == 0 || processed == total_files {
+                        info!("Recovery progress: {}/{} segments", processed, total_files);
+                    }
+                }
+
+                if !local_stashed.is_empty() {
+                    all_stashed_tombstones.lock().extend(local_stashed);
+                }
+                Ok(())
+            })
+    })?;
 
     // Version maps are dropped here, freeing all temporary version tracking memory
     drop(version_maps);
