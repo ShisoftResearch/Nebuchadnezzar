@@ -132,6 +132,23 @@ impl FieldStats {
     }
 }
 
+fn value_contains_phrase(value: &OwnedValue, query_phrase: &str) -> bool {
+    match value {
+        OwnedValue::String(text) => text.to_lowercase().contains(query_phrase),
+        OwnedValue::PrimArray(OwnedPrimArray::String(items)) => items
+            .iter()
+            .any(|text| text.to_lowercase().contains(query_phrase)),
+        OwnedValue::Array(items) => items
+            .iter()
+            .any(|item| value_contains_phrase(item, query_phrase)),
+        OwnedValue::Map(map) => map
+            .map
+            .iter()
+            .any(|(_, value)| value_contains_phrase(value, query_phrase)),
+        _ => false,
+    }
+}
+
 /// Document metadata
 #[derive(Debug, Clone)]
 struct DocMeta {
@@ -829,37 +846,11 @@ impl InvertedIndexer {
                     for (i, result) in cells.into_iter().enumerate() {
                         match result {
                             Ok(cell) => {
-                                let boost = match cell.data() {
-                                    OwnedValue::Map(map) => {
-                                        // Try to find the indexed field in the cell
-                                        // Because we only have field_id, we need a way to lookup field name
-                                        // However, usually we can assume the structured content is what we want
-                                        // For now, scan all string values in the cell
-                                        let mut found = false;
-                                        for (_, val) in map.map.iter() {
-                                            if let OwnedValue::String(s) = val {
-                                                log::info!("Checking content: '{}'", s);
-                                                if s.to_lowercase().contains(&query_phrase) {
-                                                    found = true;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        if found {
-                                            log::info!("Found phrase match in doc idx {}", i);
-                                            2.0
-                                        } else {
-                                            1.0
-                                        }
-                                    }
-                                    OwnedValue::String(s) => {
-                                        if s.to_lowercase().contains(&query_phrase) {
-                                            2.0
-                                        } else {
-                                            1.0
-                                        }
-                                    }
-                                    _ => 1.0,
+                                let boost = if value_contains_phrase(cell.data(), &query_phrase) {
+                                    log::info!("Found phrase match in doc idx {}", i);
+                                    2.0
+                                } else {
+                                    1.0
                                 };
 
                                 if boost > 1.0 {
@@ -3565,6 +3556,143 @@ mod tests {
                 );
 
                 info!("Phrase re-ranking test passed!");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_phrase_reranking_scans_string_arrays_inside_map_cells() {
+        let _ = env_logger::try_init();
+
+        let server_addr = "127.0.0.1:5731";
+        let group_name = "phrase_array_test_group";
+
+        let server = crate::server::NebServer::new_from_opts(
+            &crate::server::ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![crate::server::Service::Cell],
+                enable_recovery: false,
+            },
+            server_addr,
+            group_name,
+            async |_| {},
+        )
+        .await;
+
+        let schema_id = 701u32;
+        let aliases_field = "aliases";
+        let aliases_field_id = hash_str(aliases_field) as u64;
+
+        let fields = crate::ram::schema::Field::new_schema(vec![
+            crate::ram::schema::Field::new_indexed_array(
+                aliases_field,
+                dovahkiin::types::Type::String,
+                vec![crate::ram::schema::IndexType::Fulltext],
+            ),
+        ]);
+
+        let schema = crate::ram::schema::Schema::new_with_id(
+            schema_id,
+            "phrase_array_test_schema",
+            None,
+            fields,
+            false,
+            false,
+        );
+
+        server.meta().schemas.debug_only_new_schema(schema.clone());
+
+        let mut owned_doc_ids = Vec::new();
+        for i in 1100..1200 {
+            let test_id = Id::new(i, i);
+            if server
+                .consh
+                .get_server_id(test_id.higher)
+                .map(|sid| sid == server.server_id)
+                .unwrap_or(false)
+            {
+                owned_doc_ids.push(test_id);
+                if owned_doc_ids.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        let doc1_id = owned_doc_ids[0];
+        let doc2_id = owned_doc_ids[1];
+
+        let mut cell1_data = OwnedMap::new();
+        cell1_data.insert(
+            aliases_field,
+            OwnedValue::PrimArray(OwnedPrimArray::String(vec![
+                "Bill Gates".to_string(),
+                "William Gates".to_string(),
+            ])),
+        );
+        let mut cell1 = OwnedCell::new_with_id(schema_id, &doc1_id, OwnedValue::Map(cell1_data));
+
+        let mut cell2_data = OwnedMap::new();
+        cell2_data.insert(
+            aliases_field,
+            OwnedValue::PrimArray(OwnedPrimArray::String(vec![
+                "The Bill".to_string(),
+                "Open Gates".to_string(),
+            ])),
+        );
+        let mut cell2 = OwnedCell::new_with_id(schema_id, &doc2_id, OwnedValue::Map(cell2_data));
+
+        server.chunks().write_cell(&mut cell1).unwrap();
+        server.chunks().write_cell(&mut cell2).unwrap();
+
+        if let Some(index_builder) = server.indexer() {
+            index_builder.ensure_indices(&cell1, &schema, None);
+            index_builder.ensure_indices(&cell2, &schema, None);
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        if let Some(index_builder) = server.indexer() {
+            if let Some(indexer) = index_builder.clients.fulltext_indexer() {
+                let hits_no_rerank = indexer
+                    .bm25_search(schema_id, aliases_field_id, "Bill Gates", 10, false)
+                    .await
+                    .unwrap();
+
+                assert_eq!(hits_no_rerank.len(), 2);
+                let score1_base = hits_no_rerank
+                    .iter()
+                    .find(|h| h.id == doc1_id)
+                    .unwrap()
+                    .score;
+                let score2_base = hits_no_rerank
+                    .iter()
+                    .find(|h| h.id == doc2_id)
+                    .unwrap()
+                    .score;
+
+                let hits_rerank = indexer
+                    .bm25_search(schema_id, aliases_field_id, "Bill Gates", 10, true)
+                    .await
+                    .unwrap();
+
+                assert_eq!(hits_rerank.len(), 2);
+                let score1_boosted = hits_rerank.iter().find(|h| h.id == doc1_id).unwrap().score;
+                let score2_boosted = hits_rerank.iter().find(|h| h.id == doc2_id).unwrap().score;
+
+                assert!(
+                    score1_boosted > score1_base,
+                    "exact phrase inside a string array should be boosted"
+                );
+                assert!(
+                    (score2_boosted - score2_base).abs() < 0.001,
+                    "non-phrase array matches should not be boosted"
+                );
             }
         }
     }

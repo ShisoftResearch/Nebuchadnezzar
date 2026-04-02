@@ -4206,6 +4206,100 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn query_ids_preserves_bm25_order_for_plain_text_match() {
+    let _ = env_logger::try_init();
+    const TEXT_FIELD: &str = "BODY";
+    let server_addr = String::from("127.0.0.1:67425");
+    let server_group = String::from("query_text_match_bm25_order_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await;
+
+    let fields = Field::new_schema(vec![Field::new_indexed(
+        TEXT_FIELD,
+        Type::String,
+        vec![IndexType::Fulltext],
+    )]);
+    let schema_id = 783;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "query_text_match_bm25_order_schema",
+        None,
+        fields,
+        false,
+        false,
+    );
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let exact_match_id = Id::new(10, 3);
+    let rows = vec![
+        (Id::new(10, 1), "The Bill"),
+        (Id::new(10, 2), "Gate 7"),
+        (exact_match_id, "Bill Gates"),
+    ];
+
+    for (id, body) in &rows {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[TEXT_FIELD] = OwnedValue::String((*body).to_string());
+        let cell = OwnedCell::new_with_id(schema_id, id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+
+    for task in IndexBuilder::await_indices().await {
+        match task {
+            Ok(Ok(())) => {}
+            other => panic!("Index task failed: {:?}", other),
+        }
+    }
+
+    let idx_data_client = server.indexed_data_client();
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("@"), "@".to_string()),
+        Expr::Symbol(hash_str(TEXT_FIELD), TEXT_FIELD.to_string()),
+        Expr::Value(OwnedValue::String("Bill Gates".to_string())),
+    ]);
+
+    let mut cursor = idx_data_client
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+    let mut ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        ids.push(id);
+    }
+
+    assert_eq!(
+        ids.first().copied(),
+        Some(exact_match_id),
+        "plain full-text queries should keep BM25 relevance order",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";

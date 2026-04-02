@@ -132,7 +132,7 @@ impl IndexedDataClient {
                 .await?;
             all_ids = union_ids_ordered(all_ids, &ids);
         }
-        if plan.is_disjunction() {
+        if plan.is_disjunction() && !plan.is_pure_relevance_ranked_scan() {
             sort_ids_by_query_order(&mut all_ids, ordering);
         }
         Ok(all_ids)
@@ -189,6 +189,7 @@ impl IndexedDataClient {
             if !ordered_candidates
                 .iter()
                 .any(|candidate| matches!(candidate, IndexedClausePlan::Ranged { .. }))
+                && !disjunct.is_pure_relevance_ranked_scan()
             {
                 sort_ids_by_query_order(&mut candidate_ids, ordering);
             }
@@ -204,12 +205,7 @@ impl IndexedDataClient {
     }
 
     fn is_special_clause(clause: &IndexedClausePlan) -> bool {
-        matches!(
-            clause,
-            IndexedClausePlan::VectorSimilarity { .. }
-                | IndexedClausePlan::EmbeddingSimilarity { .. }
-                | IndexedClausePlan::FullTextMatch { .. }
-        )
+        clause.uses_relevance_ranking()
     }
 
     fn is_invalid_input_error(err: &RPCError) -> bool {

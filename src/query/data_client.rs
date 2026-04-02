@@ -524,6 +524,11 @@ impl IndexedDataClient {
                     .and_then(Self::infer_query_order_field_from_plan)
             })
             .flatten();
+        let preserve_relevance_order = explicit_order_by_field.is_none()
+            && plan
+                .as_ref()
+                .map(|plan| plan.is_pure_relevance_ranked_scan())
+                .unwrap_or(false);
         let (candidate_ids, requires_selection_filter): (Vec<Id>, bool) = if let Some(plan) = plan {
             if plan.is_impossible() {
                 (vec![], false)
@@ -553,7 +558,7 @@ impl IndexedDataClient {
         if let Some(field_id) = inferred_order_field {
             self.sort_ids_by_field_postprocessing(field_id, &mut selected_ids, ordering)
                 .await;
-        } else if explicit_order_by_field.is_none() {
+        } else if explicit_order_by_field.is_none() && !preserve_relevance_order {
             sort_ids_by_query_order(&mut selected_ids, ordering);
         }
         if let Some(field_ids) = distinct_fields.as_ref() {

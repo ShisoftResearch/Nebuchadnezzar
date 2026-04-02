@@ -173,6 +173,10 @@ impl IndexedPredicatePlan {
         self.disjuncts.as_slice()
     }
 
+    pub(crate) fn is_pure_relevance_ranked_scan(&self) -> bool {
+        self.disjuncts.len() == 1 && self.disjuncts[0].is_pure_relevance_ranked_scan()
+    }
+
     pub(crate) fn explain(&self) -> &[ClauseOrderExplain] {
         self.explain.as_slice()
     }
@@ -197,6 +201,21 @@ impl IndexedDisjunctPlan {
 
     pub(crate) fn residual(&self) -> &Expr {
         &self.residual
+    }
+
+    pub(crate) fn is_pure_relevance_ranked_scan(&self) -> bool {
+        self.clauses.len() == 1 && self.clauses[0].uses_relevance_ranking()
+    }
+}
+
+impl IndexedClausePlan {
+    pub(crate) fn uses_relevance_ranking(&self) -> bool {
+        matches!(
+            self,
+            IndexedClausePlan::VectorSimilarity { .. }
+                | IndexedClausePlan::EmbeddingSimilarity { .. }
+                | IndexedClausePlan::FullTextMatch { .. }
+        )
     }
 }
 
