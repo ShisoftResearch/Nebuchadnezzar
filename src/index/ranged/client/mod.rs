@@ -83,46 +83,75 @@ impl RangedIndexerClient {
         buffer_size: u16,
         pattern: Option<Vec<u8>>,
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
-        let key = range.key();
-        self_ref
-            .run_on_destinated_tree(
-                key,
-                |_key, client, tree_id, epoch| {
-                    let pattern = pattern.clone();
-                    let range = range.clone();
-                    async move {
-                        client
-                            .seek(tree_id, range, &pattern, buffer_size, epoch)
-                            .await
-                    }
-                    .boxed()
-                },
-                |action_res, _tree_client, _lower, _upper| {
-                    let pattern = pattern.clone();
-                    let range = range.clone();
-                    async move {
-                        if let Some(block) = action_res {
-                            if block.buffer.is_empty() {
-                                return Ok(Some(None));
-                            } else {
-                                let client_cursor = cursor::ClientCursor::new(
-                                    block,
-                                    range,
-                                    self_ref.clone(),
-                                    buffer_size,
-                                    pattern,
-                                )
-                                .await?;
-                                return Ok(Some(Some(client_cursor)));
-                            }
-                        } else {
-                            unreachable!()
+        let trace_seek = log::log_enabled!(log::Level::Debug);
+        let mut range = range;
+        loop {
+            let key = range.key().clone();
+            let block = self_ref
+                .run_on_destinated_tree(
+                    &key,
+                    |_key, client, tree_id, epoch| {
+                        let pattern = pattern.clone();
+                        let range = range.clone();
+                        async move {
+                            client
+                                .seek(tree_id, range, &pattern, buffer_size, epoch)
+                                .await
                         }
+                        .boxed()
+                    },
+                    |action_res, _tree_client, _lower, _upper| {
+                        async move { Ok(action_res) }.boxed()
+                    },
+                )
+                .await?;
+
+            if trace_seek {
+                debug!(
+                    "MIGRATION_SEEK_BLOCK request_key={:?} ordering={:?} first={:?} last={:?} len={} next={:?} empty={}",
+                    range.key().id(),
+                    range.ordering,
+                    block.buffer.first().copied(),
+                    block.buffer.last().copied(),
+                    block.buffer.len(),
+                    block.next.as_ref().map(|k| k.id()),
+                    block.buffer.is_empty()
+                );
+            }
+
+            if block.buffer.is_empty() {
+                if let Some(next_key) = block.next.clone() {
+                    let should_follow = match range.ordering {
+                        Ordering::Forward => next_key > *range.key(),
+                        Ordering::Backward => next_key < *range.key(),
+                    };
+                    if should_follow {
+                        if trace_seek {
+                            debug!(
+                                "MIGRATION_SEEK_FOLLOW_EMPTY request_key={:?} next_key={:?} ordering={:?}",
+                                range.key().id(),
+                                next_key.id(),
+                                range.ordering
+                            );
+                        }
+                        range = range.move_to(next_key);
+                        continue;
                     }
-                    .boxed()
-                },
-            )
-            .await
+                }
+                return Ok(None);
+            }
+
+            return Ok(Some(
+                cursor::ClientCursor::new(
+                    block,
+                    range,
+                    self_ref.clone(),
+                    buffer_size,
+                    pattern.clone(),
+                )
+                .await?,
+            ));
+        }
     }
 
     pub async fn delete(&self, key: &EntryKey) -> Result<bool, RPCError> {
@@ -192,6 +221,7 @@ impl RangedIndexerClient {
         let mut ensure_updated = false;
         let mut retried: i32 = 0;
         let mut last_retry_reason: Option<String> = None;
+        let trace_seek = log::log_enabled!(log::Level::Debug);
         loop {
             if retried >= MAX_RETRY_ATTEMPTS {
                 // Retry attempts all failed
@@ -205,6 +235,18 @@ impl RangedIndexerClient {
             }
             let (placement, tree_client, lower, upper) =
                 self.locate_key_server(&key, ensure_updated).await?;
+            if trace_seek {
+                debug!(
+                    "MIGRATION_SEEK_ROUTE key={:?} retry={} ensure_updated={} tree_id={:?} epoch={} lower={:?} upper={:?}",
+                    key.id(),
+                    retried,
+                    ensure_updated,
+                    placement.id,
+                    placement.epoch,
+                    lower.id(),
+                    upper.id()
+                );
+            }
             match action(
                 key.clone(),
                 tree_client.clone(),
@@ -227,6 +269,15 @@ impl RangedIndexerClient {
                     );
                 }
                 OpResult::Migrating => {
+                    if trace_seek {
+                        debug!(
+                            "MIGRATION_SEEK_RETRY key={:?} tree_id={:?} epoch={} reason=migrating retry={}",
+                            key.id(),
+                            placement.id,
+                            placement.epoch,
+                            retried + 1
+                        );
+                    }
                     last_retry_reason = Some("tree is migrating".to_string());
                     // Keep retrying, but periodically force a fresh placement lookup so
                     // clients converge on the new tree promptly once the split commits.
@@ -243,6 +294,15 @@ impl RangedIndexerClient {
                     .await;
                 }
                 OpResult::OutOfBound => {
+                    if trace_seek {
+                        debug!(
+                            "MIGRATION_SEEK_RETRY key={:?} tree_id={:?} epoch={} reason=out_of_bound retry={}",
+                            key.id(),
+                            placement.id,
+                            placement.epoch,
+                            retried + 1
+                        );
+                    }
                     last_retry_reason = Some("tree placement was out of bound".to_string());
                     debug!(
                         "Ranged client retry {} for key {:?}: {}",
@@ -253,6 +313,15 @@ impl RangedIndexerClient {
                     ensure_updated = true;
                 }
                 OpResult::NotFound => {
+                    if trace_seek {
+                        debug!(
+                            "MIGRATION_SEEK_RETRY key={:?} tree_id={:?} epoch={} reason=not_found retry={}",
+                            key.id(),
+                            placement.id,
+                            placement.epoch,
+                            retried + 1
+                        );
+                    }
                     last_retry_reason = Some("tree placement was not found".to_string());
                     debug!(
                         "Ranged client retry {} for key {:?}: {}",
@@ -263,6 +332,17 @@ impl RangedIndexerClient {
                     ensure_updated = true;
                 }
                 OpResult::EpochMissMatch(expect, actual) => {
+                    if trace_seek {
+                        debug!(
+                            "MIGRATION_SEEK_RETRY key={:?} tree_id={:?} epoch={} reason=epoch_mismatch expected={} actual={} retry={}",
+                            key.id(),
+                            placement.id,
+                            placement.epoch,
+                            expect,
+                            actual,
+                            retried + 1
+                        );
+                    }
                     debug!("Epoch mismatch, expect {}, actual {}", expect, actual);
                     last_retry_reason = Some(format!(
                         "tree epoch mismatch (expected {expect}, actual {actual})"

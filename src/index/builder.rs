@@ -411,26 +411,31 @@ impl IndexBuilder {
             schema.is_scannable
         );
         let indexers = self.clients.clone();
-        // Handle scannable indices if needed
-        if schema.is_scannable {
+        let scannable_key = if schema.is_scannable {
             log::debug!(
-                "Schema {} is scannable, calling ensure_scannable for cell {:?}",
+                "Schema {} is scannable, scheduling scannable insert for cell {:?}",
                 schema.id,
                 cell.id()
             );
-            self.ensure_scannable(cell, &indexers);
+            Some(EntryKey::for_scannable(&cell.id(), cell.header.schema))
         } else {
             log::debug!(
                 "Schema {} is NOT scannable for cell {:?}",
                 schema.id,
                 cell.id()
             );
-        }
+            None
+        };
         // Get new indices for the cell
         let new_indices = probe_cell_indices(cell, schema);
-        if !new_indices.is_empty() {
+        if scannable_key.is_some() || !new_indices.is_empty() {
             debug!("New indices: {:?}", new_indices);
+            let cell_id = cell.id();
+            let schema_id = cell.header.schema;
             new_index_task(async move {
+                if let Some(key) = scannable_key {
+                    Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_id).await?;
+                }
                 let res = Self::ensure_indices_(new_indices, old_indices, indexers).await;
                 debug!("Ensure indices result: {:?}", res);
                 res
@@ -438,28 +443,84 @@ impl IndexBuilder {
         }
     }
 
-    // Ensure scannable indices are set
-    fn ensure_scannable(&self, cell: &OwnedCell, indexers: &Arc<IndexerClients>) {
-        let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
-        let cell_id = cell.id();
-        let schema_id = cell.header.schema;
-        let indexers = indexers.clone();
-        new_index_task(async move {
-            log::debug!(
-                "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",
-                cell_id,
-                schema_id
-            );
-            indexers
-                .ranged_client
-                .insert(&key)
-                .await
-                .map(|_| ())
-                .map_err(|e| {
+    async fn ensure_scannable_insert(
+        indexers: Arc<IndexerClients>,
+        key: EntryKey,
+        cell_id: Id,
+        schema_id: u32,
+    ) -> Result<(), IndexError> {
+        log::debug!(
+            "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",
+            cell_id,
+            schema_id
+        );
+        let pattern = Some(key.as_slice()[..16].to_vec());
+        for attempt in 0..4 {
+            match indexers.ranged_client.insert(&key).await {
+                Ok(true) => {
+                    let range = crate::index::ranged::tree::service::Range::new_inclusive_opened(
+                        key.clone(),
+                        crate::index::ranged::tree::btree::Ordering::Forward,
+                    );
+                    match crate::index::ranged::client::RangedIndexerClient::seek(
+                        &indexers.ranged_client,
+                        range,
+                        1,
+                        pattern.clone(),
+                    )
+                    .await
+                    {
+                        Ok(Some(cursor)) if cursor.current_block().first() == Some(&cell_id) => {
+                            return Ok(());
+                        }
+                        Ok(Some(cursor)) => {
+                            log::warn!(
+                                "ensure_scannable: inserted key not yet visible for cell_id={:?}, schema_id={}, attempt={}, first_seen={:?}",
+                                cell_id,
+                                schema_id,
+                                attempt + 1,
+                                cursor.current_block().first()
+                            );
+                        }
+                        Ok(None) => {
+                            log::warn!(
+                                "ensure_scannable: inserted key not yet queryable for cell_id={:?}, schema_id={}, attempt={}",
+                                cell_id,
+                                schema_id,
+                                attempt + 1
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "ensure_scannable: visibility check failed for cell_id={:?}, schema_id={}, attempt={}: {:?}",
+                                cell_id,
+                                schema_id,
+                                attempt + 1,
+                                e
+                            );
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok(false) => {
+                    log::warn!(
+                        "ensure_scannable: insert returned false for cell_id={:?}, schema_id={}, attempt={}",
+                        cell_id,
+                        schema_id,
+                        attempt + 1
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => {
                     log::error!("ensure_scannable: Failed to insert key: {:?}", e);
-                    IndexError::RPCError(e)
-                })
-        });
+                    return Err(IndexError::RPCError(e));
+                }
+            }
+        }
+        Err(IndexError::Other(format!(
+            "ensure_scannable insert never became visible for cell_id={:?}, schema_id={}",
+            cell_id, schema_id
+        )))
     }
 
     // Remove indices for a cell

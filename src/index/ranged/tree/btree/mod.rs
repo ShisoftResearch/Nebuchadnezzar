@@ -62,6 +62,7 @@ where
     len: AtomicUsize,
     height: AtomicUsize,
     pub deletion: Arc<DeletionSet>,
+    writeback_client: Option<Arc<AsyncClient>>,
     marker: PhantomData<(KS, PS)>,
 }
 
@@ -100,6 +101,7 @@ where
             height: AtomicUsize::new(0),
             marker: PhantomData,
             deletion: deletion.clone(),
+            writeback_client: None,
         };
         let root_id = Self::new_page_id();
         let max_key = max_entry_key();
@@ -109,6 +111,15 @@ where
         *tree.root.write() = NodeCellRef::new(root_inner);
         tree.head_page_id = root_id;
         return tree;
+    }
+
+    pub fn new_with_client(
+        deletion: &Arc<DeletionSet>,
+        client: &Arc<AsyncClient>,
+    ) -> BPlusTree<KS, PS> {
+        let mut tree = Self::new(deletion);
+        tree.writeback_client = Some(client.clone());
+        tree
     }
 
     // Non-atomic
@@ -152,7 +163,16 @@ where
             height: AtomicUsize::new(height),
             marker: PhantomData,
             deletion: deletion.clone(),
+            writeback_client: None,
         }
+    }
+
+    pub fn set_writeback_client(&mut self, client: &Arc<AsyncClient>) {
+        self.writeback_client = Some(client.clone());
+    }
+
+    pub fn writeback_client(&self) -> Option<Arc<AsyncClient>> {
+        self.writeback_client.clone()
     }
 
     pub fn get_root(&self) -> NodeCellRef {

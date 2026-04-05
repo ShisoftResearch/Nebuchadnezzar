@@ -4,11 +4,16 @@ use super::node::{write_node, Node, NodeWriteGuard};
 use super::*;
 use super::{max_entry_key, BPlusTree, NodeCellRef};
 use crate::client::AsyncClient;
+use crate::ram::cell::OwnedCell;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::mem;
 use std::rc::Rc;
+
+const PARALLEL_FETCH_THRESHOLD: usize = 16;
+const PARALLEL_FETCH_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
 pub enum ReconstructError {
@@ -142,72 +147,39 @@ where
     let resolved_head_id = resolve_chain_head_id::<KS, PS>(head_id, neb).await;
     if resolved_head_id != head_id {
         info!(
-            "[B-TREE RECONSTRUCTION] Resolved non-head start {:?} -> real head {:?}",
+            "[B-TREE LOAD] Resolved non-head start {:?} -> real head {:?}",
             head_id, resolved_head_id
         );
     }
 
     info!(
-        "[B-TREE RECONSTRUCTION] Starting reconstruction of level {} tree from head cell {:?}",
+        "[B-TREE LOAD] Starting reconstruction of level {} tree from head cell {:?}",
         level, resolved_head_id
     );
+    let page_ids = discover_page_chain_ids::<KS, PS>(resolved_head_id, neb).await?;
+    let page_cells = fetch_page_chain_cells(page_ids, neb).await?;
     let mut len = 0;
     let mut page_count = 0;
     let (root, height) = {
         let mut constructor = TreeConstructor::<KS, PS>::new();
         let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
-        let mut id = resolved_head_id;
-        let mut at_end = false;
-        while !at_end {
+        for cell in page_cells {
             page_count += 1;
-            debug!(
-                "[B-TREE RECONSTRUCTION] Reading page {} (id={:?})",
-                page_count, id
-            );
-
-            let cell = match neb.read_cell(id).await {
-                Ok(Ok(cell)) => cell,
-                Ok(Err(e)) => {
-                    eprintln!(
-                        "[B-TREE RECONSTRUCTION] Failed to read page {} (id={:?}): {:?}",
-                        page_count, id, e
-                    );
-                    eprintln!("[B-TREE RECONSTRUCTION] This page was referenced by the previous page in the chain");
-                    eprintln!(
-                        "[B-TREE RECONSTRUCTION] Total pages read before failure: {}",
-                        page_count - 1
-                    );
-                    return Err(ReconstructError::MissingPage {
-                        page_id: id,
-                        pages_read: page_count - 1,
-                    });
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[B-TREE RECONSTRUCTION] RPC error reading page {} (id={:?}): {:?}",
-                        page_count, id, e
-                    );
-                    return Err(ReconstructError::RpcReadFailed {
-                        page_id: id,
-                        error: format!("{:?}", e),
-                    });
-                }
-            };
             let page = ExtNode::<KS, PS>::from_cell(&cell);
             let next_id = page.next_id;
             let prev_id = page.prev_id;
             let mut node = page.node;
 
             debug!(
-                "[B-TREE RECONSTRUCTION] Page {} has {} keys, next_id={:?}, prev_id={:?}",
+                "[B-TREE LOAD] Page {} has {} keys, next_id={:?}, prev_id={:?}",
                 page_count, node.len, next_id, prev_id
             );
 
-            at_end = next_id.is_unit_id();
+            let at_end = next_id.is_unit_id();
             if !at_end {
-                debug!("[B-TREE RECONSTRUCTION] Will read next page: {:?}", next_id);
+                debug!("[B-TREE LOAD] Will read next page: {:?}", next_id);
             } else {
-                debug!("[B-TREE RECONSTRUCTION] This is the last page in the chain");
+                debug!("[B-TREE LOAD] This is the last page in the chain");
             }
             if at_end {
                 node.next = NodeCellRef::new_none::<KS, PS>();
@@ -226,23 +198,115 @@ where
             }
             constructor.push_extnode(&node_ref, first_key);
             prev_ref = node_ref;
-            id = next_id;
         }
         (constructor.root(), constructor.levels())
     };
-    info!("[B-TREE RECONSTRUCTION] Completed reconstruction of tree {:?} at level {} with {} keys, height {}", resolved_head_id, level, len, height);
+    info!("[B-TREE LOAD] Completed reconstruction of tree {:?} at level {} with {} keys, height {}", resolved_head_id, level, len, height);
     let tree = BPlusTree::from_root(root, resolved_head_id, len, height, deletion);
     debug!(
-        "[B-TREE RECONSTRUCTION] Verifying reconstruction at level {}",
+        "[B-TREE LOAD] Verifying reconstruction at level {}",
         level
     );
     // debug_assert!(verification::tree_has_no_empty_node(&tree));
     debug_assert!(verification::is_tree_in_order(&tree, level));
     debug!(
-        "[B-TREE RECONSTRUCTION] Reconstruction verification completed at level {}",
+        "[B-TREE LOAD] Reconstruction verification completed at level {}",
         level
     );
     Ok(tree)
+}
+
+async fn discover_page_chain_ids<KS, PS>(head_id: Id, neb: &AsyncClient) -> Result<Vec<Id>, ReconstructError>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let mut ids = Vec::new();
+    let mut current = head_id;
+    let mut seen = HashSet::new();
+
+    loop {
+        if !seen.insert(current) {
+            warn!(
+                "[B-TREE LOAD] Detected cycle while discovering page chain from {:?}",
+                head_id
+            );
+            break;
+        }
+
+        ids.push(current);
+        let cell = match neb.read_cell(current).await {
+            Ok(Ok(cell)) => cell,
+            Ok(Err(e)) => {
+                return Err(ReconstructError::MissingPage {
+                    page_id: current,
+                    pages_read: ids.len() - 1,
+                })
+            }
+            Err(e) => {
+                return Err(ReconstructError::RpcReadFailed {
+                    page_id: current,
+                    error: format!("{:?}", e),
+                })
+            }
+        };
+        let page = ExtNode::<KS, PS>::from_cell(&cell);
+        if page.next_id.is_unit_id() {
+            break;
+        }
+        current = page.next_id;
+    }
+
+    Ok(ids)
+}
+
+async fn fetch_page_chain_cells(
+    page_ids: Vec<Id>,
+    neb: &AsyncClient,
+) -> Result<Vec<OwnedCell>, ReconstructError> {
+    if page_ids.len() < PARALLEL_FETCH_THRESHOLD {
+        let mut cells = Vec::with_capacity(page_ids.len());
+        for (idx, page_id) in page_ids.into_iter().enumerate() {
+            let cell = match neb.read_cell(page_id).await {
+                Ok(Ok(cell)) => cell,
+                Ok(Err(_)) => {
+                    return Err(ReconstructError::MissingPage {
+                        page_id,
+                        pages_read: idx,
+                    })
+                }
+                Err(e) => {
+                    return Err(ReconstructError::RpcReadFailed {
+                        page_id,
+                        error: format!("{:?}", e),
+                    })
+                }
+            };
+            cells.push(cell);
+        }
+        return Ok(cells);
+    }
+
+    let mut indexed_cells = stream::iter(page_ids.into_iter().enumerate())
+        .map(|(idx, page_id)| async move {
+            match neb.read_cell(page_id).await {
+                Ok(Ok(cell)) => Ok((idx, cell)),
+                Ok(Err(_)) => Err(ReconstructError::MissingPage {
+                    page_id,
+                    pages_read: idx,
+                }),
+                Err(e) => Err(ReconstructError::RpcReadFailed {
+                    page_id,
+                    error: format!("{:?}", e),
+                }),
+            }
+        })
+        .buffer_unordered(PARALLEL_FETCH_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    indexed_cells.sort_by_key(|(idx, _)| *idx);
+    Ok(indexed_cells.into_iter().map(|(_, cell)| cell).collect())
 }
 
 async fn resolve_chain_head_id<KS, PS>(start_id: Id, neb: &AsyncClient) -> Id
@@ -256,7 +320,7 @@ where
     loop {
         if !seen.insert(current) {
             warn!(
-                "[B-TREE RECONSTRUCTION] Detected cycle while resolving head from {:?}; using {:?}",
+                "[B-TREE LOAD] Detected cycle while resolving head from {:?}; using {:?}",
                 start_id, current
             );
             return current;
@@ -266,14 +330,14 @@ where
             Ok(Ok(cell)) => cell,
             Ok(Err(e)) => {
                 warn!(
-                    "[B-TREE RECONSTRUCTION] Failed to read candidate head {:?}: {:?}; using original {:?}",
+                    "[B-TREE LOAD] Failed to read candidate head {:?}: {:?}; using original {:?}",
                     current, e, start_id
                 );
                 return start_id;
             }
             Err(e) => {
                 warn!(
-                    "[B-TREE RECONSTRUCTION] RPC error reading candidate head {:?}: {:?}; using original {:?}",
+                    "[B-TREE LOAD] RPC error reading candidate head {:?}: {:?}; using original {:?}",
                     current, e, start_id
                 );
                 return start_id;

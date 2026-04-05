@@ -1,4 +1,5 @@
 use super::*;
+use crate::client::AsyncClient;
 use crate::index::ranged::tree::tree::DeletionSet;
 use crate::ram::cell::OwnedCell;
 use crate::ram::schema::{Field, Schema};
@@ -15,13 +16,14 @@ pub const NEXT_FIELD: &'static str = "next";
 pub const PREV_FIELD: &'static str = "prev";
 
 pub enum ChangingNode {
-    Deleted(Id),
+    DeletedWithClient(Id, Arc<AsyncClient>),
     Modified(NodeModified),
 }
 
 pub struct NodeModified {
     pub node: NodeCellRef,
     pub deletion: Arc<DeletionSet>,
+    pub client: Arc<AsyncClient>,
 }
 
 lazy_static! {
@@ -400,24 +402,31 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     // Persist all changed nodes from the single B+ tree
+    let Some(client) = tree.writeback_client() else {
+        return;
+    };
     CHANGED_NODES.push((
         CHANGE_COUNTER.fetch_add(1, Relaxed),
         ChangingNode::Modified(NodeModified {
             node: node.clone(),
             deletion: tree.deletion.clone(),
+            client,
         }),
     ));
 }
 
-pub fn make_deleted<KS, PS>(id: &Id)
+pub fn make_deleted<KS, PS>(id: &Id, tree: &BPlusTree<KS, PS>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     // Persist all deleted nodes from the single B+ tree
+    let Some(client) = tree.writeback_client() else {
+        return;
+    };
     CHANGED_NODES.push((
         CHANGE_COUNTER.fetch_add(1, Relaxed),
-        ChangingNode::Deleted(*id),
+        ChangingNode::DeletedWithClient(*id, client),
     ));
 }
 

@@ -134,8 +134,6 @@ impl StateMachineCmds for MasterTreeSM {
             );
             self.tree
                 .insert(pivot.clone(), TreePlacement::new(new_tree));
-            self.load_sub_tree(new_tree, &pivot, &upper_bound, INITIAL_TREE_EPOCH)
-                .await;
             if let Some((_, prev_tree)) = self.tree.range_mut(..&pivot).last() {
                 assert_eq!(prev_tree.id, src_tree);
                 prev_tree.epoch += 1;
@@ -144,6 +142,13 @@ impl StateMachineCmds for MasterTreeSM {
             // Persist the tree state after split
             if let Err(e) = self.persist_tree() {
                 error!("Failed to persist tree after split: {:?}", e);
+            } else {
+                debug!(
+                    "Persisted placement split for source {:?}, target {:?}, pivot {:?}; deferred target load to balancer",
+                    src_tree,
+                    new_tree,
+                    pivot
+                );
             }
         }
         .boxed()
@@ -202,7 +207,7 @@ impl MasterTreeSM {
         persistence_path: Option<PathBuf>,
     ) -> Self {
         info!(
-            "[RANGED INDEX RECOVERY] Creating MasterTreeSM with persistence_path={:?}",
+            "[RANGED INDEX LOAD] Creating MasterTreeSM with persistence_path={:?}",
             persistence_path
         );
         let mut sm = Self {
@@ -217,19 +222,19 @@ impl MasterTreeSM {
         // Try to recover from disk if persistence path is provided
         if let Some(ref path) = persistence_path {
             info!(
-                "[RANGED INDEX RECOVERY] Attempting recovery from persistence path: {:?}",
+                "[RANGED INDEX LOAD] Attempting to load persisted tree map from: {:?}",
                 path
             );
             if let Err(e) = sm.recover_from_disk(path) {
                 info!(
-                    "[RANGED INDEX RECOVERY] No existing tree state or failed to recover: {:?}",
+                    "[RANGED INDEX LOAD] No existing persisted tree map or failed to load: {:?}",
                     e
                 );
             } else {
-                info!("[RANGED INDEX RECOVERY] Successfully recovered MasterTreeSM from disk with {} tree entries", sm.tree.len());
+                info!("[RANGED INDEX LOAD] Successfully loaded MasterTreeSM from disk with {} tree entries", sm.tree.len());
             }
         } else {
-            info!("[RANGED INDEX RECOVERY] No persistence path provided, starting with empty tree");
+            info!("[RANGED INDEX LOAD] No persistence path provided, starting with empty tree");
         }
 
         sm
@@ -238,7 +243,7 @@ impl MasterTreeSM {
     pub async fn try_initialize(&mut self) -> bool {
         // Don't initialize if tree already has data (recovered from disk)
         if !self.tree.is_empty() {
-            info!("[RANGED INDEX RECOVERY] MasterTreeSM already has data from disk recovery, loading {} recovered trees", self.tree.len());
+            info!("[RANGED INDEX LOAD] MasterTreeSM already has persisted data, loading {} trees", self.tree.len());
             // Load all recovered trees into the TreeService
             let tree_entries: Vec<_> = self
                 .tree
@@ -252,18 +257,18 @@ impl MasterTreeSM {
                 } else {
                     max_entry_key()
                 };
-                info!("[RANGED INDEX RECOVERY] Loading recovered tree {}/{}: tree_id={:?}, boundary=[{:?}, {:?}), epoch={}",
+                info!("[RANGED INDEX LOAD] Loading tree {}/{}: tree_id={:?}, boundary=[{:?}, {:?}), epoch={}",
                       i + 1, tree_entries.len(), placement.id, lower, upper, placement.epoch);
                 self.load_sub_tree(placement.id, lower, &upper, placement.epoch)
                     .await;
                 info!(
-                    "[RANGED INDEX RECOVERY] Completed loading tree {}/{}",
+                    "[RANGED INDEX LOAD] Completed loading tree {}/{}",
                     i + 1,
                     tree_entries.len()
                 );
             }
             info!(
-                "[RANGED INDEX RECOVERY] All {} recovered trees loaded successfully",
+                "[RANGED INDEX LOAD] All {} trees loaded successfully",
                 tree_entries.len()
             );
             return true;
@@ -336,12 +341,12 @@ impl MasterTreeSM {
 
     fn recover_from_disk(&mut self, path: &Path) -> io::Result<()> {
         info!(
-            "[RANGED INDEX RECOVERY] Attempting to recover MasterTreeSM from disk: {:?}",
+            "[RANGED INDEX LOAD] Attempting to load MasterTreeSM from disk: {:?}",
             path
         );
         if !path.exists() {
             info!(
-                "[RANGED INDEX RECOVERY] Tree persistence file not found at {:?}",
+                "[RANGED INDEX LOAD] Tree persistence file not found at {:?}",
                 path
             );
             return Err(io::Error::new(
@@ -355,12 +360,12 @@ impl MasterTreeSM {
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer)?;
         info!(
-            "[RANGED INDEX RECOVERY] Read {} bytes from persistence file",
+            "[RANGED INDEX LOAD] Read {} bytes from persistence file",
             buffer.len()
         );
 
         if buffer.is_empty() {
-            info!("[RANGED INDEX RECOVERY] Persistence file is empty");
+            info!("[RANGED INDEX LOAD] Persistence file is empty");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Empty persistence file",
@@ -369,19 +374,19 @@ impl MasterTreeSM {
 
         let entries: Vec<(EntryKey, TreePlacement)> = utils::serde::deserialize(&buffer)
             .ok_or_else(|| {
-                error!("[RANGED INDEX RECOVERY] Failed to deserialize tree data");
+                error!("[RANGED INDEX LOAD] Failed to deserialize tree data");
                 io::Error::new(io::ErrorKind::InvalidData, "Failed to deserialize tree")
             })?;
 
         // Convert Vec back to BTreeMap
         self.tree = entries.into_iter().collect();
         info!(
-            "[RANGED INDEX RECOVERY] Successfully recovered tree with {} entries",
+            "[RANGED INDEX LOAD] Successfully loaded tree map with {} entries",
             self.tree.len()
         );
         for (key, placement) in &self.tree {
             info!(
-                "[RANGED INDEX RECOVERY]   Tree entry: key={:?}, tree_id={:?}, epoch={}",
+                "[RANGED INDEX LOAD]   Tree entry: key={:?}, tree_id={:?}, epoch={}",
                 key, placement.id, placement.epoch
             );
         }
@@ -391,10 +396,10 @@ impl MasterTreeSM {
     async fn load_sub_tree(&mut self, id: Id, lower: &EntryKey, upper: &EntryKey, epoch: u64) {
         if self.raft_svr.is_leader() {
             // Only the leader can initiate the request to load the sub tree
-            info!("[RANGED INDEX RECOVERY] Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}, epoch={}", id, lower, upper, epoch);
+            info!("[RANGED INDEX LOAD] Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}, epoch={}", id, lower, upper, epoch);
             let client = self.locate_tree_server(&id).await.unwrap();
             info!(
-                "[RANGED INDEX RECOVERY] Located tree {:?} at server {:?}",
+                "[RANGED INDEX LOAD] Located tree {:?} at server {:?}",
                 id,
                 client.server_id()
             );
@@ -403,12 +408,12 @@ impl MasterTreeSM {
                 .await
                 .unwrap();
             info!(
-                "[RANGED INDEX RECOVERY] Successfully loaded tree {:?} into LSM service",
+                "[RANGED INDEX LOAD] Successfully loaded tree {:?} into LSM service",
                 id
             );
         } else {
             info!(
-                "[RANGED INDEX RECOVERY] Not leader, skipping load_sub_tree for {:?}",
+                "[RANGED INDEX LOAD] Not leader, skipping load_sub_tree for {:?}",
                 id
             );
         }

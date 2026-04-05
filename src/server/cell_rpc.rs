@@ -310,9 +310,25 @@ impl NebRPCService {
         F: FnOnce() -> R + Send + 'a,
     {
         if self.database_runtime.indexer().is_some() {
-            IndexBuilder::with_request_index_scope(op)
-                .map(|(res, _)| res)
-                .boxed()
+            async move {
+                let (res, request_results) = IndexBuilder::with_request_index_scope(op).await;
+                let pending_results = IndexBuilder::await_indices().await;
+
+                for result in request_results.into_iter().chain(pending_results.into_iter()) {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!("Index task failed during request: {:?}", e);
+                        }
+                        Err(e) => {
+                            warn!("Index task join failed during request: {:?}", e);
+                        }
+                    }
+                }
+
+                res
+            }
+            .boxed()
         } else {
             future::ready(op()).boxed()
         }

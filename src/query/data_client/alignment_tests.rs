@@ -13,7 +13,7 @@ use bifrost_hasher::hash_str;
 use dovahkiin::{integrated::lisp::parse_to_serde_expr, types::*};
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rusqlite::{params, Connection};
-use std::{collections::BTreeSet, fmt::Write as _, sync::Arc};
+use std::{collections::BTreeSet, fmt::Write as _, sync::Arc, time::Duration};
 
 const RANGE_A: &str = "RANGE_A";
 const RANGE_B: &str = "RANGE_B";
@@ -573,24 +573,75 @@ async fn run_aggregate_alignment_suite(
     let server_addr = format!("127.0.0.1:{port}");
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     let idx_client = server.indexed_data_client();
+    let trace_aggregate = log::log_enabled!(log::Level::Debug);
 
     for (dataset_index, dataset) in datasets.into_iter().enumerate() {
         let schema_id = 50_000 + port as u32 * 10 + dataset_index as u32;
+        if trace_aggregate {
+            debug!(
+                "ALIGN_AGGREGATE_DATASET_START dataset={} schema={} row_count={}",
+                dataset.name,
+                schema_id,
+                dataset.rows.len()
+            );
+        }
         let schema = alignment_schema(
             schema_id,
             &format!("{}_aggregate_{}", dataset.name, schema_mode.suffix()),
             schema_mode.is_scannable(),
         );
         client.new_schema_with_id(schema).await.unwrap().unwrap();
+        if trace_aggregate {
+            debug!(
+                "ALIGN_AGGREGATE_SCHEMA_READY dataset={} schema={}",
+                dataset.name,
+                schema_id
+            );
+        }
         materialize_neb_dataset(&client, schema_id, &dataset.rows).await;
+        if trace_aggregate {
+            debug!(
+                "ALIGN_AGGREGATE_NEB_READY dataset={} schema={}",
+                dataset.name,
+                schema_id
+            );
+        }
         let sqlite = materialize_sqlite_dataset(&dataset.rows);
+        if trace_aggregate {
+            debug!(
+                "ALIGN_AGGREGATE_SQLITE_READY dataset={} schema={}",
+                dataset.name,
+                schema_id
+            );
+        }
         let queries = if generated {
             generated_aggregate_queries(&dataset)
         } else {
             fixed_aggregate_queries(&dataset)
         };
-        for query in queries {
+        for (query_index, query) in queries.into_iter().enumerate() {
+            if trace_aggregate {
+                debug!(
+                    "ALIGN_AGGREGATE_START dataset={} schema={} query_index={} generated={} group_by={:?} aggregates={:?} limit={:?} offset={:?}",
+                    dataset.name,
+                    schema_id,
+                    query_index,
+                    generated,
+                    query.group_by_fields,
+                    query.aggregates,
+                    query.limit,
+                    query.offset
+                );
+            }
             assert_aggregate_alignment(&idx_client, &sqlite, schema_id, &dataset, &query).await;
+            if trace_aggregate {
+                debug!(
+                    "ALIGN_AGGREGATE_DONE dataset={} schema={} query_index={}",
+                    dataset.name,
+                    schema_id,
+                    query_index
+                );
+            }
         }
     }
 }
@@ -900,8 +951,9 @@ async fn assert_aggregate_alignment(
 ) {
     let neb_lisp = query.predicate.render_lisp();
     let selection = parse_to_serde_expr(&neb_lisp).unwrap()[0].clone();
-    let mut neb_cursor = idx_client
-        .aggregate(
+    let mut neb_cursor = tokio::time::timeout(
+        Duration::from_secs(30),
+        idx_client.aggregate(
             schema_id,
             AggregateQuery {
                 selection,
@@ -952,9 +1004,16 @@ async fn assert_aggregate_alignment(
                         }),
                 )
                 .collect(),
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "aggregate query timed out after 30s: dataset={} schema={} neb_lisp={}",
+            dataset.name, schema_id, neb_lisp
         )
-        .await
-        .unwrap();
+    })
+    .unwrap();
 
     let mut neb_rows = Vec::new();
     while let Some(row) = neb_cursor.next().await.unwrap() {

@@ -529,6 +529,7 @@ impl IndexedDataClient {
                 .as_ref()
                 .map(|plan| plan.is_pure_relevance_ranked_scan())
                 .unwrap_or(false);
+        let selection_requires_post_filter = !selection.is_empty();
         let (candidate_ids, requires_selection_filter): (Vec<Id>, bool) = if let Some(plan) = plan {
             if plan.is_impossible() {
                 (vec![], false)
@@ -540,7 +541,10 @@ impl IndexedDataClient {
                 )
             }
         } else {
-            (self.scan_schema_ids(schema, ordering).await?, true)
+            (
+                self.scan_schema_ids(schema, ordering).await?,
+                selection_requires_post_filter,
+            )
         };
 
         let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = explicit_order_by_field {

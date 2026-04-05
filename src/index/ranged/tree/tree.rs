@@ -17,7 +17,6 @@ pub const RANGED_TREE_SCHEMA_NAME: &'static str = "NEB_RANGED_TREE";
 pub const RANGED_TREE_HEAD_NAME: &'static str = "head";
 pub const RANGED_TREE_MIGRATION_NAME: &'static str = "migration";
 pub const INITIAL_TREE_EPOCH: u64 = 0;
-
 lazy_static! {
     pub static ref RANGED_TREE_SCHEMA_ID: u32 = key_hash(RANGED_TREE_SCHEMA_NAME) as u32;
     pub static ref RANGED_TREE_HEAD_HASH: u64 = key_hash(RANGED_TREE_HEAD_NAME);
@@ -43,7 +42,7 @@ impl RangedTree {
     pub async fn create(neb_client: &Arc<AsyncClient>, id: &Id) -> Self {
         // Create a single disk tree (no deletion set needed for direct operations)
         let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
-        let tree = DiskTree::new(&deletion_set);
+        let tree = DiskTree::new_with_client(&deletion_set, neb_client);
         tree.persist_root(neb_client).await;
 
         let tree_cell = ranged_tree_cell(&tree.head_id(), id, None);
@@ -68,21 +67,21 @@ impl RangedTree {
 
     /// Recover a ranged tree from persistent storage
     pub async fn recover(neb_client: &Arc<AsyncClient>, tree_id: &Id) -> Self {
-        info!("[TREE RECOVERY] Starting recovery for tree {:?}", tree_id);
+        info!("[TREE LOAD] Starting load for tree {:?}", tree_id);
 
         let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
 
         let cell = match neb_client.read_cell(*tree_id).await {
             Ok(Ok(cell)) => {
                 info!(
-                    "[TREE RECOVERY] Successfully read tree root cell {:?}",
+                    "[TREE LOAD] Successfully read tree root cell {:?}",
                     tree_id
                 );
                 cell
             }
             Ok(Err(e)) => {
                 error!(
-                    "[TREE RECOVERY] Failed to read tree root cell {:?}: {:?} - creating fresh tree",
+                    "[TREE LOAD] Failed to read tree root cell {:?}: {:?} - creating fresh tree",
                     tree_id, e
                 );
                 // Cell doesn't exist in NEB (WAL/backup loss after SM recorded this tree).
@@ -92,15 +91,15 @@ impl RangedTree {
                 let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
                 match neb_client.write_cell(tree_cell).await {
                     Ok(Ok(_)) => info!(
-                        "[TREE RECOVERY] Created replacement tree root cell for {:?}",
+                        "[TREE LOAD] Created replacement tree root cell for {:?}",
                         tree_id
                     ),
                     Ok(Err(e2)) => error!(
-                        "[TREE RECOVERY] Failed to create replacement cell for {:?}: {:?}",
+                        "[TREE LOAD] Failed to create replacement cell for {:?}: {:?}",
                         tree_id, e2
                     ),
                     Err(e2) => error!(
-                        "[TREE RECOVERY] RPC error creating replacement cell for {:?}: {:?}",
+                        "[TREE LOAD] RPC error creating replacement cell for {:?}: {:?}",
                         tree_id, e2
                     ),
                 }
@@ -108,7 +107,7 @@ impl RangedTree {
             }
             Err(e) => {
                 error!(
-                    "[TREE RECOVERY] RPC error reading tree root cell {:?}: {:?}",
+                    "[TREE LOAD] RPC error reading tree root cell {:?}: {:?}",
                     tree_id, e
                 );
                 panic!("RPC error reading tree root cell");
@@ -119,7 +118,7 @@ impl RangedTree {
             Some(id) => *id,
             None => {
                 error!(
-                    "[TREE RECOVERY] Tree root cell {:?} exists but head pointer is missing \
+                    "[TREE LOAD] Tree root cell {:?} exists but head pointer is missing \
                      (corrupt cell). Creating a fresh empty tree.",
                     tree_id
                 );
@@ -129,28 +128,31 @@ impl RangedTree {
                 // Cell already exists (we read it above), so use update_cell not write_cell
                 match neb_client.update_cell(tree_cell).await {
                     Ok(Ok(_)) => info!(
-                        "[TREE RECOVERY] Repaired corrupt tree root cell {:?}",
+                        "[TREE LOAD] Repaired corrupt tree root cell {:?}",
                         tree_id
                     ),
                     Ok(Err(e)) => error!(
-                        "[TREE RECOVERY] Failed to repair corrupt cell {:?}: {:?}",
+                        "[TREE LOAD] Failed to repair corrupt cell {:?}: {:?}",
                         tree_id, e
                     ),
                     Err(e) => error!(
-                        "[TREE RECOVERY] RPC error repairing corrupt cell {:?}: {:?}",
+                        "[TREE LOAD] RPC error repairing corrupt cell {:?}: {:?}",
                         tree_id, e
                     ),
                 }
                 return Self { tree };
             }
         };
-        info!("[TREE RECOVERY] Recovering B-tree from head {:?}", head_id);
+        info!("[TREE LOAD] Loading B-tree from head {:?}", head_id);
 
         let tree = match DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0).await {
-            Ok(tree) => tree,
+            Ok(mut tree) => {
+                tree.set_writeback_client(neb_client);
+                tree
+            }
             Err(e) => {
                 error!(
-                    "[TREE RECOVERY] Failed to reconstruct B-tree for {:?} from head {:?}: {:?}. Creating a fresh empty tree.",
+                    "[TREE LOAD] Failed to reconstruct B-tree for {:?} from head {:?}: {:?}. Creating a fresh empty tree.",
                     tree_id, head_id, e
                 );
                 let tree = DiskTree::new(&deletion_set);
@@ -158,15 +160,15 @@ impl RangedTree {
                 let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
                 match neb_client.update_cell(tree_cell).await {
                     Ok(Ok(_)) => info!(
-                        "[TREE RECOVERY] Replaced corrupt tree metadata for {:?}",
+                        "[TREE LOAD] Replaced corrupt tree metadata for {:?}",
                         tree_id
                     ),
                     Ok(Err(e2)) => error!(
-                        "[TREE RECOVERY] Failed to replace corrupt metadata for {:?}: {:?}",
+                        "[TREE LOAD] Failed to replace corrupt metadata for {:?}: {:?}",
                         tree_id, e2
                     ),
                     Err(e2) => error!(
-                        "[TREE RECOVERY] RPC error replacing corrupt metadata for {:?}: {:?}",
+                        "[TREE LOAD] RPC error replacing corrupt metadata for {:?}: {:?}",
                         tree_id, e2
                     ),
                 }
@@ -174,7 +176,7 @@ impl RangedTree {
             }
         };
         info!(
-            "[TREE RECOVERY] B-tree recovered with {} keys",
+            "[TREE LOAD] B-tree loaded with {} keys",
             tree.count()
         );
 
@@ -218,6 +220,10 @@ impl RangedTree {
     /// Check if tree is oversized and needs splitting
     pub fn oversized(&self) -> bool {
         self.tree.count() > self.ideal_capacity()
+    }
+
+    pub fn should_split(&self) -> bool {
+        self.oversized()
     }
 
     /// Get pivot key for tree splitting
@@ -362,6 +368,17 @@ mod tests {
         EntryKey::from_props(&Id::new(1, n), &feature, 100, 1)
     }
 
+    fn make_scan_key(schema_id: u32, id: Id) -> EntryKey {
+        EntryKey::for_scannable(&id, schema_id)
+    }
+
+    fn make_field_key(schema_id: u32, field: u64, n: u64, id: Id) -> EntryKey {
+        let mut feature: Feature = [0u8; FEATURE_SIZE];
+        let mut c = std::io::Cursor::new(&mut feature[..]);
+        c.write_u64::<BigEndian>(n).unwrap();
+        EntryKey::from_props(&id, &feature, field, schema_id)
+    }
+
     // ---- pivot_key correctness tests ----------------------------------------
 
     #[test]
@@ -491,6 +508,109 @@ mod tests {
         let expected: Vec<_> = (0..128u64).map(make_key).collect();
         assert_eq!(retained, expected);
         assert_eq!(tree.count(), 128);
+    }
+
+    #[test]
+    fn seek_iteration_preserves_all_sequential_keys() {
+        let tree = make_tree();
+        let n = 1_024u64;
+        for i in 0..n {
+            tree.insert(&make_key(i));
+        }
+
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut seen = Vec::new();
+
+        if let Some(key) = cursor.current() {
+            seen.push(key.clone());
+        }
+        while let Some(key) = cursor.next() {
+            if seen.last() != Some(&key) {
+                seen.push(key);
+            }
+        }
+
+        let expected: Vec<_> = (0..n).map(make_key).collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn scan_prefix_iteration_preserves_all_scannable_keys_with_mixed_entries() {
+        let tree = make_tree();
+        let schema_id = 123u32;
+        let field_id = 100u64;
+        let n = 1_024u64;
+
+        for i in 0..n {
+            let id = Id::new(1, i);
+            assert!(tree.insert(&make_scan_key(schema_id, id)));
+            assert!(tree.insert(&make_field_key(schema_id, field_id, i, id)));
+        }
+
+        let prefix = EntryKey::for_schema(schema_id).as_slice()[..16].to_vec();
+        let mut cursor = tree.seek(&EntryKey::for_schema(schema_id), Ordering::Forward);
+        let mut seen = Vec::new();
+
+        if let Some(key) = cursor.current() {
+            if key.as_slice()[..16] == prefix {
+                seen.push(key.id());
+            }
+        }
+        while let Some(key) = cursor.next() {
+            if key.as_slice()[..16] != prefix {
+                break;
+            }
+            if seen.last() != Some(&key.id()) {
+                seen.push(key.id());
+            }
+        }
+
+        let expected: Vec<_> = (0..n).map(|i| Id::new(1, i)).collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn scan_prefix_iteration_preserves_all_scannable_keys_across_two_schemas() {
+        let tree = make_tree();
+        let schema_1 = 123u32;
+        let schema_2 = 234u32;
+        let field_id = 100u64;
+        let n = 1_024u64;
+
+        for i in 0..n {
+            let id = Id::new(1, i);
+            assert!(tree.insert(&make_scan_key(schema_1, id)));
+            assert!(tree.insert(&make_field_key(schema_1, field_id, i, id)));
+        }
+
+        for i in 0..n {
+            let id = Id::new(2, i);
+            assert!(tree.insert(&make_scan_key(schema_2, id)));
+            assert!(tree.insert(&make_field_key(schema_2, field_id, i, id)));
+        }
+
+        for (schema_id, higher) in [(schema_1, 1u64), (schema_2, 2u64)] {
+            let prefix = EntryKey::for_schema(schema_id).as_slice()[..16].to_vec();
+            let mut cursor = tree.seek(&EntryKey::for_schema(schema_id), Ordering::Forward);
+            let mut seen = Vec::new();
+
+            if let Some(key) = cursor.current() {
+                if key.as_slice()[..16] == prefix {
+                    seen.push(key.id());
+                }
+            }
+            while let Some(key) = cursor.next() {
+                if key.as_slice()[..16] != prefix {
+                    break;
+                }
+                if seen.last() != Some(&key.id()) {
+                    seen.push(key.id());
+                }
+            }
+
+            let expected: Vec<_> = (0..n).map(|i| Id::new(higher, i)).collect();
+            assert_eq!(seen, expected, "schema {}", schema_id);
+        }
     }
 
     // ---- oversized detection ------------------------------------------------

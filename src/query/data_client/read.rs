@@ -62,11 +62,8 @@ impl IndexedDataClient {
             return Ok(vec![]);
         };
         let mut ids = vec![];
-        loop {
-            ids.extend_from_slice(index_cursor.current_block());
-            if !index_cursor.next_block().await? {
-                break;
-            }
+        while let Some(id) = index_cursor.next().await? {
+            ids.push(id);
         }
         Ok(ids)
     }
@@ -139,7 +136,13 @@ impl IndexedDataClient {
         proc: &Expr,
     ) -> Vec<OwnedCell> {
         let normalized_selection = normalize_selection_for_eval(selection);
+        let expect_full_batch = normalized_selection.is_empty() && proc.is_empty();
         let mut all_cells = vec![];
+        let mut ordered_cells = if expect_full_batch {
+            Some(vec![None; ids.len()])
+        } else {
+            None
+        };
         let mut tasks = ids
             .iter()
             .enumerate()
@@ -174,6 +177,13 @@ impl IndexedDataClient {
                                 .read_all_cells_proced(&grouped_ids, &projection, &selection, &proc)
                                 .await
                                 .map(|cells| {
+                                    if cells.len() != idx.len() {
+                                        warn!(
+                                            "Batch cell read count mismatch: requested {}, got {}",
+                                            idx.len(),
+                                            cells.len()
+                                        );
+                                    }
                                     cells
                                         .into_iter()
                                         .zip(idx)
@@ -202,11 +212,68 @@ impl IndexedDataClient {
 
         while let Some(task_res) = tasks.next().await {
             match task_res {
-                Ok(mut cells) => all_cells.append(&mut cells),
+                Ok(mut cells) => {
+                    if let Some(ordered_cells) = ordered_cells.as_mut() {
+                        for (cell, original_idx) in cells.drain(..) {
+                            ordered_cells[original_idx] = Some(cell);
+                        }
+                    } else {
+                        all_cells.append(&mut cells);
+                    }
+                }
                 Err(e) => {
                     warn!("Task error in read_cells_from_ids: {:?}", e);
                 }
             }
+        }
+
+        if let Some(mut ordered_cells) = ordered_cells {
+            for (idx, slot) in ordered_cells.iter_mut().enumerate() {
+                if slot.is_some() {
+                    continue;
+                }
+                let Some(sid) = self.conshash.get_server_id_by(&ids[idx]) else {
+                    warn!("Missing server mapping for id {:?}", ids[idx]);
+                    continue;
+                };
+                let server_name = self.conshash.to_server_name(sid);
+                match client_by_server_name_for_database(
+                    sid,
+                    server_name,
+                    &self.group_name,
+                    &self.database_name,
+                )
+                .await
+                {
+                    Ok(client) => {
+                        let single_id = vec![ids[idx]];
+                        match client
+                            .read_all_cells_proced(&single_id, projection, selection, proc)
+                            .await
+                        {
+                            Ok(mut cells) => match cells.pop() {
+                                Some(Ok(cell)) => {
+                                    *slot = Some(cell);
+                                }
+                                Some(Err(e)) => {
+                                    warn!("Retry cell read error at index {}: {:?}", idx, e);
+                                }
+                                None => {
+                                    warn!("Retry cell read returned no cell at index {}", idx);
+                                }
+                            },
+                            Err(e) => {
+                                warn!("Retry task error in read_cells_from_ids: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Retry client creation error in read_cells_from_ids: {:?}", e);
+                    }
+                }
+            }
+
+            return ordered_cells.into_iter().flatten().collect_vec();
         }
 
         all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));

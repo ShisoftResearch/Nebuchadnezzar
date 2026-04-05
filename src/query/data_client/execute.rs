@@ -51,7 +51,7 @@ impl IndexedDataClient {
                 }
             }
             IndexedClausePlan::Ranged { field_id, range } => {
-                self.range_query_ids(schema, *field_id, range, range_index_order_for_range(range))
+                self.range_query_ids(schema, *field_id, range, Ordering::Forward)
                     .await
             }
             IndexedClausePlan::VectorSimilarity {
@@ -319,11 +319,8 @@ impl IndexedDataClient {
         else {
             return Ok(ids);
         };
-        loop {
-            ids.extend_from_slice(cursor.current_block());
-            if !cursor.next_block().await? {
-                break;
-            }
+        while let Some(id) = cursor.next().await? {
+            ids.push(id);
         }
         Ok(ids)
     }

@@ -1254,4 +1254,360 @@ mod test {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         let _ = std::fs::remove_dir_all(&test_dir);
     }
+
+    #[tokio::test]
+    async fn test_split_target_tree_is_visible_before_routing() {
+        use crate::client;
+        use crate::index::ranged::trees::Cursor;
+        use crate::index::ranged::tree::btree::{page_schema, storage, Ordering};
+        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
+        use crate::server::{NebServer, ServerOptions, Service};
+        use std::sync::Arc;
+
+        let _ = env_logger::try_init();
+
+        let server_addr = String::from("127.0.0.1:6727");
+        let server_group = "split_target_publish_test";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await;
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+
+        storage::start_external_nodes_write_back(&client);
+
+        let source_tree_id = Id::new(777, 777);
+        let target_tree_id = Id::new(778, 778);
+        let schema_id = 1;
+        let field = 400;
+        let source_tree = RangedTree::create(&client, &source_tree_id).await;
+        let target_tree = RangedTree::create(&client, &target_tree_id).await;
+
+        for i in 10..=100 {
+            let key = create_entry_key(schema_id, field, i, Id::new(4, i));
+            source_tree.insert(&key);
+        }
+
+        let pivot = create_entry_key(schema_id, field, 60, Id::new(0, 0));
+        let mut cursor = source_tree.seek(&pivot, Ordering::Forward);
+        let mut moved_keys = Vec::new();
+        while let Some(entry) = cursor.next() {
+            moved_keys.push(entry);
+        }
+        assert!(
+            !moved_keys.is_empty(),
+            "expected to move some keys into the split target"
+        );
+
+        target_tree.merge_keys(moved_keys.clone());
+        storage::wait_until_updated().await;
+        target_tree
+            .mark_migration(&target_tree_id, None, &client)
+            .await
+            .expect("target tree head should be published before routing");
+
+        let recovered_target = RangedTree::recover(&client, &target_tree_id).await;
+        assert_eq!(
+            recovered_target.count(),
+            moved_keys.len(),
+            "recovered split target should expose the moved keys once metadata is published"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[ignore = "stress test"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_writes_during_split_remain_scannable() {
+        use crate::client;
+        use crate::index::ranged::client::RangedIndexerClient;
+        use crate::index::ranged::tree::btree::{self, storage, Ordering};
+        use crate::index::ranged::trees::{Cursor, Range};
+        use crate::index::EntryKey;
+        use crate::ram::schema::{Field, Schema};
+        use crate::ram::types::Type;
+        use crate::server::{NebServer, ServerOptions, Service};
+        use futures::stream::FuturesUnordered;
+        use futures::StreamExt;
+        use itertools::Itertools;
+        use rand::seq::SliceRandom;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let _ = env_logger::try_init();
+
+        let server_addr = String::from("127.0.0.1:6728");
+        let server_group = "split_concurrent_write_stress";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 128 * 1024 * 1024,
+                db_size: 128 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell, Service::RangedIndexer],
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await;
+
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr.clone()],
+                server_group,
+            )
+                .await
+                .unwrap(),
+        );
+        client
+            .new_schema_with_id(Schema::new_with_id(
+                11,
+                &String::from("split_stress"),
+                None,
+                Field::new_schema(vec![Field::new_unindexed("data", Type::U8)]),
+                false,
+                false,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let ranged_client = Arc::new(RangedIndexerClient::new(
+            &server.consh,
+            &server.raft_client,
+        ));
+        let expected_total = btree::ideal_capacity_from_node_size(btree::level::BTREE_NODE_SIZE) * 4;
+        let mut shuffled = (0..expected_total).collect_vec();
+        shuffled.as_mut_slice().shuffle(&mut rand::thread_rng());
+
+        let mut writers = FuturesUnordered::new();
+        for value in shuffled {
+            let ranged_client = ranged_client.clone();
+            writers.push(tokio::time::timeout(Duration::from_secs(240), async move {
+                let id = Id::new(1, value as u64);
+                let key = EntryKey::from_id(&id);
+                ranged_client.insert(&key).await
+            }));
+        }
+        while let Some(result) = writers.next().await {
+            assert!(result.unwrap().unwrap(), "insertion returned false");
+        }
+
+        assert!(
+            !ranged_client.tree_stats().await.unwrap().is_empty(),
+            "expected ranged tree stats after concurrent write stress"
+        );
+
+        storage::wait_until_updated().await;
+
+        let start_id = Id::new(1, 0);
+        let mut cursor = RangedIndexerClient::seek(
+            &ranged_client,
+            Range::new_inclusive_opened(EntryKey::from_id(&start_id), Ordering::Forward),
+            256,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(cursor.current(), Some(&start_id));
+
+        for value in 0..expected_total {
+            let expected_id = Id::new(1, value as u64);
+            let current = cursor.current().expect("scan should cover every inserted key");
+            assert_eq!(
+                current, &expected_id,
+                "ordered scan should stay complete after split for position {}",
+                value
+            );
+            let _ = cursor.next().await.unwrap();
+        }
+        assert!(
+            cursor.next().await.unwrap().is_none(),
+            "expected ordered scan to end immediately after the final inserted key"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[ignore = "stress test"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_cell_query_concurrent_writes_eventually_scan_all() {
+        use crate::index::builder::IndexBuilder;
+        use crate::query::data_client::QueryOrdering;
+        use crate::ram::cell::OwnedCell;
+        use crate::ram::schema::{Field, IndexType, Schema};
+        use crate::ram::types::Type;
+        use crate::server::{NebServer, ServerOptions, Service};
+        use dovahkiin::{
+            expr::serde::Expr,
+            types::{Map, OwnedMap, OwnedValue},
+        };
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        use tokio::task::JoinSet;
+
+        const SCORE_FIELD: &'static str = "score";
+        const PAYLOAD_FIELD: &'static str = "payload";
+
+        let _ = env_logger::try_init();
+
+        let server_addr = String::from("127.0.0.1:6729");
+        let server_group = "split_cell_query_stress";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 128 * 1024 * 1024,
+                db_size: 128 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![Service::Cell, Service::Query, Service::RangedIndexer],
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await;
+
+        let schema = Schema::new_with_id(
+            302,
+            "split_cell_query_stress",
+            None,
+            Field::new_schema(vec![
+                Field::new_indexed(SCORE_FIELD, Type::U64, vec![IndexType::Ranged]),
+                Field::new_unindexed(PAYLOAD_FIELD, Type::U32),
+            ]),
+            false,
+            true,
+        );
+
+        let client = Arc::new(
+            server
+                .data_client(&vec![server_addr.clone()])
+                .await
+                .unwrap(),
+        );
+        client
+            .new_schema_with_id(schema)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let workers = 16usize;
+        let writes_per_worker = 2048usize;
+        let expected_total = workers * writes_per_worker;
+        let mut writers = JoinSet::new();
+        for worker in 0..workers {
+            let client = client.clone();
+            writers.spawn(async move {
+                let worker_base = worker * writes_per_worker;
+                for offset in 0..writes_per_worker {
+                    let ordinal = worker_base + offset;
+                    let mut value = OwnedValue::Map(OwnedMap::new());
+                    value[SCORE_FIELD] = OwnedValue::U64(ordinal as u64);
+                    value[PAYLOAD_FIELD] = OwnedValue::U32(worker as u32);
+                    let cell = OwnedCell::new_with_id(302, &Id::new(1, ordinal as u64), value);
+                    client.upsert_cell(cell).await.unwrap().unwrap();
+                    if offset % 128 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            });
+        }
+        while let Some(result) = writers.join_next().await {
+            result.unwrap();
+        }
+
+        let _ = IndexBuilder::await_all_indices().await;
+
+        let ranged_client = server
+            .database_runtime
+            .indexer()
+            .expect("indexer should be enabled")
+            .clients
+            .ranged_client
+            .clone();
+        assert!(
+            !ranged_client.tree_stats().await.unwrap().is_empty(),
+            "expected ranged tree stats after cell/query stress"
+        );
+
+        let idx_client = server.indexed_data_client();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let mut cursor = idx_client
+                .scan_all(
+                    302,
+                    vec![],
+                    Expr::nothing(),
+                    Expr::nothing(),
+                    QueryOrdering::Asc,
+                )
+                .await
+                .unwrap();
+            let mut seen_ids = HashSet::with_capacity(expected_total);
+            while let Ok(Some(cell)) = cursor.next().await {
+                seen_ids.insert(cell.id());
+            }
+            if seen_ids.len() == expected_total {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "scan_all did not converge after concurrent indexed writes: expected {}, observed {}",
+                expected_total,
+                seen_ids.len()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        server.shutdown().await;
+    }
 }

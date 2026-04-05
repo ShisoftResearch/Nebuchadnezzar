@@ -1,7 +1,8 @@
 use super::external;
 use crate::client;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 lazy_static! {
@@ -12,9 +13,40 @@ lazy_static! {
     static ref WB_STARTED: AtomicBool = AtomicBool::new(false);
     // Flag to signal the write-back task to stop
     static ref WB_SHOULD_STOP: AtomicBool = AtomicBool::new(false);
+    // Track completed operations that finished ahead of earlier queue ids.
+    static ref OUT_OF_ORDER_COMPLETIONS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
 }
 
-pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
+fn write_back_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4)
+}
+
+fn record_completed_change(id: usize) {
+    let mut completions = OUT_OF_ORDER_COMPLETIONS
+        .lock()
+        .expect("write-back completion lock poisoned");
+    let current = CHANGE_PROGRESS.load(Ordering::Acquire);
+    let expected = if current == usize::MAX { 0 } else { current + 1 };
+
+    if id == expected {
+        let mut new_progress = id;
+        loop {
+            let next_expected = new_progress + 1;
+            if completions.remove(&next_expected) {
+                new_progress = next_expected;
+            } else {
+                break;
+            }
+        }
+        CHANGE_PROGRESS.store(new_progress, Ordering::Release);
+    } else if id > expected {
+        completions.insert(id);
+    }
+}
+
+pub fn start_external_nodes_write_back(_client: &Arc<client::AsyncClient>) {
     // Check if already started using atomic compare-exchange
     if WB_STARTED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
@@ -27,42 +59,38 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
     // Reset the stop flag
     WB_SHOULD_STOP.store(false, Ordering::SeqCst);
 
-    let client = client.clone();
-    tokio::spawn(async move {
-        debug!("B-tree write-back task started");
-        loop {
-            // Check if we should stop
-            if WB_SHOULD_STOP.load(Ordering::SeqCst) {
-                debug!("B-tree write-back task stopping");
-                break;
-            }
-
-            while let Some((id, changing)) = external::CHANGED_NODES.pop() {
-                match changing {
-                    external::ChangingNode::Modified(modified) => {
-                        modified.node.persist(&modified.deletion, &client).await;
-                    }
-                    external::ChangingNode::Deleted(id) => {
-                        let _ = client.remove_cell(id).await.unwrap();
-                    }
-                }
-                CHANGE_PROGRESS.store(id, Ordering::Release);
-
-                // Check if we should stop between operations
+    for worker_id in 0..write_back_worker_count() {
+        tokio::spawn(async move {
+            debug!("B-tree write-back worker {} started", worker_id);
+            loop {
                 if WB_SHOULD_STOP.load(Ordering::SeqCst) {
-                    debug!("B-tree write-back task stopping (mid-operation)");
+                    debug!("B-tree write-back worker {} stopping", worker_id);
                     break;
                 }
-            }
 
-            if WB_SHOULD_STOP.load(Ordering::SeqCst) {
-                break;
+                match external::CHANGED_NODES.pop() {
+                    Some((id, changing)) => {
+                        match changing {
+                            external::ChangingNode::Modified(modified) => {
+                                modified
+                                    .node
+                                    .persist(&modified.deletion, &modified.client)
+                                    .await;
+                            }
+                            external::ChangingNode::DeletedWithClient(id, client) => {
+                                let _ = client.remove_cell(id).await.unwrap();
+                            }
+                        }
+                        record_completed_change(id);
+                    }
+                    None => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                }
             }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        debug!("B-tree write-back task stopped");
-    });
+            debug!("B-tree write-back worker {} stopped", worker_id);
+        });
+    }
 }
 
 /// Reset write-back state for server restart
@@ -71,15 +99,18 @@ pub async fn reset_write_back_state() {
     // Signal the task to stop
     WB_SHOULD_STOP.store(true, Ordering::SeqCst);
 
-    // Wait briefly to allow the old task to see the stop signal and exit
-    // The task checks every 500ms, so wait a bit longer
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Wait briefly to allow workers to see the stop signal and exit.
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Reset the started flag so a new task can be started on restart
     WB_STARTED.store(false, Ordering::SeqCst);
 
     // Reset progress to initial state
     CHANGE_PROGRESS.store(usize::MAX, Ordering::SeqCst);
+    OUT_OF_ORDER_COMPLETIONS
+        .lock()
+        .expect("write-back completion lock poisoned")
+        .clear();
 
     // Reset the counter
     external::CHANGE_COUNTER.store(0, Ordering::SeqCst);
