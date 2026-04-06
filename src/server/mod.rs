@@ -41,23 +41,24 @@ pub use status::{ChunkMemoryStatus, ServerMemoryStatus};
 
 pub static CONS_HASH_ID: u64 = hash_ident!(NEB_CONSHASH_MEM_WEIGHTS) as u64;
 
+fn has_recoverable_raft_state_at(raft_path: &Path) -> bool {
+    let log_file = raft_path.join("log.dat");
+    let snapshot_file = raft_path.join("snapshot.dat");
+
+    let has_logs = log_file.exists() && log_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let has_snapshot = snapshot_file.exists()
+        && snapshot_file
+            .metadata()
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
+
+    has_logs || has_snapshot
+}
+
 /// Check if Raft state exists on disk at the given path
 fn has_existing_raft_state(raft_storage: &Option<String>) -> bool {
     if let Some(ref path) = raft_storage {
-        let raft_path = Path::new(path);
-        let log_file = raft_path.join("log.dat");
-        let snapshot_file = raft_path.join("snapshot.dat");
-
-        // Consider state exists if either log or snapshot file exists and is non-empty
-        let has_logs =
-            log_file.exists() && log_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
-        let has_snapshot = snapshot_file.exists()
-            && snapshot_file
-                .metadata()
-                .map(|m| m.len() > 0)
-                .unwrap_or(false);
-
-        has_logs || has_snapshot
+        has_recoverable_raft_state_at(Path::new(path))
     } else {
         false
     }
@@ -78,6 +79,9 @@ fn discover_known_databases_from_raft_storage(
                     continue;
                 };
                 if !file_type.is_dir() {
+                    continue;
+                }
+                if !has_recoverable_raft_state_at(&entry.path()) {
                     continue;
                 }
                 if let Some(name) = entry.file_name().to_str() {
@@ -128,19 +132,23 @@ mod startup_discovery_tests {
     use super::discover_known_databases_from_raft_storage;
 
     #[test]
-    fn discovers_default_and_scoped_databases_from_raft_root() {
+    fn discovers_only_databases_with_recoverable_raft_state() {
         let temp = tempfile::TempDir::new().expect("tempdir should be created");
         let raft_root = temp.path();
         std::fs::create_dir_all(raft_root.join("databases/default"))
             .expect("default db dir should be created");
         std::fs::create_dir_all(raft_root.join("databases/wikidata"))
             .expect("wikidata db dir should be created");
+        std::fs::create_dir_all(raft_root.join("databases/analytics"))
+            .expect("analytics db dir should be created");
+        std::fs::write(raft_root.join("databases/analytics/log.dat"), b"raft log")
+            .expect("analytics log should be created");
 
         let discovered = discover_known_databases_from_raft_storage(raft_root.to_str(), "default");
 
         assert_eq!(
             discovered,
-            vec!["default".to_string(), "wikidata".to_string()]
+            vec!["analytics".to_string(), "default".to_string()]
         );
     }
 
