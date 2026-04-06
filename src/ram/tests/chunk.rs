@@ -1,4 +1,8 @@
 use super::{complex_fields, default_fields, dyn_map_field, simple_fields};
+use crate::index::ranged::tree::tree::{
+    RANGED_TREE_HEAD_HASH, RANGED_TREE_MIGRATION_HASH, RANGED_TREE_SCHEMA,
+    RANGED_TREE_SCHEMA_ID,
+};
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
 use crate::ram::schema::*;
@@ -179,6 +183,53 @@ pub fn simple_cell_rw() {
         let stored_cell = chunks.read_cell(&id1).unwrap();
         assert_eq!(stored_cell.data.u64(), Some(&128));
     }
+}
+
+#[test]
+pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
+    let _ = env_logger::try_init();
+    let tree_id = Id::new(11, 7);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(RANGED_TREE_SCHEMA.clone());
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let mut first_map = OwnedMap::new();
+    first_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::new(100, 1)));
+    first_map.insert_key_id(*RANGED_TREE_MIGRATION_HASH, OwnedValue::Null);
+    let mut tree_cell = OwnedCell::new_with_id(
+        *RANGED_TREE_SCHEMA_ID,
+        &tree_id,
+        OwnedValue::Map(first_map),
+    );
+    chunks.write_cell(&mut tree_cell).unwrap();
+    assert_eq!(
+        chunks.list[0].statistics.changes.load(Ordering::Relaxed),
+        0,
+        "internal ranged-tree metadata writes should not arm chunk statistics refresh"
+    );
+
+    let mut update_map = OwnedMap::new();
+    update_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::new(100, 2)));
+    update_map.insert_key_id(*RANGED_TREE_MIGRATION_HASH, OwnedValue::Null);
+    let mut updated_tree_cell = OwnedCell::new_with_id(
+        *RANGED_TREE_SCHEMA_ID,
+        &tree_id,
+        OwnedValue::Map(update_map),
+    );
+    chunks.update_cell(&mut updated_tree_cell).unwrap();
+    assert_eq!(
+        chunks.list[0].statistics.changes.load(Ordering::Relaxed),
+        0,
+        "internal ranged-tree metadata updates should not accumulate stats refresh changes"
+    );
 }
 
 #[test]

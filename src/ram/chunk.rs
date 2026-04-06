@@ -1,3 +1,4 @@
+use crate::index::ranged::tree::tree::RANGED_TREE_SCHEMA_ID;
 use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
 use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
@@ -167,6 +168,18 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    #[inline]
+    fn schema_tracks_statistics(schema_id: u32) -> bool {
+        schema_id != *RANGED_TREE_SCHEMA_ID
+    }
+
+    #[inline]
+    fn refresh_statistics_for_schema(&self, schema_id: u32) {
+        if Self::schema_tracks_statistics(schema_id) {
+            self.refresh_statistics();
+        }
+    }
+
     /// Debug-only validation for cell locations
     /// Checks alignment and basic sanity of addresses stored in cell index
     #[cfg(debug_assertions)]
@@ -642,7 +655,7 @@ impl Chunk {
                 *guard = cell_loc;
                 drop(guard);
                 self.ensure_indices(cell, None, &*write_plan.schema);
-                self.refresh_statistics();
+                self.refresh_statistics_for_schema(write_plan.schema.id);
             }
             None => return Err(WriteError::CellAlreadyExisted),
         }
@@ -676,7 +689,7 @@ impl Chunk {
             drop(cell_guard);
             self.ensure_indices_with_res(cell, old_indices, schema);
             self.mark_dead_entry_with_cell(cell_location, cell);
-            self.refresh_statistics();
+            self.refresh_statistics_for_schema(schema.id);
             drop(write_plan);
             cell.header.version = write_result.new_version;
             cell.header.timestamp = write_result.new_timestamp;
@@ -725,7 +738,7 @@ impl Chunk {
                 drop(cell_guard);
                 self.ensure_indices_with_res(cell, old_indices, &*write_plan.schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
-                self.refresh_statistics();
+                self.refresh_statistics_for_schema(write_plan.schema.id);
                 drop(write_plan);
                 cell.header.version = write_result.new_version;
                 cell.header.timestamp = write_result.new_timestamp;
@@ -751,7 +764,7 @@ impl Chunk {
                     *guard = new_cell_loc;
                     drop(guard);
                     self.ensure_indices(cell, None, &*write_plan.schema);
-                    self.refresh_statistics();
+                    self.refresh_statistics_for_schema(write_plan.schema.id);
                     drop(write_plan);
                     cell.header.version = write_result.new_version;
                     cell.header.timestamp = write_result.new_timestamp;
@@ -814,7 +827,7 @@ impl Chunk {
                             self.mark_dead_entry_with_size(old_loc, size, &seg);
                         }
 
-                        self.refresh_statistics();
+                        self.refresh_statistics_for_schema(write_plan.schema.id);
                         drop(write_plan);
                         new_cell.header.version = write_result.new_version;
                         new_cell.header.timestamp = write_result.new_timestamp;
@@ -1822,7 +1835,7 @@ impl<'a> CellGuard<'a> {
         self.chunk
             .ensure_indices_with_res(cell, old_indices, schema);
         self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
-        self.chunk.refresh_statistics();
+        self.chunk.refresh_statistics_for_schema(schema.id);
         drop(write_plan);
         cell.header.version = write_result.new_version;
         cell.header.timestamp = write_result.new_timestamp;
@@ -1847,6 +1860,7 @@ impl<'a> CellGuard<'a> {
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
+        let schema_id = schema.id;
         if old_cell_loc != 0 {
             // Update case - cell already exists
             let old_indices = self.old_index_res(&*schema)?;
@@ -1866,7 +1880,7 @@ impl<'a> CellGuard<'a> {
         cell.header.version = write_result.new_version;
         cell.header.timestamp = write_result.new_timestamp;
 
-        self.chunk.refresh_statistics();
+        self.chunk.refresh_statistics_for_schema(schema_id);
         Ok(cell.header)
     }
 
