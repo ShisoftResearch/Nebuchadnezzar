@@ -24,6 +24,7 @@ use crate::ram::cleaner::Cleaner;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::schema::sm as schema_sm;
 use crate::ram::types::Id;
+use crate::server::storage_lock::StorageDirectoryLocks;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -33,6 +34,7 @@ use std::sync::{Arc, RwLock};
 pub mod cell_rpc;
 pub mod database;
 pub mod status;
+mod storage_lock;
 #[cfg(test)]
 mod tests;
 pub mod transactions;
@@ -434,12 +436,48 @@ pub enum ServerError {
     CannotSetServerWeight,
     CannotInitConsistentHashTable,
     CannotLoadMetaClient,
+    CannotAcquireStorageLock(String),
     CannotInitializeSharedPlane(String),
     CannotInitializeDatabaseCatalog(sm_master::ExecError),
     CannotInitializeSchemaServer(sm_master::ExecError),
     CannotInitializeSchemaPlane(String),
     StandaloneMustAlsoBeMetaServer,
 }
+
+impl std::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerError::CannotJoinCluster => write!(f, "cannot join cluster"),
+            ServerError::CannotJoinClusterGroup(error) => {
+                write!(f, "cannot join cluster group: {error:?}")
+            }
+            ServerError::CannotInitMemberTable => write!(f, "cannot initialize member table"),
+            ServerError::CannotSetServerWeight => write!(f, "cannot set server weight"),
+            ServerError::CannotInitConsistentHashTable => {
+                write!(f, "cannot initialize consistent hash table")
+            }
+            ServerError::CannotLoadMetaClient => write!(f, "cannot load meta client"),
+            ServerError::CannotAcquireStorageLock(error) => write!(f, "{error}"),
+            ServerError::CannotInitializeSharedPlane(error) => {
+                write!(f, "cannot initialize shared plane: {error}")
+            }
+            ServerError::CannotInitializeDatabaseCatalog(error) => {
+                write!(f, "cannot initialize database catalog: {error:?}")
+            }
+            ServerError::CannotInitializeSchemaServer(error) => {
+                write!(f, "cannot initialize schema server: {error:?}")
+            }
+            ServerError::CannotInitializeSchemaPlane(error) => {
+                write!(f, "cannot initialize schema plane: {error}")
+            }
+            ServerError::StandaloneMustAlsoBeMetaServer => {
+                write!(f, "standalone server must also be a meta server")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ServerError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerOptions {
@@ -471,6 +509,7 @@ pub struct ServerMeta {
 pub struct DatabaseRuntime {
     pub group_name: String,
     pub database_name: String,
+    _storage_locks: Arc<StorageDirectoryLocks>,
     pub chunks: Arc<Chunks>,
     pub meta: Arc<ServerMeta>,
     pub cleaner: Arc<Cleaner>,
@@ -489,6 +528,7 @@ impl DatabaseRuntime {
     pub fn new(
         group_name: &str,
         database_name: &str,
+        storage_locks: Arc<StorageDirectoryLocks>,
         chunks: Arc<Chunks>,
         meta: Arc<ServerMeta>,
         cleaner: Arc<Cleaner>,
@@ -504,6 +544,7 @@ impl DatabaseRuntime {
         Self {
             group_name: group_name.to_string(),
             database_name: database_name.to_string(),
+            _storage_locks: storage_locks,
             chunks,
             meta,
             cleaner,
@@ -662,6 +703,7 @@ impl NebServer {
         member_pool: &Arc<rpc::ClientPool>,
         txn_peer: &Peer,
         register_schema_state_machine: bool,
+        pre_acquired_storage_locks: Option<Arc<StorageDirectoryLocks>>,
     ) -> Result<Arc<DatabaseRuntime>, ServerError> {
         let _shared_meta_plane =
             ensure_shared_meta_plane(raft_service, server_addr, meta_members, group_name).await?;
@@ -684,6 +726,13 @@ impl NebServer {
 
         let storage_layout =
             database::DatabaseStorageLayout::from_options(opts, group_name, database_name);
+        let storage_locks = match pre_acquired_storage_locks {
+            Some(locks) => locks,
+            None => Arc::new(
+                StorageDirectoryLocks::acquire(&storage_layout)
+                    .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
+            ),
+        };
         let effective_opts = ServerOptions {
             backup_storage: storage_layout.backup_storage,
             wal_storage: storage_layout.wal_storage,
@@ -801,6 +850,7 @@ impl NebServer {
         let transaction_runtime = Arc::new(DatabaseRuntime::new(
             group_name,
             database_name,
+            storage_locks.clone(),
             chunks.clone(),
             meta_rc.clone(),
             cleaner.clone(),
@@ -833,6 +883,7 @@ impl NebServer {
         let database_runtime = Arc::new(DatabaseRuntime::new(
             group_name,
             database_name,
+            storage_locks,
             chunks.clone(),
             meta_rc.clone(),
             cleaner,
@@ -949,6 +1000,7 @@ impl NebServer {
             &self.member_pool,
             &self.txn_peer,
             needs_schema_registration,
+            None,
         )
         .await?;
 
@@ -1199,6 +1251,7 @@ impl NebServer {
         meta_members: &Vec<String>,
         group_name: &String,
         database_name: &str,
+        startup_storage_locks: Arc<StorageDirectoryLocks>,
         rpc_server: &Arc<rpc::Server>,
         raft_service: &Arc<raft::RaftService>,
         raft_client: &Arc<RaftClient>,
@@ -1248,6 +1301,7 @@ impl NebServer {
             &member_pool,
             &txn_peer,
             false,
+            Some(startup_storage_locks),
         )
         .await?;
 
@@ -1296,7 +1350,7 @@ impl NebServer {
         server_addr: &'a str,
         group_name: &'a str,
         prepare_raft_service: F,
-    ) -> Arc<NebServer> {
+    ) -> Result<Arc<NebServer>, ServerError> {
         Self::new_cluster_from_opts_in_database(
             opts,
             server_addr,
@@ -1314,7 +1368,7 @@ impl NebServer {
         group_name: &'a str,
         database_name: &'a str,
         prepare_raft_service: F,
-    ) -> Arc<NebServer> {
+    ) -> Result<Arc<NebServer>, ServerError> {
         Self::new_cluster_from_opts_in_database(
             opts,
             server_addr,
@@ -1332,7 +1386,7 @@ impl NebServer {
         meta_servers: &Vec<String>,
         group_name: &'a str,
         prepare_raft_service: F,
-    ) -> Arc<NebServer> {
+    ) -> Result<Arc<NebServer>, ServerError> {
         Self::new_cluster_from_opts_in_database(
             opts,
             server_addr,
@@ -1351,12 +1405,16 @@ impl NebServer {
         group_name: &'a str,
         database_name: &'a str,
         prepare_raft_service: F,
-    ) -> Arc<NebServer> {
+    ) -> Result<Arc<NebServer>, ServerError> {
         debug!("Creating key-value server from options");
         let group_name = &String::from(group_name);
         let server_addr = &String::from(server_addr);
         let storage_layout =
             database::DatabaseStorageLayout::from_options(opts, group_name, database_name);
+        let startup_storage_locks = Arc::new(
+            StorageDirectoryLocks::acquire(&storage_layout)
+                .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
+        );
         debug!("Creating RPC server and listen");
         let rpc_server = rpc::Server::new(server_addr);
         let meta_members: Vec<_> = meta_servers
@@ -1484,7 +1542,7 @@ impl NebServer {
                 }
                 e => {
                     error!("Cannot join into cluster: {:?}", e);
-                    panic!("{:?}", ServerError::CannotJoinCluster)
+                    return Err(ServerError::CannotJoinCluster);
                 }
             }
         }
@@ -1495,15 +1553,17 @@ impl NebServer {
             .map_err(|e| {
                 error!("Failed to create Raft client: {:?}", e);
                 error!("This may happen if resuming from disk without proper cluster state");
-                e
-            })
-            .unwrap();
+                ServerError::CannotLoadMetaClient
+            })?;
         debug!("Prepare raft subscription");
         RaftClient::prepare_subscription(&rpc_server).await;
         debug!("Starting member service");
         let member_service = MemberService::new(server_addr, &raft_client, &raft_service).await;
         debug!("Member join group: {}", group_name);
-        member_service.join_group(group_name).await.unwrap();
+        member_service
+            .join_group(group_name)
+            .await
+            .map_err(ServerError::CannotJoinClusterGroup)?;
         let membership_client = Arc::new(ObserverClient::new(&raft_client));
         debug!("Creating neb server");
         NebServer::new(
@@ -1512,13 +1572,14 @@ impl NebServer {
             &meta_servers,
             group_name,
             database_name,
+            startup_storage_locks,
             &rpc_server,
             &raft_service,
             &raft_client,
             &membership_client,
         )
         .await
-        .unwrap()
+        
     }
 
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
