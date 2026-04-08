@@ -6,15 +6,15 @@
 use std::sync::Arc;
 
 use bifrost::conshash::ConsistentHashing;
-use bifrost::raft::client::RaftClient;
+use bifrost::raft::client::AsRaftPlaneClient;
 use bifrost::rpc::RPCError;
 
+use crate::index::Feature;
 use crate::index::entry::EntryKey;
-use crate::index::ranged::client::cursor::ClientCursor;
 use crate::index::ranged::client::RangedIndexerClient;
+use crate::index::ranged::client::cursor::ClientCursor;
 use crate::index::ranged::tree::btree::Ordering;
 use crate::index::ranged::tree::service::{Range, RangeTerm};
-use crate::index::Feature;
 use crate::ram::types::Id;
 
 /// Client for distributed ranged index queries
@@ -66,18 +66,24 @@ impl From<ScanOrder> for Ordering {
 
 impl RangedClient {
     /// Create a new ranged client
-    pub fn new(conshash: Arc<ConsistentHashing>, raft_client: Arc<RaftClient>) -> Self {
+    pub fn new<C>(conshash: Arc<ConsistentHashing>, raft_client: Arc<C>) -> Self
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         Self {
             inner: Arc::new(RangedIndexerClient::new(&conshash, &raft_client)),
         }
     }
 
-    pub fn new_for_database(
+    pub fn new_for_database<C>(
         conshash: Arc<ConsistentHashing>,
-        raft_client: Arc<RaftClient>,
+        raft_client: Arc<C>,
         group_name: &str,
         database_name: &str,
-    ) -> Self {
+    ) -> Self
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         Self {
             inner: Arc::new(RangedIndexerClient::new_for_database(
                 &conshash,

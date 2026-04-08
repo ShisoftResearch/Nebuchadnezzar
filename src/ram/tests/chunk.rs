@@ -1,7 +1,6 @@
 use super::{complex_fields, default_fields, dyn_map_field, simple_fields};
 use crate::index::ranged::tree::tree::{
-    RANGED_TREE_HEAD_HASH, RANGED_TREE_MIGRATION_HASH, RANGED_TREE_SCHEMA,
-    RANGED_TREE_SCHEMA_ID,
+    RANGED_TREE_HEAD_HASH, RANGED_TREE_MIGRATION_HASH, RANGED_TREE_SCHEMA, RANGED_TREE_SCHEMA_ID,
 };
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
@@ -204,11 +203,8 @@ pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
     let mut first_map = OwnedMap::new();
     first_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::new(100, 1)));
     first_map.insert_key_id(*RANGED_TREE_MIGRATION_HASH, OwnedValue::Null);
-    let mut tree_cell = OwnedCell::new_with_id(
-        *RANGED_TREE_SCHEMA_ID,
-        &tree_id,
-        OwnedValue::Map(first_map),
-    );
+    let mut tree_cell =
+        OwnedCell::new_with_id(*RANGED_TREE_SCHEMA_ID, &tree_id, OwnedValue::Map(first_map));
     chunks.write_cell(&mut tree_cell).unwrap();
     assert_eq!(
         chunks.list[0].statistics.changes.load(Ordering::Relaxed),

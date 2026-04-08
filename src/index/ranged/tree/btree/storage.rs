@@ -28,7 +28,11 @@ fn record_completed_change(id: usize) {
         .lock()
         .expect("write-back completion lock poisoned");
     let current = CHANGE_PROGRESS.load(Ordering::Acquire);
-    let expected = if current == usize::MAX { 0 } else { current + 1 };
+    let expected = if current == usize::MAX {
+        0
+    } else {
+        current + 1
+    };
 
     if id == expected {
         let mut new_progress = id;

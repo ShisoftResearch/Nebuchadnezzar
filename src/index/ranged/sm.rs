@@ -4,8 +4,9 @@ use super::trees::*;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
 use bifrost::conshash::ConsistentHashing;
-use bifrost::raft::state_machine::StateMachineCtl;
+use bifrost::raft::PlaneId;
 use bifrost::raft::RaftService;
+use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::rpc::{RPCError, ServiceClient};
 use bifrost::utils;
 use bifrost_hasher::hash_str;
@@ -47,6 +48,7 @@ pub struct TreeInfo {
 pub struct MasterTreeSM {
     tree: BTreeMap<EntryKey, TreePlacement>,
     raft_svr: Arc<RaftService>,
+    plane_id: PlaneId,
     conshash: Arc<ConsistentHashing>,
     tree_service_id: u64,
     persistence_path: Option<PathBuf>,
@@ -175,34 +177,11 @@ impl StateMachineCtl for MasterTreeSM {
 }
 
 impl MasterTreeSM {
-    pub fn new(raft_svr: &Arc<RaftService>, conshash: &Arc<ConsistentHashing>) -> Self {
-        Self::new_with_id_and_persistence(
-            DEFAULT_SM_ID,
-            DEFAULT_SERVICE_ID,
-            raft_svr,
-            conshash,
-            None,
-        )
-    }
-
-    pub fn new_with_persistence(
-        raft_svr: &Arc<RaftService>,
-        conshash: &Arc<ConsistentHashing>,
-        persistence_path: Option<PathBuf>,
-    ) -> Self {
-        Self::new_with_id_and_persistence(
-            DEFAULT_SM_ID,
-            DEFAULT_SERVICE_ID,
-            raft_svr,
-            conshash,
-            persistence_path,
-        )
-    }
-
-    pub fn new_with_id_and_persistence(
+    pub fn new_with_id_and_persistence_on_plane(
         sm_id: u64,
         tree_service_id: u64,
         raft_svr: &Arc<RaftService>,
+        plane_id: PlaneId,
         conshash: &Arc<ConsistentHashing>,
         persistence_path: Option<PathBuf>,
     ) -> Self {
@@ -213,6 +192,7 @@ impl MasterTreeSM {
         let mut sm = Self {
             tree: BTreeMap::new(),
             raft_svr: raft_svr.clone(),
+            plane_id,
             conshash: conshash.clone(),
             tree_service_id,
             persistence_path: persistence_path.clone(),
@@ -231,7 +211,10 @@ impl MasterTreeSM {
                     e
                 );
             } else {
-                info!("[RANGED INDEX LOAD] Successfully loaded MasterTreeSM from disk with {} tree entries", sm.tree.len());
+                info!(
+                    "[RANGED INDEX LOAD] Successfully loaded MasterTreeSM from disk with {} tree entries",
+                    sm.tree.len()
+                );
             }
         } else {
             info!("[RANGED INDEX LOAD] No persistence path provided, starting with empty tree");
@@ -240,10 +223,20 @@ impl MasterTreeSM {
         sm
     }
 
+    async fn is_plane_leader(&self) -> bool {
+        self.raft_svr
+            .is_leader_on_plane(self.plane_id)
+            .await
+            .unwrap_or(false)
+    }
+
     pub async fn try_initialize(&mut self) -> bool {
         // Don't initialize if tree already has data (recovered from disk)
         if !self.tree.is_empty() {
-            info!("[RANGED INDEX LOAD] MasterTreeSM already has persisted data, loading {} trees", self.tree.len());
+            info!(
+                "[RANGED INDEX LOAD] MasterTreeSM already has persisted data, loading {} trees",
+                self.tree.len()
+            );
             // Load all recovered trees into the TreeService
             let tree_entries: Vec<_> = self
                 .tree
@@ -257,8 +250,15 @@ impl MasterTreeSM {
                 } else {
                     max_entry_key()
                 };
-                info!("[RANGED INDEX LOAD] Loading tree {}/{}: tree_id={:?}, boundary=[{:?}, {:?}), epoch={}",
-                      i + 1, tree_entries.len(), placement.id, lower, upper, placement.epoch);
+                info!(
+                    "[RANGED INDEX LOAD] Loading tree {}/{}: tree_id={:?}, boundary=[{:?}, {:?}), epoch={}",
+                    i + 1,
+                    tree_entries.len(),
+                    placement.id,
+                    lower,
+                    upper,
+                    placement.epoch
+                );
                 self.load_sub_tree(placement.id, lower, &upper, placement.epoch)
                     .await;
                 info!(
@@ -394,9 +394,12 @@ impl MasterTreeSM {
         Ok(())
     }
     async fn load_sub_tree(&mut self, id: Id, lower: &EntryKey, upper: &EntryKey, epoch: u64) {
-        if self.raft_svr.is_leader() {
+        if self.is_plane_leader().await {
             // Only the leader can initiate the request to load the sub tree
-            info!("[RANGED INDEX LOAD] Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}, epoch={}", id, lower, upper, epoch);
+            info!(
+                "[RANGED INDEX LOAD] Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}, epoch={}",
+                id, lower, upper, epoch
+            );
             let client = self.locate_tree_server(&id).await.unwrap();
             info!(
                 "[RANGED INDEX LOAD] Located tree {:?} at server {:?}",
@@ -618,8 +621,15 @@ mod tests {
             .unwrap();
         conshash.init_table().await.unwrap();
 
-        // Create MasterTreeSM without persistence (None)
-        let mut tree_sm = MasterTreeSM::new_with_persistence(&raft_service, &conshash, None);
+        // Create MasterTreeSM without persistence on the root plane.
+        let mut tree_sm = MasterTreeSM::new_with_id_and_persistence_on_plane(
+            DEFAULT_SM_ID,
+            DEFAULT_SERVICE_ID,
+            &raft_service,
+            PlaneId::type1(),
+            &conshash,
+            None,
+        );
 
         // Add an entry
         let mut key_bytes = vec![0x40];

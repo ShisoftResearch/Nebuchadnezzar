@@ -11,8 +11,8 @@ use crate::{
 };
 use bifrost_hasher::hash_str;
 use dovahkiin::{integrated::lisp::parse_to_serde_expr, types::*};
-use rand::{rngs::SmallRng, Rng, SeedableRng};
-use rusqlite::{params, Connection};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
+use rusqlite::{Connection, params};
 use std::{collections::BTreeSet, fmt::Write as _, sync::Arc, time::Duration};
 
 const RANGE_A: &str = "RANGE_A";
@@ -594,24 +594,21 @@ async fn run_aggregate_alignment_suite(
         if trace_aggregate {
             debug!(
                 "ALIGN_AGGREGATE_SCHEMA_READY dataset={} schema={}",
-                dataset.name,
-                schema_id
+                dataset.name, schema_id
             );
         }
         materialize_neb_dataset(&client, schema_id, &dataset.rows).await;
         if trace_aggregate {
             debug!(
                 "ALIGN_AGGREGATE_NEB_READY dataset={} schema={}",
-                dataset.name,
-                schema_id
+                dataset.name, schema_id
             );
         }
         let sqlite = materialize_sqlite_dataset(&dataset.rows);
         if trace_aggregate {
             debug!(
                 "ALIGN_AGGREGATE_SQLITE_READY dataset={} schema={}",
-                dataset.name,
-                schema_id
+                dataset.name, schema_id
             );
         }
         let queries = if generated {
@@ -637,9 +634,7 @@ async fn run_aggregate_alignment_suite(
             if trace_aggregate {
                 debug!(
                     "ALIGN_AGGREGATE_DONE dataset={} schema={} query_index={}",
-                    dataset.name,
-                    schema_id,
-                    query_index
+                    dataset.name, schema_id, query_index
                 );
             }
         }
@@ -675,6 +670,8 @@ async fn materialize_neb_dataset(
         let cell = OwnedCell::new_with_id(schema_id, &row.id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
+    crate::index::builder::IndexBuilder::await_all_indices().await;
+    crate::index::ranged::tree::btree::storage::wait_until_updated().await;
 }
 
 fn materialize_sqlite_dataset(rows: &[AlignRow]) -> Connection {

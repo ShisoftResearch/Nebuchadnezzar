@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use bifrost::rpc::RPCError;
-use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
+use bifrost::{conshash::ConsistentHashing, raft::client::AsRaftPlaneClient};
 use dovahkiin::types::{Id, OwnedValue};
 pub use entry::EntryKey;
 pub use entry::ID_SIZE;
@@ -57,12 +57,15 @@ pub struct IndexerClients {
 
 impl IndexerClients {
     /// Create IndexerClients without inverted indexer (lazy initialization)
-    pub fn new(
+    pub fn new<C>(
         neb_client: &Arc<AsyncClient>,
         conshash: &Arc<ConsistentHashing>,
-        raft_client: &Arc<RaftClient>,
+        raft_client: &Arc<C>,
         server_id: u64,
-    ) -> Self {
+    ) -> Self
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         IndexerClients {
             ranged_client: Arc::new(RangedIndexerClient::new_for_database(
                 conshash,
@@ -105,12 +108,15 @@ impl IndexerClients {
     }
 
     /// Create IndexerClients without hybrid inverted indexer (for query-only clients)
-    pub fn new_query_only(
+    pub fn new_query_only<C>(
         neb_client: &Arc<AsyncClient>,
         conshash: &Arc<ConsistentHashing>,
-        raft_client: &Arc<RaftClient>,
+        raft_client: &Arc<C>,
         server_id: u64,
-    ) -> Self {
+    ) -> Self
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         IndexerClients {
             ranged_client: Arc::new(RangedIndexerClient::new_for_database(
                 conshash,

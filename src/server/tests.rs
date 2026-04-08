@@ -215,9 +215,11 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
     );
 
     let names = server.database_names();
-    assert!(names
-        .iter()
-        .any(|name| name == "dynamic_database_runtime_group"));
+    assert!(
+        names
+            .iter()
+            .any(|name| name == "dynamic_database_runtime_group")
+    );
     assert!(names.iter().any(|name| name == "analytics"));
 
     let analytics_client = analytics_runtime

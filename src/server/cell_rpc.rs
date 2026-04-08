@@ -314,7 +314,10 @@ impl NebRPCService {
                 let (res, request_results) = IndexBuilder::with_request_index_scope(op).await;
                 let pending_results = IndexBuilder::await_indices().await;
 
-                for result in request_results.into_iter().chain(pending_results.into_iter()) {
+                for result in request_results
+                    .into_iter()
+                    .chain(pending_results.into_iter())
+                {
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {

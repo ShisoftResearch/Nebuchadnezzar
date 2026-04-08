@@ -26,8 +26,8 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicUsize, Ordering::*};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::*};
 
 pub mod cell_ref;
 mod clear;
@@ -242,7 +242,7 @@ where
             let root_guard = write_node::<KS, PS>(&root);
             debug_assert!(*root_guard.node_ref() == self.get_root());
             info!(
-                "Radical merge split for root (may need to split more than once), {} to {}, num keys {}", 
+                "Radical merge split for root (may need to split more than once), {} to {}, num keys {}",
                 root_new_pages.len() + 1,
                 KS::slice_len(),
                 keys_len

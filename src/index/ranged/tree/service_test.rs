@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::index::entry::EntryKey;
-    use crate::index::{Feature, FEATURE_SIZE};
+    use crate::index::{FEATURE_SIZE, Feature};
     use crate::ram::types::Id;
     use byteorder::{BigEndian, WriteBytesExt};
 
@@ -215,8 +215,8 @@ mod test {
 
     #[test]
     fn test_range_seek_with_actual_btree() {
-        use crate::index::ranged::tree::btree::test::LevelBPlusTree;
         use crate::index::ranged::tree::btree::Ordering;
+        use crate::index::ranged::tree::btree::test::LevelBPlusTree;
         use crate::index::ranged::tree::service::{Range, RangeTerm};
         use crate::index::ranged::trees::Cursor;
         use lightning::map::HashSet;
@@ -500,9 +500,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_range_query_survives_recovery() {
         use crate::client;
-        use crate::index::ranged::tree::btree::{page_schema, Ordering};
+        use crate::index::ranged::tree::btree::{Ordering, page_schema};
         use crate::index::ranged::tree::service::{Range, RangeTerm};
-        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
+        use crate::index::ranged::tree::tree::{RANGED_TREE_SCHEMA, RangedTree};
         use crate::index::ranged::trees::Cursor;
         use crate::server::*;
         use std::sync::Arc;
@@ -757,9 +757,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_range_query_backward_survives_recovery() {
         use crate::client;
-        use crate::index::ranged::tree::btree::{page_schema, Ordering};
+        use crate::index::ranged::tree::btree::{Ordering, page_schema};
         use crate::index::ranged::tree::service::{Range, RangeTerm};
-        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
+        use crate::index::ranged::tree::tree::{RANGED_TREE_SCHEMA, RangedTree};
         use crate::index::ranged::trees::Cursor;
         use crate::server::*;
         use std::sync::Arc;
@@ -1258,9 +1258,9 @@ mod test {
     #[tokio::test]
     async fn test_split_target_tree_is_visible_before_routing() {
         use crate::client;
+        use crate::index::ranged::tree::btree::{Ordering, page_schema, storage};
+        use crate::index::ranged::tree::tree::{RANGED_TREE_SCHEMA, RangedTree};
         use crate::index::ranged::trees::Cursor;
-        use crate::index::ranged::tree::btree::{page_schema, storage, Ordering};
-        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
         use crate::server::{NebServer, ServerOptions, Service};
         use std::sync::Arc;
 
@@ -1354,15 +1354,15 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_writes_during_split_remain_scannable() {
         use crate::client;
-        use crate::index::ranged::client::RangedIndexerClient;
-        use crate::index::ranged::tree::btree::{self, storage, Ordering};
-        use crate::index::ranged::trees::{Cursor, Range};
         use crate::index::EntryKey;
+        use crate::index::ranged::client::RangedIndexerClient;
+        use crate::index::ranged::tree::btree::{self, Ordering, storage};
+        use crate::index::ranged::trees::{Cursor, Range};
         use crate::ram::schema::{Field, Schema};
         use crate::ram::types::Type;
         use crate::server::{NebServer, ServerOptions, Service};
-        use futures::stream::FuturesUnordered;
         use futures::StreamExt;
+        use futures::stream::FuturesUnordered;
         use itertools::Itertools;
         use rand::seq::SliceRandom;
         use std::sync::Arc;
@@ -1398,8 +1398,8 @@ mod test {
                 &vec![server_addr.clone()],
                 server_group,
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
         );
         client
             .new_schema_with_id(Schema::new_with_id(
@@ -1414,11 +1414,9 @@ mod test {
             .unwrap()
             .unwrap();
 
-        let ranged_client = Arc::new(RangedIndexerClient::new(
-            &server.consh,
-            &server.raft_client,
-        ));
-        let expected_total = btree::ideal_capacity_from_node_size(btree::level::BTREE_NODE_SIZE) * 4;
+        let ranged_client = Arc::new(RangedIndexerClient::new(&server.consh, &server.raft_client));
+        let expected_total =
+            btree::ideal_capacity_from_node_size(btree::level::BTREE_NODE_SIZE) * 4;
         let mut shuffled = (0..expected_total).collect_vec();
         shuffled.as_mut_slice().shuffle(&mut rand::thread_rng());
 
@@ -1456,7 +1454,9 @@ mod test {
 
         for value in 0..expected_total {
             let expected_id = Id::new(1, value as u64);
-            let current = cursor.current().expect("scan should cover every inserted key");
+            let current = cursor
+                .current()
+                .expect("scan should cover every inserted key");
             assert_eq!(
                 current, &expected_id,
                 "ordered scan should stay complete after split for position {}",
@@ -1534,11 +1534,7 @@ mod test {
                 .await
                 .unwrap(),
         );
-        client
-            .new_schema_with_id(schema)
-            .await
-            .unwrap()
-            .unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
 
         let workers = 16usize;
         let writes_per_worker = 2048usize;

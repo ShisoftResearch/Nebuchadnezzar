@@ -1,6 +1,6 @@
 use std::{io, sync::Arc};
 
-use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
+use bifrost::{conshash::ConsistentHashing, raft::client::AsRaftPlaneClient, rpc::RPCError};
 use dovahkiin::{
     ahash::HashMap,
     expr::serde::Expr,
@@ -132,11 +132,14 @@ impl IndexedDataClient {
         ))
     }
 
-    pub fn new(
+    pub fn new<C>(
         neb_client: &Arc<AsyncClient>,
         conshash: &Arc<ConsistentHashing>,
-        raft_client: &Arc<RaftClient>,
-    ) -> Self {
+        raft_client: &Arc<C>,
+    ) -> Self
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         Self {
             conshash: conshash.clone(),
             // Use 0 as server_id for query-only clients since inverted indexer won't be initialized

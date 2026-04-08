@@ -17,7 +17,7 @@ use crate::{
 };
 use bifrost_hasher::hash_str;
 use dovahkiin::{expr::serde::Expr, integrated::lisp::*, types::*};
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 #[derive(Clone)]
@@ -266,6 +266,8 @@ async fn scan_all() {
         let cell = OwnedCell::new_with_id(schema_id_1, &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
+    crate::index::builder::IndexBuilder::await_all_indices().await;
+    crate::index::ranged::tree::btree::storage::wait_until_updated().await;
     let idx_data_client = server.indexed_data_client();
     {
         let mut cursor = idx_data_client
@@ -305,6 +307,8 @@ async fn scan_all() {
         let cell = OwnedCell::new_with_id(schema_id_2, &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
+    crate::index::builder::IndexBuilder::await_all_indices().await;
+    crate::index::ranged::tree::btree::storage::wait_until_updated().await;
     {
         let mut cursor = idx_data_client
             .scan_all(
@@ -4610,12 +4614,14 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
             },
         ],
     );
-    assert!(server
-        .indexer()
-        .unwrap()
-        .clients
-        .embedding_client
-        .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits,)));
+    assert!(
+        server
+            .indexer()
+            .unwrap()
+            .clients
+            .embedding_client
+            .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits,))
+    );
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(
@@ -4736,12 +4742,14 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
             },
         ],
     );
-    assert!(server
-        .indexer()
-        .unwrap()
-        .clients
-        .embedding_client
-        .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits)));
+    assert!(
+        server
+            .indexer()
+            .unwrap()
+            .clients
+            .embedding_client
+            .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits))
+    );
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(
@@ -4857,12 +4865,14 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
     )
     .await;
 
-    assert!(server
-        .indexer()
-        .unwrap()
-        .clients
-        .embedding_client
-        .set_embedding_index_core(MockEmbeddingIndexerCore::failing()));
+    assert!(
+        server
+            .indexer()
+            .unwrap()
+            .clients
+            .embedding_client
+            .set_embedding_index_core(MockEmbeddingIndexerCore::failing())
+    );
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         EMB_FIELD,
@@ -5158,10 +5168,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
 
     println!(
         "[bench][or+limit] limit={} avg_optimized_ms={:.3} avg_baseline_no_limit_ms={:.3} speedup={:.2}x",
-        limit,
-        opt_avg,
-        base_avg,
-        speedup
+        limit, opt_avg, base_avg, speedup
     );
     assert!(
         speedup >= 2.0,

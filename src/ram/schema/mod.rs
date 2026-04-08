@@ -1,4 +1,4 @@
-use bifrost::raft::client::RaftClient;
+use bifrost::raft::client::AsRaftPlaneClient;
 use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
@@ -19,8 +19,8 @@ use super::types;
 use std::string::String;
 use std::sync::Arc;
 
-use futures::prelude::*;
 use futures::FutureExt;
+use futures::prelude::*;
 use smallvec::SmallVec;
 use std::ops::Deref;
 
@@ -598,18 +598,21 @@ pub struct LocalSchemasCache {
 }
 
 impl LocalSchemasCache {
-    pub async fn new(
-        group: &str,
-        raft_client: &Arc<RaftClient>,
-    ) -> Result<LocalSchemasCache, ExecError> {
+    pub async fn new<C>(group: &str, raft_client: &Arc<C>) -> Result<LocalSchemasCache, ExecError>
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         Self::new_for_database(group, group, raft_client).await
     }
 
-    pub async fn new_for_database(
+    pub async fn new_for_database<C>(
         group: &str,
         database_name: &str,
-        raft_client: &Arc<RaftClient>,
-    ) -> Result<LocalSchemasCache, ExecError> {
+        raft_client: &Arc<C>,
+    ) -> Result<LocalSchemasCache, ExecError>
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         info!("Initializing local schema cache");
         let map = Arc::new(LocalSchemasMap::new());
         let m1 = map.clone();
@@ -767,8 +770,10 @@ impl LocalSchemasMap {
         // Check if schema already exists (could happen during subscription race)
         if let Some(existing_id) = self.name_map.get(&name) {
             if existing_id != id {
-                error!("Schema name collision: name '{}' already mapped to ID {} but new schema has ID {}", 
-                       name, existing_id, id);
+                error!(
+                    "Schema name collision: name '{}' already mapped to ID {} but new schema has ID {}",
+                    name, existing_id, id
+                );
                 // Don't overwrite - keep the existing mapping
                 return;
             } else {

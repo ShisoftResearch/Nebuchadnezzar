@@ -1,6 +1,6 @@
 use super::*;
-use futures::prelude::*;
 use futures::FutureExt;
+use futures::prelude::*;
 use mem::forget;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};

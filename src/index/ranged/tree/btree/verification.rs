@@ -60,14 +60,14 @@ where
         let second_right_bound = nodes[i + 1].right_bound();
         if first_right_bound >= second_right_bound {
             error!(
-                "right bound at {} larger than right right bound, first_right_bound {:?}, second_right_bound {:?}", 
+                "right bound at {} larger than right right bound, first_right_bound {:?}, second_right_bound {:?}",
                 i, first_right_bound, second_right_bound
             );
             return false;
         }
         if first_right_bound > &second_first_node {
             error!(
-                "right bound at {} larger than right first node, first_right_bound {:?}, second_first_node {:?}", 
+                "right bound at {} larger than right first node, first_right_bound {:?}, second_first_node {:?}",
                 i, first_right_bound, second_first_node
             );
             return false;
@@ -130,8 +130,16 @@ where
         if !next.is_empty_node() && !node.is_empty_node() {
             assert!(right_bound > &*MIN_ENTRY_KEY, "unreachable");
             if next.first_key() < *right_bound {
-                error!("next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
-                       lsm_level, tree_level, node.type_name(), node.keys(), next.keys(), node.right_bound(), next.right_bound());
+                error!(
+                    "next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
+                    lsm_level,
+                    tree_level,
+                    node.type_name(),
+                    node.keys(),
+                    next.keys(),
+                    node.right_bound(),
+                    next.right_bound()
+                );
                 return false;
             }
             if next.right_bound() < right_bound {

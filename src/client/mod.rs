@@ -3,7 +3,7 @@ use bifrost::membership::client::ObserverClient;
 use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::master::ExecError;
-use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, ServiceClient, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::{DEFAULT_CLIENT_POOL, RPCClient, RPCError, Server as RPCServer, ServiceClient};
 use dovahkiin::types::OwnedValue;
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
@@ -22,11 +22,12 @@ use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
 use crate::server::database::{
-    generate_sm_id as generate_database_catalog_sm_id, CreateDatabaseError, DatabaseCatalogEntry,
-    DeleteDatabaseError,
+    CreateDatabaseError, DatabaseCatalogEntry, DeleteDatabaseError,
+    generate_sm_id as generate_database_catalog_sm_id,
 };
 use crate::server::transactions::TxnId;
-use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
+use crate::server::{CONS_HASH_ID, cell_rpc as plain_server, transactions as txn_server};
+use crate::server::{database_meta_plane_id, shared_meta_plane_id};
 
 use self::transaction::*;
 
@@ -90,16 +91,24 @@ impl AsyncClient {
                 .await
                 {
                     Ok(chash) => Ok(Self {
+                        schema_client: {
+                            let schema_plane_client =
+                                raft_client.plane(database_meta_plane_id(group, database_name));
+                            SchemaClient::new(
+                                generate_scoped_sm_id(group, database_name),
+                                &schema_plane_client,
+                            )
+                        },
                         conshash: chash,
                         raft_client: raft_client.clone(),
-                        schema_client: SchemaClient::new(
-                            generate_scoped_sm_id(group, database_name),
-                            &raft_client,
-                        ),
-                        database_catalog_client: DatabaseCatalogClient::new(
-                            generate_database_catalog_sm_id(group),
-                            &raft_client,
-                        ),
+                        database_catalog_client: {
+                            let shared_plane_client =
+                                raft_client.plane(shared_meta_plane_id(group));
+                            DatabaseCatalogClient::new(
+                                generate_database_catalog_sm_id(group),
+                                &shared_plane_client,
+                            )
+                        },
                         group_name: group.to_string(),
                         database_name: database_name.to_string(),
                     }),
@@ -369,7 +378,7 @@ impl AsyncClient {
                             txn.tid, e
                         );
                         Err(TxnError::CannotBegin)
-                    }
+                    };
                 }
                 Err(e) => {
                     error!(
@@ -478,7 +487,7 @@ impl AsyncClient {
                             return Ok(Err(NewSchemaError::PostProcessError(format!(
                                 "Connecting error for post process: {:?}",
                                 e
-                            ))))
+                            ))));
                         }
                     }
                 } else {
@@ -527,7 +536,7 @@ impl AsyncClient {
                         return Ok(Err(DelSchemaError::PostProcessError(format!(
                             "Connecting error for post process: {:?}",
                             e
-                        ))))
+                        ))));
                     }
                 }
             } else {
@@ -576,9 +585,13 @@ impl AsyncClient {
     /// }
     /// ```
     pub fn ranged(&self) -> RangedClient {
+        let plane_client = self.raft_client.plane(database_meta_plane_id(
+            self.group_name(),
+            self.database_name(),
+        ));
         RangedClient::new_for_database(
             self.conshash.clone(),
-            self.raft_client.clone(),
+            plane_client,
             self.group_name(),
             self.database_name(),
         )

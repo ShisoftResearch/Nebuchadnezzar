@@ -2,8 +2,8 @@ use crate::client::{AsyncClient, NebClientError};
 use crate::query::data_client::IndexedDataClient;
 use crate::server::transactions::manager::TransactionManager;
 use crate::{client, index::builder::IndexBuilder};
-use bifrost::conshash::weights::Weights;
 use bifrost::conshash::ConsistentHashing;
+use bifrost::conshash::weights::Weights;
 use bifrost::membership::client::ObserverClient;
 use bifrost::membership::member::MemberService;
 use bifrost::membership::server::Membership;
@@ -15,13 +15,14 @@ use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use bifrost::rpc::{self, ClientPool};
 use bifrost::rpc::{RPCClient, RPCError, Server};
 use bifrost::vector_clock::ServerVectorClock;
+use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 // use crate::index::lsmtree;
 use crate::index::ranged;
 use crate::ram::chunk::Chunks;
 use crate::ram::cleaner::Cleaner;
-use crate::ram::schema::sm as schema_sm;
 use crate::ram::schema::LocalSchemasCache;
+use crate::ram::schema::sm as schema_sm;
 use crate::ram::types::Id;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -98,38 +99,216 @@ fn discover_known_databases_from_raft_storage(
     out
 }
 
+fn discover_known_databases_from_storage_roots(
+    storage_roots: &[Option<&str>],
+    default_database_name: &str,
+) -> Vec<String> {
+    let mut names = HashSet::new();
+    names.insert(default_database_name.to_string());
+
+    for root in storage_roots.iter().flatten() {
+        let db_root = Path::new(root).join("databases");
+        if let Ok(entries) = fs::read_dir(db_root) {
+            for entry in entries.flatten() {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    if !name.is_empty() {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = names.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn discover_databases_for_startup_schema_registration(
+    raft_storage_root: Option<&str>,
+    non_raft_storage_roots: &[Option<&str>],
+    default_database_name: &str,
+) -> Vec<String> {
+    let mut names =
+        discover_known_databases_from_raft_storage(raft_storage_root, default_database_name)
+            .into_iter()
+            .collect::<HashSet<_>>();
+    names.extend(discover_known_databases_from_storage_roots(
+        non_raft_storage_roots,
+        default_database_name,
+    ));
+
+    let mut out = names.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+pub fn database_meta_plane_id(group_name: &str, database_name: &str) -> raft::PlaneId {
+    let mut raw =
+        hash_str(&format!("MORPHEUS_DB_PLANE-{group_name}-{database_name}")).wrapping_add(2);
+    if raw < 2 {
+        raw = raw.wrapping_add(2);
+    }
+    raft::PlaneId::type2(raw).expect("database plane ids must be non-zero")
+}
+
+pub fn shared_meta_plane_id(_group_name: &str) -> raft::PlaneId {
+    raft::PlaneId::type2(1).expect("shared plane id must be non-zero")
+}
+
+pub fn database_meta_plane_seed_nodes(server_addr: &str, seed_nodes: &[String]) -> Vec<String> {
+    let mut nodes = seed_nodes.to_vec();
+    nodes.push(server_addr.to_string());
+    nodes.sort();
+    nodes.dedup();
+    nodes
+}
+
+async fn ensure_shared_meta_plane(
+    raft_service: &Arc<raft::RaftService>,
+    server_addr: &str,
+    meta_members: &[String],
+    group_name: &str,
+) -> Result<raft::PlaneHandle, ServerError> {
+    raft_service
+        .ensure_plane_from_seeds(raft::PlaneBootstrap {
+            plane_id: shared_meta_plane_id(group_name),
+            seed_nodes: database_meta_plane_seed_nodes(server_addr, meta_members),
+        })
+        .await
+        .map_err(|e| {
+            ServerError::CannotInitializeSharedPlane(format!(
+                "failed to ensure shared meta plane for {group_name}: {e}"
+            ))
+        })
+}
+
+async fn register_shared_state_machines_on_plane(
+    group_name: &str,
+    plane: &raft::PlaneHandle,
+) -> Result<(), raft::PlaneError> {
+    plane
+        .register_state_machine(Box::new(database::DatabaseCatalogSM::new(group_name)))
+        .await
+}
+
+async fn ensure_database_meta_plane(
+    raft_service: &Arc<raft::RaftService>,
+    server_addr: &str,
+    meta_members: &[String],
+    group_name: &str,
+    database_name: &str,
+) -> Result<raft::PlaneHandle, ServerError> {
+    raft_service
+        .ensure_plane_from_seeds(raft::PlaneBootstrap {
+            plane_id: database_meta_plane_id(group_name, database_name),
+            seed_nodes: database_meta_plane_seed_nodes(server_addr, meta_members),
+        })
+        .await
+        .map_err(|e| {
+            ServerError::CannotInitializeSchemaPlane(format!(
+                "failed to ensure database meta plane for {database_name}: {e}"
+            ))
+        })
+}
+
+async fn register_schema_state_machine_on_plane(
+    group_name: &str,
+    database_name: &str,
+    plane: &raft::PlaneHandle,
+    recovering_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), raft::PlaneError> {
+    let sm_id = schema_sm::generate_scoped_sm_id(group_name, database_name);
+    let schema_state_machine = schema_sm::SchemasSM::with_callback_and_recovery_flag(
+        sm_id,
+        plane.callback(sm_id).await?,
+        recovering_flag,
+    );
+    plane
+        .register_state_machine(Box::new(schema_state_machine))
+        .await
+}
+
 async fn register_schema_sms_for_known_databases(
     group_name: &str,
-    default_database_name: &str,
-    raft_storage_root: Option<&str>,
+    databases: &[String],
     raft_service: &Arc<raft::RaftService>,
     recovering_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let databases =
-        discover_known_databases_from_raft_storage(raft_storage_root, default_database_name);
     info!(
         "Pre-registering Neb SchemasSM for databases before replay: {:?}",
         databases
     );
 
     for database_name in databases {
-        raft_service
-            .register_state_machine(Box::new(
-                schema_sm::SchemasSM::new_with_recovery_flag(
-                    group_name,
-                    &database_name,
-                    raft_service,
-                    recovering_flag.clone(),
-                )
-                .await,
-            ))
-            .await;
+        let plane = raft_service
+            .ensure_plane(raft::PlaneSpec {
+                plane_id: database_meta_plane_id(group_name, database_name),
+            })
+            .await
+            .expect("database meta plane should materialize locally during startup");
+        register_schema_state_machine_on_plane(
+            group_name,
+            database_name,
+            &plane,
+            recovering_flag.clone(),
+        )
+        .await
+        .expect("database schema state machine should register during startup");
+    }
+}
+
+async fn recover_startup_meta_planes(group_name: &str, raft_service: &Arc<raft::RaftService>) {
+    let shared_meta_plane = raft_service
+        .ensure_plane(raft::PlaneSpec {
+            plane_id: shared_meta_plane_id(group_name),
+        })
+        .await
+        .expect("shared meta plane should materialize locally during startup recovery");
+    shared_meta_plane
+        .recover_after_register()
+        .await
+        .expect("shared meta plane should recover registered state machines during startup");
+}
+
+async fn recover_schema_sms_for_known_databases(
+    group_name: &str,
+    databases: &[String],
+    raft_service: &Arc<raft::RaftService>,
+) {
+    info!(
+        "Recovering pre-registered Neb SchemasSM planes after Raft start: {:?}",
+        databases
+    );
+
+    for database_name in databases {
+        let plane = raft_service
+            .ensure_plane(raft::PlaneSpec {
+                plane_id: database_meta_plane_id(group_name, database_name),
+            })
+            .await
+            .expect("database meta plane should materialize locally during startup recovery");
+        plane
+            .recover_after_register()
+            .await
+            .expect("database schema state machine should recover during startup");
     }
 }
 
 #[cfg(test)]
 mod startup_discovery_tests {
-    use super::discover_known_databases_from_raft_storage;
+    use super::{
+        database_meta_plane_id, database_meta_plane_seed_nodes,
+        discover_databases_for_startup_schema_registration,
+        discover_known_databases_from_raft_storage, discover_known_databases_from_storage_roots,
+        shared_meta_plane_id,
+    };
 
     #[test]
     fn discovers_only_databases_with_recoverable_raft_state() {
@@ -157,6 +336,94 @@ mod startup_discovery_tests {
         let discovered = discover_known_databases_from_raft_storage(None, "default");
         assert_eq!(discovered, vec!["default".to_string()]);
     }
+
+    #[test]
+    fn discovers_databases_from_scoped_storage_roots() {
+        let temp = tempfile::TempDir::new().expect("tempdir should be created");
+        let backup_root = temp.path().join("backup");
+        let wal_root = temp.path().join("wal");
+        std::fs::create_dir_all(backup_root.join("databases/default"))
+            .expect("default backup dir should be created");
+        std::fs::create_dir_all(backup_root.join("databases/wikidata"))
+            .expect("wikidata backup dir should be created");
+        std::fs::create_dir_all(wal_root.join("databases/analytics"))
+            .expect("analytics wal dir should be created");
+
+        let discovered = discover_known_databases_from_storage_roots(
+            &[backup_root.to_str(), wal_root.to_str()],
+            "default",
+        );
+
+        assert_eq!(
+            discovered,
+            vec![
+                "analytics".to_string(),
+                "default".to_string(),
+                "wikidata".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_schema_registration_unions_raft_and_non_raft_databases() {
+        let temp = tempfile::TempDir::new().expect("tempdir should be created");
+        let raft_root = temp.path().join("raft");
+        let backup_root = temp.path().join("backup");
+        let wal_root = temp.path().join("wal");
+        std::fs::create_dir_all(raft_root.join("databases/default"))
+            .expect("default raft dir should be created");
+        std::fs::create_dir_all(raft_root.join("databases/catalog_only"))
+            .expect("catalog_only raft dir should be created");
+        std::fs::write(
+            raft_root.join("databases/catalog_only/log.dat"),
+            b"raft log",
+        )
+        .expect("catalog_only log should be created");
+        std::fs::create_dir_all(backup_root.join("databases/data_only"))
+            .expect("data_only backup dir should be created");
+        std::fs::create_dir_all(wal_root.join("databases/data_only"))
+            .expect("data_only wal dir should be created");
+
+        let discovered = discover_databases_for_startup_schema_registration(
+            raft_root.to_str(),
+            &[backup_root.to_str(), wal_root.to_str()],
+            "default",
+        );
+
+        assert_eq!(
+            discovered,
+            vec![
+                "catalog_only".to_string(),
+                "data_only".to_string(),
+                "default".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn database_meta_plane_seed_nodes_always_include_local_server() {
+        let seeds =
+            database_meta_plane_seed_nodes("127.0.0.1:7000", &["127.0.0.1:7001".to_string()]);
+
+        assert_eq!(
+            seeds,
+            vec!["127.0.0.1:7000".to_string(), "127.0.0.1:7001".to_string()]
+        );
+    }
+
+    #[test]
+    fn shared_meta_plane_is_type2() {
+        let plane_id = shared_meta_plane_id("group_a");
+        assert!(plane_id.is_type2());
+        assert_eq!(plane_id.raw(), 1);
+    }
+
+    #[test]
+    fn database_meta_plane_never_uses_reserved_shared_id() {
+        let plane_id = database_meta_plane_id("group_a", "analytics");
+        assert!(plane_id.is_type2());
+        assert_ne!(plane_id.raw(), 1);
+    }
 }
 
 #[derive(Debug)]
@@ -167,8 +434,10 @@ pub enum ServerError {
     CannotSetServerWeight,
     CannotInitConsistentHashTable,
     CannotLoadMetaClient,
+    CannotInitializeSharedPlane(String),
     CannotInitializeDatabaseCatalog(sm_master::ExecError),
     CannotInitializeSchemaServer(sm_master::ExecError),
+    CannotInitializeSchemaPlane(String),
     StandaloneMustAlsoBeMetaServer,
 }
 
@@ -289,7 +558,11 @@ impl DatabaseRuntime {
         if let Some(index_builder) = self.indexer() {
             IndexedDataClient::new_with_indexers(index_builder.clients.clone(), self.consh.clone())
         } else {
-            IndexedDataClient::new(&self.neb_client, &self.consh, &self.raft_client)
+            let meta_plane_client = self.raft_client.plane(database_meta_plane_id(
+                &self.group_name,
+                &self.database_name,
+            ));
+            IndexedDataClient::new(&self.neb_client, &self.consh, &meta_plane_client)
         }
     }
 
@@ -308,6 +581,7 @@ impl DatabaseRuntime {
 pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
     database_runtimes: RwLock<HashMap<String, Arc<DatabaseRuntime>>>,
+    registered_schema_services: RwLock<HashSet<String>>,
     runtime_init_lock: tokio::sync::Mutex<()>,
     host_options: ServerOptions,
     /// Shared physical-memory budget for all databases on this server.
@@ -356,19 +630,20 @@ impl NebServer {
     async fn register_schema_state_machine(
         group_name: &str,
         database_name: &str,
-        raft_service: &Arc<raft::RaftService>,
-    ) {
-        raft_service
-            .register_state_machine(Box::new(
-                schema_sm::SchemasSM::new_with_recovery_flag(
-                    group_name,
-                    database_name,
-                    raft_service,
-                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                )
-                .await,
+        plane: &raft::PlaneHandle,
+    ) -> Result<(), ServerError> {
+        register_schema_state_machine_on_plane(
+            group_name,
+            database_name,
+            plane,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await
+        .map_err(|e| {
+            ServerError::CannotInitializeSchemaPlane(format!(
+                "failed to register schema state machine for {database_name}: {e}"
             ))
-            .await;
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -388,8 +663,23 @@ impl NebServer {
         txn_peer: &Peer,
         register_schema_state_machine: bool,
     ) -> Result<Arc<DatabaseRuntime>, ServerError> {
+        let _shared_meta_plane =
+            ensure_shared_meta_plane(raft_service, server_addr, meta_members, group_name).await?;
+        let schema_plane = ensure_database_meta_plane(
+            raft_service,
+            server_addr,
+            meta_members,
+            group_name,
+            database_name,
+        )
+        .await?;
         if register_schema_state_machine {
-            Self::register_schema_state_machine(group_name, database_name, raft_service).await;
+            Self::register_schema_state_machine(group_name, database_name, &schema_plane).await?;
+            schema_plane.recover_after_register().await.map_err(|e| {
+                ServerError::CannotInitializeSchemaPlane(format!(
+                    "failed to recover schema state machine for {database_name}: {e}"
+                ))
+            })?;
         }
 
         let storage_layout =
@@ -402,9 +692,12 @@ impl NebServer {
             ..opts.clone()
         };
 
-        let schemas = LocalSchemasCache::new_for_database(group_name, database_name, raft_client)
-            .await
-            .unwrap();
+        let schema_plane_client =
+            raft_client.plane(database_meta_plane_id(group_name, database_name));
+        let schemas =
+            LocalSchemasCache::new_for_database(group_name, database_name, &schema_plane_client)
+                .await
+                .unwrap();
         let meta_rc = Arc::new(ServerMeta { schemas });
         let neb_client = Arc::new(
             client::AsyncClient::new_for_database(
@@ -437,7 +730,13 @@ impl NebServer {
 
         let index_builder = if effective_opts.index_enabled {
             Some(Arc::new(
-                IndexBuilder::new(&neb_client, conshasing, raft_client, rpc_server.server_id).await,
+                IndexBuilder::new(
+                    &neb_client,
+                    conshasing,
+                    &schema_plane_client,
+                    rpc_server.server_id,
+                )
+                .await,
             ))
         } else {
             None
@@ -575,7 +874,8 @@ impl NebServer {
                         rpc_server,
                         &database_runtime.neb_client,
                         raft_service,
-                        raft_client,
+                        &schema_plane,
+                        &schema_plane_client,
                         conshasing,
                         group_name,
                         database_name,
@@ -628,6 +928,12 @@ impl NebServer {
             return Ok(runtime);
         }
 
+        let needs_schema_registration = !self
+            .registered_schema_services
+            .read()
+            .expect("schema service registry lock poisoned")
+            .contains(database_name);
+
         let database_runtime = Self::build_database_runtime(
             &self.host_options,
             &self.rpc.address,
@@ -642,9 +948,16 @@ impl NebServer {
             &self.consh,
             &self.member_pool,
             &self.txn_peer,
-            true,
+            needs_schema_registration,
         )
         .await?;
+
+        if needs_schema_registration {
+            self.registered_schema_services
+                .write()
+                .expect("schema service registry lock poisoned")
+                .insert(database_name.to_string());
+        }
 
         self.database_runtimes
             .write()
@@ -944,6 +1257,19 @@ impl NebServer {
                 database_name.to_string(),
                 database_runtime.clone(),
             )])),
+            registered_schema_services: RwLock::new(
+                discover_databases_for_startup_schema_registration(
+                    opts.raft_storage.as_deref(),
+                    &[
+                        opts.backup_storage.as_deref(),
+                        opts.wal_storage.as_deref(),
+                        opts.undo_log_storage.as_deref(),
+                    ],
+                    database_name,
+                )
+                .into_iter()
+                .collect(),
+            ),
             runtime_init_lock: tokio::sync::Mutex::new(()),
             host_options: opts.clone(),
             shared_memory_pool,
@@ -1063,17 +1389,15 @@ impl NebServer {
         // Register state machines BEFORE starting Raft so WAL replay can apply to them
         // This is critical: any SM registered after start() won't receive replayed WAL entries
         debug!("Registering state machines before Raft start for WAL replay (recovery mode)");
-        raft_service
-            .register_state_machine(Box::new(database::DatabaseCatalogSM::new(group_name)))
-            .await;
-        register_schema_sms_for_known_databases(
-            group_name,
-            database_name,
+        let startup_schema_databases = discover_databases_for_startup_schema_registration(
             opts.raft_storage.as_deref(),
-            &raft_service,
-            recovering_flag.clone(),
-        )
-        .await;
+            &[
+                opts.backup_storage.as_deref(),
+                opts.wal_storage.as_deref(),
+                opts.undo_log_storage.as_deref(),
+            ],
+            database_name,
+        );
         Weights::new_with_id(CONS_HASH_ID, &raft_service).await;
 
         // TODO: If RangedIndexer service is enabled, MasterTreeSM should also be
@@ -1086,11 +1410,37 @@ impl NebServer {
         debug!("Registering Membership service before Raft start");
         Membership::new(&rpc_server, &raft_service).await;
 
+        let shared_meta_plane = raft_service
+            .ensure_plane(raft::PlaneSpec {
+                plane_id: shared_meta_plane_id(group_name),
+            })
+            .await
+            .expect("shared meta plane should materialize locally during startup");
+        register_shared_state_machines_on_plane(group_name, &shared_meta_plane)
+            .await
+            .expect("shared state machines should register during startup");
+
+        register_schema_sms_for_known_databases(
+            group_name,
+            &startup_schema_databases,
+            &raft_service,
+            recovering_flag.clone(),
+        )
+        .await;
+
         debug!("Preparing raft service");
         prepare_raft_service(&raft_service).await;
 
         debug!("RPC server created, starting Raft service (will replay WAL to registered SMs)");
         raft::RaftService::start(&raft_service, true).await;
+
+        recover_startup_meta_planes(group_name, &raft_service).await;
+        recover_schema_sms_for_known_databases(
+            group_name,
+            &startup_schema_databases,
+            &raft_service,
+        )
+        .await;
 
         // Clear recovery flag after Raft recovery completes
         // Future schema operations should now send callbacks normally
@@ -1106,7 +1456,9 @@ impl NebServer {
             // Don't bootstrap or join - let Raft recover automatically
             // Give Raft time to elect leader if this is a single-server resumed cluster
             if meta_members.is_empty() {
-                info!("Single-server resumed cluster, waiting for leader election and state recovery...");
+                info!(
+                    "Single-server resumed cluster, waiting for leader election and state recovery..."
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         } else if meta_members.is_empty() {
@@ -1320,16 +1672,19 @@ pub async fn init_inverted_index_rpc_service(
     }
 }
 
-pub async fn init_ranged_indexer_service(
+pub async fn init_ranged_indexer_service<C>(
     rpc_server: &Arc<Server>,
     neb_client: &Arc<AsyncClient>,
     raft_svr: &Arc<raft::RaftService>,
-    raft_client: &Arc<RaftClient>,
+    meta_plane: &raft::PlaneHandle,
+    raft_client: &Arc<C>,
     cons_hash: &Arc<ConsistentHashing>,
     group_name: &str,
     database_name: &str,
     tree_persistence_path: Option<String>,
-) {
+) where
+    C: bifrost::raft::client::AsRaftPlaneClient + 'static,
+{
     info!("Initializing range indexer service");
     // TODO: create the schema only when it does not exists
     let _ = neb_client
@@ -1355,15 +1710,20 @@ pub async fn init_ranged_indexer_service(
 
     // Create MasterTreeSM with persistence support
     let persistence_path = tree_persistence_path.map(PathBuf::from);
-    let mut tree_sm = ranged::sm::MasterTreeSM::new_with_id_and_persistence(
+    let mut tree_sm = ranged::sm::MasterTreeSM::new_with_id_and_persistence_on_plane(
         ranged::sm::generate_scoped_sm_id(group_name, database_name),
         ranged::tree::service::generate_scoped_service_id(group_name, database_name),
         raft_svr,
+        meta_plane.id(),
         cons_hash,
         persistence_path,
     );
     tree_sm.try_initialize().await;
-    raft_svr.register_state_machine(Box::new(tree_sm)).await;
+    meta_plane
+        .register_state_machine(Box::new(tree_sm))
+        .await
+        .unwrap();
+    meta_plane.recover_after_register().await.unwrap();
 }
 
 fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {

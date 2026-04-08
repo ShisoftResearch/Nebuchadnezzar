@@ -1,6 +1,6 @@
 use super::external::ExtNode;
-use super::node::read_unchecked;
 use super::node::NodeData;
+use super::node::read_unchecked;
 use super::*;
 use itertools::Itertools;
 use serde_json;

@@ -1,8 +1,8 @@
 use super::external::ExtNode;
 use super::internal::InNode;
-use super::node::{write_node, Node, NodeWriteGuard};
+use super::node::{Node, NodeWriteGuard, write_node};
 use super::*;
-use super::{max_entry_key, BPlusTree, NodeCellRef};
+use super::{BPlusTree, NodeCellRef, max_entry_key};
 use crate::client::AsyncClient;
 use crate::ram::cell::OwnedCell;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -201,12 +201,12 @@ where
         }
         (constructor.root(), constructor.levels())
     };
-    info!("[B-TREE LOAD] Completed reconstruction of tree {:?} at level {} with {} keys, height {}", resolved_head_id, level, len, height);
-    let tree = BPlusTree::from_root(root, resolved_head_id, len, height, deletion);
-    debug!(
-        "[B-TREE LOAD] Verifying reconstruction at level {}",
-        level
+    info!(
+        "[B-TREE LOAD] Completed reconstruction of tree {:?} at level {} with {} keys, height {}",
+        resolved_head_id, level, len, height
     );
+    let tree = BPlusTree::from_root(root, resolved_head_id, len, height, deletion);
+    debug!("[B-TREE LOAD] Verifying reconstruction at level {}", level);
     // debug_assert!(verification::tree_has_no_empty_node(&tree));
     debug_assert!(verification::is_tree_in_order(&tree, level));
     debug!(
@@ -216,7 +216,10 @@ where
     Ok(tree)
 }
 
-async fn discover_page_chain_ids<KS, PS>(head_id: Id, neb: &AsyncClient) -> Result<Vec<Id>, ReconstructError>
+async fn discover_page_chain_ids<KS, PS>(
+    head_id: Id,
+    neb: &AsyncClient,
+) -> Result<Vec<Id>, ReconstructError>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -241,13 +244,13 @@ where
                 return Err(ReconstructError::MissingPage {
                     page_id: current,
                     pages_read: ids.len() - 1,
-                })
+                });
             }
             Err(e) => {
                 return Err(ReconstructError::RpcReadFailed {
                     page_id: current,
                     error: format!("{:?}", e),
-                })
+                });
             }
         };
         let page = ExtNode::<KS, PS>::from_cell(&cell);
@@ -273,13 +276,13 @@ async fn fetch_page_chain_cells(
                     return Err(ReconstructError::MissingPage {
                         page_id,
                         pages_read: idx,
-                    })
+                    });
                 }
                 Err(e) => {
                     return Err(ReconstructError::RpcReadFailed {
                         page_id,
                         error: format!("{:?}", e),
-                    })
+                    });
                 }
             };
             cells.push(cell);

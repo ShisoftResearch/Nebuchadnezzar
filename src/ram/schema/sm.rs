@@ -1,12 +1,12 @@
 use super::*;
 
-use bifrost::raft::state_machine::callback::server::SMCallback;
-use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
+use bifrost::raft::state_machine::StateMachineCtl;
+use bifrost::raft::state_machine::callback::server::SMCallback;
 use bifrost::utils;
 use bifrost_hasher::hash_str;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub static SM_ID_PREFIX: &'static str = "NEB_SCHEMAS_SM";
 
@@ -167,6 +167,20 @@ impl StateMachineCtl for SchemasSM {
 }
 
 impl SchemasSM {
+    pub fn with_callback_and_recovery_flag(
+        sm_id: u64,
+        callback: SMCallback,
+        recovering: Arc<AtomicBool>,
+    ) -> SchemasSM {
+        SchemasSM {
+            callback,
+            map: SchemasMap::new(),
+            id_count: 0,
+            sm_id,
+            recovering,
+        }
+    }
+
     /// Create a new state machine with a shared recovery flag
     /// The flag should be set to false after server initialization completes
     pub async fn new_with_recovery_flag<'a>(
@@ -183,13 +197,11 @@ impl SchemasSM {
             sm_id,
             recovering.load(Ordering::Relaxed)
         );
-        SchemasSM {
-            callback: SMCallback::new(sm_id, raft_service.clone()).await,
-            map: SchemasMap::new(),
-            id_count: 0,
+        SchemasSM::with_callback_and_recovery_flag(
             sm_id,
+            SMCallback::new(sm_id, raft_service.clone()).await,
             recovering,
-        }
+        )
     }
 
     /// Create a new state machine (legacy method, defaults to not recovering)

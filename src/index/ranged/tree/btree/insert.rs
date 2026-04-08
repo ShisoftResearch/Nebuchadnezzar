@@ -1,9 +1,9 @@
+use super::node::NodeWriteGuard;
 use super::node::read_unchecked;
 use super::node::write_node;
 use super::node::write_targeted;
-use super::node::NodeWriteGuard;
-use super::search::mut_search;
 use super::search::MutSearchResult;
+use super::search::mut_search;
 use super::*;
 use std::fmt::Debug;
 

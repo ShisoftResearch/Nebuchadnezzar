@@ -14,9 +14,9 @@ use futures::prelude::*;
 use lightning::map::{Map, PtrHashMap as HashMap};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::collections::HashMap as StdHashMap;
 use std::collections::HashSet;
+use std::env;
 use std::time::{Duration, Instant};
 
 pub type IdBlock = [Id; MIGRATE_SIZE]; // Fixed size for ID arrays (not related to tree node size)
@@ -185,11 +185,7 @@ fn trace_seek_block(
     }
 }
 
-fn trace_seek_progress(
-    tree_id: Id,
-    entry: &EntryKey,
-    progress: &[String],
-) {
+fn trace_seek_progress(tree_id: Id, entry: &EntryKey, progress: &[String]) {
     if progress.is_empty() {
         return;
     }
@@ -202,12 +198,7 @@ fn trace_seek_progress(
     );
 }
 
-fn trace_probe_missing_key(
-    tree_id: Id,
-    tree: &RangedTree,
-    schema_id: u32,
-    gap: (Id, Id),
-) {
+fn trace_probe_missing_key(tree_id: Id, tree: &RangedTree, schema_id: u32, gap: (Id, Id)) {
     if gap.1.lower != gap.0.lower + 2 || gap.0.higher != gap.1.higher {
         return;
     }
@@ -230,11 +221,7 @@ fn trace_probe_missing_key(
 
     debug!(
         "RANGE_SEEK_PROBE tree={:?} schema={} missing={:?} gap={:?} probe_seen={:?}",
-        tree_id,
-        schema_id,
-        missing_id,
-        gap,
-        seen
+        tree_id, schema_id, missing_id, gap, seen
     );
 }
 
@@ -291,7 +278,10 @@ impl Service for TreeService {
                     pending_prop.migration = None;
                 }
                 self.trees.insert(id, pending_tree);
-                info!("Promoted in-memory migration target {:?} into active tree map", id);
+                info!(
+                    "Promoted in-memory migration target {:?} into active tree map",
+                    id
+                );
                 return;
             }
             info!("Called to load tree {:?}, boundary {:?}", id, boundary);
@@ -559,7 +549,14 @@ impl Service for TreeService {
                 last_key,
             };
             if trace_seek {
-                trace_seek_block(id, entry, &range, boundary, &result_block.buffer, &result_block.next);
+                trace_seek_block(
+                    id,
+                    entry,
+                    &range,
+                    boundary,
+                    &result_block.buffer,
+                    &result_block.next,
+                );
                 if let Some(gap) = trace_id_gap(&result_block.buffer) {
                     if let Some(progress) = trace_progress.as_ref() {
                         trace_seek_progress(id, entry, progress);
@@ -702,7 +699,11 @@ impl TreeService {
             let mut dist_prop = dist_tree.prop.write();
             dist_prop.migration = None;
         }
-        if let Err(unmark_err) = dist_tree.tree.mark_migration(&dist_tree.id, None, client).await {
+        if let Err(unmark_err) = dist_tree
+            .tree
+            .mark_migration(&dist_tree.id, None, client)
+            .await
+        {
             warn!(
                 "Failed to clear migration marker for tree {:?} after split rollback: {:?}",
                 dist_tree.id, unmark_err
@@ -978,18 +979,13 @@ impl TreeService {
                             Ok((_lower, placement, _upper)) => {
                                 debug!(
                                     "Preflighted split for source {:?} at pivot {:?}; current placement tree {:?}, epoch {}",
-                                    dist_tree.id,
-                                    pivot_key,
-                                    placement.id,
-                                    placement.epoch
+                                    dist_tree.id, pivot_key, placement.id, placement.epoch
                                 );
                             }
                             Err(e) => {
                                 warn!(
                                     "Failed to preflight split for source {:?} at pivot {:?}: {:?}",
-                                    dist_tree.id,
-                                    pivot_key,
-                                    e
+                                    dist_tree.id, pivot_key, e
                                 );
                             }
                         }
@@ -1002,10 +998,7 @@ impl TreeService {
                             Err(e) => {
                                 warn!(
                                     "Placement split from {:?} to {:?} at {:?} returned error: {:?}",
-                                    dist_tree.id,
-                                    migration_target_id,
-                                    pivot_key,
-                                    e
+                                    dist_tree.id, migration_target_id, pivot_key, e
                                 );
                                 if Self::split_visible_in_placement(
                                     &sm_client,

@@ -273,10 +273,7 @@ where
     pub fn merge_with(&mut self, right: &mut Self) {
         trace!(
             "Merge external node, left len {}:{:?}, right len {}:{:?}",
-            self.len,
-            self.keys,
-            right.len,
-            right.keys
+            self.len, self.keys, right.len, right.keys
         );
         let self_len = self.len;
         let new_len = self.len + right.len;
@@ -377,7 +374,9 @@ where
             if num_duplicates == self_len_before_merge + right.len() {
                 warn!(
                     "Merge resulted in NO unique keys! left={}, right={}, all {} keys were duplicates. This may indicate repeated merge of same data.",
-                    self_len_before_merge, right.len(), num_duplicates
+                    self_len_before_merge,
+                    right.len(),
+                    num_duplicates
                 );
             }
         }

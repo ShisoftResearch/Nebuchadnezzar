@@ -1,17 +1,17 @@
 use super::super::tree::service::*;
+use crate::index::EntryKey;
+use crate::index::ranged::trees::Ordering;
 use crate::index::ranged::{
     client::{
-        migration_retry_delay_ms, too_many_retry_error, RangedIndexerClient, MAX_RETRY_ATTEMPTS,
-        MIGRATION_REFRESH_INTERVAL,
+        MAX_RETRY_ATTEMPTS, MIGRATION_REFRESH_INTERVAL, RangedIndexerClient,
+        migration_retry_delay_ms, too_many_retry_error,
     },
     trees::{max_entry_key, min_entry_key},
 };
-use crate::index::EntryKey;
-use crate::index::ranged::trees::Ordering;
 use crate::ram::types::Id;
 use bifrost::rpc::RPCError;
-use std::env;
 use std::collections::HashSet;
+use std::env;
 use std::sync::Arc;
 
 fn cursor_trace_schema_from_key(key: &EntryKey) -> u32 {
@@ -315,7 +315,8 @@ impl ClientCursor {
                                 cursor_trace_gap(&block.buffer)
                             );
                         }
-                        let trace_cursor = should_trace_cursor(current_key, self.pattern.as_deref());
+                        let trace_cursor =
+                            should_trace_cursor(current_key, self.pattern.as_deref());
                         if trace_cursor {
                             let first = block.buffer.first().copied();
                             let last = block.buffer.last().copied();

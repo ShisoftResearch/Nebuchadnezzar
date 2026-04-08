@@ -5,7 +5,7 @@ use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
 use crate::index::embedding::EmbeddingModel;
 use crate::index::full_text::{
-    build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
+    FullTextIndexMeta, ToOwnedValue, build_index_meta as build_inverted_index_meta,
 };
 use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
 use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
@@ -14,7 +14,7 @@ use crate::ram::{
     cell::Cell,
     schema::{CompoundIndex, IndexType, Schema},
 };
-use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
+use bifrost::{conshash::ConsistentHashing, raft::client::AsRaftPlaneClient, rpc::RPCError};
 use futures::FutureExt;
 use futures::{
     future::BoxFuture,
@@ -23,7 +23,7 @@ use futures::{
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use std::cell::RefCell;
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -374,12 +374,15 @@ pub struct IndexBuilder {
 
 impl IndexBuilder {
     // Create a new IndexBuilder instance
-    pub async fn new(
+    pub async fn new<C>(
         neb_client: &Arc<AsyncClient>,
         conshash: &Arc<ConsistentHashing>,
-        raft_client: &Arc<RaftClient>,
+        raft_client: &Arc<C>,
         server_id: u64,
-    ) -> Self {
+    ) -> Self
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         let _ = IndexerClients::init_index_schema(neb_client).await;
         Self {
             clients: Arc::new(IndexerClients::new(
@@ -434,7 +437,8 @@ impl IndexBuilder {
             let schema_id = cell.header.schema;
             new_index_task(async move {
                 if let Some(key) = scannable_key {
-                    Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_id).await?;
+                    Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_id)
+                        .await?;
                 }
                 let res = Self::ensure_indices_(new_indices, old_indices, indexers).await;
                 debug!("Ensure indices result: {:?}", res);
@@ -455,71 +459,67 @@ impl IndexBuilder {
             schema_id
         );
         let pattern = Some(key.as_slice()[..16].to_vec());
-        for attempt in 0..4 {
-            match indexers.ranged_client.insert(&key).await {
-                Ok(true) => {
-                    let range = crate::index::ranged::tree::service::Range::new_inclusive_opened(
-                        key.clone(),
-                        crate::index::ranged::tree::btree::Ordering::Forward,
-                    );
-                    match crate::index::ranged::client::RangedIndexerClient::seek(
-                        &indexers.ranged_client,
-                        range,
-                        1,
-                        pattern.clone(),
-                    )
-                    .await
-                    {
-                        Ok(Some(cursor)) if cursor.current_block().first() == Some(&cell_id) => {
-                            return Ok(());
-                        }
-                        Ok(Some(cursor)) => {
-                            log::warn!(
-                                "ensure_scannable: inserted key not yet visible for cell_id={:?}, schema_id={}, attempt={}, first_seen={:?}",
-                                cell_id,
-                                schema_id,
-                                attempt + 1,
-                                cursor.current_block().first()
-                            );
-                        }
-                        Ok(None) => {
-                            log::warn!(
-                                "ensure_scannable: inserted key not yet queryable for cell_id={:?}, schema_id={}, attempt={}",
-                                cell_id,
-                                schema_id,
-                                attempt + 1
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "ensure_scannable: visibility check failed for cell_id={:?}, schema_id={}, attempt={}: {:?}",
-                                cell_id,
-                                schema_id,
-                                attempt + 1,
-                                e
-                            );
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let inserted = match indexers.ranged_client.insert(&key).await {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                log::error!("ensure_scannable: Failed to insert key: {:?}", e);
+                return Err(IndexError::RPCError(e));
+            }
+        };
+
+        for attempt in 0..32 {
+            let range = crate::index::ranged::tree::service::Range::new_inclusive_opened(
+                key.clone(),
+                crate::index::ranged::tree::btree::Ordering::Forward,
+            );
+            match crate::index::ranged::client::RangedIndexerClient::seek(
+                &indexers.ranged_client,
+                range,
+                1,
+                pattern.clone(),
+            )
+            .await
+            {
+                Ok(Some(cursor)) if cursor.current_block().first() == Some(&cell_id) => {
+                    return Ok(());
                 }
-                Ok(false) => {
+                Ok(Some(cursor)) => {
                     log::warn!(
-                        "ensure_scannable: insert returned false for cell_id={:?}, schema_id={}, attempt={}",
+                        "ensure_scannable: inserted key not yet visible for cell_id={:?}, schema_id={}, attempt={}, inserted={}, first_seen={:?}",
                         cell_id,
                         schema_id,
-                        attempt + 1
+                        attempt + 1,
+                        inserted,
+                        cursor.current_block().first()
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Ok(None) => {
+                    log::warn!(
+                        "ensure_scannable: inserted key not yet queryable for cell_id={:?}, schema_id={}, attempt={}, inserted={}",
+                        cell_id,
+                        schema_id,
+                        attempt + 1,
+                        inserted
+                    );
                 }
                 Err(e) => {
-                    log::error!("ensure_scannable: Failed to insert key: {:?}", e);
-                    return Err(IndexError::RPCError(e));
+                    log::warn!(
+                        "ensure_scannable: visibility check failed for cell_id={:?}, schema_id={}, attempt={}, inserted={}: {:?}",
+                        cell_id,
+                        schema_id,
+                        attempt + 1,
+                        inserted,
+                        e
+                    );
                 }
             }
+
+            let delay_ms = 10 + ((attempt / 4) as u64 * 10).min(70);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         Err(IndexError::Other(format!(
-            "ensure_scannable insert never became visible for cell_id={:?}, schema_id={}",
-            cell_id, schema_id
+            "ensure_scannable insert never became visible for cell_id={:?}, schema_id={}, inserted={}",
+            cell_id, schema_id, inserted
         )))
     }
 

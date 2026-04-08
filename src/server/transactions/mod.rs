@@ -1,7 +1,7 @@
 use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
 use crate::server::Peer;
-use bifrost::rpc::{RPCError, ServiceClient, ServiceClientWithId, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::{DEFAULT_CLIENT_POOL, RPCError, ServiceClient, ServiceClientWithId};
 use bifrost::vector_clock::StandardVectorClock;
 use std::io;
 use std::sync::Arc;

@@ -1,9 +1,9 @@
-use super::node::write_node;
-use super::node::NodeWriteGuard;
-use super::search::MutSearchResult;
 use super::BPlusTree;
 use super::LevelTree;
 use super::NodeCellRef;
+use super::node::NodeWriteGuard;
+use super::node::write_node;
+use super::search::MutSearchResult;
 use super::*;
 use itertools::Itertools;
 use std::collections::HashSet;
@@ -183,12 +183,19 @@ where
                             match right_node {
                                 RightCheck::SinglePtr => {}
                                 RightCheck::LevelTerminal(ref r) => panic!(
-                                    "Unexpected internal level terminal {:?}, tree level {}, lsm {}, {:?}, keys {:?}", 
-                                    r, level, lsm, src_tree.head_id(), read_unchecked::<KS, PS>(r).keys()
+                                    "Unexpected internal level terminal {:?}, tree level {}, lsm {}, {:?}, keys {:?}",
+                                    r,
+                                    level,
+                                    lsm,
+                                    src_tree.head_id(),
+                                    read_unchecked::<KS, PS>(r).keys()
                                 ),
                                 _ => panic!(
-                                    "Unexpected internal node status {:?}, tree level {}, lsm {}, {:?}", 
-                                    &right_node, level, lsm, src_tree.head_id()
+                                    "Unexpected internal node status {:?}, tree level {}, lsm {}, {:?}",
+                                    &right_node,
+                                    level,
+                                    lsm,
+                                    src_tree.head_id()
                                 ),
                             }
                         }

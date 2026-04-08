@@ -87,7 +87,7 @@ where
             }
             drop(node);
             if key_index == 0 {
-                    make_deleted::<KS, PS>(&node_id, tree);
+                make_deleted::<KS, PS>(&node_id, tree);
                 if !prev_node_ref.is_default() {
                     let mut prev_node = write_node::<KS, PS>(&prev_node_ref);
                     prev_node.extnode_mut(tree).next = Default::default();
@@ -101,7 +101,7 @@ where
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
                 num_removed_keys += node.len();
                 *node = NodeData::Empty(Box::new(Default::default()));
-                    make_deleted::<KS, PS>(&node_id, tree);
+                make_deleted::<KS, PS>(&node_id, tree);
             }
             tree.len.fetch_sub(num_removed_keys, Release);
             info!("LSM tree retention removed {} keys", num_removed_keys);

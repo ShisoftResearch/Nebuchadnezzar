@@ -73,10 +73,7 @@ impl RangedTree {
 
         let cell = match neb_client.read_cell(*tree_id).await {
             Ok(Ok(cell)) => {
-                info!(
-                    "[TREE LOAD] Successfully read tree root cell {:?}",
-                    tree_id
-                );
+                info!("[TREE LOAD] Successfully read tree root cell {:?}", tree_id);
                 cell
             }
             Ok(Err(e)) => {
@@ -127,10 +124,7 @@ impl RangedTree {
                 let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
                 // Cell already exists (we read it above), so use update_cell not write_cell
                 match neb_client.update_cell(tree_cell).await {
-                    Ok(Ok(_)) => info!(
-                        "[TREE LOAD] Repaired corrupt tree root cell {:?}",
-                        tree_id
-                    ),
+                    Ok(Ok(_)) => info!("[TREE LOAD] Repaired corrupt tree root cell {:?}", tree_id),
                     Ok(Err(e)) => error!(
                         "[TREE LOAD] Failed to repair corrupt cell {:?}: {:?}",
                         tree_id, e
@@ -175,10 +169,7 @@ impl RangedTree {
                 return Self { tree };
             }
         };
-        info!(
-            "[TREE LOAD] B-tree loaded with {} keys",
-            tree.count()
-        );
+        info!("[TREE LOAD] B-tree loaded with {} keys", tree.count());
 
         Self { tree }
     }
@@ -348,7 +339,7 @@ unsafe impl Sync for RangedTree {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{Feature, FEATURE_SIZE};
+    use crate::index::{FEATURE_SIZE, Feature};
     use crate::ram::types::Id;
     use byteorder::{BigEndian, WriteBytesExt};
     use lightning::map::HashSet as LFHashSet;

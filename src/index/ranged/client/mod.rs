@@ -3,7 +3,7 @@ use super::tree::service::*;
 use super::{sm::TreePlacement, tree::btree::Ordering};
 use crate::index::EntryKey;
 use crate::ram::types::Id;
-use bifrost::raft::client::RaftClient;
+use bifrost::raft::client::AsRaftPlaneClient;
 use bifrost::rpc::RPCError;
 use bifrost::{conshash::ConsistentHashing, raft::state_machine::master::ExecError};
 use futures::future::BoxFuture;
@@ -49,7 +49,10 @@ pub struct RangedIndexerClient {
 }
 
 impl RangedIndexerClient {
-    pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
+    pub fn new<C>(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<C>) -> Self
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         let sm = SMClient::new(crate::index::ranged::sm::DEFAULT_SM_ID, raft_client);
         Self {
             conshash: conshash.clone(),
@@ -60,12 +63,15 @@ impl RangedIndexerClient {
         }
     }
 
-    pub fn new_for_database(
+    pub fn new_for_database<C>(
         conshash: &Arc<ConsistentHashing>,
-        raft_client: &Arc<RaftClient>,
+        raft_client: &Arc<C>,
         group_name: &str,
         database_name: &str,
-    ) -> Self {
+    ) -> Self
+    where
+        C: AsRaftPlaneClient + 'static,
+    {
         let sm_id = crate::index::ranged::sm::generate_scoped_sm_id(group_name, database_name);
         let sm = SMClient::new(sm_id, raft_client);
         Self {

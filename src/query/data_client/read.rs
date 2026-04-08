@@ -9,17 +9,19 @@ use itertools::Itertools;
 use crate::{
     client::client_by_server_name_for_database,
     index::{
+        EntryKey, SCHEMA_SCAN_PATT_SIZE,
         ranged::{
             client::cursor::ClientCursor,
             tree::{btree::Ordering, service::Range},
         },
-        EntryKey, SCHEMA_SCAN_PATT_SIZE,
     },
     query::planner::normalize_selection_for_eval,
     ram::cell::OwnedCell,
 };
 
 use super::{DataCursor, IndexedDataClient, QueryOrdering, SCAN_BUFFER_SIZE};
+
+const SCHEMA_SCAN_BUFFER_SIZE: u16 = 2048;
 
 impl IndexedDataClient {
     pub(super) async fn scan_schema_index<'a>(
@@ -35,7 +37,7 @@ impl IndexedDataClient {
             .index_clients
             .range_seek(
                 Range::new_inclusive_opened(key, ordering),
-                SCAN_BUFFER_SIZE,
+                SCHEMA_SCAN_BUFFER_SIZE,
                 Some(SCHEMA_SCAN_PATT_SIZE),
             )
             .await?;
@@ -54,7 +56,7 @@ impl IndexedDataClient {
             .index_clients
             .range_seek(
                 Range::new_inclusive_opened(key, Ordering::Forward),
-                SCAN_BUFFER_SIZE,
+                SCHEMA_SCAN_BUFFER_SIZE,
                 Some(SCHEMA_SCAN_PATT_SIZE),
             )
             .await?
@@ -268,7 +270,10 @@ impl IndexedDataClient {
                         }
                     }
                     Err(e) => {
-                        warn!("Retry client creation error in read_cells_from_ids: {:?}", e);
+                        warn!(
+                            "Retry client creation error in read_cells_from_ids: {:?}",
+                            e
+                        );
                     }
                 }
             }

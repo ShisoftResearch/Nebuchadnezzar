@@ -1,5 +1,5 @@
 use super::*;
-use crate::ram::cell::{header_from_chunk_raw, OwnedCellRef};
+use crate::ram::cell::{OwnedCellRef, header_from_chunk_raw};
 use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
 use crate::server::{DatabaseRuntime, Peer};
@@ -383,10 +383,7 @@ impl DataManager {
             // The timestamp constraint won't change after waiting
             warn!(
                 "ReadTooLate: Transaction {:?} (effective ts: {:?}) trying to read cell {:?} but write timestamp {:?} is newer. Transaction timestamp is older than cell's write timestamp.",
-                tid,
-                effective_ts,
-                id,
-                meta.write
+                tid, effective_ts, id, meta.write
             );
             return Err(self.response_with(TxnExecResult::Rejected));
         }
