@@ -61,7 +61,8 @@ mod tests {
             "mock_test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         Arc::new(
             AsyncClient::new(

@@ -119,6 +119,7 @@ service_with_id!(TreeService, DEFAULT_SERVICE_ID);
 
 pub struct TreeService {
     client: Arc<AsyncClient>,
+    sm_client: Arc<SMClient>,
     trees: Arc<HashMap<Id, Arc<DistTree>>>,
     pending_migrations: Arc<HashMap<Id, Arc<DistTree>>>,
 }
@@ -298,7 +299,7 @@ impl Service for TreeService {
     }
 
     fn insert(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<'_, OpResult<bool>> {
-        self.apply_in_ranged_tree(id, entry, epoch, true, move |entry, tree, dist_prop| {
+        self.apply_in_ranged_tree(id, entry, epoch, true, move |entry, tree, _dist_prop| {
             let inserted = tree.insert(&entry);
             if inserted {
                 OpResult::Successful(true)
@@ -604,8 +605,78 @@ impl TreeService {
         Self::start_tree_balancer(&trees_map, &pending_migrations, client, sm_client);
         Self {
             client: client.clone(),
+            sm_client: sm_client.clone(),
             trees: trees_map,
             pending_migrations,
+        }
+    }
+
+    async fn hydrate_missing_tree(&self, id: Id, entry: &EntryKey) -> bool {
+        if self.trees.contains_key(&id) {
+            return true;
+        }
+
+        match self.sm_client.locate_key(entry).await {
+            Ok((lower, placement, upper)) if placement.id == id => {
+                if let Some(pending_tree) = self.pending_migrations.remove(&id) {
+                    {
+                        let mut pending_prop = pending_tree.prop.write();
+                        pending_prop.boundary = Boundary::new(lower.clone(), upper.clone());
+                        pending_prop.epoch = placement.epoch;
+                        pending_prop.migration = None;
+                    }
+                    self.trees.insert(id, pending_tree);
+                    info!(
+                        "Promoted missing active tree {:?} from pending migration for entry {:?}",
+                        id,
+                        entry.id()
+                    );
+                    return true;
+                }
+
+                info!(
+                    "Recovering missing active tree {:?} for entry {:?} with boundary [{:?}, {:?}), epoch={}",
+                    id,
+                    entry.id(),
+                    lower,
+                    upper,
+                    placement.epoch
+                );
+                let tree = RangedTree::recover(&self.client, &id).await;
+                if self.trees.contains_key(&id) {
+                    return true;
+                }
+                self.trees.insert(
+                    id,
+                    Arc::new(DistTree::new(
+                        id,
+                        tree,
+                        Boundary::new(lower, upper),
+                        None,
+                        placement.epoch,
+                    )),
+                );
+                true
+            }
+            Ok((_lower, placement, _upper)) => {
+                warn!(
+                    "Cannot hydrate missing tree {:?} for entry {:?}: placement currently points to {:?} (epoch={})",
+                    id,
+                    entry.id(),
+                    placement.id,
+                    placement.epoch
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot hydrate missing tree {:?} for entry {:?}: placement lookup failed: {:?}",
+                    id,
+                    entry.id(),
+                    e
+                );
+                false
+            }
         }
     }
 
@@ -1121,7 +1192,7 @@ impl TreeService {
         id: Id,
         entry: EntryKey,
         epoch: u64,
-        route_pending_migration_to_target: bool,
+        _route_pending_migration_to_target: bool,
         func: F,
     ) -> BoxFuture<'a, OpResult<R>>
     where
@@ -1129,25 +1200,32 @@ impl TreeService {
         R: Send + 'static,
     {
         async move {
-            if let Some(tree) = self.trees.get(&id) {
-                let tree_prop = tree.prop.read().clone();
-                if epoch < tree_prop.epoch {
-                    OpResult::EpochMissMatch(tree_prop.epoch, epoch)
-                } else if tree_prop.boundary.in_boundary(&entry) {
-                    if tree_prop.migration.is_some() {
-                        // Keep the source tree immutable while the split snapshot is copied and
-                        // placement catches up. Clients retry against fresh placement once the
-                        // migration window closes.
-                        OpResult::Migrating
-                    } else {
-                        func(&entry, &tree.tree, &tree_prop)
+            for attempt in 0..2 {
+                if let Some(tree) = self.trees.get(&id) {
+                    let tree_prop = tree.prop.read().clone();
+                    if epoch < tree_prop.epoch {
+                        return OpResult::EpochMissMatch(tree_prop.epoch, epoch);
                     }
-                } else {
-                    OpResult::OutOfBound
+                    if tree_prop.boundary.in_boundary(&entry) {
+                        if tree_prop.migration.is_some() {
+                            // Keep the source tree immutable while the split snapshot is copied and
+                            // placement catches up. Clients retry against fresh placement once the
+                            // migration window closes.
+                            return OpResult::Migrating;
+                        }
+                        return func(&entry, &tree.tree, &tree_prop);
+                    }
+                    return OpResult::OutOfBound;
                 }
-            } else {
-                OpResult::NotFound
+
+                if attempt == 0 && self.hydrate_missing_tree(id, &entry).await {
+                    continue;
+                }
+
+                return OpResult::NotFound;
             }
+
+            OpResult::NotFound
         }
         .boxed()
     }
@@ -1174,6 +1252,7 @@ impl Boundary {
     pub fn new(lower: EntryKey, upper: EntryKey) -> Self {
         Boundary { lower, upper }
     }
+
     fn in_boundary(&self, entry: &EntryKey) -> bool {
         // Allow max/min query as special cases
         (entry >= &self.lower && entry < &self.upper)
@@ -1197,6 +1276,7 @@ impl Range {
             },
         }
     }
+
     pub fn move_to(mut self, key: EntryKey) -> Self {
         match self.ordering {
             Ordering::Forward => self.start = RangeTerm::Inclusive(key),
@@ -1204,6 +1284,7 @@ impl Range {
         }
         self
     }
+
     pub fn key(&self) -> &EntryKey {
         match self.ordering {
             Ordering::Forward => match self.start {
@@ -1217,6 +1298,7 @@ impl Range {
         }
     }
 }
+
 
 dispatch_rpc_service_functions!(TreeService);
 

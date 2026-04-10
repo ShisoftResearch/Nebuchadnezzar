@@ -180,7 +180,23 @@ where
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
-        search_node(&self.get_root(), key, ordering)
+        search_node(&self.get_root(), key, ordering, &self.deletion, true)
+    }
+
+    pub(crate) fn seek_raw(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
+        search_node(&self.get_root(), key, ordering, &self.deletion, false)
+    }
+
+    pub(crate) fn mark_changed(&self, node: &NodeCellRef) {
+        external::make_changed(node, self);
+    }
+
+    pub(crate) fn increment_visible_len(&self) {
+        self.len.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn decrement_visible_len(&self) {
+        self.len.fetch_sub(1, Relaxed);
     }
 
     pub fn insert(&self, key: &EntryKey) -> bool {

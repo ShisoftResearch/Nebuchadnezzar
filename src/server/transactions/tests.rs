@@ -37,7 +37,8 @@ pub async fn workspace_wr() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema = Schema::new_with_id(
         1,
         &String::from("test"),
@@ -180,7 +181,8 @@ pub async fn data_site_wr() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema = Schema::new_with_id(
         1,
         &String::from("test"),
@@ -280,7 +282,8 @@ pub async fn multi_transaction() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema = Schema::new_with_id(
         1,
         &String::from("test"),
@@ -389,7 +392,8 @@ pub async fn smoke_rw() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema = Schema::new_with_id(
         1,
         &String::from("test"),

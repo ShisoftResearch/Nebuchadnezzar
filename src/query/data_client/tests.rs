@@ -230,7 +230,8 @@ async fn scan_all() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     // Require schema to be scannable to insert special scan key to the range indexer
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -457,7 +458,8 @@ async fn range_query_scan() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     // Require schema to be scannable to insert special scan key to the range indexer
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -536,6 +538,7 @@ async fn create_test_server(port: u16) -> Arc<NebServer> {
         async |_| {},
     )
     .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3529,7 +3532,8 @@ async fn hashed_query_test() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     // Create schema with hashed index on DATA_1
     let fields = Field::new_schema(vec![
@@ -3741,7 +3745,8 @@ async fn hashed_query_rejects_map_values() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         DATA_1,
@@ -3817,7 +3822,8 @@ async fn bm25_search_returns_ranked_results() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         TEXT_FIELD,
@@ -3923,7 +3929,8 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
@@ -4029,7 +4036,8 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
@@ -4135,7 +4143,8 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
@@ -4237,7 +4246,8 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         TEXT_FIELD,
@@ -4334,7 +4344,8 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
@@ -4470,7 +4481,8 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(TEXT_FIELD, Type::String, vec![IndexType::Fulltext]),
@@ -4597,7 +4609,8 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let embedding_field_id = hash_str(EMB_FIELD);
     let mut embedding_hits = HashMap::new();
@@ -4725,7 +4738,8 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let embedding_field_id = hash_str(EMB_FIELD);
     let mut embedding_hits = HashMap::new();
@@ -4863,7 +4877,8 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     assert!(
         server

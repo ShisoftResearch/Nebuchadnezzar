@@ -520,6 +520,7 @@ mod tests {
             async |_| {},
         )
         .await
+        .unwrap()
     }
 
     async fn data_manager_for_database(

@@ -83,7 +83,8 @@ async fn test_cell_location_alignment_after_write() {
         "alignment_test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -156,7 +157,8 @@ async fn test_cell_location_alignment_after_update() {
         "alignment_update_test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -252,7 +254,8 @@ async fn test_varying_size_alignment() {
         "alignment_varying_test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -436,7 +439,8 @@ async fn test_alignment_after_multiple_segments() {
         "alignment_multi_seg_test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,

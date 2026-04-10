@@ -9,8 +9,7 @@ use lightning::map::HashSet as LFHashSet;
 use std::mem;
 use std::sync::Arc;
 
-// DeletionSet type - kept for btree module compatibility
-// In single-tree design, we use an empty set (no tombstone tracking needed)
+// DeletionSet hides deleted keys immediately and lets page writeback compact them.
 pub type DeletionSet = LFHashSet<EntryKey>;
 
 pub const RANGED_TREE_SCHEMA_NAME: &'static str = "NEB_RANGED_TREE";
@@ -40,7 +39,6 @@ pub struct RangedTree {
 impl RangedTree {
     /// Create a new ranged tree
     pub async fn create(neb_client: &Arc<AsyncClient>, id: &Id) -> Self {
-        // Create a single disk tree (no deletion set needed for direct operations)
         let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
         let tree = DiskTree::new_with_client(&deletion_set, neb_client);
         tree.persist_root(neb_client).await;
@@ -177,26 +175,36 @@ impl RangedTree {
     /// Insert an entry into the tree
     pub fn insert(&self, entry: &EntryKey) -> bool {
         debug!("Inserting entry: {:?}", entry);
+        if self.tree.deletion.remove(entry) {
+            let cursor = self.tree.seek_raw(entry, Ordering::Forward);
+            if cursor.current() == Some(entry) {
+                if let Some(page) = cursor.page.as_ref() {
+                    self.tree.mark_changed(page);
+                }
+                self.tree.increment_visible_len();
+                return true;
+            }
+        }
         self.tree.insert(entry)
     }
 
     /// Delete an entry from the tree
-    ///
-    /// Note: Currently uses seek to verify existence.
-    /// TODO: Implement true B+ tree deletion for better performance.
     pub fn delete(&self, entry: &EntryKey) -> bool {
-        if let Some(k) = self.seek(entry, Ordering::Forward).current() {
-            if k == entry {
-                // TODO: Implement actual B+ tree node deletion
-                // For now, we mark as deleted in deletion set (temporary until delete is implemented)
-                warn!(
-                    "delete() not yet fully implemented - key {} will still exist",
-                    entry.len()
-                );
-                return true;
-            }
+        let cursor = self.tree.seek_raw(entry, Ordering::Forward);
+        if cursor.current() != Some(entry) {
+            return false;
         }
-        false
+
+        if !self.tree.deletion.insert(entry.clone()) {
+            return false;
+        }
+
+        if let Some(page) = cursor.page.as_ref() {
+            self.tree.mark_changed(page);
+        }
+
+        self.tree.decrement_visible_len();
+        true
     }
 
     /// Seek to a position in the tree
@@ -253,9 +261,28 @@ impl RangedTree {
         migration: Option<Id>,
         client: &Arc<AsyncClient>,
     ) -> Result<(), String> {
+        use crate::ram::cell::WriteError;
+
         let tree_cell = ranged_tree_cell(&self.tree.head_id(), id, migration);
-        match client.update_cell(tree_cell).await {
+        match client.update_cell(tree_cell.clone()).await {
             Ok(Ok(_)) => Ok(()),
+            Ok(Err(WriteError::CellDoesNotExisted)) => {
+                warn!(
+                    "Ranged tree metadata cell {:?} missing during checkpoint/update; recreating",
+                    id
+                );
+                match client.upsert_cell(tree_cell).await {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) => Err(format!(
+                        "Failed to recreate missing tree cell after update miss: {:?}",
+                        e
+                    )),
+                    Err(e) => Err(format!(
+                        "RPC error recreating missing tree cell after update miss: {:?}",
+                        e
+                    )),
+                }
+            }
             Ok(Err(e)) => Err(format!("Failed to write tree cell: {:?}", e)),
             Err(e) => Err(format!("RPC error updating tree cell: {:?}", e)),
         }
@@ -352,10 +379,21 @@ mod tests {
         }
     }
 
-    fn make_key(n: u64) -> EntryKey {
+    fn make_feature(n: u64) -> Feature {
         let mut feature: Feature = [0u8; FEATURE_SIZE];
         let mut c = std::io::Cursor::new(&mut feature[..]);
         c.write_u64::<BigEndian>(n).unwrap();
+        feature
+    }
+
+    fn feature_from_key(key: &EntryKey) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&key.as_slice()[8..16]);
+        u64::from_be_bytes(bytes)
+    }
+
+    fn make_key(n: u64) -> EntryKey {
+        let feature = make_feature(n);
         EntryKey::from_props(&Id::new(1, n), &feature, 100, 1)
     }
 
@@ -364,9 +402,7 @@ mod tests {
     }
 
     fn make_field_key(schema_id: u32, field: u64, n: u64, id: Id) -> EntryKey {
-        let mut feature: Feature = [0u8; FEATURE_SIZE];
-        let mut c = std::io::Cursor::new(&mut feature[..]);
-        c.write_u64::<BigEndian>(n).unwrap();
+        let feature = make_feature(n);
         EntryKey::from_props(&id, &feature, field, schema_id)
     }
 
@@ -523,6 +559,219 @@ mod tests {
 
         let expected: Vec<_> = (0..n).map(make_key).collect();
         assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn delete_hides_key_and_insert_restores_it() {
+        let tree = make_tree();
+        let key_1 = make_key(1);
+        let key_2 = make_key(2);
+        let key_3 = make_key(3);
+
+        assert!(tree.insert(&key_1));
+        assert!(tree.insert(&key_2));
+        assert!(tree.insert(&key_3));
+        assert_eq!(tree.count(), 3);
+
+        assert!(tree.delete(&key_2));
+        assert!(!tree.delete(&key_2));
+        assert_eq!(tree.count(), 2);
+
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut visible = Vec::new();
+        if let Some(key) = cursor.current() {
+            visible.push(key.clone());
+        }
+        while let Some(key) = cursor.next() {
+            if visible.last() != Some(&key) {
+                visible.push(key);
+            }
+        }
+        assert_eq!(visible, vec![key_1.clone(), key_3.clone()]);
+
+        assert!(tree.insert(&key_2));
+        assert_eq!(tree.count(), 3);
+
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut restored = Vec::new();
+        if let Some(key) = cursor.current() {
+            restored.push(key.clone());
+        }
+        while let Some(key) = cursor.next() {
+            if restored.last() != Some(&key) {
+                restored.push(key);
+            }
+        }
+        assert_eq!(restored, vec![key_1, key_2, key_3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_survives_recovery() {
+        use crate::client;
+        use crate::index::ranged::tree::btree::{Ordering, page_schema, storage};
+        use crate::server::{NebServer, ServerOptions, Service};
+
+        let _ = env_logger::try_init();
+
+        let server_addr = String::from("127.0.0.1:6730");
+        let server_group = "ranged_tree_delete_recovery";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+
+        storage::start_external_nodes_write_back(&client);
+
+        let tree_id = Id::new(901, 901);
+        let schema_id = 1;
+        let field = 777;
+        let tree = RangedTree::create(&client, &tree_id).await;
+
+        for value in 10..=12 {
+            assert!(tree.insert(&make_field_key(schema_id, field, value, Id::new(5, value))));
+        }
+        assert_eq!(tree.count(), 3);
+
+        let deleted = make_field_key(schema_id, field, 11, Id::new(5, 11));
+        assert!(tree.delete(&deleted));
+        assert_eq!(tree.count(), 2);
+
+        let start_key = EntryKey::for_schema_field_feature(schema_id, field, &make_feature(10));
+        let end_key = EntryKey::from_props(
+            &Id::new(u64::MAX, u64::MAX),
+            &make_feature(12),
+            field,
+            schema_id,
+        );
+
+        let collect_visible = |tree: &RangedTree| {
+            let mut cursor = tree.seek(&start_key, Ordering::Forward);
+            let mut visible = Vec::new();
+            while let Some(key) = cursor.next() {
+                if key.prefix_gt(&end_key) {
+                    break;
+                }
+                visible.push(feature_from_key(&key));
+            }
+            visible
+        };
+
+        assert_eq!(collect_visible(&tree), vec![10, 12]);
+
+        storage::wait_until_updated().await;
+        drop(tree);
+
+        let recovered = RangedTree::recover(&client, &tree_id).await;
+        assert_eq!(recovered.count(), 2);
+        assert_eq!(collect_visible(&recovered), vec![10, 12]);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mark_migration_recreates_missing_tree_cell() {
+        use crate::client;
+        use crate::index::ranged::tree::btree::{page_schema, storage};
+        use crate::server::{NebServer, ServerOptions, Service};
+
+        let _ = env_logger::try_init();
+
+        let server_addr = String::from("127.0.0.1:6732");
+        let server_group = "ranged_tree_mark_migration_repair";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+
+        storage::start_external_nodes_write_back(&client);
+
+        let tree_id = Id::new(902, 902);
+        let tree = RangedTree::create(&client, &tree_id).await;
+        let head_id = tree.head_id();
+
+        client.remove_cell(tree_id).await.unwrap().unwrap();
+        tree.mark_migration(&tree_id, None, &client)
+            .await
+            .expect("mark_migration should recreate a missing tree metadata cell");
+
+        let restored = client.read_cell(tree_id).await.unwrap().unwrap();
+        assert_eq!(restored.data[*RANGED_TREE_HEAD_HASH].id(), Some(&head_id));
+
+        server.shutdown().await;
     }
 
     #[test]

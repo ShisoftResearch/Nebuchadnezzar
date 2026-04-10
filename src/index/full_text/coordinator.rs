@@ -494,7 +494,8 @@ mod tests {
             "shard1_group",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         info!("Creating shard 2...");
         let shard2 = crate::server::NebServer::new_from_opts(
@@ -514,7 +515,8 @@ mod tests {
             "shard2_group",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -765,7 +767,8 @@ mod tests {
             "single_shard_test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema_id = 501u32;
         let content_field = "content";
@@ -863,7 +866,8 @@ mod tests {
             "empty_query_test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let coordinator = DistributedInvertedIndexCoordinator::new(
             server.consh.clone(),

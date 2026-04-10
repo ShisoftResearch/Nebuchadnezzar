@@ -2111,4 +2111,5 @@ async fn create_alignment_test_server(port: u16) -> Arc<NebServer> {
         async |_| {},
     )
     .await
+    .unwrap()
 }

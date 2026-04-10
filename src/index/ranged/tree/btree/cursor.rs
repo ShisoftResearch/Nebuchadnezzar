@@ -14,6 +14,8 @@ where
     pub page: Option<NodeCellRef>,
     pub marker: PhantomData<(KS, PS)>,
     pub current: Option<EntryKey>,
+    pub deletion: Arc<DeletionSet>,
+    pub filter_deleted: bool,
 }
 
 impl<KS, PS> RTCursor<KS, PS>
@@ -21,22 +23,32 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(pos: usize, page: &NodeCellRef, ordering: Ordering) -> Self {
+    pub fn new(
+        pos: usize,
+        page: &NodeCellRef,
+        ordering: Ordering,
+        deletion: Arc<DeletionSet>,
+        filter_deleted: bool,
+    ) -> Self {
         let mut cursor = RTCursor {
             index: pos,
             ordering,
             page: Some(page.clone()),
             marker: PhantomData,
             current: None,
+            deletion,
+            filter_deleted,
         };
         match ordering {
             Ordering::Forward
                 if pos >= read_node(page, |node: &NodeReadHandler<KS, PS>| node.len()) =>
             {
-                cursor.next();
+                let _ = cursor.next_raw_candidate();
+                cursor.skip_deleted_current();
             }
             _ => {
                 cursor.current = Self::read_current(page, pos);
+                cursor.skip_deleted_current();
             }
         }
         trace!(
@@ -58,7 +70,22 @@ where
         })
     }
 
-    fn next_candidate(&mut self) -> Option<EntryKey> {
+    fn current_is_deleted(&self) -> bool {
+        self.filter_deleted
+            && self
+                .current
+                .as_ref()
+                .map(|key| self.deletion.contains(key))
+                .unwrap_or(false)
+    }
+
+    fn skip_deleted_current(&mut self) {
+        while self.current_is_deleted() {
+            let _ = self.next_raw_candidate();
+        }
+    }
+
+    fn next_raw_candidate(&mut self) -> Option<EntryKey> {
         loop {
             let search_result = if self.page.is_some() {
                 let current_page = self.page.clone().unwrap();
@@ -160,6 +187,12 @@ where
                 return res;
             }
         }
+    }
+
+    fn next_candidate(&mut self) -> Option<EntryKey> {
+        let res = self.next_raw_candidate();
+        self.skip_deleted_current();
+        res
     }
 }
 

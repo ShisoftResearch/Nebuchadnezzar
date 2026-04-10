@@ -1991,7 +1991,8 @@ mod tests {
             "test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema = crate::ram::schema::Schema::new_with_id(
             1,
@@ -2072,7 +2073,8 @@ mod tests {
             "test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         server2.meta().schemas.debug_only_new_schema(schema.clone());
 
@@ -2139,7 +2141,8 @@ mod tests {
             "test",
             async move |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Add schema via async client so it's persisted to Raft
         use crate::client::AsyncClient;
@@ -2245,7 +2248,8 @@ mod tests {
             "test",
             async move |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Cell should have original value after rollback
         let restored_cell = server2.chunks().read_cell(&cell_id).unwrap();
@@ -2306,7 +2310,8 @@ mod tests {
             "test",
             async move |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Add schema via async client so it's persisted to Raft
         use crate::client::AsyncClient;
@@ -2396,7 +2401,8 @@ mod tests {
             "test",
             async move |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Cell should exist after rollback
         let restored_cell = server2.chunks().read_cell(&cell_id).unwrap();
@@ -2450,7 +2456,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Wait for Raft to stabilize before starting the test
         // This prevents overwhelming the Raft heartbeat mechanism
@@ -2526,7 +2533,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Wait for Raft to stabilize after recovery restart
         sleep(Duration::from_millis(500)).await;

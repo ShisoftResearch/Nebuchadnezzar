@@ -36,7 +36,8 @@ pub async fn database_catalog() {
         database_name,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(server.database_name(), database_name);
 
@@ -100,7 +101,8 @@ pub async fn general() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema = Schema::new_with_id(
         1,
         &String::from("test"),
@@ -251,7 +253,8 @@ pub async fn multi_cell_update() {
         server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema = Schema::new_with_id(
         1,
         &String::from("test"),
@@ -354,7 +357,8 @@ async fn schema_validation_context(
         server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let client = Arc::new(
         client::AsyncClient::new(
@@ -698,7 +702,8 @@ pub async fn write_skew() {
         server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema = Schema::new_with_id(
         1,
         &String::from("test"),
@@ -798,7 +803,8 @@ pub async fn server_isolation() {
         server_1_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let client1 = Arc::new(
         client::AsyncClient::new(
             &server_1.rpc,
@@ -827,7 +833,8 @@ pub async fn server_isolation() {
         server_2_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let client2 = Arc::new(
         client::AsyncClient::new(
             &server_2.rpc,

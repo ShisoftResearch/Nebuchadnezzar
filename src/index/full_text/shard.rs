@@ -1292,7 +1292,8 @@ mod tests {
             "basic_test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Create a simple schema with fulltext indexing
         let schema_id = 999u32;
@@ -1414,7 +1415,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema_id = 500u32;
         let content_field = "content";
@@ -1578,7 +1580,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema_id = 501u32;
         let content_field = "content";
@@ -1777,7 +1780,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema_id = 600u32;
         let content_field = "content";
@@ -1931,7 +1935,8 @@ mod tests {
             "hybrid_index_test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Get the indexer from the server
         let indexer = server
@@ -2039,7 +2044,8 @@ mod tests {
             "hybrid_index_remove_test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Get the indexer from the server
         let indexer = server
@@ -2118,7 +2124,8 @@ mod tests {
             "hybrid_index_flush_test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Get the indexer from the server
         let indexer = server
@@ -2202,7 +2209,8 @@ mod tests {
             "per_chunk_index_test",
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Get the indexer from the server
         let indexer = server
@@ -2276,7 +2284,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Create a schema with a text field that has Fulltext index
         let schema_id = 200u32;
@@ -2488,7 +2497,10 @@ mod tests {
         .await;
 
         let server = match server_result {
-            Ok(s) => s,
+            Ok(Ok(server)) => server,
+            Ok(Err(error)) => {
+                panic!("Server creation failed: {:?}", error);
+            }
             Err(_) => {
                 panic!("Server creation timed out after 30 seconds");
             }
@@ -2704,7 +2716,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         info!("Server 1 created, setting up schema...");
         let schema_id = 300u32;
@@ -3023,7 +3036,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         info!("Server 2 created with recovery, registering schemas...");
         // Re-register schemas (needed for recovery)
@@ -3195,7 +3209,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema_id = 301u32;
         let content_field = "content";
@@ -3305,7 +3320,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         server2.meta().schemas.debug_only_new_schema(schema.clone());
         server2
@@ -3425,7 +3441,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema_id = 700u32;
         let content_field = "content";
@@ -3584,7 +3601,8 @@ mod tests {
             group_name,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema_id = 701u32;
         let aliases_field = "aliases";

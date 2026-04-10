@@ -1126,6 +1126,7 @@ mod tests {
             async |_| {},
         )
         .await
+        .unwrap()
     }
 
     fn install_basic_schema(runtime: &Arc<crate::server::DatabaseRuntime>) -> Schema {

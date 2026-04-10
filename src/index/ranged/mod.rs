@@ -43,7 +43,8 @@ mod tests {
             server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
         let client = Arc::new(
             AsyncClient::new(
                 &server.rpc,
@@ -163,7 +164,8 @@ mod tests {
             server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
         let client = Arc::new(
             AsyncClient::new(
                 &server.rpc,

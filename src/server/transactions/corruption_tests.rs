@@ -43,7 +43,8 @@ async fn test_rapid_concurrent_updates_same_cell() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -154,7 +155,8 @@ async fn test_varying_size_concurrent_updates() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -253,7 +255,8 @@ async fn test_multi_cell_concurrent_transactions() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -355,7 +358,8 @@ async fn test_rapid_commit_sequence() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -441,7 +445,8 @@ async fn test_interleaved_prepare_commit() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -543,7 +548,8 @@ async fn test_maximum_concurrency_stress() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -653,7 +659,8 @@ async fn test_wikidata_import_scenario() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         1,
@@ -778,7 +785,8 @@ async fn test_update_cell_by_stress() {
         group_name,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     // Wait for Raft to stabilize before starting stress test
     // This prevents overwhelming the Raft heartbeat mechanism

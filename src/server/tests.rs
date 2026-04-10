@@ -52,7 +52,8 @@ pub async fn init() {
         &String::from("test"),
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -84,7 +85,8 @@ pub async fn explicit_database_binding_scopes_storage_roots() {
         database_name,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(server.database_name(), database_name);
     assert!(
@@ -130,7 +132,8 @@ pub async fn resolves_bound_database_runtime_by_name() {
         database_name,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let looked_up_runtime = server
         .database(database_name)
@@ -180,7 +183,8 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
         "dynamic_database_runtime_group",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let default_runtime = server.current_database();
     let analytics_runtime = server
@@ -258,7 +262,8 @@ pub async fn unload_database_runtime_evicts_non_default_runtime() {
         "runtime_unload_group",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let analytics_runtime = server
         .ensure_database_runtime("analytics")
@@ -318,7 +323,8 @@ pub async fn delete_database_storage_removes_scoped_paths() {
         "runtime_delete_storage_group",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     server
         .ensure_database_runtime("analytics/db")
@@ -375,7 +381,8 @@ pub async fn unload_database_runtime_unchecked_allows_default() {
         "runtime_unchecked_unload_group",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let default_name = server.database_name().to_string();
 
@@ -432,7 +439,8 @@ pub async fn delete_database_storage_unchecked_allows_default() {
         group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let default_name = server.database_name().to_string();
 
@@ -498,7 +506,8 @@ pub async fn smoke_test() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema_id = 123;
     let schema = Schema::new_with_id(
         schema_id,
@@ -579,7 +588,8 @@ pub async fn smoke_test_parallel() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema_id = 123;
     let schema = Schema::new_with_id(
         schema_id,
@@ -679,7 +689,8 @@ pub async fn txn() {
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
     let schema_id = 123;
     let schema = Schema::new_with_id(
         schema_id,
@@ -740,7 +751,8 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
         &server_group,
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema_id = 321;
     let schema = Schema::new_with_id(
@@ -840,7 +852,8 @@ pub async fn schema_wal_recovery_test() {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let client = Arc::new(
             client::AsyncClient::new(
@@ -954,7 +967,8 @@ pub async fn schema_wal_recovery_test() {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let client2 = Arc::new(
             client::AsyncClient::new(
@@ -1044,7 +1058,8 @@ pub async fn schema_snapshot_recovery_test() {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let client = Arc::new(
             client::AsyncClient::new(
@@ -1179,7 +1194,8 @@ pub async fn schema_snapshot_recovery_test() {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let client2 = Arc::new(
             client::AsyncClient::new(
@@ -1290,7 +1306,8 @@ pub async fn schema_persistence_multiple_restarts() {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let client = Arc::new(
             client::AsyncClient::new(
@@ -1359,7 +1376,8 @@ pub async fn schema_persistence_multiple_restarts() {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let client = Arc::new(
             client::AsyncClient::new(
@@ -1414,7 +1432,8 @@ pub async fn memory_status_test() {
         "memory_status_test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     // Get memory status
     let status = server.memory_status();

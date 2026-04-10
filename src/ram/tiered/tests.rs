@@ -927,7 +927,8 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn()
         "tiered_single_db_cleaner_drift",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         9021,
@@ -1004,7 +1005,8 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
         "tiered_multi_db_cleaner_drift",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let analytics = server
         .ensure_database_runtime("analytics")
@@ -1127,7 +1129,8 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
         "tiered_unload_reload_drift",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let analytics = server
         .ensure_database_runtime("analytics")
@@ -1274,7 +1277,8 @@ async fn test_global_eviction_across_multiple_databases() {
         "tiered_multi_db_global",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let analytics = server
         .ensure_database_runtime("analytics")
@@ -1416,7 +1420,8 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
         "tiered_multi_db_threshold_gate",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let analytics = server
         .ensure_database_runtime("analytics")
@@ -1813,7 +1818,8 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         "large_scale_test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     // Create schema
     let fields = fields_with_score();
@@ -2160,7 +2166,8 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
         "stress_test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let fields = fields_with_score();
     let schema = Schema::new("stress_schema", None, fields, false, false);
@@ -2373,7 +2380,8 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         schema_id,
@@ -2656,7 +2664,8 @@ async fn test_direct_writes_with_tiered_memory() {
         "test",
         async |_| {},
     )
-    .await;
+    .await
+    .unwrap();
 
     let schema = Schema::new_with_id(
         schema_id,

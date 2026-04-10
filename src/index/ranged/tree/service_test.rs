@@ -527,7 +527,8 @@ mod test {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
         let client = Arc::new(
             client::AsyncClient::new(
                 &server.rpc,
@@ -784,7 +785,8 @@ mod test {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
         let client = Arc::new(
             client::AsyncClient::new(
                 &server.rpc,
@@ -1001,7 +1003,8 @@ mod test {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Define schema with ranged index on price field
         let fields = Field::new_schema(vec![
@@ -1161,7 +1164,8 @@ mod test {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         // Re-register the schema after recovery (schemas are recovered from Raft but need to be loaded into cache)
         println!("Re-registering schema...");
@@ -1285,7 +1289,8 @@ mod test {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
         let client = Arc::new(
             client::AsyncClient::new(
                 &server.rpc,
@@ -1389,7 +1394,8 @@ mod test {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let client = Arc::new(
             client::AsyncClient::new(
@@ -1514,7 +1520,8 @@ mod test {
             &server_group,
             async |_| {},
         )
-        .await;
+        .await
+        .unwrap();
 
         let schema = Schema::new_with_id(
             302,
