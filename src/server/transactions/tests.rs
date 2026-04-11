@@ -30,6 +30,7 @@ pub async fn workspace_wr() {
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
+            disable_storage_locks: true,
             undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
         },
@@ -174,6 +175,7 @@ pub async fn data_site_wr() {
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
+            disable_storage_locks: true,
             undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
         },
@@ -275,6 +277,7 @@ pub async fn multi_transaction() {
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
+            disable_storage_locks: true,
             undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
         },
@@ -385,6 +388,7 @@ pub async fn smoke_rw() {
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
+            disable_storage_locks: true,
             undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
         },

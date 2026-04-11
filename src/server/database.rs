@@ -194,6 +194,7 @@ mod tests {
             services: vec![],
             index_enabled: false,
             enable_recovery: false,
+            disable_storage_locks: true,
         }
     }
 

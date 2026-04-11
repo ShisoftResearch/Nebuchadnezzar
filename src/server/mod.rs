@@ -491,6 +491,8 @@ pub struct ServerOptions {
     pub services: Vec<Service>,
     pub index_enabled: bool,
     pub enable_recovery: bool,
+    #[serde(default)]
+    pub disable_storage_locks: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -729,7 +731,7 @@ impl NebServer {
         let storage_locks = match pre_acquired_storage_locks {
             Some(locks) => locks,
             None => Arc::new(
-                StorageDirectoryLocks::acquire(&storage_layout)
+                StorageDirectoryLocks::acquire(&storage_layout, opts.disable_storage_locks)
                     .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
             ),
         };
@@ -1412,7 +1414,7 @@ impl NebServer {
         let storage_layout =
             database::DatabaseStorageLayout::from_options(opts, group_name, database_name);
         let startup_storage_locks = Arc::new(
-            StorageDirectoryLocks::acquire(&storage_layout)
+            StorageDirectoryLocks::acquire(&storage_layout, opts.disable_storage_locks)
                 .map_err(|e| ServerError::CannotAcquireStorageLock(e.to_string()))?,
         );
         debug!("Creating RPC server and listen");

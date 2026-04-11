@@ -27,6 +27,7 @@ async fn main() {
         services: vec![Service::Cell],
         index_enabled: false,
         enable_recovery: false,
+        disable_storage_locks: false,
     };
 
     // Create server instance

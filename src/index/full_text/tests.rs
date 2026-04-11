@@ -56,6 +56,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![crate::server::Service::Cell],
                 enable_recovery: false,
+                disable_storage_locks: true,
             },
             "127.0.0.1:29500",
             "mock_test",

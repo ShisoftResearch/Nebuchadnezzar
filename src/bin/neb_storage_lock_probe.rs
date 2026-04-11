@@ -104,6 +104,7 @@ async fn async_main(args: ProbeArgs) -> Result<(), String> {
             index_enabled: false,
             services: vec![],
             enable_recovery: false,
+            disable_storage_locks: false,
         },
         &args.server_addr,
         &args.group_name,

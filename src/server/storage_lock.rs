@@ -69,8 +69,11 @@ impl Display for StorageLockError {
 impl std::error::Error for StorageLockError {}
 
 impl StorageDirectoryLocks {
-    pub fn acquire(layout: &DatabaseStorageLayout) -> Result<Self, StorageLockError> {
-        if should_skip_storage_locks() {
+    pub fn acquire(
+        layout: &DatabaseStorageLayout,
+        disable_storage_locks: bool,
+    ) -> Result<Self, StorageLockError> {
+        if disable_storage_locks {
             return Ok(Self { _guards: Vec::new() });
         }
 
@@ -91,10 +94,6 @@ impl StorageDirectoryLocks {
 
         Ok(Self { _guards: guards })
     }
-}
-
-fn should_skip_storage_locks() -> bool {
-    cfg!(test)
 }
 
 impl DirectoryLockGuard {

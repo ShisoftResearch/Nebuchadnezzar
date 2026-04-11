@@ -1984,6 +1984,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
+                disable_storage_locks: true,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
                 raft_storage: Some(raft_path_str.clone()), // Needed for schema recovery when segments exist
             },
@@ -2066,6 +2067,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
+                disable_storage_locks: true,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
                 raft_storage: Some(raft_path_str.clone()), // Needed for schema recovery when segments exist
             },
@@ -2134,6 +2136,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
+                disable_storage_locks: true,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
                 raft_storage: Some(raft_path.to_str().unwrap().to_string()), // Enable Raft persistence for schema
             },
@@ -2241,6 +2244,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
+                disable_storage_locks: true,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
                 raft_storage: Some(raft_path.to_str().unwrap().to_string()), // Use same Raft storage to recover schema
             },
@@ -2303,6 +2307,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
+                disable_storage_locks: true,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
                 raft_storage: Some(raft_path.to_str().unwrap().to_string()), // Enable Raft persistence for schema
             },
@@ -2394,6 +2399,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
+                disable_storage_locks: true,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
                 raft_storage: Some(raft_path.to_str().unwrap().to_string()), // Use same Raft storage to recover schema
             },
@@ -2449,6 +2455,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
+                disable_storage_locks: true,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
                 raft_storage: Some(raft_path_str.clone()), // Needed for schema recovery when segments exist
             },
@@ -2526,6 +2533,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
+                disable_storage_locks: true,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
                 raft_storage: Some(raft_path_str.clone()), // Needed for schema recovery when segments exist
             },

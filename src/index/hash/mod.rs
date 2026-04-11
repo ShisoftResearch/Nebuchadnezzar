@@ -408,6 +408,7 @@ mod tests {
                 index_enabled: false,
                 services: vec![Service::Cell],
                 enable_recovery: false,
+                disable_storage_locks: true,
             },
             &server_addr,
             &server_group,

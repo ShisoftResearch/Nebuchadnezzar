@@ -2105,6 +2105,7 @@ async fn create_alignment_test_server(port: u16) -> Arc<NebServer> {
             index_enabled: true,
             services: vec![Service::Cell, Service::Query],
             enable_recovery: false,
+            disable_storage_locks: true,
         },
         &server_addr,
         &server_group,
