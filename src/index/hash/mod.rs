@@ -303,7 +303,7 @@ impl HashIndexer {
                             .await;
                         if let Ok(Ok(cell)) = &cell_res {
                             let field_val = &cell[0usize];
-                            if field_val == value {
+                            if values_semantically_equal(field_val, value) {
                                 result.push(*id);
                             } else {
                                 debug!(
@@ -376,8 +376,9 @@ pub fn get_null_hash_id(schema: u32, field: u64) -> Id {
     Id::from_obj(&(schema, field, "NULL_BUCKET"))
 }
 
-pub fn get_hash_id_from_value<V: Value>(schema: u32, field: u64, value: &V) -> Id {
-    let hash_feat = value.hash();
+pub fn get_hash_id_from_value(schema: u32, field: u64, value: &OwnedValue) -> Id {
+    let hash_feat = hash_indexable_owned_value(value)
+        .expect("hash index values must be scalar values or flat scalar arrays");
     get_hash_id(schema, field, hash_feat)
 }
 
@@ -385,7 +386,6 @@ pub fn get_hash_id_from_value<V: Value>(schema: u32, field: u64, value: &V) -> I
 mod tests {
     use super::*;
     use crate::client::AsyncClient;
-    use crate::ram::schema::Field;
     use crate::server::{NebServer, ServerOptions, Service};
     use std::sync::Arc;
     use tokio::task::JoinSet;

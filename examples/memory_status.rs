@@ -30,8 +30,9 @@ async fn main() {
     };
 
     // Create server instance
-    let server =
-        NebServer::new_from_opts(&opts, "127.0.0.1:9000", "test_group", async |_| {}).await;
+    let server = NebServer::new_from_opts(&opts, "127.0.0.1:9000", "test_group", async |_| {})
+        .await
+        .expect("server should start");
 
     // Get memory status
     let status = server.memory_status();

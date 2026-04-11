@@ -9,7 +9,7 @@ use crate::index::full_text::{
 };
 use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
 use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
-use crate::ram::types::Id;
+use crate::ram::types::{hash_indexable_owned_value, Id, OwnedValue};
 use crate::ram::{
     cell::Cell,
     schema::{CompoundIndex, IndexType, Schema},
@@ -706,11 +706,12 @@ where
     schema.index_fields.iter().for_each(|(field_id, indices)| {
         if let Some(id_path) = schema.id_index.get(field_id) {
             let value = cell.data().get_in_by_ids(id_path);
+            let owned_value = value.to_owned_value();
             let mut components = vec![];
             let mut metas = vec![];
 
             // Handle array data
-            if value.is_prime_array() {
+            if matches!(owned_value, OwnedValue::Array(_) | OwnedValue::PrimArray(_)) {
                 // Index each element of the array
                 for index in indices {
                     match index {
@@ -739,25 +740,23 @@ where
                             config,
                         )),
                         &IndexType::Fulltext => {
-                            let owned_value = value.to_owned_value();
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
                                 cell.header().version,
                                 schema.id,
                                 *field_id,
-                                owned_value,
+                                owned_value.clone(),
                             ) {
                                 metas.push(IndexMeta::FullText(meta));
                             }
                         }
                         &IndexType::Embedding(ref model) => {
-                            let owned_value = value.to_owned_value();
                             if let Some(meta) = build_embedding_index_meta(
                                 cell.id(),
                                 schema.id,
                                 *field_id,
                                 model.clone(),
-                                owned_value,
+                                owned_value.clone(),
                             ) {
                                 metas.push(IndexMeta::Embedding(meta));
                             }
@@ -767,25 +766,20 @@ where
                 }
             } else {
                 // Handle scalar data
-                let owned_value = value.to_owned_value();
                 let null_scalar = matches!(
-                    owned_value,
-                    crate::ram::types::OwnedValue::Null | crate::ram::types::OwnedValue::NA
-                );
-                let indexable_scalar = !matches!(
                     owned_value,
                     crate::ram::types::OwnedValue::Null | crate::ram::types::OwnedValue::NA
                 );
                 for index in indices {
                     match index {
                         &IndexType::Ranged => {
-                            if indexable_scalar {
+                            if !null_scalar {
                                 components.push(IndexComps::Ranged(value.feature()))
                             }
                         }
                         &IndexType::Hashed => {
-                            if indexable_scalar {
-                                components.push(IndexComps::Hashed(value.hash()))
+                            if let Some(feature) = hash_indexable_owned_value(&owned_value) {
+                                components.push(IndexComps::Hashed(feature))
                             }
                         }
                         &IndexType::Null => {

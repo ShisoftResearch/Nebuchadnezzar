@@ -3,7 +3,7 @@ use crate::{
     index::builder::IndexError,
     index::embedding::{EmbeddingHit, EmbeddingIndexerCore, EmbeddingModel, EmbeddingModelInfo},
     index::ranged::tree::btree::Ordering,
-    index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore},
+    index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexerCore},
     query::data_client::{
         AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateSpec,
         ProjectionField, ProjectionItem, QueryOrdering, QueryResultCursor, QueryRow, ValueRange,
@@ -485,6 +485,7 @@ async fn range_query_scan() {
         let cell = OwnedCell::new_with_id(schema_id_1, &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
+    await_ranged_indices_ready().await;
     let idx_data_client = server.indexed_data_client();
     let val_range = ValueRange {
         start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(5).shared()),
@@ -514,6 +515,8 @@ async fn range_query_scan() {
     if let Some(cell) = out_of_range_item {
         panic!("Should not have any more cell. Got id {:?}", cell.id());
     }
+
+    server.shutdown().await;
 }
 
 // Helper function to create a test server for ranged query tests
@@ -539,6 +542,10 @@ async fn create_test_server(port: u16) -> Arc<NebServer> {
     )
     .await
     .unwrap()
+}
+
+async fn await_ranged_indices_ready() {
+    crate::index::ranged::tree::btree::storage::wait_until_updated().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -679,6 +686,8 @@ async fn range_query_scan_inclusive_exclusive() {
         results.iter().any(|&v| v >= 30 && v <= 70),
         "Should have values in range [30, 70]"
     );
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -709,6 +718,8 @@ async fn range_query_scan_open_ranges() {
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
+
+    await_ranged_indices_ready().await;
 
     let idx_data_client = server.indexed_data_client();
     let field_id = hash_str(DATA_1);
@@ -829,6 +840,8 @@ async fn range_query_scan_open_ranges() {
         cursor.next().await.unwrap().is_none(),
         "Should not have more items"
     );
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -895,6 +908,8 @@ async fn range_query_scan_backward_ordering() {
         cursor.next().await.unwrap().is_none(),
         "Should not have more items"
     );
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1051,6 +1066,8 @@ async fn range_query_scan_edge_cases() {
             values
         );
     }
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1124,6 +1141,8 @@ async fn range_query_scan_large_dataset() {
         cursor.next().await.unwrap().is_none(),
         "Should not have more items"
     );
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1192,7 +1211,7 @@ async fn range_query_scan_with_selection() {
     // Verify we got values in the expected range
     // Selection may filter some results, so we check leniently
     assert!(!results.is_empty(), "Should return some results");
-    for (id, value1, value2) in &results {
+    for (_, value1, value2) in &results {
         assert!(*value1 >= 10, "DATA_1 value {} should be >= 10", value1);
         assert!(*value1 <= 90, "DATA_1 value {} should be <= 90", value1);
         assert_eq!(*value2, (*value1 * 2) as u32, "DATA_2 should be DATA_1 * 2");
@@ -1203,6 +1222,8 @@ async fn range_query_scan_with_selection() {
         results.len() >= 70,
         "Should have at least 70 items after selection"
     );
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1268,6 +1289,8 @@ async fn range_query_scan_sparse_data() {
         cursor.next().await.unwrap().is_none(),
         "Should not have more items"
     );
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3718,6 +3741,246 @@ async fn hashed_query_test() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn hashed_query_supports_array_values() {
+    const TAGS: &'static str = "TAGS";
+    let _ = env_logger::try_init();
+    let server_addr = String::from("127.0.0.1:6714");
+    let server_group = String::from("hashed_query_supports_array_values");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let fields = Field::new_schema(vec![Field::new_indexed_array(
+        TAGS,
+        Type::U64,
+        vec![IndexType::Hashed],
+    )]);
+    let schema_id = 12614;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "hashed_query_supports_array_values",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let query_array = OwnedValue::Array(vec![OwnedValue::U64(7), OwnedValue::U64(13)]);
+    let scalar_expr = Expr::List(vec![
+        Expr::Symbol(hash_str("="), "=".to_string()),
+        Expr::Symbol(hash_str(TAGS), TAGS.to_string()),
+        Expr::Value(OwnedValue::U64(11)),
+    ]);
+    let array_expr = Expr::List(vec![
+        Expr::Symbol(hash_str("="), "=".to_string()),
+        Expr::Symbol(hash_str(TAGS), TAGS.to_string()),
+        Expr::Value(query_array.clone()),
+    ]);
+
+    let contains_both = Id::new(3, 1);
+    let contains_thirteen = Id::new(3, 2);
+    let contains_eleven = Id::new(3, 3);
+    let non_match = Id::new(3, 4);
+
+    let mut array_cell = OwnedValue::Map(OwnedMap::new());
+    array_cell[TAGS] = OwnedValue::Array(vec![OwnedValue::U64(7), OwnedValue::U64(11)]);
+    client
+        .write_cell(OwnedCell::new_with_id(schema_id, &contains_both, array_cell))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut prim_array_cell = OwnedValue::Map(OwnedMap::new());
+    prim_array_cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(vec![11, 13]));
+    client
+        .write_cell(OwnedCell::new_with_id(
+            schema_id,
+            &contains_eleven,
+            prim_array_cell,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut array_match_cell = OwnedValue::Map(OwnedMap::new());
+    array_match_cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(vec![13]));
+    client
+        .write_cell(OwnedCell::new_with_id(
+            schema_id,
+            &contains_thirteen,
+            array_match_cell,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut non_match_cell = OwnedValue::Map(OwnedMap::new());
+    non_match_cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(vec![99]));
+    client
+        .write_cell(OwnedCell::new_with_id(schema_id, &non_match, non_match_cell))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let idx_data_client = server.indexed_data_client();
+    let field_id = hash_str(TAGS);
+
+    let direct_scalar_matches = idx_data_client
+        .hashed_query(schema_id, field_id, &OwnedValue::U64(11))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(direct_scalar_matches.len(), 2);
+    assert!(direct_scalar_matches.contains(&contains_both));
+    assert!(direct_scalar_matches.contains(&contains_eleven));
+    assert!(!direct_scalar_matches.contains(&contains_thirteen));
+
+    let direct_array_matches = idx_data_client
+        .hashed_query(schema_id, field_id, &query_array)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(direct_array_matches.len(), 3);
+    assert!(direct_array_matches.contains(&contains_both));
+    assert!(direct_array_matches.contains(&contains_eleven));
+    assert!(direct_array_matches.contains(&contains_thirteen));
+    assert!(!direct_array_matches.contains(&non_match));
+
+    let mut cursor = idx_data_client
+        .query_ids(schema_id, scalar_expr, QueryOrdering::Asc)
+        .await
+        .unwrap();
+    let mut queried_ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        queried_ids.push(id);
+    }
+    assert_eq!(queried_ids.len(), 2);
+    assert!(queried_ids.contains(&contains_both));
+    assert!(queried_ids.contains(&contains_eleven));
+
+    let mut array_cursor = idx_data_client
+        .query_ids(schema_id, array_expr, QueryOrdering::Asc)
+        .await
+        .unwrap();
+    let mut array_query_ids = vec![];
+    while let Some(id) = array_cursor.next().await.unwrap() {
+        array_query_ids.push(id);
+    }
+    assert_eq!(array_query_ids.len(), 3);
+    assert!(array_query_ids.contains(&contains_both));
+    assert!(array_query_ids.contains(&contains_eleven));
+    assert!(array_query_ids.contains(&contains_thirteen));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ranged_query_supports_array_values() {
+    const TAGS: &'static str = "TAGS";
+    let _ = env_logger::try_init();
+    let server_addr = String::from("127.0.0.1:6715");
+    let server_group = String::from("ranged_query_supports_array_values");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![Service::Cell, Service::Transaction, Service::Query],
+            enable_recovery: false,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let fields = Field::new_schema(vec![Field::new_indexed_array(
+        TAGS,
+        Type::U64,
+        vec![IndexType::Ranged],
+    )]);
+    let schema_id = 12615;
+    let schema = Schema::new_with_id(
+        schema_id,
+        "ranged_query_supports_array_values",
+        None,
+        fields,
+        false,
+        false,
+    );
+
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    let values = [
+        (Id::new(4, 1), vec![3u64, 5u64]),
+        (Id::new(4, 2), vec![8u64]),
+        (Id::new(4, 3), vec![13u64]),
+        (Id::new(4, 4), vec![21u64]),
+    ];
+
+    for (id, tags) in values {
+        let mut cell = OwnedValue::Map(OwnedMap::new());
+        cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(tags));
+        client
+            .write_cell(OwnedCell::new_with_id(schema_id, &id, cell))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    await_ranged_indices_ready().await;
+
+    let selection = Expr::List(vec![
+        Expr::Symbol(hash_str("="), "=".to_string()),
+        Expr::Symbol(hash_str(TAGS), TAGS.to_string()),
+        Expr::Value(OwnedValue::Array(vec![OwnedValue::U64(5), OwnedValue::U64(21)])),
+    ]);
+
+    let idx_data_client = server.indexed_data_client();
+    let mut cursor = idx_data_client
+        .query_ids(schema_id, selection, QueryOrdering::Asc)
+        .await
+        .unwrap();
+    let mut matched_ids = vec![];
+    while let Some(id) = cursor.next().await.unwrap() {
+        matched_ids.push(id);
+    }
+
+    assert_eq!(matched_ids.len(), 2);
+    assert!(matched_ids.contains(&Id::new(4, 1)));
+    assert!(matched_ids.contains(&Id::new(4, 4)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn hashed_query_rejects_map_values() {
     const DATA_1: &'static str = "DATA_1";
     let _ = env_logger::try_init();
@@ -3782,7 +4045,7 @@ async fn hashed_query_rejects_map_values() {
             assert!(
                 inner
                     .to_string()
-                    .contains("hashed equality requires a scalar value"),
+                    .contains("hashed equality requires a scalar value or flat scalar array"),
                 "unexpected error: {inner}"
             );
             assert!(

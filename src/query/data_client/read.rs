@@ -16,7 +16,7 @@ use crate::{
         },
     },
     query::planner::normalize_selection_for_eval,
-    ram::cell::OwnedCell,
+    ram::{cell::OwnedCell, types::{index_query_scalars, values_semantically_equal}},
 };
 
 use super::{DataCursor, IndexedDataClient, QueryOrdering, SCAN_BUFFER_SIZE};
@@ -430,7 +430,7 @@ fn cell_matches_selection(cell: &OwnedCell, selection: &Expr) -> bool {
             .iter()
             .skip(2)
             .filter_map(expr_owned_value)
-            .any(|value| field_value == value);
+            .any(|value| values_semantically_equal(field_value, value));
     }
 
     if is_symbol_named(&items[0], "between") {
@@ -514,13 +514,45 @@ fn reverse_compare_op(op: CompareOp) -> CompareOp {
 }
 
 fn compare_values(left: &OwnedValue, right: &OwnedValue, op: CompareOp) -> bool {
+    let (Some(left_values), Some(right_values)) = (index_query_scalars(left), index_query_scalars(right)) else {
+        return false;
+    };
+
     match op {
-        CompareOp::Eq => left == right,
-        CompareOp::Ne => left != right,
-        CompareOp::Gt => left.partial_cmp(right).is_some_and(|ord| ord.is_gt()),
-        CompareOp::Ge => left.partial_cmp(right).is_some_and(|ord| ord.is_ge()),
-        CompareOp::Lt => left.partial_cmp(right).is_some_and(|ord| ord.is_lt()),
-        CompareOp::Le => left.partial_cmp(right).is_some_and(|ord| ord.is_le()),
+        CompareOp::Eq => values_semantically_equal(left, right),
+        CompareOp::Ne => left_values.iter().all(|left_value| {
+            right_values
+                .iter()
+                .all(|right_value| left_value != right_value)
+        }),
+        CompareOp::Gt => left_values.iter().any(|left_value| {
+            right_values.iter().any(|right_value| {
+                left_value
+                    .partial_cmp(right_value)
+                    .is_some_and(|ord| ord.is_gt())
+            })
+        }),
+        CompareOp::Ge => left_values.iter().any(|left_value| {
+            right_values.iter().any(|right_value| {
+                left_value
+                    .partial_cmp(right_value)
+                    .is_some_and(|ord| ord.is_ge())
+            })
+        }),
+        CompareOp::Lt => left_values.iter().any(|left_value| {
+            right_values.iter().any(|right_value| {
+                left_value
+                    .partial_cmp(right_value)
+                    .is_some_and(|ord| ord.is_lt())
+            })
+        }),
+        CompareOp::Le => left_values.iter().any(|left_value| {
+            right_values.iter().any(|right_value| {
+                left_value
+                    .partial_cmp(right_value)
+                    .is_some_and(|ord| ord.is_le())
+            })
+        }),
     }
 }
 

@@ -14,7 +14,7 @@ use crate::{
         },
         statistics::SchemaStatistics,
     },
-    ram::schema::{IndexType, Schema},
+    ram::{schema::{IndexType, Schema}, types::index_query_scalars},
 };
 
 use super::{ValueRange, ValueRangeTerm};
@@ -177,6 +177,7 @@ impl IndexedPredicatePlan {
         self.disjuncts.len() == 1 && self.disjuncts[0].is_pure_relevance_ranked_scan()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn explain(&self) -> &[ClauseOrderExplain] {
         self.explain.as_slice()
     }
@@ -1316,7 +1317,42 @@ fn expand_special_clause(expr: &Expr) -> Option<Expr> {
     if let Some(expanded) = expand_in_clause(expr) {
         return Some(expanded);
     }
-    expand_between_clause(expr)
+    if let Some(expanded) = expand_between_clause(expr) {
+        return Some(expanded);
+    }
+    expand_array_comparison_clause(expr)
+}
+
+fn expand_array_comparison_clause(expr: &Expr) -> Option<Expr> {
+    let (op, field_id, value) = comparison_clause(expr)?;
+    if !matches!(
+        op,
+        ClauseOp::Eq | ClauseOp::Ne | ClauseOp::Gt | ClauseOp::Ge | ClauseOp::Lt | ClauseOp::Le
+    ) {
+        return None;
+    }
+    let field_name = expr_field_name(expr)?;
+    let scalar_values = index_query_scalars(&value)?;
+
+    if scalar_values.len() <= 1 {
+        return None;
+    }
+
+    let junction_name = if matches!(op, ClauseOp::Ne) { "and" } else { "or" };
+    let mut clauses = Vec::with_capacity(scalar_values.len() + 1);
+    clauses.push(Expr::Symbol(
+        hash_str(junction_name),
+        junction_name.to_string(),
+    ));
+    for scalar_value in scalar_values {
+        clauses.push(comparison_expr(
+            op,
+            field_id,
+            field_name.clone(),
+            scalar_value,
+        ));
+    }
+    Some(Expr::List(clauses))
 }
 
 fn expand_in_clause(expr: &Expr) -> Option<Expr> {

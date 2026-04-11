@@ -144,7 +144,7 @@ while IFS= read -r test_name; do
     # Run test with timeout (directly using test binary)
     # Run in background so we can track PID and handle signals
     # Use PIPESTATUS to capture the test exit code, not tee's exit code
-    (timeout "$TIMEOUT" "$TEST_BINARY" "$test_name" --test-threads="$TEST_THREADS" --nocapture 2>&1; echo $? > /tmp/test_exit_code.txt) | tee /tmp/test_output.log &
+    (timeout "$TIMEOUT" "$TEST_BINARY" "$test_name" --exact --test-threads="$TEST_THREADS" --nocapture 2>&1; echo $? > /tmp/test_exit_code.txt) | tee /tmp/test_output.log &
     CURRENT_TEST_NAME="$test_name"
     CURRENT_TEST_PID=$!
     

@@ -15,7 +15,7 @@ use crate::{
         IndexerClients,
     },
     query::planner::{IndexedPredicatePlan, QueryPlanExplain},
-    ram::cell::ReadError,
+    ram::{cell::ReadError, types::index_query_scalars},
 };
 
 mod aggregate;
@@ -103,10 +103,7 @@ pub struct AggregateQuery {
 
 impl IndexedDataClient {
     fn hashed_query_rejects_value(value: &OwnedValue) -> bool {
-        matches!(
-            value,
-            OwnedValue::Map(_) | OwnedValue::Array(_) | OwnedValue::PrimArray(_)
-        )
+        index_query_scalars(value).is_none()
     }
 
     fn hashed_query_value_kind(value: &OwnedValue) -> &'static str {
@@ -126,10 +123,19 @@ impl IndexedDataClient {
         RPCError::IOError(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "hashed equality requires a scalar value for schema {schema} field {field_id}, got {}",
+                "hashed equality requires a scalar value or flat scalar array for schema {schema} field {field_id}, got {}",
                 Self::hashed_query_value_kind(value)
             ),
         ))
+    }
+
+    fn hashed_query_index_ids(schema: u32, field: u64, value: &OwnedValue) -> Vec<Id> {
+        index_query_scalars(value)
+            .into_iter()
+            .flatten()
+            .map(|scalar| get_hash_id_from_value(schema, field, &scalar))
+            .unique()
+            .collect()
     }
 
     pub fn new<C>(
@@ -636,10 +642,14 @@ impl IndexedDataClient {
                 schema, field_id, value,
             ));
         }
-        let index_id = Self::hashed_index_id(schema, field_id, value);
-        self.index_clients
-            .hashed_query(index_id, field_id, value)
-            .await
+        let mut matched_ids = vec![];
+        for index_id in Self::hashed_query_index_ids(schema, field_id, value) {
+            match self.index_clients.hashed_query(index_id, field_id, value).await? {
+                Ok(ids) => matched_ids.extend(ids),
+                Err(_) => {}
+            }
+        }
+        Ok(Ok(matched_ids.into_iter().unique().collect()))
     }
 
     pub async fn bm25_search(

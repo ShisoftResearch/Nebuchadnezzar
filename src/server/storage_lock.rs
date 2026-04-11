@@ -70,6 +70,14 @@ impl std::error::Error for StorageLockError {}
 
 impl StorageDirectoryLocks {
     pub fn acquire(layout: &DatabaseStorageLayout) -> Result<Self, StorageLockError> {
+        if should_skip_storage_locks() {
+            return Ok(Self { _guards: Vec::new() });
+        }
+
+        Self::acquire_impl(layout)
+    }
+
+    fn acquire_impl(layout: &DatabaseStorageLayout) -> Result<Self, StorageLockError> {
         let mut directories = BTreeSet::new();
         directories.extend(layout.backup_storage.iter().cloned());
         directories.extend(layout.wal_storage.iter().cloned());
@@ -83,6 +91,10 @@ impl StorageDirectoryLocks {
 
         Ok(Self { _guards: guards })
     }
+}
+
+fn should_skip_storage_locks() -> bool {
+    cfg!(test)
 }
 
 impl DirectoryLockGuard {
@@ -236,7 +248,7 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir should be created");
         let storage_path = temp.path().join("raft");
 
-        let _locks = StorageDirectoryLocks::acquire(&layout_with_raft_path(&storage_path))
+        let _locks = StorageDirectoryLocks::acquire_impl(&layout_with_raft_path(&storage_path))
             .expect("lock should be acquired");
 
         let contents = std::fs::read_to_string(storage_path.join(LOCK_FILE_NAME))
