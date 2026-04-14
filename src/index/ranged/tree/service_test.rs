@@ -950,6 +950,8 @@ mod test {
     /// 5. Query again and verify results match
     #[tokio::test(flavor = "multi_thread")]
     async fn test_e2e_range_index_recovery_with_schema() {
+        use crate::index::builder::IndexBuilder;
+        use crate::index::ranged::tree::btree::storage;
         use crate::index::ranged::tree::btree::Ordering;
         use crate::query::data_client::{QueryOrdering, ValueRange, ValueRangeTerm};
         use crate::ram::cell::OwnedCell;
@@ -958,6 +960,8 @@ mod test {
         use crate::server::*;
         use bifrost_hasher::hash_str;
         use dovahkiin::{expr::serde::Expr, types::*};
+        use std::time::{Duration, Instant};
+        use tempfile::TempDir;
 
         let _ = env_logger::try_init();
         let server_group = "e2e-range-recovery";
@@ -967,15 +971,13 @@ mod test {
         const NAME_FIELD: &'static str = "name";
         const QUANTITY_FIELD: &'static str = "quantity";
 
-        // Create temporary directories for persistent storage
-        let test_dir = std::env::temp_dir().join("neb_e2e_range_recovery_test");
-        let backup_dir = test_dir.join("backup");
-        let wal_dir = test_dir.join("wal");
-        let undo_dir = test_dir.join("undo");
-        let raft_dir = test_dir.join("raft");
+        // Use a dedicated temp directory so repeated runs cannot inherit stale state.
+        let test_dir = TempDir::new().unwrap();
+        let backup_dir = test_dir.path().join("backup");
+        let wal_dir = test_dir.path().join("wal");
+        let undo_dir = test_dir.path().join("undo");
+        let raft_dir = test_dir.path().join("raft");
 
-        // Clean up any existing test data
-        let _ = std::fs::remove_dir_all(&test_dir);
         std::fs::create_dir_all(&backup_dir).unwrap();
         std::fs::create_dir_all(&wal_dir).unwrap();
         std::fs::create_dir_all(&undo_dir).unwrap();
@@ -1081,14 +1083,62 @@ mod test {
             prices
         }
 
+        async fn scan_all_prices(
+            idx_client: &crate::query::data_client::IndexedDataClient,
+            schema_id: u32,
+        ) -> (Vec<u64>, Vec<Id>) {
+            let mut scan_cursor = idx_client
+                .scan_all(
+                    schema_id,
+                    vec![],
+                    Expr::nothing(),
+                    Expr::nothing(),
+                    QueryOrdering::Asc,
+                )
+                .await
+                .unwrap();
+
+            let mut prices = Vec::new();
+            let mut ids = Vec::new();
+            while let Ok(Some(cell)) = scan_cursor.next().await {
+                if let OwnedValue::U64(price) = &cell.data[PRICE_FIELD] {
+                    prices.push(*price);
+                    ids.push(cell.id());
+                }
+            }
+            prices.sort();
+            (prices, ids)
+        }
+
         println!("=== Testing range queries BEFORE recovery ===");
         let idx_client = server.indexed_data_client();
+        let expected_range_1: Vec<u64> = (20..=30).collect();
+        let expected_all_prices: Vec<u64> = (10..=100).collect();
+
+        let _ = IndexBuilder::await_all_indices().await;
+        storage::wait_until_updated().await;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let (results_1_before, all_prices_before, mut all_ids_before) = loop {
+            let results_1 = query_price_range(&idx_client, schema_id, 20, 30).await;
+            let (all_prices, all_ids) = scan_all_prices(&idx_client, schema_id).await;
+            if results_1 == expected_range_1 && all_prices == expected_all_prices {
+                break (results_1, all_prices, all_ids);
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "range index did not converge before recovery: range [20, 30]={:?}, scan_all={} items",
+                results_1,
+                all_prices.len()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
 
         // Test query 1: [20, 30]
-        let results_1_before = query_price_range(&idx_client, schema_id, 20, 30).await;
         println!("Range [20, 30]: {} items", results_1_before.len());
         assert_eq!(results_1_before.len(), 11, "Should have 11 items");
-        assert_eq!(results_1_before, (20..=30).collect::<Vec<_>>());
+        assert_eq!(results_1_before, expected_range_1);
 
         // Test query 2: [50, 60]
         let results_2_before = query_price_range(&idx_client, schema_id, 50, 60).await;
@@ -1102,26 +1152,6 @@ mod test {
 
         // Test scan_all before recovery
         println!("=== Testing scan_all BEFORE recovery ===");
-        let mut scan_cursor_before = idx_client
-            .scan_all(
-                schema_id,
-                vec![],
-                Expr::nothing(),
-                Expr::nothing(),
-                QueryOrdering::Asc,
-            )
-            .await
-            .unwrap();
-
-        let mut all_prices_before = Vec::new();
-        let mut all_ids_before = Vec::new();
-        while let Ok(Some(cell)) = scan_cursor_before.next().await {
-            if let OwnedValue::U64(price) = &cell.data[PRICE_FIELD] {
-                all_prices_before.push(*price);
-                all_ids_before.push(cell.id());
-            }
-        }
-        all_prices_before.sort();
         println!(
             "scan_all before recovery: {} items",
             all_prices_before.len()
@@ -1133,7 +1163,7 @@ mod test {
         );
         assert_eq!(
             all_prices_before,
-            (10..=100).collect::<Vec<_>>(),
+            expected_all_prices,
             "All prices from 10 to 100 should be present"
         );
 
@@ -1181,9 +1211,25 @@ mod test {
         println!("=== Testing range queries AFTER recovery ===");
         let idx_client_recovered = server_recovered.indexed_data_client();
 
+        let recovery_deadline = Instant::now() + Duration::from_secs(30);
+        let (results_1_after, all_prices_after, mut all_ids_after) = loop {
+            let results_1 = query_price_range(&idx_client_recovered, schema_id, 20, 30).await;
+            let (all_prices, all_ids) = scan_all_prices(&idx_client_recovered, schema_id).await;
+            if results_1 == expected_range_1 && all_prices == expected_all_prices {
+                break (results_1, all_prices, all_ids);
+            }
+
+            assert!(
+                Instant::now() < recovery_deadline,
+                "recovered range index did not converge: range [20, 30]={:?}, scan_all={} items",
+                results_1,
+                all_prices.len()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+
         // Repeat the same queries
         println!("Attempting first query after recovery...");
-        let results_1_after = query_price_range(&idx_client_recovered, schema_id, 20, 30).await;
         println!(
             "Range [20, 30] after recovery: {} items - SUCCESS!",
             results_1_after.len()
@@ -1215,26 +1261,6 @@ mod test {
 
         // Test scan_all after recovery
         println!("=== Testing scan_all AFTER recovery ===");
-        let mut scan_cursor_after = idx_client_recovered
-            .scan_all(
-                schema_id,
-                vec![],
-                Expr::nothing(),
-                Expr::nothing(),
-                QueryOrdering::Asc,
-            )
-            .await
-            .unwrap();
-
-        let mut all_prices_after = Vec::new();
-        let mut all_ids_after = Vec::new();
-        while let Ok(Some(cell)) = scan_cursor_after.next().await {
-            if let OwnedValue::U64(price) = &cell.data[PRICE_FIELD] {
-                all_prices_after.push(*price);
-                all_ids_after.push(cell.id());
-            }
-        }
-        all_prices_after.sort();
         println!("scan_all after recovery: {} items", all_prices_after.len());
         assert_eq!(
             all_prices_after.len(),
@@ -1243,7 +1269,7 @@ mod test {
         );
         assert_eq!(
             all_prices_after,
-            (10..=100).collect::<Vec<_>>(),
+            expected_all_prices,
             "All prices from 10 to 100 should be present after recovery"
         );
 
@@ -1258,9 +1284,9 @@ mod test {
         println!("=== End-to-end recovery test passed! ===");
 
         // Cleanup
+        drop(idx_client_recovered);
+        server_recovered.shutdown().await;
         drop(server_recovered);
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let _ = std::fs::remove_dir_all(&test_dir);
     }
 
     #[tokio::test]
