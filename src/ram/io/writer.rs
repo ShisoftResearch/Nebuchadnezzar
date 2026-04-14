@@ -46,6 +46,16 @@ pub struct Instruction<'a> {
     offset: usize,
 }
 
+fn nullable_data_offset(field: &Field, tail_offset: usize) -> usize {
+    if field.is_array || field.vector_size.is_some() {
+        align_ptr_addr(tail_offset)
+    } else if field.sub_fields.is_some() {
+        tail_offset
+    } else {
+        align_address_with_ty(field.data_type, tail_offset)
+    }
+}
+
 pub fn plan_write_field<'a>(
     tail_offset: &mut usize,
     field: &Field,
@@ -61,7 +71,9 @@ pub fn plan_write_field<'a>(
     };
     let offset = if field.nullable {
         if !is_var {
-            let null_flag = is_null.then_some(0).unwrap_or(*tail_offset) as u32;
+            let null_flag = is_null
+                .then_some(0)
+                .unwrap_or(nullable_data_offset(field, *tail_offset)) as u32;
             ins.push(Instruction {
                 data_type: Type::U32,
                 val: InstData::Val(OwnedValue::U32(null_flag)),
@@ -444,5 +456,30 @@ mod tests {
         plan_write_dynamic_value(&mut offset, &OwnedValue::Null, &mut ins).unwrap();
         assert_eq!(offset, 0);
         assert!(ins.inner.is_empty());
+    }
+
+    #[test]
+    fn nullable_fixed_u64_pointer_uses_aligned_payload_offset() {
+        let mut offset = 76usize;
+        let mut ins = WriteInstructions::new();
+        let mut field = Field::new_unindexed_nullable("char_offset_start", Type::U64);
+        field.offset = Some(36);
+
+        plan_write_field(
+            &mut offset,
+            &field,
+            &OwnedValue::U64(10),
+            &mut ins,
+            false,
+        )
+        .unwrap();
+
+        match &ins.inner[0].val {
+            InstData::Val(OwnedValue::U32(pointer)) => assert_eq!(*pointer, 80),
+            other => panic!("unexpected pointer instruction: {other:?}"),
+        }
+        assert_eq!(ins.inner[0].offset, 36);
+        assert_eq!(ins.inner[1].offset, 80);
+        assert_eq!(offset, 88);
     }
 }
