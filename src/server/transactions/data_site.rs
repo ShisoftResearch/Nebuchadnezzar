@@ -479,6 +479,287 @@ impl DataManager {
 
         (released_count, failures)
     }
+
+    fn warn_on_index_wait_results<I>(&self, tid: &TxnId, results: I)
+    where
+        I: IntoIterator<
+            Item = Result<Result<(), crate::index::builder::IndexError>, tokio::task::JoinError>,
+        >,
+    {
+        for result in results {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(
+                        "Index task failed during transaction commit {:?}: {:?}",
+                        tid, error
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        "Index task join failed during transaction commit {:?}: {:?}",
+                        tid, error
+                    );
+                }
+            }
+        }
+    }
+
+    fn apply_commit_ops(
+        &self,
+        txn_lock: &TxnMutex,
+        tid: &TxnId,
+        effective_ts: &TxnId,
+        cells: Vec<CommitOp>,
+    ) -> DMCommitResult {
+        let mut txn = txn_lock.lock();
+        txn.last_activity = get_time();
+        match txn.state {
+            TxnState::Started => {
+                return DMCommitResult::CheckFailed(CheckError::NotCommitted);
+            }
+            TxnState::Aborted => {
+                return DMCommitResult::CheckFailed(CheckError::AlreadyAborted);
+            }
+            TxnState::Committed => {
+                return DMCommitResult::CheckFailed(CheckError::AlreadyCommitted);
+            }
+            TxnState::Cleanup => {
+                return DMCommitResult::CheckFailed(CheckError::AlreadyCleanup);
+            }
+            TxnState::Prepared => {}
+        };
+
+        let prepared_cells_num = txn.affected_cells.len();
+        let arrived_cells_num = cells.len();
+        if prepared_cells_num != arrived_cells_num {
+            return DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(
+                prepared_cells_num,
+                arrived_cells_num,
+            ));
+        }
+
+        crate::ram::chunk::set_transaction_context(true);
+        let mut write_error: Option<(Id, WriteError)> = None;
+        {
+            for cell_op in cells {
+                match cell_op {
+                    CommitOp::Read(_id, _version) => {}
+                    CommitOp::Write(mut cell) => {
+                        let cell_id = cell.id();
+                        let (should_skip, write_ts) = {
+                            let meta_ref = self.cell_meta_mutex(&cell_id);
+                            let meta = meta_ref.lock();
+                            (effective_ts < &meta.write, meta.write.clone())
+                        };
+
+                        if should_skip {
+                            debug!(
+                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
+                                cell_id, effective_ts, write_ts
+                            );
+                            continue;
+                        }
+
+                        match self.chunks().write_cell(&mut cell) {
+                            Ok(header) => {
+                                if let Some(undo_log) = self.undo_log() {
+                                    let undo_entry = super::undo_log::UndoLogEntry::new_write(
+                                        tid.clone(),
+                                        cell_id,
+                                        header.version,
+                                    );
+                                    if let Err(error) = undo_log.write_undo_entry(undo_entry) {
+                                        error!(
+                                            "Failed to write undo log entry for new cell: {:?}",
+                                            error
+                                        );
+                                    }
+                                }
+                                txn.history
+                                    .insert(cell_id, CellHistory::new(None, header.version));
+                                self.update_cell_write(&cell_id, effective_ts);
+                            }
+                            Err(error) => {
+                                write_error = Some((cell.id(), error));
+                                break;
+                            }
+                        };
+                    }
+                    CommitOp::Remove(ref cell_id) => {
+                        let (cell_addr, orig_version, old_cell_ref) = {
+                            let shared_cell = match self.chunks().read_cell(cell_id) {
+                                Ok(cell) => cell,
+                                Err(read_error) => {
+                                    write_error =
+                                        Some((*cell_id, WriteError::ReadError(read_error)));
+                                    break;
+                                }
+                            };
+                            let addr = shared_cell.cell_guard().get_ptr();
+                            let version = shared_cell.header.version;
+                            let cell_ref = shared_cell.to_owned().into_ref();
+                            (addr, version, cell_ref)
+                        };
+                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
+                        let chunk_idx = chunk.id;
+                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
+                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
+                        let cell_offset = (cell_addr - segment_base_addr) as u64;
+                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
+                            Some(guard) => guard,
+                            None => {
+                                write_error = Some((
+                                    *cell_id,
+                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
+                                ));
+                                break;
+                            }
+                        };
+
+                        if let Some(undo_log) = self.undo_log() {
+                            let undo_entry = super::undo_log::UndoLogEntry::new_restore(
+                                tid.clone(),
+                                *cell_id,
+                                super::undo_log::UndoOpType::Remove,
+                                orig_version,
+                                chunk_idx as u64,
+                                seq_id,
+                                cell_offset,
+                            );
+                            if let Err(error) = undo_log.write_undo_entry(undo_entry) {
+                                error!("Failed to write undo log entry: {:?}", error);
+                            }
+                        }
+
+                        match self
+                            .chunks()
+                            .remove_cell_by(cell_id, |cell| cell.header.version == orig_version)
+                        {
+                            Ok(()) => {
+                                txn.history
+                                    .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
+                                self.update_cell_write(cell_id, effective_ts);
+                                txn.segment_guards.push(guard);
+                            }
+                            Err(error) => {
+                                write_error = Some((*cell_id, error));
+                                break;
+                            }
+                        }
+                    }
+                    CommitOp::Update(mut cell) => {
+                        let cell_id = cell.id();
+                        let (cell_addr, orig_version) = {
+                            match self.chunks().location_for_read(&cell_id).and_then(|loc| {
+                                let addr = *loc;
+                                let header = header_from_chunk_raw(addr);
+                                header.map(|(header, _)| (header, addr))
+                            }) {
+                                Ok((header, addr)) => (addr, header.version),
+                                Err(read_error) => {
+                                    write_error =
+                                        Some((cell_id, WriteError::ReadError(read_error)));
+                                    break;
+                                }
+                            }
+                        };
+                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
+                        let chunk_idx = chunk.id;
+                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
+                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
+                        let cell_offset = (cell_addr - segment_base_addr) as u64;
+                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
+                            Some(guard) => guard,
+                            None => {
+                                write_error = Some((
+                                    cell_id,
+                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
+                                ));
+                                break;
+                            }
+                        };
+
+                        if let Some(undo_log) = self.undo_log() {
+                            let undo_entry = super::undo_log::UndoLogEntry::new_restore(
+                                tid.clone(),
+                                cell_id,
+                                super::undo_log::UndoOpType::Update,
+                                orig_version,
+                                chunk_idx as u64,
+                                seq_id,
+                                cell_offset,
+                            );
+                            if let Err(error) = undo_log.write_undo_entry(undo_entry) {
+                                error!("Failed to write undo log entry: {:?}", error);
+                            }
+                        }
+                        cell.header.version = orig_version;
+                        let mut old_cell_ref = None;
+                        match self.chunks().update_cell_by(&cell_id, |cell_to_update| {
+                            if cell_to_update.header.version == orig_version {
+                                old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
+                                Some(cell)
+                            } else {
+                                None
+                            }
+                        }) {
+                            Ok(cell) => {
+                                debug_assert!(old_cell_ref.is_some());
+                                txn.history.insert(
+                                    cell_id,
+                                    CellHistory::new(old_cell_ref, cell.header.version),
+                                );
+                                self.update_cell_write(&cell_id, effective_ts);
+                                txn.segment_guards.push(guard);
+                            }
+                            Err(error) => {
+                                write_error = Some((cell_id, error));
+                                break;
+                            }
+                        }
+                    }
+                    CommitOp::None => panic!("None CommitOp should not appear in data site"),
+                }
+            }
+        }
+        txn.last_activity = get_time();
+        crate::ram::chunk::set_transaction_context(false);
+
+        if let Some((id, error)) = write_error {
+            let guards_to_drop = std::mem::take(&mut txn.segment_guards);
+            drop(txn);
+            drop(guards_to_drop);
+            return match error {
+                WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
+                    DMCommitResult::CellChanged(id)
+                }
+                _ => DMCommitResult::WriteError(id, error),
+            };
+        }
+
+        txn.state = TxnState::Committed;
+        for guard in &txn.segment_guards {
+            let chunk_idx = guard.chunk_id();
+            let seg_id = guard.segment_id();
+            let chunk = &self.chunks().list[chunk_idx];
+            if let Some(segment) = chunk.segs.get(&(seg_id as usize)) {
+                if let Err(error) = segment.force_wal_sync() {
+                    error!(
+                        "Failed to sync WAL for segment {} during commit: {:?}",
+                        seg_id, error
+                    );
+                } else {
+                    debug!(
+                        "Synced segment {} (chunk {}) WAL to disk for transaction commit",
+                        seg_id, chunk_idx
+                    );
+                }
+            }
+        }
+
+        DMCommitResult::Success
+    }
 }
 
 #[cfg(test)]
@@ -924,321 +1205,39 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<DMCommitResult>> {
         self.update_clock(&clock);
 
-        // Use the more recent timestamp between the transaction ID and the incoming clock
-        let effective_ts = if &clock > &tid { &clock } else { &tid };
+        let effective_ts = if clock > tid {
+            clock.clone()
+        } else {
+            tid.clone()
+        };
 
         let Some(txn_lock) = self.find_transaction(&tid) else {
             return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted));
         };
-        let mut txn = txn_lock.lock();
-        txn.last_activity = get_time();
-        // check state
-        match txn.state {
-            TxnState::Started => {
-                return self.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted));
+
+        if self.database_runtime.indexer().is_some() {
+            let tid_for_logs = tid.clone();
+            let scoped_commit = IndexBuilder::with_request_index_scope({
+                let txn_lock = txn_lock.clone();
+                let tid = tid.clone();
+                let effective_ts = effective_ts.clone();
+                move || self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells)
+            });
+            return async move {
+                let (payload, request_results) = scoped_commit.await;
+                let pending_results = IndexBuilder::await_indices().await;
+                self.warn_on_index_wait_results(
+                    &tid_for_logs,
+                    request_results
+                        .into_iter()
+                        .chain(pending_results.into_iter()),
+                );
+                DataSiteResponse::new(&self.txn_peer, payload)
             }
-            TxnState::Aborted => {
-                return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted));
-            }
-            TxnState::Committed => {
-                return self
-                    .response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
-            }
-            TxnState::Cleanup => {
-                return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCleanup));
-            }
-            TxnState::Prepared => {}
-        };
-        // check cell list integrity
-        let prepared_cells_num = txn.affected_cells.len();
-        let arrived_cells_num = cells.len();
-        if prepared_cells_num != arrived_cells_num {
-            return self.response_with(DMCommitResult::CheckFailed(
-                CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num),
-            ));
+            .boxed();
         }
 
-        // Set transaction context to skip fsync during writes
-        // Segments will be synced at the end of commit instead
-        crate::ram::chunk::set_transaction_context(true);
-
-        // Pre-allocate small temporaries to reduce reallocations
-        let mut write_error: Option<(Id, WriteError)> = None;
-        {
-            for cell_op in cells {
-                match cell_op {
-                    CommitOp::Read(_id, _version) => {}
-                    CommitOp::Write(mut cell) => {
-                        let cell_id = cell.id();
-
-                        // Apply Thomas Write Rule: Skip if this write is obsolete
-                        // Check if a later transaction has already written to this cell
-                        let (should_skip, write_ts) = {
-                            let meta_ref = self.cell_meta_mutex(&cell_id);
-                            let meta = meta_ref.lock();
-                            (effective_ts < &meta.write, meta.write.clone())
-                        };
-
-                        if should_skip {
-                            debug!(
-                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
-                                cell_id, effective_ts, write_ts
-                            );
-                            continue;
-                        }
-
-                        let write_result = self.chunks().write_cell(&mut cell);
-                        match write_result {
-                            Ok(header) => {
-                                // Log the new cell creation with its version for rollback
-                                // During recovery, if cell exists with this version, it will be deleted
-                                if let Some(undo_log) = self.undo_log() {
-                                    let undo_entry = super::undo_log::UndoLogEntry::new_write(
-                                        tid.clone(),
-                                        cell_id,
-                                        header.version,
-                                    );
-                                    if let Err(e) = undo_log.write_undo_entry(undo_entry) {
-                                        error!(
-                                            "Failed to write undo log entry for new cell: {:?}",
-                                            e
-                                        );
-                                    }
-                                }
-
-                                txn.history
-                                    .insert(cell_id, CellHistory::new(None, header.version));
-                                self.update_cell_write(&cell_id, effective_ts);
-                            }
-                            Err(error) => {
-                                write_error = Some((cell.id(), error));
-                                break;
-                            }
-                        };
-                    }
-                    CommitOp::Remove(ref cell_id) => {
-                        // Read cell and extract information while holding lock
-                        let (cell_addr, orig_version, old_cell_ref) = {
-                            let shared_cell = match self.chunks().read_cell(cell_id) {
-                                Ok(cell) => cell,
-                                Err(re) => {
-                                    write_error = Some((*cell_id, WriteError::ReadError(re)));
-                                    break;
-                                }
-                            };
-                            let addr = shared_cell.cell_guard().get_ptr();
-                            let version = shared_cell.header.version;
-                            let cell_ref = shared_cell.to_owned().into_ref();
-                            (addr, version, cell_ref)
-                        }; // SharedCell dropped here, lock released
-
-                        // Now protect the segment without holding cell lock
-                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
-                        let chunk_idx = chunk.id;
-                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
-
-                        // Calculate cell offset within segment for fast recovery
-                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
-                        let cell_offset = (cell_addr - segment_base_addr) as u64;
-
-                        // Acquire RAII guard to prevent segment eviction during transaction
-                        // Guard automatically releases reference when dropped
-                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
-                            Some(g) => g,
-                            None => {
-                                write_error = Some((
-                                    *cell_id,
-                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                ));
-                                break;
-                            }
-                        };
-
-                        // Write undo log entry before performing the remove
-                        // Store old version and exact offset for verification during recovery
-                        // Note: only seq_id is stored, not seg_id (which changes across recoveries)
-                        if let Some(undo_log) = self.undo_log() {
-                            let undo_entry = super::undo_log::UndoLogEntry::new_restore(
-                                tid.clone(),
-                                *cell_id,
-                                super::undo_log::UndoOpType::Remove,
-                                orig_version,
-                                chunk_idx as u64,
-                                seq_id,
-                                cell_offset,
-                            );
-                            if let Err(e) = undo_log.write_undo_entry(undo_entry) {
-                                error!("Failed to write undo log entry: {:?}", e);
-                                // Continue anyway - segment guard will prevent data loss
-                            }
-                        }
-
-                        let write_result = self
-                            .chunks()
-                            .remove_cell_by(cell_id, |cell| cell.header.version == orig_version);
-                        match write_result {
-                            Ok(()) => {
-                                txn.history
-                                    .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
-                                self.update_cell_write(cell_id, effective_ts);
-                                // Keep the guard alive by storing it in transaction
-                                txn.segment_guards.push(guard);
-                            }
-                            Err(error) => {
-                                // Guard dropped here, automatically releasing reference
-                                write_error = Some((*cell_id, error));
-                                break;
-                            }
-                        }
-                    }
-                    CommitOp::Update(mut cell) => {
-                        let cell_id = cell.id();
-                        // Read cell and extract information while holding lock
-                        let (cell_addr, orig_version) = {
-                            match self.chunks().location_for_read(&cell_id).and_then(|loc| {
-                                let addr = *loc;
-                                let header = header_from_chunk_raw(addr);
-                                header.map(|(header, _)| (header, addr))
-                            }) {
-                                Ok((header, addr)) => {
-                                    let version = header.version;
-                                    (addr, version)
-                                }
-                                Err(re) => {
-                                    write_error = Some((cell_id, WriteError::ReadError(re)));
-                                    break;
-                                }
-                            }
-                        }; // SharedCell dropped here, lock released
-
-                        // Now protect the segment without holding cell lock
-                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
-                        let chunk_idx = chunk.id;
-                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
-
-                        // Calculate cell offset within segment for fast recovery
-                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
-                        let cell_offset = (cell_addr - segment_base_addr) as u64;
-
-                        // Acquire RAII guard to prevent segment eviction during transaction
-                        // Guard automatically releases reference when dropped
-                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
-                            Some(g) => g,
-                            None => {
-                                write_error = Some((
-                                    cell_id,
-                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                ));
-                                break;
-                            }
-                        };
-
-                        // Write undo log entry before performing the update
-                        // Store old version and exact offset for verification during recovery
-                        // Note: only seq_id is stored, not seg_id (which changes across recoveries)
-                        if let Some(undo_log) = self.undo_log() {
-                            let undo_entry = super::undo_log::UndoLogEntry::new_restore(
-                                tid.clone(),
-                                cell_id,
-                                super::undo_log::UndoOpType::Update,
-                                orig_version,
-                                chunk_idx as u64,
-                                seq_id,
-                                cell_offset,
-                            );
-                            if let Err(e) = undo_log.write_undo_entry(undo_entry) {
-                                error!("Failed to write undo log entry: {:?}", e);
-                                // Continue anyway - segment guard will prevent data loss
-                            }
-                        }
-                        cell.header.version = orig_version; // Enforce version consistency
-                        let mut old_cell_ref = None;
-                        let write_result =
-                            self.chunks().update_cell_by(&cell_id, |cell_to_update| {
-                                if cell_to_update.header.version == orig_version {
-                                    old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
-                                    Some(cell)
-                                } else {
-                                    None
-                                }
-                            });
-                        match write_result {
-                            Ok(cell) => {
-                                debug_assert!(old_cell_ref.is_some());
-                                txn.history.insert(
-                                    cell_id,
-                                    CellHistory::new(old_cell_ref, cell.header.version),
-                                );
-                                self.update_cell_write(&cell_id, effective_ts);
-                                // Keep the guard alive by storing it in transaction
-                                txn.segment_guards.push(guard);
-                            }
-                            Err(error) => {
-                                // Guard dropped here, automatically releasing reference
-                                write_error = Some((cell_id, error));
-                                break;
-                            }
-                        }
-                    }
-                    CommitOp::None => {
-                        panic!("None CommitOp should not appear in data site");
-                    }
-                }
-            }
-        }
-        txn.last_activity = get_time();
-
-        // Clear transaction context before returning
-        crate::ram::chunk::set_transaction_context(false);
-
-        // check if any of those operations failed, if yes, rollback and fail this commit
-        if let Some((id, error)) = write_error {
-            // Release all segment references on failure by dropping guards
-            // Moving guards out of transaction causes them to drop, releasing references
-            let _guards_to_drop = std::mem::take(&mut txn.segment_guards);
-            drop(txn); // Release the lock before guards drop
-            drop(_guards_to_drop); // Explicitly drop guards, releasing all segment references
-
-            match error {
-                WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
-                    // in this case, we can inform transaction manager to try again
-                    return self.response_with(DMCommitResult::CellChanged(id));
-                }
-                _ => {
-                    // other failure due to unfixable error should abort without retry
-                    return self.response_with(DMCommitResult::WriteError(id, error));
-                }
-            }
-        } else {
-            // all set, able to commit - segments remain protected until transaction ends
-            txn.state = TxnState::Committed;
-
-            // Sync all segments that were written to during this transaction
-            // This ensures durability - data is persisted to disk before commit succeeds
-            for guard in &txn.segment_guards {
-                let chunk_idx = guard.chunk_id();
-                let seg_id = guard.segment_id();
-                let chunk = &self.chunks().list[chunk_idx];
-                if let Some(segment) = chunk.segs.get(&(seg_id as usize)) {
-                    // Use force_wal_sync to ensure WAL is persisted and counters are reset
-                    if let Err(e) = segment.force_wal_sync() {
-                        error!(
-                            "Failed to sync WAL for segment {} during commit: {:?}",
-                            seg_id, e
-                        );
-                    } else {
-                        debug!(
-                            "Synced segment {} (chunk {}) WAL to disk for transaction commit",
-                            seg_id, chunk_idx
-                        );
-                    }
-                }
-            }
-
-            // Commit all indices
-            let response = DataSiteResponse::new(&self.txn_peer, DMCommitResult::Success);
-            return IndexBuilder::await_indices().map(|_| response).boxed();
-        }
+        self.response_with(self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells))
     }
     fn abort(
         &self,

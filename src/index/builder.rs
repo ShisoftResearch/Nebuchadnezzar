@@ -9,7 +9,7 @@ use crate::index::full_text::{
 };
 use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
 use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
-use crate::ram::types::{hash_indexable_owned_value, Id, OwnedValue};
+use crate::ram::types::{Id, OwnedValue, hash_indexable_owned_value};
 use crate::ram::{
     cell::Cell,
     schema::{CompoundIndex, IndexType, Schema},
@@ -347,19 +347,22 @@ lazy_static! {
         Arc::new(Mutex::new(Vec::new()));
 }
 
-tokio::task_local! {
-    static REQUEST_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), IndexError>>>>;
+std::thread_local! {
+    static REQUEST_INDEX_TASKS: RefCell<Vec<Vec<JoinHandle<Result<(), IndexError>>>>> =
+        RefCell::new(Vec::new());
 }
 
 fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
     let mut handle = Some(tokio::spawn(task));
-    let stored_locally = REQUEST_INDEX_TASKS
-        .try_with(|tasks| {
-            tasks
-                .borrow_mut()
-                .push(handle.take().expect("index task handle should exist"));
-        })
-        .is_ok();
+    let stored_locally = REQUEST_INDEX_TASKS.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        if let Some(tasks) = scopes.last_mut() {
+            tasks.push(handle.take().expect("index task handle should exist"));
+            true
+        } else {
+            false
+        }
+    });
     if !stored_locally {
         PENDING_INDEX_TASKS
             .lock()
@@ -571,22 +574,25 @@ impl IndexBuilder {
     ) -> BoxFuture<'a, (R, Vec<Result<Result<(), IndexError>, JoinError>>)>
     where
         R: Send + 'a,
-        F: FnOnce() -> R + Send + 'a,
+        F: FnOnce() -> R + 'a,
     {
+        let (res, tasks) = REQUEST_INDEX_TASKS.with(|scopes| {
+            scopes.borrow_mut().push(Vec::new());
+            let res = op();
+            let tasks = scopes
+                .borrow_mut()
+                .pop()
+                .expect("request index scope stack should not be empty");
+            (res, tasks)
+        });
+
         async move {
-            REQUEST_INDEX_TASKS
-                .scope(RefCell::new(Vec::new()), async move {
-                    let res = op();
-                    let tasks = REQUEST_INDEX_TASKS
-                        .with(|pending| std::mem::take(&mut *pending.borrow_mut()));
-                    let results = tasks
-                        .into_iter()
-                        .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
-                        .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
-                        .await;
-                    (res, results)
-                })
-                .await
+            let results = tasks
+                .into_iter()
+                .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
+                .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
+                .await;
+            (res, results)
         }
         .boxed()
     }
@@ -880,6 +886,10 @@ mod tests {
     use crate::ram::schema::{Field, IndexType, Schema};
     use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
     use bifrost_hasher::hash_str;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::{Duration, Instant};
 
     fn collect_embedding_metas(indices: Vec<IndexRes>) -> Vec<EmbeddingIndexMeta> {
@@ -1000,6 +1010,46 @@ mod tests {
             global_results.len(),
             1,
             "the unrelated global task should remain pending until explicitly drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_backlog_can_be_drained_before_task_completion() {
+        let _ = IndexBuilder::await_indices().await;
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_flag = completed.clone();
+        new_index_task(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            completed_flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let drained_tasks = {
+            let mut guard = PENDING_INDEX_TASKS.lock();
+            std::mem::take(&mut *guard)
+        };
+        assert_eq!(
+            drained_tasks.len(),
+            1,
+            "the global queue should expose the in-flight task handle"
+        );
+
+        let later_waiter_results = IndexBuilder::await_indices().await;
+        assert!(
+            later_waiter_results.is_empty(),
+            "a later waiter sees an empty backlog once another waiter drained the handles"
+        );
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "draining task handles is not the same as the index task finishing"
+        );
+
+        let drained_results = futures::future::join_all(drained_tasks).await;
+        assert_eq!(drained_results.len(), 1);
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "the original drained task should still complete successfully"
         );
     }
 }

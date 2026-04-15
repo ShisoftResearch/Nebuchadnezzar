@@ -5,6 +5,8 @@ use crate::ram::types::*;
 use crate::ram::{cell::*, segs::SEGMENT_SIZE};
 use crate::server::transactions;
 use crate::server::*;
+use bifrost_hasher::hash_str;
+use dovahkiin::types::Type;
 use env_logger;
 
 async fn scoped_txn_client(
@@ -261,6 +263,90 @@ pub async fn data_site_wr() {
     assert_eq!(cell_r2.data["id"].i64().unwrap(), &100);
     assert_eq!(cell_r2.data["name"].string().unwrap(), "Jack");
     assert_eq!(cell_r2.data["score"].u64().unwrap(), &90);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn data_site_commit_waits_for_hashed_indices() {
+    let _ = env_logger::try_init();
+    let server_addr = String::from("127.0.0.1:5208");
+    let server_group = "txn_hash_commit";
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            index_enabled: true,
+            services: vec![
+                Service::Cell,
+                Service::Transaction,
+                Service::Query,
+                Service::HashIndexer,
+            ],
+            enable_recovery: false,
+            disable_storage_locks: true,
+            undo_log_storage: None,
+            raft_storage: None,
+        },
+        &server_addr,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let fields = Field::new_schema(vec![
+        Field::new_indexed("id", Type::U64, vec![IndexType::Hashed]),
+        Field::new_unindexed("name", Type::String),
+    ]);
+    let schema = Schema::new_with_id(1208, "txn_hash_commit", None, fields, false, false);
+    let client = server
+        .data_client(&vec![server_addr.clone()])
+        .await
+        .unwrap();
+    client
+        .new_schema_with_id(schema.clone())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let txn = scoped_txn_client(&server_addr, server_group).await;
+    let txn_id = txn.begin().await.unwrap().unwrap();
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::U64(100));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
+    let cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+
+    let write_result = txn
+        .write(txn_id.to_owned(), cell.to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    match write_result {
+        TxnExecResult::Accepted(()) => {}
+        _ => panic!("write cell not accepted: {:?}", write_result),
+    }
+
+    assert_eq!(
+        txn.prepare(txn_id.to_owned()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(txn_id.to_owned()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let query_result = server
+        .indexed_data_client()
+        .hashed_query(schema.id, hash_str("id"), &OwnedValue::U64(100))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(query_result, vec![cell.id()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
