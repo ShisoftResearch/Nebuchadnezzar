@@ -5,13 +5,13 @@ pub mod trees;
 
 #[cfg(test)]
 mod tests {
-    use super::tree::btree::Ordering;
     use super::tree::btree::storage;
+    use super::tree::btree::Ordering;
     use super::*;
     use crate::client::*;
-    use crate::index::EntryKey;
     use crate::index::ranged::tree::btree;
     use crate::index::ranged::trees::Range;
+    use crate::index::EntryKey;
     use crate::ram::schema::*;
     use crate::ram::types::Id;
     use crate::server::*;
@@ -19,8 +19,8 @@ mod tests {
     use futures::stream::FuturesUnordered;
     use itertools::Itertools;
     use rand::seq::SliceRandom;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::time::timeout;
     use tokio_stream::StreamExt;

@@ -174,7 +174,9 @@ mod tests {
         first.kill();
 
         let mut second = ProbeChild::spawn(&paths, &reserve_addr(), group, database);
-        let second_pid = second.wait_ready().expect("second probe should reclaim stale lock");
+        let second_pid = second
+            .wait_ready()
+            .expect("second probe should reclaim stale lock");
         assert_ne!(first_pid, second_pid);
         assert_eq!(read_lock_pid(&paths.lock_file(group, database)), second_pid);
 

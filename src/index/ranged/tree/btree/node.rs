@@ -755,7 +755,9 @@ pub fn insert_into_split<T, S>(
 {
     trace!(
         "insert into split left len {}, right len {}, pos {}",
-        xlen, ylen, pos
+        xlen,
+        ylen,
+        pos
     );
     if pos < *xlen {
         trace!("insert into left part, pos: {}", pos);

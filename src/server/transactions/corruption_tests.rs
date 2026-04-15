@@ -8,7 +8,7 @@ use crate::ram::types::*;
 use crate::server::transactions;
 use crate::server::*;
 use env_logger;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 
 async fn scoped_txn_client(
     address: &String,

@@ -11,8 +11,8 @@ use crate::{
 };
 use bifrost_hasher::hash_str;
 use dovahkiin::{integrated::lisp::parse_to_serde_expr, types::*};
-use rand::{Rng, SeedableRng, rngs::SmallRng};
-use rusqlite::{Connection, params};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
+use rusqlite::{params, Connection};
 use std::{collections::BTreeSet, fmt::Write as _, sync::Arc, time::Duration};
 
 const RANGE_A: &str = "RANGE_A";

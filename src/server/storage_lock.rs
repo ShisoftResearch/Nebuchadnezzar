@@ -38,7 +38,11 @@ impl Display for StorageLockError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             StorageLockError::Io { directory, source } => {
-                write!(f, "failed to lock storage directory {}: {source}", directory.display())
+                write!(
+                    f,
+                    "failed to lock storage directory {}: {source}",
+                    directory.display()
+                )
             }
             StorageLockError::AlreadyLocked {
                 directory,
@@ -74,7 +78,9 @@ impl StorageDirectoryLocks {
         disable_storage_locks: bool,
     ) -> Result<Self, StorageLockError> {
         if disable_storage_locks {
-            return Ok(Self { _guards: Vec::new() });
+            return Ok(Self {
+                _guards: Vec::new(),
+            });
         }
 
         Self::acquire_impl(layout)
@@ -299,6 +305,9 @@ mod tests {
             .open(&lock_path)
             .expect("lock file should open");
 
-        assert_eq!(read_lock_pid(&mut file).expect("pid should parse"), Some(1234));
+        assert_eq!(
+            read_lock_pid(&mut file).expect("pid should parse"),
+            Some(1234)
+        );
     }
 }

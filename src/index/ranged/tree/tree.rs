@@ -366,7 +366,7 @@ unsafe impl Sync for RangedTree {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{FEATURE_SIZE, Feature};
+    use crate::index::{Feature, FEATURE_SIZE};
     use crate::ram::types::Id;
     use byteorder::{BigEndian, WriteBytesExt};
     use lightning::map::HashSet as LFHashSet;
@@ -608,7 +608,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn delete_survives_recovery() {
         use crate::client;
-        use crate::index::ranged::tree::btree::{Ordering, page_schema, storage};
+        use crate::index::ranged::tree::btree::{page_schema, storage, Ordering};
         use crate::server::{NebServer, ServerOptions, Service};
 
         let _ = env_logger::try_init();

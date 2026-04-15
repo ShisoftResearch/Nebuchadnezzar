@@ -1,4 +1,4 @@
-use crate::ram::cell::{CellHeader, OwnedCell, cell_header_from_entry_content_addr};
+use crate::ram::cell::{cell_header_from_entry_content_addr, CellHeader, OwnedCell};
 use crate::ram::chunk::Chunks;
 use crate::ram::entry::Entry;
 use crate::ram::io::reader;
@@ -7,11 +7,11 @@ use bifrost::vector_clock::StandardVectorClock;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions, create_dir_all, remove_file};
+use std::fs::{create_dir_all, remove_file, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub type TxnId = StandardVectorClock;
 
@@ -2432,7 +2432,7 @@ mod tests {
         use crate::server::transactions;
         use crate::server::{NebServer, ServerOptions, Service};
         use tempfile::TempDir;
-        use tokio::time::{Duration, sleep};
+        use tokio::time::{sleep, Duration};
 
         let temp_dir = TempDir::new().unwrap();
         let undo_log_path = temp_dir.path().join("undo");
@@ -2443,7 +2443,7 @@ mod tests {
         let raft_path_str = raft_path.to_str().unwrap().to_string();
 
         let server_addr = String::from("127.0.0.1:5320"); // Unique port for this test
-        // Use unique group name to avoid conflicts with other tests
+                                                          // Use unique group name to avoid conflicts with other tests
         let group_name = "test_e2e_txn_committed_no_rollback";
         let server = NebServer::new_from_opts(
             &ServerOptions {

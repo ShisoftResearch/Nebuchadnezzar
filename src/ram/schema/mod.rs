@@ -19,8 +19,8 @@ use super::types;
 use std::string::String;
 use std::sync::Arc;
 
-use futures::FutureExt;
 use futures::prelude::*;
+use futures::FutureExt;
 use smallvec::SmallVec;
 use std::ops::Deref;
 

@@ -1,7 +1,7 @@
 use super::cursor::RTCursor;
+use super::node::read_node;
 use super::node::NodeData;
 use super::node::NodeReadHandler;
-use super::node::read_node;
 use super::*;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -70,7 +70,9 @@ where
                 &NodeData::Internal(ref n) => {
                     trace!(
                         "search in internal node for {:?}, len {}, pos {}",
-                        key, n.len, pos
+                        key,
+                        n.len,
+                        pos
                     );
                     let next_node_ref = &n.ptrs.as_slice_immute()[pos];
                     debug_assert!(pos <= n.len);

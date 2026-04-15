@@ -74,11 +74,15 @@ pub fn values_semantically_equal(left: &OwnedValue, right: &OwnedValue) -> bool 
         return true;
     }
 
-    let (Some(left_values), Some(right_values)) = (index_query_scalars(left), index_query_scalars(right)) else {
+    let (Some(left_values), Some(right_values)) =
+        (index_query_scalars(left), index_query_scalars(right))
+    else {
         return false;
     };
 
-    left_values
-        .iter()
-        .any(|left_value| right_values.iter().any(|right_value| left_value == right_value))
+    left_values.iter().any(|left_value| {
+        right_values
+            .iter()
+            .any(|right_value| left_value == right_value)
+    })
 }

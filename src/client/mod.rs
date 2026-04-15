@@ -3,7 +3,7 @@ use bifrost::membership::client::ObserverClient;
 use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::master::ExecError;
-use bifrost::rpc::{DEFAULT_CLIENT_POOL, RPCClient, RPCError, Server as RPCServer, ServiceClient};
+use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, ServiceClient, DEFAULT_CLIENT_POOL};
 use dovahkiin::types::OwnedValue;
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
@@ -22,11 +22,11 @@ use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
 use crate::ram::types::Id;
 use crate::server::database::client::SMClient as DatabaseCatalogClient;
 use crate::server::database::{
-    CreateDatabaseError, DatabaseCatalogEntry, DeleteDatabaseError,
-    generate_sm_id as generate_database_catalog_sm_id,
+    generate_sm_id as generate_database_catalog_sm_id, CreateDatabaseError, DatabaseCatalogEntry,
+    DeleteDatabaseError,
 };
 use crate::server::transactions::TxnId;
-use crate::server::{CONS_HASH_ID, cell_rpc as plain_server, transactions as txn_server};
+use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
 use crate::server::{database_meta_plane_id, shared_meta_plane_id};
 
 use self::transaction::*;

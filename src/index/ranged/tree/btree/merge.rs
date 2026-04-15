@@ -1,7 +1,7 @@
 use super::external;
 use super::node::*;
-use super::search::MutSearchResult;
 use super::search::mut_search;
+use super::search::MutSearchResult;
 use super::*;
 use itertools::Itertools;
 use std::fmt::Debug;
@@ -134,7 +134,8 @@ where
                     let right_node_ref = current_guard.right_ref().unwrap();
                     trace!(
                         "Merge with node split at {:?}, locking on right node {:?}",
-                        target_node_ref, right_node_ref
+                        target_node_ref,
+                        right_node_ref
                     );
                     #[cfg(debug_assertions)]
                     if is_node_locked::<KS, PS>(right_node_ref) {

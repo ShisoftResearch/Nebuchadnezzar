@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::index::entry::EntryKey;
-    use crate::index::{FEATURE_SIZE, Feature};
+    use crate::index::{Feature, FEATURE_SIZE};
     use crate::ram::types::Id;
     use byteorder::{BigEndian, WriteBytesExt};
 
@@ -215,8 +215,8 @@ mod test {
 
     #[test]
     fn test_range_seek_with_actual_btree() {
-        use crate::index::ranged::tree::btree::Ordering;
         use crate::index::ranged::tree::btree::test::LevelBPlusTree;
+        use crate::index::ranged::tree::btree::Ordering;
         use crate::index::ranged::tree::service::{Range, RangeTerm};
         use crate::index::ranged::trees::Cursor;
         use lightning::map::HashSet;
@@ -500,9 +500,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_range_query_survives_recovery() {
         use crate::client;
-        use crate::index::ranged::tree::btree::{Ordering, page_schema};
+        use crate::index::ranged::tree::btree::{page_schema, Ordering};
         use crate::index::ranged::tree::service::{Range, RangeTerm};
-        use crate::index::ranged::tree::tree::{RANGED_TREE_SCHEMA, RangedTree};
+        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
         use crate::index::ranged::trees::Cursor;
         use crate::server::*;
         use std::sync::Arc;
@@ -759,9 +759,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_range_query_backward_survives_recovery() {
         use crate::client;
-        use crate::index::ranged::tree::btree::{Ordering, page_schema};
+        use crate::index::ranged::tree::btree::{page_schema, Ordering};
         use crate::index::ranged::tree::service::{Range, RangeTerm};
-        use crate::index::ranged::tree::tree::{RANGED_TREE_SCHEMA, RangedTree};
+        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
         use crate::index::ranged::trees::Cursor;
         use crate::server::*;
         use std::sync::Arc;
@@ -1162,8 +1162,7 @@ mod test {
             "Should have 91 items before recovery"
         );
         assert_eq!(
-            all_prices_before,
-            expected_all_prices,
+            all_prices_before, expected_all_prices,
             "All prices from 10 to 100 should be present"
         );
 
@@ -1268,8 +1267,7 @@ mod test {
             "Should have 91 items after recovery"
         );
         assert_eq!(
-            all_prices_after,
-            expected_all_prices,
+            all_prices_after, expected_all_prices,
             "All prices from 10 to 100 should be present after recovery"
         );
 
@@ -1292,8 +1290,8 @@ mod test {
     #[tokio::test]
     async fn test_split_target_tree_is_visible_before_routing() {
         use crate::client;
-        use crate::index::ranged::tree::btree::{Ordering, page_schema, storage};
-        use crate::index::ranged::tree::tree::{RANGED_TREE_SCHEMA, RangedTree};
+        use crate::index::ranged::tree::btree::{page_schema, storage, Ordering};
+        use crate::index::ranged::tree::tree::{RangedTree, RANGED_TREE_SCHEMA};
         use crate::index::ranged::trees::Cursor;
         use crate::server::{NebServer, ServerOptions, Service};
         use std::sync::Arc;
@@ -1390,15 +1388,15 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_concurrent_writes_during_split_remain_scannable() {
         use crate::client;
-        use crate::index::EntryKey;
         use crate::index::ranged::client::RangedIndexerClient;
-        use crate::index::ranged::tree::btree::{self, Ordering, storage};
+        use crate::index::ranged::tree::btree::{self, storage, Ordering};
         use crate::index::ranged::trees::{Cursor, Range};
+        use crate::index::EntryKey;
         use crate::ram::schema::{Field, Schema};
         use crate::ram::types::Type;
         use crate::server::{NebServer, ServerOptions, Service};
-        use futures::StreamExt;
         use futures::stream::FuturesUnordered;
+        use futures::StreamExt;
         use itertools::Itertools;
         use rand::seq::SliceRandom;
         use std::sync::Arc;

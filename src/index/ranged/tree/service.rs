@@ -1299,7 +1299,6 @@ impl Range {
     }
 }
 
-
 dispatch_rpc_service_functions!(TreeService);
 
 unsafe impl Send for DistTree {}

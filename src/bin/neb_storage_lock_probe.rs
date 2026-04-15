@@ -19,19 +19,27 @@ struct ProbeArgs {
 impl ProbeArgs {
     fn parse() -> Result<Self, String> {
         let mut args = env::args().skip(1);
-        let server_addr = args.next().ok_or_else(|| "missing server_addr".to_string())?;
-        let group_name = args.next().ok_or_else(|| "missing group_name".to_string())?;
+        let server_addr = args
+            .next()
+            .ok_or_else(|| "missing server_addr".to_string())?;
+        let group_name = args
+            .next()
+            .ok_or_else(|| "missing group_name".to_string())?;
         let database_name = args
             .next()
             .ok_or_else(|| "missing database_name".to_string())?;
         let backup_storage = args
             .next()
             .ok_or_else(|| "missing backup_storage".to_string())?;
-        let wal_storage = args.next().ok_or_else(|| "missing wal_storage".to_string())?;
+        let wal_storage = args
+            .next()
+            .ok_or_else(|| "missing wal_storage".to_string())?;
         let undo_log_storage = args
             .next()
             .ok_or_else(|| "missing undo_log_storage".to_string())?;
-        let raft_storage = args.next().ok_or_else(|| "missing raft_storage".to_string())?;
+        let raft_storage = args
+            .next()
+            .ok_or_else(|| "missing raft_storage".to_string())?;
         let hold_secs = args
             .next()
             .ok_or_else(|| "missing hold_secs".to_string())?

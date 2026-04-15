@@ -273,7 +273,10 @@ where
     pub fn merge_with(&mut self, right: &mut Self) {
         trace!(
             "Merge external node, left len {}:{:?}, right len {}:{:?}",
-            self.len, self.keys, right.len, right.keys
+            self.len,
+            self.keys,
+            right.len,
+            right.keys
         );
         let self_len = self.len;
         let new_len = self.len + right.len;

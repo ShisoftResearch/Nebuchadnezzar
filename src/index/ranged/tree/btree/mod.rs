@@ -26,8 +26,8 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::*};
+use std::sync::Arc;
 
 pub mod cell_ref;
 mod clear;

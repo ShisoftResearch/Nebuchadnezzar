@@ -1,8 +1,8 @@
 use super::external::ExtNode;
 use super::internal::InNode;
-use super::node::{Node, NodeWriteGuard, write_node};
+use super::node::{write_node, Node, NodeWriteGuard};
 use super::*;
-use super::{BPlusTree, NodeCellRef, max_entry_key};
+use super::{max_entry_key, BPlusTree, NodeCellRef};
 use crate::client::AsyncClient;
 use crate::ram::cell::OwnedCell;
 use futures::stream::{self, StreamExt, TryStreamExt};

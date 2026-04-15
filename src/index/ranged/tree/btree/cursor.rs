@@ -53,7 +53,9 @@ where
         }
         trace!(
             "Created cursor with pos {}, current {:?}, ordering: {:?}",
-            cursor.index, cursor.current, cursor.ordering
+            cursor.index,
+            cursor.current,
+            cursor.ordering
         );
         cursor
     }

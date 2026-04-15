@@ -14,7 +14,10 @@ use crate::{
         },
         statistics::SchemaStatistics,
     },
-    ram::{schema::{IndexType, Schema}, types::index_query_scalars},
+    ram::{
+        schema::{IndexType, Schema},
+        types::index_query_scalars,
+    },
 };
 
 use super::{ValueRange, ValueRangeTerm};
@@ -1338,7 +1341,11 @@ fn expand_array_comparison_clause(expr: &Expr) -> Option<Expr> {
         return None;
     }
 
-    let junction_name = if matches!(op, ClauseOp::Ne) { "and" } else { "or" };
+    let junction_name = if matches!(op, ClauseOp::Ne) {
+        "and"
+    } else {
+        "or"
+    };
     let mut clauses = Vec::with_capacity(scalar_values.len() + 1);
     clauses.push(Expr::Symbol(
         hash_str(junction_name),

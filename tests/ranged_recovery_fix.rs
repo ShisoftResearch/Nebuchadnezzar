@@ -2,15 +2,11 @@ use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
 use neb::client;
-use neb::index::EntryKey;
 use neb::index::ranged::sm::{self, client::SMClient as PlacementClient};
 use neb::index::ranged::tree::btree::{page_schema, storage, Ordering};
-use neb::index::ranged::tree::service::{
-    OpResult, Range, Service as TreeRpcService, TreeService,
-};
-use neb::index::ranged::tree::tree::{
-    RangedTree, RANGED_TREE_HEAD_HASH, RANGED_TREE_SCHEMA,
-};
+use neb::index::ranged::tree::service::{OpResult, Range, Service as TreeRpcService, TreeService};
+use neb::index::ranged::tree::tree::{RangedTree, RANGED_TREE_HEAD_HASH, RANGED_TREE_SCHEMA};
+use neb::index::EntryKey;
 use neb::ram::types::Id;
 use neb::server::{database_meta_plane_id, NebServer, ServerOptions, Service as NebService};
 
@@ -63,13 +59,8 @@ async fn lazy_hydration_recovers_missing_active_tree() {
     let entry = EntryKey::for_scannable(&Id::new(7, 7), 0x12_34_56_78);
     let (_lower, placement, _upper) = sm_client.locate_key(&entry).await.unwrap();
 
-    let insert_result = TreeRpcService::insert(
-        &local_service,
-        placement.id,
-        entry.clone(),
-        placement.epoch,
-    )
-    .await;
+    let insert_result =
+        TreeRpcService::insert(&local_service, placement.id, entry.clone(), placement.epoch).await;
     assert!(matches!(insert_result, OpResult::Successful(true)));
 
     let seek_result = TreeRpcService::seek(

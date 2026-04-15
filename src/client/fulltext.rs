@@ -9,8 +9,8 @@ use std::sync::Arc;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::rpc::{ClientPool, RPCError};
 
-use crate::index::full_text::BM25Hit;
 use crate::index::full_text::coordinator::DistributedInvertedIndexCoordinator;
+use crate::index::full_text::BM25Hit;
 
 /// Client for distributed full-text search operations
 ///

@@ -9,12 +9,12 @@ use bifrost::conshash::ConsistentHashing;
 use bifrost::raft::client::AsRaftPlaneClient;
 use bifrost::rpc::RPCError;
 
-use crate::index::Feature;
 use crate::index::entry::EntryKey;
-use crate::index::ranged::client::RangedIndexerClient;
 use crate::index::ranged::client::cursor::ClientCursor;
+use crate::index::ranged::client::RangedIndexerClient;
 use crate::index::ranged::tree::btree::Ordering;
 use crate::index::ranged::tree::service::{Range, RangeTerm};
+use crate::index::Feature;
 use crate::ram::types::Id;
 
 /// Client for distributed ranged index queries

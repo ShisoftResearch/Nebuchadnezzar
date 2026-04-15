@@ -17,7 +17,7 @@ use crate::{
 };
 use bifrost_hasher::hash_str;
 use dovahkiin::{expr::serde::Expr, integrated::lisp::*, types::*};
-use futures::{FutureExt, future::BoxFuture};
+use futures::{future::BoxFuture, FutureExt};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 #[derive(Clone)]
@@ -3814,7 +3814,11 @@ async fn hashed_query_supports_array_values() {
     let mut array_cell = OwnedValue::Map(OwnedMap::new());
     array_cell[TAGS] = OwnedValue::Array(vec![OwnedValue::U64(7), OwnedValue::U64(11)]);
     client
-        .write_cell(OwnedCell::new_with_id(schema_id, &contains_both, array_cell))
+        .write_cell(OwnedCell::new_with_id(
+            schema_id,
+            &contains_both,
+            array_cell,
+        ))
         .await
         .unwrap()
         .unwrap();
@@ -3846,7 +3850,11 @@ async fn hashed_query_supports_array_values() {
     let mut non_match_cell = OwnedValue::Map(OwnedMap::new());
     non_match_cell[TAGS] = OwnedValue::PrimArray(OwnedPrimArray::U64(vec![99]));
     client
-        .write_cell(OwnedCell::new_with_id(schema_id, &non_match, non_match_cell))
+        .write_cell(OwnedCell::new_with_id(
+            schema_id,
+            &non_match,
+            non_match_cell,
+        ))
         .await
         .unwrap()
         .unwrap();
@@ -3968,7 +3976,10 @@ async fn ranged_query_supports_array_values() {
     let selection = Expr::List(vec![
         Expr::Symbol(hash_str("="), "=".to_string()),
         Expr::Symbol(hash_str(TAGS), TAGS.to_string()),
-        Expr::Value(OwnedValue::Array(vec![OwnedValue::U64(5), OwnedValue::U64(21)])),
+        Expr::Value(OwnedValue::Array(vec![
+            OwnedValue::U64(5),
+            OwnedValue::U64(21),
+        ])),
     ]);
 
     let idx_data_client = server.indexed_data_client();
@@ -4905,14 +4916,12 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
             },
         ],
     );
-    assert!(
-        server
-            .indexer()
-            .unwrap()
-            .clients
-            .embedding_client
-            .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits,))
-    );
+    assert!(server
+        .indexer()
+        .unwrap()
+        .clients
+        .embedding_client
+        .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits,)));
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(
@@ -5035,14 +5044,12 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
             },
         ],
     );
-    assert!(
-        server
-            .indexer()
-            .unwrap()
-            .clients
-            .embedding_client
-            .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits))
-    );
+    assert!(server
+        .indexer()
+        .unwrap()
+        .clients
+        .embedding_client
+        .set_embedding_index_core(MockEmbeddingIndexerCore::successful(embedding_hits)));
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(
@@ -5160,14 +5167,12 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
     .await
     .unwrap();
 
-    assert!(
-        server
-            .indexer()
-            .unwrap()
-            .clients
-            .embedding_client
-            .set_embedding_index_core(MockEmbeddingIndexerCore::failing())
-    );
+    assert!(server
+        .indexer()
+        .unwrap()
+        .clients
+        .embedding_client
+        .set_embedding_index_core(MockEmbeddingIndexerCore::failing()));
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         EMB_FIELD,

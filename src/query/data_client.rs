@@ -644,7 +644,11 @@ impl IndexedDataClient {
         }
         let mut matched_ids = vec![];
         for index_id in Self::hashed_query_index_ids(schema, field_id, value) {
-            match self.index_clients.hashed_query(index_id, field_id, value).await? {
+            match self
+                .index_clients
+                .hashed_query(index_id, field_id, value)
+                .await?
+            {
                 Ok(ids) => matched_ids.extend(ids),
                 Err(_) => {}
             }

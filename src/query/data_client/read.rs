@@ -9,14 +9,17 @@ use itertools::Itertools;
 use crate::{
     client::client_by_server_name_for_database,
     index::{
-        EntryKey, SCHEMA_SCAN_PATT_SIZE,
         ranged::{
             client::cursor::ClientCursor,
             tree::{btree::Ordering, service::Range},
         },
+        EntryKey, SCHEMA_SCAN_PATT_SIZE,
     },
     query::planner::normalize_selection_for_eval,
-    ram::{cell::OwnedCell, types::{index_query_scalars, values_semantically_equal}},
+    ram::{
+        cell::OwnedCell,
+        types::{index_query_scalars, values_semantically_equal},
+    },
 };
 
 use super::{DataCursor, IndexedDataClient, QueryOrdering, SCAN_BUFFER_SIZE};
@@ -514,7 +517,9 @@ fn reverse_compare_op(op: CompareOp) -> CompareOp {
 }
 
 fn compare_values(left: &OwnedValue, right: &OwnedValue, op: CompareOp) -> bool {
-    let (Some(left_values), Some(right_values)) = (index_query_scalars(left), index_query_scalars(right)) else {
+    let (Some(left_values), Some(right_values)) =
+        (index_query_scalars(left), index_query_scalars(right))
+    else {
         return false;
     };
 

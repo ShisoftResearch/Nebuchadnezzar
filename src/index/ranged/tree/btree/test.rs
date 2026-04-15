@@ -276,17 +276,15 @@ fn parallel() {
         .unwrap();
 
     let tree_clone = tree.clone();
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(10));
-            let tree_len = tree_clone.len();
-            debug!(
-                "B+ Tree now have {}/{} elements, total {:.2}%",
-                tree_len,
-                num,
-                tree_len as f32 / num as f32 * 100.0
-            );
-        }
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(10));
+        let tree_len = tree_clone.len();
+        debug!(
+            "B+ Tree now have {}/{} elements, total {:.2}%",
+            tree_len,
+            num,
+            tree_len as f32 / num as f32 * 100.0
+        );
     });
     let mut rng = rand::rng();
     let mut nums = (0..num).collect_vec();

@@ -1084,8 +1084,8 @@ mod tests {
     use crate::ram::types::{OwnedMap, OwnedValue};
     use crate::server::transactions;
     use crate::server::{NebServer, ServerOptions, Service};
-    use dovahkiin::types::Map;
     use dovahkiin::types::custom_types::id::Id;
+    use dovahkiin::types::Map;
     use futures::future::join_all;
 
     #[test]

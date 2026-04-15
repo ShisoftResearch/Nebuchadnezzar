@@ -2,8 +2,8 @@ use crate::client::{AsyncClient, NebClientError};
 use crate::query::data_client::IndexedDataClient;
 use crate::server::transactions::manager::TransactionManager;
 use crate::{client, index::builder::IndexBuilder};
-use bifrost::conshash::ConsistentHashing;
 use bifrost::conshash::weights::Weights;
+use bifrost::conshash::ConsistentHashing;
 use bifrost::membership::client::ObserverClient;
 use bifrost::membership::member::MemberService;
 use bifrost::membership::server::Membership;
@@ -21,8 +21,8 @@ use bifrost_plugins::hash_ident;
 use crate::index::ranged;
 use crate::ram::chunk::Chunks;
 use crate::ram::cleaner::Cleaner;
-use crate::ram::schema::LocalSchemasCache;
 use crate::ram::schema::sm as schema_sm;
+use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
 use crate::server::storage_lock::StorageDirectoryLocks;
 use std::collections::{HashMap, HashSet};
@@ -1581,7 +1581,6 @@ impl NebServer {
             &membership_client,
         )
         .await
-        
     }
 
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {

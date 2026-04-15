@@ -1,5 +1,5 @@
-use super::Slice;
 use super::node::EmptyNode;
+use super::Slice;
 use super::*;
 use crate::index::KEY_SIZE;
 use itertools::free::chain;
@@ -136,7 +136,11 @@ where
     }
 
     pub fn key_pos_from_ptr_pos(&self, ptr_pos: usize) -> usize {
-        if ptr_pos == 0 { 0 } else { ptr_pos - 1 }
+        if ptr_pos == 0 {
+            0
+        } else {
+            ptr_pos - 1
+        }
     }
     pub fn search(&self, key: &EntryKey) -> usize {
         let mut left = 0;
@@ -171,7 +175,9 @@ where
             let mut keys = self.keys.to_vec(*n_key_len);
             trace!(
                 "Removing from internal node pos {}, len {}, key {:?}",
-                key_pos, n_key_len, &keys[key_pos]
+                key_pos,
+                n_key_len,
+                &keys[key_pos]
             );
             keys.remove(key_pos);
             self.keys = InternalKeys::from_keys(keys.as_slice());
@@ -285,7 +291,8 @@ where
         debug_assert!(pointer_pos <= self.len);
         trace!(
             "Searching for rebalance candidate, pos {}, len {}",
-            pointer_pos, self.len
+            pointer_pos,
+            self.len
         );
         if pointer_pos == 0 {
             1
@@ -344,7 +351,10 @@ where
         }));
         trace!(
             "Removing merged node at {}, left {}, right {}, merged {}",
-            right_ptr_pos, left_len, right_len, merged_len
+            right_ptr_pos,
+            left_len,
+            right_len,
+            merged_len
         );
         self.remove_at(right_ptr_pos);
         trace!("Merged parent level keys: {:?}", self.keys);
@@ -354,7 +364,9 @@ where
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
         trace!(
             "Merge internal node, left len {}, right len {}, right_key {:?}",
-            self.len, right.len, right_key
+            self.len,
+            right.len,
+            right_key
         );
         let self_len = self.len;
         let right_len = right.len;
@@ -396,7 +408,10 @@ where
 
                 trace!(
                     "Before relocation internal children. left {}:{:?} right {}:{:?}",
-                    left_innode.len, left_innode.keys, right_innode.len, right_innode.keys
+                    left_innode.len,
+                    left_innode.keys,
+                    right_innode.len,
+                    right_innode.keys
                 );
 
                 let mut new_left_ptrs = PS::init();
@@ -464,7 +479,10 @@ where
 
             trace!(
                 "Before relocation external children. left {}:{:?} right {}:{:?}",
-                left_extnode.len, left_extnode.keys, right_extnode.len, right_extnode.keys
+                left_extnode.len,
+                left_extnode.keys,
+                right_extnode.len,
+                right_extnode.keys
             );
 
             let mut new_left_keys = KS::init();
@@ -499,14 +517,18 @@ where
 
             trace!(
                 "Relocated external children. left {}:{:?} right {}:{:?}",
-                left_extnode.len, left_extnode.keys, right_extnode.len, right_extnode.keys
+                left_extnode.len,
+                left_extnode.keys,
+                right_extnode.len,
+                right_extnode.keys
             );
         }
 
         let right_key_pos = right_ptr_pos - 1;
         trace!(
             "Setting key at pos {} to new key {:?}",
-            right_key_pos, new_right_node_key
+            right_key_pos,
+            new_right_node_key
         );
         debug_assert!(new_right_node_key > min_entry_key());
         let mut parent_keys = self.keys.to_vec(self.len);

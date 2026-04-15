@@ -1,12 +1,12 @@
 use super::*;
 
-use bifrost::raft::RaftService;
-use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::state_machine::callback::server::SMCallback;
+use bifrost::raft::state_machine::StateMachineCtl;
+use bifrost::raft::RaftService;
 use bifrost::utils;
 use bifrost_hasher::hash_str;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub static SM_ID_PREFIX: &'static str = "NEB_SCHEMAS_SM";
 
