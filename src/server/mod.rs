@@ -1047,6 +1047,17 @@ impl NebServer {
 
         if runtime.indexer().is_some() {
             let _ = IndexBuilder::await_all_indices().await;
+
+            if let Some(indexer) = runtime.indexer() {
+                if let Err(e) = indexer.graceful_shutdown().await {
+                    warn!(
+                        "Failed to gracefully shut down fulltext indexer for {}/{}: {:?}",
+                        runtime.group_name(),
+                        runtime.database_name(),
+                        e
+                    );
+                }
+            }
         }
 
         runtime.cleaner().stop();
@@ -1176,6 +1187,17 @@ impl NebServer {
             // There is no separate Raft commit barrier to wait on here, so a fixed sleep
             // only makes shutdown liveness depend on timer scheduling.
             info!("Index tasks drained; proceeding to LSM flush");
+
+            if let Some(indexer) = self.indexer() {
+                if let Err(e) = indexer.graceful_shutdown().await {
+                    warn!(
+                        "Failed to gracefully shut down fulltext indexer for {}/{}: {:?}",
+                        self.group_name,
+                        self.database_name,
+                        e
+                    );
+                }
+            }
         } else {
             debug!("No index builder, skipping index task await");
         }

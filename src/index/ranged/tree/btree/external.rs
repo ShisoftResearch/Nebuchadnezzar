@@ -1,3 +1,4 @@
+use super::reconstruct::ReconstructError;
 use super::*;
 use crate::client::AsyncClient;
 use crate::index::ranged::tree::tree::DeletionSet;
@@ -35,6 +36,14 @@ lazy_static! {
     pub static ref CHANGE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 }
 
+fn invalid_page_format(cell: &OwnedCell, reason: impl Into<String>) -> ReconstructError {
+    ReconstructError::InvalidPageFormat {
+        page_id: cell.id(),
+        schema_id: cell.header.schema,
+        reason: reason.into(),
+    }
+}
+
 pub struct ExtNode<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -66,17 +75,49 @@ where
         })
     }
 
-    pub fn from_cell(cell: &OwnedCell) -> Box<IncubatingExtNode<KS, PS>> {
+    pub fn from_cell(cell: &OwnedCell) -> Result<Box<IncubatingExtNode<KS, PS>>, ReconstructError> {
         let cell_id = cell.id();
         let _cell_version = cell.header.version;
-        let next = cell.data[*NEXT_PAGE_KEY_HASH].id().unwrap();
-        let prev = cell.data[*PREV_PAGE_KEY_HASH].id().unwrap();
+        if cell.header.schema != *PAGE_SCHEMA_ID {
+            return Err(invalid_page_format(
+                cell,
+                format!(
+                    "expected page schema {}, got {}",
+                    *PAGE_SCHEMA_ID, cell.header.schema
+                ),
+            ));
+        }
+        let next = cell.data[*NEXT_PAGE_KEY_HASH]
+            .id()
+            .copied()
+            .ok_or_else(|| {
+                invalid_page_format(cell, format!("missing or invalid `{}` field", NEXT_FIELD))
+            })?;
+        let prev = cell.data[*PREV_PAGE_KEY_HASH]
+            .id()
+            .copied()
+            .ok_or_else(|| {
+                invalid_page_format(cell, format!("missing or invalid `{}` field", PREV_FIELD))
+            })?;
         let keys = &cell.data[*KEYS_KEY_HASH];
         let keys_array = if let OwnedValue::PrimArray(OwnedPrimArray::SmallBytes(ref array)) = keys
         {
             array
         } else {
-            panic!()
+            return Err(invalid_page_format(
+                cell,
+                format!("missing or invalid `{}` field", KEYS_FIELD),
+            ));
+        };
+        if keys_array.len() > KS::slice_len() {
+            return Err(invalid_page_format(
+                cell,
+                format!(
+                    "page stores {} keys but capacity is {}",
+                    keys_array.len(),
+                    KS::slice_len()
+                ),
+            ));
         };
         let mut key_slice = KS::init();
         let mut key_count = 0;
@@ -93,11 +134,11 @@ where
             right_bound: max_entry_key(), // UNDETERMINED
             mark: PhantomData,
         };
-        Box::new(IncubatingExtNode {
+        Ok(Box::new(IncubatingExtNode {
             node: ext_node,
-            prev_id: *prev,
-            next_id: *next,
-        })
+            prev_id: prev,
+            next_id: next,
+        }))
     }
 
     pub fn to_cell(&self, deleted: &DeletionSet) -> OwnedCell {

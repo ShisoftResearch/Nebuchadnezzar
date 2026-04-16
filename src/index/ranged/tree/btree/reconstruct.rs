@@ -19,6 +19,11 @@ const PARALLEL_FETCH_CONCURRENCY: usize = 8;
 pub enum ReconstructError {
     MissingPage { page_id: Id, pages_read: usize },
     RpcReadFailed { page_id: Id, error: String },
+    InvalidPageFormat {
+        page_id: Id,
+        schema_id: u32,
+        reason: String,
+    },
 }
 
 pub struct TreeConstructor<KS, PS>
@@ -165,7 +170,7 @@ where
         let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
         for cell in page_cells {
             page_count += 1;
-            let page = ExtNode::<KS, PS>::from_cell(&cell);
+            let page = ExtNode::<KS, PS>::from_cell(&cell)?;
             let next_id = page.next_id;
             let prev_id = page.prev_id;
             let mut node = page.node;
@@ -240,7 +245,7 @@ where
         ids.push(current);
         let cell = match neb.read_cell(current).await {
             Ok(Ok(cell)) => cell,
-            Ok(Err(e)) => {
+            Ok(Err(_)) => {
                 return Err(ReconstructError::MissingPage {
                     page_id: current,
                     pages_read: ids.len() - 1,
@@ -253,7 +258,7 @@ where
                 });
             }
         };
-        let page = ExtNode::<KS, PS>::from_cell(&cell);
+        let page = ExtNode::<KS, PS>::from_cell(&cell)?;
         if page.next_id.is_unit_id() {
             break;
         }
@@ -347,7 +352,16 @@ where
             }
         };
 
-        let page = ExtNode::<KS, PS>::from_cell(&cell);
+        let page = match ExtNode::<KS, PS>::from_cell(&cell) {
+            Ok(page) => page,
+            Err(error) => {
+                warn!(
+                    "[B-TREE LOAD] Failed to decode candidate head {:?}: {:?}; using original {:?}",
+                    current, error, start_id
+                );
+                return start_id;
+            }
+        };
         if page.prev_id.is_unit_id() {
             return current;
         }
@@ -365,6 +379,7 @@ where
 
 #[cfg(test)]
 mod test {
+    use super::ReconstructError;
     use super::external::*;
     use crate::index::ranged::tree::btree::test::*;
     use crate::index::ranged::tree::btree::*;
@@ -478,6 +493,27 @@ mod test {
             .collect_vec();
         for t in threads {
             t.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn extnode_from_cell_rejects_missing_page_links() {
+        let page_id = Id::new(42, 42);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        let key = EntryKey::from_id(&page_id);
+        value[*KEYS_KEY_HASH] = vec![SmallBytes::from_vec(key.as_slice().to_vec())].value();
+        let cell = OwnedCell::new_with_id(*PAGE_SCHEMA_ID, &page_id, value);
+
+        match ExtNode::<KeySlice, PtrSlice>::from_cell(&cell) {
+            Err(ReconstructError::InvalidPageFormat {
+                page_id: error_page_id,
+                reason,
+                ..
+            }) => {
+                assert_eq!(error_page_id, page_id);
+                assert!(reason.contains(NEXT_FIELD));
+            }
+            _ => panic!("expected invalid page format error"),
         }
     }
 }

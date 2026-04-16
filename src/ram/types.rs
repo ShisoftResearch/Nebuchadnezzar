@@ -1,10 +1,16 @@
 use crate::ram::cell::CellHeader;
-use lightning::rand;
+use rand::rngs::SmallRng;
+use rand::{RngCore, SeedableRng};
+use std::cell::RefCell;
 
 pub use dovahkiin::types::*;
 
-lazy_static! {
-    static ref RAND_GEN: rand::XorRand = rand::XorRand::new(1024);
+thread_local! {
+    static RAND_GEN: RefCell<SmallRng> = RefCell::new(SmallRng::from_os_rng());
+}
+
+fn with_rand<T>(f: impl FnOnce(&mut SmallRng) -> T) -> T {
+    RAND_GEN.with(|rng| f(&mut rng.borrow_mut()))
 }
 
 pub trait RandValue {
@@ -13,7 +19,7 @@ pub trait RandValue {
 
 impl RandValue for Id {
     fn rand() -> Self {
-        Id::new(RAND_GEN.rand() as u64, RAND_GEN.rand() as u64)
+        with_rand(|rng| Id::new(rng.next_u64(), rng.next_u64()))
     }
 }
 
@@ -23,7 +29,7 @@ pub trait RandId: RandValue {
 
 impl RandId for Id {
     fn rand_lower() -> Self {
-        Id::new(0, RAND_GEN.rand() as u64)
+        with_rand(|rng| Id::new(0, rng.next_u64()))
     }
 }
 

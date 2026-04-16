@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bifrost_hasher::hash_str;
 use lightning::map::{Map as LFMap, PtrHashMap};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 
 use crate::client::AsyncClient;
@@ -477,8 +477,9 @@ pub struct InvertedIndexer {
     field_stats: Arc<PtrHashMap<u64, Arc<Mutex<FieldStats>>>>,
     doc_metadata: Arc<PtrHashMap<u64, Arc<Mutex<DocMeta>>>>,
 
-    // Track original keys for iteration (PtrHashMap doesn't support iteration)
-    field_stats_keys: Arc<Mutex<HashMap<u64, (u32, u64)>>>, // hash -> (schema_id, field_id)
+    // Dirty field-stats keys pending persistence.
+    // PtrHashMap doesn't support iteration, so we keep the original tuple here.
+    dirty_field_stats_keys: Arc<Mutex<HashMap<u64, (u32, u64)>>>, // hash -> (schema_id, field_id)
 
     // Background sync for stats
     flush_interval: Duration,
@@ -503,7 +504,7 @@ impl InvertedIndexer {
             neb_client,
             field_stats: Arc::new(PtrHashMap::with_capacity(64)),
             doc_metadata: Arc::new(PtrHashMap::with_capacity(1024)),
-            field_stats_keys: Arc::new(Mutex::new(HashMap::new())),
+            dirty_field_stats_keys: Arc::new(Mutex::new(HashMap::new())),
             flush_interval,
             shutdown: Arc::new(AtomicBool::new(false)),
         }
@@ -535,6 +536,22 @@ impl InvertedIndexer {
 
     fn doc_meta_cell_id(schema_id: u32, field_id: u64, doc_id: &Id) -> Id {
         Id::from_obj(&(schema_id, field_id, doc_id.higher, doc_id.lower))
+    }
+
+    fn mark_field_stats_dirty(&self, schema_id: u32, field_id: u64) -> u64 {
+        let stats_key = Self::stats_key(schema_id, field_id);
+        self.dirty_field_stats_keys
+            .lock()
+            .insert(stats_key, (schema_id, field_id));
+        stats_key
+    }
+
+    fn requeue_dirty_field_stats_keys(&self, dirty_keys: HashMap<u64, (u32, u64)>) {
+        if dirty_keys.is_empty() {
+            return;
+        }
+
+        self.dirty_field_stats_keys.lock().extend(dirty_keys);
     }
 
     /// Add a document to the index
@@ -594,12 +611,6 @@ impl InvertedIndexer {
             }
         };
 
-        // Track stats key for iteration during flush
-        {
-            let mut keys = self.field_stats_keys.lock();
-            keys.insert(stats_key, (meta.schema_id, meta.field_id));
-        }
-
         // Get or create field_stats entry
         let stats_arc = self
             .field_stats
@@ -618,6 +629,9 @@ impl InvertedIndexer {
             stats.doc_count += 1;
             stats.total_length += meta.doc_length as u64;
         }
+
+        drop(stats);
+        self.mark_field_stats_dirty(meta.schema_id, meta.field_id);
     }
 
     /// Remove a document from the index
@@ -650,6 +664,8 @@ impl InvertedIndexer {
             if let Some(stats_arc) = self.field_stats.get(&stats_key) {
                 let mut stats = stats_arc.lock();
                 stats.apply_remove(doc_len);
+                drop(stats);
+                self.mark_field_stats_dirty(meta.schema_id, meta.field_id);
             }
         }
 
@@ -899,51 +915,60 @@ impl InvertedIndexer {
     /// Note: Posting lists are written directly to Chunks during add_document,
     /// so we only need to flush the stats cache here.
     pub(crate) async fn flush_to_disk(&self) -> Result<(), IndexError> {
+        let dirty_keys = {
+            let mut keys = self.dirty_field_stats_keys.lock();
+            std::mem::take(&mut *keys)
+        };
+
+        if dirty_keys.is_empty() {
+            debug!("No dirty field stats to flush");
+            return Ok(());
+        }
+
+        info!("Flushing {} field stats to disk", dirty_keys.len());
+
+        if self.chunks.list.is_empty() {
+            self.requeue_dirty_field_stats_keys(dirty_keys);
+            error!("No chunks available!");
+            return Err(IndexError::Other("No chunks available".to_string()));
+        }
+
+        let schema_registered = self.chunks.list[0]
+            .meta
+            .schemas
+            .get(&(*INVERTED_STATS_SCHEMA_ID))
+            .is_some();
+        if !schema_registered {
+            self.requeue_dirty_field_stats_keys(dirty_keys);
+            error!("Stats schema {} not registered!", *INVERTED_STATS_SCHEMA_ID);
+            return Err(IndexError::Other(format!(
+                "Stats schema {} not registered",
+                *INVERTED_STATS_SCHEMA_ID
+            )));
+        }
+
         let mut cells_to_flush = Vec::new();
+        for (hash_key, (schema_id, field_id)) in dirty_keys.iter() {
+            if let Some(stats_arc) = self.field_stats.get(hash_key) {
+                let stat = stats_arc.lock();
+                let stats_id = Self::stats_cell_id(*schema_id, *field_id);
+                let cell = OwnedCell::new_with_id(
+                    *INVERTED_STATS_SCHEMA_ID,
+                    &stats_id,
+                    stat.to_value(),
+                );
 
-        // Collect stats cells to flush
-        {
-            let keys = self.field_stats_keys.lock();
-            info!("Flushing {} field stats to disk", keys.len());
+                info!(
+                    "Preparing stats cell for flush: schema={}, field={}, doc_count={}, total_length={}",
+                    schema_id, field_id, stat.doc_count, stat.total_length
+                );
 
-            if self.chunks.list.is_empty() {
-                error!("No chunks available!");
-                return Err(IndexError::Other("No chunks available".to_string()));
-            }
-
-            let schema_registered = self.chunks.list[0]
-                .meta
-                .schemas
-                .get(&(*INVERTED_STATS_SCHEMA_ID))
-                .is_some();
-            if !schema_registered {
-                error!("Stats schema {} not registered!", *INVERTED_STATS_SCHEMA_ID);
-                return Err(IndexError::Other(format!(
-                    "Stats schema {} not registered",
-                    *INVERTED_STATS_SCHEMA_ID
-                )));
-            }
-
-            for (hash_key, (schema_id, field_id)) in keys.iter() {
-                if let Some(stats_arc) = self.field_stats.get(hash_key) {
-                    let stat = stats_arc.lock();
-                    let stats_id = Self::stats_cell_id(*schema_id, *field_id);
-                    let cell = OwnedCell::new_with_id(
-                        *INVERTED_STATS_SCHEMA_ID,
-                        &stats_id,
-                        stat.to_value(),
-                    );
-
-                    info!("Preparing stats cell for flush: schema={}, field={}, doc_count={}, total_length={}",
-                          schema_id, field_id, stat.doc_count, stat.total_length);
-
-                    cells_to_flush.push(cell);
-                }
+                cells_to_flush.push((*hash_key, *schema_id, *field_id, cell));
             }
         }
 
         if cells_to_flush.is_empty() {
-            info!("No cells to flush");
+            debug!("Dirty field stats keys had no cached stats to flush");
             return Ok(());
         }
 
@@ -953,14 +978,16 @@ impl InvertedIndexer {
         // Each stats cell is independent, so we don't need atomicity across all cells
         let mut success_count = 0;
         let mut error_count = 0;
+        let mut failed_keys = HashMap::new();
 
-        for cell in cells_to_flush {
+        for (hash_key, schema_id, field_id, cell) in cells_to_flush {
             match self.neb_client.upsert_cell(cell.clone()).await {
                 Ok(Ok(_)) => {
                     success_count += 1;
                 }
                 Ok(Err(e)) => {
                     error!("Failed to upsert stats cell {:?}: {:?}", cell.id(), e);
+                    failed_keys.insert(hash_key, (schema_id, field_id));
                     error_count += 1;
                 }
                 Err(e) => {
@@ -969,12 +996,14 @@ impl InvertedIndexer {
                         cell.id(),
                         e
                     );
+                    failed_keys.insert(hash_key, (schema_id, field_id));
                     error_count += 1;
                 }
             }
         }
 
         if error_count > 0 {
+            self.requeue_dirty_field_stats_keys(failed_keys);
             warn!(
                 "Flush completed with {} successes and {} errors",
                 success_count, error_count
@@ -1117,7 +1146,7 @@ impl Clone for InvertedIndexer {
             neb_client: self.neb_client.clone(),
             field_stats: self.field_stats.clone(),
             doc_metadata: self.doc_metadata.clone(),
-            field_stats_keys: self.field_stats_keys.clone(),
+            dirty_field_stats_keys: self.dirty_field_stats_keys.clone(),
             flush_interval: self.flush_interval,
             shutdown: self.shutdown.clone(),
         }
@@ -2079,10 +2108,25 @@ mod tests {
 
         let doc_id = doc_id.expect("Should find an owned document");
         let meta = create_test_meta(schema_id, field_id, doc_id, "test document to remove");
+        let stats_key = InvertedIndexer::stats_key(schema_id, field_id);
 
         // Add document
         indexer.add_document(&meta).unwrap();
         indexer.update_stats_for_add(&meta);
+
+        assert!(
+            indexer
+                .dirty_field_stats_keys
+                .lock()
+                .contains_key(&stats_key),
+            "add should mark field stats dirty"
+        );
+
+        indexer.flush_to_disk().await.unwrap();
+        assert!(
+            indexer.dirty_field_stats_keys.lock().is_empty(),
+            "successful flush should clear dirty field stats"
+        );
 
         // Verify it's indexed
         let stats = indexer.get_field_stats(schema_id, field_id);
@@ -2090,6 +2134,20 @@ mod tests {
 
         // Remove document
         indexer.remove_document(&meta).unwrap();
+
+        assert!(
+            indexer
+                .dirty_field_stats_keys
+                .lock()
+                .contains_key(&stats_key),
+            "remove should mark field stats dirty again"
+        );
+
+        indexer.flush_to_disk().await.unwrap();
+        assert!(
+            indexer.dirty_field_stats_keys.lock().is_empty(),
+            "successful flush should clear dirty field stats after remove"
+        );
 
         // Verify it's removed
         let stats = indexer.get_field_stats(schema_id, field_id);

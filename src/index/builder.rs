@@ -402,6 +402,14 @@ impl IndexBuilder {
         self.clients.initialize_inverted_indexer(chunks);
     }
 
+    pub async fn graceful_shutdown(&self) -> Result<(), IndexError> {
+        if let Some(indexer) = self.clients.fulltext_indexer() {
+            indexer.graceful_shutdown().await?;
+        }
+
+        Ok(())
+    }
+
     // Ensure indices are properly set for a cell
     pub fn ensure_indices(
         &self,
