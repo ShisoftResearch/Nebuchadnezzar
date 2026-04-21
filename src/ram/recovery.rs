@@ -2,8 +2,9 @@ use super::cell::cell_header_from_entry_content_addr;
 use super::chunk::Chunk;
 use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
-use super::segs::{Segment, SEGMENT_SIZE};
+use super::segs::{Segment, SegmentClass, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
+use lightning::aarc::Arc as AArc;
 use lightning::map::WordMap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -99,6 +100,15 @@ struct StashedTombstone {
     chunk_id: usize,
 }
 
+#[derive(Debug)]
+struct RecoveryScanResult {
+    stashed_tombstones: Vec<StashedTombstone>,
+    segment_class: SegmentClass,
+    append_offset: usize,
+    dead_space: u32,
+    tombstones: u32,
+}
+
 /// Recovery configuration
 #[derive(Debug, Clone)]
 pub struct RecoveryConfig {
@@ -136,13 +146,10 @@ fn estimate_recovery_word_map_capacity(files: &[SegmentFileInfo]) -> usize {
         .next_power_of_two()
 }
 
-fn group_files_by_chunk(
-    files: Vec<(SegmentFileInfo, bool)>,
-    num_chunks: usize,
-) -> Vec<Vec<SegmentFileInfo>> {
+fn group_files_by_chunk(files: Vec<SegmentFileInfo>, num_chunks: usize) -> Vec<Vec<SegmentFileInfo>> {
     let mut grouped = vec![Vec::new(); num_chunks];
-    for (file_info, _) in files {
-        grouped[file_info.chunk_id].push(file_info);
+    for file in files {
+        grouped[file.chunk_id].push(file);
     }
     for chunk_files in &mut grouped {
         chunk_files.sort_unstable_by_key(|file| (file.seg_id, file.seq_id));
@@ -278,6 +285,166 @@ fn should_recover_as_cold(
     }
 }
 
+fn newer_resident_segment(chunk: &Chunk, seg_id: u64, seq_id: u64) -> Option<AArc<Segment>> {
+    let existing_segment = chunk.segs.get(&(seg_id as usize))?;
+    if existing_segment.seq_id > seq_id {
+        Some(existing_segment)
+    } else {
+        None
+    }
+}
+
+fn has_only_zero_padding(data: &[u8], start_offset: usize) -> bool {
+    data[start_offset..].iter().all(|byte| *byte == 0)
+}
+
+fn observe_recovered_segment_class(
+    chunk: &Chunk,
+    seg_id: u64,
+    schema_id: u32,
+    detected_class: &mut Option<SegmentClass>,
+    mixed_class_warning_emitted: &mut bool,
+    missing_schema_entries: &mut usize,
+    first_missing_schema_id: &mut Option<u32>,
+) -> io::Result<()> {
+    if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
+        let entry_class = if schema.blobs {
+            SegmentClass::Blob
+        } else {
+            SegmentClass::Regular
+        };
+
+        match *detected_class {
+            None => *detected_class = Some(entry_class),
+            Some(existing_class) if existing_class == entry_class => {}
+            Some(existing_class) => {
+                *detected_class = Some(SegmentClass::Blob);
+                if !*mixed_class_warning_emitted {
+                    warn!(
+                        "recovery scan found mixed runtime classes in segment {} (saw {:?} and {:?}); treating the recovered segment as Blob for safety",
+                        seg_id,
+                        existing_class,
+                        entry_class
+                    );
+                    *mixed_class_warning_emitted = true;
+                }
+            }
+        }
+    } else {
+        *missing_schema_entries += 1;
+        first_missing_schema_id.get_or_insert(schema_id);
+    }
+
+    Ok(())
+}
+
+fn ensure_backup_for_cold_recovery(chunk: &Chunk, file_info: &SegmentFileInfo) -> io::Result<()> {
+    if file_info.is_backup {
+        return Ok(());
+    }
+
+    let copied = chunk.file_manager.copy_wal_to_backup(
+        file_info.chunk_id,
+        file_info.seg_id,
+        file_info.seq_id,
+        Some(SEGMENT_SIZE),
+    )?;
+    if copied {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "cold recovery for segment {} requires a backup file, but WAL copy failed",
+                file_info.seg_id
+            ),
+        ))
+    }
+}
+
+fn apply_recovery_scan_result(segment: &Segment, scan_result: &RecoveryScanResult) {
+    segment
+        .append_header
+        .store(segment.addr + scan_result.append_offset, Ordering::Release);
+    segment
+        .dead_space
+        .store(scan_result.dead_space, Ordering::Release);
+    segment
+        .tombstones
+        .store(scan_result.tombstones, Ordering::Release);
+    if scan_result.dead_space > 0 || scan_result.tombstones > 0 {
+        segment.note_dead_bytes_change();
+    }
+}
+
+fn prepare_recovered_segment(
+    chunk: &Chunk,
+    file_info: &SegmentFileInfo,
+    hot: bool,
+    segment_class: SegmentClass,
+) -> io::Result<AArc<Segment>> {
+    if let Some(existing_segment) =
+        newer_resident_segment(chunk, file_info.seg_id, file_info.seq_id)
+    {
+        return Ok(existing_segment);
+    }
+
+    if let Some(existing_segment) = chunk.segs.get(&(file_info.seg_id as usize)) {
+        let needs_replacement = existing_segment.seq_id < file_info.seq_id
+            || existing_segment.segment_class() != segment_class
+            || existing_segment.is_hot() != hot;
+
+        if needs_replacement {
+            let replacement = chunk
+                .allocator
+                .alloc_seg_at_id_with(
+                    file_info.seg_id,
+                    file_info.seq_id,
+                    &chunk.file_manager,
+                    hot,
+                    segment_class,
+                )
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::OutOfMemory, "Cannot allocate segment")
+                })?;
+            return Ok(install_recovered_segment(chunk, replacement));
+        }
+
+        return Ok(existing_segment);
+    }
+
+    let new_segment = chunk
+        .allocator
+        .alloc_seg_at_id_with(
+            file_info.seg_id,
+            file_info.seq_id,
+            &chunk.file_manager,
+            hot,
+            segment_class,
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "Cannot allocate segment"))?;
+    let segment_id = new_segment.id as usize;
+    chunk.put_segment(new_segment);
+    Ok(chunk.segs.get(&segment_id).unwrap())
+}
+
+fn install_recovered_segment(chunk: &Chunk, segment: Segment) -> AArc<Segment> {
+    let segment_id = segment.id as usize;
+    let new_is_hot = segment.is_hot();
+    let replaced = chunk.segs.insert_back(segment_id, AArc::new(segment));
+
+    if let Some(ref tiered_manager) = chunk.tiered_manager {
+        let replaced_hot = replaced.as_ref().map(|segment| segment.is_hot()).unwrap_or(false);
+        match (replaced_hot, new_is_hot) {
+            (false, true) => tiered_manager.increment_hot_count(),
+            (true, false) => tiered_manager.decrement_hot_count(),
+            _ => {}
+        }
+    }
+
+    chunk.segs.get(&segment_id).unwrap()
+}
+
 /// Recover a segment as hot by copying file data to memory
 fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
     // Verify the data looks like valid segment data (should start with entry headers, not compression magic)
@@ -318,23 +485,38 @@ fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
     );
 }
 
-/// Scan segment data from a slice and update cell index.
-/// Unlike scan_segment_and_update_index, this scans from `data` slice but computes
-/// virtual addresses as `segment.addr + offset`. This allows cold segments to be
-/// scanned from a Vec without copying to segment memory (no physical pages committed).
+fn current_segment_entry_content_length(
+    data_base: usize,
+    segment_base: usize,
+    data_len: usize,
+    addr: usize,
+) -> Option<u32> {
+    let offset = addr.checked_sub(segment_base)?;
+    if offset >= data_len {
+        return None;
+    }
+
+    let entry_addr = data_base + offset;
+    let (entry, _) = Entry::decode_from(entry_addr, |_, _| {});
+    Some(entry.content_length)
+}
+
+/// Scan recovered segment data from a slice and update the recovery index state.
 ///
-/// After scanning, the cell index contains valid virtual addresses that will
-/// trigger segment promotion on access.
-///
-/// Uses version_map to compare versions without reading from segment memory.
+/// The scan runs against the deterministic virtual address range for the segment
+/// before a Segment object is installed. That lets recovery discover the final
+/// segment class and statistics in the same pass that rebuilds the cell index.
 fn scan_segment_from_data(
     chunk: &Chunk,
-    segment: &Segment,
+    seg_id: u64,
+    segment_base: usize,
     data: &[u8],
     version_map: &WordMap,
-) -> Vec<StashedTombstone> {
+) -> io::Result<RecoveryScanResult> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+    use std::io::Cursor;
+
     let data_base = data.as_ptr() as usize;
-    let segment_base = segment.addr;
     let bound = data_base + data.len();
 
     let mut cursor = data_base;
@@ -343,23 +525,115 @@ fn scan_segment_from_data(
     let mut dead_space = 0u64;
     let mut entries_processed = 0u32;
     let mut append_header = data_base;
+    let mut detected_class = None;
+    let mut mixed_class_warning_emitted = false;
+    let mut missing_schema_entries = 0usize;
+    let mut first_missing_schema_id = None;
 
     while cursor < bound {
         entries_processed += 1;
         if entries_processed > 1_000_000 {
             warn!(
-                "Cold segment {} scan exceeded 1M entries, breaking",
-                segment.id
+                "Recovered segment {} scan exceeded 1M entries, breaking",
+                seg_id
             );
             break;
         }
         let prev_cursor = cursor;
 
+        if cursor + ENTRY_HEAD_SIZE > bound {
+            if append_header > data_base {
+                warn!(
+                    "Recovered segment {} scan stopped at a crash-truncated tail (offset {})",
+                    seg_id,
+                    cursor - data_base
+                );
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "recovery cannot scan segment {}: truncated entry header at offset {}",
+                    seg_id,
+                    cursor - data_base
+                ),
+            ));
+        }
+
+        let entry_type_bits = unsafe {
+            let mut reader = Cursor::new(std::slice::from_raw_parts(cursor as *const u8, 8));
+            reader.read_u32::<LittleEndian>().unwrap()
+        };
+        if EntryType::from_bits(entry_type_bits).is_none() {
+            if append_header > data_base {
+                warn!(
+                    "Recovered segment {} scan stopped at a malformed tail (offset {}, invalid entry type bits {})",
+                    seg_id,
+                    cursor - data_base,
+                    entry_type_bits
+                );
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "recovery cannot scan segment {}: invalid entry type bits {} at offset {}",
+                    seg_id,
+                    entry_type_bits,
+                    cursor - data_base
+                ),
+            ));
+        }
+
         let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
+        if entry_header.entry_type == EntryType::UNDECIDED || entry_header.content_length == 0 {
+            let padding_offset = cursor - data_base;
+            if !has_only_zero_padding(data, padding_offset) {
+                if append_header > data_base {
+                    warn!(
+                        "Recovered segment {} scan stopped at a non-zero truncated tail (offset {})",
+                        seg_id,
+                        padding_offset
+                    );
+                    break;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "recovery cannot scan segment {}: non-zero bytes after padding at offset {}",
+                        seg_id,
+                        padding_offset
+                    ),
+                ));
+            }
+            break;
+        }
+
         let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
 
-        if entry_size == 0 || entry_size > SEGMENT_SIZE || entry_size < ENTRY_HEAD_SIZE {
-            break;
+        if entry_size == 0
+            || entry_size > SEGMENT_SIZE
+            || entry_size < ENTRY_HEAD_SIZE
+            || cursor + entry_size > bound
+        {
+            if append_header > data_base {
+                warn!(
+                    "Recovered segment {} scan stopped at a truncated tail (offset {}, entry size {})",
+                    seg_id,
+                    cursor - data_base,
+                    entry_size
+                );
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "recovery cannot scan segment {}: invalid entry size {} at offset {}",
+                    seg_id,
+                    entry_size,
+                    cursor - data_base
+                ),
+            ));
         }
 
         let offset = cursor - data_base;
@@ -368,6 +642,15 @@ fn scan_segment_from_data(
         if entry_header.entry_type == EntryType::CELL {
             let content_addr = Entry::content_pos(cursor);
             let cell_header = cell_header_from_entry_content_addr(content_addr);
+            observe_recovered_segment_class(
+                chunk,
+                seg_id,
+                cell_header.schema,
+                &mut detected_class,
+                &mut mixed_class_warning_emitted,
+                &mut missing_schema_entries,
+                &mut first_missing_schema_id,
+            )?;
             let hash = cell_header.hash;
             let new_version = cell_header.version;
 
@@ -388,8 +671,15 @@ fn scan_segment_from_data(
                     if existing_addr == 0 {
                         *cell_guard = virtual_cursor;
                     } else {
-                        // Update dead space for old entry if in hot segment
-                        if let Some(old_seg) = chunk.locate_segment(existing_addr) {
+                        if let Some(old_size) = current_segment_entry_content_length(
+                            data_base,
+                            segment_base,
+                            data.len(),
+                            existing_addr,
+                        ) {
+                            dead_space += old_size as u64;
+                        } else if let Some(old_seg) = chunk.locate_segment(existing_addr) {
+                            // Update dead space for old entry if the previous segment is hot.
                             if !old_seg.is_cold() {
                                 let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
                                 old_seg
@@ -426,7 +716,14 @@ fn scan_segment_from_data(
                     let existing_addr = *cell_guard;
                     if existing_addr != 0 {
                         *cell_guard = 0;
-                        if let Some(target_seg) = chunk.locate_segment(existing_addr) {
+                        if let Some(old_size) = current_segment_entry_content_length(
+                            data_base,
+                            segment_base,
+                            data.len(),
+                            existing_addr,
+                        ) {
+                            dead_space += old_size as u64;
+                        } else if let Some(target_seg) = chunk.locate_segment(existing_addr) {
                             if !target_seg.is_cold() {
                                 let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
                                 target_seg
@@ -455,152 +752,42 @@ fn scan_segment_from_data(
         }
         cursor = new_cursor;
     }
-
-    // Set append_header to virtual address
     let final_append_offset = append_header - data_base;
-    segment
-        .append_header
-        .store(segment_base + final_append_offset, Ordering::Release);
-
-    // Update segment statistics
     let dead_space_u32 = dead_space.min(u32::MAX as u64) as u32;
-    segment.dead_space.store(dead_space_u32, Ordering::Release);
-    segment.tombstones.store(tombstone_count, Ordering::Release);
-    if dead_space_u32 > 0 || tombstone_count > 0 {
-        segment.note_dead_bytes_change();
+
+    if missing_schema_entries > 0 {
+        let first_missing_schema_id = first_missing_schema_id.unwrap_or_default();
+        if let Some(segment_class) = detected_class {
+            warn!(
+                "recovery scan skipped {} cell entries with missing schemas (first schema {}) and kept {:?} based on known entries",
+                missing_schema_entries,
+                first_missing_schema_id,
+                segment_class
+            );
+        } else {
+            warn!(
+                "recovery scan skipped {} cell entries with missing schemas (first schema {}) and defaulted the segment to Regular until schemas are registered",
+                missing_schema_entries,
+                first_missing_schema_id
+            );
+        }
     }
 
     debug!(
-        "Cold segment {} scanned from data: {} entries, {} dead bytes, {} stashed tombstones",
-        segment.id,
+        "Recovered segment {} scanned from data: {} entries, {} dead bytes, {} stashed tombstones",
+        seg_id,
         entries_processed,
         dead_space_u32,
         stashed_tombstones.len()
     );
 
-    stashed_tombstones
-}
-
-/// Scan a hot segment and update both cell_index and version_map
-/// The version_map is used by cold segments for version comparison without reading segment memory
-fn scan_segment_and_update_index_with_versions(
-    chunk: &Chunk,
-    segment: &Segment,
-    bound: usize,
-    version_map: &WordMap,
-) -> Vec<StashedTombstone> {
-    let mut cursor = segment.addr;
-    let mut stashed_tombstones = Vec::new();
-    let mut tombstone_count = 0u32;
-    let mut dead_space = 0u64;
-    let mut entries_processed = 0u32;
-
-    while cursor < bound {
-        entries_processed += 1;
-        if entries_processed > 1_000_000 {
-            warn!("Segment {} scan exceeded 1M entries, breaking", segment.id);
-            break;
-        }
-        let prev_cursor = cursor;
-
-        let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
-        let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
-
-        if entry_size == 0 || entry_size > SEGMENT_SIZE || entry_size < ENTRY_HEAD_SIZE {
-            break;
-        }
-
-        if entry_header.entry_type == EntryType::CELL {
-            let content_addr = Entry::content_pos(cursor);
-            let cell_header = cell_header_from_entry_content_addr(content_addr);
-            let hash = cell_header.hash;
-            let new_version = cell_header.version;
-
-            // Update version_map (for cold segment comparison later)
-            let mut version_guard = version_map.lock_or_insert(hash as usize, new_version as usize);
-            let existing_version = *version_guard as u64;
-
-            if new_version >= existing_version {
-                *version_guard = new_version as usize;
-                drop(version_guard);
-
-                // Update cell_index
-                let mut cell_guard = chunk.cell_index.lock_or_insert(hash as usize, cursor);
-                if *cell_guard != cursor {
-                    let existing_addr = *cell_guard;
-                    if existing_addr == 0 {
-                        *cell_guard = cursor;
-                    } else {
-                        // Mark old entry as dead
-                        if let Some(old_seg) = chunk.locate_segment(existing_addr) {
-                            let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                            old_seg
-                                .dead_space
-                                .fetch_add(entry.content_length, Ordering::Relaxed);
-                            old_seg.note_dead_bytes_change();
-                        }
-                        *cell_guard = cursor;
-                    }
-                }
-            } else {
-                drop(version_guard);
-                dead_space += entry_header.content_length as u64;
-            }
-        } else if entry_header.entry_type == EntryType::TOMBSTONE {
-            let content_addr = Entry::content_pos(cursor);
-            let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
-            let hash = tombstone.hash;
-            tombstone_count += 1;
-
-            // Update version_map with tombstone version
-            let mut version_guard =
-                version_map.lock_or_insert(hash as usize, tombstone.version as usize);
-            let existing_version = *version_guard as u64;
-
-            if tombstone.version >= existing_version {
-                *version_guard = tombstone.version as usize;
-                drop(version_guard);
-
-                // Delete from cell_index
-                if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
-                    let existing_addr = *cell_guard;
-                    if existing_addr != 0 {
-                        *cell_guard = 0;
-                        if let Some(target_seg) = chunk.locate_segment(existing_addr) {
-                            let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                            target_seg
-                                .dead_space
-                                .fetch_add(entry.content_length, Ordering::Relaxed);
-                            target_seg.note_dead_bytes_change();
-                        }
-                    }
-                }
-            } else {
-                drop(version_guard);
-                stashed_tombstones.push(StashedTombstone {
-                    hash,
-                    version: tombstone.version,
-                    chunk_id: chunk.id,
-                });
-            }
-        } else {
-        }
-
-        let new_cursor = prev_cursor + entry_size;
-        if new_cursor <= prev_cursor {
-            break;
-        }
-        cursor = new_cursor;
-    }
-
-    let dead_space_u32 = dead_space.min(u32::MAX as u64) as u32;
-    segment.dead_space.store(dead_space_u32, Ordering::Release);
-    segment.tombstones.store(tombstone_count, Ordering::Release);
-    if dead_space_u32 > 0 || tombstone_count > 0 {
-        segment.note_dead_bytes_change();
-    }
-
-    stashed_tombstones
+    Ok(RecoveryScanResult {
+        stashed_tombstones,
+        segment_class: detected_class.unwrap_or(SegmentClass::Regular),
+        append_offset: final_append_offset,
+        dead_space: dead_space_u32,
+        tombstones: tombstone_count,
+    })
 }
 
 /// Merge stashed tombstones from all threads, keeping latest version per hash
@@ -731,66 +918,18 @@ pub fn recover_chunks(
     let cold_count = std::sync::atomic::AtomicUsize::new(0);
     let segments_processed = std::sync::atomic::AtomicUsize::new(0);
 
-    // Pre-compute hot vs cold decisions to avoid lock contention during parallel processing
-    let recovery_decisions: Vec<(SegmentFileInfo, bool)> = {
-        let mut planned_global_hot_segments = chunks
-            .iter()
-            .find_map(|chunk| {
-                chunk
-                    .tiered_manager
-                    .as_ref()
-                    .map(|manager| manager.shared_pool().total_hot_segments())
-            })
-            .unwrap_or(0);
-        files
-            .iter()
-            .map(|file_info| {
-                let chunk = &chunks[file_info.chunk_id];
-                let existing_hot = chunk
-                    .segs
-                    .get(&(file_info.seg_id as usize))
-                    .map(|segment| segment.is_hot())
-                    .unwrap_or(false);
-                let is_cold = should_recover_as_cold(chunk, file_info, planned_global_hot_segments);
-                if is_cold {
-                    if existing_hot {
-                        planned_global_hot_segments = planned_global_hot_segments.saturating_sub(1);
-                    }
-                } else if !existing_hot {
-                    planned_global_hot_segments += 1;
-                }
-                (file_info.clone(), is_cold)
-            })
-            .collect()
-    };
-
-    // Separate hot and cold files for two-phase processing, but keep work grouped by chunk
-    // so recovery workers do not all contend on the same few per-chunk maps.
-    let (hot_files, cold_files): (Vec<_>, Vec<_>) = recovery_decisions
-        .into_iter()
-        .partition(|(_, is_cold)| !is_cold);
-    let hot_files_by_chunk = group_files_by_chunk(hot_files, chunks.len());
-    let cold_files_by_chunk = group_files_by_chunk(cold_files, chunks.len());
-
-    let hot_segments: usize = hot_files_by_chunk.iter().map(Vec::len).sum();
-    let cold_segments: usize = cold_files_by_chunk.iter().map(Vec::len).sum();
+    let files_by_chunk = group_files_by_chunk(files, chunks.len());
+    let total_files: usize = files_by_chunk.iter().map(Vec::len).sum();
     info!(
-        "Processing {} hot segments, {} cold segments with up to {} recovery threads",
-        hot_segments,
-        cold_segments,
+        "Recovering {} segments with up to {} recovery threads",
+        total_files,
         recovery_parallelism(config)
     );
 
     // Create per-chunk version maps sized from the actual recovery footprint.
-    let version_maps: Vec<WordMap> = hot_files_by_chunk
+    let version_maps: Vec<WordMap> = files_by_chunk
         .iter()
-        .zip(cold_files_by_chunk.iter())
-        .map(|(hot_chunk_files, cold_chunk_files)| {
-            let mut combined = Vec::with_capacity(hot_chunk_files.len() + cold_chunk_files.len());
-            combined.extend(hot_chunk_files.iter().cloned());
-            combined.extend(cold_chunk_files.iter().cloned());
-            WordMap::with_capacity(estimate_recovery_word_map_capacity(&combined))
-        })
+        .map(|chunk_files| WordMap::with_capacity(estimate_recovery_word_map_capacity(chunk_files)))
         .collect();
 
     // Track max seq_id per chunk to update allocators after recovery
@@ -800,7 +939,14 @@ pub fn recover_chunks(
         .map(|_| std::sync::atomic::AtomicU64::new(0))
         .collect();
 
-    let total_files = hot_segments + cold_segments;
+    let planned_global_hot_segments = std::sync::atomic::AtomicUsize::new(
+        chunks
+            .iter()
+            .find_map(|chunk| chunk.tiered_manager.as_ref())
+            .map(|manager| manager.shared_pool().total_hot_segments())
+            .unwrap_or(0),
+    );
+
     let recovery_pool = ThreadPoolBuilder::new()
         .num_threads(recovery_parallelism(config))
         .thread_name(|idx| format!("recovery-{}", idx))
@@ -813,8 +959,7 @@ pub fn recover_chunks(
         })?;
 
     recovery_pool.install(|| -> io::Result<()> {
-        // Phase 1: Process HOT segments in parallel across chunks.
-        hot_files_by_chunk
+        files_by_chunk
             .into_par_iter()
             .enumerate()
             .try_for_each(|(chunk_id, chunk_files)| -> io::Result<()> {
@@ -823,98 +968,14 @@ pub fn recover_chunks(
                 let mut local_stashed = Vec::new();
 
                 for file_info in chunk_files {
-                    let segment =
-                        if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
-                            existing_seg
-                        } else {
-                            let new_seg = chunk
-                                .allocator
-                                .alloc_seg_at_id(
-                                    file_info.seg_id,
-                                    file_info.seq_id,
-                                    &chunk.file_manager,
-                                )
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::OutOfMemory,
-                                        "Cannot allocate segment",
-                                    )
-                                })?;
-                            let seg_id = new_seg.id as usize;
-                            chunk.put_segment(new_seg);
-                            chunk.segs.get(&seg_id).unwrap()
-                        };
-
-                    let file_data = load_file_to_memory(&file_info.path)?;
-                    if file_data.len() > SEGMENT_SIZE {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
-                    }
-
-                    recover_segment_as_hot(&segment, &file_data);
-                    let append_header = find_append_header(segment.addr, file_data.len());
-                    segment
-                        .append_header
-                        .store(append_header, Ordering::Release);
-                    drop(file_data);
-
-                    local_stashed.extend(scan_segment_and_update_index_with_versions(
-                        chunk,
-                        &segment,
-                        append_header,
-                        version_map,
-                    ));
-                    segment.clear_dirty();
-                    hot_count.fetch_add(1, Ordering::Relaxed);
-                    max_seq_ids[chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
-
-                    let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if processed % 100 == 0 {
-                        info!("Recovery progress: {}/{} segments", processed, total_files);
-                    }
-                }
-
-                if !local_stashed.is_empty() {
-                    all_stashed_tombstones.lock().extend(local_stashed);
-                }
-                Ok(())
-            })?;
-
-        // Phase 2: Process COLD segments in parallel across chunks.
-        cold_files_by_chunk
-            .into_par_iter()
-            .enumerate()
-            .try_for_each(|(chunk_id, chunk_files)| -> io::Result<()> {
-                let chunk = &chunks[chunk_id];
-                let version_map = &version_maps[chunk_id];
-                let mut local_stashed = Vec::new();
-
-                for file_info in chunk_files {
-                    let segment =
-                        if let Some(existing_seg) = chunk.segs.get(&(file_info.seg_id as usize)) {
-                            existing_seg
-                        } else {
-                            let new_seg = chunk
-                                .allocator
-                                .alloc_seg_at_id(
-                                    file_info.seg_id,
-                                    file_info.seq_id,
-                                    &chunk.file_manager,
-                                )
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::OutOfMemory,
-                                        "Cannot allocate segment",
-                                    )
-                                })?;
-                            let seg_id = new_seg.id as usize;
-                            chunk.put_segment(new_seg);
-                            chunk.segs.get(&seg_id).unwrap()
-                        };
-
-                    segment.set_cold();
-                    segment.clear_dirty();
-                    if let Some(ref tiered_manager) = chunk.tiered_manager {
-                        tiered_manager.decrement_hot_count();
+                    if newer_resident_segment(chunk, file_info.seg_id, file_info.seq_id).is_some() {
+                        debug!(
+                            "Skipping stale recovery file for chunk {} seg {} seq {}",
+                            chunk_id,
+                            file_info.seg_id,
+                            file_info.seq_id
+                        );
+                        continue;
                     }
 
                     let file_data = load_file_to_memory(&file_info.path)?;
@@ -922,13 +983,68 @@ pub fn recover_chunks(
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
                     }
 
-                    local_stashed.extend(scan_segment_from_data(
+                    let segment_base = chunk.allocator.addr_by_id(file_info.seg_id as usize);
+                    let scan_result = scan_segment_from_data(
                         chunk,
-                        &segment,
+                        file_info.seg_id,
+                        segment_base,
                         &file_data,
                         version_map,
-                    ));
-                    cold_count.fetch_add(1, Ordering::Relaxed);
+                    )?;
+                    let segment_class = scan_result.segment_class;
+
+                    let existing_hot = chunk
+                        .segs
+                        .get(&(file_info.seg_id as usize))
+                        .map(|segment| segment.is_hot())
+                        .unwrap_or(false);
+
+                    let recover_as_cold = if segment_class == SegmentClass::Blob {
+                        true
+                    } else if chunk.tiered_manager.is_some() {
+                        let current_hot_segments = planned_global_hot_segments.load(Ordering::Relaxed);
+                        should_recover_as_cold(chunk, &file_info, current_hot_segments)
+                    } else {
+                        false
+                    };
+
+                    match (existing_hot, recover_as_cold) {
+                        (true, true) => {
+                            planned_global_hot_segments.fetch_update(
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                                |current| Some(current.saturating_sub(1)),
+                            ).ok();
+                        }
+                        (true, false) => {}
+                        (false, false) => {
+                            planned_global_hot_segments.fetch_add(1, Ordering::Relaxed);
+                        }
+                        (false, true) => {}
+                    }
+
+                    if recover_as_cold {
+                        ensure_backup_for_cold_recovery(chunk, &file_info)?;
+                    }
+
+                    let segment = prepare_recovered_segment(
+                        chunk,
+                        &file_info,
+                        !recover_as_cold,
+                        segment_class,
+                    )?;
+
+                    if !recover_as_cold {
+                        recover_segment_as_hot(&segment, &file_data);
+                        hot_count.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        cold_count.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    apply_recovery_scan_result(&segment, &scan_result);
+
+                    segment.clear_dirty();
+                    local_stashed.extend(scan_result.stashed_tombstones);
                     max_seq_ids[chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
 
                     let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -954,6 +1070,10 @@ pub fn recover_chunks(
         if next_seq > 0 {
             chunks[chunk_id].allocator.set_next_seq_id(next_seq);
         }
+    }
+
+    for chunk in chunks {
+        chunk.reset_write_heads_after_recovery()?;
     }
 
     let final_hot = hot_count.load(Ordering::Relaxed);
@@ -1010,10 +1130,13 @@ mod tests {
     use crate::dovahkiin::types::Map;
     use crate::ram::cell::*;
     use crate::ram::chunk::Chunks;
+    use crate::ram::segs::{SegmentClass, SEGMENT_SIZE};
+    use crate::ram::tiered::{manager::TieredMemoryManager, SharedMemoryPool, TieredConfig};
     use crate::ram::schema::{Field, LocalSchemasCache, Schema};
     use crate::ram::types::Id;
     use crate::server::ServerMeta;
     use dovahkiin::types::Type;
+    use lightning::map::WordMap;
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Arc;
@@ -1042,6 +1165,57 @@ mod tests {
         let schemas = LocalSchemasCache::new_local("");
         schemas.debug_only_new_schema(schema);
         schemas
+    }
+
+    fn schema_with_id(schema_id: u32, name: &str, blobs: bool) -> Schema {
+        let schema = Schema::new_with_id(schema_id, name, None, default_fields(), false, false);
+        if blobs {
+            schema.with_blobs(true)
+        } else {
+            schema
+        }
+    }
+
+    fn tiered_manager_for_test(physical_memory_limit: usize) -> Arc<TieredMemoryManager> {
+        Arc::new(TieredMemoryManager::new(SharedMemoryPool::new(&TieredConfig {
+            threshold: 0.95,
+            lower_watermark: 0.8,
+            physical_memory_limit,
+            promotion_cooldown_ms: 0,
+        })))
+    }
+
+    fn entry_bytes_at(addr: usize) -> Vec<u8> {
+        let (entry, _) = Entry::decode_from(addr, |_, header| header);
+        let entry_size = ENTRY_HEAD_SIZE + entry.content_length as usize;
+        unsafe { std::slice::from_raw_parts(addr as *const u8, entry_size).to_vec() }
+    }
+
+    fn empty_segment_bytes() -> Vec<u8> {
+        vec![0_u8; SEGMENT_SIZE]
+    }
+
+    fn tombstone_only_segment_bytes() -> Vec<u8> {
+        let mut segment = empty_segment_bytes();
+        Tombstone::put(segment.as_mut_ptr() as usize, 41, 7, 3, 9_999);
+        segment
+    }
+
+    fn write_backup_segment(
+        backup_dir: &TempDir,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+        data: &[u8],
+    ) {
+        let manager = SegmentFileManager::new(
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            None,
+        );
+        let path = manager
+            .backup_path(chunk_id, seg_id, seq_id)
+            .expect("backup storage should be configured for test recovery files");
+        fs::write(path, data).unwrap();
     }
 
     fn temp_raft_dir() -> (TempDir, String) {
@@ -1075,6 +1249,14 @@ mod tests {
         }
     }
 
+    fn scan_segment_for_recovery_test(
+        chunk: &Chunk,
+        data: &[u8],
+    ) -> io::Result<RecoveryScanResult> {
+        let version_map = WordMap::with_capacity(128);
+        scan_segment_from_data(chunk, 1, chunk.allocator.addr_by_id(1), data, &version_map)
+    }
+
     // Purpose: Validate parsing of segment filenames `{chunk}-{seg}-{seq}.{nlog|nbackup}`
     // and correct discrimination of WAL vs backup extensions.
     #[test]
@@ -1103,6 +1285,676 @@ mod tests {
         let path3 = temp_dir.path().join("invalid-file.log");
         File::create(&path3).unwrap();
         assert!(SegmentFileInfo::parse_filename(&path3).is_none());
+    }
+
+    #[test]
+    fn test_scan_segment_from_data_prefers_blob_when_schema_classes_are_mixed() {
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let regular_schema = schema_with_id(100, "recovery_mixed_regular", false);
+        let blob_schema = schema_with_id(101, "recovery_mixed_blob", true);
+        chunk.meta.schemas.debug_only_new_schema(regular_schema.clone());
+        chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+
+        let regular_id = Id::new(10, 1);
+        let blob_id = Id::new(10, 2);
+        let mut regular_cell = OwnedCell {
+            header: CellHeader::new(regular_schema.id, &regular_id),
+            data: data_map_value!(id: 1_i32, data: vec![0x11_u8; DATA_SIZE]),
+        };
+        let mut blob_cell = OwnedCell {
+            header: CellHeader::new(blob_schema.id, &blob_id),
+            data: data_map_value!(id: 2_i32, data: vec![0x22_u8; DATA_SIZE]),
+        };
+
+        chunks.write_cell(&mut regular_cell).unwrap();
+        chunks.write_cell(&mut blob_cell).unwrap();
+
+        let regular_entry = entry_bytes_at(chunks.address_of(&regular_id));
+        let blob_entry = entry_bytes_at(chunks.address_of(&blob_id));
+        let mut mixed_segment = vec![0_u8; SEGMENT_SIZE];
+        mixed_segment[..regular_entry.len()].copy_from_slice(&regular_entry);
+        mixed_segment[regular_entry.len()..regular_entry.len() + blob_entry.len()]
+            .copy_from_slice(&blob_entry);
+
+        let scan = scan_segment_for_recovery_test(chunk, &mixed_segment)
+            .expect("mixed blob and regular cells should recover as a blob segment");
+        assert_eq!(scan.segment_class, SegmentClass::Blob);
+    }
+
+    #[test]
+    fn test_scan_segment_from_data_accepts_empty_segment() {
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+
+        let scan = scan_segment_for_recovery_test(chunk, &empty_segment_bytes())
+            .expect("empty archived segment should recover as a regular segment");
+        assert_eq!(scan.segment_class, SegmentClass::Regular);
+    }
+
+    #[test]
+    fn test_scan_segment_from_data_accepts_tombstone_only_segment() {
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+
+        let scan = scan_segment_for_recovery_test(chunk, &tombstone_only_segment_bytes())
+            .expect("tombstone-only recovered segment should stay recoverable");
+        assert_eq!(scan.segment_class, SegmentClass::Regular);
+    }
+
+    #[test]
+    fn test_scan_segment_from_data_accepts_valid_prefix_with_truncated_tail() {
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let blob_schema = schema_with_id(102, "recovery_truncated_blob", true);
+        chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+
+        let first_id = Id::new(12, 1);
+        let second_id = Id::new(12, 2);
+        let mut first_cell = OwnedCell {
+            header: CellHeader::new(blob_schema.id, &first_id),
+            data: data_map_value!(id: 1_i32, data: vec![0x55_u8; DATA_SIZE]),
+        };
+        let mut second_cell = OwnedCell {
+            header: CellHeader::new(blob_schema.id, &second_id),
+            data: data_map_value!(id: 2_i32, data: vec![0x66_u8; DATA_SIZE]),
+        };
+
+        chunks.write_cell(&mut first_cell).unwrap();
+        chunks.write_cell(&mut second_cell).unwrap();
+
+        let first_entry = entry_bytes_at(chunks.address_of(&first_id));
+        let second_entry = entry_bytes_at(chunks.address_of(&second_id));
+        let mut truncated_segment = first_entry.clone();
+        truncated_segment.extend_from_slice(&second_entry[..ENTRY_HEAD_SIZE / 2]);
+
+        let scan = scan_segment_for_recovery_test(chunk, &truncated_segment)
+            .expect("a recoverable valid prefix should survive a crash-truncated tail");
+        assert_eq!(scan.segment_class, SegmentClass::Blob);
+    }
+
+    #[test]
+    fn test_scan_segment_from_data_accepts_missing_schema_ids() {
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let regular_schema = schema_with_id(103, "recovery_missing_schema_regular", false);
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(regular_schema.clone());
+
+        let cell_id = Id::new(13, 1);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(regular_schema.id, &cell_id),
+            data: data_map_value!(id: 3_i32, data: vec![0x99_u8; DATA_SIZE]),
+        };
+        writer_chunks.write_cell(&mut cell).unwrap();
+
+        let segment_bytes = entry_bytes_at(writer_chunks.address_of(&cell_id));
+        let classifier_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let classifier_chunk = &classifier_chunks.list[0];
+
+        let scan = scan_segment_for_recovery_test(classifier_chunk, &segment_bytes)
+            .expect("missing startup schemas should not abort recovery classification");
+        assert_eq!(scan.segment_class, SegmentClass::Regular);
+    }
+
+    #[test]
+    fn test_scan_segment_from_data_rejects_malformed_input() {
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+
+        let mut malformed_segment = vec![0_u8; ENTRY_HEAD_SIZE];
+        malformed_segment[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed_segment[4..8].copy_from_slice(&(DATA_SIZE as u32).to_le_bytes());
+
+        let err = scan_segment_for_recovery_test(chunk, &malformed_segment)
+            .expect_err("malformed recovered data must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_recovery_allows_empty_archived_segment() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        write_backup_segment(&backup_dir, 0, 0, 1, &empty_segment_bytes());
+
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        let chunk = &chunks.list[0];
+        let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
+        let segment = chunk
+            .segs
+            .get(&(regular_head as usize))
+            .expect("recovery should keep an empty regular segment resident");
+
+        assert_eq!(blob_head, None);
+        assert_eq!(chunk.segments().len(), 1);
+        assert_eq!(segment.segment_class(), SegmentClass::Regular);
+        assert_eq!(segment.append_header.load(Ordering::Acquire), segment.addr);
+        assert_eq!(total_hot_segments(&chunks), 1);
+        assert_eq!(total_cold_segments(&chunks), 0);
+    }
+
+    #[test]
+    fn test_recovery_allows_tombstone_only_segment() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        write_backup_segment(&backup_dir, 0, 0, 1, &tombstone_only_segment_bytes());
+
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        let chunk = &chunks.list[0];
+        let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
+        let segment = chunk
+            .segs
+            .get(&(regular_head as usize))
+            .expect("recovery should keep a tombstone-only regular segment resident");
+
+        assert_eq!(blob_head, None);
+        assert_eq!(segment.segment_class(), SegmentClass::Regular);
+        assert_eq!(segment.tombstones.load(Ordering::Acquire), 1);
+        assert_eq!(
+            segment.append_header.load(Ordering::Acquire),
+            segment.addr + crate::ram::tombstone::TOMBSTONE_ENTRY_SIZE
+        );
+        assert_eq!(total_hot_segments(&chunks), 1);
+        assert_eq!(total_cold_segments(&chunks), 0);
+    }
+
+    #[test]
+    fn test_recovery_reads_cells_after_late_schema_registration() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let regular_schema = schema_with_id(113, "recovery_late_schema_registration", false);
+        let cell_id = Id::new(13, 7);
+
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(regular_schema.clone());
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(raft_path.clone()),
+            );
+
+            let mut cell = OwnedCell {
+                header: CellHeader::new(regular_schema.id, &cell_id),
+                data: data_map_value!(id: 7_i32, data: vec![0x5A_u8; DATA_SIZE]),
+            };
+            chunks.write_cell(&mut cell).unwrap();
+
+            for chunk in &chunks.list {
+                for seg in chunk.segments() {
+                    seg.archive().unwrap();
+                }
+            }
+        }
+
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                true,
+                Some(raft_path.clone()),
+            );
+
+            assert_eq!(chunks.list[0].cell_count(), 1);
+
+            chunks.list[0]
+                .meta
+                .schemas
+                .debug_only_new_schema(regular_schema.clone());
+
+            let recovered_cell = chunks.read_cell(&cell_id).unwrap();
+            assert_eq!(*recovered_cell.data["id"].i32().unwrap(), 7);
+        }
+    }
+
+    #[test]
+    fn test_recovery_keeps_blob_segments_cold() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let regular_schema = schema_with_id(110, "recovery_regular_lane", false);
+        let blob_schema = schema_with_id(111, "recovery_blob_lane", true);
+        let regular_id = Id::new(11, 1);
+        let blob_id = Id::new(11, 2);
+
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(regular_schema.clone());
+            schemas.debug_only_new_schema(blob_schema.clone());
+            let manager = tiered_manager_for_test(8 * SEGMENT_SIZE);
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                Some(manager),
+                false,
+                Some(raft_path.clone()),
+            );
+
+            let mut regular_cell = OwnedCell {
+                header: CellHeader::new(regular_schema.id, &regular_id),
+                data: data_map_value!(id: 1_i32, data: vec![0x33_u8; DATA_SIZE]),
+            };
+            let mut blob_cell = OwnedCell {
+                header: CellHeader::new(blob_schema.id, &blob_id),
+                data: data_map_value!(id: 2_i32, data: vec![0x44_u8; DATA_SIZE]),
+            };
+
+            chunks.write_cell(&mut regular_cell).unwrap();
+            chunks.write_cell(&mut blob_cell).unwrap();
+
+            for chunk in &chunks.list {
+                for seg in chunk.segments() {
+                    seg.archive().unwrap();
+                }
+            }
+        }
+
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(regular_schema.clone());
+            schemas.debug_only_new_schema(blob_schema.clone());
+            let manager = tiered_manager_for_test(8 * SEGMENT_SIZE);
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                Some(manager),
+                true,
+                Some(raft_path.clone()),
+            );
+
+            let chunk = &chunks.list[0];
+            let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
+            let regular_head_segment = chunk
+                .segs
+                .get(&(regular_head as usize))
+                .expect("recovery should leave a regular write head installed");
+            let regular_segments: Vec<_> = chunk
+                .segments()
+                .into_iter()
+                .filter(|seg| seg.segment_class() == SegmentClass::Regular)
+                .collect();
+            let blob_segments: Vec<_> = chunk
+                .segments()
+                .into_iter()
+                .filter(|seg| seg.segment_class() == SegmentClass::Blob)
+                .collect();
+
+            assert_eq!(blob_head, None, "recovery should leave the blob head empty");
+            assert_eq!(blob_segments.len(), 1, "setup should recover exactly one blob segment");
+            assert_eq!(
+                regular_segments.len(),
+                1,
+                "recovery should reuse the recovered regular segment instead of allocating a fresh empty head"
+            );
+            assert!(blob_segments[0].is_cold(), "recovered blob segments must come back cold");
+            assert_eq!(
+                regular_head_segment.segment_class(),
+                SegmentClass::Regular,
+                "recovery should re-establish a regular runtime head"
+            );
+            assert_eq!(
+                regular_head_segment.id,
+                regular_segments[0].id,
+                "the regular write head should reuse the recovered hot regular segment"
+            );
+            assert_eq!(
+                regular_head_segment.append_header.load(Ordering::Relaxed) > regular_head_segment.addr,
+                true,
+                "the regular head after recovery should keep the recovered append position"
+            );
+
+            let blob_cell = chunks.read_cell(&blob_id).unwrap();
+            assert_eq!(*blob_cell.data["id"].i32().unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn test_recovery_keeps_wal_only_blob_segments_cold_with_truncated_tail() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let blob_schema = schema_with_id(112, "recovery_blob_wal_only", true);
+        let first_id = Id::new(12, 1);
+        let second_id = Id::new(12, 2);
+        let wal_path: String;
+        let backup_path: String;
+        let truncated_wal: Vec<u8>;
+        let blob_segment_id: u64;
+        let blob_seq_id: u64;
+
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(blob_schema.clone());
+            let manager = tiered_manager_for_test(8 * SEGMENT_SIZE);
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                Some(manager),
+                false,
+                Some(raft_path.clone()),
+            );
+
+            let mut first_cell = OwnedCell {
+                header: CellHeader::new(blob_schema.id, &first_id),
+                data: data_map_value!(id: 1_i32, data: vec![0x77_u8; DATA_SIZE]),
+            };
+            let mut second_cell = OwnedCell {
+                header: CellHeader::new(blob_schema.id, &second_id),
+                data: data_map_value!(id: 2_i32, data: vec![0x88_u8; DATA_SIZE]),
+            };
+
+            chunks.write_cell(&mut first_cell).unwrap();
+            chunks.write_cell(&mut second_cell).unwrap();
+            chunks.sync_all();
+
+            let chunk = &chunks.list[0];
+            let blob_segment = chunk
+                .locate_segment(chunks.address_of(&first_id))
+                .expect("blob write should land in a segment");
+            let first_entry = entry_bytes_at(chunks.address_of(&first_id));
+            let second_entry = entry_bytes_at(chunks.address_of(&second_id));
+
+            blob_segment_id = blob_segment.id;
+            blob_seq_id = blob_segment.seq_id;
+            wal_path = chunk
+                .file_manager
+                .wal_path(chunk.id, blob_segment_id, blob_seq_id)
+                .expect("wal path should exist for WAL-only blob recovery test");
+            backup_path = chunk
+                .file_manager
+                .backup_path(chunk.id, blob_segment_id, blob_seq_id)
+                .expect("backup path should be derivable for WAL-only blob recovery test");
+            truncated_wal = {
+                let mut bytes = first_entry;
+                bytes.extend_from_slice(&second_entry[..ENTRY_HEAD_SIZE / 2]);
+                bytes
+            };
+
+            assert!(Path::new(&wal_path).exists());
+            assert!(!Path::new(&backup_path).exists());
+        }
+
+        fs::write(&wal_path, &truncated_wal).unwrap();
+        assert!(!Path::new(&backup_path).exists());
+
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(blob_schema.clone());
+            let manager = tiered_manager_for_test(8 * SEGMENT_SIZE);
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                Some(manager),
+                true,
+                Some(raft_path.clone()),
+            );
+
+            let chunk = &chunks.list[0];
+            let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
+            let blob_segment = chunk
+                .segs
+                .get(&(blob_segment_id as usize))
+                .expect("WAL-only recovery should restore the blob segment in place");
+
+            assert_eq!(blob_segment.seq_id, blob_seq_id);
+            assert_eq!(blob_head, None, "recovery should leave the blob head empty");
+            assert!(
+                chunk.segs.get(&(regular_head as usize)).unwrap().is_hot(),
+                "recovery should still keep a regular write head ready"
+            );
+            assert_eq!(blob_segment.segment_class(), SegmentClass::Blob);
+            assert!(blob_segment.is_cold(), "WAL-only recovered blob segments must start cold");
+            assert!(
+                Path::new(&backup_path).exists(),
+                "cold recovery from WAL should synthesize a backup file before future promotion"
+            );
+
+            let first_cell = chunks.read_cell(&first_id).unwrap();
+            assert_eq!(*first_cell.data["id"].i32().unwrap(), 1);
+            drop(first_cell);
+
+            assert!(
+                chunks.read_cell(&second_id).is_err(),
+                "the crash-truncated tail entry should not be recovered"
+            );
+            assert!(
+                blob_segment.is_hot(),
+                "reading a cold WAL-only blob segment should later promote it"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prepare_recovered_segment_keeps_newer_resident_seq_across_class_changes() {
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let seg_id = 0_u64;
+        let newer_regular_seq_id = 5_u64;
+        let older_blob_seq_id = 4_u64;
+
+        let resident = chunk
+            .allocator
+            .alloc_seg_at_id_with(
+                seg_id,
+                newer_regular_seq_id,
+                &chunk.file_manager,
+                true,
+                SegmentClass::Regular,
+            )
+            .expect("should allocate the newer resident segment");
+        let resident = install_recovered_segment(chunk, resident);
+
+        let older_blob_file = SegmentFileInfo {
+            chunk_id: chunk.id,
+            seg_id,
+            seq_id: older_blob_seq_id,
+            path: Path::new("older-blob-segment.nbackup").to_path_buf(),
+            size: 0,
+            is_backup: true,
+        };
+
+        let prepared = prepare_recovered_segment(
+            chunk,
+            &older_blob_file,
+            false,
+            SegmentClass::Blob,
+        )
+            .expect("older plan should not make preparation fail");
+
+        assert_eq!(
+            prepared.seq_id,
+            newer_regular_seq_id,
+            "older recovery plans must not displace a newer resident seq for the same seg_id"
+        );
+        assert_eq!(
+            prepared.segment_class(),
+            SegmentClass::Regular,
+            "older cross-class recovery plans must not change the surviving runtime class"
+        );
+        assert!(prepared.is_hot(), "the newer resident segment should stay hot");
+        assert_eq!(prepared.id, seg_id, "the surviving segment must keep the same seg_id");
+        assert_eq!(
+            resident.seq_id,
+            chunk.segs.get(&(seg_id as usize)).unwrap().seq_id,
+            "segment installation must preserve the newer resident seq_id"
+        );
+    }
+
+    #[test]
+    fn test_prepare_recovered_segment_replaces_same_seq_when_class_changes() {
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let seg_id = 0_u64;
+        let seq_id = 0_u64;
+
+        let blob_file = SegmentFileInfo {
+            chunk_id: chunk.id,
+            seg_id,
+            seq_id,
+            path: Path::new("bootstrap-blob-segment.nbackup").to_path_buf(),
+            size: 0,
+            is_backup: true,
+        };
+
+        let prepared = prepare_recovered_segment(chunk, &blob_file, false, SegmentClass::Blob)
+            .expect("same-seq class change should allocate a replacement segment");
+
+        assert_eq!(prepared.seq_id, seq_id);
+        assert_eq!(prepared.id, seg_id);
+        assert_eq!(prepared.segment_class(), SegmentClass::Blob);
+        assert!(prepared.is_cold());
+    }
+
+    #[test]
+    fn test_recovery_preserves_bootstrap_segment_seq_id_when_reused() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let recovered_seq_id = 77_u64;
+        let cell_id = Id::new(0, 1);
+
+        {
+            let schemas = setup_test_schema();
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(raft_path.clone()),
+            );
+
+            let mut cell = default_cell(&cell_id);
+            chunks.write_cell(&mut cell).unwrap();
+
+            for chunk in &chunks.list {
+                for seg in chunk.segments() {
+                    seg.archive().unwrap();
+                }
+            }
+
+            let original_backup = chunks.list[0]
+                .file_manager
+                .backup_path(0, 0, 0)
+                .expect("backup storage should be configured for the bootstrap segment");
+            let recovered_backup = chunks.list[0]
+                .file_manager
+                .backup_path(0, 0, recovered_seq_id)
+                .expect("backup storage should be configured for the recovered bootstrap segment");
+            std::fs::copy(&original_backup, &recovered_backup)
+                .expect("should be able to synthesize a recovered bootstrap segment with a higher seq_id");
+        }
+
+        {
+            let schemas = setup_test_schema();
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                true,
+                Some(raft_path.clone()),
+            );
+
+            let bootstrap_segment = chunks.list[0]
+                .segs
+                .get(&0)
+                .expect("recovery should reuse segment 0 in place");
+
+            assert_eq!(
+                bootstrap_segment.seq_id,
+                recovered_seq_id,
+                "recovery should preserve the seq_id from the recovered bootstrap segment file"
+            );
+            assert!(
+                chunks.list[0].segs.contains_seq_id(recovered_seq_id),
+                "segment lookup by seq_id should point at the recovered bootstrap segment"
+            );
+            assert!(
+                !chunks.list[0].segs.contains_seq_id(0),
+                "bootstrap recovery should replace the preallocated seq_id 0 entry"
+            );
+
+            let recovered_cell = chunks.read_cell(&cell_id).unwrap();
+            assert_eq!(*recovered_cell.data["id"].i32().unwrap(), 1);
+        }
     }
 
     // Purpose: End-to-end sanity check. Write cells, archive segments,

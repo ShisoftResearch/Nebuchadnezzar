@@ -4,7 +4,9 @@ use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::segment_list::SegmentList;
-use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
+use crate::ram::segs::{
+    Segment, SegmentAllocator, SegmentClass, SEGMENT_SIZE, SEGMENT_SIZE_U32,
+};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
 use crate::ram::types::Id;
 use crate::server::ServerMeta;
@@ -21,6 +23,7 @@ use lightning::map::{Map, WordMap, WordMutexGuard};
 use lightning::spin_hint::Backoff;
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
+use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -38,6 +41,9 @@ static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
 static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.50f32;
+
+const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
+const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 
 /// Get the current global chunk base address
 pub fn get_global_chunk_base() -> usize {
@@ -153,6 +159,7 @@ pub struct Chunk {
     pub cell_index: WordMap,
     pub segs: SegmentList,
     pub head_seg_id: AtomicU64,
+    pub blob_head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
@@ -356,6 +363,7 @@ impl Chunk {
             capacity: size,
             total_space: AtomicUsize::new(0),
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
+            blob_head_seg_id: AtomicU64::new(HEAD_SEG_ID_EMPTY),
             gc_lock: Mutex::new(()),
             statistics: ChunkStatistics::new(),
             tiered_manager,
@@ -364,150 +372,201 @@ impl Chunk {
         return chunk;
     }
 
+    #[inline]
+    fn head_slot(&self, segment_class: SegmentClass) -> &AtomicU64 {
+        match segment_class {
+            SegmentClass::Regular => &self.head_seg_id,
+            SegmentClass::Blob => &self.blob_head_seg_id,
+        }
+    }
+
     pub fn get_head_seg_id(&self) -> u64 {
         self.head_seg_id.load(Ordering::Acquire)
     }
 
+    pub fn is_active_head(&self, seg_id: u64) -> bool {
+        self.head_seg_id.load(Ordering::Acquire) == seg_id
+            || self.blob_head_seg_id.load(Ordering::Acquire) == seg_id
+    }
+
+    #[inline]
+    pub fn has_blob_head(&self) -> bool {
+        self.blob_head_seg_id.load(Ordering::Acquire) != HEAD_SEG_ID_EMPTY
+    }
+
     pub fn try_acquire(&self, size: u32, full_gc: bool) -> Result<PendingEntry, WriteError> {
+        self.try_acquire_in_class(size, full_gc, SegmentClass::Regular)
+    }
+
+    pub fn try_acquire_in_class(
+        &self,
+        size: u32,
+        full_gc: bool,
+        segment_class: SegmentClass,
+    ) -> Result<PendingEntry, WriteError> {
         let mut tried_gc = false;
         let backoff = Backoff::new();
+        let head_slot = self.head_slot(segment_class);
         loop {
-            let head_seg_id = self.get_head_seg_id();
-            if head_seg_id == u64::MAX {
+            let head_seg_id = head_slot.load(Ordering::Acquire);
+            if head_seg_id == HEAD_SEG_ID_ALLOCATING {
                 // Allocating new segment in progress, wait for it to complete
                 backoff.spin();
                 continue;
             }
-            // Try to get the head segment. If it's been removed (e.g., by cleaner after
-            // a new head was allocated), retry with the updated head_seg_id.
-            let head = match self.segs.get(&(head_seg_id as usize)) {
-                Some(seg) => seg,
-                None => {
-                    // Segment was removed (likely by cleaner after a new head was allocated)
-                    // Retry the loop to get the current head segment
-                    debug!(
-                        "Head segment {} was removed, retrying with current head",
-                        head_seg_id
-                    );
-                    backoff.spin();
-                    continue;
-                }
-            };
-            match head.try_acquire(size) {
-                Some(addr) => {
+            if head_seg_id != HEAD_SEG_ID_EMPTY {
+                // Try to get the head segment. If it's been removed (e.g., by cleaner after
+                // a new head was allocated), retry with the updated head_seg_id.
+                let head = match self.segs.get(&(head_seg_id as usize)) {
+                    Some(seg) => seg,
+                    None => {
+                        debug!(
+                            "Head segment {} was removed, retrying with current head",
+                            head_seg_id
+                        );
+                        backoff.spin();
+                        continue;
+                    }
+                };
+                if let Some(addr) = head.try_acquire(size) {
                     trace!(
-                        "Chunk {} acquired address {} for size {} in segment {}",
+                        "Chunk {} acquired address {} for size {} in segment {} ({:?})",
                         self.id,
                         addr,
                         size,
-                        head.id
+                        head.id,
+                        segment_class
                     );
                     head.incr_references();
                     return Ok(PendingEntry {
                         addr,
                         seg: head,
                         size,
-                        skip_sync: is_in_transaction(), // Skip sync if in transaction
+                        skip_sync: is_in_transaction(),
                     });
                 }
-                None => {
-                    let total_space = self.segs.len() * SEGMENT_SIZE;
-                    if total_space >= self.capacity - SEGMENT_SIZE {
-                        // No space left
-                        if tried_gc {
-                            debug!(
-                                "chunk-allocation-failure: chunk={}, total_space={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}",
-                                self.id,
-                                total_space,
-                                self.capacity,
-                                self.head_seg_id.load(Ordering::Relaxed),
-                                self.segs.len(),
-                                full_gc
-                            );
-                            error!("No space left for chunk {}, cannot allocate space", self.id);
-                            return Err(WriteError::CannotAllocateSpace);
-                        } else if full_gc {
-                            warn!("No space left for chunk {}, emergency full GC", self.id);
-                            let _ = Cleaner::clean(self, true, true);
-                            tried_gc = true;
-                            continue;
-                        } else {
+            }
+
+            let total_space = self.segs.len() * SEGMENT_SIZE;
+            if total_space >= self.capacity - SEGMENT_SIZE {
+                if tried_gc {
+                    debug!(
+                        "chunk-allocation-failure: chunk={}, total_space={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}, segment_class={:?}",
+                        self.id,
+                        total_space,
+                        self.capacity,
+                        head_slot.load(Ordering::Relaxed),
+                        self.segs.len(),
+                        full_gc,
+                        segment_class
+                    );
+                    error!("No space left for chunk {}, cannot allocate space", self.id);
+                    return Err(WriteError::CannotAllocateSpace);
+                } else if full_gc {
+                    warn!("No space left for chunk {}, emergency full GC", self.id);
+                    let _ = Cleaner::clean(self, true, true);
+                    tried_gc = true;
+                    continue;
+                } else {
+                    warn!(
+                        "No space left for chunk {}, emergency best effort GC",
+                        self.id
+                    );
+                    let _ = Cleaner::clean(self, true, false);
+                    tried_gc = true;
+                    continue;
+                }
+            }
+            if self.allocator.meet_gc_threshold() {
+                debug!("Allocator meet GC threshold, will try partial GC");
+                let _ = Cleaner::clean(self, false, false);
+            }
+
+            if head_slot
+                .compare_exchange(
+                    head_seg_id,
+                    HEAD_SEG_ID_ALLOCATING,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                backoff.spin();
+                continue;
+            }
+
+            let new_seg_opt = self
+                .allocator
+                .alloc_seg_with_class(&self.file_manager, segment_class);
+            let new_seg = new_seg_opt.expect("No space left after full GCs");
+            let new_seg_id = new_seg.id;
+
+            // Publish new head segment id FIRST
+            // This creates a window where the head_seg_id points to a segment not yet in self.segs.
+            // Readers of head_seg_id must handle this by retrying.
+            head_slot.store(new_seg_id, Ordering::Release);
+
+            self.put_segment(new_seg);
+
+            if head_seg_id != HEAD_SEG_ID_EMPTY {
+                if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
+                    if let Err(e) = old_head.force_wal_sync() {
+                        warn!(
+                            "Failed to sync WAL for old head segment {}: {}",
+                            head_seg_id, e
+                        );
+                    }
+                    let mut state = old_head.file_state.lock();
+                    if let Some(wal) = state.wal.take() {
+                        if let Err(e) = wal.sync_all() {
                             warn!(
-                                "No space left for chunk {}, emergency best effort GC",
-                                self.id
-                            );
-                            let _ = Cleaner::clean(self, true, false);
-                            tried_gc = true;
-                            continue;
-                        }
-                    }
-                    if self.allocator.meet_gc_threshold() {
-                        debug!("Allocator meet GC threshold, will try partial GC");
-                        let _ = Cleaner::clean(self, false, false);
-                    }
-
-                    // We are supposed to do proactive eviction here
-                    // but since we have background proactive eviction in the cleaner thread,
-                    // we don't need to do it during live cell allocation
-
-                    if !self
-                        .head_seg_id
-                        .compare_exchange(
-                            head_seg_id,
-                            u64::MAX,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        // New segment allocated, retry
-                        backoff.spin();
-                        continue;
-                    }
-                    // head segment did not changed and locked, suitable for creating a new segment and point it to
-                    let new_seg_opt = self.allocator.alloc_seg(&self.file_manager);
-                    let new_seg = new_seg_opt.expect("No space left after full GCs");
-                    let new_seg_id = new_seg.id;
-
-                    // Publish new head segment id FIRST
-                    // This creates a window where the head_seg_id points to a segment not yet in self.segs.
-                    // Readers of head_seg_id must handle this by retrying.
-                    // This order is CRITICAL: if we put_segment first, the Cleaner might see the new segment
-                    // before it's marked as head_seg_id, and try to compact/clean it (since it looks like a
-                    // non-head segment). By setting head_seg_id first, we protect it from the cleaner.
-                    self.head_seg_id.store(new_seg_id, Ordering::Release);
-
-                    self.put_segment(new_seg);
-
-                    // Old head is no longer active for writes. Flush and close its WAL file
-                    // to avoid keeping unnecessary file descriptors open.
-                    if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
-                        if let Err(e) = old_head.force_wal_sync() {
-                            warn!(
-                                "Failed to sync WAL for old head segment {}: {}",
+                                "Failed to sync WAL during close for old head segment {}: {}",
                                 head_seg_id, e
                             );
                         }
-                        let mut state = old_head.file_state.lock();
-                        if let Some(wal) = state.wal.take() {
-                            if let Err(e) = wal.sync_all() {
-                                warn!(
-                                    "Failed to sync WAL during close for old head segment {}: {}",
-                                    head_seg_id, e
-                                );
-                            }
-                            drop(wal);
-                            debug!(
-                                "Closed WAL file for old head segment {} (freed file descriptor)",
-                                head_seg_id
-                            );
-                        }
+                        drop(wal);
+                        debug!(
+                            "Closed WAL file for old head segment {} (freed file descriptor)",
+                            head_seg_id
+                        );
                     }
-                    // whether the segment acquisition success or not,
-                    // try to get the new segment and try again
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn head_seg_ids_for_test(&self) -> (u64, Option<u64>) {
+        let blob_head_id = self.blob_head_seg_id.load(Ordering::Acquire);
+        (
+            self.get_head_seg_id(),
+            if blob_head_id == HEAD_SEG_ID_EMPTY {
+                None
+            } else {
+                Some(blob_head_id)
+            },
+        )
+    }
+
+    pub(crate) fn reset_write_heads_after_recovery(&self) -> io::Result<()> {
+        self.blob_head_seg_id
+            .store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+
+        let regular_head_id = self
+            .segments()
+            .into_iter()
+            .filter(|segment| {
+                segment.segment_class() == SegmentClass::Regular
+                    && segment.is_hot()
+                    && segment.append_header.load(Ordering::Acquire) < segment.bound
+            })
+            .max_by_key(|segment| segment.seq_id)
+            .map(|segment| segment.id)
+            .unwrap_or(HEAD_SEG_ID_EMPTY);
+
+        self.head_seg_id.store(regular_head_id, Ordering::Release);
+
+        Ok(())
     }
 
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard<'_>, ReadError> {
@@ -1100,8 +1159,41 @@ impl Chunk {
         self.segs_for_combine_cleaner_impl(true)
     }
 
+    fn choose_combine_candidate_class(
+        mapping: &[(AArc<Segment>, f32)],
+    ) -> Option<SegmentClass> {
+        let preferred_class = mapping.first().map(|(seg, _)| seg.segment_class())?;
+        let mut blob_count = 0;
+        let mut regular_count = 0;
+
+        for (seg, _) in mapping {
+            match seg.segment_class() {
+                SegmentClass::Blob => blob_count += 1,
+                SegmentClass::Regular => regular_count += 1,
+            }
+        }
+
+        let preferred_count = match preferred_class {
+            SegmentClass::Blob => blob_count,
+            SegmentClass::Regular => regular_count,
+        };
+
+        if preferred_count >= 2 {
+            return Some(preferred_class);
+        }
+
+        if blob_count >= 2 {
+            return Some(SegmentClass::Blob);
+        }
+
+        if regular_count >= 2 {
+            return Some(SegmentClass::Regular);
+        }
+
+        None
+    }
+
     fn segs_for_combine_cleaner_impl(&self, full: bool) -> Vec<(AArc<Segment>, f32)> {
-        let head_seg_id = self.get_head_seg_id();
         let mut mapping: Vec<_> = self
             .segments()
             .into_iter()
@@ -1116,13 +1208,20 @@ impl Chunk {
                 // For partial GC, only consider high-dead segments
                 *utilization < 1.0
                     && (full || *utilization < DEAD_RATE_FOR_COMBINE_CLEANER)
-                    && head_seg_id != seg.id
+                    && !self.is_active_head(seg.id)
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
                     && !seg.cleaned_without_progress()
             })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
+
+        let Some(preferred_class) = Self::choose_combine_candidate_class(&mapping) else {
+            return Vec::new();
+        };
+
+        mapping.retain(|(seg, _)| seg.segment_class() == preferred_class);
+
         let max_segments = if full {
             mapping.len()
         } else {

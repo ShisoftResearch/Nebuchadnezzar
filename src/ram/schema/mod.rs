@@ -47,6 +47,8 @@ pub struct Schema {
     pub static_bound: usize,
     pub is_dynamic: bool,
     pub is_scannable: bool,
+    #[serde(default)]
+    pub blobs: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -141,6 +143,7 @@ impl Schema {
             compression_plan: SchemaCompressionPlan::default(),
             is_dynamic,
             is_scannable,
+            blobs: false,
             field_index,
             id_index,
             index_fields,
@@ -160,6 +163,11 @@ impl Schema {
         let mut schema = Schema::new(name, key_field, fields, dynamic, scannable);
         schema.id = id;
         schema
+    }
+
+    pub fn with_blobs(mut self, blobs: bool) -> Schema {
+        self.blobs = blobs;
+        self
     }
 
     pub fn field_by_id_path(&self, path: &[u64]) -> Option<&Field> {

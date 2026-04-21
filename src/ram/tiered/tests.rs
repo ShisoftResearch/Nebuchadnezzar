@@ -7,11 +7,13 @@
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
 use crate::ram::schema::*;
-use crate::ram::segs::SEGMENT_SIZE;
+use crate::ram::segs::{SegmentClass, SEGMENT_SIZE};
+use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::types::*;
 use crate::server::transactions;
 use crate::server::ServerMeta;
 use crate::server::{NebServer, ServerOptions, Service};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -76,6 +78,26 @@ fn write_cells_for_partition(
             .write_cell(&mut cell)
             .expect("direct write for eviction test should succeed");
     }
+}
+
+fn large_string_cell(schema_id: u32, id: Id, payload_len: usize, prefix: &str) -> OwnedCell {
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(format!("{}_{}", prefix, id.lower)),
+    );
+    data_map.insert(
+        &String::from("data"),
+        OwnedValue::String(prefix.repeat(payload_len / prefix.len().max(1) + 1)[..payload_len].to_string()),
+    );
+
+    OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data_map))
+}
+
+fn segment_id_for_cell(chunks: &Arc<Chunks>, id: &Id) -> u64 {
+    let chunk = chunks.locate_chunk_by_partition(id.higher);
+    chunk.locate_segment(chunks.address_of(id)).unwrap().id
 }
 
 fn total_hot_segments(chunks: &Arc<Chunks>) -> usize {
@@ -612,6 +634,319 @@ fn test_metrics_and_churn_counters() {
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
     let _ = std::fs::remove_dir_all("/tmp/neb_test_metrics_schema");
+}
+
+#[test]
+fn test_active_blob_head_is_not_evicted_by_clock() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let chunks = Chunks::new_dummy(1, 3 * SEGMENT_SIZE);
+    let chunk = &chunks.list[0];
+
+    let blob_head = chunk
+        .allocator
+        .alloc_seg_with_class(&chunk.file_manager, SegmentClass::Blob)
+        .expect("should allocate a blob head for the test");
+    let blob_head_id = blob_head.id;
+    chunk.put_segment(blob_head);
+    chunk
+        .blob_head_seg_id
+        .store(blob_head_id, AtomicOrdering::Relaxed);
+
+    let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
+    let blob_head = blob_head.expect("blob head should be installed for the test");
+    let policy = ClockEvictionPolicy::default();
+
+    let victim = policy.select_victim(chunk);
+    assert!(
+        victim.is_none(),
+        "CLOCK must not evict an active blob head when only heads exist"
+    );
+
+    assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
+    assert!(chunk.segs.get(&(blob_head as usize)).unwrap().is_hot());
+}
+
+#[test]
+fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let chunks = Chunks::new_dummy(1, 4 * SEGMENT_SIZE);
+    let chunk = &chunks.list[0];
+
+    let regular_candidate = chunk
+        .allocator
+        .alloc_seg_with_class(&chunk.file_manager, SegmentClass::Regular)
+        .expect("should allocate a regular candidate for the test");
+    let regular_candidate_id = regular_candidate.id;
+    chunk.put_segment(regular_candidate);
+
+    let blob_candidate = chunk
+        .allocator
+        .alloc_seg_with_class(&chunk.file_manager, SegmentClass::Blob)
+        .expect("should allocate a blob candidate for the test");
+    let blob_candidate_id = blob_candidate.id;
+    chunk.put_segment(blob_candidate);
+
+    let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
+    assert_eq!(blob_head, None, "test setup should not install a blob write head");
+    assert_eq!(
+        chunk.segs.get(&(regular_candidate_id as usize)).unwrap().segment_class(),
+        SegmentClass::Regular
+    );
+    assert_eq!(
+        chunk.segs.get(&(blob_candidate_id as usize)).unwrap().segment_class(),
+        SegmentClass::Blob
+    );
+    assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
+    assert!(chunk.segs.get(&(regular_candidate_id as usize)).unwrap().is_hot());
+    assert!(chunk.segs.get(&(blob_candidate_id as usize)).unwrap().is_hot());
+
+    let policy = ClockEvictionPolicy::default();
+    let victim = policy
+        .select_victim(chunk)
+        .expect("CLOCK should pick a victim when both blob and regular candidates exist");
+
+    assert_eq!(
+        victim.id, blob_candidate_id,
+        "blob-first eviction should not depend on an active blob write head"
+    );
+}
+
+#[test]
+fn test_blob_segments_evict_before_regular_segments() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let schema_dir = "/tmp/neb_blob_priority_schema";
+    let backup_dir = "/tmp/neb_blob_priority_bk";
+    let wal_dir = "/tmp/neb_blob_priority_wal";
+    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let regular = Schema::new_with_id(
+        910,
+        "regular_evict",
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let blob = Schema::new_with_id(
+        920,
+        "blob_evict",
+        None,
+        default_fields(),
+        false,
+        false,
+    )
+    .with_blobs(true);
+    let schemas = LocalSchemasCache::new_local(schema_dir);
+    schemas.debug_only_new_schema(regular.clone());
+    schemas.debug_only_new_schema(blob.clone());
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.95,
+            lower_watermark: 0.8,
+            physical_memory_limit: 8 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let chunks = Chunks::new(
+        1,
+        6 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+        Some(manager.clone()),
+    );
+    let chunk = &chunks.list[0];
+
+    let mut regular_segments = BTreeSet::new();
+    for index in 0..64_u64 {
+        let id = Id::new(9_100, 10_000 + index);
+        let mut cell = large_string_cell(regular.id, id, 512_000, "regular-evict");
+        chunks.write_cell(&mut cell).unwrap();
+        regular_segments.insert(segment_id_for_cell(&chunks, &id));
+        if regular_segments.len() >= 2 {
+            break;
+        }
+    }
+
+    let mut blob_segments = BTreeSet::new();
+    for index in 0..64_u64 {
+        let id = Id::new(9_200, 20_000 + index);
+        let mut cell = large_string_cell(blob.id, id, 1_500_000, "blob-evict");
+        chunks.write_cell(&mut cell).unwrap();
+        blob_segments.insert(segment_id_for_cell(&chunks, &id));
+        if blob_segments.len() >= 2 {
+            break;
+        }
+    }
+
+    let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
+    let blob_head = blob_head.expect("blob writes should leave an active blob head");
+    let regular_non_head = regular_segments
+        .iter()
+        .copied()
+        .find(|segment_id| *segment_id != regular_head)
+        .expect("setup should create a non-head regular segment");
+    let blob_non_head = blob_segments
+        .iter()
+        .copied()
+        .find(|segment_id| *segment_id != blob_head)
+        .expect("setup should create a non-head blob segment");
+
+    assert_eq!(
+        chunk
+            .segs
+            .get(&(regular_non_head as usize))
+            .unwrap()
+            .segment_class(),
+        SegmentClass::Regular,
+        "setup should classify the regular victim candidate correctly"
+    );
+    assert_eq!(
+        chunk
+            .segs
+            .get(&(blob_non_head as usize))
+            .unwrap()
+            .segment_class(),
+        SegmentClass::Blob,
+        "setup should classify the blob victim candidate correctly"
+    );
+    assert!(
+        chunk.segs.get(&(regular_non_head as usize)).unwrap().is_hot(),
+        "setup should keep the regular non-head hot before eviction"
+    );
+    assert!(
+        chunk.segs.get(&(blob_non_head as usize)).unwrap().is_hot(),
+        "setup should keep the blob non-head hot before eviction"
+    );
+
+    let evicted = manager
+        .explicit_evict(chunk, 1)
+        .expect("explicit eviction should succeed");
+
+    let cold_blob_segments: Vec<_> = chunk
+        .segments()
+        .into_iter()
+        .filter(|seg| seg.segment_class() == SegmentClass::Blob && seg.is_cold())
+        .map(|seg| seg.id)
+        .collect();
+
+    assert_eq!(evicted, 1, "the test should evict exactly one segment");
+    assert!(
+        !cold_blob_segments.is_empty(),
+        "the real tiered path should evict a blob segment before any regular hot segment"
+    );
+    assert!(
+        cold_blob_segments
+            .iter()
+            .all(|segment_id| *segment_id != blob_head),
+        "explicit eviction must leave the active blob head hot"
+    );
+    assert!(
+        chunk.segs.get(&(regular_non_head as usize)).unwrap().is_hot(),
+        "regular hot segments should remain hot while a blob victim exists"
+    );
+    assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
+    assert!(chunk.segs.get(&(blob_head as usize)).unwrap().is_hot());
+
+    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+}
+
+#[test]
+fn test_blob_segments_promote_on_read_after_eviction() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    let schema_dir = "/tmp/neb_blob_promote_schema";
+    let backup_dir = "/tmp/neb_blob_promote_bk";
+    let wal_dir = "/tmp/neb_blob_promote_wal";
+    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+
+    let blob = Schema::new("blob_promote", None, default_fields(), false, false).with_blobs(true);
+    let schemas = LocalSchemasCache::new_local(schema_dir);
+    schemas.debug_only_new_schema(blob.clone());
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.95,
+            lower_watermark: 0.8,
+            physical_memory_limit: 8 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let chunks = Chunks::new(
+        1,
+        4 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+        Some(manager.clone()),
+    );
+    let chunk = &chunks.list[0];
+
+    let mut blob_cells = Vec::new();
+    let mut blob_segments = BTreeSet::new();
+    for index in 0..64_u64 {
+        let id = Id::new(93, index);
+        let mut cell = large_string_cell(blob.id, id, 1_500_000, "blob-promote");
+        chunks.write_cell(&mut cell).unwrap();
+        let segment_id = segment_id_for_cell(&chunks, &id);
+        blob_segments.insert(segment_id);
+        blob_cells.push((id, segment_id));
+        if blob_segments.len() >= 2 {
+            break;
+        }
+    }
+
+    let (_, blob_head) = chunk.head_seg_ids_for_test();
+    let blob_head = blob_head.expect("blob writes should allocate a blob head");
+    let (cold_target_id, cold_target_segment_id) = blob_cells
+        .iter()
+        .copied()
+        .find(|(_, segment_id)| *segment_id != blob_head)
+        .expect("setup should create a non-head blob segment to evict");
+
+    let evicted = manager
+        .explicit_evict(chunk, 1)
+        .expect("explicit eviction should succeed");
+    assert_eq!(evicted, 1);
+
+    let cold_segment = chunk
+        .segs
+        .get(&(cold_target_segment_id as usize))
+        .expect("target blob segment should still exist after eviction");
+    assert!(cold_segment.is_cold(), "blob segment should be cold after explicit eviction");
+
+    let read_back = chunks.read_cell(&cold_target_id).unwrap();
+    assert_eq!(read_back.data["id"].i64(), Some(&(cold_target_id.lower as i64)));
+    drop(read_back);
+
+    assert!(cold_segment.is_hot(), "reading a cold blob segment should promote it");
+    assert_eq!(cold_segment.get_access_count(), 0, "promotion should reset the cold access counter");
+
+    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
 }
 
 #[test]

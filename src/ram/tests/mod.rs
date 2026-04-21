@@ -1,5 +1,6 @@
 pub mod alignment_root_cause_test;
 pub mod alignment_tests;
+pub mod blob_schema;
 pub mod cell;
 pub mod chunk;
 pub mod field_compression;

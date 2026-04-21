@@ -8,6 +8,7 @@ use crate::ram::io::align_address;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{CompressedFieldKind, Field, Schema, SchemaCompressionPlan};
+use crate::ram::segs::SegmentClass;
 use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::types::{self, Bytes, Id, Map, OwnedValue, RandValue, SharedValue, Value};
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -23,6 +24,7 @@ use super::io::writer::WriteInstructions;
 use super::schema::SchemaRef;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
+pub const MAX_BLOB_CELL_SIZE: u32 = 2 * 1024 * 1024;
 
 pub type OwnedCellRef = ARef<OwnedCell>;
 
@@ -108,6 +110,7 @@ pub struct WritePlan<'a> {
     pub entry_body_size: usize,
     pub total_size: u32,
     pub schema: SchemaRef,
+    pub segment_class: SegmentClass,
 }
 
 def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor);
@@ -176,14 +179,25 @@ impl OwnedCell {
         }
         let entry_body_size = align_address(8, tail_offset + CELL_HEADER_SIZE);
         let total_size = (ENTRY_HEAD_SIZE + entry_body_size) as u32;
-        if total_size > MAX_CELL_SIZE {
+        let max_cell_size = if schema.blobs {
+            MAX_BLOB_CELL_SIZE
+        } else {
+            MAX_CELL_SIZE
+        };
+        if total_size > max_cell_size {
             return Err(WriteError::CellIsTooLarge(total_size as usize));
         }
+        let segment_class = if schema.blobs {
+            SegmentClass::Blob
+        } else {
+            SegmentClass::Regular
+        };
         Ok(WritePlan::new(
             instructions,
             entry_body_size,
             total_size,
             schema,
+            segment_class,
         ))
     }
 
@@ -295,17 +309,19 @@ impl<'a> WritePlan<'a> {
         entry_body_size: usize,
         total_size: u32,
         schema: SchemaRef,
+        segment_class: SegmentClass,
     ) -> Self {
         Self {
             instructions,
             entry_body_size,
             total_size,
             schema,
+            segment_class,
         }
     }
 
     pub fn allocate(&self, chunk: &Chunk, full_gc: bool) -> Result<PendingEntry, WriteError> {
-        chunk.try_acquire(self.total_size, full_gc)
+        chunk.try_acquire_in_class(self.total_size, full_gc, self.segment_class)
     }
     pub fn entry_body_size(&self) -> usize {
         self.entry_body_size

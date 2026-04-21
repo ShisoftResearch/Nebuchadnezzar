@@ -1,6 +1,8 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::segs::Segment;
+use crate::ram::segs::{Segment, SegmentClass};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const BLOB_FIRST_CLASSES: [SegmentClass; 2] = [SegmentClass::Blob, SegmentClass::Regular];
 
 /// CLOCK eviction policy for selecting victim segments to evict
 ///
@@ -44,53 +46,57 @@ impl ClockEvictionPolicy {
             return None;
         }
 
-        let head_seg_id = chunk.get_head_seg_id();
         let num_segments = segments.len();
         let start_pos = self.cursor.load(Ordering::Relaxed);
+        let cooldown_ms = self.promotion_cooldown_ms.load(Ordering::Relaxed);
+        let preferred_classes = &BLOB_FIRST_CLASSES[..];
 
-        debug!(
-            "CLOCK selecting victim: {} total segments, head_seg_id={}",
-            num_segments, head_seg_id
-        );
+        debug!("CLOCK selecting victim across {} total segments", num_segments);
 
-        for i in 0..num_segments {
-            let pos = (start_pos + i) % num_segments;
-            let segment = &segments[pos];
+        for &preferred_class in preferred_classes {
+            for i in 0..num_segments {
+                let pos = (start_pos + i) % num_segments;
+                let segment = &segments[pos];
 
-            if segment.id == head_seg_id {
-                debug!("CLOCK: seg {} is head, skipping", segment.id);
-                continue;
-            }
+                if segment.segment_class() != preferred_class {
+                    continue;
+                }
 
-            if !segment.no_references() {
-                debug!("CLOCK: seg {} has active references, skipping", segment.id);
-                continue;
-            }
+                if chunk.is_active_head(segment.id) {
+                    debug!("CLOCK: seg {} is an active head, skipping", segment.id);
+                    continue;
+                }
 
-            if segment.is_cold() {
-                debug!("CLOCK: seg {} is already cold, skipping", segment.id);
-                continue;
-            }
+                if !segment.no_references() {
+                    debug!("CLOCK: seg {} has active references, skipping", segment.id);
+                    continue;
+                }
 
-            let cooldown_ms = self.promotion_cooldown_ms.load(Ordering::Relaxed);
-            if cooldown_ms > 0 && segment.recently_promoted_within(cooldown_ms) {
-                debug!("CLOCK: seg {} recently promoted, skipping", segment.id);
-                continue;
-            }
+                if segment.is_cold() {
+                    debug!("CLOCK: seg {} is already cold, skipping", segment.id);
+                    continue;
+                }
 
-            if segment.decrement_and_check() {
-                self.cursor
-                    .store((pos + 1) % num_segments, Ordering::Relaxed);
-                debug!(
-                    "CLOCK selected segment {} as victim (count reached zero)",
-                    segment.id
-                );
-                return Some(segment.clone());
+                if cooldown_ms > 0 && segment.recently_promoted_within(cooldown_ms) {
+                    debug!("CLOCK: seg {} recently promoted, skipping", segment.id);
+                    continue;
+                }
+
+                if segment.decrement_and_check() {
+                    self.cursor
+                        .store((pos + 1) % num_segments, Ordering::Relaxed);
+                    debug!(
+                        "CLOCK selected {:?} segment {} as victim (count reached zero)",
+                        preferred_class,
+                        segment.id
+                    );
+                    return Some(segment.clone());
+                }
             }
         }
 
         // No eligible victim found
-        debug!("CLOCK could not find any victim segment (all protected or head segment)");
+        debug!("CLOCK could not find any victim segment (all protected or active heads)");
         None
     }
 

@@ -43,6 +43,19 @@ pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 
 pub const EXCLUSIVE_REF_COUNT: usize = usize::MAX;
 
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SegmentClass {
+    Regular = 0,
+    Blob = 1,
+}
+
+impl Default for SegmentClass {
+    fn default() -> Self {
+        Self::Regular
+    }
+}
+
 // WAL Performance Configuration
 // These settings implement group commit batching to improve write throughput
 // while maintaining durability guarantees within bounded loss windows.
@@ -77,6 +90,7 @@ pub struct Segment {
     pub id: u64,
     pub seq_id: u64,
     pub chunk_id: usize,
+    segment_class: SegmentClass,
     pub addr: usize,
     pub bound: usize,
     pub append_header: AtomicUsize,
@@ -137,6 +151,26 @@ impl Segment {
         hot: bool,
         file_manager: Arc<SegmentFileManager>,
     ) -> Segment {
+        Self::new_with_class(
+            id,
+            seq_id,
+            chunk_id,
+            buffer_ptr,
+            hot,
+            file_manager,
+            SegmentClass::Regular,
+        )
+    }
+
+    pub fn new_with_class(
+        id: u64,
+        seq_id: u64,
+        chunk_id: usize,
+        buffer_ptr: usize,
+        hot: bool,
+        file_manager: Arc<SegmentFileManager>,
+        segment_class: SegmentClass,
+    ) -> Segment {
         let size = SEGMENT_SIZE;
 
         if let Err(e) = file_manager.init_directories() {
@@ -158,6 +192,7 @@ impl Segment {
             id,
             seq_id,
             chunk_id,
+            segment_class,
             bound: buffer_ptr + size,
             append_header: AtomicUsize::new(buffer_ptr),
             dead_space: AtomicU32::new(0),
@@ -179,6 +214,11 @@ impl Segment {
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
         }
+    }
+
+    #[inline]
+    pub fn segment_class(&self) -> SegmentClass {
+        self.segment_class
     }
 
     pub fn try_acquire(&self, size: u32) -> Option<usize> {
@@ -1246,6 +1286,14 @@ impl SegmentAllocator {
     }
 
     pub fn alloc_seg(&self, file_manager: &Arc<SegmentFileManager>) -> Option<Segment> {
+        self.alloc_seg_with_class(file_manager, SegmentClass::Regular)
+    }
+
+    pub fn alloc_seg_with_class(
+        &self,
+        file_manager: &Arc<SegmentFileManager>,
+        segment_class: SegmentClass,
+    ) -> Option<Segment> {
         self.free
             .pop_front()
             .or_else(|| loop {
@@ -1268,13 +1316,14 @@ impl SegmentAllocator {
             .map(|addr| {
                 let id = self.id_by_addr(addr);
                 let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
-                Segment::new(
+                Segment::new_with_class(
                     id as u64,
                     seq_id as u64,
                     self.chunk_id,
                     addr,
                     true,
                     file_manager.clone(),
+                    segment_class,
                 )
             })
     }
@@ -1285,6 +1334,16 @@ impl SegmentAllocator {
         &self,
         seq_id: u64,
         file_manager: &Arc<SegmentFileManager>,
+    ) -> Option<Segment> {
+        self.alloc_seg_with_seq_id_and_class(seq_id, file_manager, true, SegmentClass::Regular)
+    }
+
+    pub fn alloc_seg_with_seq_id_and_class(
+        &self,
+        seq_id: u64,
+        file_manager: &Arc<SegmentFileManager>,
+        hot: bool,
+        segment_class: SegmentClass,
     ) -> Option<Segment> {
         // First allocate the address
         self.free
@@ -1308,13 +1367,14 @@ impl SegmentAllocator {
             .map(|addr| {
                 let id = self.id_by_addr(addr);
                 // Use the provided seq_id instead of fetching a new one
-                Segment::new(
+                Segment::new_with_class(
                     id as u64,
                     seq_id,
                     self.chunk_id,
                     addr,
-                    true,
+                    hot,
                     file_manager.clone(),
+                    segment_class,
                 )
             })
     }
@@ -1326,6 +1386,17 @@ impl SegmentAllocator {
         seg_id: u64,
         seq_id: u64,
         file_manager: &Arc<SegmentFileManager>,
+    ) -> Option<Segment> {
+        self.alloc_seg_at_id_with(seg_id, seq_id, file_manager, true, SegmentClass::Regular)
+    }
+
+    pub fn alloc_seg_at_id_with(
+        &self,
+        seg_id: u64,
+        seq_id: u64,
+        file_manager: &Arc<SegmentFileManager>,
+        hot: bool,
+        segment_class: SegmentClass,
     ) -> Option<Segment> {
         let addr = self.addr_by_id(seg_id as usize);
 
@@ -1360,13 +1431,14 @@ impl SegmentAllocator {
             }
         }
 
-        Some(Segment::new(
+        Some(Segment::new_with_class(
             seg_id,
             seq_id,
             self.chunk_id,
             addr,
-            true, // hot - recovery starts segments as hot
+            hot,
             file_manager.clone(),
+            segment_class,
         ))
     }
 

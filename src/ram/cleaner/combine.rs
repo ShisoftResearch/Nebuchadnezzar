@@ -2,7 +2,7 @@ use crate::ram::cell;
 use crate::ram::chunk::Chunk;
 use crate::ram::cleaner::SegmentCandidate;
 use crate::ram::entry::EntryContent;
-use crate::ram::segs::{Segment, SEGMENT_SIZE};
+use crate::ram::segs::{Segment, SegmentClass, SEGMENT_SIZE};
 use itertools::Itertools;
 use lightning::map::Map;
 use rayon::prelude::*;
@@ -45,13 +45,15 @@ struct DummyEntry {
 
 struct DummySegment {
     head: usize,
+    segment_class: SegmentClass,
     entries: Vec<DummyEntry>,
 }
 
 impl DummySegment {
-    fn new() -> DummySegment {
+    fn new(segment_class: SegmentClass) -> DummySegment {
         DummySegment {
             head: 0,
+            segment_class,
             entries: Vec::new(),
         }
     }
@@ -68,14 +70,13 @@ impl CombinedCleaner {
         chunk: &Chunk,
         selected_segments: &[lightning::aarc::Arc<Segment>],
     ) -> Vec<SegmentCandidate> {
-        let head_seg_id = chunk.get_head_seg_id();
         // Remove the head segment, cold segments, and segments locked by tiered operations
         // Skip locked segments (eviction/promotion in progress) to avoid conflicts
         // Skip cold segments to avoid accessing evicted data (would trigger promotion)
         let segments = selected_segments
             .iter()
             .filter_map(|seg| {
-                if seg.id == head_seg_id {
+                if chunk.is_active_head(seg.id) {
                     return None;
                 }
                 // Check references first to avoid locking if busy (fast path)
@@ -95,7 +96,38 @@ impl CombinedCleaner {
             );
             return Vec::new();
         }
-        segments
+
+        let preferred_class = segments
+            .first()
+            .map(|seg| seg.segment_class())
+            .unwrap_or(SegmentClass::Regular);
+        let (blob_segments, regular_segments): (Vec<_>, Vec<_>) = segments
+            .into_iter()
+            .partition(|seg| seg.segment_class() == SegmentClass::Blob);
+
+        if preferred_class == SegmentClass::Blob && blob_segments.len() >= 2 {
+            return blob_segments;
+        }
+
+        if preferred_class == SegmentClass::Regular && regular_segments.len() >= 2 {
+            return regular_segments;
+        }
+
+        if blob_segments.len() >= 2 {
+            return blob_segments;
+        }
+
+        if regular_segments.len() >= 2 {
+            return regular_segments;
+        }
+
+        trace!(
+            "too few same-class segments to combine, chunk {}, blob={}, regular={}",
+            chunk.id,
+            blob_segments.len(),
+            regular_segments.len()
+        );
+        Vec::new()
     }
 
     fn collect_and_deduplicate_entries(
@@ -184,18 +216,18 @@ impl CombinedCleaner {
         all_entries
     }
 
-    fn plan_segment_layout(entries: &[DummyEntry]) -> Vec<DummySegment> {
+    fn plan_segment_layout(entries: &[DummyEntry], segment_class: SegmentClass) -> Vec<DummySegment> {
         if entries.is_empty() {
             return Vec::new();
         }
         let mut pending_segments = Vec::new();
-        pending_segments.push(DummySegment::new());
+        pending_segments.push(DummySegment::new(segment_class));
         for entry in entries {
             let entry_size = entry.size;
             {
                 let segment_space_remains = SEGMENT_SIZE - pending_segments.last().unwrap().head;
                 if entry_size > segment_space_remains {
-                    pending_segments.push(DummySegment::new());
+                    pending_segments.push(DummySegment::new(segment_class));
                 }
             }
             let last_segment = pending_segments.last_mut().unwrap();
@@ -219,7 +251,7 @@ impl CombinedCleaner {
                 .map(|dummy_seg| {
                     let new_seg = chunk
                         .allocator
-                        .alloc_seg(&chunk.file_manager)
+                        .alloc_seg_with_class(&chunk.file_manager, dummy_seg.segment_class)
                         .expect("No space left during combine");
                     let new_seg_id = new_seg.id;
                     let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
@@ -403,8 +435,9 @@ impl CombinedCleaner {
         let mut space_cleaned = 0;
 
         if all_entries.len() > 0 {
+            let segment_class = segments[0].segment_class();
             // Simulate the combine process to determine the efficiency
-            let pending_segments = Self::plan_segment_layout(&all_entries);
+            let pending_segments = Self::plan_segment_layout(&all_entries, segment_class);
 
             debug!("Checking combine feasibility");
             let pending_segments_len = pending_segments.len() as isize;
