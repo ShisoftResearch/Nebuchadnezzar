@@ -3,9 +3,9 @@ use crate::ram::cell::{
 };
 use crate::ram::chunk::Chunks;
 use crate::ram::cleaner::combine;
-use crate::ram::segs::SegmentClass;
 use crate::ram::entry::ENTRY_HEAD_SIZE;
 use crate::ram::schema::{Field, Schema};
+use crate::ram::segs::SegmentClass;
 use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::types::{Bytes, Id, Map, OwnedMap, OwnedValue, Type};
 use std::collections::BTreeSet;
@@ -49,10 +49,7 @@ fn written_segment_class(chunks: &Chunks, id: &Id) -> SegmentClass {
         *loc
     };
     let chunk = chunks.locate_chunk_by_partition(id.higher);
-    chunk
-        .locate_segment(addr)
-        .unwrap()
-        .segment_class()
+    chunk.locate_segment(addr).unwrap().segment_class()
 }
 
 fn written_segment_id(chunks: &Chunks, id: &Id) -> u64 {
@@ -130,7 +127,10 @@ fn blob_schema_regular_schema_accepts_exact_one_mib_boundary_and_rejects_next_ed
         boundary_payload_lengths(&schema, MAX_CELL_SIZE);
     let rejected_size = modeled_total_size(&schema, rejected_payload_len);
 
-    assert_eq!(modeled_total_size(&schema, accepted_payload_len), MAX_CELL_SIZE as usize);
+    assert_eq!(
+        modeled_total_size(&schema, accepted_payload_len),
+        MAX_CELL_SIZE as usize
+    );
     assert!(rejected_size > MAX_CELL_SIZE as usize);
 
     let accepted = bytes_cell(schema.id, Id::new(42, 1), accepted_payload_len);
@@ -171,7 +171,10 @@ fn blob_schema_blob_schema_accepts_exact_two_mib_boundary_and_rejects_next_edge(
 
     let accepted = bytes_cell(schema.id, Id::new(43, 1), accepted_payload_len);
     let accepted_plan = accepted.plan_write(chunk).unwrap();
-    assert_eq!(accepted_plan.total_size() as usize, MAX_BLOB_CELL_SIZE as usize);
+    assert_eq!(
+        accepted_plan.total_size() as usize,
+        MAX_BLOB_CELL_SIZE as usize
+    );
 
     let rejected = bytes_cell(schema.id, Id::new(43, 2), rejected_payload_len);
     assert!(matches!(
@@ -186,8 +189,14 @@ fn blob_schema_blob_and_regular_cells_land_in_different_segment_classes() {
     let chunk = &chunks.list[0];
     let regular_schema = bytes_schema(44, "blob_schema_regular_lane", false);
     let blob_schema = bytes_schema(45, "blob_schema_blob_lane", true);
-    chunk.meta.schemas.debug_only_new_schema(regular_schema.clone());
-    chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+    chunk
+        .meta
+        .schemas
+        .debug_only_new_schema(regular_schema.clone());
+    chunk
+        .meta
+        .schemas
+        .debug_only_new_schema(blob_schema.clone());
 
     let regular_id = Id::new(44, 1);
     let blob_id = Id::new(44, 2);
@@ -197,7 +206,10 @@ fn blob_schema_blob_and_regular_cells_land_in_different_segment_classes() {
     chunks.write_cell(&mut regular_cell).unwrap();
     chunks.write_cell(&mut blob_cell).unwrap();
 
-    assert_eq!(written_segment_class(&chunks, &regular_id), SegmentClass::Regular);
+    assert_eq!(
+        written_segment_class(&chunks, &regular_id),
+        SegmentClass::Regular
+    );
     assert_eq!(written_segment_class(&chunks, &blob_id), SegmentClass::Blob);
 }
 
@@ -207,8 +219,14 @@ fn blob_schema_chunk_keeps_independent_blob_and_regular_heads() {
     let chunk = &chunks.list[0];
     let regular_schema = bytes_schema(46, "blob_schema_regular_head", false);
     let blob_schema = bytes_schema(47, "blob_schema_blob_head", true);
-    chunk.meta.schemas.debug_only_new_schema(regular_schema.clone());
-    chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+    chunk
+        .meta
+        .schemas
+        .debug_only_new_schema(regular_schema.clone());
+    chunk
+        .meta
+        .schemas
+        .debug_only_new_schema(blob_schema.clone());
 
     let (initial_regular_head, initial_blob_head) = chunk.head_seg_ids_for_test();
     assert_eq!(chunk.get_head_seg_id(), initial_regular_head);
@@ -242,7 +260,10 @@ fn blob_schema_active_blob_head_is_excluded_from_cleaner_candidates() {
     let chunks = Chunks::new_dummy(1, SEGMENT_SIZE * 3);
     let chunk = &chunks.list[0];
     let blob_schema = bytes_schema(48, "blob_schema_blob_cleaner_head", true);
-    chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+    chunk
+        .meta
+        .schemas
+        .debug_only_new_schema(blob_schema.clone());
 
     let id = Id::new(48, 1);
     let mut original = bytes_cell(blob_schema.id, id, 256 * 1024);
@@ -273,8 +294,14 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
     let chunk = &chunks.list[0];
     let regular_schema = bytes_schema(49, "blob_schema_regular_cleaner_lane", false);
     let blob_schema = bytes_schema(50, "blob_schema_blob_cleaner_lane", true);
-    chunk.meta.schemas.debug_only_new_schema(regular_schema.clone());
-    chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+    chunk
+        .meta
+        .schemas
+        .debug_only_new_schema(regular_schema.clone());
+    chunk
+        .meta
+        .schemas
+        .debug_only_new_schema(blob_schema.clone());
 
     let mut regular_segments = BTreeSet::new();
     let mut regular_cells = Vec::new();
@@ -383,7 +410,10 @@ fn blob_schema_combine_preserves_blob_segment_class() {
     let chunks = Chunks::new_dummy(1, SEGMENT_SIZE * 5);
     let chunk = &chunks.list[0];
     let blob_schema = bytes_schema(51, "blob_schema_combine_blob_lane", true);
-    chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+    chunk
+        .meta
+        .schemas
+        .debug_only_new_schema(blob_schema.clone());
 
     let payload_len = 1_500_000;
     let mut distinct_blob_segments = BTreeSet::new();
@@ -410,7 +440,11 @@ fn blob_schema_combine_preserves_blob_segment_class() {
         .filter(|segment_id| *segment_id != blob_head)
         .take(2)
         .collect();
-    assert_eq!(source_segments.len(), 2, "setup should produce two non-head blob segments");
+    assert_eq!(
+        source_segments.len(),
+        2,
+        "setup should produce two non-head blob segments"
+    );
 
     let mut kept_segments = BTreeSet::new();
     let mut survivor_ids = Vec::new();
@@ -437,9 +471,12 @@ fn blob_schema_combine_preserves_blob_segment_class() {
         .into_iter()
         .filter(|seg| source_segments.contains(&seg.id))
         .collect();
-    assert!(selected_segments.iter().all(|seg| seg.segment_class() == SegmentClass::Blob));
+    assert!(selected_segments
+        .iter()
+        .all(|seg| seg.segment_class() == SegmentClass::Blob));
 
-    let (_, reduced_segments) = combine::CombinedCleaner::combine_segments(chunk, &selected_segments);
+    let (_, reduced_segments) =
+        combine::CombinedCleaner::combine_segments(chunk, &selected_segments);
     assert!(
         reduced_segments > 0,
         "combine should collapse fragmented blob segments into fewer replacements"

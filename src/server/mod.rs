@@ -1192,9 +1192,7 @@ impl NebServer {
                 if let Err(e) = indexer.graceful_shutdown().await {
                     warn!(
                         "Failed to gracefully shut down fulltext indexer for {}/{}: {:?}",
-                        self.group_name,
-                        self.database_name,
-                        e
+                        self.group_name, self.database_name, e
                     );
                 }
             }

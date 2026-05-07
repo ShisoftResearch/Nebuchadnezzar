@@ -215,6 +215,61 @@ impl AsyncClient {
         client.read_cell_select(id, fields, need_header).await
     }
 
+    pub async fn read_all_cells_selected(
+        &self,
+        ids: &Vec<Id>,
+        fields: &Vec<u64>,
+        need_header: bool,
+    ) -> Result<Vec<Result<OwnedCell, ReadError>>, RPCError> {
+        let mut cells_by_client = ids
+            .iter()
+            .dedup()
+            .map(|id| (self.locate_server_id(&id).unwrap(), id))
+            .sorted_by_key(|(server_id, _)| *server_id)
+            .chunk_by(|(server_id, _)| *server_id)
+            .into_iter()
+            .map(|(server_id, ids)| (server_id, ids.map(|(_, id)| *id).collect_vec()))
+            .map(|(server_id, ids)| {
+                let fields = fields.clone();
+                async move {
+                    if server_id > 0 {
+                        let client = self.client_by_server_id(server_id).await.unwrap();
+                        (
+                            client
+                                .read_all_cells_selected(&ids, &fields, need_header)
+                                .await,
+                            ids,
+                        )
+                    } else {
+                        (
+                            Ok(vec![Err(ReadError::CellIdIsUnitId)]),
+                            vec![Id::unit_id()],
+                        )
+                    }
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut id_cell_map = HashMap::new();
+        while let Some((cells, ids)) = cells_by_client.next().await {
+            let cells = cells?;
+            for (id, cell) in ids.into_iter().zip(cells) {
+                id_cell_map.insert(id, Some(cell));
+            }
+        }
+        Ok(ids
+            .iter()
+            .map(|id| {
+                let id_ref = id_cell_map.get_mut(id).unwrap();
+                if cfg!(debug_assertions) && id_ref.is_none() {
+                    let msg = format!("Cannot find {:?} for read_all_cells_selected", id);
+                    error!("{}", msg);
+                    panic!("{}", msg);
+                }
+                mem::replace(id_ref, None).unwrap()
+            })
+            .collect())
+    }
+
     pub async fn read_all_cells(
         &self,
         ids: &Vec<Id>,

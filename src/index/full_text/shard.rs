@@ -952,11 +952,8 @@ impl InvertedIndexer {
             if let Some(stats_arc) = self.field_stats.get(hash_key) {
                 let stat = stats_arc.lock();
                 let stats_id = Self::stats_cell_id(*schema_id, *field_id);
-                let cell = OwnedCell::new_with_id(
-                    *INVERTED_STATS_SCHEMA_ID,
-                    &stats_id,
-                    stat.to_value(),
-                );
+                let cell =
+                    OwnedCell::new_with_id(*INVERTED_STATS_SCHEMA_ID, &stats_id, stat.to_value());
 
                 info!(
                     "Preparing stats cell for flush: schema={}, field={}, doc_count={}, total_length={}",

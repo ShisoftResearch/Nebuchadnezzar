@@ -51,7 +51,10 @@ impl ClockEvictionPolicy {
         let cooldown_ms = self.promotion_cooldown_ms.load(Ordering::Relaxed);
         let preferred_classes = &BLOB_FIRST_CLASSES[..];
 
-        debug!("CLOCK selecting victim across {} total segments", num_segments);
+        debug!(
+            "CLOCK selecting victim across {} total segments",
+            num_segments
+        );
 
         for &preferred_class in preferred_classes {
             for i in 0..num_segments {
@@ -87,8 +90,7 @@ impl ClockEvictionPolicy {
                         .store((pos + 1) % num_segments, Ordering::Relaxed);
                     debug!(
                         "CLOCK selected {:?} segment {} as victim (count reached zero)",
-                        preferred_class,
-                        segment.id
+                        preferred_class, segment.id
                     );
                     return Some(segment.clone());
                 }

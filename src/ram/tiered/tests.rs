@@ -89,7 +89,9 @@ fn large_string_cell(schema_id: u32, id: Id, payload_len: usize, prefix: &str) -
     );
     data_map.insert(
         &String::from("data"),
-        OwnedValue::String(prefix.repeat(payload_len / prefix.len().max(1) + 1)[..payload_len].to_string()),
+        OwnedValue::String(
+            prefix.repeat(payload_len / prefix.len().max(1) + 1)[..payload_len].to_string(),
+        ),
     );
 
     OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data_map))
@@ -691,18 +693,37 @@ fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
     chunk.put_segment(blob_candidate);
 
     let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
-    assert_eq!(blob_head, None, "test setup should not install a blob write head");
     assert_eq!(
-        chunk.segs.get(&(regular_candidate_id as usize)).unwrap().segment_class(),
+        blob_head, None,
+        "test setup should not install a blob write head"
+    );
+    assert_eq!(
+        chunk
+            .segs
+            .get(&(regular_candidate_id as usize))
+            .unwrap()
+            .segment_class(),
         SegmentClass::Regular
     );
     assert_eq!(
-        chunk.segs.get(&(blob_candidate_id as usize)).unwrap().segment_class(),
+        chunk
+            .segs
+            .get(&(blob_candidate_id as usize))
+            .unwrap()
+            .segment_class(),
         SegmentClass::Blob
     );
     assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
-    assert!(chunk.segs.get(&(regular_candidate_id as usize)).unwrap().is_hot());
-    assert!(chunk.segs.get(&(blob_candidate_id as usize)).unwrap().is_hot());
+    assert!(chunk
+        .segs
+        .get(&(regular_candidate_id as usize))
+        .unwrap()
+        .is_hot());
+    assert!(chunk
+        .segs
+        .get(&(blob_candidate_id as usize))
+        .unwrap()
+        .is_hot());
 
     let policy = ClockEvictionPolicy::default();
     let victim = policy
@@ -729,23 +750,9 @@ fn test_blob_segments_evict_before_regular_segments() {
     let _ = std::fs::create_dir_all(backup_dir);
     let _ = std::fs::create_dir_all(wal_dir);
 
-    let regular = Schema::new_with_id(
-        910,
-        "regular_evict",
-        None,
-        default_fields(),
-        false,
-        false,
-    );
-    let blob = Schema::new_with_id(
-        920,
-        "blob_evict",
-        None,
-        default_fields(),
-        false,
-        false,
-    )
-    .with_blobs(true);
+    let regular = Schema::new_with_id(910, "regular_evict", None, default_fields(), false, false);
+    let blob = Schema::new_with_id(920, "blob_evict", None, default_fields(), false, false)
+        .with_blobs(true);
     let schemas = LocalSchemasCache::new_local(schema_dir);
     schemas.debug_only_new_schema(regular.clone());
     schemas.debug_only_new_schema(blob.clone());
@@ -824,7 +831,11 @@ fn test_blob_segments_evict_before_regular_segments() {
         "setup should classify the blob victim candidate correctly"
     );
     assert!(
-        chunk.segs.get(&(regular_non_head as usize)).unwrap().is_hot(),
+        chunk
+            .segs
+            .get(&(regular_non_head as usize))
+            .unwrap()
+            .is_hot(),
         "setup should keep the regular non-head hot before eviction"
     );
     assert!(
@@ -855,7 +866,11 @@ fn test_blob_segments_evict_before_regular_segments() {
         "explicit eviction must leave the active blob head hot"
     );
     assert!(
-        chunk.segs.get(&(regular_non_head as usize)).unwrap().is_hot(),
+        chunk
+            .segs
+            .get(&(regular_non_head as usize))
+            .unwrap()
+            .is_hot(),
         "regular hot segments should remain hot while a blob victim exists"
     );
     assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
@@ -935,14 +950,27 @@ fn test_blob_segments_promote_on_read_after_eviction() {
         .segs
         .get(&(cold_target_segment_id as usize))
         .expect("target blob segment should still exist after eviction");
-    assert!(cold_segment.is_cold(), "blob segment should be cold after explicit eviction");
+    assert!(
+        cold_segment.is_cold(),
+        "blob segment should be cold after explicit eviction"
+    );
 
     let read_back = chunks.read_cell(&cold_target_id).unwrap();
-    assert_eq!(read_back.data["id"].i64(), Some(&(cold_target_id.lower as i64)));
+    assert_eq!(
+        read_back.data["id"].i64(),
+        Some(&(cold_target_id.lower as i64))
+    );
     drop(read_back);
 
-    assert!(cold_segment.is_hot(), "reading a cold blob segment should promote it");
-    assert_eq!(cold_segment.get_access_count(), 0, "promotion should reset the cold access counter");
+    assert!(
+        cold_segment.is_hot(),
+        "reading a cold blob segment should promote it"
+    );
+    assert_eq!(
+        cold_segment.get_access_count(),
+        0,
+        "promotion should reset the cold access counter"
+    );
 
     let _ = std::fs::remove_dir_all(schema_dir);
     let _ = std::fs::remove_dir_all(backup_dir);

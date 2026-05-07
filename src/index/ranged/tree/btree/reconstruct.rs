@@ -17,8 +17,14 @@ const PARALLEL_FETCH_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
 pub enum ReconstructError {
-    MissingPage { page_id: Id, pages_read: usize },
-    RpcReadFailed { page_id: Id, error: String },
+    MissingPage {
+        page_id: Id,
+        pages_read: usize,
+    },
+    RpcReadFailed {
+        page_id: Id,
+        error: String,
+    },
     InvalidPageFormat {
         page_id: Id,
         schema_id: u32,
@@ -379,8 +385,8 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::ReconstructError;
     use super::external::*;
+    use super::ReconstructError;
     use crate::index::ranged::tree::btree::test::*;
     use crate::index::ranged::tree::btree::*;
     use crate::ram::types::*;

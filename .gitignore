@@ -200,3 +200,4 @@ callgrind.out.*
 *.log
 /test-data/
 core
+.worktrees/

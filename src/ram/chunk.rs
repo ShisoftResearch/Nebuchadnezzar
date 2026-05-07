@@ -4,9 +4,7 @@ use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::segment_list::SegmentList;
-use crate::ram::segs::{
-    Segment, SegmentAllocator, SegmentClass, SEGMENT_SIZE, SEGMENT_SIZE_U32,
-};
+use crate::ram::segs::{Segment, SegmentAllocator, SegmentClass, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
 use crate::ram::types::Id;
 use crate::server::ServerMeta;
@@ -1159,9 +1157,7 @@ impl Chunk {
         self.segs_for_combine_cleaner_impl(true)
     }
 
-    fn choose_combine_candidate_class(
-        mapping: &[(AArc<Segment>, f32)],
-    ) -> Option<SegmentClass> {
+    fn choose_combine_candidate_class(mapping: &[(AArc<Segment>, f32)]) -> Option<SegmentClass> {
         let preferred_class = mapping.first().map(|(seg, _)| seg.segment_class())?;
         let mut blob_count = 0;
         let mut regular_count = 0;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::ram::cell::{OwnedCellRef, header_from_chunk_raw};
+use crate::ram::cell::{header_from_chunk_raw, OwnedCellRef};
 use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
 use crate::server::{DatabaseRuntime, Peer};

@@ -5,11 +5,11 @@ use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
 use crate::index::embedding::EmbeddingModel;
 use crate::index::full_text::{
-    FullTextIndexMeta, ToOwnedValue, build_index_meta as build_inverted_index_meta,
+    build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
 use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
 use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
-use crate::ram::types::{Id, OwnedValue, hash_indexable_owned_value};
+use crate::ram::types::{hash_indexable_owned_value, Id, OwnedValue};
 use crate::ram::{
     cell::Cell,
     schema::{CompoundIndex, IndexType, Schema},
@@ -23,7 +23,7 @@ use futures::{
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use std::cell::RefCell;
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -895,8 +895,8 @@ mod tests {
     use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
     use bifrost_hasher::hash_str;
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     };
     use std::time::{Duration, Instant};
 

@@ -216,7 +216,10 @@ impl CombinedCleaner {
         all_entries
     }
 
-    fn plan_segment_layout(entries: &[DummyEntry], segment_class: SegmentClass) -> Vec<DummySegment> {
+    fn plan_segment_layout(
+        entries: &[DummyEntry],
+        segment_class: SegmentClass,
+    ) -> Vec<DummySegment> {
         if entries.is_empty() {
             return Vec::new();
         }

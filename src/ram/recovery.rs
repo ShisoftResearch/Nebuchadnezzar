@@ -146,7 +146,10 @@ fn estimate_recovery_word_map_capacity(files: &[SegmentFileInfo]) -> usize {
         .next_power_of_two()
 }
 
-fn group_files_by_chunk(files: Vec<SegmentFileInfo>, num_chunks: usize) -> Vec<Vec<SegmentFileInfo>> {
+fn group_files_by_chunk(
+    files: Vec<SegmentFileInfo>,
+    num_chunks: usize,
+) -> Vec<Vec<SegmentFileInfo>> {
     let mut grouped = vec![Vec::new(); num_chunks];
     for file in files {
         grouped[file.chunk_id].push(file);
@@ -434,7 +437,10 @@ fn install_recovered_segment(chunk: &Chunk, segment: Segment) -> AArc<Segment> {
     let replaced = chunk.segs.insert_back(segment_id, AArc::new(segment));
 
     if let Some(ref tiered_manager) = chunk.tiered_manager {
-        let replaced_hot = replaced.as_ref().map(|segment| segment.is_hot()).unwrap_or(false);
+        let replaced_hot = replaced
+            .as_ref()
+            .map(|segment| segment.is_hot())
+            .unwrap_or(false);
         match (replaced_hot, new_is_hot) {
             (false, true) => tiered_manager.increment_hot_count(),
             (true, false) => tiered_manager.decrement_hot_count(),
@@ -959,10 +965,8 @@ pub fn recover_chunks(
         })?;
 
     recovery_pool.install(|| -> io::Result<()> {
-        files_by_chunk
-            .into_par_iter()
-            .enumerate()
-            .try_for_each(|(chunk_id, chunk_files)| -> io::Result<()> {
+        files_by_chunk.into_par_iter().enumerate().try_for_each(
+            |(chunk_id, chunk_files)| -> io::Result<()> {
                 let chunk = &chunks[chunk_id];
                 let version_map = &version_maps[chunk_id];
                 let mut local_stashed = Vec::new();
@@ -971,9 +975,7 @@ pub fn recover_chunks(
                     if newer_resident_segment(chunk, file_info.seg_id, file_info.seq_id).is_some() {
                         debug!(
                             "Skipping stale recovery file for chunk {} seg {} seq {}",
-                            chunk_id,
-                            file_info.seg_id,
-                            file_info.seq_id
+                            chunk_id, file_info.seg_id, file_info.seq_id
                         );
                         continue;
                     }
@@ -1002,7 +1004,8 @@ pub fn recover_chunks(
                     let recover_as_cold = if segment_class == SegmentClass::Blob {
                         true
                     } else if chunk.tiered_manager.is_some() {
-                        let current_hot_segments = planned_global_hot_segments.load(Ordering::Relaxed);
+                        let current_hot_segments =
+                            planned_global_hot_segments.load(Ordering::Relaxed);
                         should_recover_as_cold(chunk, &file_info, current_hot_segments)
                     } else {
                         false
@@ -1010,11 +1013,11 @@ pub fn recover_chunks(
 
                     match (existing_hot, recover_as_cold) {
                         (true, true) => {
-                            planned_global_hot_segments.fetch_update(
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |current| Some(current.saturating_sub(1)),
-                            ).ok();
+                            planned_global_hot_segments
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                    Some(current.saturating_sub(1))
+                                })
+                                .ok();
                         }
                         (true, false) => {}
                         (false, false) => {
@@ -1057,7 +1060,8 @@ pub fn recover_chunks(
                     all_stashed_tombstones.lock().extend(local_stashed);
                 }
                 Ok(())
-            })
+            },
+        )
     })?;
 
     // Version maps are dropped here, freeing all temporary version tracking memory
@@ -1130,9 +1134,9 @@ mod tests {
     use crate::dovahkiin::types::Map;
     use crate::ram::cell::*;
     use crate::ram::chunk::Chunks;
+    use crate::ram::schema::{Field, LocalSchemasCache, Schema};
     use crate::ram::segs::{SegmentClass, SEGMENT_SIZE};
     use crate::ram::tiered::{manager::TieredMemoryManager, SharedMemoryPool, TieredConfig};
-    use crate::ram::schema::{Field, LocalSchemasCache, Schema};
     use crate::ram::types::Id;
     use crate::server::ServerMeta;
     use dovahkiin::types::Type;
@@ -1177,12 +1181,14 @@ mod tests {
     }
 
     fn tiered_manager_for_test(physical_memory_limit: usize) -> Arc<TieredMemoryManager> {
-        Arc::new(TieredMemoryManager::new(SharedMemoryPool::new(&TieredConfig {
-            threshold: 0.95,
-            lower_watermark: 0.8,
-            physical_memory_limit,
-            promotion_cooldown_ms: 0,
-        })))
+        Arc::new(TieredMemoryManager::new(SharedMemoryPool::new(
+            &TieredConfig {
+                threshold: 0.95,
+                lower_watermark: 0.8,
+                physical_memory_limit,
+                promotion_cooldown_ms: 0,
+            },
+        )))
     }
 
     fn entry_bytes_at(addr: usize) -> Vec<u8> {
@@ -1208,10 +1214,8 @@ mod tests {
         seq_id: u64,
         data: &[u8],
     ) {
-        let manager = SegmentFileManager::new(
-            Some(backup_dir.path().to_str().unwrap().to_string()),
-            None,
-        );
+        let manager =
+            SegmentFileManager::new(Some(backup_dir.path().to_str().unwrap().to_string()), None);
         let path = manager
             .backup_path(chunk_id, seg_id, seq_id)
             .expect("backup storage should be configured for test recovery files");
@@ -1293,8 +1297,14 @@ mod tests {
         let chunk = &chunks.list[0];
         let regular_schema = schema_with_id(100, "recovery_mixed_regular", false);
         let blob_schema = schema_with_id(101, "recovery_mixed_blob", true);
-        chunk.meta.schemas.debug_only_new_schema(regular_schema.clone());
-        chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+        chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(regular_schema.clone());
+        chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(blob_schema.clone());
 
         let regular_id = Id::new(10, 1);
         let blob_id = Id::new(10, 2);
@@ -1347,7 +1357,10 @@ mod tests {
         let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
         let chunk = &chunks.list[0];
         let blob_schema = schema_with_id(102, "recovery_truncated_blob", true);
-        chunk.meta.schemas.debug_only_new_schema(blob_schema.clone());
+        chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(blob_schema.clone());
 
         let first_id = Id::new(12, 1);
         let second_id = Id::new(12, 2);
@@ -1639,25 +1652,32 @@ mod tests {
                 .collect();
 
             assert_eq!(blob_head, None, "recovery should leave the blob head empty");
-            assert_eq!(blob_segments.len(), 1, "setup should recover exactly one blob segment");
+            assert_eq!(
+                blob_segments.len(),
+                1,
+                "setup should recover exactly one blob segment"
+            );
             assert_eq!(
                 regular_segments.len(),
                 1,
                 "recovery should reuse the recovered regular segment instead of allocating a fresh empty head"
             );
-            assert!(blob_segments[0].is_cold(), "recovered blob segments must come back cold");
+            assert!(
+                blob_segments[0].is_cold(),
+                "recovered blob segments must come back cold"
+            );
             assert_eq!(
                 regular_head_segment.segment_class(),
                 SegmentClass::Regular,
                 "recovery should re-establish a regular runtime head"
             );
             assert_eq!(
-                regular_head_segment.id,
-                regular_segments[0].id,
+                regular_head_segment.id, regular_segments[0].id,
                 "the regular write head should reuse the recovered hot regular segment"
             );
             assert_eq!(
-                regular_head_segment.append_header.load(Ordering::Relaxed) > regular_head_segment.addr,
+                regular_head_segment.append_header.load(Ordering::Relaxed)
+                    > regular_head_segment.addr,
                 true,
                 "the regular head after recovery should keep the recovered append position"
             );
@@ -1772,7 +1792,10 @@ mod tests {
                 "recovery should still keep a regular write head ready"
             );
             assert_eq!(blob_segment.segment_class(), SegmentClass::Blob);
-            assert!(blob_segment.is_cold(), "WAL-only recovered blob segments must start cold");
+            assert!(
+                blob_segment.is_cold(),
+                "WAL-only recovered blob segments must start cold"
+            );
             assert!(
                 Path::new(&backup_path).exists(),
                 "cold recovery from WAL should synthesize a backup file before future promotion"
@@ -1822,17 +1845,12 @@ mod tests {
             is_backup: true,
         };
 
-        let prepared = prepare_recovered_segment(
-            chunk,
-            &older_blob_file,
-            false,
-            SegmentClass::Blob,
-        )
-            .expect("older plan should not make preparation fail");
+        let prepared =
+            prepare_recovered_segment(chunk, &older_blob_file, false, SegmentClass::Blob)
+                .expect("older plan should not make preparation fail");
 
         assert_eq!(
-            prepared.seq_id,
-            newer_regular_seq_id,
+            prepared.seq_id, newer_regular_seq_id,
             "older recovery plans must not displace a newer resident seq for the same seg_id"
         );
         assert_eq!(
@@ -1840,8 +1858,14 @@ mod tests {
             SegmentClass::Regular,
             "older cross-class recovery plans must not change the surviving runtime class"
         );
-        assert!(prepared.is_hot(), "the newer resident segment should stay hot");
-        assert_eq!(prepared.id, seg_id, "the surviving segment must keep the same seg_id");
+        assert!(
+            prepared.is_hot(),
+            "the newer resident segment should stay hot"
+        );
+        assert_eq!(
+            prepared.id, seg_id,
+            "the surviving segment must keep the same seg_id"
+        );
         assert_eq!(
             resident.seq_id,
             chunk.segs.get(&(seg_id as usize)).unwrap().seq_id,
@@ -1915,8 +1939,9 @@ mod tests {
                 .file_manager
                 .backup_path(0, 0, recovered_seq_id)
                 .expect("backup storage should be configured for the recovered bootstrap segment");
-            std::fs::copy(&original_backup, &recovered_backup)
-                .expect("should be able to synthesize a recovered bootstrap segment with a higher seq_id");
+            std::fs::copy(&original_backup, &recovered_backup).expect(
+                "should be able to synthesize a recovered bootstrap segment with a higher seq_id",
+            );
         }
 
         {
@@ -1939,8 +1964,7 @@ mod tests {
                 .expect("recovery should reuse segment 0 in place");
 
             assert_eq!(
-                bootstrap_segment.seq_id,
-                recovered_seq_id,
+                bootstrap_segment.seq_id, recovered_seq_id,
                 "recovery should preserve the seq_id from the recovered bootstrap segment file"
             );
             assert!(
