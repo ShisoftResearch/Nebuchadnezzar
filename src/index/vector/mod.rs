@@ -405,9 +405,13 @@ mod tests {
             diversity_factor: 0.7,
         };
         let config = VectorIndexConfig::hnsw(MetricEncoding::L2, hnsw);
+        let encoded = serde_json::to_string(&config).expect("config should encode");
+        let decoded: VectorIndexConfig =
+            serde_json::from_str(&encoded).expect("config should decode");
 
         assert_eq!(config.metric, MetricEncoding::L2);
         assert_eq!(config.engine, VectorIndexEngine::Hnsw(hnsw));
+        assert_eq!(decoded, config);
     }
 
     #[test]
