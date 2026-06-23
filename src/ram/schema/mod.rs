@@ -684,6 +684,10 @@ impl LocalSchemasCache {
         let m = &self.map;
         m.new_schema(schema)
     }
+    pub fn cache_schema_from_cluster(&self, schema: Schema) {
+        let m = &self.map;
+        m.new_schema(schema)
+    }
     pub fn name_to_id(&self, name: &str) -> Option<u32> {
         let m = &self.map;
         m.name_to_id(name)

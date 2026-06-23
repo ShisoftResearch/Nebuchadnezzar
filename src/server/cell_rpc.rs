@@ -126,17 +126,79 @@ impl Service for NebRPCService {
         future::ready(self.database_runtime.chunks().head_cell(&key)).boxed()
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(move || self.database_runtime.chunks().write_cell(&mut cell))
+        async move {
+            let result = self
+                .with_indices_ensured(|| self.database_runtime.chunks().write_cell(&mut cell))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(|| {
+                        self.database_runtime.chunks().write_cell(&mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
     }
 
     fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(move || self.database_runtime.chunks().update_cell(&mut cell))
+        async move {
+            let result = self
+                .with_indices_ensured(|| self.database_runtime.chunks().update_cell(&mut cell))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(|| {
+                        self.database_runtime.chunks().update_cell(&mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
     }
     fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
-        self.with_indices_ensured(move || self.database_runtime.chunks().remove_cell(&key))
+        async move {
+            let result = self
+                .with_indices_ensured(|| self.database_runtime.chunks().remove_cell(&key))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(|| self.database_runtime.chunks().remove_cell(&key))
+                        .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
     }
     fn upsert_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(move || self.database_runtime.chunks().upsert_cell(&mut cell))
+        async move {
+            let result = self
+                .with_indices_ensured(|| self.database_runtime.chunks().upsert_cell(&mut cell))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(|| {
+                        self.database_runtime.chunks().upsert_cell(&mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
     }
     fn compare_version_and_update_cell(
         &self,
@@ -144,11 +206,29 @@ impl Service for NebRPCService {
         version: u64,
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(move || {
-            self.database_runtime
-                .chunks()
-                .compare_version_and_update_cell(&key, version, &mut cell)
-        })
+        async move {
+            let result = self
+                .with_indices_ensured(|| {
+                    self.database_runtime
+                        .chunks()
+                        .compare_version_and_update_cell(&key, version, &mut cell)
+                })
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(|| {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_update_cell(&key, version, &mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
     }
     fn compare_version_and_set_field(
         &self,
@@ -157,11 +237,30 @@ impl Service for NebRPCService {
         field: u64,
         value: OwnedValue,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
-        self.with_indices_ensured(move || {
-            self.database_runtime
-                .chunks()
-                .compare_version_and_set_field(&key, version, field, value)
-        })
+        async move {
+            let first_value = value.clone();
+            let result = self
+                .with_indices_ensured(|| {
+                    self.database_runtime
+                        .chunks()
+                        .compare_version_and_set_field(&key, version, field, first_value)
+                })
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(|| {
+                        self.database_runtime
+                            .chunks()
+                            .compare_version_and_set_field(&key, version, field, value)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
     }
     fn count(&self) -> BoxFuture<'_, u64> {
         future::ready(self.database_runtime.chunks().count() as u64).boxed()
@@ -261,6 +360,9 @@ impl Service for NebRPCService {
                 .await
                 .map_err(|e| e.to_string())?;
             if let Some(schema) = schema {
+                self.database_runtime
+                    .schemas()
+                    .cache_schema_from_cluster(schema.clone());
                 post_schema_add(&schema, &self.database_runtime).await
             } else {
                 Err(format!(
@@ -303,6 +405,24 @@ impl NebRPCService {
             database_runtime,
             neb_client,
         })
+    }
+    async fn refresh_local_schema_cache_for_write(&self, schema_id: u32) -> Result<(), WriteError> {
+        match self.neb_client.schema_by_id(schema_id).await {
+            Ok(Some(schema)) => {
+                self.database_runtime
+                    .schemas()
+                    .cache_schema_from_cluster(schema);
+                Ok(())
+            }
+            Ok(None) => Err(WriteError::SchemaDoesNotExisted(schema_id)),
+            Err(error) => {
+                warn!(
+                    "Failed to refresh local schema cache for schema {} before write retry: {:?}",
+                    schema_id, error
+                );
+                Err(WriteError::SchemaDoesNotExisted(schema_id))
+            }
+        }
     }
     fn with_indices_ensured<'a, R, F>(&'a self, op: F) -> BoxFuture<'a, R>
     where

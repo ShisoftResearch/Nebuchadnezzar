@@ -1,4 +1,5 @@
 use super::{complex_fields, default_fields, dyn_map_field, simple_fields};
+use crate::index::ranged::tree::btree::page_schema;
 use crate::index::ranged::tree::tree::{
     RANGED_TREE_HEAD_HASH, RANGED_TREE_MIGRATION_HASH, RANGED_TREE_SCHEMA, RANGED_TREE_SCHEMA_ID,
 };
@@ -225,6 +226,121 @@ pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
         chunks.list[0].statistics.changes.load(Ordering::Relaxed),
         0,
         "internal ranged-tree metadata updates should not accumulate stats refresh changes"
+    );
+}
+
+#[test]
+pub fn ranged_btree_page_cells_do_not_build_chunk_statistics_when_forced() {
+    let _ = env_logger::try_init();
+    let page_schema = page_schema();
+    let page_schema_id = page_schema.id;
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(page_schema);
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let mut page_map = OwnedMap::new();
+    page_map.insert(&String::from("next"), OwnedValue::Id(Id::unit_id()));
+    page_map.insert(&String::from("prev"), OwnedValue::Id(Id::unit_id()));
+    page_map.insert(
+        &String::from("keys"),
+        vec![SmallBytes::from_vec(vec![1u8; 32])].value(),
+    );
+    let page_id = Id::new(12, 1);
+    let mut page_cell = OwnedCell::new_with_id(page_schema_id, &page_id, OwnedValue::Map(page_map));
+    chunks.write_cell(&mut page_cell).unwrap();
+
+    chunks.ensure_statistics();
+
+    assert!(
+        chunks.all_chunk_statistics(page_schema_id)[0].is_none(),
+        "forced statistics rebuild should skip internal ranged B-tree page schemas"
+    );
+}
+
+#[test]
+pub fn sparse_sidecar_system_updates_do_not_refresh_chunk_statistics() {
+    let _ = env_logger::try_init();
+    let sidecar_schema_id = 0xF015;
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(Schema::new_with_id(
+        sidecar_schema_id,
+        "_sys_sparse_sidecar_matrix_fragments",
+        None,
+        default_fields(),
+        false,
+        false,
+    ));
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let cell_id = Id::new(100, 1);
+    let mut sidecar_cell = create_test_cell(sidecar_schema_id, &cell_id, "fragment", 1);
+    chunks.write_cell(&mut sidecar_cell).unwrap();
+    assert_eq!(
+        chunks.list[0].statistics.changes.load(Ordering::Relaxed),
+        0,
+        "internal sparse sidecar writes should not arm chunk statistics refresh"
+    );
+
+    let mut updated_sidecar_cell = create_test_cell(sidecar_schema_id, &cell_id, "fragment", 2);
+    chunks.update_cell(&mut updated_sidecar_cell).unwrap();
+    assert_eq!(
+        chunks.list[0].statistics.changes.load(Ordering::Relaxed),
+        0,
+        "internal sparse sidecar updates should not accumulate stats refresh changes"
+    );
+}
+
+#[test]
+pub fn sparse_sidecar_system_cells_do_not_build_chunk_statistics_when_forced() {
+    let _ = env_logger::try_init();
+    let sidecar_schema_id = 0xF015;
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(Schema::new_with_id(
+        sidecar_schema_id,
+        "_sys_sparse_sidecar_matrix_fragments",
+        None,
+        default_fields(),
+        false,
+        false,
+    ));
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    for offset in 0..16 {
+        let cell_id = Id::new(100, 1 + offset);
+        let mut sidecar_cell =
+            create_test_cell(sidecar_schema_id, &cell_id, "fragment", offset as u64);
+        chunks.write_cell(&mut sidecar_cell).unwrap();
+    }
+
+    chunks.ensure_statistics();
+
+    assert!(
+        chunks.all_chunk_statistics(sidecar_schema_id)[0].is_none(),
+        "forced statistics rebuild should skip internal sparse sidecar schemas"
     );
 }
 

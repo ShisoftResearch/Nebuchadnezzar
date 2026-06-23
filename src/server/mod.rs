@@ -13,7 +13,7 @@ use bifrost::raft::disk::DiskOptions;
 use bifrost::raft::state_machine::master as sm_master;
 use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use bifrost::rpc::{self, ClientPool};
-use bifrost::rpc::{RPCClient, RPCError, Server};
+use bifrost::rpc::{RPCClient, RPCError, Server, ServiceClient};
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
@@ -43,6 +43,16 @@ pub mod transactions;
 pub use status::{ChunkMemoryStatus, ServerMemoryStatus};
 
 pub static CONS_HASH_ID: u64 = hash_ident!(NEB_CONSHASH_MEM_WEIGHTS) as u64;
+const META_CLUSTER_JOIN_MAX_RETRIES: usize = 100;
+const META_CLUSTER_JOIN_RETRY_DELAY_MS: u64 = 100;
+const CLUSTER_GROUP_JOIN_MAX_RETRIES: usize = 100;
+const CLUSTER_GROUP_JOIN_RETRY_DELAY_MS: u64 = 100;
+const DATABASE_SCOPED_CELL_RPC_READY_MAX_RETRIES: usize = 100;
+const DATABASE_SCOPED_CELL_RPC_READY_DELAY_MS: u64 = 100;
+const LOCAL_SCHEMA_CACHE_INIT_MAX_RETRIES: usize = 100;
+const LOCAL_SCHEMA_CACHE_INIT_RETRY_DELAY_MS: u64 = 100;
+const META_PLANE_BOOTSTRAP_MAX_RETRIES: usize = 100;
+const META_PLANE_BOOTSTRAP_RETRY_DELAY_MS: u64 = 100;
 
 fn has_recoverable_raft_state_at(raft_path: &Path) -> bool {
     let log_file = raft_path.join("log.dat");
@@ -65,6 +75,88 @@ fn has_existing_raft_state(raft_storage: &Option<String>) -> bool {
     } else {
         false
     }
+}
+
+fn configured_cluster_members(server_addr: &str, meta_members: &[String]) -> Vec<String> {
+    let mut members = meta_members.iter().cloned().collect::<HashSet<_>>();
+    members.insert(server_addr.to_string());
+    let mut members = members.into_iter().collect::<Vec<_>>();
+    members.sort();
+    members
+}
+
+fn routed_cluster_members(
+    server_addr: &str,
+    meta_members: &[String],
+    conshash: &ConsistentHashing,
+) -> Vec<String> {
+    configured_cluster_members(server_addr, meta_members)
+        .into_iter()
+        .filter(|member| {
+            conshash
+                .to_server_name_option(Some(hash_str(member)))
+                .as_ref()
+                == Some(member)
+        })
+        .collect()
+}
+
+async fn wait_for_scoped_cell_rpc_services(
+    server_addr: &str,
+    meta_members: &[String],
+    conshash: &ConsistentHashing,
+    group_name: &str,
+    database_name: &str,
+) -> Result<(), ServerError> {
+    let members = routed_cluster_members(server_addr, meta_members, conshash);
+    if members.len() <= 1 {
+        return Ok(());
+    }
+
+    let service_id = cell_rpc::generate_scoped_service_id(group_name, database_name);
+    let mut last_unavailable = Vec::new();
+
+    for attempt in 0..DATABASE_SCOPED_CELL_RPC_READY_MAX_RETRIES {
+        let mut unavailable = Vec::new();
+
+        for member in &members {
+            if member == server_addr {
+                continue;
+            }
+
+            let rpc_client = match DEFAULT_CLIENT_POOL.get(member).await {
+                Ok(client) => client,
+                Err(error) => {
+                    unavailable.push(format!("{member}: connect failed: {error:?}"));
+                    continue;
+                }
+            };
+            let cell_client =
+                cell_rpc::AsyncServiceClient::new_with_service_id(service_id, &rpc_client);
+
+            if let Err(error) = cell_client.count().await {
+                unavailable.push(format!("{member}: {error:?}"));
+            }
+        }
+
+        if unavailable.is_empty() {
+            return Ok(());
+        }
+
+        last_unavailable = unavailable;
+        if attempt + 1 < DATABASE_SCOPED_CELL_RPC_READY_MAX_RETRIES {
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                DATABASE_SCOPED_CELL_RPC_READY_DELAY_MS,
+            ))
+            .await;
+        }
+    }
+
+    Err(ServerError::CannotInitializeDatabaseServices(format!(
+        "database-scoped cell RPC service {service_id} for {group_name}/{database_name} did not become ready on configured members {:?}; last_unavailable={:?}",
+        members,
+        last_unavailable
+    )))
 }
 
 fn discover_known_databases_from_raft_storage(
@@ -172,23 +264,172 @@ pub fn database_meta_plane_seed_nodes(server_addr: &str, seed_nodes: &[String]) 
     nodes
 }
 
+fn canonical_member_addresses(mut members: Vec<String>) -> Vec<String> {
+    members.sort();
+    members.dedup();
+    members
+}
+
+fn includes_all_members(discovered: &[String], expected: &[String]) -> bool {
+    expected
+        .iter()
+        .all(|member| discovered.iter().any(|known| known == member))
+}
+
+async fn ensure_type2_meta_plane(
+    raft_service: &Arc<raft::RaftService>,
+    raft_client: &Arc<RaftClient>,
+    server_addr: &str,
+    meta_members: &[String],
+    plane_id: raft::PlaneId,
+    plane_label: &str,
+) -> Result<raft::PlaneHandle, String> {
+    let requested_seed_nodes =
+        canonical_member_addresses(database_meta_plane_seed_nodes(server_addr, meta_members));
+    let type1_members = raft_client
+        .root_member_addresses()
+        .await
+        .map(canonical_member_addresses)
+        .unwrap_or_else(|_| vec![server_addr.to_string()]);
+    let requested_members = canonical_member_addresses(
+        requested_seed_nodes
+            .into_iter()
+            .filter(|member| type1_members.iter().any(|known| known == member))
+            .collect(),
+    );
+    let mut last_transient_error = None;
+
+    for attempt in 0..META_PLANE_BOOTSTRAP_MAX_RETRIES {
+        let plane = match raft_service
+            .ensure_plane(raft::PlaneSpec { plane_id })
+            .await
+        {
+            Ok(plane) => plane,
+            Err(error) => {
+                last_transient_error = Some(format!(
+                    "failed to materialize local plane runtime: {error}"
+                ));
+                if attempt + 1 < META_PLANE_BOOTSTRAP_MAX_RETRIES {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                    continue;
+                }
+                break;
+            }
+        };
+        let current_members = match plane.member_addresses().await {
+            Ok(members) => canonical_member_addresses(members),
+            Err(error) => {
+                last_transient_error = Some(format!("failed to read plane membership: {error:?}"));
+                if attempt + 1 < META_PLANE_BOOTSTRAP_MAX_RETRIES {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                    continue;
+                }
+                break;
+            }
+        };
+        if current_members.iter().any(|member| {
+            !requested_members
+                .iter()
+                .any(|requested| requested == member)
+        }) {
+            return Err(format!(
+                "{plane_label} membership conflict: current={current_members:?}, requested={requested_members:?}"
+            ));
+        }
+
+        let has_missing_members = requested_members
+            .iter()
+            .any(|member| !current_members.iter().any(|current| current == member));
+        let mut add_error = None;
+        if has_missing_members {
+            for member in &requested_members {
+                let add_result = plane.add_member(member.clone()).await;
+                match add_result {
+                    Ok(added) => {
+                        if !added && !current_members.iter().any(|current| current == member) {
+                            add_error = Some(format!(
+                                "failed to add {member} to {plane_label} membership: target was rejected or not reachable"
+                            ));
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        add_error = Some(format!(
+                            "failed to add {member} to {plane_label} membership: {error:?}"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = add_error {
+            last_transient_error = Some(error);
+            if attempt + 1 < META_PLANE_BOOTSTRAP_MAX_RETRIES {
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                ))
+                .await;
+                continue;
+            }
+            break;
+        }
+
+        match plane.member_addresses().await {
+            Ok(members) => {
+                let members = canonical_member_addresses(members);
+                if includes_all_members(&members, &requested_members) {
+                    return Ok(plane);
+                }
+                last_transient_error = Some(format!(
+                    "{plane_label} membership did not converge: current={members:?}, requested={requested_members:?}"
+                ));
+            }
+            Err(error) => {
+                last_transient_error = Some(format!(
+                    "failed to verify {plane_label} membership: {error:?}"
+                ));
+            }
+        }
+
+        if attempt + 1 < META_PLANE_BOOTSTRAP_MAX_RETRIES {
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+            ))
+            .await;
+        }
+    }
+
+    Err(last_transient_error.unwrap_or_else(|| "unknown transient bootstrap error".to_string()))
+}
+
 async fn ensure_shared_meta_plane(
     raft_service: &Arc<raft::RaftService>,
+    raft_client: &Arc<RaftClient>,
     server_addr: &str,
     meta_members: &[String],
     group_name: &str,
 ) -> Result<raft::PlaneHandle, ServerError> {
-    raft_service
-        .ensure_plane_from_seeds(raft::PlaneBootstrap {
-            plane_id: shared_meta_plane_id(group_name),
-            seed_nodes: database_meta_plane_seed_nodes(server_addr, meta_members),
-        })
-        .await
-        .map_err(|e| {
-            ServerError::CannotInitializeSharedPlane(format!(
-                "failed to ensure shared meta plane for {group_name}: {e}"
-            ))
-        })
+    ensure_type2_meta_plane(
+        raft_service,
+        raft_client,
+        server_addr,
+        meta_members,
+        shared_meta_plane_id(group_name),
+        "shared meta plane",
+    )
+    .await
+    .map_err(|e| {
+        ServerError::CannotInitializeSharedPlane(format!(
+            "failed to ensure shared meta plane for {group_name}: {e}"
+        ))
+    })
 }
 
 async fn register_shared_state_machines_on_plane(
@@ -202,22 +443,26 @@ async fn register_shared_state_machines_on_plane(
 
 async fn ensure_database_meta_plane(
     raft_service: &Arc<raft::RaftService>,
+    raft_client: &Arc<RaftClient>,
     server_addr: &str,
     meta_members: &[String],
     group_name: &str,
     database_name: &str,
 ) -> Result<raft::PlaneHandle, ServerError> {
-    raft_service
-        .ensure_plane_from_seeds(raft::PlaneBootstrap {
-            plane_id: database_meta_plane_id(group_name, database_name),
-            seed_nodes: database_meta_plane_seed_nodes(server_addr, meta_members),
-        })
-        .await
-        .map_err(|e| {
-            ServerError::CannotInitializeSchemaPlane(format!(
-                "failed to ensure database meta plane for {database_name}: {e}"
-            ))
-        })
+    ensure_type2_meta_plane(
+        raft_service,
+        raft_client,
+        server_addr,
+        meta_members,
+        database_meta_plane_id(group_name, database_name),
+        "database meta plane",
+    )
+    .await
+    .map_err(|e| {
+        ServerError::CannotInitializeSchemaPlane(format!(
+            "failed to ensure database meta plane for {database_name}: {e}"
+        ))
+    })
 }
 
 async fn register_schema_state_machine_on_plane(
@@ -431,7 +676,9 @@ mod startup_discovery_tests {
 #[derive(Debug)]
 pub enum ServerError {
     CannotJoinCluster,
+    CannotJoinClusterRejected(String),
     CannotJoinClusterGroup(sm_master::ExecError),
+    CannotJoinClusterGroupRejected(String),
     CannotInitMemberTable,
     CannotSetServerWeight,
     CannotInitConsistentHashTable,
@@ -439,6 +686,7 @@ pub enum ServerError {
     CannotAcquireStorageLock(String),
     CannotInitializeSharedPlane(String),
     CannotInitializeDatabaseCatalog(sm_master::ExecError),
+    CannotInitializeDatabaseServices(String),
     CannotInitializeSchemaServer(sm_master::ExecError),
     CannotInitializeSchemaPlane(String),
     StandaloneMustAlsoBeMetaServer,
@@ -448,8 +696,14 @@ impl std::fmt::Display for ServerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServerError::CannotJoinCluster => write!(f, "cannot join cluster"),
+            ServerError::CannotJoinClusterRejected(error) => {
+                write!(f, "cannot join cluster: {error}")
+            }
             ServerError::CannotJoinClusterGroup(error) => {
                 write!(f, "cannot join cluster group: {error:?}")
+            }
+            ServerError::CannotJoinClusterGroupRejected(error) => {
+                write!(f, "cannot join cluster group: {error}")
             }
             ServerError::CannotInitMemberTable => write!(f, "cannot initialize member table"),
             ServerError::CannotSetServerWeight => write!(f, "cannot set server weight"),
@@ -463,6 +717,9 @@ impl std::fmt::Display for ServerError {
             }
             ServerError::CannotInitializeDatabaseCatalog(error) => {
                 write!(f, "cannot initialize database catalog: {error:?}")
+            }
+            ServerError::CannotInitializeDatabaseServices(error) => {
+                write!(f, "cannot initialize database services: {error}")
             }
             ServerError::CannotInitializeSchemaServer(error) => {
                 write!(f, "cannot initialize schema server: {error:?}")
@@ -669,7 +926,137 @@ pub async fn init_conshash(
     }
 }
 
+fn is_meta_cluster_bootstrap_seed(server_addr: &str, meta_servers: &[String]) -> bool {
+    meta_servers
+        .first()
+        .map(|candidate| candidate == server_addr)
+        .unwrap_or(true)
+}
+
+async fn join_or_bootstrap_meta_cluster(
+    raft_service: &Arc<raft::RaftService>,
+    server_addr: &String,
+    meta_members: &Vec<String>,
+    meta_servers: &Vec<String>,
+) -> Result<(), ServerError> {
+    if meta_members.is_empty() {
+        debug!("No existing state and no other members, bootstrapping new cluster");
+        raft_service.bootstrap().await;
+        return Ok(());
+    }
+
+    let bootstrap_seed = is_meta_cluster_bootstrap_seed(server_addr, meta_servers);
+    if bootstrap_seed {
+        info!(
+            "No existing state, bootstrapping fresh meta cluster as configured seed {}",
+            server_addr
+        );
+        raft_service.bootstrap().await;
+        return Ok(());
+    }
+
+    let max_retries = META_CLUSTER_JOIN_MAX_RETRIES;
+    let mut last_error = None;
+
+    for attempt in 0..max_retries {
+        debug!(
+            "No existing state, joining cluster with members: {:?}",
+            meta_members
+        );
+        let join_result = raft_service.join(meta_members).await;
+        match join_result {
+            Ok(true) => {
+                info!(
+                    "Joined meta cluster, number of members: {}",
+                    raft_service.num_members().await
+                );
+                return Ok(());
+            }
+            Ok(false) => {
+                last_error = Some("join returned false".to_string());
+            }
+            Err(error) => {
+                last_error = Some(format!("{error:?}"));
+            }
+        }
+
+        if attempt + 1 < max_retries {
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                META_CLUSTER_JOIN_RETRY_DELAY_MS,
+            ))
+            .await;
+        }
+    }
+
+    Err(ServerError::CannotJoinClusterRejected(format!(
+        "non-seed member {server_addr:?} refused to bootstrap a fresh cluster after {max_retries} join attempts; last_error={}",
+        last_error.unwrap_or_else(|| "none".to_string())
+    )))
+}
+
+async fn join_cluster_group_with_retry(
+    member_service: &Arc<MemberService>,
+    server_addr: &String,
+    group_name: &String,
+) -> Result<(), ServerError> {
+    let mut last_error = None;
+    for attempt in 0..CLUSTER_GROUP_JOIN_MAX_RETRIES {
+        match member_service.join(server_addr).await {
+            Ok(_) => match member_service.join_group(group_name).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    last_error = Some(format!(
+                        "membership state rejected group {group_name:?} for {server_addr:?}"
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(format!("{error:?}"));
+                }
+            },
+            Err(error) => {
+                last_error = Some(format!("{error:?}"));
+            }
+        }
+
+        if attempt + 1 < CLUSTER_GROUP_JOIN_MAX_RETRIES {
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                CLUSTER_GROUP_JOIN_RETRY_DELAY_MS,
+            ))
+            .await;
+        }
+    }
+
+    Err(ServerError::CannotJoinClusterGroupRejected(format!(
+        "group {group_name:?} did not accept member {server_addr:?} after {CLUSTER_GROUP_JOIN_MAX_RETRIES} attempts; last_error={}",
+        last_error.unwrap_or_else(|| "none".to_string())
+    )))
+}
+
 impl NebServer {
+    pub async fn ensure_database_meta_plane_membership(
+        &self,
+        database_name: &str,
+    ) -> Result<(), ServerError> {
+        ensure_shared_meta_plane(
+            &self.raft_service,
+            &self.raft_client,
+            &self.rpc.address,
+            &self.meta_servers,
+            &self.group_name,
+        )
+        .await?;
+        ensure_database_meta_plane(
+            &self.raft_service,
+            &self.raft_client,
+            &self.rpc.address,
+            &self.meta_servers,
+            &self.group_name,
+            database_name,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn register_schema_state_machine(
         group_name: &str,
         database_name: &str,
@@ -707,10 +1094,17 @@ impl NebServer {
         register_schema_state_machine: bool,
         pre_acquired_storage_locks: Option<Arc<StorageDirectoryLocks>>,
     ) -> Result<Arc<DatabaseRuntime>, ServerError> {
-        let _shared_meta_plane =
-            ensure_shared_meta_plane(raft_service, server_addr, meta_members, group_name).await?;
+        let _shared_meta_plane = ensure_shared_meta_plane(
+            raft_service,
+            raft_client,
+            server_addr,
+            meta_members,
+            group_name,
+        )
+        .await?;
         let schema_plane = ensure_database_meta_plane(
             raft_service,
+            raft_client,
             server_addr,
             meta_members,
             group_name,
@@ -745,10 +1139,33 @@ impl NebServer {
 
         let schema_plane_client =
             raft_client.plane(database_meta_plane_id(group_name, database_name));
-        let schemas =
-            LocalSchemasCache::new_for_database(group_name, database_name, &schema_plane_client)
+        let mut last_schema_cache_error = None;
+        let schemas = 'schema_cache: loop {
+            for attempt in 0..LOCAL_SCHEMA_CACHE_INIT_MAX_RETRIES {
+                match LocalSchemasCache::new_for_database(
+                    group_name,
+                    database_name,
+                    &schema_plane_client,
+                )
                 .await
-                .unwrap();
+                {
+                    Ok(schemas) => break 'schema_cache schemas,
+                    Err(error) => {
+                        last_schema_cache_error = Some(format!("{error:?}"));
+                        if attempt + 1 < LOCAL_SCHEMA_CACHE_INIT_MAX_RETRIES {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                LOCAL_SCHEMA_CACHE_INIT_RETRY_DELAY_MS,
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            }
+            return Err(ServerError::CannotInitializeSchemaPlane(format!(
+                "failed to initialize local schema cache for {group_name}/{database_name}: {}",
+                last_schema_cache_error.unwrap_or_else(|| "unknown error".to_string())
+            )));
+        };
         let meta_rc = Arc::new(ServerMeta { schemas });
         let neb_client = Arc::new(
             client::AsyncClient::new_for_database(
@@ -908,7 +1325,7 @@ impl NebServer {
                         database_runtime.clone(),
                         database_runtime.neb_client.clone(),
                     )
-                    .await
+                    .await;
                 }
                 Service::Transaction | Service::HashIndexer => {
                     init_txn_data_site_service(
@@ -919,6 +1336,14 @@ impl NebServer {
                     .await
                 }
                 Service::RangedIndexer => {
+                    wait_for_scoped_cell_rpc_services(
+                        server_addr,
+                        meta_members,
+                        conshasing,
+                        group_name,
+                        database_name,
+                    )
+                    .await?;
                     let tree_path = effective_opts
                         .raft_storage
                         .as_ref()
@@ -1541,32 +1966,9 @@ impl NebServer {
                 );
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
-        } else if meta_members.is_empty() {
-            // Fresh start, no other members - bootstrap a new cluster
-            debug!("No existing state and no other members, bootstrapping new cluster");
-            raft_service.bootstrap().await;
         } else {
-            // Fresh start with other members - join the cluster
-            debug!(
-                "No existing state, joining cluster with members: {:?}",
-                &meta_members
-            );
-            match raft_service.join(&meta_members).await {
-                Err(sm_master::ExecError::CannotConstructClient) => {
-                    info!("Cannot join meta cluster, will bootstrap one.");
-                    raft_service.bootstrap().await;
-                }
-                Ok(true) => {
-                    info!(
-                        "Joined meta cluster, number of members: {}",
-                        raft_service.num_members().await
-                    );
-                }
-                e => {
-                    error!("Cannot join into cluster: {:?}", e);
-                    return Err(ServerError::CannotJoinCluster);
-                }
-            }
+            join_or_bootstrap_meta_cluster(&raft_service, server_addr, &meta_members, meta_servers)
+                .await?;
         }
         debug!("Joined with members, membership service already started before Raft start");
         debug!("Starting raft client");
@@ -1582,10 +1984,7 @@ impl NebServer {
         debug!("Starting member service");
         let member_service = MemberService::new(server_addr, &raft_client, &raft_service).await;
         debug!("Member join group: {}", group_name);
-        member_service
-            .join_group(group_name)
-            .await
-            .map_err(ServerError::CannotJoinClusterGroup)?;
+        join_cluster_group_with_retry(&member_service, server_addr, group_name).await?;
         let membership_client = Arc::new(ObserverClient::new(&raft_client));
         debug!("Creating neb server");
         NebServer::new(

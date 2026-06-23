@@ -337,8 +337,7 @@ pub async fn multi_cell_update() {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn read_all_cells_selected_returns_requested_fields_in_input_order() {
     let _ = env_logger::try_init();
-    let (_server, client) =
-        schema_validation_context("read_all_cells_selected_test", 5412).await;
+    let (_server, client) = schema_validation_context("read_all_cells_selected_test", 5412).await;
 
     let schema = Schema::new_with_id(
         1,
@@ -359,7 +358,11 @@ pub async fn read_all_cells_selected_returns_requested_fields_in_input_order() {
         OwnedValue::String(String::from("First")),
     );
     let first_cell = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(first));
-    client.write_cell(first_cell.clone()).await.unwrap().unwrap();
+    client
+        .write_cell(first_cell.clone())
+        .await
+        .unwrap()
+        .unwrap();
 
     let mut second = OwnedMap::new();
     second.insert(&String::from("id"), OwnedValue::I64(2));
@@ -369,7 +372,11 @@ pub async fn read_all_cells_selected_returns_requested_fields_in_input_order() {
         OwnedValue::String(String::from("Second")),
     );
     let second_cell = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(second));
-    client.write_cell(second_cell.clone()).await.unwrap().unwrap();
+    client
+        .write_cell(second_cell.clone())
+        .await
+        .unwrap()
+        .unwrap();
 
     let selected = client
         .read_all_cells_selected(
@@ -381,12 +388,25 @@ pub async fn read_all_cells_selected_returns_requested_fields_in_input_order() {
         .unwrap();
 
     let second_selected = selected[0].as_ref().expect("second cell should read");
-    assert_eq!(second_selected.data.uni_array().unwrap()[0].u64(), Some(&20));
-    assert_eq!(second_selected.data.uni_array().unwrap()[1].string().unwrap(), "Second");
+    assert_eq!(
+        second_selected.data.uni_array().unwrap()[0].u64(),
+        Some(&20)
+    );
+    assert_eq!(
+        second_selected.data.uni_array().unwrap()[1]
+            .string()
+            .unwrap(),
+        "Second"
+    );
 
     let first_selected = selected[1].as_ref().expect("first cell should read");
     assert_eq!(first_selected.data.uni_array().unwrap()[0].u64(), Some(&10));
-    assert_eq!(first_selected.data.uni_array().unwrap()[1].string().unwrap(), "First");
+    assert_eq!(
+        first_selected.data.uni_array().unwrap()[1]
+            .string()
+            .unwrap(),
+        "First"
+    );
 }
 
 fn schema_validation_server_options() -> ServerOptions {

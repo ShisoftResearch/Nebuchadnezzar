@@ -1,5 +1,6 @@
-use crate::index::ranged::tree::tree::RANGED_TREE_SCHEMA_ID;
-use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
+use crate::query::statistics::{
+    merge_statistics, schema_tracks_statistics, ChunkStatistics, SchemaStatistics,
+};
 use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::LocalSchemasCache;
@@ -174,13 +175,8 @@ pub struct Chunk {
 
 impl Chunk {
     #[inline]
-    fn schema_tracks_statistics(schema_id: u32) -> bool {
-        schema_id != *RANGED_TREE_SCHEMA_ID
-    }
-
-    #[inline]
     fn refresh_statistics_for_schema(&self, schema_id: u32) {
-        if Self::schema_tracks_statistics(schema_id) {
+        if schema_tracks_statistics(schema_id) {
             self.refresh_statistics();
         }
     }

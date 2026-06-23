@@ -320,25 +320,53 @@ impl AsyncClient {
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
-        client.write_cell(cell).await
+        match client.write_cell(cell.clone()).await? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client.write_cell(cell).await
+            }
+            other => Ok(other),
+        }
     }
     pub async fn update_cell(
         &self,
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
-        client.update_cell(cell).await
+        match client.update_cell(cell.clone()).await? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client.update_cell(cell).await
+            }
+            other => Ok(other),
+        }
     }
     pub async fn upsert_cell(
         &self,
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
-        client.upsert_cell(cell).await
+        match client.upsert_cell(cell.clone()).await? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client.upsert_cell(cell).await
+            }
+            other => Ok(other),
+        }
     }
     pub async fn remove_cell(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
-        client.remove_cell(id).await
+        match client.remove_cell(id).await? {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client.remove_cell(id).await
+            }
+            other => Ok(other),
+        }
     }
     pub async fn count(&self) -> Result<u64, RPCError> {
         let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
@@ -362,9 +390,19 @@ impl AsyncClient {
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
-        client
-            .compare_version_and_update_cell(id, version, cell)
-            .await
+        match client
+            .compare_version_and_update_cell(id, version, cell.clone())
+            .await?
+        {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client
+                    .compare_version_and_update_cell(id, version, cell)
+                    .await
+            }
+            other => Ok(other),
+        }
     }
     pub async fn compare_version_and_set_field(
         &self,
@@ -374,9 +412,19 @@ impl AsyncClient {
         value: OwnedValue,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
-        client
-            .compare_version_and_set_field(id, version, field, value)
-            .await
+        match client
+            .compare_version_and_set_field(id, version, field, value.clone())
+            .await?
+        {
+            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                    .await?;
+                client
+                    .compare_version_and_set_field(id, version, field, value)
+                    .await
+            }
+            other => Ok(other),
+        }
     }
     pub async fn head_cell(&self, id: Id) -> Result<Result<CellHeader, ReadError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
@@ -650,6 +698,25 @@ impl AsyncClient {
             self.group_name(),
             self.database_name(),
         )
+    }
+}
+
+impl AsyncClient {
+    async fn refresh_owner_schema_cache_for_retry(
+        &self,
+        client: &Arc<plain_server::AsyncServiceClient>,
+        schema_id: u32,
+    ) -> Result<(), RPCError> {
+        match client.post_schema_add(schema_id).await? {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                warn!(
+                    "Schema cache refresh before write retry failed for schema {}: {}",
+                    schema_id, error
+                );
+                Ok(())
+            }
+        }
     }
 }
 

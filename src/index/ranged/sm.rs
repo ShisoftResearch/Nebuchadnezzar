@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const DEFAULT_SM_ID: u64 = hash_ident!("RANGED_INDEX_SM_ID") as u64;
+const LOCAL_TREE_ID_SELECTION_MAX_ATTEMPTS: usize = 10_000;
 
 pub fn generate_scoped_sm_id(group_name: &str, database_name: &str) -> u64 {
     if group_name == database_name {
@@ -274,7 +275,15 @@ impl MasterTreeSM {
             return true;
         }
 
-        let genesis_id = Id::rand();
+        let Some(genesis_id) = self.local_tree_id() else {
+            error!(
+                "Failed to select local genesis ranged tree id for server {} after {} attempts; conshash server_count={}",
+                self.raft_svr.get_server_id(),
+                LOCAL_TREE_ID_SELECTION_MAX_ATTEMPTS,
+                self.conshash.server_count()
+            );
+            return false;
+        };
         self.tree
             .insert(min_entry_key(), TreePlacement::new(genesis_id));
 
@@ -393,6 +402,18 @@ impl MasterTreeSM {
 
         Ok(())
     }
+
+    fn local_tree_id(&self) -> Option<Id> {
+        let local_server_id = self.raft_svr.get_server_id();
+        for _ in 0..LOCAL_TREE_ID_SELECTION_MAX_ATTEMPTS {
+            let id = Id::rand();
+            if self.conshash.get_server_id_by(&id) == Some(local_server_id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     async fn load_sub_tree(&mut self, id: Id, lower: &EntryKey, upper: &EntryKey, epoch: u64) {
         if self.is_plane_leader().await {
             // Only the leader can initiate the request to load the sub tree

@@ -13,6 +13,7 @@ use std::{
 
 use dovahkiin::types::{Map, SharedValue};
 
+use crate::index::ranged::tree::{btree::PAGE_SCHEMA_ID, tree::RANGED_TREE_SCHEMA_ID};
 use crate::ram::{
     cell::{header_from_chunk_raw, select_from_chunk_raw},
     chunk::Chunk,
@@ -43,9 +44,19 @@ const HISTOGRAM_PARTITATION_KEYS: usize = HISTOGRAM_PARTITATION_BUCKETS + 1;
 const HISTOGRAM_TARGET_BUCKETS: usize = HISTOGRAM_PARTITATION_BUCKETS;
 const HISTOGRAM_TARGET_KEYS: usize = HISTOGRAM_TARGET_BUCKETS + 1;
 const REFRESH_CHANGES_THRESHOLD: u32 = 512;
+const MORPHEUS_SPARSE_SIDECAR_SCHEMA_ID_START: u32 = 0xF010;
+const MORPHEUS_SPARSE_SIDECAR_SCHEMA_ID_END: u32 = 0xF017;
 
 type HistogramKey = [u8; 8];
 type TargetHistogram = [HistogramKey; HISTOGRAM_TARGET_KEYS];
+
+#[inline]
+pub fn schema_tracks_statistics(schema_id: u32) -> bool {
+    schema_id != *RANGED_TREE_SCHEMA_ID
+        && schema_id != *PAGE_SCHEMA_ID
+        && !(MORPHEUS_SPARSE_SIDECAR_SCHEMA_ID_START..=MORPHEUS_SPARSE_SIDECAR_SCHEMA_ID_END)
+            .contains(&schema_id)
+}
 
 impl ChunkStatistics {
     pub fn new() -> Self {
@@ -224,6 +235,9 @@ fn build_partitation_statistics(
                 let cell_size = entry_hdr.content_length as usize;
                 let cell_seg = chunk.allocator.id_by_addr(loc);
                 let schema_id = header.schema;
+                if !schema_tracks_statistics(schema_id) {
+                    continue;
+                }
                 if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
                     // Filter out fields that only have Fulltext or Vector indices
                     // as these don't support feature() for histogram building
