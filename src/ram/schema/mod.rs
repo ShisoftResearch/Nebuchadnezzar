@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::mem;
 
 use crate::index::embedding::EmbeddingModel;
-use crate::index::vector::VectorIndexConfig;
+use crate::index::vector::{VectorIndexConfig, VectorIndexEngine};
 use crate::ram::io::align_address;
 use crate::server::DatabaseRuntime;
 use crate::utils::thread_id;
@@ -849,11 +849,20 @@ pub async fn post_schema_add(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
+                    let hnsw_config = match config.engine {
+                        VectorIndexEngine::Hnsw(hnsw_config) => hnsw_config,
+                        VectorIndexEngine::Cagra(_) => {
+                            return Err(
+                                "CAGRA vector indexes are not supported by neb runtime yet"
+                                    .to_string(),
+                            );
+                        }
+                    };
                     if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
-                            .new_index_with_config(schema_id, field_id, config.hnsw)
+                            .new_index_with_config(schema_id, field_id, hnsw_config)
                             .await
                             .map_err(|e| format!("Error creating vector index: {:?}", e))?;
                     } else {
@@ -882,11 +891,20 @@ pub async fn post_schema_add(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
+                    let hnsw_config = match config.engine {
+                        VectorIndexEngine::Hnsw(hnsw_config) => hnsw_config,
+                        VectorIndexEngine::Cagra(_) => {
+                            return Err(
+                                "CAGRA vector indexes are not supported by neb runtime yet"
+                                    .to_string(),
+                            );
+                        }
+                    };
                     if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .vector_client
-                            .new_index_with_config(schema_id, field_id, config.hnsw)
+                            .new_index_with_config(schema_id, field_id, hnsw_config)
                             .await
                             .map_err(|e| format!("Error creating vector index: {:?}", e))?;
                     } else {

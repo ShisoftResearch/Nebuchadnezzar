@@ -478,8 +478,9 @@ async fn expect_invalid_schema_registration(
 }
 
 fn cosine_vector_index() -> IndexType {
-    IndexType::Vector(crate::index::vector::VectorIndexConfig::new(
+    IndexType::Vector(crate::index::vector::VectorIndexConfig::hnsw(
         crate::index::vector::MetricEncoding::Cosine,
+        crate::index::vector::HnswConfig::default(),
     ))
 }
 

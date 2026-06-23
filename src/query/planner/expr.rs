@@ -1522,7 +1522,10 @@ mod tests {
     use dovahkiin::types::{OwnedPrimArray, OwnedValue, Type};
 
     use crate::{
-        index::{embedding::EmbeddingModel, vector::MetricEncoding, vector::VectorIndexConfig},
+        index::{
+            embedding::EmbeddingModel,
+            vector::{HnswConfig, MetricEncoding, VectorIndexConfig},
+        },
         ram::schema::{Field, IndexType, Schema},
     };
 
@@ -1761,8 +1764,9 @@ mod tests {
             Field::new_schema(vec![Field::new_indexed(
                 field,
                 Type::String,
-                vec![IndexType::Vector(VectorIndexConfig::new(
+                vec![IndexType::Vector(VectorIndexConfig::hnsw(
                     MetricEncoding::Cosine,
+                    HnswConfig::default(),
                 ))],
             )]),
             false,
@@ -1871,8 +1875,9 @@ mod tests {
             Field::new_schema(vec![Field::new_indexed(
                 field,
                 Type::String,
-                vec![IndexType::Vector(VectorIndexConfig::new(
+                vec![IndexType::Vector(VectorIndexConfig::hnsw(
                     MetricEncoding::Cosine,
+                    HnswConfig::default(),
                 ))],
             )]),
             false,

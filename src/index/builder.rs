@@ -7,7 +7,7 @@ use crate::index::embedding::EmbeddingModel;
 use crate::index::full_text::{
     build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
-use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
+use crate::index::vector::{VectorIndexConfig, VectorIndexEngine};
 use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
 use crate::ram::types::{hash_indexable_owned_value, Id, OwnedValue};
 use crate::ram::{
@@ -151,8 +151,7 @@ pub struct VectorIndexMeta {
     cell_id: Id,
     schema_id: u32,
     field_id: u64,
-    metric_encoding: MetricEncoding,
-    hnsw_config: HnswConfig,
+    config: VectorIndexConfig,
 }
 
 /// Metadata for embedding index operations.
@@ -248,18 +247,25 @@ impl IndexMeta {
                     .await
                     .map_err(|e| IndexError::WriteError(e))?;
             }
-            &IndexMeta::Vector(ref meta) => {
-                indexers
-                    .vector_client
-                    .insert(
-                        &meta.cell_id,
-                        meta.schema_id,
-                        meta.field_id,
-                        meta.metric_encoding,
-                        meta.hnsw_config,
-                    )
-                    .await?;
-            }
+            &IndexMeta::Vector(ref meta) => match meta.config.engine {
+                VectorIndexEngine::Hnsw(hnsw_config) => {
+                    indexers
+                        .vector_client
+                        .insert(
+                            &meta.cell_id,
+                            meta.schema_id,
+                            meta.field_id,
+                            meta.config.metric,
+                            hnsw_config,
+                        )
+                        .await?;
+                }
+                VectorIndexEngine::Cagra(_) => {
+                    return Err(IndexError::Other(
+                        "CAGRA vector indexes are not supported by neb runtime yet".to_string(),
+                    ));
+                }
+            },
             &IndexMeta::FullText(ref meta) => {
                 if let Some(indexer) = indexers.fulltext_indexer() {
                     // Write posting lists to Chunk (synchronous)
@@ -850,8 +856,7 @@ where
                             cell_id,
                             schema_id,
                             field_id,
-                            metric_encoding: config.metric,
-                            hnsw_config: config.hnsw,
+                            config,
                         }));
                     }
                 }

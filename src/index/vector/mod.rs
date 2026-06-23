@@ -67,23 +67,60 @@ impl Default for HnswConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum CagraBuildAlgo {
+    Auto,
+    BruteForceKnn,
+    NnDescent,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct CagraConfig {
+    pub graph_degree: u16,
+    pub intermediate_graph_degree: u16,
+    pub delta_graph_degree: u16,
+    pub max_delta_rows: u32,
+    pub build_algo: CagraBuildAlgo,
+}
+
+impl Default for CagraConfig {
+    fn default() -> Self {
+        Self {
+            graph_degree: 64,
+            intermediate_graph_degree: 128,
+            delta_graph_degree: 32,
+            max_delta_rows: 50_000,
+            build_algo: CagraBuildAlgo::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum VectorIndexEngine {
+    Hnsw(HnswConfig),
+    Cagra(CagraConfig),
+}
+
 /// Vector index configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct VectorIndexConfig {
     pub metric: MetricEncoding,
-    pub hnsw: HnswConfig,
+    pub engine: VectorIndexEngine,
 }
 
 impl VectorIndexConfig {
-    pub fn new(metric: MetricEncoding) -> Self {
+    pub fn hnsw(metric: MetricEncoding, hnsw: HnswConfig) -> Self {
         Self {
             metric,
-            hnsw: HnswConfig::default(),
+            engine: VectorIndexEngine::Hnsw(hnsw),
         }
     }
 
-    pub fn with_hnsw(metric: MetricEncoding, hnsw: HnswConfig) -> Self {
-        Self { metric, hnsw }
+    pub fn cagra(metric: MetricEncoding, cagra: CagraConfig) -> Self {
+        Self {
+            metric,
+            engine: VectorIndexEngine::Cagra(cagra),
+        }
     }
 }
 
@@ -352,5 +389,42 @@ impl VectorIndexClient {
 impl Default for VectorIndexClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hnsw_vector_config_uses_explicit_engine() {
+        let hnsw = HnswConfig {
+            m: 32,
+            ef_construction: 512,
+            ef_search_default: 400,
+            diversity_factor: 0.7,
+        };
+        let config = VectorIndexConfig::hnsw(MetricEncoding::L2, hnsw);
+
+        assert_eq!(config.metric, MetricEncoding::L2);
+        assert_eq!(config.engine, VectorIndexEngine::Hnsw(hnsw));
+    }
+
+    #[test]
+    fn cagra_vector_config_round_trips_through_serde() {
+        let cagra = CagraConfig {
+            graph_degree: 64,
+            intermediate_graph_degree: 128,
+            delta_graph_degree: 32,
+            max_delta_rows: 50_000,
+            build_algo: CagraBuildAlgo::Auto,
+        };
+        let config = VectorIndexConfig::cagra(MetricEncoding::L2, cagra);
+
+        let encoded = serde_json::to_string(&config).expect("config should encode");
+        let decoded: VectorIndexConfig =
+            serde_json::from_str(&encoded).expect("config should decode");
+
+        assert_eq!(decoded, config);
     }
 }
