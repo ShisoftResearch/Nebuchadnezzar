@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::mem;
 
 use crate::index::embedding::EmbeddingModel;
-use crate::index::vector::{VectorIndexConfig, VectorIndexEngine};
+use crate::index::vector::{HnswConfig, VectorIndexConfig, VectorIndexEngine};
 use crate::ram::io::align_address;
 use crate::server::DatabaseRuntime;
 use crate::utils::thread_id;
@@ -849,24 +849,17 @@ pub async fn post_schema_add(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    let hnsw_config = match config.engine {
-                        VectorIndexEngine::Hnsw(hnsw_config) => hnsw_config,
-                        VectorIndexEngine::Cagra(_) => {
-                            return Err(
-                                "CAGRA vector indexes are not supported by neb runtime yet"
-                                    .to_string(),
-                            );
+                    if let Some(hnsw_config) = hnsw_runtime_config(*config) {
+                        if let Some(indexer) = database_runtime.indexer() {
+                            let _ = indexer
+                                .clients
+                                .vector_client
+                                .new_index_with_config(schema_id, field_id, hnsw_config)
+                                .await
+                                .map_err(|e| format!("Error creating vector index: {:?}", e))?;
+                        } else {
+                            return Err(format!("Indexing not enabled"));
                         }
-                    };
-                    if let Some(indexer) = database_runtime.indexer() {
-                        let _ = indexer
-                            .clients
-                            .vector_client
-                            .new_index_with_config(schema_id, field_id, hnsw_config)
-                            .await
-                            .map_err(|e| format!("Error creating vector index: {:?}", e))?;
-                    } else {
-                        return Err(format!("Indexing not enabled"));
                     }
                 }
                 IndexType::Embedding(model) => {
@@ -891,24 +884,17 @@ pub async fn post_schema_add(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    let hnsw_config = match config.engine {
-                        VectorIndexEngine::Hnsw(hnsw_config) => hnsw_config,
-                        VectorIndexEngine::Cagra(_) => {
-                            return Err(
-                                "CAGRA vector indexes are not supported by neb runtime yet"
-                                    .to_string(),
-                            );
+                    if let Some(hnsw_config) = hnsw_runtime_config(*config) {
+                        if let Some(indexer) = database_runtime.indexer() {
+                            let _ = indexer
+                                .clients
+                                .vector_client
+                                .new_index_with_config(schema_id, field_id, hnsw_config)
+                                .await
+                                .map_err(|e| format!("Error creating vector index: {:?}", e))?;
+                        } else {
+                            return Err(format!("Indexing not enabled"));
                         }
-                    };
-                    if let Some(indexer) = database_runtime.indexer() {
-                        let _ = indexer
-                            .clients
-                            .vector_client
-                            .new_index_with_config(schema_id, field_id, hnsw_config)
-                            .await
-                            .map_err(|e| format!("Error creating vector index: {:?}", e))?;
-                    } else {
-                        return Err(format!("Indexing not enabled"));
                     }
                 }
                 IndexType::Embedding(model) => {
@@ -928,6 +914,13 @@ pub async fn post_schema_add(
         }
     }
     Ok(())
+}
+
+fn hnsw_runtime_config(config: VectorIndexConfig) -> Option<HnswConfig> {
+    match config.engine {
+        VectorIndexEngine::Hnsw(hnsw_config) => Some(hnsw_config),
+        VectorIndexEngine::Cagra(_) => None,
+    }
 }
 
 pub async fn post_schema_delete(
@@ -1001,4 +994,25 @@ pub async fn post_schema_delete(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::vector::{CagraConfig, HnswConfig, MetricEncoding};
+
+    #[test]
+    fn hnsw_runtime_config_matches_engine_variant() {
+        let hnsw = HnswConfig {
+            m: 32,
+            ef_construction: 512,
+            ef_search_default: 400,
+            diversity_factor: 0.7,
+        };
+        let hnsw_config = VectorIndexConfig::hnsw(MetricEncoding::L2, hnsw);
+        let cagra_config = VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default());
+
+        assert_eq!(hnsw_runtime_config(hnsw_config), Some(hnsw));
+        assert_eq!(hnsw_runtime_config(cagra_config), None);
+    }
 }
