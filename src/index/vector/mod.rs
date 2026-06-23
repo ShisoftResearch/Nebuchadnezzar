@@ -423,6 +423,7 @@ mod tests {
             max_delta_rows: 50_000,
             build_algo: CagraBuildAlgo::Auto,
         };
+        assert_eq!(CagraConfig::default(), cagra);
         let config = VectorIndexConfig::cagra(MetricEncoding::L2, cagra);
 
         let encoded = serde_json::to_string(&config).expect("config should encode");

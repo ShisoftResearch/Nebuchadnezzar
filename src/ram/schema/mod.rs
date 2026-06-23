@@ -916,6 +916,8 @@ pub async fn post_schema_add(
     Ok(())
 }
 
+// CAGRA is schema-visible now, but Neb runtime setup and cleanup stay HNSW-only
+// until the later CAGRA engine integration wires its own hooks.
 fn hnsw_runtime_config(config: VectorIndexConfig) -> Option<HnswConfig> {
     match config.engine {
         VectorIndexEngine::Hnsw(hnsw_config) => Some(hnsw_config),
@@ -932,16 +934,18 @@ pub async fn post_schema_delete(
             let field_id = *field;
             let schema_id = schema.id;
             match index {
-                IndexType::Vector(_config) => {
-                    if let Some(indexer) = database_runtime.indexer() {
-                        let _ = indexer
-                            .clients
-                            .vector_client
-                            .delete_index(schema_id, field_id)
-                            .await
-                            .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
-                    } else {
-                        return Err(format!("Indexing not enabled"));
+                IndexType::Vector(config) => {
+                    if hnsw_runtime_config(*config).is_some() {
+                        if let Some(indexer) = database_runtime.indexer() {
+                            let _ = indexer
+                                .clients
+                                .vector_client
+                                .delete_index(schema_id, field_id)
+                                .await
+                                .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
+                        } else {
+                            return Err(format!("Indexing not enabled"));
+                        }
                     }
                 }
                 IndexType::Embedding(_model) => {
@@ -965,16 +969,18 @@ pub async fn post_schema_delete(
             let field_id = *compound_id;
             let schema_id = schema.id;
             match index {
-                IndexType::Vector(_config) => {
-                    if let Some(indexer) = database_runtime.indexer() {
-                        let _ = indexer
-                            .clients
-                            .vector_client
-                            .delete_index(schema_id, field_id)
-                            .await
-                            .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
-                    } else {
-                        return Err(format!("Indexing not enabled"));
+                IndexType::Vector(config) => {
+                    if hnsw_runtime_config(*config).is_some() {
+                        if let Some(indexer) = database_runtime.indexer() {
+                            let _ = indexer
+                                .clients
+                                .vector_client
+                                .delete_index(schema_id, field_id)
+                                .await
+                                .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
+                        } else {
+                            return Err(format!("Indexing not enabled"));
+                        }
                     }
                 }
                 IndexType::Embedding(_model) => {
@@ -1000,6 +1006,56 @@ pub async fn post_schema_delete(
 mod tests {
     use super::*;
     use crate::index::vector::{CagraConfig, HnswConfig, MetricEncoding};
+    use crate::server::{NebServer, ServerOptions, Service};
+    use dovahkiin::types::Type;
+    use std::sync::Arc;
+
+    fn post_schema_hook_server_options() -> ServerOptions {
+        ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        }
+    }
+
+    async fn post_schema_hook_server(server_group: &str, port: u16) -> Arc<NebServer> {
+        let server_addr = format!("127.0.0.1:{port}");
+        NebServer::new_from_opts(
+            &post_schema_hook_server_options(),
+            &server_addr,
+            server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap()
+    }
+
+    fn cagra_vector_schema(schema_id: u32) -> Schema {
+        Schema::new_with_id(
+            schema_id,
+            "cagra_schema",
+            None,
+            Field::new_schema(vec![Field::new_indexed_vector(
+                "embedding",
+                Type::F32,
+                4,
+                vec![IndexType::Vector(VectorIndexConfig::cagra(
+                    MetricEncoding::L2,
+                    CagraConfig::default(),
+                ))],
+            )]),
+            false,
+            false,
+        )
+    }
 
     #[test]
     fn hnsw_runtime_config_matches_engine_variant() {
@@ -1014,5 +1070,19 @@ mod tests {
 
         assert_eq!(hnsw_runtime_config(hnsw_config), Some(hnsw));
         assert_eq!(hnsw_runtime_config(cagra_config), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_schema_delete_skips_cagra_runtime_cleanup() {
+        let _ = env_logger::try_init();
+        let server = post_schema_hook_server("post_schema_delete_skips_cagra_runtime_cleanup", 5481)
+            .await;
+        let schema = cagra_vector_schema(77);
+
+        post_schema_delete(&schema, &server.current_database())
+            .await
+            .expect("cagra runtime cleanup should be deferred");
+
+        server.shutdown().await;
     }
 }
