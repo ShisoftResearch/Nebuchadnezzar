@@ -135,7 +135,13 @@ pub struct VectorHit {
     pub score: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Payload-based vector insert request.
+///
+/// The default adapter preserves legacy cell-based insert behavior by forwarding
+/// only the cell identity and index configuration into `insert`, ignoring
+/// `vector`. Payload-aware vector engines should override
+/// `VectorIndexerCore::insert_vector_payload`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VectorPayloadInsert {
     pub cell_id: Id,
     pub schema_id: u32,
@@ -175,19 +181,28 @@ pub trait VectorIndexerCore: Send + Sync {
         config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
+    /// Default adapter for payload insert requests.
+    ///
+    /// This preserves the legacy cell-based insert path by forwarding
+    /// `cell_id`, `schema_id`, `field_id`, `metric`, and `config` into
+    /// `insert`, while ignoring `vector`. Engines that consume the payload
+    /// vector directly should override this method.
     fn insert_vector_payload(
         &self,
         request: VectorPayloadInsert,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
+        let VectorPayloadInsert {
+            cell_id,
+            schema_id,
+            field_id,
+            metric,
+            config,
+            vector: _,
+        } = request;
+
         Box::pin(async move {
-            self.insert(
-                &request.cell_id,
-                request.schema_id,
-                request.field_id,
-                request.metric,
-                request.config,
-            )
-            .await
+            self.insert(&cell_id, schema_id, field_id, metric, config)
+                .await
         })
     }
 
@@ -434,6 +449,88 @@ impl Default for VectorIndexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct RecordedInsertCall {
+        cell_id: Id,
+        schema_id: u32,
+        field_id: u64,
+        metric: MetricEncoding,
+        config: VectorIndexConfig,
+    }
+
+    struct RecordingVectorCore {
+        recorded_calls: Arc<Mutex<Vec<RecordedInsertCall>>>,
+    }
+
+    impl RecordingVectorCore {
+        fn new(recorded_calls: Arc<Mutex<Vec<RecordedInsertCall>>>) -> Self {
+            Self { recorded_calls }
+        }
+    }
+
+    impl VectorIndexerCore for RecordingVectorCore {
+        fn insert(
+            &self,
+            cell_id: &Id,
+            schema_id: u32,
+            field_id: u64,
+            metric_encoding: MetricEncoding,
+            config: VectorIndexConfig,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            let recorded_calls = Arc::clone(&self.recorded_calls);
+            let cell_id = *cell_id;
+
+            Box::pin(async move {
+                recorded_calls.lock().unwrap().push(RecordedInsertCall {
+                    cell_id,
+                    schema_id,
+                    field_id,
+                    metric: metric_encoding,
+                    config,
+                });
+                Ok(())
+            })
+        }
+
+        fn remove(
+            &self,
+            _cell_id: &Id,
+            _schema_id: u32,
+            _field_id: u64,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            Box::pin(async { panic!("remove should not be called in this test") })
+        }
+
+        fn search(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+            _query_vector: &[f32],
+            _limit: usize,
+            _ef_search: Option<u16>,
+        ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>> {
+            Box::pin(async { panic!("search should not be called in this test") })
+        }
+
+        fn new_index_with_config(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+            _config: VectorIndexConfig,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            Box::pin(async { panic!("new_index_with_config should not be called in this test") })
+        }
+
+        fn delete_index(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            Box::pin(async { panic!("delete_index should not be called in this test") })
+        }
+    }
 
     #[test]
     fn hnsw_vector_config_uses_explicit_engine() {
@@ -495,8 +592,61 @@ mod tests {
         assert!(matches!(config.engine, VectorIndexEngine::Cagra(_)));
     }
 
+    #[tokio::test]
+    async fn insert_vector_payload_forwards_request_fields_via_default_adapter() {
+        let recorded_calls = Arc::new(Mutex::new(Vec::new()));
+        let client = VectorIndexClient::new();
+        assert!(
+            client.set_vector_index_core(RecordingVectorCore::new(Arc::clone(&recorded_calls,)))
+        );
+
+        let request = VectorPayloadInsert {
+            cell_id: Id::new(11, 12),
+            schema_id: 13,
+            field_id: 14,
+            metric: MetricEncoding::Chebyshev,
+            config: VectorIndexConfig::cagra(
+                MetricEncoding::Manhattan,
+                CagraConfig {
+                    graph_degree: 20,
+                    intermediate_graph_degree: 40,
+                    delta_graph_degree: 10,
+                    max_delta_rows: 1234,
+                    build_algo: CagraBuildAlgo::BruteForceKnn,
+                },
+            ),
+            vector: vec![13.0, 21.0, 34.0],
+        };
+
+        client
+            .insert_vector_payload(request)
+            .await
+            .expect("payload insert should succeed");
+
+        let calls = recorded_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![RecordedInsertCall {
+                cell_id: Id::new(11, 12),
+                schema_id: 13,
+                field_id: 14,
+                metric: MetricEncoding::Chebyshev,
+                config: VectorIndexConfig::cagra(
+                    MetricEncoding::Manhattan,
+                    CagraConfig {
+                        graph_degree: 20,
+                        intermediate_graph_degree: 40,
+                        delta_graph_degree: 10,
+                        max_delta_rows: 1234,
+                        build_algo: CagraBuildAlgo::BruteForceKnn,
+                    },
+                ),
+            }]
+        );
+    }
+
     #[test]
-    fn vector_payload_mutation_request_keeps_engine_config() {
+    fn vector_payload_insert_round_trips_through_serde() {
         let request = VectorPayloadInsert {
             cell_id: Id::new(1, 2),
             schema_id: 3,
@@ -505,8 +655,10 @@ mod tests {
             config: VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default()),
             vector: vec![0.0, 1.0],
         };
+        let encoded = serde_json::to_string(&request).expect("payload should encode");
+        let decoded: VectorPayloadInsert =
+            serde_json::from_str(&encoded).expect("payload should decode");
 
-        assert!(matches!(request.config.engine, VectorIndexEngine::Cagra(_)));
-        assert_eq!(request.vector, vec![0.0, 1.0]);
+        assert_eq!(decoded, request);
     }
 }
