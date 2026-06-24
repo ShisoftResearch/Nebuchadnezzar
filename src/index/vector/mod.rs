@@ -135,6 +135,16 @@ pub struct VectorHit {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorPayloadInsert {
+    pub cell_id: Id,
+    pub schema_id: u32,
+    pub field_id: u64,
+    pub metric: MetricEncoding,
+    pub config: VectorIndexConfig,
+    pub vector: Vec<f32>,
+}
+
 /// Core trait for vector index implementations.
 ///
 /// Implementations should handle:
@@ -164,6 +174,22 @@ pub trait VectorIndexerCore: Send + Sync {
         metric_encoding: MetricEncoding,
         config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
+
+    fn insert_vector_payload(
+        &self,
+        request: VectorPayloadInsert,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
+        Box::pin(async move {
+            self.insert(
+                &request.cell_id,
+                request.schema_id,
+                request.field_id,
+                request.metric,
+                request.config,
+            )
+            .await
+        })
+    }
 
     /// Remove a vector from the index.
     ///
@@ -328,6 +354,13 @@ impl VectorIndexClient {
             .insert(cell_id, schema_id, field_id, metric_encoding, config)
     }
 
+    pub fn insert_vector_payload<'a>(
+        &'a self,
+        request: VectorPayloadInsert,
+    ) -> BoxFuture<'a, Result<(), IndexError>> {
+        self.get_vector_index_core().insert_vector_payload(request)
+    }
+
     /// Remove a vector from the index.
     pub fn remove<'a>(
         &'a self,
@@ -460,5 +493,20 @@ mod tests {
             ) -> BoxFuture<'a, Result<(), IndexError>>;
 
         assert!(matches!(config.engine, VectorIndexEngine::Cagra(_)));
+    }
+
+    #[test]
+    fn vector_payload_mutation_request_keeps_engine_config() {
+        let request = VectorPayloadInsert {
+            cell_id: Id::new(1, 2),
+            schema_id: 3,
+            field_id: 4,
+            metric: MetricEncoding::L2,
+            config: VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default()),
+            vector: vec![0.0, 1.0],
+        };
+
+        assert!(matches!(request.config.engine, VectorIndexEngine::Cagra(_)));
+        assert_eq!(request.vector, vec![0.0, 1.0]);
     }
 }
