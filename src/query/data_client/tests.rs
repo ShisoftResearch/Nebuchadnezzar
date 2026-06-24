@@ -3,7 +3,7 @@ use crate::{
     index::builder::IndexError,
     index::embedding::{EmbeddingHit, EmbeddingIndexerCore, EmbeddingModel, EmbeddingModelInfo},
     index::ranged::tree::btree::Ordering,
-    index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexerCore},
+    index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore},
     query::data_client::{
         AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateSpec,
         ProjectionField, ProjectionItem, QueryOrdering, QueryResultCursor, QueryRow, ValueRange,
@@ -49,7 +49,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
         _schema_id: u32,
         _field_id: u64,
         _metric_encoding: MetricEncoding,
-        _hnsw_config: HnswConfig,
+        _config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
     }
@@ -87,15 +87,11 @@ impl VectorIndexerCore for MockVectorIndexerCore {
         .boxed()
     }
 
-    fn new_index(&self, _schema_id: u32, _field_id: u64) -> BoxFuture<'_, Result<(), IndexError>> {
-        async { Ok(()) }.boxed()
-    }
-
     fn new_index_with_config(
         &self,
         _schema_id: u32,
         _field_id: u64,
-        _hnsw_config: HnswConfig,
+        _config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
     }

@@ -162,7 +162,7 @@ pub trait VectorIndexerCore: Send + Sync {
         schema_id: u32,
         field_id: u64,
         metric_encoding: MetricEncoding,
-        hnsw_config: HnswConfig,
+        config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
     /// Remove a vector from the index.
@@ -199,12 +199,19 @@ pub trait VectorIndexerCore: Send + Sync {
     /// Create a new vector index for a schema/field combination.
     ///
     /// Called when a new schema with vector index is created.
-    fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>>;
+    fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>> {
+        self.new_index_with_config(
+            schema_id,
+            field_id,
+            VectorIndexConfig::hnsw(MetricEncoding::L2, HnswConfig::default()),
+        )
+    }
+
     fn new_index_with_config(
         &self,
         schema_id: u32,
         field_id: u64,
-        hnsw_config: HnswConfig,
+        config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
     /// Delete a vector index for a schema/field combination.
@@ -315,15 +322,10 @@ impl VectorIndexClient {
         schema_id: u32,
         field_id: u64,
         metric_encoding: MetricEncoding,
-        hnsw_config: HnswConfig,
+        config: VectorIndexConfig,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
-        self.get_vector_index_core().insert(
-            cell_id,
-            schema_id,
-            field_id,
-            metric_encoding,
-            hnsw_config,
-        )
+        self.get_vector_index_core()
+            .insert(cell_id, schema_id, field_id, metric_encoding, config)
     }
 
     /// Remove a vector from the index.
@@ -362,17 +364,21 @@ impl VectorIndexClient {
         schema_id: u32,
         field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
-        self.get_vector_index_core().new_index(schema_id, field_id)
+        self.new_index_with_config(
+            schema_id,
+            field_id,
+            VectorIndexConfig::hnsw(MetricEncoding::L2, HnswConfig::default()),
+        )
     }
 
     pub fn new_index_with_config(
         &self,
         schema_id: u32,
         field_id: u64,
-        hnsw_config: HnswConfig,
+        config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_vector_index_core()
-            .new_index_with_config(schema_id, field_id, hnsw_config)
+            .new_index_with_config(schema_id, field_id, config)
     }
 
     /// Delete a vector index.
@@ -431,5 +437,28 @@ mod tests {
             serde_json::from_str(&encoded).expect("config should decode");
 
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn cagra_config_can_be_passed_to_client_api_types() {
+        let config = VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default());
+        let _new_index_with_config = VectorIndexClient::new_index_with_config
+            as for<'a> fn(
+                &'a VectorIndexClient,
+                u32,
+                u64,
+                VectorIndexConfig,
+            ) -> BoxFuture<'a, Result<(), IndexError>>;
+        let _insert = VectorIndexClient::insert
+            as for<'a, 'b> fn(
+                &'a VectorIndexClient,
+                &'b Id,
+                u32,
+                u64,
+                MetricEncoding,
+                VectorIndexConfig,
+            ) -> BoxFuture<'a, Result<(), IndexError>>;
+
+        assert!(matches!(config.engine, VectorIndexEngine::Cagra(_)));
     }
 }

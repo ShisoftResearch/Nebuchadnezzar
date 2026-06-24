@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::mem;
 
 use crate::index::embedding::EmbeddingModel;
-use crate::index::vector::{HnswConfig, VectorIndexConfig, VectorIndexEngine};
+use crate::index::vector::VectorIndexConfig;
 use crate::ram::io::align_address;
 use crate::server::DatabaseRuntime;
 use crate::utils::thread_id;
@@ -849,17 +849,15 @@ pub async fn post_schema_add(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    if let Some(hnsw_config) = hnsw_runtime_config(*config) {
-                        if let Some(indexer) = database_runtime.indexer() {
-                            let _ = indexer
-                                .clients
-                                .vector_client
-                                .new_index_with_config(schema_id, field_id, hnsw_config)
-                                .await
-                                .map_err(|e| format!("Error creating vector index: {:?}", e))?;
-                        } else {
-                            return Err(format!("Indexing not enabled"));
-                        }
+                    if let Some(indexer) = database_runtime.indexer() {
+                        let _ = indexer
+                            .clients
+                            .vector_client
+                            .new_index_with_config(schema_id, field_id, *config)
+                            .await
+                            .map_err(|e| format!("Error creating vector index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
                     }
                 }
                 IndexType::Embedding(model) => {
@@ -884,17 +882,15 @@ pub async fn post_schema_add(
             let schema_id = schema.id;
             match index {
                 IndexType::Vector(config) => {
-                    if let Some(hnsw_config) = hnsw_runtime_config(*config) {
-                        if let Some(indexer) = database_runtime.indexer() {
-                            let _ = indexer
-                                .clients
-                                .vector_client
-                                .new_index_with_config(schema_id, field_id, hnsw_config)
-                                .await
-                                .map_err(|e| format!("Error creating vector index: {:?}", e))?;
-                        } else {
-                            return Err(format!("Indexing not enabled"));
-                        }
+                    if let Some(indexer) = database_runtime.indexer() {
+                        let _ = indexer
+                            .clients
+                            .vector_client
+                            .new_index_with_config(schema_id, field_id, *config)
+                            .await
+                            .map_err(|e| format!("Error creating vector index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
                     }
                 }
                 IndexType::Embedding(model) => {
@@ -916,15 +912,6 @@ pub async fn post_schema_add(
     Ok(())
 }
 
-// CAGRA is schema-visible now, but Neb runtime setup and cleanup stay HNSW-only
-// until the later CAGRA engine integration wires its own hooks.
-fn hnsw_runtime_config(config: VectorIndexConfig) -> Option<HnswConfig> {
-    match config.engine {
-        VectorIndexEngine::Hnsw(hnsw_config) => Some(hnsw_config),
-        VectorIndexEngine::Cagra(_) => None,
-    }
-}
-
 pub async fn post_schema_delete(
     schema: &Schema,
     database_runtime: &Arc<DatabaseRuntime>,
@@ -934,18 +921,16 @@ pub async fn post_schema_delete(
             let field_id = *field;
             let schema_id = schema.id;
             match index {
-                IndexType::Vector(config) => {
-                    if hnsw_runtime_config(*config).is_some() {
-                        if let Some(indexer) = database_runtime.indexer() {
-                            let _ = indexer
-                                .clients
-                                .vector_client
-                                .delete_index(schema_id, field_id)
-                                .await
-                                .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
-                        } else {
-                            return Err(format!("Indexing not enabled"));
-                        }
+                IndexType::Vector(_) => {
+                    if let Some(indexer) = database_runtime.indexer() {
+                        let _ = indexer
+                            .clients
+                            .vector_client
+                            .delete_index(schema_id, field_id)
+                            .await
+                            .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
                     }
                 }
                 IndexType::Embedding(_model) => {
@@ -969,18 +954,16 @@ pub async fn post_schema_delete(
             let field_id = *compound_id;
             let schema_id = schema.id;
             match index {
-                IndexType::Vector(config) => {
-                    if hnsw_runtime_config(*config).is_some() {
-                        if let Some(indexer) = database_runtime.indexer() {
-                            let _ = indexer
-                                .clients
-                                .vector_client
-                                .delete_index(schema_id, field_id)
-                                .await
-                                .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
-                        } else {
-                            return Err(format!("Indexing not enabled"));
-                        }
+                IndexType::Vector(_) => {
+                    if let Some(indexer) = database_runtime.indexer() {
+                        let _ = indexer
+                            .clients
+                            .vector_client
+                            .delete_index(schema_id, field_id)
+                            .await
+                            .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
+                    } else {
+                        return Err(format!("Indexing not enabled"));
                     }
                 }
                 IndexType::Embedding(_model) => {
@@ -1005,10 +988,15 @@ pub async fn post_schema_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::vector::{CagraConfig, HnswConfig, MetricEncoding};
+    use crate::index::builder::IndexError;
+    use crate::index::vector::{
+        CagraConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore,
+    };
     use crate::server::{NebServer, ServerOptions, Service};
+    use dovahkiin::types::Id;
     use dovahkiin::types::Type;
-    use std::sync::Arc;
+    use futures::{future::BoxFuture, FutureExt};
+    use std::sync::{Arc, Mutex};
 
     fn post_schema_hook_server_options() -> ServerOptions {
         ServerOptions {
@@ -1057,31 +1045,170 @@ mod tests {
         )
     }
 
-    #[test]
-    fn hnsw_runtime_config_matches_engine_variant() {
-        let hnsw = HnswConfig {
-            m: 32,
-            ef_construction: 512,
-            ef_search_default: 400,
-            diversity_factor: 0.7,
-        };
-        let hnsw_config = VectorIndexConfig::hnsw(MetricEncoding::L2, hnsw);
-        let cagra_config = VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default());
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum VectorCoreCall {
+        NewIndex {
+            schema_id: u32,
+            field_id: u64,
+            config: VectorIndexConfig,
+        },
+        DeleteIndex {
+            schema_id: u32,
+            field_id: u64,
+        },
+    }
 
-        assert_eq!(hnsw_runtime_config(hnsw_config), Some(hnsw));
-        assert_eq!(hnsw_runtime_config(cagra_config), None);
+    #[derive(Clone, Default)]
+    struct RecordingVectorIndexerCore {
+        calls: Arc<Mutex<Vec<VectorCoreCall>>>,
+    }
+
+    impl RecordingVectorIndexerCore {
+        fn recorded_calls(&self) -> Vec<VectorCoreCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl VectorIndexerCore for RecordingVectorIndexerCore {
+        fn insert(
+            &self,
+            _cell_id: &Id,
+            _schema_id: u32,
+            _field_id: u64,
+            _metric_encoding: MetricEncoding,
+            _config: VectorIndexConfig,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn remove(
+            &self,
+            _cell_id: &Id,
+            _schema_id: u32,
+            _field_id: u64,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn search(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+            _query_vector: &[f32],
+            _limit: usize,
+            _ef_search: Option<u16>,
+        ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>> {
+            async { Ok(vec![]) }.boxed()
+        }
+
+        fn new_index_with_config(
+            &self,
+            schema_id: u32,
+            field_id: u64,
+            config: VectorIndexConfig,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            let calls = self.calls.clone();
+            async move {
+                calls.lock().unwrap().push(VectorCoreCall::NewIndex {
+                    schema_id,
+                    field_id,
+                    config,
+                });
+                Ok(())
+            }
+            .boxed()
+        }
+
+        fn delete_index(
+            &self,
+            schema_id: u32,
+            field_id: u64,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            let calls = self.calls.clone();
+            async move {
+                calls.lock().unwrap().push(VectorCoreCall::DeleteIndex {
+                    schema_id,
+                    field_id,
+                });
+                Ok(())
+            }
+            .boxed()
+        }
+    }
+
+    fn install_recording_vector_core(server: &Arc<NebServer>) -> RecordingVectorIndexerCore {
+        let vector_core = RecordingVectorIndexerCore::default();
+        let added = server
+            .current_database()
+            .indexer()
+            .expect("indexer should be enabled")
+            .clients
+            .vector_client
+            .set_vector_index_core(vector_core.clone());
+
+        assert!(added, "vector core should be installed once");
+
+        vector_core
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn post_schema_delete_skips_cagra_runtime_cleanup() {
+    async fn post_schema_add_passes_cagra_config_to_vector_core() {
         let _ = env_logger::try_init();
-        let server = post_schema_hook_server("post_schema_delete_skips_cagra_runtime_cleanup", 5481)
-            .await;
+        let server =
+            post_schema_hook_server("post_schema_add_passes_cagra_config_to_vector_core", 5481)
+                .await;
+        let vector_core = install_recording_vector_core(&server);
         let schema = cagra_vector_schema(77);
+        let field_id = *schema
+            .index_fields
+            .keys()
+            .next()
+            .expect("vector field should be indexed");
+        let config = VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default());
+
+        post_schema_add(&schema, &server.current_database())
+            .await
+            .expect("cagra config should be forwarded to the vector core");
+
+        assert_eq!(
+            vector_core.recorded_calls(),
+            vec![VectorCoreCall::NewIndex {
+                schema_id: 77,
+                field_id,
+                config,
+            }]
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_schema_delete_runs_vector_cleanup_for_cagra_schema() {
+        let _ = env_logger::try_init();
+        let server = post_schema_hook_server(
+            "post_schema_delete_runs_vector_cleanup_for_cagra_schema",
+            5482,
+        )
+        .await;
+        let vector_core = install_recording_vector_core(&server);
+        let schema = cagra_vector_schema(78);
+        let field_id = *schema
+            .index_fields
+            .keys()
+            .next()
+            .expect("vector field should be indexed");
 
         post_schema_delete(&schema, &server.current_database())
             .await
-            .expect("cagra runtime cleanup should be deferred");
+            .expect("vector cleanup should be forwarded to the vector core");
+
+        assert_eq!(
+            vector_core.recorded_calls(),
+            vec![VectorCoreCall::DeleteIndex {
+                schema_id: 78,
+                field_id,
+            }]
+        );
 
         server.shutdown().await;
     }

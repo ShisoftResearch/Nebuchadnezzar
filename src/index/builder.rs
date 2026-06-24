@@ -7,7 +7,7 @@ use crate::index::embedding::EmbeddingModel;
 use crate::index::full_text::{
     build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
-use crate::index::vector::{VectorIndexConfig, VectorIndexEngine};
+use crate::index::vector::VectorIndexConfig;
 use crate::ram::cell::{OwnedCell, SharedCell, WriteError};
 use crate::ram::types::{hash_indexable_owned_value, Id, OwnedValue};
 use crate::ram::{
@@ -247,25 +247,18 @@ impl IndexMeta {
                     .await
                     .map_err(|e| IndexError::WriteError(e))?;
             }
-            &IndexMeta::Vector(ref meta) => match meta.config.engine {
-                VectorIndexEngine::Hnsw(hnsw_config) => {
-                    indexers
-                        .vector_client
-                        .insert(
-                            &meta.cell_id,
-                            meta.schema_id,
-                            meta.field_id,
-                            meta.config.metric,
-                            hnsw_config,
-                        )
-                        .await?;
-                }
-                VectorIndexEngine::Cagra(_) => {
-                    return Err(IndexError::Other(
-                        "CAGRA vector indexes are not supported by neb runtime yet".to_string(),
-                    ));
-                }
-            },
+            &IndexMeta::Vector(ref meta) => {
+                indexers
+                    .vector_client
+                    .insert(
+                        &meta.cell_id,
+                        meta.schema_id,
+                        meta.field_id,
+                        meta.config.metric,
+                        meta.config,
+                    )
+                    .await?;
+            }
             &IndexMeta::FullText(ref meta) => {
                 if let Some(indexer) = indexers.fulltext_indexer() {
                     // Write posting lists to Chunk (synchronous)
