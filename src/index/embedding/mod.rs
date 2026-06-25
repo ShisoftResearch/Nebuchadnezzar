@@ -19,6 +19,7 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use crate::index::builder::IndexError;
+use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
 
 pub const NO_EMBEDDING_CORE_ERROR: &str =
     "Embedding indexer core is not set. Should call `set_embedding_index_core` to set it.";
@@ -70,6 +71,38 @@ impl From<&str> for EmbeddingModel {
 impl From<String> for EmbeddingModel {
     fn from(s: String) -> Self {
         Self(s)
+    }
+}
+
+/// Configuration for an embedding index.
+///
+/// The embedding model controls text-to-vector generation. The vector config
+/// controls the backing ANN engine used to index generated embedding vectors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct EmbeddingIndexConfig {
+    pub model: EmbeddingModel,
+    pub vector: VectorIndexConfig,
+}
+
+impl EmbeddingIndexConfig {
+    pub fn new(model: EmbeddingModel, vector: VectorIndexConfig) -> Self {
+        Self { model, vector }
+    }
+
+    pub fn for_model(model: EmbeddingModel) -> Self {
+        Self {
+            model,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for EmbeddingIndexConfig {
+    fn default() -> Self {
+        Self {
+            model: EmbeddingModel::default_model(),
+            vector: VectorIndexConfig::hnsw(MetricEncoding::Cosine, HnswConfig::default()),
+        }
     }
 }
 
@@ -173,13 +206,13 @@ pub trait EmbeddingIndexerCore: Send + Sync {
     /// * `schema_id` - Schema ID for namespace isolation
     /// * `field_id` - Field ID to index
     /// * `model` - The embedding model to use for this index
-    /// * `hnsw_config` - Optional HNSW configuration (defaults to HnswConfig::default())
+    /// * `vector_config` - Backing vector engine configuration.
     fn new_index(
         &self,
         schema_id: u32,
         field_id: u64,
         model: &EmbeddingModel,
-        hnsw_config: Option<crate::index::vector::HnswConfig>,
+        vector_config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
     /// Delete an embedding index for a schema/field combination.
@@ -290,10 +323,10 @@ impl EmbeddingIndexClient {
         schema_id: u32,
         field_id: u64,
         model: &'a EmbeddingModel,
-        hnsw_config: Option<crate::index::vector::HnswConfig>,
+        vector_config: VectorIndexConfig,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
         self.get_embedding_index_core()
-            .new_index(schema_id, field_id, model, hnsw_config)
+            .new_index(schema_id, field_id, model, vector_config)
     }
 
     /// Delete an embedding index.

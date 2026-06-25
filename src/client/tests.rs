@@ -485,7 +485,9 @@ fn cosine_vector_index() -> IndexType {
 }
 
 fn test_embedding_index() -> IndexType {
-    IndexType::Embedding(crate::index::embedding::EmbeddingModel::from("test-model"))
+    IndexType::Embedding(crate::index::embedding::EmbeddingIndexConfig::for_model(
+        crate::index::embedding::EmbeddingModel::from("test-model"),
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread")]

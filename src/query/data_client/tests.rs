@@ -1,9 +1,12 @@
 use crate::{
     index::builder::IndexBuilder,
     index::builder::IndexError,
-    index::embedding::{EmbeddingHit, EmbeddingIndexerCore, EmbeddingModel, EmbeddingModelInfo},
+    index::embedding::{
+        EmbeddingHit, EmbeddingIndexConfig, EmbeddingIndexerCore, EmbeddingModel,
+        EmbeddingModelInfo,
+    },
     index::ranged::tree::btree::Ordering,
-    index::vector::{HnswConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore},
+    index::vector::{MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore},
     query::data_client::{
         AggregateFunction, AggregateOrderBy, AggregateOrderTarget, AggregateQuery, AggregateSpec,
         ProjectionField, ProjectionItem, QueryOrdering, QueryResultCursor, QueryRow, ValueRange,
@@ -188,7 +191,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
         _schema_id: u32,
         _field_id: u64,
         _model: &EmbeddingModel,
-        _hnsw_config: Option<HnswConfig>,
+        _vector_config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
     }
@@ -4923,7 +4926,9 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
         Field::new_indexed(
             EMB_FIELD,
             Type::String,
-            vec![IndexType::Embedding(EmbeddingModel::default_model())],
+            vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+                EmbeddingModel::default_model(),
+            ))],
         ),
         Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
     ]);
@@ -5051,7 +5056,9 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
         Field::new_indexed(
             EMB_FIELD,
             Type::String,
-            vec![IndexType::Embedding(EmbeddingModel::default_model())],
+            vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+                EmbeddingModel::default_model(),
+            ))],
         ),
         Field::new_indexed(TAG_FIELD, Type::String, vec![IndexType::Hashed]),
         Field::new_unindexed(NOTE_FIELD, Type::String),
@@ -5173,7 +5180,9 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
     let fields = Field::new_schema(vec![Field::new_indexed(
         EMB_FIELD,
         Type::String,
-        vec![IndexType::Embedding(EmbeddingModel::default_model())],
+        vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+            EmbeddingModel::default_model(),
+        ))],
     )]);
     let schema = Schema::new_with_id(
         schema_id,

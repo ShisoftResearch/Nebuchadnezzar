@@ -7,6 +7,7 @@ use dovahkiin::{
 };
 
 use crate::{
+    index::embedding::{EmbeddingIndexConfig, EmbeddingModel},
     query::{
         cost::planner::{
             distinct_estimate_from_stats, estimate_clause_plan_cost, estimate_hashed_eq_rows,
@@ -1708,7 +1709,9 @@ mod tests {
             Field::new_schema(vec![Field::new_indexed(
                 field,
                 Type::String,
-                vec![IndexType::Embedding(EmbeddingModel::default_model())],
+                vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+                    EmbeddingModel::default_model(),
+                ))],
             )]),
             false,
             false,
@@ -1741,7 +1744,9 @@ mod tests {
         schema.add_compound_index(
             compound_name,
             vec!["title".to_string(), "body".to_string()],
-            vec![IndexType::Embedding(EmbeddingModel::default_model())],
+            vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+                EmbeddingModel::default_model(),
+            ))],
         );
 
         let selection = Expr::List(vec![
@@ -1835,7 +1840,9 @@ mod tests {
                 Field::new_indexed(
                     emb_field,
                     Type::String,
-                    vec![IndexType::Embedding(EmbeddingModel::default_model())],
+                    vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+                        EmbeddingModel::default_model(),
+                    ))],
                 ),
                 Field::new_indexed(tag_field, Type::String, vec![IndexType::Hashed]),
             ]),
@@ -2018,7 +2025,9 @@ mod tests {
                 Field::new_indexed(
                     emb_field,
                     Type::String,
-                    vec![IndexType::Embedding(EmbeddingModel::default_model())],
+                    vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+                        EmbeddingModel::default_model(),
+                    ))],
                 ),
                 Field::new_indexed(tag_field, Type::String, vec![IndexType::Hashed]),
             ]),

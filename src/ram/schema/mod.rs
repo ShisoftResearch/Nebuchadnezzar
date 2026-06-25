@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;
 
-use crate::index::embedding::EmbeddingModel;
+use crate::index::embedding::EmbeddingIndexConfig;
 use crate::index::vector::VectorIndexConfig;
 use crate::ram::io::align_address;
 use crate::server::DatabaseRuntime;
@@ -69,7 +69,7 @@ pub enum IndexType {
     Fulltext,
     /// Embedding index with configurable model.
     /// The model name is interpreted by the embedding implementation (e.g., Morpheus).
-    Embedding(EmbeddingModel),
+    Embedding(EmbeddingIndexConfig),
     Statistics,
 }
 
@@ -860,12 +860,12 @@ pub async fn post_schema_add(
                         return Err(format!("Indexing not enabled"));
                     }
                 }
-                IndexType::Embedding(model) => {
+                IndexType::Embedding(config) => {
                     if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client
-                            .new_index(schema_id, field_id, model, None)
+                            .new_index(schema_id, field_id, &config.model, config.vector)
                             .await
                             .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
                     } else {
@@ -893,12 +893,12 @@ pub async fn post_schema_add(
                         return Err(format!("Indexing not enabled"));
                     }
                 }
-                IndexType::Embedding(model) => {
+                IndexType::Embedding(config) => {
                     if let Some(indexer) = database_runtime.indexer() {
                         let _ = indexer
                             .clients
                             .embedding_client
-                            .new_index(schema_id, field_id, model, None)
+                            .new_index(schema_id, field_id, &config.model, config.vector)
                             .await
                             .map_err(|e| format!("Error creating embedding index: {:?}", e))?;
                     } else {
@@ -989,6 +989,10 @@ pub async fn post_schema_delete(
 mod tests {
     use super::*;
     use crate::index::builder::IndexError;
+    use crate::index::embedding::{
+        EmbeddingHit, EmbeddingIndexConfig, EmbeddingIndexerCore, EmbeddingModel,
+        EmbeddingModelInfo,
+    };
     use crate::index::vector::{
         CagraConfig, MetricEncoding, VectorHit, VectorIndexConfig, VectorIndexerCore,
     };
@@ -1045,6 +1049,24 @@ mod tests {
         )
     }
 
+    fn cagra_embedding_schema(schema_id: u32) -> Schema {
+        Schema::new_with_id(
+            schema_id,
+            "cagra_embedding_schema",
+            None,
+            Field::new_schema(vec![Field::new_indexed(
+                "body",
+                Type::String,
+                vec![IndexType::Embedding(EmbeddingIndexConfig::new(
+                    EmbeddingModel::from("test-model"),
+                    VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default()),
+                ))],
+            )]),
+            false,
+            false,
+        )
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum VectorCoreCall {
         NewIndex {
@@ -1058,13 +1080,34 @@ mod tests {
         },
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum EmbeddingCoreCall {
+        NewIndex {
+            schema_id: u32,
+            field_id: u64,
+            model: EmbeddingModel,
+            vector_config: VectorIndexConfig,
+        },
+    }
+
     #[derive(Clone, Default)]
     struct RecordingVectorIndexerCore {
         calls: Arc<Mutex<Vec<VectorCoreCall>>>,
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingEmbeddingIndexerCore {
+        calls: Arc<Mutex<Vec<EmbeddingCoreCall>>>,
+    }
+
     impl RecordingVectorIndexerCore {
         fn recorded_calls(&self) -> Vec<VectorCoreCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl RecordingEmbeddingIndexerCore {
+        fn recorded_calls(&self) -> Vec<EmbeddingCoreCall> {
             self.calls.lock().unwrap().clone()
         }
     }
@@ -1136,6 +1179,71 @@ mod tests {
         }
     }
 
+    impl EmbeddingIndexerCore for RecordingEmbeddingIndexerCore {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<EmbeddingModelInfo>, IndexError>> {
+            async { Ok(vec![]) }.boxed()
+        }
+
+        fn insert(
+            &self,
+            _cell_id: &Id,
+            _schema_id: u32,
+            _field_id: u64,
+            _model: &EmbeddingModel,
+            _text: &str,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn remove(
+            &self,
+            _cell_id: &Id,
+            _schema_id: u32,
+            _field_id: u64,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async { Ok(()) }.boxed()
+        }
+
+        fn search(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+            _query: &str,
+            _limit: usize,
+        ) -> BoxFuture<'_, Result<Vec<EmbeddingHit>, IndexError>> {
+            async { Ok(vec![]) }.boxed()
+        }
+
+        fn new_index(
+            &self,
+            schema_id: u32,
+            field_id: u64,
+            model: &EmbeddingModel,
+            vector_config: VectorIndexConfig,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            let calls = self.calls.clone();
+            let model = model.clone();
+            async move {
+                calls.lock().unwrap().push(EmbeddingCoreCall::NewIndex {
+                    schema_id,
+                    field_id,
+                    model,
+                    vector_config,
+                });
+                Ok(())
+            }
+            .boxed()
+        }
+
+        fn delete_index(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async { Ok(()) }.boxed()
+        }
+    }
+
     fn install_recording_vector_core(server: &Arc<NebServer>) -> RecordingVectorIndexerCore {
         let vector_core = RecordingVectorIndexerCore::default();
         let added = server
@@ -1149,6 +1257,21 @@ mod tests {
         assert!(added, "vector core should be installed once");
 
         vector_core
+    }
+
+    fn install_recording_embedding_core(server: &Arc<NebServer>) -> RecordingEmbeddingIndexerCore {
+        let embedding_core = RecordingEmbeddingIndexerCore::default();
+        let added = server
+            .current_database()
+            .indexer()
+            .expect("indexer should be enabled")
+            .clients
+            .embedding_client
+            .set_embedding_index_core(embedding_core.clone());
+
+        assert!(added, "embedding core should be installed once");
+
+        embedding_core
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1176,6 +1299,40 @@ mod tests {
                 schema_id: 77,
                 field_id,
                 config,
+            }]
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_schema_add_passes_cagra_config_to_embedding_core() {
+        let _ = env_logger::try_init();
+        let server = post_schema_hook_server(
+            "post_schema_add_passes_cagra_config_to_embedding_core",
+            5483,
+        )
+        .await;
+        let embedding_core = install_recording_embedding_core(&server);
+        let schema = cagra_embedding_schema(79);
+        let field_id = *schema
+            .index_fields
+            .keys()
+            .next()
+            .expect("embedding field should be indexed");
+        let vector_config = VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default());
+
+        post_schema_add(&schema, &server.current_database())
+            .await
+            .expect("embedding CAGRA config should be forwarded to embedding core");
+
+        assert_eq!(
+            embedding_core.recorded_calls(),
+            vec![EmbeddingCoreCall::NewIndex {
+                schema_id: 79,
+                field_id,
+                model: EmbeddingModel::from("test-model"),
+                vector_config,
             }]
         );
 

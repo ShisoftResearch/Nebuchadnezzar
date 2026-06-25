@@ -3,7 +3,7 @@ use super::hash::{get_hash_id, get_null_hash_id};
 use super::{EntryKey, Feature, IndexerClients};
 use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
-use crate::index::embedding::EmbeddingModel;
+use crate::index::embedding::{EmbeddingIndexConfig, EmbeddingModel};
 use crate::index::full_text::{
     build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
@@ -763,12 +763,12 @@ where
                                 metas.push(IndexMeta::FullText(meta));
                             }
                         }
-                        &IndexType::Embedding(ref model) => {
+                        &IndexType::Embedding(ref config) => {
                             if let Some(meta) = build_embedding_index_meta(
                                 cell.id(),
                                 schema.id,
                                 *field_id,
-                                model.clone(),
+                                config.model.clone(),
                                 owned_value.clone(),
                             ) {
                                 metas.push(IndexMeta::Embedding(meta));
@@ -812,12 +812,12 @@ where
                                 metas.push(IndexMeta::FullText(meta));
                             }
                         }
-                        &IndexType::Embedding(ref model) => {
+                        &IndexType::Embedding(ref config) => {
                             if let Some(meta) = build_embedding_index_meta(
                                 cell.id(),
                                 schema.id,
                                 *field_id,
-                                model.clone(),
+                                config.model.clone(),
                                 owned_value.clone(),
                             ) {
                                 metas.push(IndexMeta::Embedding(meta));
@@ -865,13 +865,13 @@ where
             let mut metas = vec![];
             for index in &compound.indices {
                 match index {
-                    IndexType::Embedding(model) => {
+                    IndexType::Embedding(config) => {
                         if let Some(text) = build_compound_embedding_text(cell, schema, compound) {
                             metas.push(IndexMeta::Embedding(EmbeddingIndexMeta {
                                 cell_id: cell.id(),
                                 schema_id: schema.id,
                                 field_id: *compound_id,
-                                model: model.clone(),
+                                model: config.model.clone(),
                                 text,
                             }));
                         }
@@ -920,7 +920,9 @@ mod tests {
         schema.add_compound_index(
             "title_body",
             vec!["title".to_string(), "body".to_string()],
-            vec![IndexType::Embedding(EmbeddingModel::from("test-model"))],
+            vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+                EmbeddingModel::from("test-model"),
+            ))],
         );
 
         let mut data = OwnedMap::new();
@@ -951,7 +953,9 @@ mod tests {
         schema.add_compound_index(
             "title_body",
             vec!["title".to_string(), "body".to_string()],
-            vec![IndexType::Embedding(EmbeddingModel::from("test-model"))],
+            vec![IndexType::Embedding(EmbeddingIndexConfig::for_model(
+                EmbeddingModel::from("test-model"),
+            ))],
         );
 
         let mut data = OwnedMap::new();
