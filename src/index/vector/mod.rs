@@ -17,6 +17,7 @@ pub const NO_VECTOR_CORE_ERROR: &str =
     "Vector indexer core is not set. Should call `set_vector_index_core` to set it.";
 pub const NO_VECTOR_SEARCH_COORDINATOR_ERROR: &str =
     "Vector search coordinator is not set. Should call `set_vector_search_coordinator` to set it.";
+const EMPTY_VECTOR_SEARCH_BATCH_ERROR: &str = "vector search batch must not be empty";
 
 /// Encodings to allow metric serialization and conversion.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -237,6 +238,37 @@ pub trait VectorIndexerCore: Send + Sync {
         ef_search: Option<u16>,
     ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>>;
 
+    /// Search for similar vectors using multiple query vectors.
+    ///
+    /// The default adapter preserves object safety and query order by
+    /// forwarding each batch entry through `search` sequentially.
+    fn search_batch(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        query_vectors: Vec<Vec<f32>>,
+        limit: usize,
+        ef_search: Option<u16>,
+    ) -> BoxFuture<'_, Result<Vec<Vec<VectorHit>>, IndexError>> {
+        Box::pin(async move {
+            if query_vectors.is_empty() {
+                return Err(IndexError::Other(
+                    EMPTY_VECTOR_SEARCH_BATCH_ERROR.to_string(),
+                ));
+            }
+
+            let mut results = Vec::with_capacity(query_vectors.len());
+            for query_vector in query_vectors {
+                results.push(
+                    self.search(schema_id, field_id, &query_vector, limit, ef_search)
+                        .await?,
+                );
+            }
+
+            Ok(results)
+        })
+    }
+
     /// Create a new vector index for a schema/field combination.
     ///
     /// Called when a new schema with vector index is created.
@@ -270,6 +302,33 @@ pub trait VectorSearchCoordinator: Send + Sync {
         limit: usize,
         ef_search: Option<u16>,
     ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>>;
+
+    fn search_distributed_batch(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        query_vectors: Vec<Vec<f32>>,
+        limit: usize,
+        ef_search: Option<u16>,
+    ) -> BoxFuture<'_, Result<Vec<Vec<VectorHit>>, IndexError>> {
+        Box::pin(async move {
+            if query_vectors.is_empty() {
+                return Err(IndexError::Other(
+                    EMPTY_VECTOR_SEARCH_BATCH_ERROR.to_string(),
+                ));
+            }
+
+            let mut results = Vec::with_capacity(query_vectors.len());
+            for query_vector in query_vectors {
+                results.push(
+                    self.search_distributed(schema_id, field_id, &query_vector, limit, ef_search)
+                        .await?,
+                );
+            }
+
+            Ok(results)
+        })
+    }
 }
 
 /// Client for vector index operations.
@@ -356,6 +415,18 @@ impl VectorIndexClient {
         )
     }
 
+    pub fn search_distributed_batch<'a>(
+        &'a self,
+        schema_id: u32,
+        field_id: u64,
+        query_vectors: Vec<Vec<f32>>,
+        limit: usize,
+        ef_search: Option<u16>,
+    ) -> BoxFuture<'a, Result<Vec<Vec<VectorHit>>, IndexError>> {
+        self.get_vector_search_coordinator()
+            .search_distributed_batch(schema_id, field_id, query_vectors, limit, ef_search)
+    }
+
     /// Insert a vector into the index.
     pub fn insert<'a>(
         &'a self,
@@ -404,6 +475,23 @@ impl VectorIndexClient {
     ) -> BoxFuture<'a, Result<Vec<VectorHit>, IndexError>> {
         self.get_vector_index_core()
             .search(schema_id, field_id, query_vector, limit, ef_search)
+    }
+
+    pub fn search_batch<'a>(
+        &'a self,
+        schema_id: u32,
+        field_id: u64,
+        query_vectors: Vec<Vec<f32>>,
+        limit: usize,
+        ef_search: Option<u16>,
+    ) -> BoxFuture<'a, Result<Vec<Vec<VectorHit>>, IndexError>> {
+        self.get_vector_index_core().search_batch(
+            schema_id,
+            field_id,
+            query_vectors,
+            limit,
+            ef_search,
+        )
     }
 
     /// Create a new vector index.
@@ -462,11 +550,25 @@ mod tests {
 
     struct RecordingVectorCore {
         recorded_calls: Arc<Mutex<Vec<RecordedInsertCall>>>,
+        recorded_search_queries: Arc<Mutex<Vec<Vec<f32>>>>,
     }
 
     impl RecordingVectorCore {
         fn new(recorded_calls: Arc<Mutex<Vec<RecordedInsertCall>>>) -> Self {
-            Self { recorded_calls }
+            Self {
+                recorded_calls,
+                recorded_search_queries: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn new_with_search_queries(
+            recorded_calls: Arc<Mutex<Vec<RecordedInsertCall>>>,
+            recorded_search_queries: Arc<Mutex<Vec<Vec<f32>>>>,
+        ) -> Self {
+            Self {
+                recorded_calls,
+                recorded_search_queries,
+            }
         }
     }
 
@@ -507,11 +609,24 @@ mod tests {
             &self,
             _schema_id: u32,
             _field_id: u64,
-            _query_vector: &[f32],
+            query_vector: &[f32],
             _limit: usize,
             _ef_search: Option<u16>,
         ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>> {
-            Box::pin(async { panic!("search should not be called in this test") })
+            let recorded_search_queries = Arc::clone(&self.recorded_search_queries);
+            let query_vector = query_vector.to_vec();
+
+            Box::pin(async move {
+                recorded_search_queries
+                    .lock()
+                    .unwrap()
+                    .push(query_vector.clone());
+
+                Ok(vec![VectorHit {
+                    id: Id::new(0, query_vector[0] as u64),
+                    score: query_vector[0],
+                }])
+            })
         }
 
         fn new_index_with_config(
@@ -529,6 +644,44 @@ mod tests {
             _field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             Box::pin(async { panic!("delete_index should not be called in this test") })
+        }
+    }
+
+    struct RecordingVectorSearchCoordinator {
+        recorded_search_queries: Arc<Mutex<Vec<Vec<f32>>>>,
+    }
+
+    impl RecordingVectorSearchCoordinator {
+        fn new(recorded_search_queries: Arc<Mutex<Vec<Vec<f32>>>>) -> Self {
+            Self {
+                recorded_search_queries,
+            }
+        }
+    }
+
+    impl VectorSearchCoordinator for RecordingVectorSearchCoordinator {
+        fn search_distributed(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+            query_vector: &[f32],
+            _limit: usize,
+            _ef_search: Option<u16>,
+        ) -> BoxFuture<'_, Result<Vec<VectorHit>, IndexError>> {
+            let recorded_search_queries = Arc::clone(&self.recorded_search_queries);
+            let query_vector = query_vector.to_vec();
+
+            Box::pin(async move {
+                recorded_search_queries
+                    .lock()
+                    .unwrap()
+                    .push(query_vector.clone());
+
+                Ok(vec![VectorHit {
+                    id: Id::new(0, query_vector[0] as u64),
+                    score: query_vector[0],
+                }])
+            })
         }
     }
 
@@ -642,6 +795,106 @@ mod tests {
                     },
                 ),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_batch_default_adapter_preserves_query_order() {
+        let recorded_search_queries = Arc::new(Mutex::new(Vec::new()));
+        let core = RecordingVectorCore::new_with_search_queries(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&recorded_search_queries),
+        );
+
+        let results = core
+            .search_batch(7, 8, vec![vec![3.0], vec![1.0], vec![2.0]], 4, Some(32))
+            .await
+            .expect("batch search should succeed");
+
+        let scores: Vec<f32> = results.iter().map(|row| row[0].score).collect();
+        assert_eq!(scores, vec![3.0, 1.0, 2.0]);
+        assert_eq!(
+            recorded_search_queries.lock().unwrap().clone(),
+            vec![vec![3.0], vec![1.0], vec![2.0]]
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_batch_default_adapter_rejects_empty_batch() {
+        let core = RecordingVectorCore::new(Arc::new(Mutex::new(Vec::new())));
+
+        let error = core
+            .search_batch(7, 8, Vec::new(), 4, Some(32))
+            .await
+            .expect_err("empty batch should fail");
+
+        match error {
+            IndexError::Other(message) => {
+                assert_eq!(message, "vector search batch must not be empty");
+            }
+            other => panic!("expected IndexError::Other, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn vector_batch_default_adapter_client_and_distributed_forwarding_preserve_order() {
+        let core_search_queries = Arc::new(Mutex::new(Vec::new()));
+        let distributed_search_queries = Arc::new(Mutex::new(Vec::new()));
+
+        let coordinator =
+            RecordingVectorSearchCoordinator::new(Arc::clone(&distributed_search_queries));
+        let distributed_results = coordinator
+            .search_distributed_batch(9, 10, vec![vec![3.0], vec![1.0], vec![2.0]], 5, Some(24))
+            .await
+            .expect("distributed batch search should succeed");
+        let distributed_scores: Vec<f32> =
+            distributed_results.iter().map(|row| row[0].score).collect();
+        assert_eq!(distributed_scores, vec![3.0, 1.0, 2.0]);
+
+        let client = VectorIndexClient::new();
+        assert!(
+            client.set_vector_index_core(RecordingVectorCore::new_with_search_queries(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::clone(&core_search_queries),
+            ))
+        );
+        assert!(
+            client.set_vector_search_coordinator(RecordingVectorSearchCoordinator::new(
+                Arc::clone(&distributed_search_queries),
+            ))
+        );
+
+        let client_results = client
+            .search_batch(11, 12, vec![vec![3.0], vec![1.0], vec![2.0]], 6, Some(16))
+            .await
+            .expect("client batch search should succeed");
+        let client_scores: Vec<f32> = client_results.iter().map(|row| row[0].score).collect();
+        assert_eq!(client_scores, vec![3.0, 1.0, 2.0]);
+
+        let client_distributed_results = client
+            .search_distributed_batch(13, 14, vec![vec![3.0], vec![1.0], vec![2.0]], 7, Some(8))
+            .await
+            .expect("client distributed batch search should succeed");
+        let client_distributed_scores: Vec<f32> = client_distributed_results
+            .iter()
+            .map(|row| row[0].score)
+            .collect();
+        assert_eq!(client_distributed_scores, vec![3.0, 1.0, 2.0]);
+
+        assert_eq!(
+            core_search_queries.lock().unwrap().clone(),
+            vec![vec![3.0], vec![1.0], vec![2.0]]
+        );
+        assert_eq!(
+            distributed_search_queries.lock().unwrap().clone(),
+            vec![
+                vec![3.0],
+                vec![1.0],
+                vec![2.0],
+                vec![3.0],
+                vec![1.0],
+                vec![2.0],
+            ]
         );
     }
 
