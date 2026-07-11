@@ -23,6 +23,7 @@ use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
 
 pub const NO_EMBEDDING_CORE_ERROR: &str =
     "Embedding indexer core is not set. Should call `set_embedding_index_core` to set it.";
+const EMPTY_EMBEDDING_SEARCH_BATCH_ERROR: &str = "embedding search batch must not be empty";
 
 /// Embedding model identifier.
 ///
@@ -198,6 +199,33 @@ pub trait EmbeddingIndexerCore: Send + Sync {
         limit: usize,
     ) -> BoxFuture<'_, Result<Vec<EmbeddingHit>, IndexError>>;
 
+    /// Search for similar documents using multiple text queries.
+    ///
+    /// The default adapter preserves object safety and query order by
+    /// forwarding each batch entry through `search` sequentially.
+    fn search_batch(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        queries: Vec<String>,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<Vec<EmbeddingHit>>, IndexError>> {
+        Box::pin(async move {
+            if queries.is_empty() {
+                return Err(IndexError::Other(
+                    EMPTY_EMBEDDING_SEARCH_BATCH_ERROR.to_string(),
+                ));
+            }
+
+            let mut results = Vec::with_capacity(queries.len());
+            for query in queries {
+                results.push(self.search(schema_id, field_id, &query, limit).await?);
+            }
+
+            Ok(results)
+        })
+    }
+
     /// Create a new embedding index for a schema/field combination.
     ///
     /// Called when a new schema with embedding index is created.
@@ -317,6 +345,18 @@ impl EmbeddingIndexClient {
             .search(schema_id, field_id, query, limit)
     }
 
+    /// Search for similar documents with multiple text queries.
+    pub fn search_batch<'a>(
+        &'a self,
+        schema_id: u32,
+        field_id: u64,
+        queries: Vec<String>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Vec<EmbeddingHit>>, IndexError>> {
+        self.get_embedding_index_core()
+            .search_batch(schema_id, field_id, queries, limit)
+    }
+
     /// Create a new embedding index with the specified model.
     pub fn new_index<'a>(
         &'a self,
@@ -343,5 +383,152 @@ impl EmbeddingIndexClient {
 impl Default for EmbeddingIndexClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use futures::FutureExt;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingEmbeddingCore {
+        queries: Mutex<Vec<String>>,
+    }
+
+    impl RecordingEmbeddingCore {
+        fn recorded_queries(&self) -> Vec<String> {
+            self.queries.lock().unwrap().clone()
+        }
+    }
+
+    impl EmbeddingIndexerCore for RecordingEmbeddingCore {
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<EmbeddingModelInfo>, IndexError>> {
+            async move { Ok(Vec::new()) }.boxed()
+        }
+
+        fn insert(
+            &self,
+            _cell_id: &Id,
+            _schema_id: u32,
+            _field_id: u64,
+            _model: &EmbeddingModel,
+            _text: &str,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async move { Ok(()) }.boxed()
+        }
+
+        fn remove(
+            &self,
+            _cell_id: &Id,
+            _schema_id: u32,
+            _field_id: u64,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async move { Ok(()) }.boxed()
+        }
+
+        fn search(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+            query: &str,
+            _limit: usize,
+        ) -> BoxFuture<'_, Result<Vec<EmbeddingHit>, IndexError>> {
+            let query = query.to_string();
+            async move {
+                self.queries.lock().unwrap().push(query.clone());
+                Ok(vec![EmbeddingHit {
+                    id: Id::new(0, query.len() as u64),
+                    score: query.len() as f32,
+                }])
+            }
+            .boxed()
+        }
+
+        fn new_index(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+            _model: &EmbeddingModel,
+            _vector_config: VectorIndexConfig,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async move { Ok(()) }.boxed()
+        }
+
+        fn delete_index(
+            &self,
+            _schema_id: u32,
+            _field_id: u64,
+        ) -> BoxFuture<'_, Result<(), IndexError>> {
+            async move { Ok(()) }.boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_batch_trait_default_preserves_query_order() {
+        let core = RecordingEmbeddingCore::default();
+
+        let hits = core
+            .search_batch(7, 11, vec!["third".to_string(), "one".to_string()], 3)
+            .await
+            .expect("batch search should succeed");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0][0].score, 5.0);
+        assert_eq!(hits[1][0].score, 3.0);
+        assert_eq!(
+            core.recorded_queries(),
+            vec!["third".to_string(), "one".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_batch_trait_default_rejects_empty_queries() {
+        let core = RecordingEmbeddingCore::default();
+
+        let error = core
+            .search_batch(7, 11, Vec::new(), 3)
+            .await
+            .expect_err("empty batch should fail");
+
+        match error {
+            IndexError::Other(message) => {
+                assert_eq!(message, "embedding search batch must not be empty");
+                assert!(message.contains("must not be empty"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_batch_trait_object_is_object_safe() {
+        let core: Arc<dyn EmbeddingIndexerCore> = Arc::new(RecordingEmbeddingCore::default());
+
+        let hits = core
+            .search_batch(7, 11, vec!["third".to_string(), "one".to_string()], 3)
+            .await
+            .expect("trait object batch search should succeed");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0][0].score, 5.0);
+        assert_eq!(hits[1][0].score, 3.0);
+    }
+
+    #[tokio::test]
+    async fn embedding_batch_client_forwards_owned_queries_in_order() {
+        let client = EmbeddingIndexClient::new();
+        assert!(client.set_embedding_index_core(RecordingEmbeddingCore::default()));
+
+        let hits = client
+            .search_batch(7, 11, vec!["third".to_string(), "one".to_string()], 3)
+            .await
+            .expect("client batch search should succeed");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0][0].score, 5.0);
+        assert_eq!(hits[1][0].score, 3.0);
     }
 }
