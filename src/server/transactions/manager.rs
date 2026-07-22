@@ -364,7 +364,8 @@ impl Service for TransactionManager {
                             return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
                         }
                         data_obj.cell = Some(cell);
-                        data_obj.new = matches!(data_obj.expectation, CellExpectation::Absent);
+                        data_obj.new = matches!(data_obj.expectation, CellExpectation::Absent)
+                            && !data_obj.changed;
                         data_obj.changed = true;
                         Ok(TxnExecResult::Accepted(()))
                     }

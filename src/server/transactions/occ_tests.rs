@@ -360,3 +360,45 @@ async fn repeatable_remove_then_write_replaces_existing_cell() {
 
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5337";
+    let group = "txn_occ_repeatable_blind_replace_after_remove";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90108);
+
+    let mut initial = counter_cell(schema.id, cell_id, 2, "counter_blind_replace_initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    assert_eq!(
+        txn.remove(tid.clone(), cell_id).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    let replacement = counter_cell(schema.id, cell_id, 8, "counter_blind_replace_updated");
+    assert_eq!(
+        txn.write(tid.clone(), replacement).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(tid.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let replaced = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(score_of(&replaced), 8);
+    assert!(replaced.header.version > initial.header.version);
+
+    server.shutdown().await;
+}
