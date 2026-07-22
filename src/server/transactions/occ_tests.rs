@@ -524,3 +524,85 @@ async fn repeatable_blind_update_after_clock_advance_uses_transaction_observatio
     abort_txn(&txn, later_tid).await;
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5350";
+    let group = "txn_occ_lost_update_retry";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90113);
+
+    let mut initial = counter_cell(schema.id, cell_id, 0, "counter_lost_update_initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let t1 = txn.begin().await.unwrap().unwrap();
+    let t2 = txn.begin().await.unwrap().unwrap();
+
+    let first = accepted_cell(txn.read(t1.clone(), cell_id).await.unwrap().unwrap());
+    let second = accepted_cell(txn.read(t2.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(score_of(&first), 0);
+    assert_eq!(score_of(&second), 0);
+    assert_eq!(first.header.version, second.header.version);
+
+    let t1_update = counter_cell(schema.id, cell_id, 1, "counter_lost_update_t1");
+    let t2_update = counter_cell(schema.id, cell_id, 1, "counter_lost_update_t2");
+    assert_eq!(
+        txn.update(t1.clone(), t1_update).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.update(t2.clone(), t2_update).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    assert_eq!(
+        txn.prepare(t1.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(t1.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let after_t1 = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(score_of(&after_t1), 1);
+    assert!(after_t1.header.version > first.header.version);
+
+    assert_eq!(
+        txn.prepare(t2.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
+    );
+    let after_t2 = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(score_of(&after_t2), 1);
+    assert_eq!(after_t2.data, after_t1.data);
+
+    let retry = txn.begin().await.unwrap().unwrap();
+    let retry_read = accepted_cell(txn.read(retry.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(score_of(&retry_read), 1);
+
+    let retry_update = counter_cell(schema.id, cell_id, 2, "counter_lost_update_retry");
+    assert_eq!(
+        txn.update(retry.clone(), retry_update)
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(retry.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(retry.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let final_cell = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(score_of(&final_cell), 2);
+
+    server.shutdown().await;
+}

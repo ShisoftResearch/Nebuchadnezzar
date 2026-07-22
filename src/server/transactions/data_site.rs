@@ -1,5 +1,5 @@
 use super::*;
-use crate::ram::cell::{header_from_chunk_raw, OwnedCellRef};
+use crate::ram::cell::OwnedCellRef;
 use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
 use crate::server::{DatabaseRuntime, Peer};
@@ -92,6 +92,30 @@ impl CellHistory {
             cell,
             current_version: current_ver,
         }
+    }
+}
+
+impl Transaction {
+    fn certified_op(&self, id: &Id) -> Option<&PrepareOp> {
+        self.certified.get(id)
+    }
+
+    fn certified_present_version(&self, id: &Id) -> Option<u64> {
+        match self.certified_op(id).map(|op| &op.expectation) {
+            Some(CellExpectation::Present(version)) => Some(*version),
+            _ => None,
+        }
+    }
+
+    fn certified_expects_absent_write(&self, id: &Id) -> bool {
+        matches!(
+            self.certified_op(id),
+            Some(PrepareOp {
+                intent: PrepareIntent::Write,
+                expectation: CellExpectation::Absent,
+                ..
+            })
+        )
     }
 }
 
@@ -582,6 +606,9 @@ impl DataManager {
         if let Err(result) = Self::validate_commit_subset(&txn.affected_cells, &cells) {
             return result;
         }
+        if let Err(result) = Self::validate_commit_payload(&txn, &cells) {
+            return result;
+        }
 
         let Some(coordinator_id) = txn.coordinator_id else {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
@@ -608,9 +635,8 @@ impl DataManager {
         {
             for cell_op in cells {
                 match cell_op {
-                    CommitOp::Read(_, _) | CommitOp::None => {
-                        unreachable!("validate_commit_subset rejects non-mutation commit ops")
-                    }
+                    CommitOp::Read(_, _) => continue,
+                    CommitOp::None => unreachable!("commit payload validation rejects None ops"),
                     CommitOp::Write(mut cell) => {
                         let cell_id = cell.id();
                         let meta_index = guarded_cell_ids
@@ -648,12 +674,15 @@ impl DataManager {
                                 meta.write = effective_ts.clone();
                             }
                             Err(error) => {
-                                write_error = Some((cell.id(), error));
+                                write_error = Some((cell_id, error));
                                 break;
                             }
                         };
                     }
                     CommitOp::Remove(ref cell_id) => {
+                        let expected_version = txn
+                            .certified_present_version(cell_id)
+                            .expect("commit payload validation requires present certification");
                         let meta_index = guarded_cell_ids
                             .binary_search(cell_id)
                             .expect("prepared cell metadata must exist");
@@ -669,7 +698,7 @@ impl DataManager {
                             continue;
                         }
 
-                        let (cell_addr, orig_version, old_cell_ref) = {
+                        let (cell_addr, old_cell_ref) = {
                             let shared_cell = match self.chunks().read_cell(cell_id) {
                                 Ok(cell) => cell,
                                 Err(read_error) => {
@@ -678,10 +707,13 @@ impl DataManager {
                                     break;
                                 }
                             };
+                            if shared_cell.header.version != expected_version {
+                                write_error = Some((*cell_id, WriteError::CellVersionMismatch));
+                                break;
+                            }
                             let addr = shared_cell.cell_guard().get_ptr();
-                            let version = shared_cell.header.version;
                             let cell_ref = shared_cell.to_owned().into_ref();
-                            (addr, version, cell_ref)
+                            (addr, cell_ref)
                         };
                         let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
@@ -704,7 +736,7 @@ impl DataManager {
                                 tid.clone(),
                                 *cell_id,
                                 super::undo_log::UndoOpType::Remove,
-                                orig_version,
+                                expected_version,
                                 chunk_idx as u64,
                                 seq_id,
                                 cell_offset,
@@ -716,7 +748,7 @@ impl DataManager {
 
                         match self
                             .chunks()
-                            .remove_cell_by(cell_id, |cell| cell.header.version == orig_version)
+                            .remove_cell_by(cell_id, |cell| cell.header.version == expected_version)
                         {
                             Ok(()) => {
                                 txn.history
@@ -732,6 +764,9 @@ impl DataManager {
                     }
                     CommitOp::Update(mut cell) => {
                         let cell_id = cell.id();
+                        let expected_version = txn
+                            .certified_present_version(&cell_id)
+                            .expect("commit payload validation requires present certification");
                         let meta_index = guarded_cell_ids
                             .binary_search(&cell_id)
                             .expect("prepared cell metadata must exist");
@@ -747,19 +782,20 @@ impl DataManager {
                             continue;
                         }
 
-                        let (cell_addr, orig_version) = {
-                            match self.chunks().location_for_read(&cell_id).and_then(|loc| {
-                                let addr = *loc;
-                                let header = header_from_chunk_raw(addr);
-                                header.map(|(header, _)| (header, addr))
-                            }) {
-                                Ok((header, addr)) => (addr, header.version),
+                        let cell_addr = {
+                            let shared_cell = match self.chunks().read_cell(&cell_id) {
+                                Ok(cell) => cell,
                                 Err(read_error) => {
                                     write_error =
                                         Some((cell_id, WriteError::ReadError(read_error)));
                                     break;
                                 }
+                            };
+                            if shared_cell.header.version != expected_version {
+                                write_error = Some((cell_id, WriteError::CellVersionMismatch));
+                                break;
                             }
+                            shared_cell.cell_guard().get_ptr()
                         };
                         let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
@@ -782,7 +818,7 @@ impl DataManager {
                                 tid.clone(),
                                 cell_id,
                                 super::undo_log::UndoOpType::Update,
-                                orig_version,
+                                expected_version,
                                 chunk_idx as u64,
                                 seq_id,
                                 cell_offset,
@@ -791,21 +827,21 @@ impl DataManager {
                                 error!("Failed to write undo log entry: {:?}", error);
                             }
                         }
-                        cell.header.version = orig_version;
                         let mut old_cell_ref = None;
                         match self.chunks().update_cell_by(&cell_id, |cell_to_update| {
-                            if cell_to_update.header.version == orig_version {
+                            if cell_to_update.header.version == expected_version {
                                 old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
+                                cell.header.version = expected_version;
                                 Some(cell)
                             } else {
                                 None
                             }
                         }) {
-                            Ok(cell) => {
+                            Ok(updated_cell) => {
                                 debug_assert!(old_cell_ref.is_some());
                                 txn.history.insert(
                                     cell_id,
-                                    CellHistory::new(old_cell_ref, cell.header.version),
+                                    CellHistory::new(old_cell_ref, updated_cell.header.version),
                                 );
                                 meta.write = effective_ts.clone();
                                 txn.segment_guards.push(guard);
@@ -823,15 +859,7 @@ impl DataManager {
         crate::ram::chunk::set_transaction_context(false);
 
         if let Some((id, error)) = write_error {
-            let guards_to_drop = std::mem::take(&mut txn.segment_guards);
-            drop(txn);
-            drop(guards_to_drop);
-            return match error {
-                WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
-                    DMCommitResult::CellChanged(id)
-                }
-                _ => DMCommitResult::WriteError(id, error),
-            };
+            return Self::map_commit_write_error(&txn, id, error);
         }
 
         txn.state = TxnState::Committed;
@@ -886,11 +914,66 @@ impl DataManager {
         Ok(())
     }
 
+    fn validate_commit_payload(
+        txn: &Transaction,
+        cells: &[CommitOp],
+    ) -> Result<(), DMCommitResult> {
+        for op in cells {
+            let cell_id =
+                Self::commit_op_cell_id(op).map_err(|error| DMCommitResult::CheckFailed(error))?;
+            let Some(certified) = txn.certified_op(&cell_id) else {
+                return Err(DMCommitResult::CheckFailed(CheckError::CannotEnd));
+            };
+
+            let valid = match op {
+                CommitOp::Write(_) => {
+                    certified.intent == PrepareIntent::Write
+                        && certified.expectation == CellExpectation::Absent
+                }
+                CommitOp::Update(_) | CommitOp::Remove(_) => {
+                    certified.intent == PrepareIntent::Write
+                        && matches!(certified.expectation, CellExpectation::Present(_))
+                }
+                CommitOp::Read(_, version) => {
+                    certified.intent == PrepareIntent::Read
+                        && certified.expectation == CellExpectation::Present(*version)
+                }
+                CommitOp::None => false,
+            };
+
+            if !valid {
+                return Err(DMCommitResult::CheckFailed(CheckError::CannotEnd));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn map_commit_write_error(txn: &Transaction, id: Id, error: WriteError) -> DMCommitResult {
+        let expected_present = txn.certified_present_version(&id).is_some();
+        let expected_absent_write = txn.certified_expects_absent_write(&id);
+        let is_cell_changed = match &error {
+            WriteError::DeletionPredictionFailed
+            | WriteError::UserCanceledUpdate
+            | WriteError::CellVersionMismatch => true,
+            WriteError::CellDoesNotExisted
+            | WriteError::ReadError(ReadError::CellDoesNotExisted) => expected_present,
+            WriteError::CellAlreadyExisted => expected_absent_write,
+            _ => false,
+        };
+
+        if is_cell_changed {
+            DMCommitResult::CellChanged(id)
+        } else {
+            DMCommitResult::WriteError(id, error)
+        }
+    }
+
     fn commit_op_cell_id(op: &CommitOp) -> Result<Id, CheckError> {
         match op {
             CommitOp::Write(cell) | CommitOp::Update(cell) => Ok(cell.id()),
-            CommitOp::Remove(id) => Ok(*id),
-            CommitOp::Read(_, _) | CommitOp::None => Err(CheckError::CannotEnd),
+            CommitOp::Remove(id) | CommitOp::Read(id, _) => Ok(*id),
+            CommitOp::None => Err(CheckError::CannotEnd),
         }
     }
 }
@@ -1044,6 +1127,38 @@ mod tests {
             meta.owner = Some(owner.clone());
             meta.lock_acquired_at = Some(lock_time);
         }
+    }
+
+    async fn prepare_ops_local(
+        manager: &Arc<DataManager>,
+        coordinator_id: u64,
+        tid: &TxnId,
+        ops: Vec<PrepareOp>,
+    ) -> DMPrepareResult {
+        <DataManager as Service>::prepare(manager, coordinator_id, tid.clone(), tid.clone(), ops)
+            .await
+            .payload
+    }
+
+    async fn commit_ops_local(
+        manager: &Arc<DataManager>,
+        tid: &TxnId,
+        ops: Vec<CommitOp>,
+    ) -> DMCommitResult {
+        <DataManager as Service>::commit(manager, tid.clone(), tid.clone(), ops)
+            .await
+            .payload
+    }
+
+    async fn abort_and_end_local(manager: &Arc<DataManager>, tid: &TxnId) {
+        let abort = <DataManager as Service>::abort(manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort, AbortResult::Success(None));
+        let end = <DataManager as Service>::end(manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2238,6 +2353,347 @@ mod tests {
             .payload;
         assert_eq!(end_t1, EndResult::Success);
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_vector_clock_stale_update_rejected_after_committed_peer_changes_version() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5351";
+        let group = "txn_data_site_concurrent_stale_update";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8210);
+        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 0, 0);
+        let t1 = StandardVectorClock::from_vec(vec![(11, 1)]);
+        let t2 = StandardVectorClock::from_vec(vec![(22, 1)]);
+        let prepare_op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_version),
+            intent: PrepareIntent::Write,
+        };
+
+        assert_eq!(
+            t1.relation(&t2),
+            bifrost::vector_clock::Relation::Concurrent
+        );
+
+        let prepare_t1 = prepare_ops_local(&manager, 11, &t1, vec![prepare_op.clone()]).await;
+        assert_eq!(prepare_t1, DMPrepareResult::Success);
+
+        let commit_t1 = commit_ops_local(
+            &manager,
+            &t1,
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                1,
+                "counter_concurrent_stale_t1",
+            ))],
+        )
+        .await;
+        assert_eq!(commit_t1, DMCommitResult::Success);
+
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+            .await
+            .payload;
+        assert_eq!(end_t1, EndResult::Success);
+
+        let prepare_t2 = prepare_ops_local(&manager, 22, &t2, vec![prepare_op]).await;
+        assert_eq!(prepare_t2, DMPrepareResult::NotRealizable);
+
+        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*persisted.data["score"].u64().unwrap(), 1);
+        assert!(persisted.header.version > initial_version);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_rejects_change_after_certification() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5352";
+        let group = "txn_data_site_commit_rechecks_certified_version";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8211);
+        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 1, 0);
+        let tid = StandardVectorClock::from_vec(vec![(31, 1)]);
+
+        let prepare = prepare_ops_local(
+            &manager,
+            31,
+            &tid,
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Present(initial_version),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+
+        let mut external = counter_cell(schema.id, cell_id, 7, "counter_commit_external");
+        let external_header = runtime.chunks().update_cell(&mut external).unwrap();
+        assert!(external_header.version > initial_version);
+
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                99,
+                "counter_commit_after_certification",
+            ))],
+        )
+        .await;
+        assert_eq!(commit, DMCommitResult::CellChanged(cell_id));
+
+        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*persisted.data["score"].u64().unwrap(), 7);
+        assert_eq!(persisted.header.version, external_header.version);
+
+        let txn = manager.txns.get(&tid).expect("txn should remain tracked");
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert!(txn.history.is_empty());
+        drop(txn);
+
+        abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_remove_rejects_change_after_certification() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5353";
+        let group = "txn_data_site_remove_rechecks_certified_version";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8212);
+        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 2, 0);
+        let tid = StandardVectorClock::from_vec(vec![(32, 1)]);
+
+        let prepare = prepare_ops_local(
+            &manager,
+            32,
+            &tid,
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Present(initial_version),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+
+        let mut external = counter_cell(schema.id, cell_id, 8, "counter_remove_external");
+        let external_header = runtime.chunks().update_cell(&mut external).unwrap();
+        assert!(external_header.version > initial_version);
+
+        let commit = commit_ops_local(&manager, &tid, vec![CommitOp::Remove(cell_id)]).await;
+        assert_eq!(commit, DMCommitResult::CellChanged(cell_id));
+
+        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*persisted.data["score"].u64().unwrap(), 8);
+        assert_eq!(persisted.header.version, external_header.version);
+
+        let txn = manager.txns.get(&tid).expect("txn should remain tracked");
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert!(txn.history.is_empty());
+        drop(txn);
+
+        abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_update_rejects_missing_after_certification() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5356";
+        let group = "txn_data_site_update_rechecks_missing_certification";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8216);
+        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
+        let tid = StandardVectorClock::from_vec(vec![(35, 1)]);
+
+        let prepare = prepare_ops_local(
+            &manager,
+            35,
+            &tid,
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Present(initial_version),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+
+        runtime
+            .chunks()
+            .remove_cell_by(&cell_id, |_| true)
+            .expect("external direct removal should succeed");
+
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                18,
+                "counter_update_after_external_remove",
+            ))],
+        )
+        .await;
+        assert_eq!(commit, DMCommitResult::CellChanged(cell_id));
+        assert!(
+            matches!(
+                runtime.chunks().read_cell(&cell_id),
+                Err(ReadError::CellDoesNotExisted)
+            ),
+            "cell should remain missing after stale certified update"
+        );
+
+        let txn = manager.txns.get(&tid).expect("txn should remain tracked");
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert!(txn.history.is_empty());
+        drop(txn);
+
+        abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_write_rejects_insert_after_absent_certification() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5354";
+        let group = "txn_data_site_write_rechecks_absent_certification";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8213);
+        let tid = StandardVectorClock::from_vec(vec![(33, 1)]);
+
+        let prepare = prepare_ops_local(
+            &manager,
+            33,
+            &tid,
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Absent,
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+
+        let mut external = counter_cell(schema.id, cell_id, 5, "counter_write_external");
+        let external_header = runtime.chunks().write_cell(&mut external).unwrap();
+
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![CommitOp::Write(counter_cell(
+                schema.id,
+                cell_id,
+                11,
+                "counter_write_after_absent_prepare",
+            ))],
+        )
+        .await;
+        assert_eq!(commit, DMCommitResult::CellChanged(cell_id));
+
+        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*persisted.data["score"].u64().unwrap(), 5);
+        assert_eq!(persisted.header.version, external_header.version);
+
+        let txn = manager.txns.get(&tid).expect("txn should remain tracked");
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert!(txn.history.is_empty());
+        drop(txn);
+
+        abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_prevalidates_full_payload_before_any_storage_mutation() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5355";
+        let group = "txn_data_site_commit_prevalidation";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_a = Id::new(0, 8214);
+        let cell_b = Id::new(0, 8215);
+        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 3, 0);
+        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 4, 0);
+        let tid = StandardVectorClock::from_vec(vec![(34, 1)]);
+
+        let prepare = prepare_ops_local(
+            &manager,
+            34,
+            &tid,
+            vec![
+                PrepareOp {
+                    id: cell_a,
+                    expectation: CellExpectation::Present(version_a),
+                    intent: PrepareIntent::Write,
+                },
+                PrepareOp {
+                    id: cell_b,
+                    expectation: CellExpectation::Present(version_b),
+                    intent: PrepareIntent::Read,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+
+        let before_a = runtime.chunks().read_cell(&cell_a).unwrap().to_owned();
+        let before_b = runtime.chunks().read_cell(&cell_b).unwrap().to_owned();
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![
+                CommitOp::Update(counter_cell(schema.id, cell_a, 13, "counter_prevalidate_a")),
+                CommitOp::Update(counter_cell(schema.id, cell_b, 14, "counter_prevalidate_b")),
+            ],
+        )
+        .await;
+
+        assert_eq!(commit, DMCommitResult::CheckFailed(CheckError::CannotEnd));
+
+        let after_a = runtime.chunks().read_cell(&cell_a).unwrap().to_owned();
+        let after_b = runtime.chunks().read_cell(&cell_b).unwrap().to_owned();
+        assert_eq!(after_a.data, before_a.data);
+        assert_eq!(after_a.header.version, before_a.header.version);
+        assert_eq!(after_b.data, before_b.data);
+        assert_eq!(after_b.header.version, before_b.header.version);
+
+        let txn = manager.txns.get(&tid).expect("txn should remain tracked");
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert!(txn.history.is_empty());
+        drop(txn);
+
+        abort_and_end_local(&manager, &tid).await;
         server.shutdown().await;
     }
 }
