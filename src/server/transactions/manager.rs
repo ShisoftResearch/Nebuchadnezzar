@@ -17,6 +17,7 @@ use std::io;
 use async_std::sync::{Mutex, MutexGuard};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -873,8 +874,8 @@ impl TransactionManager {
         affected_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
     ) -> Result<DMPrepareResult, TMError> {
-        let mut prepare_futures: FuturesUnordered<_> = affected_objs
-            .into_iter()
+        let prepare_futures: FuturesUnordered<_> = affected_objs
+            .iter()
             .map(|(server, objs)| async move {
                 let data_site = data_sites.get(server).unwrap().clone();
                 TransactionManager::site_prepare(
@@ -887,14 +888,8 @@ impl TransactionManager {
                 .await
             })
             .collect();
-        while let Some(result) = prepare_futures.next().await {
-            match result {
-                Ok(DMPrepareResult::Success) => {}
-                Ok(res) => return Ok(res),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(DMPrepareResult::Success)
+        let results: Vec<Result<DMPrepareResult, TMError>> = prepare_futures.collect().await;
+        Self::reduce_prepare_results(results)
     }
     async fn sites_commit(
         &self,
@@ -1034,6 +1029,31 @@ impl TransactionManager {
     fn ensure_rw_state(&self, txn: &TxnGuard) -> Result<(), TMError> {
         self.ensure_txn_state(txn, TxnState::Started)
     }
+
+    fn reduce_prepare_results<I>(results: I) -> Result<DMPrepareResult, TMError>
+    where
+        I: IntoIterator<Item = Result<DMPrepareResult, TMError>>,
+    {
+        let mut first_failure = None;
+        let mut first_error = None;
+
+        for result in results {
+            match result {
+                Ok(DMPrepareResult::Success) => {}
+                Ok(other) if first_failure.is_none() => first_failure = Some(other),
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(first_failure.unwrap_or(DMPrepareResult::Success))
+        }
+    }
+
     fn cleanup_transaction(&self, tid: &TxnId) {
         let txn = self.transactions.remove(tid);
         if let Some(txn) = txn {
@@ -1241,6 +1261,20 @@ mod tests {
             CommitOp::Update(updated) => assert_eq!(updated.data, cell.data),
             other => panic!("expected update commit op, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn prepare_result_reduction_waits_for_all_and_returns_first_failure() {
+        let results = vec![
+            Ok(DMPrepareResult::Success),
+            Ok(DMPrepareResult::NotRealizable),
+            Ok(DMPrepareResult::Success),
+        ];
+
+        assert_eq!(
+            TransactionManager::reduce_prepare_results(results).unwrap(),
+            DMPrepareResult::NotRealizable
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1659,7 +1693,8 @@ mod tests {
             );
 
             match prepare_result {
-                Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
+                Ok(TMPrepareResult::Success)
+                | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
                 | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))
                 | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::TransactionNotExisted))
                 | Err(TMError::TransactionNotFound) => {}
@@ -1759,7 +1794,8 @@ mod tests {
                 );
 
                 match prepare_result {
-                    Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
+                    Ok(TMPrepareResult::Success)
+                    | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
                     | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))
                     | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::TransactionNotExisted))
                     | Err(TMError::TransactionNotFound) => {}

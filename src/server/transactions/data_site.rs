@@ -18,7 +18,11 @@ use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::time::Duration;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
@@ -38,6 +42,65 @@ const MAX_LOCK_RELEASE_RETRIES: usize = 3;
 
 // Backoff between lock release retries in milliseconds
 const LOCK_RELEASE_RETRY_BACKOFF_MS: u64 = 100;
+
+#[cfg(test)]
+struct PrepareDelayState {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    released: AtomicBool,
+    released_notify: Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct PrepareDelayHandle {
+    state: Arc<PrepareDelayState>,
+}
+
+#[cfg(test)]
+impl PrepareDelayHandle {
+    pub(crate) async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self
+            .state
+            .entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        notified.await;
+    }
+
+    pub(crate) fn release(&self) {
+        if !self
+            .state
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.state.released_notify.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+static PREPARE_DELAY_HOOKS: OnceLock<Mutex<BTreeMap<Id, Arc<PrepareDelayState>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn prepare_delay_hooks() -> &'static Mutex<BTreeMap<Id, Arc<PrepareDelayState>>> {
+    PREPARE_DELAY_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_prepare_delay_for_cell(id: Id) -> PrepareDelayHandle {
+    let state = Arc::new(PrepareDelayState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    prepare_delay_hooks().lock().insert(id, state.clone());
+    PrepareDelayHandle { state }
+}
 
 type CommitHistory = BTreeMap<Id, CellHistory>;
 type CellMetaMutex = Arc<Mutex<CellMeta>>;
@@ -257,6 +320,38 @@ impl DataManager {
         future::ready(DataSiteResponse::new(&self.txn_peer, data)).boxed()
     }
 
+    #[cfg(test)]
+    fn matching_prepare_delay(prepared_ops: &[PrepareOp]) -> Option<Arc<PrepareDelayState>> {
+        let hooks = prepare_delay_hooks().lock();
+        prepared_ops
+            .iter()
+            .find_map(|op| hooks.get(&op.id).cloned())
+    }
+
+    #[cfg(test)]
+    async fn await_prepare_delay(state: &Arc<PrepareDelayState>) {
+        state
+            .entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.entered_notify.notify_waiters();
+        let notified = state.released_notify.notified();
+        if state
+            .released
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        notified.await;
+    }
+
+    #[cfg(test)]
+    fn clear_prepare_delay(prepared_ops: &[PrepareOp]) {
+        let mut hooks = prepare_delay_hooks().lock();
+        for op in prepared_ops {
+            hooks.remove(&op.id);
+        }
+    }
+
     fn canonical_prepare_ops(ops: Vec<PrepareOp>) -> Result<Vec<PrepareOp>, DMPrepareResult> {
         let mut by_id = BTreeMap::new();
         for op in ops {
@@ -415,8 +510,6 @@ impl DataManager {
         T: 'static + Clone,
     {
         self.update_clock(clock);
-        let txn_lock = self.get_or_create_transaction(tid);
-        let mut txn = txn_lock.lock();
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
         let committing = meta.owner.is_some();
@@ -426,11 +519,6 @@ impl DataManager {
         // due to clock updates from concurrent transactions
         let effective_ts = if clock > tid { clock } else { tid };
         let read_too_late = &meta.write > effective_ts;
-
-        txn.last_activity = get_time();
-        if txn.state != TxnState::Started {
-            return Err(self.response_with(TxnExecResult::StateError(txn.state)));
-        }
 
         // Check timestamp constraints first
         if read_too_late {
@@ -1816,6 +1904,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_transaction_creates_no_data_site_transaction() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5358";
+        let group = "txn_data_site_read_only_stateless";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99011);
+        seed_cell_version(&runtime, schema.id, cell_id, 7, 0);
+        let tid = StandardVectorClock::from_vec(vec![(31, 1)]);
+
+        let response =
+            <DataManager as Service>::read(&manager, 31, tid.clone(), tid.clone(), cell_id)
+                .await
+                .payload;
+
+        assert!(matches!(response, TxnExecResult::Accepted(_)));
+        assert!(manager.find_transaction(&tid).is_none());
+        assert_eq!(manager.txns.len(), 0);
+        assert!(manager.txns_sorted.lock().is_empty());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn end_cleans_up_many_active_transactions_without_leaking_bookkeeping() {
         let _ = env_logger::try_init();
         let address = "127.0.0.1:5291";
@@ -3115,97 +3229,111 @@ impl Service for DataManager {
         ops: Vec<PrepareOp>,
     ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
         debug!("PREPARE FOR {:?}, {} ops", &tid, ops.len());
-        self.update_clock(&clock);
+        async move {
+            self.update_clock(&clock);
 
-        let prepared_ops = match Self::canonical_prepare_ops(ops) {
-            Ok(prepared_ops) => prepared_ops,
-            Err(result) => return self.response_with(result),
-        };
-        let prepared_ops_by_id: BTreeMap<Id, PrepareOp> =
-            prepared_ops.iter().cloned().map(|op| (op.id, op)).collect();
-        let requester = TxnPriority::new(tid.clone(), coordinator_id);
-
-        let txn_lock = self.get_or_create_transaction(&tid);
-        let mut txn = txn_lock.lock();
-        match txn.state {
-            TxnState::Started => {}
-            TxnState::Prepared => {
-                if txn.coordinator_id != Some(coordinator_id) || txn.certified != prepared_ops_by_id
-                {
-                    return self.response_with(DMPrepareResult::StateError(TxnState::Prepared));
-                }
+            let prepared_ops = match Self::canonical_prepare_ops(ops) {
+                Ok(prepared_ops) => prepared_ops,
+                Err(result) => return self.response_with(result).await,
+            };
+            #[cfg(test)]
+            if let Some(state) = Self::matching_prepare_delay(&prepared_ops) {
+                Self::await_prepare_delay(&state).await;
             }
-            _ => return self.response_with(DMPrepareResult::StateError(txn.state)),
-        }
 
-        let mut cell_mutices = Vec::with_capacity(prepared_ops.len());
-        let mut cell_guards = Vec::with_capacity(prepared_ops.len());
+            let prepared_ops_by_id: BTreeMap<Id, PrepareOp> =
+                prepared_ops.iter().cloned().map(|op| (op.id, op)).collect();
+            let requester = TxnPriority::new(tid.clone(), coordinator_id);
 
-        for op in &prepared_ops {
-            cell_mutices.push(self.cell_meta_mutex(&op.id));
-        }
-        for cell_mutex in &cell_mutices {
-            let mut meta = cell_mutex.lock();
-            let current_time = get_time();
+            let result = 'result: {
+                let txn_lock = self.get_or_create_transaction(&tid);
+                let mut txn = txn_lock.lock();
+                match txn.state {
+                    TxnState::Started => {}
+                    TxnState::Prepared => {
+                        if txn.coordinator_id != Some(coordinator_id)
+                            || txn.certified != prepared_ops_by_id
+                        {
+                            break 'result DMPrepareResult::StateError(TxnState::Prepared);
+                        }
+                    }
+                    _ => break 'result DMPrepareResult::StateError(txn.state),
+                }
 
-            if let Some(owner) = meta.owner.clone() {
-                if owner != requester {
-                    let lock_age = meta
-                        .lock_acquired_at
-                        .map(|acquired| current_time - acquired)
-                        .unwrap_or(0);
+                let mut cell_mutices = Vec::with_capacity(prepared_ops.len());
+                let mut cell_guards = Vec::with_capacity(prepared_ops.len());
 
-                    if lock_age > LOCK_TIMEOUT_MS {
-                        // Lock expiry is treated as lease expiry; the old owner can no longer commit
-                        // once certification ownership is revalidated during commit.
-                        warn!(
-                            "PREPARE: Reclaiming stale lock on cell (held for {}ms by {:?}), now claimed by {:?}",
-                            lock_age, owner, requester
-                        );
-                        meta.owner = None;
-                        meta.lock_acquired_at = None;
-                    } else if requester.compare_age(&owner).is_gt() {
+                for op in &prepared_ops {
+                    cell_mutices.push(self.cell_meta_mutex(&op.id));
+                }
+                for cell_mutex in &cell_mutices {
+                    let mut meta = cell_mutex.lock();
+                    let current_time = get_time();
+
+                    if let Some(owner) = meta.owner.clone() {
+                        if owner != requester {
+                            let lock_age = meta
+                                .lock_acquired_at
+                                .map(|acquired| current_time - acquired)
+                                .unwrap_or(0);
+
+                            if lock_age > LOCK_TIMEOUT_MS {
+                                warn!(
+                                    "PREPARE: Reclaiming stale lock on cell (held for {}ms by {:?}), now claimed by {:?}",
+                                    lock_age, owner, requester
+                                );
+                                meta.owner = None;
+                                meta.lock_acquired_at = None;
+                            } else if requester.compare_age(&owner).is_gt() {
+                                debug!(
+                                    "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
+                                    requester, owner, lock_age
+                                );
+                                break 'result DMPrepareResult::NotRealizable;
+                            } else {
+                                debug!(
+                                    "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?} (lock age: {}ms)",
+                                    requester, owner, lock_age
+                                );
+                                break 'result DMPrepareResult::Wait;
+                            }
+                        }
+                    }
+
+                    cell_guards.push(meta);
+                }
+
+                for op in &prepared_ops {
+                    if !self.prepare_expectation_matches(op) {
                         debug!(
-                            "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
-                            requester, owner, lock_age
+                            "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
+                            requester, op.id, op
                         );
-                        return self.response_with(DMPrepareResult::NotRealizable);
-                    } else {
-                        debug!(
-                            "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?} (lock age: {}ms)",
-                            requester, owner, lock_age
-                        );
-                        return self.response_with(DMPrepareResult::Wait);
+                        break 'result DMPrepareResult::NotRealizable;
                     }
                 }
-            }
 
-            cell_guards.push(meta);
+                let lock_time = get_time();
+                for meta in &mut cell_guards {
+                    meta.owner = Some(requester.clone());
+                    meta.lock_acquired_at = Some(lock_time);
+                }
+
+                txn.certified = prepared_ops_by_id;
+                txn.affected_cells = txn.certified.keys().copied().collect();
+                txn.coordinator_id = Some(coordinator_id);
+                txn.state = TxnState::Prepared;
+                txn.last_activity = get_time();
+                debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
+                DMPrepareResult::Success
+            };
+
+            #[cfg(test)]
+            Self::clear_prepare_delay(&prepared_ops);
+
+            self.response_with(result).await
         }
-
-        for op in &prepared_ops {
-            if !self.prepare_expectation_matches(op) {
-                debug!(
-                    "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
-                    requester, op.id, op
-                );
-                return self.response_with(DMPrepareResult::NotRealizable);
-            }
-        }
-
-        let lock_time = get_time();
-        for meta in &mut cell_guards {
-            meta.owner = Some(requester.clone());
-            meta.lock_acquired_at = Some(lock_time);
-        }
-
-        txn.certified = prepared_ops_by_id;
-        txn.affected_cells = txn.certified.keys().copied().collect();
-        txn.coordinator_id = Some(coordinator_id);
-        txn.state = TxnState::Prepared;
-        txn.last_activity = get_time();
-        debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
-        self.response_with(DMPrepareResult::Success)
+        .boxed()
     }
     fn commit(
         &self,
