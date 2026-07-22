@@ -214,17 +214,6 @@ where
     ) -> Result<usize, Box<dyn std::any::Any + Send + 'static>> {
         panic::catch_unwind(panic::AssertUnwindSafe(|| self.search(key)))
     }
-    pub fn remove_at(&mut self, pos: usize) {
-        let cached_len = &mut self.len;
-        trace!(
-            "Removing from external pos {}, len {}, key {:?}",
-            pos,
-            cached_len,
-            self.keys.as_slice()[pos]
-        );
-        self.keys.remove_at(pos, cached_len);
-    }
-
     pub fn split_insert(
         &mut self,
         key: EntryKey,
@@ -344,41 +333,34 @@ where
         })
     }
 
-    pub fn merge_with(&mut self, right: &mut Self) {
-        trace!(
-            "Merge external node, left len {}:{:?}, right len {}:{:?}",
-            self.len,
-            self.keys,
-            right.len,
-            right.keys
-        );
-        let self_len = self.len;
-        let new_len = self.len + right.len;
-        debug_assert!(new_len <= KS::slice_len());
-        for i in self.len..new_len {
-            mem::swap(
-                &mut self.keys.as_slice()[i],
-                &mut right.keys.as_slice()[i - self_len],
-            );
-        }
-        self.len = new_len;
-    }
-
+    // Compacts tombstoned keys: removes them from the page AND drops their
+    // tombstones from the deletion set. The caller must hold this page's
+    // write latch — the set drop happens before the latch releases, so any
+    // validated snapshot orders entirely before (key present + tombstone
+    // present) or after (neither) this compaction. Cursors additionally
+    // filter tombstoned keys at snapshot time to stay race-free. Protocol
+    // model-checked in docs/tla/DeletionReclaim.tla.
     pub fn remove_contains(&mut self, set: &DeletionSet) {
-        let remaining_keys = {
-            let remaining = self.keys.as_slice()[..self.len]
+        let (remaining_keys, removed_keys) = {
+            let (removed, remaining): (Vec<&EntryKey>, Vec<&EntryKey>) = self.keys.as_slice()
+                [..self.len]
                 .iter()
-                .filter(|&k| !set.contains(k))
-                .collect_vec();
-            if remaining.len() == self.len {
+                .partition(|&k| set.contains(k));
+            if removed.is_empty() {
                 return;
             }
-            remaining.into_iter().cloned().collect_vec()
+            (
+                remaining.into_iter().cloned().collect_vec(),
+                removed.into_iter().cloned().collect_vec(),
+            )
         };
         let self_key_slice = self.keys.as_slice();
         self.len = remaining_keys.len();
         for (i, k_ref) in remaining_keys.into_iter().enumerate() {
             self_key_slice[i] = k_ref;
+        }
+        for key in &removed_keys {
+            set.remove(key);
         }
     }
 

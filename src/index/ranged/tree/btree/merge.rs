@@ -111,6 +111,11 @@ where
                     start_key
                 );
                 current_guard = write_targeted(current_guard, start_key);
+                // Compact tombstoned keys first: it may free slots and avoid
+                // a split, and it reclaims their tombstones (remove_contains).
+                current_guard
+                    .extnode_mut(tree)
+                    .remove_contains(&*tree.deletion);
                 let remain_slots = KS::slice_len() - current_guard.len();
                 trace!(
                     "Locked on targed with {:?}, remaining slots {}",
@@ -119,7 +124,6 @@ where
                 );
                 if remain_slots > 0 {
                     let ext_node = current_guard.extnode_mut(tree);
-                    ext_node.remove_contains(&*tree.deletion);
                     let selection = keys[merging_pos..keys_len]
                         .iter()
                         .filter(|&k| k < &ext_node.right_bound)

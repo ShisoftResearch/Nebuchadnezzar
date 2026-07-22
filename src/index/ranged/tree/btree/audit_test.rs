@@ -164,3 +164,84 @@ fn concurrent_scan_does_not_skip_keys() {
         NUM as usize - min_count
     );
 }
+
+// Tombstone compaction: remove_contains under the page latch must remove the
+// keys physically AND drop their tombstones (docs/tla/DeletionReclaim.tla).
+#[test]
+fn tombstone_compaction_reclaims_set() {
+    let _ = env_logger::try_init();
+    let deletion = deletion_set();
+    let tree = TinyTree::new(&deletion);
+    const N: u64 = 40;
+    for n in 0..N {
+        assert!(tree.insert(&key_of(n)));
+    }
+    // Tombstone the even keys.
+    for n in (0..N).step_by(2) {
+        assert!(deletion.insert(key_of(n)));
+    }
+    // Compact every leaf page under its write latch, walking the chain.
+    let mut node_ref = tree.get_root();
+    loop {
+        let next = match &*read_unchecked::<TinyKeySlice, TinyPtrSlice>(&node_ref) {
+            &NodeData::Internal(ref n) => n.ptrs.as_slice_immute()[0].clone(),
+            &NodeData::External(_) => break,
+            _ => unreachable!(),
+        };
+        node_ref = next;
+    }
+    let mut page_ref = node_ref;
+    while !page_ref.is_default() {
+        let mut guard = write_node::<TinyKeySlice, TinyPtrSlice>(&page_ref);
+        let next = guard.extnode_mut_no_persist().next.clone();
+        guard
+            .extnode_mut_no_persist()
+            .remove_contains(&deletion);
+        drop(guard);
+        page_ref = next;
+    }
+    // Tombstones are gone from the set.
+    for n in (0..N).step_by(2) {
+        assert!(
+            !deletion.contains(&key_of(n)),
+            "tombstone for {} must be reclaimed",
+            n
+        );
+    }
+    // Scan yields exactly the odd keys.
+    let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
+    let mut seen = vec![];
+    while let Some(k) = cursor.next() {
+        seen.push(k);
+    }
+    let expected: Vec<_> = (1..N).step_by(2).map(key_of).collect();
+    assert_eq!(seen, expected);
+    // Reclaimed keys can be re-inserted and become visible again.
+    assert!(tree.insert(&key_of(0)));
+    let cursor = tree.seek(&key_of(0), Ordering::Forward);
+    assert_eq!(cursor.current(), Some(&key_of(0)));
+}
+
+// The bulk-merge path calls remove_contains too; tombstones must be dropped.
+#[test]
+fn merge_compaction_drops_tombstones() {
+    let _ = env_logger::try_init();
+    let deletion = deletion_set();
+    let tree = TinyTree::new(&deletion);
+    for n in [0u64, 2, 4, 6, 8] {
+        assert!(tree.insert(&key_of(n)));
+    }
+    assert!(deletion.insert(key_of(2)));
+    assert!(deletion.insert(key_of(6)));
+    tree.merge_with_keys_(vec![key_of(1)]);
+    assert!(!deletion.contains(&key_of(2)));
+    assert!(!deletion.contains(&key_of(6)));
+    let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
+    let mut seen = vec![];
+    while let Some(k) = cursor.next() {
+        seen.push(k);
+    }
+    let expected: Vec<_> = [0u64, 1, 4, 8].iter().map(|&n| key_of(n)).collect();
+    assert_eq!(seen, expected);
+    assert!(verification::is_tree_in_order(&tree, 0));
+}

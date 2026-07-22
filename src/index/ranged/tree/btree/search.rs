@@ -71,6 +71,7 @@ where
                     Ok(match found {
                         Some(idx) => RTCursor::from_lazy(
                             all[idx].clone(),
+                            filter_deleted && deletion.contains(&all[idx]),
                             node_ref.clone(),
                             ordering,
                             deletion.clone(),

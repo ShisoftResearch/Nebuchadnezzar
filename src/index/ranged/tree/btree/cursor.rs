@@ -32,6 +32,10 @@ where
     // tail copy). Position is re-derived from `current` by binary search, so
     // the deferred read stays correct if the page split in between.
     lazy: bool,
+    // Tombstone verdict for the lazy `current`, taken inside the same
+    // validated read that captured it (checking later races with tombstone
+    // reclamation).
+    current_deleted: bool,
 }
 
 // Result of reading one page while walking the sibling chain.
@@ -61,6 +65,7 @@ where
             keys: Vec::new(),
             follow: NodeCellRef::default(),
             lazy: false,
+            current_deleted: false,
         }
     }
 
@@ -88,6 +93,7 @@ where
             keys,
             follow,
             lazy: false,
+            current_deleted: false,
         }
     }
 
@@ -95,6 +101,7 @@ where
     // the rest of the page is read on first advance.
     pub(super) fn from_lazy(
         current: EntryKey,
+        current_deleted: bool,
         page: NodeCellRef,
         ordering: Ordering,
         deletion: Arc<DeletionSet>,
@@ -111,6 +118,7 @@ where
             keys: Vec::new(),
             follow: NodeCellRef::default(),
             lazy: true,
+            current_deleted,
         }
     }
 
@@ -119,7 +127,7 @@ where
     // closure.
     pub(super) fn initialize(&mut self) {
         if self.lazy {
-            if self.current_is_deleted() {
+            if self.current_deleted || self.current_is_deleted() {
                 self.advance();
             }
             return;
@@ -148,7 +156,16 @@ where
     }
 
     // Read one page of the sibling chain without side effects on the cursor.
-    fn read_page(page_ref: &NodeCellRef, ordering: Ordering) -> PageSnap {
+    // Tombstoned keys are filtered inside the validated closure: tombstone
+    // reclamation drops a tombstone under the page's write latch, so a
+    // validated snapshot sees either key+tombstone (filtered here) or
+    // neither — checking at yield time instead would race the reclaim.
+    fn read_page(
+        page_ref: &NodeCellRef,
+        ordering: Ordering,
+        deletion: &DeletionSet,
+        filter_deleted: bool,
+    ) -> PageSnap {
         if page_ref.is_default() {
             return PageSnap::End;
         }
@@ -158,10 +175,15 @@ where
                     Ordering::Forward => n.next.clone(),
                     Ordering::Backward => n.prev.clone(),
                 };
-                if n.len == 0 {
+                let keys: Vec<EntryKey> = n.keys.as_slice_immute()[..n.len]
+                    .iter()
+                    .filter(|k| !filter_deleted || !deletion.contains(k))
+                    .cloned()
+                    .collect();
+                if keys.is_empty() {
                     PageSnap::Skip(follow)
                 } else {
-                    PageSnap::Page(n.keys.as_slice_immute()[..n.len].to_vec(), follow)
+                    PageSnap::Page(keys, follow)
                 }
             }
             &NodeData::Empty(ref n) => PageSnap::Skip(match ordering {
@@ -179,7 +201,7 @@ where
     fn load_following_page(&mut self) -> bool {
         let mut follow = mem::take(&mut self.follow);
         loop {
-            match Self::read_page(&follow, self.ordering) {
+            match Self::read_page(&follow, self.ordering, &self.deletion, self.filter_deleted) {
                 PageSnap::End => return false,
                 PageSnap::Skip(next) => {
                     if next.is_default() {
@@ -219,6 +241,13 @@ where
         let snap = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::External(ref n) => {
                 let keys = &n.keys.as_slice_immute()[..n.len];
+                let snap = |range: &[EntryKey]| -> Vec<EntryKey> {
+                    range
+                        .iter()
+                        .filter(|k| !self.filter_deleted || !self.deletion.contains(k))
+                        .cloned()
+                        .collect()
+                };
                 match self.ordering {
                     Ordering::Forward => {
                         // First key strictly greater than the current one.
@@ -226,12 +255,12 @@ where
                             Ok(i) => i + 1,
                             Err(i) => i,
                         };
-                        PageSnap::Page(keys[pos..].to_vec(), n.next.clone())
+                        PageSnap::Page(snap(&keys[pos..]), n.next.clone())
                     }
                     Ordering::Backward => {
                         // Keys strictly smaller than the current one.
                         let pos = keys.binary_search(&cur).unwrap_or_else(|i| i);
-                        PageSnap::Page(keys[..pos].to_vec(), n.prev.clone())
+                        PageSnap::Page(snap(&keys[..pos]), n.prev.clone())
                     }
                 }
             }

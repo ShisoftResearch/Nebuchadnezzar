@@ -240,29 +240,28 @@ where
                     unreachable!();
                 }
             }
-            debug_assert!(
-                root.ptr_eq(&self.get_root()),
-                "Merge target tree should always have a persistent root unless merge split"
-            );
-            let root_guard = write_node::<KS, PS>(&root);
-            debug_assert!(*root_guard.node_ref() == self.get_root());
             info!(
                 "Radical merge split for root (may need to split more than once), {} to {}, num keys {}",
                 root_new_pages.len() + 1,
                 KS::slice_len(),
                 keys_len
             );
-            let mut new_pages = root_new_pages;
-            let mut left_most_page = root;
-            if new_pages.is_empty() {
-                // The root is still intact and does not need to be splitted
-                // Nothing need to do here
-            } else {
-                // In the current root level we have more than one root, should generate new levels
-                loop {
-                    // Need generate and rearrange new pages
-                    // First, generate a innode with one key and two pointers
-                    // The first pointer of the innode is original node (can be the root)
+            // The merged pages are already linked into the sibling chains, so
+            // they are searchable through B-link pointers regardless of what
+            // happens to the root. Build the new upper levels against an
+            // observed root using only fresh, unshared nodes, then install
+            // under the root-versioning latch if the root has not moved.
+            // Installation races with insert-driven root splits
+            // (apply_top_level_split), which take the same latch. Modeled in
+            // docs/tla/BLinkInsert.tla (the merger process).
+            loop {
+                let observed_root = self.get_root();
+                let mut new_pages = root_new_pages.clone();
+                let mut left_most_page = observed_root.clone();
+                let mut new_levels = 0usize;
+                let new_top = loop {
+                    // Generate an innode; its first pointer is the previous
+                    // level's left-most node (initially the observed root).
                     let new_node_ref = new_internal_node::<KS, PS>(&left_most_page, &mut new_pages);
                     let mut this_level_new_pages = BTreeMap::new();
                     if !new_pages.is_empty() {
@@ -272,17 +271,26 @@ where
                             &mut this_level_new_pages,
                         );
                     }
-                    self.height.fetch_add(1, AcqRel);
+                    new_levels += 1;
                     if this_level_new_pages.is_empty() {
-                        // All sub pages merged into the new page, should set the page as root and break
-                        *self.root.write() = new_node_ref;
-                        break;
-                    } else {
-                        // Have new pages to generate a new level
-                        new_pages = this_level_new_pages;
-                        left_most_page = new_node_ref;
+                        break new_node_ref;
                     }
+                    new_pages = this_level_new_pages;
+                    left_most_page = new_node_ref;
+                };
+                // No other latch is held here, so holding root_versioning
+                // cannot participate in a latch cycle.
+                let _root_ver_guard = write_node::<KS, PS>(&self.root_versioning);
+                if observed_root.ptr_eq(&self.get_root()) {
+                    *self.root.write() = new_top;
+                    for _ in 0..new_levels {
+                        self.height.fetch_add(1, AcqRel);
+                    }
+                    break;
                 }
+                // An insert installed a new root while the scaffolding was
+                // being built; discard it and rebuild against the new root.
+                warn!("Bulk merge lost a root install race; rebuilding upper levels");
             }
             debug_assert!(
                 verification::is_node_serial(&write_node::<KS, PS>(&self.get_root())),

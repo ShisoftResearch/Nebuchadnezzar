@@ -18,6 +18,10 @@ impl Default for EmptyNode {
     }
 }
 
+// repr(C): NodeCellRef::deref reinterprets nodes across generic
+// instantiations (all tree levels share the all-None DEFAULT_NODE), which is
+// only defined behavior if every instantiation lays out identically.
+#[repr(C)]
 pub enum NodeData<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -75,13 +79,6 @@ where
         }
     }
 
-    pub fn remove(&mut self, pos: usize) {
-        match self {
-            &mut NodeData::External(ref mut node) => node.remove_at(pos),
-            &mut NodeData::Internal(ref mut node) => node.remove_at(pos),
-            &mut NodeData::None | &mut NodeData::Empty(_) => unreachable!("{}", self.type_name()),
-        }
-    }
     pub fn is_ext(&self) -> bool {
         match self {
             &NodeData::External(_) => true,
@@ -162,23 +159,6 @@ where
             &NodeData::Empty(_) => 0,
             &NodeData::None => unreachable!(),
         }
-    }
-
-    // check if the node will be half full after an item have been removed
-    pub fn is_half_full(&self) -> bool {
-        if self.is_none() {
-            true
-        } else {
-            let len = self.len();
-            if len == 0 {
-                return false;
-            }
-            len >= KS::slice_len() / 2 && len > 1
-        }
-    }
-
-    pub fn cannot_merge(&self) -> bool {
-        self.len() > KS::slice_len() / 2
     }
 
     pub fn innode_mut(&mut self) -> &mut InNode<KS, PS> {
@@ -347,6 +327,8 @@ pub trait AnyNode: Any + Send + Sync + 'static {
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef>;
 }
 
+// repr(C): see NodeData — cc/data offsets must not depend on KS/PS.
+#[repr(C)]
 pub struct Node<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -633,15 +615,19 @@ where
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<'_, ()> {
-        let guard = write_node::<KS, PS>(node_ref);
-        let guard_ref = &*guard;
-        let cell = match guard_ref {
-            &NodeData::External(ref node) => Some(node.to_cell(&*deletion)),
-            &NodeData::Empty(_) => None,
-            _ => {
+        let mut guard = write_node::<KS, PS>(node_ref);
+        let cell = match &mut *guard {
+            &mut NodeData::External(ref mut node) => {
+                // Compact tombstoned keys while the latch is held; this also
+                // drops their tombstones (see remove_contains).
+                node.remove_contains(&*deletion);
+                Some(node.to_cell(&*deletion))
+            }
+            &mut NodeData::Empty(_) => None,
+            other => {
                 error!(
                     "Cannot persist internal or other type of nodes, type {}",
-                    guard_ref.type_name()
+                    other.type_name()
                 );
                 unreachable!();
             }
@@ -743,11 +729,6 @@ where
             mark: PhantomData,
         }
     }
-}
-
-pub struct RemoveStatus {
-    pub item_found: bool,
-    pub removed: bool,
 }
 
 pub fn insert_into_split<T, S>(

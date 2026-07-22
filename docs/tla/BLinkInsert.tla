@@ -34,7 +34,7 @@
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS NumProcs, Buggy, Stale
+CONSTANTS NumProcs, Buggy, Stale, NumMergers
 
 Nil == 0
 Inf == 99
@@ -47,14 +47,17 @@ Procs == 1..NumProcs
 \* pre-built full leaf.
 KeyOf(p) == IF Stale THEN (IF p = 1 THEN 0 ELSE 7) ELSE p
 
+Mergers == 1..NumMergers
+
 VARIABLES
     nodes,     \* NodeIds -> [typ, keys, ptrs, right, rb, latch]
     root,      \* current root node id
     rootVer,   \* owner of the root-versioning latch (Nil if free)
     pc, cur, rootSeen, via, pivot, newRight, tgt,
+    mpc, mroot, \* bulk-merger state: pc and the root it built against
     inserted   \* keys visible in the tree; searches must find all of them
 
-vars == <<nodes, root, rootVer, pc, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+vars == <<nodes, root, rootVer, pc, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 FreeNode == [typ |-> "free", keys |-> <<>>, ptrs |-> <<>>,
              right |-> Nil, rb |-> Inf, latch |-> Nil]
@@ -132,6 +135,8 @@ Init ==
     /\ pivot = [p \in Procs |-> 0]
     /\ newRight = [p \in Procs |-> Nil]
     /\ tgt = [p \in Procs |-> Nil]
+    /\ mpc = [m \in Mergers |-> "build"]
+    /\ mroot = [m \in Mergers |-> Nil]
 
 --------------------------------------------------------------------------
 
@@ -142,7 +147,7 @@ Start(p) ==
     /\ cur' = [cur EXCEPT ![p] = root]
     /\ via' = [via EXCEPT ![p] = nodes[root].typ = "internal"]
     /\ pc' = [pc EXCEPT ![p] = "descend"]
-    /\ UNCHANGED <<nodes, root, rootVer, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<nodes, root, rootVer, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 \* Latch-free descent to the leaf level.
 Descend(p) ==
@@ -152,14 +157,14 @@ Descend(p) ==
             /\ pc' = pc
        ELSE /\ cur' = cur
             /\ pc' = [pc EXCEPT ![p] = "latchLeaf"]
-    /\ UNCHANGED <<nodes, root, rootVer, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<nodes, root, rootVer, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 LatchLeaf(p) ==
     /\ pc[p] = "latchLeaf"
     /\ nodes[cur[p]].latch = Nil
     /\ nodes' = [nodes EXCEPT ![cur[p]].latch = p]
     /\ pc' = [pc EXCEPT ![p] = "moveRight"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 \* write_targeted: hand-over-hand walk right while the key is out of bound.
 MoveRight(p) ==
@@ -172,7 +177,7 @@ MoveRight(p) ==
             /\ pc' = pc
        ELSE /\ nodes' = nodes /\ cur' = cur
             /\ pc' = [pc EXCEPT ![p] = "leafOp"]
-    /\ UNCHANGED <<root, rootVer, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<root, rootVer, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 \* Plain insert, or split when full (ExtNode::insert / split_insert).
 LeafOp(p) ==
@@ -201,7 +206,7 @@ LeafOp(p) ==
                   /\ pivot' = [pivot EXCEPT ![p] = piv]
                   /\ inserted' = inserted \cup {k}
                   /\ pc' = [pc EXCEPT ![p] = IF via[p] THEN "parentLatch" ELSE "rootVerAcq"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, tgt>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, tgt, mpc, mroot>>
 
 \* Split of a non-top leaf: latch the internal node the descent came through
 \* (possibly stale), walk right by the pivot, insert. The leaf latch is held
@@ -212,7 +217,7 @@ ParentLatch(p) ==
     /\ nodes' = [nodes EXCEPT ![rootSeen[p]].latch = p]
     /\ tgt' = [tgt EXCEPT ![p] = rootSeen[p]]
     /\ pc' = [pc EXCEPT ![p] = "parentMove"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, mpc, mroot, inserted>>
 
 ParentMove(p) ==
     /\ pc[p] = "parentMove"
@@ -224,7 +229,7 @@ ParentMove(p) ==
             /\ pc' = pc
        ELSE /\ nodes' = nodes /\ tgt' = tgt
             /\ pc' = [pc EXCEPT ![p] = "parentInsert"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, mpc, mroot, inserted>>
 
 InsertPivot(n, piv, child) ==
     LET nd == nodes[n]
@@ -239,7 +244,7 @@ ParentInsert(p) ==
           ![tgt[p]] = [InsertPivot(tgt[p], pivot[p], newRight[p]) EXCEPT !.latch = Nil],
           ![cur[p]].latch = Nil]
     /\ pc' = [pc EXCEPT ![p] = "done"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 \* Top-level split: acquire the root-versioning latch first.
 RootVerAcq(p) ==
@@ -247,7 +252,7 @@ RootVerAcq(p) ==
     /\ rootVer = Nil
     /\ rootVer' = p
     /\ pc' = [pc EXCEPT ![p] = "applyTop"]
-    /\ UNCHANGED <<nodes, root, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<nodes, root, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 InstallRoot(p) ==
     LET fresh == Alloc IN
@@ -269,33 +274,33 @@ ApplyTop(p) ==
             THEN \* fix-up path, latches kept, root creation NOT suppressed
                  /\ tgt' = [tgt EXCEPT ![p] = root]
                  /\ pc' = [pc EXCEPT ![p] = "bugLatchRoot"]
-                 /\ UNCHANGED <<nodes, root, rootVer, cur, rootSeen, via, pivot, newRight, inserted>>
+                 /\ UNCHANGED <<nodes, root, rootVer, cur, rootSeen, via, pivot, newRight, mpc, mroot, inserted>>
             ELSE \* first keys collide: stack a new root over the current one
                  /\ InstallRoot(p)
-                 /\ UNCHANGED <<cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+                 /\ UNCHANGED <<cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
        ELSE IF root = cur[p] \/ nodes[root].typ = "leaf"
             THEN /\ InstallRoot(p)
-                 /\ UNCHANGED <<cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+                 /\ UNCHANGED <<cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
             ELSE \* the tree grew above us: release both latches, then place
                  \* the pivot at the current root's level
                  /\ nodes' = [nodes EXCEPT ![cur[p]].latch = Nil]
                  /\ rootVer' = Nil
                  /\ pc' = [pc EXCEPT ![p] = "fixReadRoot"]
-                 /\ UNCHANGED <<root, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+                 /\ UNCHANGED <<root, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 \* Fixed fix-up: non-atomic read of the root pointer, then latch and walk.
 FixReadRoot(p) ==
     /\ pc[p] = "fixReadRoot"
     /\ tgt' = [tgt EXCEPT ![p] = root]
     /\ pc' = [pc EXCEPT ![p] = "fixLatch"]
-    /\ UNCHANGED <<nodes, root, rootVer, cur, rootSeen, via, pivot, newRight, inserted>>
+    /\ UNCHANGED <<nodes, root, rootVer, cur, rootSeen, via, pivot, newRight, mpc, mroot, inserted>>
 
 FixLatch(p) ==
     /\ pc[p] = "fixLatch"
     /\ nodes[tgt[p]].latch = Nil
     /\ nodes' = [nodes EXCEPT ![tgt[p]].latch = p]
     /\ pc' = [pc EXCEPT ![p] = "fixMove"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 FixMove(p) ==
     /\ pc[p] = "fixMove"
@@ -307,14 +312,14 @@ FixMove(p) ==
             /\ pc' = pc
        ELSE /\ nodes' = nodes /\ tgt' = tgt
             /\ pc' = [pc EXCEPT ![p] = "fixInsert"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, mpc, mroot, inserted>>
 
 FixInsert(p) ==
     /\ pc[p] = "fixInsert"
     /\ nodes' = [nodes EXCEPT
           ![tgt[p]] = [InsertPivot(tgt[p], pivot[p], newRight[p]) EXCEPT !.latch = Nil]]
     /\ pc' = [pc EXCEPT ![p] = "done"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 \* Buggy fix-up: leaf latch and root-versioning latch stay held.
 BugLatchRoot(p) ==
@@ -322,7 +327,7 @@ BugLatchRoot(p) ==
     /\ nodes[tgt[p]].latch = Nil
     /\ nodes' = [nodes EXCEPT ![tgt[p]].latch = p]
     /\ pc' = [pc EXCEPT ![p] = "bugMove"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 BugMove(p) ==
     /\ pc[p] = "bugMove"
@@ -334,22 +339,48 @@ BugMove(p) ==
             /\ pc' = pc
        ELSE /\ nodes' = nodes /\ tgt' = tgt
             /\ pc' = [pc EXCEPT ![p] = "bugInsert"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, mpc, mroot, inserted>>
 
 BugInsert(p) ==
     /\ pc[p] = "bugInsert"
     /\ nodes' = [nodes EXCEPT
           ![tgt[p]] = [InsertPivot(tgt[p], pivot[p], newRight[p]) EXCEPT !.latch = Nil]]
     /\ pc' = [pc EXCEPT ![p] = "bugInstall"]
-    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<root, rootVer, cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
 \* The discarded "handled" result: the caller stacks a new root anyway.
 BugInstall(p) ==
     /\ pc[p] = "bugInstall"
     /\ InstallRoot(p)
-    /\ UNCHANGED <<cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+    /\ UNCHANGED <<cur, rootSeen, via, pivot, newRight, tgt, mpc, mroot, inserted>>
 
-AllDone == \A p \in Procs : pc[p] = "done"
+(* Bulk merger m: models merge_with_keys_ root growth. Build against the
+   observed root without holding shared latches, then install under the
+   root-versioning latch only if the root has not moved; otherwise rebuild. *)
+
+MBuild(m) ==
+    /\ mpc[m] = "build"
+    /\ mroot' = [mroot EXCEPT ![m] = root]
+    /\ mpc' = [mpc EXCEPT ![m] = "install"]
+    /\ UNCHANGED <<nodes, root, rootVer, pc, cur, rootSeen, via, pivot, newRight, tgt, inserted>>
+
+MInstall(m) ==
+    /\ mpc[m] = "install"
+    /\ rootVer = Nil
+    /\ IF root = mroot[m]
+         THEN LET fresh == Alloc IN
+              /\ nodes' = [nodes EXCEPT
+                    ![fresh] = [typ |-> "internal", keys |-> <<>>, ptrs |-> <<root>>,
+                                right |-> Nil, rb |-> Inf, latch |-> Nil]]
+              /\ root' = fresh
+              /\ mpc' = [mpc EXCEPT ![m] = "done"]
+              /\ UNCHANGED <<rootVer, pc, cur, rootSeen, via, pivot, newRight, tgt, mroot, inserted>>
+         ELSE /\ mpc' = [mpc EXCEPT ![m] = "build"]
+              /\ UNCHANGED <<nodes, root, rootVer, pc, cur, rootSeen, via, pivot, newRight, tgt, mroot, inserted>>
+
+AllDone ==
+    /\ \A m \in Mergers : mpc[m] = "done"
+    /\ \A p \in Procs : pc[p] = "done"
 
 Next ==
     \/ \E p \in Procs :
@@ -358,6 +389,7 @@ Next ==
          \/ RootVerAcq(p) \/ ApplyTop(p)
          \/ FixReadRoot(p) \/ FixLatch(p) \/ FixMove(p) \/ FixInsert(p)
          \/ BugLatchRoot(p) \/ BugMove(p) \/ BugInsert(p) \/ BugInstall(p)
+    \/ \E m \in Mergers : MBuild(m) \/ MInstall(m)
     \/ (AllDone /\ UNCHANGED vars)
 
 Spec == Init /\ [][Next]_vars

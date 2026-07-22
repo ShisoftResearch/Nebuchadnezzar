@@ -136,6 +136,27 @@ precisely to avoid this. The corrected version waits only rightward;
 deadlock with `WaitLeft = TRUE` and proves the fixed variant deadlock-free.
 Lesson applied: latch-order changes get a model before they get committed.
 
+### Follow-up batch (post-audit hardening)
+
+- **Tombstone reclamation** (`remove_contains`): compaction now removes
+  tombstoned keys from a page AND drops their tombstones while the page's
+  write latch is held (write-back persist and bulk-merge paths; merges
+  compact before deciding to split). Cursors filter tombstoned keys inside
+  their validated snapshot closures, so reclamation cannot make a scan yield
+  a deleted key. Protocol model-checked in `docs/tla/DeletionReclaim.tla`;
+  TLC rejected the first design (grace period + recheck-undo loses inserts)
+  before it was implemented. Fixes the unbounded DeletionSet growth.
+- **Bulk-merge root install** is now serialized with insert-driven root
+  splits: upper levels are built against an observed root from fresh nodes
+  only, then installed under `root_versioning` after a pointer-identity
+  check, rebuilding on conflict (merger process added to
+  `docs/tla/BLinkInsert.tla`; all configs re-verified).
+- **Layout hardening**: `Node`/`NodeData` are `#[repr(C)]` so the
+  cross-instantiation casts in `NodeCellRef::deref` rely on defined layout.
+- **Dead rebalance code removed**: `merge_children`, `relocate_children`,
+  `rebalance_candidate`, `NodeData::remove` and their helpers (their
+  parent-before-child latch order would deadlock against the live paths).
+
 ## Known remaining risks (documented, not fixed)
 
 - **Seqlock reads are formally data races.** `read_node` closures read node
@@ -182,6 +203,9 @@ v1.8.0, Java 21):
 | BLinkInsert | Buggy=TRUE, organic | `HeightOK` **violated** (= F2.2) |
 | PersistLatch | WaitLeft=TRUE | **Deadlock reached** (the reverted to_cell variant) |
 | PersistLatch | WaitLeft=FALSE | pass, deadlock-free (6448 states) |
+| BLinkInsert | Fixed + 1 merger | pass: merger install serialized, no deadlock |
+| DeletionReclaim | grace+undo draft | `QuiescentCorrect` **violated** (loses inserts; design rejected) |
+| DeletionReclaim | latched compaction | pass with 2 concurrent users (398 states) |
 
 Run: `java -cp tla2tools.jar tlc2.TLC -config <cfg> <spec>.tla`
 
