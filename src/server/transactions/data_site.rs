@@ -1060,7 +1060,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_validation_accepts_empty_subset_and_rejects_invalid_mutation_subsets() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5300";
+        let address = "127.0.0.1:5287";
         let group = "txn_data_site_commit_subset_validation";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
