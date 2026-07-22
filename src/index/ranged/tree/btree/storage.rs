@@ -1,30 +1,37 @@
 use super::external;
 use crate::client;
+use crossbeam::queue::SegQueue;
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use futures::FutureExt;
 
+// Write-back state is scoped per server instance, keyed by the identity of
+// the server's AsyncClient. Sharing one process-wide queue meant two servers
+// in one process waited on each other's progress and a dead fleet poisoned
+// every later instance.
+pub struct WriteBackHub {
+    queue: SegQueue<(usize, external::ChangingNode)>,
+    counter: AtomicUsize,
+    // usize::MAX = nothing processed yet (avoids counter=1/progress=0
+    // looking like "operation 0 done").
+    progress: AtomicUsize,
+    // Number of live workers. Workers are tokio tasks: they die with the
+    // runtime that spawned them, so liveness is tracked with RAII guards and
+    // a dead fleet is respawned by the next ensure_workers call.
+    alive: AtomicUsize,
+    spawning: AtomicBool,
+    should_stop: AtomicBool,
+    // Completions that finished ahead of earlier queue ids.
+    completions: Mutex<BTreeSet<usize>>,
+}
+
 lazy_static! {
-    // Initialize to MAX to indicate "nothing processed yet"
-    // This prevents the race where counter=1, progress=0 looks like "operation 0 done"
-    pub static ref CHANGE_PROGRESS: AtomicUsize = AtomicUsize::new(usize::MAX);
-    // Number of live write-back workers. Workers are tokio tasks: they die
-    // with the runtime that spawned them (e.g. when a test's runtime is torn
-    // down), so liveness must be tracked, not just "started once". Each
-    // worker holds a WorkerAlive guard whose Drop decrements this counter —
-    // including on task cancellation — letting a later server instance
-    // respawn workers on its own runtime.
-    static ref WB_ALIVE: AtomicUsize = AtomicUsize::new(0);
-    // Guards against two threads spawning worker fleets concurrently.
-    static ref WB_SPAWNING: AtomicBool = AtomicBool::new(false);
-    // Flag to signal the write-back tasks to stop
-    static ref WB_SHOULD_STOP: AtomicBool = AtomicBool::new(false);
-    // Track completed operations that finished ahead of earlier queue ids.
-    static ref OUT_OF_ORDER_COMPLETIONS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+    static ref HUBS: Mutex<Vec<(Weak<client::AsyncClient>, Arc<WriteBackHub>)>> =
+        Mutex::new(Vec::new());
 }
 
 fn write_back_worker_count() -> usize {
@@ -33,20 +40,47 @@ fn write_back_worker_count() -> usize {
         .unwrap_or(4)
 }
 
+/// The hub owning write-back state for the server behind `client`.
+pub fn hub_for(client: &Arc<client::AsyncClient>) -> Arc<WriteBackHub> {
+    let mut hubs = HUBS.lock().expect("write-back hub registry poisoned");
+    hubs.retain(|(c, _)| c.strong_count() > 0);
+    for (c, hub) in hubs.iter() {
+        if let Some(existing) = c.upgrade() {
+            if Arc::ptr_eq(&existing, client) {
+                return hub.clone();
+            }
+        }
+    }
+    let hub = Arc::new(WriteBackHub {
+        queue: SegQueue::new(),
+        counter: AtomicUsize::new(0),
+        progress: AtomicUsize::new(usize::MAX),
+        alive: AtomicUsize::new(0),
+        spawning: AtomicBool::new(false),
+        should_stop: AtomicBool::new(false),
+        completions: Mutex::new(BTreeSet::new()),
+    });
+    hubs.push((Arc::downgrade(client), hub.clone()));
+    hub
+}
+
+fn all_hubs() -> Vec<Arc<WriteBackHub>> {
+    HUBS.lock()
+        .expect("write-back hub registry poisoned")
+        .iter()
+        .map(|(_, hub)| hub.clone())
+        .collect()
+}
+
 // Decrements the live-worker count when a worker ends for any reason,
 // including cancellation when its runtime is dropped.
-struct WorkerAlive;
-
-impl WorkerAlive {
-    fn register() -> Self {
-        WB_ALIVE.fetch_add(1, Ordering::AcqRel);
-        WorkerAlive
-    }
+struct WorkerAlive {
+    hub: Arc<WriteBackHub>,
 }
 
 impl Drop for WorkerAlive {
     fn drop(&mut self) {
-        WB_ALIVE.fetch_sub(1, Ordering::AcqRel);
+        self.hub.alive.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -55,39 +89,155 @@ impl Drop for WorkerAlive {
 // persisting it panics or the worker task is cancelled mid-await; a single
 // unrecorded id stalls wait_until_updated forever.
 struct CompletionGuard {
+    hub: Arc<WriteBackHub>,
     id: usize,
 }
 
 impl Drop for CompletionGuard {
     fn drop(&mut self) {
-        record_completed_change(self.id);
+        self.hub.record_completed(self.id);
     }
 }
 
-fn record_completed_change(id: usize) {
-    let mut completions = OUT_OF_ORDER_COMPLETIONS
-        .lock()
-        .expect("write-back completion lock poisoned");
-    let current = CHANGE_PROGRESS.load(Ordering::Acquire);
-    let expected = if current == usize::MAX {
-        0
-    } else {
-        current + 1
-    };
+impl WriteBackHub {
+    pub fn push(&self, changing: external::ChangingNode) {
+        let id = self.counter.fetch_add(1, Ordering::Relaxed);
+        self.queue.push((id, changing));
+    }
 
-    if id == expected {
-        let mut new_progress = id;
+    fn record_completed(&self, id: usize) {
+        let mut completions = self
+            .completions
+            .lock()
+            .expect("write-back completion lock poisoned");
+        let current = self.progress.load(Ordering::Acquire);
+        let expected = if current == usize::MAX {
+            0
+        } else {
+            current + 1
+        };
+        if id == expected {
+            let mut new_progress = id;
+            loop {
+                let next_expected = new_progress + 1;
+                if completions.remove(&next_expected) {
+                    new_progress = next_expected;
+                } else {
+                    break;
+                }
+            }
+            self.progress.store(new_progress, Ordering::Release);
+        } else if id > expected {
+            completions.insert(id);
+        }
+    }
+
+    /// Spawn the worker fleet on the caller's runtime if none is alive.
+    pub fn ensure_workers(self: &Arc<Self>) {
+        if self.alive.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        if self
+            .spawning
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if self.alive.load(Ordering::Acquire) > 0 {
+            self.spawning.store(false, Ordering::SeqCst);
+            return;
+        }
+        self.should_stop.store(false, Ordering::SeqCst);
+        for worker_id in 0..write_back_worker_count() {
+            self.alive.fetch_add(1, Ordering::AcqRel);
+            let hub = self.clone();
+            tokio::spawn(async move {
+                let _alive = WorkerAlive { hub: hub.clone() };
+                debug!("B-tree write-back worker {} started", worker_id);
+                loop {
+                    if hub.should_stop.load(Ordering::SeqCst) {
+                        debug!("B-tree write-back worker {} stopping", worker_id);
+                        break;
+                    }
+                    match hub.queue.pop() {
+                        Some((id, changing)) => {
+                            let _completion = CompletionGuard {
+                                hub: hub.clone(),
+                                id,
+                            };
+                            if let Err(e) = AssertUnwindSafe(process_change(changing))
+                                .catch_unwind()
+                                .await
+                            {
+                                let msg = e
+                                    .downcast_ref::<&str>()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| e.downcast_ref::<String>().cloned())
+                                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                                error!(
+                                    "write-back worker {}: persisting change {} panicked: {}",
+                                    worker_id, id, msg
+                                );
+                            }
+                        }
+                        None => {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    }
+                }
+                debug!("B-tree write-back worker {} stopped", worker_id);
+            });
+        }
+        self.spawning.store(false, Ordering::SeqCst);
+    }
+
+    pub async fn wait_until_updated(&self) {
+        let counter = self.counter.load(Ordering::Acquire);
+        if counter == 0 {
+            return;
+        }
+        let newest = counter - 1;
+        let progress = self.progress.load(Ordering::Acquire);
+        let has_pending = progress == usize::MAX || progress < newest;
+        if !has_pending {
+            return;
+        }
+        if self.alive.load(Ordering::Acquire) == 0 {
+            warn!(
+                "wait_until_updated: {} change(s) pending but no write-back worker \
+                 is alive on this hub; returning without waiting",
+                if progress == usize::MAX {
+                    newest + 1
+                } else {
+                    newest - progress
+                }
+            );
+            return;
+        }
         loop {
-            let next_expected = new_progress + 1;
-            if completions.remove(&next_expected) {
-                new_progress = next_expected;
-            } else {
+            let current = self.progress.load(Ordering::Acquire);
+            if current != usize::MAX && current >= newest {
                 break;
             }
+            if self.alive.load(Ordering::Acquire) == 0 {
+                warn!("wait_until_updated: write-back workers died while waiting; giving up");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        CHANGE_PROGRESS.store(new_progress, Ordering::Release);
-    } else if id > expected {
-        completions.insert(id);
+    }
+
+    pub async fn reset(&self) {
+        self.should_stop.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        self.progress.store(usize::MAX, Ordering::SeqCst);
+        self.completions
+            .lock()
+            .expect("write-back completion lock poisoned")
+            .clear();
+        self.counter.store(0, Ordering::SeqCst);
+        while self.queue.pop().is_some() {}
     }
 }
 
@@ -119,136 +269,25 @@ async fn process_change(changing: external::ChangingNode) {
     }
 }
 
-pub fn start_external_nodes_write_back(_client: &Arc<client::AsyncClient>) {
-    // Respawn whenever no worker is alive (first start, or the previous
-    // fleet died with its runtime). WB_SPAWNING keeps concurrent callers
-    // from spawning two fleets.
-    if WB_ALIVE.load(Ordering::Acquire) > 0 {
-        return;
-    }
-    if WB_SPAWNING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
-    }
-    if WB_ALIVE.load(Ordering::Acquire) > 0 {
-        WB_SPAWNING.store(false, Ordering::SeqCst);
-        return;
-    }
-
-    // Reset the stop flag
-    WB_SHOULD_STOP.store(false, Ordering::SeqCst);
-
-    for worker_id in 0..write_back_worker_count() {
-        let alive = WorkerAlive::register();
-        tokio::spawn(async move {
-            let _alive = alive;
-            debug!("B-tree write-back worker {} started", worker_id);
-            loop {
-                if WB_SHOULD_STOP.load(Ordering::SeqCst) {
-                    debug!("B-tree write-back worker {} stopping", worker_id);
-                    break;
-                }
-
-                match external::CHANGED_NODES.pop() {
-                    Some((id, changing)) => {
-                        let _completion = CompletionGuard { id };
-                        if let Err(e) =
-                            AssertUnwindSafe(process_change(changing)).catch_unwind().await
-                        {
-                            let msg = e
-                                .downcast_ref::<&str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| e.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "<non-string panic>".to_string());
-                            error!(
-                                "write-back worker {}: persisting change {} panicked: {}",
-                                worker_id, id, msg
-                            );
-                        }
-                    }
-                    None => {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                }
-            }
-            debug!("B-tree write-back worker {} stopped", worker_id);
-        });
-    }
-    WB_SPAWNING.store(false, Ordering::SeqCst);
+pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
+    hub_for(client).ensure_workers();
 }
 
-/// Reset write-back state for server restart
-/// This should be called during server shutdown after wait_until_updated()
-pub async fn reset_write_back_state() {
-    // Signal the task to stop
-    WB_SHOULD_STOP.store(true, Ordering::SeqCst);
-
-    // Wait briefly to allow workers to see the stop signal and exit.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // Reset progress to initial state
-    CHANGE_PROGRESS.store(usize::MAX, Ordering::SeqCst);
-    OUT_OF_ORDER_COMPLETIONS
-        .lock()
-        .expect("write-back completion lock poisoned")
-        .clear();
-
-    // Reset the counter
-    external::CHANGE_COUNTER.store(0, Ordering::SeqCst);
-
-    // Drain any remaining items from the queue (they should already be processed)
-    while external::CHANGED_NODES.pop().is_some() {}
-
-    debug!("B-tree write-back state reset");
-}
-
+/// Wait until every live hub has drained its pending changes.
 pub async fn wait_until_updated() {
-    let counter = external::CHANGE_COUNTER.load(Ordering::Acquire);
-    if counter == 0 {
-        return;
+    for hub in all_hubs() {
+        hub.wait_until_updated().await;
     }
-    let newest = counter - 1; // The ID of the most recent operation (fetch_add returns old value)
-    let progress = CHANGE_PROGRESS.load(Ordering::Acquire);
+}
 
-    // If progress is MAX (initial value), nothing has been processed yet
-    // If progress < newest, there are pending operations
-    let has_pending = progress == usize::MAX || progress < newest;
-    if !has_pending {
-        return;
+/// Reset write-back state for server restart.
+/// This should be called during server shutdown after wait_until_updated().
+pub async fn reset_write_back_state() {
+    for hub in all_hubs() {
+        hub.reset().await;
     }
-    if WB_ALIVE.load(Ordering::Acquire) == 0 {
-        warn!(
-            "wait_until_updated: {} change(s) pending but no write-back worker is alive; \
-             returning without waiting",
-            if progress == usize::MAX {
-                newest + 1
-            } else {
-                newest - progress
-            }
-        );
-        return;
-    }
-
-    let ops_remaining = if progress == usize::MAX {
-        newest + 1 // All operations are pending
-    } else {
-        newest - progress
-    };
-    debug!("Waiting storage, {} ops to go", ops_remaining);
-    loop {
-        let current = CHANGE_PROGRESS.load(Ordering::Acquire);
-        // If current is still MAX, nothing processed yet
-        // Otherwise, wait until current >= newest
-        if current != usize::MAX && current >= newest {
-            break;
-        }
-        if WB_ALIVE.load(Ordering::Acquire) == 0 {
-            warn!("wait_until_updated: write-back workers died while waiting; giving up");
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    debug!("Write back updated, {} cells", ops_remaining);
+    HUBS.lock()
+        .expect("write-back hub registry poisoned")
+        .clear();
+    debug!("B-tree write-back state reset");
 }

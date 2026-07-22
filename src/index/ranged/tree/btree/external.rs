@@ -5,7 +5,6 @@ use crate::index::ranged::tree::tree::DeletionSet;
 use crate::ram::cell::OwnedCell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
 use itertools::Itertools;
 use std::marker::PhantomData;
@@ -32,8 +31,6 @@ lazy_static! {
     pub static ref NEXT_PAGE_KEY_HASH: u64 = key_hash(NEXT_FIELD);
     pub static ref PREV_PAGE_KEY_HASH: u64 = key_hash(PREV_FIELD);
     pub static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
-    pub static ref CHANGED_NODES: SegQueue<(usize, ChangingNode)> = SegQueue::new();
-    pub static ref CHANGE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 }
 
 fn invalid_page_format(cell: &OwnedCell, reason: impl Into<String>) -> ReconstructError {
@@ -462,18 +459,16 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // Persist all changed nodes from the single B+ tree
+    // Queue the changed node on this server's write-back hub
     let Some(client) = tree.writeback_client() else {
         return;
     };
-    CHANGED_NODES.push((
-        CHANGE_COUNTER.fetch_add(1, Relaxed),
-        ChangingNode::Modified(NodeModified {
-            node: node.clone(),
-            deletion: tree.deletion.clone(),
-            client,
-        }),
-    ));
+    let modified = ChangingNode::Modified(NodeModified {
+        node: node.clone(),
+        deletion: tree.deletion.clone(),
+        client: client.clone(),
+    });
+    super::storage::hub_for(&client).push(modified);
 }
 
 pub fn make_deleted<KS, PS>(id: &Id, tree: &BPlusTree<KS, PS>)
@@ -481,14 +476,11 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // Persist all deleted nodes from the single B+ tree
+    // Queue the deleted node on this server's write-back hub
     let Some(client) = tree.writeback_client() else {
         return;
     };
-    CHANGED_NODES.push((
-        CHANGE_COUNTER.fetch_add(1, Relaxed),
-        ChangingNode::DeletedWithClient(*id, client),
-    ));
+    super::storage::hub_for(&client).push(ChangingNode::DeletedWithClient(*id, client));
 }
 
 pub fn page_schema() -> Schema {
