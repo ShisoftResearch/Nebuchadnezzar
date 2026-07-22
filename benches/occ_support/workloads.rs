@@ -11,7 +11,7 @@ use dovahkiin::types::Map as _;
 use neb::{
     ram::types::{Id, OwnedValue},
     server::transactions::{
-        AbortResult, DMPrepareResult, EndResult, TMPrepareResult, TxnExecResult, TxnId,
+        AbortResult, DMPrepareResult, EndResult, TMError, TMPrepareResult, TxnExecResult, TxnId,
     },
 };
 
@@ -73,9 +73,50 @@ pub struct TimedBatch {
 
 async fn abort_started(fixture: &OccFixture, tid: TxnId) -> Result<(), String> {
     match fixture.txn.abort(tid.clone()).await {
-        Ok(Ok(AbortResult::Success(_))) => Ok(()),
+        Ok(Ok(AbortResult::Success(None))) => Ok(()),
+        Ok(Ok(AbortResult::Success(Some(failures)))) => Err(format!(
+            "abort({tid:?}) retained rollback failures: {:?}",
+            failures
+        )),
         Ok(Ok(other)) => Err(format!("abort({tid:?}) returned {:?}", other)),
         Ok(Err(err)) => Err(format!("abort({tid:?}) manager error: {:?}", err)),
+        Err(err) => Err(format!("abort({tid:?}) RPC error: {:?}", err)),
+    }
+}
+
+async fn confirm_prepare_cleanup(fixture: &OccFixture, tid: TxnId) -> Result<(), String> {
+    match fixture.txn.abort(tid.clone()).await {
+        Ok(Ok(AbortResult::Success(None))) => Ok(()),
+        Ok(Ok(AbortResult::Success(Some(failures)))) => Err(format!(
+            "abort({tid:?}) retained rollback failures: {:?}",
+            failures
+        )),
+        Ok(Ok(other)) => Err(format!("abort({tid:?}) returned {:?}", other)),
+        Ok(Err(TMError::TransactionNotFound)) => Ok(()),
+        Ok(Err(TMError::TransactionIdExisted)) => Err(format!(
+            "abort({tid:?}) manager error: {:?}",
+            TMError::TransactionIdExisted
+        )),
+        Ok(Err(TMError::CannotLocateCellServer)) => Err(format!(
+            "abort({tid:?}) manager error: {:?}",
+            TMError::CannotLocateCellServer
+        )),
+        Ok(Err(TMError::RPCErrorFromCellServer)) => Err(format!(
+            "abort({tid:?}) manager error: {:?}",
+            TMError::RPCErrorFromCellServer
+        )),
+        Ok(Err(TMError::AssertionError)) => Err(format!(
+            "abort({tid:?}) manager error: {:?}",
+            TMError::AssertionError
+        )),
+        Ok(Err(TMError::InvalidTransactionState(state))) => Err(format!(
+            "abort({tid:?}) manager error: {:?}",
+            TMError::InvalidTransactionState(state)
+        )),
+        Ok(Err(TMError::Other)) => Err(format!(
+            "abort({tid:?}) manager error: {:?}",
+            TMError::Other
+        )),
         Err(err) => Err(format!("abort({tid:?}) RPC error: {:?}", err)),
     }
 }
@@ -106,6 +147,38 @@ async fn unexpected_after_abort(
             AttemptOutcome::Unexpected(format!("{context}; abort cleanup failed: {abort_error}"))
         }
     }
+}
+
+async fn retry_after_prepare_cleanup(
+    fixture: &OccFixture,
+    tid: TxnId,
+    context: impl Into<String>,
+) -> AttemptOutcome {
+    let context = context.into();
+    match confirm_prepare_cleanup(fixture, tid).await {
+        Ok(()) => AttemptOutcome::Retryable,
+        Err(cleanup_error) => AttemptOutcome::Unexpected(format!(
+            "{context}; cleanup confirmation failed: {cleanup_error}"
+        )),
+    }
+}
+
+async fn unexpected_after_prepare_cleanup(
+    fixture: &OccFixture,
+    tid: TxnId,
+    context: impl Into<String>,
+) -> AttemptOutcome {
+    let context = context.into();
+    match confirm_prepare_cleanup(fixture, tid).await {
+        Ok(()) => AttemptOutcome::Unexpected(context),
+        Err(cleanup_error) => AttemptOutcome::Unexpected(format!(
+            "{context}; cleanup confirmation failed: {cleanup_error}"
+        )),
+    }
+}
+
+fn replace_score_value(map: &mut dovahkiin::types::OwnedMap, next_score: u64) {
+    *map.get_mut("score") = OwnedValue::U64(next_score);
 }
 
 async fn read_modify_write_once(fixture: &OccFixture, ids: &[Id]) -> AttemptOutcome {
@@ -208,7 +281,7 @@ async fn read_modify_write_once(fixture: &OccFixture, ids: &[Id]) -> AttemptOutc
                 .await;
             }
         };
-        map.insert("score", OwnedValue::U64(next_score));
+        replace_score_value(&mut map, next_score);
         cell.data = OwnedValue::Map(map);
 
         match fixture.txn.update(tid.clone(), cell).await {
@@ -267,19 +340,39 @@ async fn read_modify_write_once(fixture: &OccFixture, ids: &[Id]) -> AttemptOutc
     match fixture.txn.prepare(tid.clone()).await {
         Ok(Ok(TMPrepareResult::Success)) => {}
         Ok(Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))) => {
-            return AttemptOutcome::Retryable;
+            return retry_after_prepare_cleanup(
+                fixture,
+                tid.clone(),
+                format!(
+                    "prepare({tid:?}) returned {:?}",
+                    TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
+                ),
+            )
+            .await;
         }
         Ok(Ok(other)) => {
-            return AttemptOutcome::Unexpected(format!("prepare({tid:?}) returned {:?}", other));
+            return unexpected_after_prepare_cleanup(
+                fixture,
+                tid.clone(),
+                format!("prepare({tid:?}) returned {:?}", other),
+            )
+            .await;
         }
         Ok(Err(err)) => {
-            return AttemptOutcome::Unexpected(format!(
-                "prepare({tid:?}) manager error: {:?}",
-                err
-            ));
+            return unexpected_after_prepare_cleanup(
+                fixture,
+                tid.clone(),
+                format!("prepare({tid:?}) manager error: {:?}", err),
+            )
+            .await;
         }
         Err(err) => {
-            return AttemptOutcome::Unexpected(format!("prepare({tid:?}) RPC error: {:?}", err));
+            return unexpected_after_prepare_cleanup(
+                fixture,
+                tid.clone(),
+                format!("prepare({tid:?}) RPC error: {:?}", err),
+            )
+            .await;
         }
     }
 
@@ -300,7 +393,7 @@ pub async fn run_fixed_success_rmw(
     ids: Arc<Vec<Id>>,
     spec: BatchSpec,
 ) -> TimedBatch {
-    validate_batch_spec(&ids, spec);
+    let expected_delta = validate_batch_spec(&ids, spec);
 
     let score_before = fixture.sum_scores(ids.as_ref()).await;
     let next = Arc::new(AtomicU64::new(0));
@@ -381,33 +474,18 @@ pub async fn run_fixed_success_rmw(
     }
 
     let score_after = fixture.sum_scores(ids.as_ref()).await;
-    let expected_delta = spec
-        .successes
-        .checked_mul(u64::try_from(spec.cells_per_txn).expect("cells_per_txn must fit in u64"));
-    match (score_after.checked_sub(score_before), expected_delta) {
-        (Some(actual_delta), Some(expected_delta)) if actual_delta == expected_delta => {}
-        (Some(actual_delta), Some(expected_delta)) => {
+    match score_after.checked_sub(score_before) {
+        Some(actual_delta) if actual_delta == expected_delta => {}
+        Some(actual_delta) => {
             metrics.record_unexpected(format!(
                 "fixed-success RMW score invariant failed: actual delta {}, expected {}",
                 actual_delta, expected_delta
             ));
         }
-        (Some(actual_delta), None) => {
-            metrics.record_unexpected(format!(
-                "fixed-success RMW score invariant overflow: actual delta {}, expected overflow for successes={} cells_per_txn={}",
-                actual_delta, spec.successes, spec.cells_per_txn
-            ));
-        }
-        (None, Some(expected_delta)) => {
+        None => {
             metrics.record_unexpected(format!(
                 "fixed-success RMW score invariant underflow: before {}, after {}, expected {}",
                 score_before, score_after, expected_delta
-            ));
-        }
-        (None, None) => {
-            metrics.record_unexpected(format!(
-                "fixed-success RMW score invariant underflow: before {}, after {}, expected overflow for successes={} cells_per_txn={}",
-                score_before, score_after, spec.successes, spec.cells_per_txn
             ));
         }
     }
@@ -415,7 +493,7 @@ pub async fn run_fixed_success_rmw(
     TimedBatch { metrics, elapsed }
 }
 
-fn validate_batch_spec(ids: &[Id], spec: BatchSpec) {
+fn validate_batch_spec(ids: &[Id], spec: BatchSpec) -> u64 {
     assert!(
         !ids.is_empty(),
         "fixed-success RMW requires at least one id"
@@ -435,18 +513,22 @@ fn validate_batch_spec(ids: &[Id], spec: BatchSpec) {
         spec.cells_per_txn
     );
 
-    for start in 0..ids.len() {
-        let mut seen = HashSet::with_capacity(spec.cells_per_txn);
-        for offset in 0..spec.cells_per_txn {
-            let id = ids[(start + offset) % ids.len()];
-            assert!(
-                seen.insert(id),
-                "fixed-success RMW requires consecutive distinct ids per transaction window, duplicate {:?} found from start index {}",
-                id,
-                start
-            );
-        }
+    let mut seen = HashSet::with_capacity(ids.len());
+    for id in ids {
+        assert!(
+            seen.insert(*id),
+            "fixed-success RMW requires globally unique ids"
+        );
     }
+
+    spec.successes
+        .checked_mul(u64::try_from(spec.cells_per_txn).expect("cells_per_txn must fit in u64"))
+        .unwrap_or_else(|| {
+            panic!(
+                "fixed-success RMW expected delta overflow for successes={} cells_per_txn={}",
+                spec.successes, spec.cells_per_txn
+            )
+        })
 }
 
 fn ids_for_logical_operation(ids: &[Id], logical_index: u64, cells_per_txn: usize) -> Vec<Id> {
@@ -455,4 +537,50 @@ fn ids_for_logical_operation(ids: &[Id], logical_index: u64, cells_per_txn: usiz
     (0..cells_per_txn)
         .map(|offset| ids[(start + offset) % ids.len()])
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dovahkiin::types::OwnedMap;
+
+    #[test]
+    #[should_panic(expected = "globally unique ids")]
+    fn duplicate_input_ids_are_rejected_before_timing() {
+        let id = Id::new(1, 1);
+        let spec = BatchSpec {
+            successes: 1,
+            concurrency: 1,
+            cells_per_txn: 1,
+        };
+
+        let _ = validate_batch_spec(&[id, id], spec);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected delta overflow")]
+    fn expected_delta_overflow_is_rejected_before_timing() {
+        let spec = BatchSpec {
+            successes: u64::MAX,
+            concurrency: 1,
+            cells_per_txn: 2,
+        };
+
+        let _ = validate_batch_spec(&[Id::new(1, 1), Id::new(2, 2)], spec);
+    }
+
+    #[test]
+    fn score_replacement_does_not_grow_owned_map_fields() {
+        let mut map = OwnedMap::new();
+        map.insert("id", OwnedValue::I64(7));
+        map.insert("name", OwnedValue::String("counter".to_string()));
+        map.insert("score", OwnedValue::U64(1));
+        let initial_fields = map.fields.len();
+
+        replace_score_value(&mut map, 2);
+        replace_score_value(&mut map, 3);
+
+        assert_eq!(map.fields.len(), initial_fields);
+        assert_eq!(map.get("score").u64().copied(), Some(3));
+    }
 }

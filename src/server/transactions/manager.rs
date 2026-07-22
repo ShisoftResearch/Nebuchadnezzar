@@ -522,7 +522,7 @@ impl Service for TransactionManager {
                 }
                 Err(error) => Err(error),
             };
-            if matches!(result, Ok(AbortResult::Success(_))) {
+            if Self::abort_cleanup_complete(&result) {
                 self.cleanup_transaction_guarded(&tid, &mut txn);
             }
             result
@@ -1365,6 +1365,10 @@ impl TransactionManager {
         }
     }
 
+    fn abort_cleanup_complete(result: &Result<AbortResult, TMError>) -> bool {
+        matches!(result, Ok(AbortResult::Success(None)))
+    }
+
     /// Clean up stale transactions that have been abandoned by clients
     /// Should be called periodically by a background task
     /// Returns the number of transactions cleaned up
@@ -1605,6 +1609,16 @@ mod tests {
             TransactionManager::reduce_prepare_results(results),
             Err(TMError::RPCErrorFromCellServer)
         );
+    }
+
+    #[test]
+    fn abort_cleanup_requires_empty_rollback_failures() {
+        assert!(TransactionManager::abort_cleanup_complete(&Ok(
+            AbortResult::Success(None)
+        )));
+        assert!(!TransactionManager::abort_cleanup_complete(&Ok(
+            AbortResult::Success(Some(vec![]))
+        )));
     }
 
     #[tokio::test(flavor = "current_thread")]

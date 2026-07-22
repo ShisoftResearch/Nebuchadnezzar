@@ -1,4 +1,4 @@
-use std::{fs, time::Duration};
+use std::{fs, sync::Arc, time::Duration};
 
 use serde_json::Value;
 
@@ -12,7 +12,7 @@ mod metrics;
 mod workloads;
 
 use metrics::{BatchMetrics, RunReport, ScenarioSummary};
-use workloads::{AttemptOutcome, AttemptTally};
+use workloads::{run_fixed_success_rmw, AttemptOutcome, AttemptTally, BatchSpec};
 
 #[test]
 fn nearest_rank_percentiles_are_deterministic() {
@@ -144,6 +144,39 @@ fn benchmark_ids_probe_budget_scales_and_floors() {
     assert_eq!(fixture::ids_probe_budget(0), 10_000);
     assert_eq!(fixture::ids_probe_budget(1), 10_000);
     assert_eq!(fixture::ids_probe_budget(20), 20 * 1024);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixed_success_hot_cell_batch_smoke_test() {
+    let _ = env_logger::try_init();
+    let fixture = Arc::new(fixture::OccFixture::single("127.0.0.1:54500", "occ_bench_smoke").await);
+    let server_id = fixture.servers[0].server_id;
+    let id = fixture.ids_for_server(server_id, 1, 54_500)[0];
+    fixture.seed_counter(id, 0).await;
+
+    let batch = run_fixed_success_rmw(
+        fixture.clone(),
+        Arc::new(vec![id]),
+        BatchSpec {
+            successes: 4,
+            concurrency: 2,
+            cells_per_txn: 1,
+        },
+    )
+    .await;
+    let summary = batch.metrics.summary(batch.elapsed);
+    let final_score = fixture.score(id).await;
+
+    let fixture = match Arc::try_unwrap(fixture) {
+        Ok(fixture) => fixture,
+        Err(_) => panic!("smoke test fixture should have no remaining shared owners"),
+    };
+    fixture.shutdown().await;
+
+    assert_eq!(summary.committed, 4);
+    assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+    assert!(summary.invariants_passed);
+    assert_eq!(final_score, 4);
 }
 
 #[test]
