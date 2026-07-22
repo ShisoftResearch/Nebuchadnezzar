@@ -16,6 +16,7 @@ use tokio::time::{sleep, Duration};
 const PORT_SLOT_STRIDE: u16 = 10;
 const PORT_CLUSTER_WIDTH: u16 = 3;
 const MIN_IDS_PROBE_BUDGET: usize = 10_000;
+const FULL_CRITERION_DB_SEGMENTS: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PortPlan {
@@ -268,7 +269,7 @@ fn checked_port_plan_port(base: u16, slot: u16, offset: u16) -> u16 {
 fn benchmark_server_options() -> ServerOptions {
     ServerOptions {
         chunk_size: SEGMENT_SIZE,
-        db_size: SEGMENT_SIZE * 4,
+        db_size: SEGMENT_SIZE * FULL_CRITERION_DB_SEGMENTS,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
@@ -278,5 +279,24 @@ fn benchmark_server_options() -> ServerOptions {
         index_enabled: false,
         enable_recovery: false,
         disable_storage_locks: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN_FULL_CRITERION_DB_SEGMENTS: usize = 128;
+
+    #[test]
+    fn benchmark_server_options_reserve_capacity_for_full_criterion_run() {
+        let options = benchmark_server_options();
+
+        assert_eq!(options.chunk_size, SEGMENT_SIZE);
+        assert!(
+            options.db_size >= options.chunk_size * MIN_FULL_CRITERION_DB_SEGMENTS,
+            "full Criterion OCC runs require at least {MIN_FULL_CRITERION_DB_SEGMENTS} segments, got {}",
+            options.db_size / options.chunk_size
+        );
     }
 }
