@@ -130,14 +130,22 @@ fn normalized_clock_entries(clock: &TxnId) -> Vec<(u64, u64)> {
     let mut wire = bifrost::utils::serde::deserialize::<TxnIdWire>(&bytes)
         .unwrap_or_else(|| panic!("failed to deserialize TxnId for semantic ordering"));
     wire.map.sort_unstable_by_key(|(server_id, _)| *server_id);
-    for pair in wire.map.windows(2) {
-        assert_ne!(
-            pair[0].0, pair[1].0,
-            "duplicate TxnId component for server {}",
-            pair[0].0
-        );
+    let mut canonical: Vec<(u64, u64)> = Vec::with_capacity(wire.map.len());
+    for (server_id, counter) in wire.map {
+        if let Some((last_server_id, last_counter)) = canonical.last_mut() {
+            if *last_server_id == server_id {
+                *last_counter = (*last_counter).max(counter);
+                if *last_counter == 0 {
+                    canonical.pop();
+                }
+                continue;
+            }
+        }
+        if counter > 0 {
+            canonical.push((server_id, counter));
+        }
     }
-    wire.map
+    canonical
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
@@ -302,10 +310,11 @@ pub async fn new_async_client_for_database(
 
 #[cfg(test)]
 mod occ_type_tests {
-    use super::{TxnId, TxnPriority};
+    use super::{semantic_relation, TxnId, TxnPriority};
     use bifrost::utils::serde::serialize;
-    use bifrost::vector_clock::StandardVectorClock;
+    use bifrost::vector_clock::{Relation, StandardVectorClock};
     use std::cmp::Ordering;
+    use std::panic::catch_unwind;
 
     fn clock(entries: &[(u64, u64)]) -> TxnId {
         StandardVectorClock::from_vec(entries.to_vec())
@@ -344,6 +353,39 @@ mod occ_type_tests {
         let right = TxnPriority::new(clock(&[(2, 1)]), 10);
         let expected = serialize(&left.tid).cmp(&serialize(&right.tid));
 
+        assert_ne!(expected, Ordering::Equal);
+        assert_eq!(left.compare_age(&right), expected);
+        assert_eq!(right.compare_age(&left), expected.reverse());
+    }
+
+    #[test]
+    fn txn_priority_canonicalizes_duplicate_components_by_max_counter() {
+        let older = TxnPriority::new(clock(&[(1, 1), (1, 3)]), 20);
+        let younger = TxnPriority::new(clock(&[(1, 3), (2, 1)]), 10);
+
+        let forward = catch_unwind(|| older.compare_age(&younger));
+        let reverse = catch_unwind(|| younger.compare_age(&older));
+
+        assert_eq!(forward.unwrap(), Ordering::Less);
+        assert_eq!(reverse.unwrap(), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_preserves_causal_order_for_unsorted_zero_components() {
+        let older = TxnPriority::new(clock(&[(3, 0), (2, 1), (1, 1)]), 20);
+        let younger = TxnPriority::new(clock(&[(4, 1), (2, 1), (1, 1), (3, 0)]), 10);
+
+        assert_eq!(older.compare_age(&younger), Ordering::Less);
+        assert_eq!(younger.compare_age(&older), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_tie_breaks_semantically_equal_unsorted_zero_clocks_by_tid_bytes() {
+        let left = TxnPriority::new(clock(&[(2, 0), (1, 1)]), 10);
+        let right = TxnPriority::new(clock(&[(1, 1), (3, 0)]), 10);
+        let expected = serialize(&left.tid).cmp(&serialize(&right.tid));
+
+        assert_eq!(semantic_relation(&left.tid, &right.tid), Relation::Equal);
         assert_ne!(expected, Ordering::Equal);
         assert_eq!(left.compare_age(&right), expected);
         assert_eq!(right.compare_age(&left), expected.reverse());
