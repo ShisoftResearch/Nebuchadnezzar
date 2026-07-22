@@ -320,6 +320,16 @@ impl DataManager {
         failures
     }
     #[inline]
+    fn guarded_txn_cell_ids(txn: &Transaction) -> Vec<Id> {
+        txn.affected_cells
+            .iter()
+            .copied()
+            .chain(txn.certified.keys().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+    #[inline]
     fn wipe_out_transaction(&self, tid: &TxnId) {
         let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
@@ -577,14 +587,7 @@ impl DataManager {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         };
         let expected_owner = TxnPriority::new(tid.clone(), coordinator_id);
-        let guarded_cell_ids: Vec<Id> = txn
-            .affected_cells
-            .iter()
-            .copied()
-            .chain(txn.certified.keys().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let guarded_cell_ids = Self::guarded_txn_cell_ids(&txn);
         let mut cell_mutexes = Vec::with_capacity(guarded_cell_ids.len());
         for cell_id in &guarded_cell_ids {
             cell_mutexes.push(self.cell_meta_mutex(cell_id));
@@ -2017,6 +2020,226 @@ mod tests {
         assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
         server.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abort_validation_rejects_missing_coordinator_without_rollback() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5348";
+        let group = "txn_data_site_abort_missing_coordinator";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8206);
+        let initial_score = 41;
+        let committed_score = 55;
+        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let tid = StandardVectorClock::from_vec(vec![(23, 1)]);
+        let owner = TxnPriority::new(tid.clone(), 23);
+        let prepare_op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_version),
+            intent: PrepareIntent::Write,
+        };
+
+        let prepare = <DataManager as Service>::prepare(
+            &manager,
+            23,
+            tid.clone(),
+            tid.clone(),
+            vec![prepare_op],
+        )
+        .await
+        .payload;
+        assert_eq!(prepare, DMPrepareResult::Success);
+
+        let commit = <DataManager as Service>::commit(
+            &manager,
+            tid.clone(),
+            tid.clone(),
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                committed_score,
+                "counter_abort_missing_coordinator_commit",
+            ))],
+        )
+        .await
+        .payload;
+        assert_eq!(commit, DMCommitResult::Success);
+
+        let committed = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        let committed_version = committed.header.version;
+        assert_eq!(*committed.data["score"].u64().unwrap(), committed_score);
+        assert!(committed_version > initial_version);
+
+        {
+            let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
+            let mut txn = txn_lock.lock();
+            assert_eq!(txn.state, TxnState::Committed);
+            assert!(txn.history.contains_key(&cell_id));
+            txn.coordinator_id = None;
+        }
+
+        let abort = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+
+        assert_eq!(abort, AbortResult::CheckFailed(CheckError::CannotEnd));
+
+        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*persisted.data["score"].u64().unwrap(), committed_score);
+        assert_eq!(persisted.header.version, committed_version);
+
+        let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
+        let txn = txn_lock.lock();
+        assert_eq!(txn.state, TxnState::Committed);
+        assert!(txn.history.contains_key(&cell_id));
+        drop(txn);
+
+        assert_eq!(manager.cell_meta_mutex(&cell_id).lock().owner, Some(owner));
+
+        {
+            let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
+            let mut txn = txn_lock.lock();
+            txn.coordinator_id = Some(23);
+        }
+
+        let end = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abort_validation_rejects_stale_committed_owner_before_rollback() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5349";
+        let group = "txn_data_site_abort_stale_owner";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8207);
+        let initial_score = 61;
+        let committed_score = 77;
+        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let t1 = StandardVectorClock::from_vec(vec![(24, 1)]);
+        let t2 = StandardVectorClock::from_vec(vec![(25, 1)]);
+        let t1_owner = TxnPriority::new(t1.clone(), 24);
+        let t2_owner = TxnPriority::new(t2.clone(), 25);
+        let t1_prepare = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_version),
+            intent: PrepareIntent::Write,
+        };
+
+        let prepare_t1 = <DataManager as Service>::prepare(
+            &manager,
+            24,
+            t1.clone(),
+            t1.clone(),
+            vec![t1_prepare],
+        )
+        .await
+        .payload;
+        assert_eq!(prepare_t1, DMPrepareResult::Success);
+
+        let commit_t1 = <DataManager as Service>::commit(
+            &manager,
+            t1.clone(),
+            t1.clone(),
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                committed_score,
+                "counter_abort_stale_owner_commit",
+            ))],
+        )
+        .await
+        .payload;
+        assert_eq!(commit_t1, DMCommitResult::Success);
+
+        let committed = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        let committed_version = committed.header.version;
+        assert_eq!(*committed.data["score"].u64().unwrap(), committed_score);
+        assert!(committed_version > initial_version);
+
+        {
+            let txn_lock = manager.txns.get(&t1).expect("t1 should remain tracked");
+            let txn = txn_lock.lock();
+            assert_eq!(txn.state, TxnState::Committed);
+            assert!(txn.history.contains_key(&cell_id));
+        }
+
+        {
+            let meta = manager.cell_meta_mutex(&cell_id);
+            let mut meta = meta.lock();
+            meta.lock_acquired_at = Some(get_time() - LOCK_TIMEOUT_MS - 1);
+        }
+
+        let prepare_t2 = <DataManager as Service>::prepare(
+            &manager,
+            25,
+            t2.clone(),
+            t2.clone(),
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Present(committed_version),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await
+        .payload;
+        assert_eq!(prepare_t2, DMPrepareResult::Success);
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(t2_owner.clone())
+        );
+
+        let abort_t1 = <DataManager as Service>::abort(&manager, t1.clone(), t1.clone())
+            .await
+            .payload;
+
+        assert_eq!(abort_t1, AbortResult::CheckFailed(CheckError::CannotEnd));
+
+        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*persisted.data["score"].u64().unwrap(), committed_score);
+        assert_eq!(persisted.header.version, committed_version);
+
+        let t1_txn_lock = manager.txns.get(&t1).expect("t1 should remain tracked");
+        let t1_txn = t1_txn_lock.lock();
+        assert_eq!(t1_txn.state, TxnState::Committed);
+        assert!(t1_txn.history.contains_key(&cell_id));
+        drop(t1_txn);
+
+        assert_ne!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(t1_owner)
+        );
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(t2_owner.clone())
+        );
+
+        let abort_t2 = <DataManager as Service>::abort(&manager, t2.clone(), t2.clone())
+            .await
+            .payload;
+        assert_eq!(abort_t2, AbortResult::Success(None));
+        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone())
+            .await
+            .payload;
+        assert_eq!(end_t2, EndResult::Success);
+
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+            .await
+            .payload;
+        assert_eq!(end_t1, EndResult::Success);
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+        server.shutdown().await;
+    }
 }
 
 impl Service for DataManager {
@@ -2247,7 +2470,37 @@ impl Service for DataManager {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
         }
 
-        // Move guards out before rollback (they need to stay alive during rollback)
+        if txn.history.is_empty() {
+            let guards_to_drop = std::mem::take(&mut txn.segment_guards);
+            txn.last_activity = get_time();
+            txn.state = TxnState::Aborted;
+            drop(txn);
+            drop(guards_to_drop);
+            return self.response_with(AbortResult::Success(None));
+        }
+
+        let Some(coordinator_id) = txn.coordinator_id else {
+            return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
+        };
+        let expected_owner = TxnPriority::new(tid.clone(), coordinator_id);
+        let guarded_cell_ids = Self::guarded_txn_cell_ids(&txn);
+        let mut cell_mutexes = Vec::with_capacity(guarded_cell_ids.len());
+        for cell_id in &guarded_cell_ids {
+            cell_mutexes.push(self.cell_meta_mutex(cell_id));
+        }
+        let mut cell_guards = Vec::with_capacity(cell_mutexes.len());
+        for cell_mutex in &cell_mutexes {
+            cell_guards.push(cell_mutex.lock());
+        }
+        if cell_guards
+            .iter()
+            .any(|meta| meta.owner.as_ref() != Some(&expected_owner))
+        {
+            return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
+        }
+
+        // Keep segment references and metadata guards alive throughout rollback so the owner
+        // cannot be reclaimed between validation and the storage mutations.
         let guards_to_drop = std::mem::take(&mut txn.segment_guards);
 
         let rollback_failures = {
@@ -2266,9 +2519,9 @@ impl Service for DataManager {
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
 
-        // Release segment references after marking as aborted and rollback complete
-        drop(txn); // Release the lock first
-        drop(guards_to_drop); // Then drop guards, releasing all segment references
+        drop(cell_guards);
+        drop(txn);
+        drop(guards_to_drop);
 
         self.response_with(AbortResult::Success(rollback_failures))
     }
