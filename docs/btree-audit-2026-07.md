@@ -175,6 +175,20 @@ legacy per-yield hash lookup (scans roughly doubled again). Exclusive-path
 walks (level merge pruning, clear, verification, reconstruction) still use
 plain clones by design and remain non-concurrent-safe as documented.
 
+### Soak test finding (capacity, pre-existing)
+
+`soak_migration_stress_30m_64_threads` (ignored by default) OOMs on a 62 GB
+machine in both the pre-audit and current builds: 64 unthrottled insert
+workers accumulate the in-memory tree plus a page-cell version in the
+32 GB log-structured chunk for every drained write-back entry, faster than
+debug-mode cleaning reclaims. Measured RSS growth is linear:
+**~97 MB/s pre-audit vs ~52 MB/s with the audit fixes** (tombstone
+compaction shrinks persisted pages), so the audit work roughly halved the
+burn rate but the 30-minute run still needs a larger machine. Follow-up
+that would bound it: coalesce write-back entries per page (dirty flag on
+the node instead of one queue entry per touch), which also bounds
+page-version churn in the chunk.
+
 ## Known remaining risks (documented, not fixed)
 
 - **Seqlock reads are formally data races.** `read_node` closures read node
