@@ -184,6 +184,13 @@ where
         search_node(&self.get_root(), key, ordering, &self.deletion, true)
     }
 
+    /// Approximate median key, found by descending the tree (O(height))
+    /// instead of walking a cursor count/2 steps (O(n)). Returns None only
+    /// for an empty tree. Used to pick a balanced migration split point.
+    pub fn mid_key(&self) -> Option<EntryKey> {
+        level::select_merge_boundary::<KS, PS>(&self.get_root())
+    }
+
     pub(crate) fn seek_raw(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
         search_node(&self.get_root(), key, ordering, &self.deletion, false)
     }

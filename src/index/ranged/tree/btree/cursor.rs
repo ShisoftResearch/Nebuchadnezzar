@@ -179,11 +179,6 @@ where
         }
     }
 
-    #[inline]
-    fn position_valid(&self) -> bool {
-        self.index < self.keys.len() || unsafe { (*self.current.get()).is_some() }
-    }
-
     // Fill the current-key cache from the snapshot. At most one write per
     // position; later calls only read, so references handed out by
     // `current()` are never invalidated behind the caller's back.
@@ -195,11 +190,6 @@ where
                 *cell = Some(self.keys.key(self.index));
             }
         }
-    }
-
-    fn take_current(&mut self) -> Option<EntryKey> {
-        self.fill_current();
-        self.current.get_mut().take()
     }
 
     // Read one page of the sibling chain without side effects on the cursor.

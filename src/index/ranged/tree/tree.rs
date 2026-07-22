@@ -225,26 +225,18 @@ impl RangedTree {
         self.oversized()
     }
 
-    /// Get pivot key for tree splitting
+    /// Get pivot key for tree splitting.
+    ///
+    /// Descends the tree picking the root's middle separator (O(height)),
+    /// which is a balanced approximate median for a B+ tree. The previous
+    /// implementation walked a cursor count/2 steps from the start (O(n)),
+    /// which made a single migration of a very large tree take minutes and
+    /// starved the balancer at billion-key scale.
     pub fn pivot_key(&self) -> Option<EntryKey> {
-        let count = self.count();
-        if count < 2 {
+        if self.count() < 2 {
             return None;
         }
-        // Seek to the approximate midpoint by advancing count/2 steps from the start.
-        // The seek-based traversal is O(N) but acceptable since migration itself is O(N),
-        // and it produces a balanced split unlike the old last-leaf heuristic which
-        // always returned None (scale = ideal_capacity/16 = 32768 > BTREE_NODE_SIZE = 512).
-        let target = count / 2;
-        let mut cursor = self.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
-        let mut result = cursor.current().cloned();
-        for _ in 0..target {
-            match cursor.next() {
-                Some(k) => result = Some(k),
-                None => break,
-            }
-        }
-        result
+        self.tree.mid_key()
     }
 
     /// Retain only keys less than pivot (for tree splitting)
@@ -485,6 +477,38 @@ mod tests {
             left >= min_acceptable && left <= max_acceptable,
             "Pivot should produce a balanced split: {} keys left of pivot ({}%), expected 25–75%",
             left,
+            left * 100 / total
+        );
+    }
+
+    #[test]
+    fn pivot_key_balanced_on_multi_level_tree() {
+        // Enough keys to force several internal levels; the descent-based
+        // median must still split within 25-75%.
+        let tree = make_tree();
+        let n = 50_000u64;
+        for i in 0..n {
+            tree.insert(&make_key(i));
+        }
+        let pivot = tree.pivot_key().expect("pivot for 50k keys");
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut left = 0usize;
+        if let Some(k) = cursor.current() {
+            if k < &pivot {
+                left += 1;
+            }
+        }
+        while let Some(k) = cursor.next() {
+            if k < pivot {
+                left += 1;
+            }
+        }
+        let total = n as usize;
+        assert!(
+            left >= total / 4 && left <= 3 * total / 4,
+            "multi-level pivot unbalanced: {} of {} left ({}%)",
+            left,
+            total,
             left * 100 / total
         );
     }
