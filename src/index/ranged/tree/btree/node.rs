@@ -333,6 +333,10 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     cc: AtomicUsize,
+    // Write-back coalescing flag: set on the false->true transition when the
+    // node is queued for persistence, cleared by persist under the write
+    // latch before it snapshots the page (docs/tla/DirtyCoalesce.tla).
+    pub(super) dirty: std::sync::atomic::AtomicBool,
     data: UnsafeCell<NodeData<KS, PS>>,
 }
 
@@ -345,6 +349,7 @@ where
         Node {
             data: UnsafeCell::new(data),
             cc: AtomicUsize::new(0),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -631,6 +636,10 @@ where
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<'_, ()> {
         let mut guard = write_node::<KS, PS>(node_ref);
+        // Clear the coalescing flag before reading the data: any touch after
+        // this point re-queues the node, so the snapshot below plus the next
+        // queue entry always cover the latest state.
+        self.dirty.store(false, Release);
         let cell = match &mut *guard {
             &mut NodeData::External(ref mut node) => {
                 // Compact tombstoned keys while the latch is held; this also

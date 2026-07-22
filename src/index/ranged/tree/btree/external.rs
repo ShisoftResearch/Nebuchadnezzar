@@ -486,10 +486,24 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // Queue the changed node on this server's write-back hub
+    // Queue the changed node on this server's write-back hub. Coalesced:
+    // only the false->true transition of the node's dirty flag enqueues;
+    // repeated touches of an already-queued page are free. Persist clears
+    // the flag under the page latch before snapshotting, so later touches
+    // re-queue (docs/tla/DirtyCoalesce.tla).
     let Some(client) = tree.writeback_client() else {
         return;
     };
+    if node.is_default() {
+        return;
+    }
+    if node
+        .deref::<KS, PS>()
+        .dirty
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
     let modified = ChangingNode::Modified(NodeModified {
         node: node.clone(),
         deletion: tree.deletion.clone(),

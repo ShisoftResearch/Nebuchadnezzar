@@ -51,10 +51,11 @@ pub fn u64_to_slice(n: u64) -> [u8; 8] {
 
 #[test]
 fn node_size() {
-    // expecting the node size to be an on-heap pointer plus node type tag, aligned, and one for concurrency control.
+    // On-heap pointer plus node type tag (aligned), one word for concurrency
+    // control, and one for the write-back dirty flag (aligned).
     assert_eq!(
         size_of::<Node<KeySlice, PtrSlice>>(),
-        size_of::<usize>() * 3
+        size_of::<usize>() * 4
     );
 }
 

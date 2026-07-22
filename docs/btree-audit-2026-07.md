@@ -184,10 +184,18 @@ workers accumulate the in-memory tree plus a page-cell version in the
 debug-mode cleaning reclaims. Measured RSS growth is linear:
 **~97 MB/s pre-audit vs ~52 MB/s with the audit fixes** (tombstone
 compaction shrinks persisted pages), so the audit work roughly halved the
-burn rate but the 30-minute run still needs a larger machine. Follow-up
-that would bound it: coalesce write-back entries per page (dirty flag on
-the node instead of one queue entry per touch), which also bounds
-page-version churn in the chunk.
+burn rate but the 30-minute run still needs a larger machine. Implemented follow-up: write-back entries are now coalesced per page — a
+node-level dirty flag enqueues only on the false-to-true transition, and
+persist clears the flag under the page write latch before snapshotting
+(model: `docs/tla/DirtyCoalesce.tla`, including the mark-after-latch-release
+call sites; verified no lost updates and a bounded per-page queue). This
+bounds queue growth and page-cell version churn, but does not make the
+30-minute soak fit a 62 GB machine: an smaps breakdown shows the dominant
+residual growth is general heap (dozens of 64 MB glibc arenas — service/RPC
+allocation churn and allocator retention, ~75+ MB/s at speed, present
+pre-audit as well) plus ~20 MB/s of chunk-page touching from cell appends.
+A full fix is server-side: allocator strategy (jemalloc/MADV_FREE), debug
+cleaner throughput, or bounding ingest; out of scope for the B-tree.
 
 ## Known remaining risks (documented, not fixed)
 
