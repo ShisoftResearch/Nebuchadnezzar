@@ -1,5 +1,7 @@
 use std::{fs, time::Duration};
 
+use serde_json::Value;
+
 #[path = "../benches/occ_support/metrics.rs"]
 mod metrics;
 
@@ -36,6 +38,7 @@ fn retries_and_failures_cannot_be_counted_as_throughput() {
     assert_eq!(summary.committed, 1);
     assert_eq!(summary.attempts, 3);
     assert_eq!(summary.not_realizable, 2);
+    assert_eq!(summary.logical_retries, 2);
     assert_eq!(summary.commits_per_second, 0.5);
     assert_eq!(summary.unexpected, vec![String::from("rpc disconnected")]);
     assert!(!summary.invariants_passed);
@@ -82,8 +85,21 @@ fn run_report_replaces_a_scenario_by_name() {
     assert!(path.exists());
     assert!(!path.with_file_name("report.json.tmp").exists());
 
-    let persisted: RunReport =
-        serde_json::from_slice(&fs::read(&path).expect("read report")).expect("parse report");
+    let bytes = fs::read(&path).expect("read report");
+    let persisted_json: Value = serde_json::from_slice(&bytes).expect("parse report as json");
+    let scenario = persisted_json
+        .get("scenarios")
+        .and_then(|scenarios| scenarios.get("repeatable-read"))
+        .and_then(Value::as_object)
+        .expect("repeatable-read scenario object");
+    assert_eq!(scenario.get("p50_ns"), Some(&Value::from(1_000_000_u64)));
+    assert_eq!(scenario.get("p95_ns"), Some(&Value::from(1_000_000_u64)));
+    assert_eq!(scenario.get("p99_ns"), Some(&Value::from(1_000_000_u64)));
+    assert!(!scenario.contains_key("latency_p50_ns"));
+    assert!(!scenario.contains_key("latency_p95_ns"));
+    assert!(!scenario.contains_key("latency_p99_ns"));
+
+    let persisted: RunReport = serde_json::from_slice(&bytes).expect("parse typed report");
     assert_eq!(persisted.scenarios.len(), 1);
     assert_eq!(persisted.scenarios.get("repeatable-read"), Some(&second));
 }

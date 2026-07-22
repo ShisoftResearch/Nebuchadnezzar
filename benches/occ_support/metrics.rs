@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -105,7 +104,10 @@ impl RunReport {
 
     pub fn write_json(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)?;
         }
 
