@@ -42,15 +42,13 @@ where
             match node {
                 &NodeData::External(ref n) => {
                     trace!(
-                        "search in external for {:?}, len {}, ordering {:?}, content: {:?}",
+                        "search in external for {:?}, len {}, ordering {:?}",
                         key,
                         n.len,
-                        ordering,
-                        &n.keys.as_slice_immute()[..n.len]
+                        ordering
                     );
                     // Capture only the key at the found position; the rest of
                     // the page is snapshotted lazily on the first advance.
-                    let all = &n.keys.as_slice_immute()[..n.len];
                     let found = match ordering {
                         Ordering::Forward => {
                             if pos < n.len {
@@ -63,7 +61,9 @@ where
                             // Position at the largest key <= the seek key; when
                             // no such key exists in this page, fall through to
                             // the previous page.
-                            if pos < n.len && &all[pos] == key {
+                            if pos < n.len
+                                && n.keys.cmp_at(pos, key) == std::cmp::Ordering::Equal
+                            {
                                 Some(pos)
                             } else if pos > 0 {
                                 Some(pos - 1)
@@ -74,10 +74,10 @@ where
                     };
                     Ok(match found {
                         Some(idx) => RTCursor::from_lazy(
-                            all[idx].clone(),
+                            n.keys.key_at(idx),
                             filter_deleted
                                 && deletion.len() > 0
-                                && deletion.contains(&all[idx]),
+                                && deletion.contains(&n.keys.key_at(idx)),
                             node_ref.clone(),
                             ordering,
                             deletion.clone(),

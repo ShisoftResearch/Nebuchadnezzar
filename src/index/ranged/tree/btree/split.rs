@@ -13,10 +13,7 @@ where
 {
     // Use read unchecked for there should be no writer for disk trees
     match &*read_unchecked::<KS, PS>(node_ref) {
-        &NodeData::External(ref n) => {
-            let keys = n.keys.as_slice_immute();
-            Some((n.len, n.prev.clone(), keys[n.len / 2].clone()))
-        }
+        &NodeData::External(ref n) => Some((n.len, n.prev.clone(), n.keys.key_at(n.len / 2))),
         &NodeData::Internal(ref n) => {
             debug!("Collecting pivot in internal {:?}", node_ref);
             last_node_prev_digest::<KS, PS>(&n.ptrs.as_slice_immute()[..n.len].last().unwrap())
@@ -68,7 +65,7 @@ where
                 // Pivot is beyond reach, nothing to do
                 return true;
             }
-            let selected_key = &n.keys.as_slice_immute()[key_index];
+            let selected_key = &n.keys.key_at(key_index);
             let origin_node_len = n.len;
             let prev_node_ref = n.prev.clone();
             let node_id = n.id;

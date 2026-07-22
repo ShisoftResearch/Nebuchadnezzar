@@ -97,18 +97,9 @@ where
 
     pub fn keys(&self) -> Vec<EntryKey> {
         if self.is_ext() {
-            self.extnode().keys.as_slice_immute()[..self.len()].to_vec()
+            self.extnode().keys.to_vec(0..self.len())
         } else {
             self.innode().keys.to_vec(self.len())
-        }
-    }
-
-    pub fn keys_mut(&mut self) -> &mut [EntryKey] {
-        let len = self.len();
-        if self.is_ext() {
-            &mut self.extnode_mut().keys.as_slice()[..len]
-        } else {
-            panic!("internal keys are prefix-compressed and cannot be mutably borrowed as a slice")
         }
     }
 
@@ -133,7 +124,7 @@ where
             MIN_ENTRY_KEY.clone()
         } else {
             match self {
-                &NodeData::External(ref n) => n.keys.as_slice_immute()[0].clone(),
+                &NodeData::External(ref n) => n.keys.key_at(0),
                 &NodeData::Internal(ref n) => n.keys.key_at(0),
                 _ => unreachable!("{}", self.type_name()),
             }
@@ -145,7 +136,7 @@ where
             MIN_ENTRY_KEY.clone()
         } else {
             match self {
-                &NodeData::External(ref n) => n.keys.as_slice_immute()[n.len - 1].clone(),
+                &NodeData::External(ref n) => n.keys.key_at(n.len - 1),
                 &NodeData::Internal(ref n) => n.keys.key_at(n.len - 1),
                 _ => unreachable!("{}", self.type_name()),
             }

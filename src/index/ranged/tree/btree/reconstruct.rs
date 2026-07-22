@@ -197,7 +197,7 @@ where
             }
             let mut prev_lock = write_node::<KS, PS>(&prev_ref);
             debug_assert!(prev_ref.is_default() || node.len != 0);
-            let first_key = node.keys.as_slice_immute()[0].clone();
+            let first_key = node.keys.key_at(0);
             len += node.len;
             node.prev = prev_ref.clone();
             let node_ref = NodeCellRef::new(Node::with_external(Box::new(node)));

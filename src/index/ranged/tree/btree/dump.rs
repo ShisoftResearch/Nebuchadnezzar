@@ -53,7 +53,8 @@ where
     match &*node {
         &NodeData::External(ref node) => {
             let node: &ExtNode<KS, PS> = node;
-            let keys = node.keys.as_slice_immute()[..node.len]
+            let keys = node.keys.to_vec(0..node.len);
+            let keys = keys
                 .iter()
                 .map(|key| {
                     let id = key.id();

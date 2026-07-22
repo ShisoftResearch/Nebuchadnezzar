@@ -140,7 +140,8 @@ where
                 } else if remain_slots == 0 {
                     let insert_pos = current_guard.search(&start_key);
                     if insert_pos < current_guard.len()
-                        && &current_guard.extnode().keys.as_slice_immute()[insert_pos] == start_key
+                        && current_guard.extnode().keys.cmp_at(insert_pos, start_key)
+                            == std::cmp::Ordering::Equal
                     {
                         // Key already present; the split path below would
                         // blindly duplicate it.

@@ -197,6 +197,27 @@ pre-audit as well) plus ~20 MB/s of chunk-page touching from cell appends.
 A full fix is server-side: allocator strategy (jemalloc/MADV_FREE), debug
 cleaner throughput, or bounding ingest; out of scope for the B-tree.
 
+### Leaf prefix compression
+
+Leaf pages now store one shared prefix plus fixed-width suffixes
+(`leaf_keys.rs`), mirroring the internal nodes' InternalKeys but with
+in-place mutation on the insert path. Concurrency: the suffix buffer is
+reached through a single atomic pointer to a self-describing allocation
+(prefix, width, capacity and data in one block), so optimistic readers can
+never observe inconsistent bounds; in-place suffix edits happen under the
+page latch (torn bytes are discarded by seqlock validation), and structural
+rebuilds (prefix shrink, bulk replace) swap the pointer and epoch-retire
+the old buffer — the swap-and-defer protocol verified in
+`SeqlockReclaim.tla` (readers keep nothing past their pin). Validated by a
+randomized differential test against a `Vec<EntryKey>` model.
+
+Measured (4M keys, 128-key pages): sequential 33.4 -> 11.5 bytes/key,
+random 48 -> ~6 bytes/key (suffix width shrinks to the bytes that actually
+vary within a page). Performance: random insert +40% (1.64-1.71M ops/s),
+point seek 1.28-1.53M ops/s, sequential insert ~3M ops/s; full scans trade
+~30% (84M -> 58M ops/s) for the 6x memory reduction because snapshots
+reconstruct keys from prefix+suffix instead of one bulk memcpy.
+
 ## Known remaining risks (documented, not fixed)
 
 - **Seqlock reads are formally data races.** `read_node` closures read node

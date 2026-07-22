@@ -1,3 +1,4 @@
+use super::leaf_keys::LeafKeys;
 use super::reconstruct::ReconstructError;
 use super::*;
 use crate::client::AsyncClient;
@@ -8,7 +9,7 @@ use crate::ram::types::*;
 use dovahkiin::types::custom_types::id::Id;
 use itertools::Itertools;
 use std::marker::PhantomData;
-use std::{mem, panic};
+use std::panic;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -53,12 +54,13 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub id: Id,
-    pub keys: KS,
+    // Prefix-compressed page keys; KS only provides the page capacity.
+    pub keys: LeafKeys,
     pub next: NodeCellRef,
     pub prev: NodeCellRef,
     pub len: usize,
     pub right_bound: EntryKey,
-    pub mark: PhantomData<PS>,
+    pub mark: PhantomData<(KS, PS)>,
 }
 
 impl<KS, PS> ExtNode<KS, PS>
@@ -69,7 +71,7 @@ where
     pub fn new(id: Id, right_bound: EntryKey) -> Box<Self> {
         Box::new(ExtNode {
             id,
-            keys: KS::init(),
+            keys: LeafKeys::new(KS::slice_len()),
             next: Node::<KS, PS>::none_ref(),
             prev: Node::<KS, PS>::none_ref(),
             len: 0,
@@ -122,15 +124,14 @@ where
                 ),
             ));
         };
-        let mut key_slice = KS::init();
-        let mut key_count = 0;
-        for (i, key_val) in keys_array.iter().enumerate() {
-            key_slice.as_slice()[i] = EntryKey::from_slice(key_val.as_slice());
-            key_count += 1;
-        }
+        let cell_keys = keys_array
+            .iter()
+            .map(|key_val| EntryKey::from_slice(key_val.as_slice()))
+            .collect_vec();
+        let key_count = cell_keys.len();
         let ext_node = ExtNode {
             id: cell_id,
-            keys: key_slice,
+            keys: LeafKeys::from_keys(&cell_keys, KS::slice_len()),
             next: NodeCellRef::default(), // UNDETERMINED
             prev: NodeCellRef::default(), // UNDETERMINED
             len: key_count,
@@ -218,9 +219,11 @@ where
 
         value[*NEXT_PAGE_KEY_HASH] = OwnedValue::Id(next_id);
         value[*PREV_PAGE_KEY_HASH] = OwnedValue::Id(prev_id);
-        value[*KEYS_KEY_HASH] = self.keys.as_slice_immute()[..self.len]
-            .iter()
-            .filter(|&key| !deleted.contains(key))
+        value[*KEYS_KEY_HASH] = self
+            .keys
+            .to_vec(0..self.len)
+            .into_iter()
+            .filter(|key| !deleted.contains(key))
             .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
             .collect_vec()
             .value();
@@ -228,9 +231,7 @@ where
     }
 
     pub fn search(&self, key: &EntryKey) -> usize {
-        self.keys.as_slice_immute()[..self.len]
-            .binary_search(key)
-            .unwrap_or_else(|i| i)
+        self.keys.search(self.len, key)
     }
     pub fn search_unwindable(
         &self,
@@ -246,8 +247,6 @@ where
         self_next: &mut NodeWriteGuard<KS, PS>,
         tree: &BPlusTree<KS, PS>,
     ) -> (NodeCellRef, EntryKey) {
-        // cached.dump();
-        let keys_1 = &mut self.keys;
         // Append-aware split: a key landing past the last slot keeps the
         // left page completely full and opens a fresh right page (sequential
         // writers otherwise leave every page half empty and split twice as
@@ -258,19 +257,16 @@ where
             self.len / 2
         };
         let new_page_id = BPlusTree::<KS, PS>::new_page_id();
-        let mut keys_2 = keys_1.split_at_pivot(pivot, self.len);
+        let mut keys_2 = self.keys.split_off(pivot, self.len);
         let mut keys_1_len = pivot;
         let mut keys_2_len = self.len - pivot;
-        // modify next node point previous to new node
-        insert_into_split(
-            key,
-            keys_1,
-            &mut keys_2,
-            &mut keys_1_len,
-            &mut keys_2_len,
-            pos,
-        );
-        let pivot_key = keys_2.as_slice_immute()[0].clone();
+        // insert the new key into whichever side owns its position
+        if pos < keys_1_len {
+            self.keys.insert_at(key, pos, &mut keys_1_len);
+        } else {
+            keys_2.insert_at(key, pos - keys_1_len, &mut keys_2_len);
+        }
+        let pivot_key = keys_2.key_at(0);
         let extnode_2: Box<ExtNode<KS, PS>> = Box::new(ExtNode {
             id: new_page_id,
             keys: keys_2,
@@ -288,10 +284,10 @@ where
         );
         debug_assert!(pivot_key > Default::default());
         debug_assert!(
-            &pivot_key > &keys_1.as_slice()[keys_1_len - 1],
+            pivot_key > self.keys.key_at(keys_1_len - 1),
             "{:?} / {:?} @ {}",
             pivot_key,
-            &keys_1.as_slice()[keys_1_len - 1],
+            self.keys.key_at(keys_1_len - 1),
             pos
         );
         self.len = keys_1_len;
@@ -303,7 +299,7 @@ where
             read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
         );
         debug_assert_eq!(self.right_bound, pivot_key);
-        debug_assert_eq!(&self.right_bound, &extnode_2.keys.as_slice_immute()[0]);
+        debug_assert_eq!(self.right_bound, extnode_2.keys.key_at(0));
         debug_assert!(
             self.right_bound < extnode_2.right_bound,
             "node right bound >= next right bound {:?} - {:?}",
@@ -311,10 +307,10 @@ where
             extnode_2.right_bound
         );
         debug_assert!(
-            self.right_bound <= extnode_2.keys.as_slice_immute()[0],
+            self.right_bound <= extnode_2.keys.key_at(0),
             "node right bound < next first key, {:?} - {:?}",
             self.right_bound,
-            &extnode_2.keys.as_slice_immute()[..extnode_2.len]
+            extnode_2.keys.to_vec(0..extnode_2.len)
         );
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         if !self_next.is_ref_none() {
@@ -322,7 +318,7 @@ where
             debug_assert!(
                 self_next_node.prev.ptr_eq(&self_ref),
                 "node next node's prev node is not self {:?}",
-                self_next_node.keys.as_slice_immute()[0]
+                self_next_node.keys.key_at(0)
             );
             self_next_node.prev = node_2.clone();
         }
@@ -342,7 +338,7 @@ where
         let pos = self.search(&key);
         debug_assert!(self.len <= KS::slice_len());
         debug_assert!(pos <= self.len);
-        if self.len > pos && self.keys.as_slice_immute()[pos] == key {
+        if self.len > pos && self.keys.cmp_at(pos, &key) == std::cmp::Ordering::Equal {
             trace!("inserting existing key");
             return None;
         }
@@ -373,25 +369,14 @@ where
     // filter tombstoned keys at snapshot time to stay race-free. Protocol
     // model-checked in docs/tla/DeletionReclaim.tla.
     pub fn remove_contains(&mut self, set: &DeletionSet) {
-        let (remaining_keys, removed_keys) = {
-            let (removed, remaining): (Vec<&EntryKey>, Vec<&EntryKey>) = self.keys.as_slice()
-                [..self.len]
-                .iter()
-                .partition(|&k| set.contains(k));
-            if removed.is_empty() {
-                return;
-            }
-            (
-                remaining.into_iter().cloned().collect_vec(),
-                removed.into_iter().cloned().collect_vec(),
-            )
-        };
-        let self_key_slice = self.keys.as_slice();
-        self.len = remaining_keys.len();
-        for (i, k_ref) in remaining_keys.into_iter().enumerate() {
-            self_key_slice[i] = k_ref;
+        let all = self.keys.to_vec(0..self.len);
+        let (removed, remaining): (Vec<EntryKey>, Vec<EntryKey>) =
+            all.into_iter().partition(|k| set.contains(k));
+        if removed.is_empty() {
+            return;
         }
-        for key in &removed_keys {
+        self.keys.set_from(&remaining, &mut self.len);
+        for key in &removed {
             set.remove(key);
         }
     }
@@ -402,50 +387,41 @@ where
         trace!("Merge sort have right nodes {:?}", right);
         let self_len_before_merge = self.len;
         debug_assert!(self_len_before_merge + right.len() <= KS::slice_len());
-        let mut pos = 0;
+        let left = self.keys.to_vec(0..self.len);
+        let mut merged: Vec<EntryKey> = Vec::with_capacity(self.len + right.len());
         let mut left_pos = 0;
         let mut right_pos = 0;
-        let mut left_keys = mem::replace(&mut self.keys, KS::init());
-        let left = left_keys.as_slice();
-        while left_pos < self.len && right_pos < right.len() {
+        while left_pos < left.len() && right_pos < right.len() {
             let left_key = &left[left_pos];
             let right_key = right[right_pos];
-            if left_key <= right_key {
-                self.keys.as_slice()[pos] = left_key.clone();
+            let take = if left_key <= right_key {
                 left_pos += 1;
-            } else if left_key > right_key {
-                self.keys.as_slice()[pos] = right_key.clone();
+                if left_key == right_key {
+                    // duplicate across the two runs: consume both, keep one
+                    right_pos += 1;
+                }
+                left_key
+            } else {
                 right_pos += 1;
-            }
-            if left_key == right_key {
-                // when duplication detected, skip the duplicated one
-                right_pos += 1;
-            }
-            if pos == 0 || self.keys.as_slice_immute()[pos - 1] != self.keys.as_slice_immute()[pos]
-            {
-                // if no duplicate assigned, step further
-                pos += 1;
+                right_key
+            };
+            if merged.last() != Some(take) {
+                merged.push(take.clone());
             }
         }
-        for key in &left[left_pos..self.len] {
-            if pos == 0 || &self.keys.as_slice_immute()[pos - 1] != key {
-                self.keys.as_slice()[pos] = key.clone();
-                pos += 1;
+        for key in &left[left_pos..] {
+            if merged.last() != Some(key) {
+                merged.push(key.clone());
             }
             left_pos += 1;
         }
         for key in &right[right_pos..] {
-            if pos == 0 || &self.keys.as_slice_immute()[pos - 1] != *key {
-                self.keys.as_slice()[pos] = (*key).clone();
-                pos += 1;
+            if merged.last() != Some(*key) {
+                merged.push((*key).clone());
             }
             right_pos += 1;
         }
-        trace!(
-            "Merge sorted have keys {:?}",
-            &self.keys.as_slice_immute()[..pos]
-        );
-        self.len = pos;
+        self.keys.set_from(&merged, &mut self.len);
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
 
@@ -474,17 +450,13 @@ where
             }
         }
 
-        trace!(
-            "Merge sorted page have keys: {:?}",
-            &self.keys.as_slice_immute()[..self.len]
-        );
         num_duplicates
     }
 
     pub fn dump(&self) {
         trace!("Dumping {:?}, keys {}", self.id, self.len);
-        for i in 0..KS::slice_len() {
-            trace!("{}\t- {:?}", i, self.keys.as_slice_immute()[i]);
+        for i in 0..self.len {
+            trace!("{}\t- {:?}", i, self.keys.key_at(i));
         }
     }
 }

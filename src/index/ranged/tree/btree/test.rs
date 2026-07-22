@@ -536,8 +536,10 @@ fn reconstruct() {
                 nodes.push(last_node);
                 last_node = new_node();
             }
-            last_node.keys[last_node.len] = key;
-            last_node.len += 1;
+            let insert_pos = last_node.len;
+            let mut new_len = last_node.len;
+            last_node.keys.insert_at(key, insert_pos, &mut new_len);
+            last_node.len = new_len;
         }
         nodes.push(last_node);
         let nodes = nodes

@@ -172,10 +172,11 @@ where
                 // One emptiness check per page instead of one hash lookup
                 // per key when nothing is tombstoned (the common case).
                 let filtering = filter_deleted && deletion.len() > 0;
-                let keys: Vec<EntryKey> = n.keys.as_slice_immute()[..n.len]
-                    .iter()
+                let keys: Vec<EntryKey> = n
+                    .keys
+                    .to_vec(0..n.len)
+                    .into_iter()
                     .filter(|k| !filtering || !deletion.contains(k))
-                    .cloned()
                     .collect();
                 if keys.is_empty() {
                     PageSnap::Skip(follow)
@@ -248,32 +249,35 @@ where
         let snap = loop {
             let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::External(ref n) => {
-                let keys = &n.keys.as_slice_immute()[..n.len];
                 let filtering = self.filter_deleted && self.deletion.len() > 0;
-                let snap = |range: &[EntryKey]| -> Vec<EntryKey> {
-                    range
-                        .iter()
+                let snap = |range: std::ops::Range<usize>| -> Vec<EntryKey> {
+                    n.keys
+                        .to_vec(range)
+                        .into_iter()
                         .filter(|k| !filtering || !self.deletion.contains(k))
-                        .cloned()
                         .collect()
                 };
                 match self.ordering {
                     Ordering::Forward => {
                         // First key strictly greater than the current one.
-                        let pos = match keys.binary_search(&cur) {
-                            Ok(i) => i + 1,
-                            Err(i) => i,
+                        let lb = n.keys.search(n.len, &cur);
+                        let pos = if lb < n.len
+                            && n.keys.cmp_at(lb, &cur) == std::cmp::Ordering::Equal
+                        {
+                            lb + 1
+                        } else {
+                            lb
                         };
                         match n.next.try_clone_speculative() {
-                            Some(follow) => PageSnap::Page(snap(&keys[pos..]), follow),
+                            Some(follow) => PageSnap::Page(snap(pos..n.len), follow),
                             None => PageSnap::Retry,
                         }
                     }
                     Ordering::Backward => {
                         // Keys strictly smaller than the current one.
-                        let pos = keys.binary_search(&cur).unwrap_or_else(|i| i);
+                        let pos = n.keys.search(n.len, &cur);
                         match n.prev.try_clone_speculative() {
-                            Some(follow) => PageSnap::Page(snap(&keys[..pos]), follow),
+                            Some(follow) => PageSnap::Page(snap(0..pos), follow),
                             None => PageSnap::Retry,
                         }
                     }
