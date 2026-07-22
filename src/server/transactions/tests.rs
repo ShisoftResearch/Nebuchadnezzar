@@ -394,11 +394,13 @@ pub async fn multi_transaction() {
     );
     let cell_1 =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
-    let _cell_1_t1_write = txn
-        .update(txn_1_id.to_owned(), cell_1.to_owned())
-        .await
-        .unwrap()
-        .unwrap();
+    assert_eq!(
+        txn.update(txn_1_id.to_owned(), cell_1.to_owned())
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Error(WriteError::CellDoesNotExisted)
+    );
     let data_map_2 = data_map_1.clone();
     data_map_1.insert(&String::from("score"), OwnedValue::U64(90));
     let cell_2 =
@@ -410,35 +412,46 @@ pub async fn multi_transaction() {
         .unwrap();
     txn.prepare(txn_2_id.to_owned()).await.unwrap().unwrap();
     txn.commit(txn_2_id.to_owned()).await.unwrap().unwrap();
-
-    // With strict timestamp ordering + Wait-Die:
-    // T1 (older) should fail to prepare after T2 (newer) has committed
-    // because tid_1 < meta.write (set by T2)
-    assert_ne!(
-        txn.prepare(txn_1_id.to_owned()).await.unwrap().unwrap(),
-        TMPrepareResult::Success
-    );
-    assert!(txn.commit(txn_1_id.to_owned()).await.unwrap().is_err());
+    assert!(matches!(
+        txn.abort(txn_1_id.to_owned()).await.unwrap().unwrap(),
+        AbortResult::Success(_)
+    ));
     ///////////////// PHASE 2 //////////////////
     let txn_1_id = txn.begin().await.unwrap().unwrap();
     let txn_2_id = txn.begin().await.unwrap().unwrap();
-    match txn
+    let mut txn_2_cell = match txn
         .read(txn_2_id.to_owned(), cell_1.id())
         .await
         .unwrap()
         .unwrap()
     {
-        TxnExecResult::Accepted(_) => {}
+        TxnExecResult::Accepted(cell) => cell,
         _ => {
             panic!("Cannot read cell 1 for txn 2");
         }
-    }
+    };
     txn.update(txn_1_id.to_owned(), cell_1.to_owned())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        txn.prepare(txn_1_id.to_owned()).await.unwrap().unwrap(), // write too late
+        txn.prepare(txn_1_id.to_owned()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(txn_1_id.to_owned()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let mut stale_data = txn_2_cell.data.Map().unwrap().clone();
+    stale_data.insert(&String::from("score"), OwnedValue::U64(80));
+    txn_2_cell.data = OwnedValue::Map(stale_data);
+    txn.update(txn_2_id.to_owned(), txn_2_cell)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        txn.prepare(txn_2_id.to_owned()).await.unwrap().unwrap(),
         TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
     );
     // Note: When prepare fails, the transaction is automatically aborted and cleaned up

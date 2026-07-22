@@ -2228,7 +2228,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         let end_idx = ((batch_idx + 1) * batch_size).min(num_cells);
 
         for i in start_idx..end_idx {
-            let id = Id::new(schema.id as u64, i as u64);
+            let id = Id::new(schema.id as u64, i as u64 + 1);
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(
@@ -2561,7 +2561,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     for batch in 0..(num_keys / batch_size) {
         let tx = client.begin().await.unwrap().unwrap();
         for i in (batch * batch_size)..((batch + 1) * batch_size) {
-            let id = Id::new(schema.id as u64, i as u64);
+            let id = Id::new(schema.id as u64, i as u64 + 1);
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(
