@@ -734,8 +734,10 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Rejected);
             }
 
+            // Use the transaction's own timestamp for internal blind observations so the
+            // read timestamp recorded at the data site cannot advance beyond this tid.
             let head_response = server
-                .head(self_server_id, self.get_clock(), tid.to_owned(), *id)
+                .head(self_server_id, tid.clone(), tid.to_owned(), *id)
                 .await;
             match head_response {
                 Ok(dsr) => {
@@ -1228,7 +1230,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn affected_objs_retains_read_dependencies_for_rw_transaction() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5297";
+        let address = "127.0.0.1:5288";
         let group = "txn_manager_affected_objs_rw";
         let server = start_manager_test_server(address, group).await;
         let manager = server.current_database().txn_manager().unwrap().clone();

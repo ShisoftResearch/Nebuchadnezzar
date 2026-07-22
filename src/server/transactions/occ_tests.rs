@@ -482,3 +482,45 @@ async fn occ_mixed_read_write_prepare_commit_updates_only_changed_cell() {
 
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeatable_blind_update_after_clock_advance_uses_transaction_observation_clock() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5342";
+    let group = "txn_occ_repeatable_blind_update_clock";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90112);
+
+    let mut initial = counter_cell(schema.id, cell_id, 4, "counter_blind_clock_initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    let later_tid = txn.begin().await.unwrap().unwrap();
+
+    let updated = counter_cell(schema.id, cell_id, 11, "counter_blind_clock_updated");
+    assert_eq!(
+        txn.update(tid.clone(), updated.clone())
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    assert_eq!(
+        txn.prepare(tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(tid.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(persisted.data, updated.data);
+
+    abort_txn(&txn, later_tid).await;
+    server.shutdown().await;
+}

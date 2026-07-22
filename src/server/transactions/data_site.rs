@@ -530,23 +530,8 @@ impl DataManager {
             TxnState::Prepared => {}
         };
 
-        let prepared_cells_num = txn.affected_cells.len();
-        let arrived_cells_num = cells.len();
-        if arrived_cells_num > prepared_cells_num {
-            return DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(
-                prepared_cells_num,
-                arrived_cells_num,
-            ));
-        }
-        let prepared_cell_ids: BTreeSet<_> = txn.affected_cells.iter().copied().collect();
-        let mut committed_cell_ids = BTreeSet::new();
-        for cell_id in cells.iter().map(Self::commit_op_cell_id) {
-            if !prepared_cell_ids.contains(&cell_id) || !committed_cell_ids.insert(cell_id) {
-                return DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(
-                    prepared_cells_num,
-                    arrived_cells_num,
-                ));
-            }
+        if let Err(result) = Self::validate_commit_subset(&txn.affected_cells, &cells) {
+            return result;
         }
 
         crate::ram::chunk::set_transaction_context(true);
@@ -554,7 +539,9 @@ impl DataManager {
         {
             for cell_op in cells {
                 match cell_op {
-                    CommitOp::Read(_id, _version) => {}
+                    CommitOp::Read(_, _) | CommitOp::None => {
+                        return DMCommitResult::CheckFailed(CheckError::CannotEnd);
+                    }
                     CommitOp::Write(mut cell) => {
                         let cell_id = cell.id();
                         let (should_skip, write_ts) = {
@@ -729,7 +716,6 @@ impl DataManager {
                             }
                         }
                     }
-                    CommitOp::None => panic!("None CommitOp should not appear in data site"),
                 }
             }
         }
@@ -771,11 +757,40 @@ impl DataManager {
         DMCommitResult::Success
     }
 
-    fn commit_op_cell_id(op: &CommitOp) -> Id {
+    fn validate_commit_subset(
+        affected_cells: &[Id],
+        cells: &[CommitOp],
+    ) -> Result<(), DMCommitResult> {
+        let prepared_cells_num = affected_cells.len();
+        let arrived_cells_num = cells.len();
+        if arrived_cells_num > prepared_cells_num {
+            return Err(DMCommitResult::CheckFailed(
+                CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num),
+            ));
+        }
+
+        let prepared_cell_ids: BTreeSet<_> = affected_cells.iter().copied().collect();
+        let mut committed_cell_ids = BTreeSet::new();
+        for op in cells {
+            let cell_id = match Self::commit_op_cell_id(op) {
+                Ok(cell_id) => cell_id,
+                Err(error) => return Err(DMCommitResult::CheckFailed(error)),
+            };
+            if !prepared_cell_ids.contains(&cell_id) || !committed_cell_ids.insert(cell_id) {
+                return Err(DMCommitResult::CheckFailed(
+                    CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commit_op_cell_id(op: &CommitOp) -> Result<Id, CheckError> {
         match op {
-            CommitOp::Write(cell) | CommitOp::Update(cell) => cell.id(),
-            CommitOp::Remove(id) | CommitOp::Read(id, _) => *id,
-            CommitOp::None => panic!("None CommitOp should not appear in data site"),
+            CommitOp::Write(cell) | CommitOp::Update(cell) => Ok(cell.id()),
+            CommitOp::Remove(id) => Ok(*id),
+            CommitOp::Read(_, _) | CommitOp::None => Err(CheckError::CannotEnd),
         }
     }
 }
@@ -833,6 +848,15 @@ mod tests {
             .await
             .expect("database runtime");
         DataManager::new(runtime, crate::server::Peer::new(&address.to_string()))
+    }
+
+    fn prepare_local_txn(manager: &Arc<DataManager>, tid: &TxnId, affected_cells: Vec<Id>) {
+        let txn_lock = manager.get_or_create_transaction(tid);
+        let mut txn = txn_lock.lock();
+        txn.state = TxnState::Prepared;
+        txn.affected_cells = affected_cells;
+        txn.history.clear();
+        txn.last_activity = get_time();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1001,6 +1025,102 @@ mod tests {
 
         assert!(manager.txns.get(&tid).is_none());
         assert!(!manager.txns_sorted.lock().contains(&tid));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_validation_rejects_non_mutation_ops_without_panicking() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5299";
+        let group = "txn_data_site_commit_variant_validation";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let affected_id = Id::new(0, 8101);
+
+        for ops in [vec![CommitOp::Read(affected_id, 1)], vec![CommitOp::None]] {
+            let tid = manager.txn_peer.clock.inc();
+            prepare_local_txn(&manager, &tid, vec![affected_id]);
+
+            let result = <DataManager as Service>::commit(&manager, tid.clone(), tid.clone(), ops)
+                .await
+                .payload;
+            assert_eq!(result, DMCommitResult::CheckFailed(CheckError::CannotEnd));
+
+            let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
+            let txn = txn_lock.lock();
+            assert_eq!(txn.state, TxnState::Prepared);
+            assert_eq!(txn.affected_cells, vec![affected_id]);
+            assert!(txn.history.is_empty());
+        }
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_validation_accepts_empty_subset_and_rejects_invalid_mutation_subsets() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5300";
+        let group = "txn_data_site_commit_subset_validation";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let affected_a = Id::new(0, 8201);
+        let affected_b = Id::new(0, 8202);
+        let unprepared = Id::new(0, 8203);
+
+        let empty_tid = manager.txn_peer.clock.inc();
+        prepare_local_txn(&manager, &empty_tid, vec![affected_a, affected_b]);
+        let empty_result = <DataManager as Service>::commit(
+            &manager,
+            empty_tid.clone(),
+            empty_tid.clone(),
+            vec![],
+        )
+        .await
+        .payload;
+        assert_eq!(empty_result, DMCommitResult::Success);
+        assert_eq!(
+            manager.txns.get(&empty_tid).unwrap().lock().state,
+            TxnState::Committed
+        );
+
+        let extra_tid = manager.txn_peer.clock.inc();
+        prepare_local_txn(&manager, &extra_tid, vec![affected_a, affected_b]);
+        let extra_result = <DataManager as Service>::commit(
+            &manager,
+            extra_tid.clone(),
+            extra_tid.clone(),
+            vec![CommitOp::Remove(unprepared)],
+        )
+        .await
+        .payload;
+        assert_eq!(
+            extra_result,
+            DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(2, 1))
+        );
+        assert_eq!(
+            manager.txns.get(&extra_tid).unwrap().lock().state,
+            TxnState::Prepared
+        );
+
+        let duplicate_tid = manager.txn_peer.clock.inc();
+        prepare_local_txn(&manager, &duplicate_tid, vec![affected_a, affected_b]);
+        let duplicate_result = <DataManager as Service>::commit(
+            &manager,
+            duplicate_tid.clone(),
+            duplicate_tid.clone(),
+            vec![CommitOp::Remove(affected_a), CommitOp::Remove(affected_a)],
+        )
+        .await
+        .payload;
+        assert_eq!(
+            duplicate_result,
+            DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(2, 2))
+        );
+        assert_eq!(
+            manager.txns.get(&duplicate_tid).unwrap().lock().state,
+            TxnState::Prepared
+        );
 
         server.shutdown().await;
     }
