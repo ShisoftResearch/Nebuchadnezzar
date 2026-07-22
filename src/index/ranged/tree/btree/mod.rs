@@ -201,18 +201,7 @@ where
 
     pub fn insert(&self, key: &EntryKey) -> bool {
         match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
-            Some(Some(split)) => {
-                trace!("split root with pivot key {:?}", split.pivot);
-                let new_node = split.new_right_node;
-                let pivot = split.pivot;
-                let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(1, max_entry_key());
-                let old_root = self.get_root().clone();
-                new_in_root.keys = InternalKeys::from_keys(&[pivot]);
-                new_in_root.ptrs.as_slice()[0] = old_root;
-                new_in_root.ptrs.as_slice()[1] = new_node;
-                *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
-                self.height.fetch_add(1, AcqRel);
-            }
+            Some(Some(split)) => apply_top_level_split(self, split),
             Some(None) => {}
             None => return false,
         }
@@ -521,5 +510,9 @@ impl LevelTree for DummyLevelTree {
 impl_slice_ops!([EntryKey; 0], EntryKey, 0);
 impl_slice_ops!([NodeCellRef; 0], NodeCellRef, 0);
 
+#[cfg(test)]
+pub mod audit_test;
+#[cfg(test)]
+pub mod bench_test;
 #[cfg(test)]
 pub mod test;

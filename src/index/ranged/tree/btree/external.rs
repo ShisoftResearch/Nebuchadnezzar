@@ -349,7 +349,9 @@ where
         }
     }
 
-    pub fn merge_sort(&mut self, right: &[&EntryKey]) {
+    // Merges `right` into this node's keys, dropping duplicates.
+    // Returns the number of duplicate keys that were dropped.
+    pub fn merge_sort(&mut self, right: &[&EntryKey]) -> usize {
         trace!("Merge sort have right nodes {:?}", right);
         let self_len_before_merge = self.len;
         debug_assert!(self_len_before_merge + right.len() <= KS::slice_len());
@@ -428,7 +430,8 @@ where
         trace!(
             "Merge sorted page have keys: {:?}",
             &self.keys.as_slice_immute()[..self.len]
-        )
+        );
+        num_duplicates
     }
 
     pub fn dump(&self) {

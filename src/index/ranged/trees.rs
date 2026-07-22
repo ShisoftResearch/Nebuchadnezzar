@@ -6,13 +6,7 @@ pub use crate::index::*;
 pub trait Slice<T: Default>: Send + Sync {
     const SLICE_LEN: usize;
     fn as_slice(&mut self) -> &mut [T];
-    #[inline]
-    fn as_slice_immute(&self) -> &[T] {
-        unsafe {
-            let raw = self as *const Self as *mut Self;
-            (*raw).as_slice()
-        }
-    }
+    fn as_slice_immute(&self) -> &[T];
     #[inline]
     fn slice_len() -> usize {
         Self::SLICE_LEN
@@ -42,26 +36,18 @@ pub trait Slice<T: Default>: Send + Sync {
         debug_assert!(pos <= *len, "pos {} larger or equals to len {}", pos, len);
         trace!("insert into slice, pos: {}, len {}", pos, len);
         let slice = self.as_slice();
-        if *len > 0 {
-            slice[*len] = T::default();
-            for i in (pos..=*len - 1).rev() {
-                slice.swap(i, i + 1);
-            }
-        }
-        *len += 1;
+        // Shift [pos..len] right by one in a single rotation (compiles to a
+        // memmove-style loop) and drop whatever occupied the vacated slot.
+        slice[pos..=*len].rotate_right(1);
         slice[pos] = item;
+        *len += 1;
     }
     fn remove_at(&mut self, pos: usize, len: &mut usize) {
         trace!("remove at {} len {}", pos, len);
         debug_assert!(pos < *len, "remove overflow, pos {}, len {}", pos, len);
         let slice = self.as_slice();
-        let bound = *len - 1;
-        if pos < bound {
-            for i in pos..bound {
-                slice.swap(i, i + 1);
-            }
-        }
-        slice[bound] = T::default();
+        slice[pos..*len].rotate_left(1);
+        slice[*len - 1] = T::default();
         *len -= 1;
     }
 }

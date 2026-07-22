@@ -98,6 +98,33 @@ impl InternalKeys {
     pub fn to_vec(&self, len: usize) -> Vec<EntryKey> {
         (0..len).map(|i| self.key_at(i)).collect()
     }
+
+    // Routing search over `len` keys: returns the child position for `key`,
+    // with keys equal to a pivot routing right. The shared prefix is compared
+    // once up front so the binary search only touches the stored suffixes.
+    pub fn search(&self, len: usize, key: &EntryKey) -> usize {
+        let prefix_len = self.blob.shared_prefix_len as usize;
+        let key_bytes = key.as_slice();
+        match self.blob.shared_prefix[..prefix_len].cmp(&key_bytes[..prefix_len]) {
+            std::cmp::Ordering::Greater => return 0, // every stored key > key
+            std::cmp::Ordering::Less => return len,  // every stored key < key
+            std::cmp::Ordering::Equal => {}
+        }
+        let suffix_len = KEY_SIZE - prefix_len;
+        let key_suffix = &key_bytes[prefix_len..];
+        let mut left = 0;
+        let mut right = len;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let start = mid * suffix_len;
+            match self.blob.suffixes[start..start + suffix_len].cmp(key_suffix) {
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Greater => right = mid,
+                std::cmp::Ordering::Equal => return mid + 1,
+            }
+        }
+        left
+    }
 }
 
 pub struct InNode<KS, PS>
@@ -143,23 +170,7 @@ where
         }
     }
     pub fn search(&self, key: &EntryKey) -> usize {
-        let mut left = 0;
-        let mut right = self.len;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            match self.keys.cmp_at(mid, key) {
-                std::cmp::Ordering::Less => {
-                    left = mid + 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    right = mid;
-                }
-                std::cmp::Ordering::Equal => {
-                    return mid + 1;
-                }
-            }
-        }
-        left
+        self.keys.search(self.len, key)
     }
     pub fn search_unwindable(
         &self,

@@ -135,7 +135,11 @@ where
         if self.is_empty() && !self.is_empty_node() {
             MIN_ENTRY_KEY.clone()
         } else {
-            self.keys()[0].clone()
+            match self {
+                &NodeData::External(ref n) => n.keys.as_slice_immute()[0].clone(),
+                &NodeData::Internal(ref n) => n.keys.key_at(0),
+                _ => unreachable!("{}", self.type_name()),
+            }
         }
     }
 
@@ -143,7 +147,11 @@ where
         if self.is_empty() && !self.is_empty_node() {
             MIN_ENTRY_KEY.clone()
         } else {
-            self.keys()[self.len() - 1].clone()
+            match self {
+                &NodeData::External(ref n) => n.keys.as_slice_immute()[n.len - 1].clone(),
+                &NodeData::Internal(ref n) => n.keys.key_at(n.len - 1),
+                _ => unreachable!("{}", self.type_name()),
+            }
         }
     }
 

@@ -4,7 +4,6 @@ use super::node::NodeData;
 use super::node::NodeReadHandler;
 use super::*;
 use std::fmt::Debug;
-use std::marker::PhantomData;
 
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
@@ -21,22 +20,15 @@ where
     let mut node_ref = node_ref;
     let backoff = crossbeam::utils::Backoff::new();
     loop {
+        // The closure must stay free of side effects: read_node re-runs it when
+        // the node version changes under a concurrent writer.
         let r = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
             let node = &**node_handler;
-            let gen_empty_cursor = || RTCursor {
-                index: 0,
-                ordering,
-                page: None,
-                marker: PhantomData,
-                current: None,
-                deletion: deletion.clone(),
-                filter_deleted,
-            };
             if let Some(right_node) = node.key_at_right_node(key) {
                 trace!("Search found a node at the right side");
                 return Err(right_node.clone());
             }
-            let mut pos = match node.search_unwindable(key) {
+            let pos = match node.search_unwindable(key) {
                 Ok(pos) => pos,
                 Err(_) => {
                     warn!("Search cursor failed, expecting retry");
@@ -52,16 +44,40 @@ where
                         ordering,
                         &n.keys.as_slice_immute()[..n.len]
                     );
-                    if ordering == Ordering::Backward {
-                        trace!("found cursor pos {} for backwards, will be corrected", pos);
-                        if pos > 0 && (pos >= n.len || &n.keys.as_slice_immute()[pos] != key) {
-                            pos -= 1;
+                    // Snapshot only the part of the page the cursor can still
+                    // visit in its direction; the rest is never read.
+                    let all = &n.keys.as_slice_immute()[..n.len];
+                    let (keys, index, follow) = match ordering {
+                        Ordering::Forward => {
+                            if pos < n.len {
+                                (all[pos..].to_vec(), 0, n.next.clone())
+                            } else {
+                                (Vec::new(), usize::MAX, n.next.clone())
+                            }
                         }
-                        trace!("cursor pos have been corrected to {}", pos);
-                    }
-                    Ok(RTCursor::new(
-                        pos,
-                        node_ref,
+                        Ordering::Backward => {
+                            // Position at the largest key <= the seek key; when
+                            // no such key exists in this page, fall through to
+                            // the previous page (usize::MAX sentinel).
+                            let index = if pos < n.len && &all[pos] == key {
+                                pos
+                            } else if pos > 0 {
+                                pos - 1
+                            } else {
+                                usize::MAX
+                            };
+                            if index == usize::MAX {
+                                (Vec::new(), usize::MAX, n.prev.clone())
+                            } else {
+                                (all[..=index].to_vec(), index, n.prev.clone())
+                            }
+                        }
+                    };
+                    Ok(RTCursor::from_snapshot(
+                        keys,
+                        index,
+                        node_ref.clone(),
+                        follow,
                         ordering,
                         deletion.clone(),
                         filter_deleted,
@@ -79,11 +95,18 @@ where
                     Err(next_node_ref.clone())
                 }
                 &NodeData::Empty(ref n) => Err(n.right.clone()),
-                &NodeData::None => Ok(gen_empty_cursor()),
+                &NodeData::None => Ok(RTCursor::empty(
+                    ordering,
+                    deletion.clone(),
+                    filter_deleted,
+                )),
             }
         });
         match r {
-            Ok(res) => return res,
+            Ok(mut cursor) => {
+                cursor.initialize();
+                return cursor;
+            }
             Err(e) => {
                 node = e;
                 node_ref = &node;

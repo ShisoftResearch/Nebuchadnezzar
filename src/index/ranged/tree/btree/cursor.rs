@@ -1,9 +1,13 @@
 use super::*;
 
-// This is the runtime cursor on iteration
-// It hold a copy of the containing page next page lock guard
-// These lock guards are preventing the node and their neighbourhoods been changed externally
-// Ordering are specified that can also change lock pattern
+// Runtime cursor for iteration.
+//
+// The cursor never holds locks. Each page it visits is snapshotted (keys copied
+// out) inside a single validated `read_node` closure, then iterated locally.
+// This matters for correctness: `read_node` re-runs its closure when the page
+// version changes mid-read, so the closure must be free of side effects on the
+// cursor. The previous implementation mutated `self.index` inside the closure
+// and skipped or repeated keys whenever a writer forced a retry.
 pub struct RTCursor<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -11,11 +15,28 @@ where
 {
     pub index: usize,
     pub ordering: Ordering,
+    // Page the current snapshot was taken from; kept so callers can mark the
+    // page changed for write-back. None once the cursor is exhausted.
     pub page: Option<NodeCellRef>,
     pub marker: PhantomData<(KS, PS)>,
     pub current: Option<EntryKey>,
     pub deletion: Arc<DeletionSet>,
     pub filter_deleted: bool,
+    // Snapshot of the current page's keys, in key order.
+    keys: Vec<EntryKey>,
+    // Next page to visit in iteration direction (next for Forward, prev for
+    // Backward). Default ref means the iteration ends after this snapshot.
+    follow: NodeCellRef,
+}
+
+// Result of reading one page while walking the sibling chain.
+enum PageSnap {
+    // Keys of an external page plus the ref to follow afterwards.
+    Page(Vec<EntryKey>, NodeCellRef),
+    // Node holds no data (empty page or tombstone); continue with this ref.
+    Skip(NodeCellRef),
+    // End of the chain.
+    End,
 }
 
 impl<KS, PS> RTCursor<KS, PS>
@@ -23,53 +44,62 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(
-        pos: usize,
-        page: &NodeCellRef,
-        ordering: Ordering,
-        deletion: Arc<DeletionSet>,
-        filter_deleted: bool,
-    ) -> Self {
-        let mut cursor = RTCursor {
-            index: pos,
+    pub fn empty(ordering: Ordering, deletion: Arc<DeletionSet>, filter_deleted: bool) -> Self {
+        RTCursor {
+            index: 0,
             ordering,
-            page: Some(page.clone()),
+            page: None,
             marker: PhantomData,
             current: None,
             deletion,
             filter_deleted,
-        };
-        match ordering {
-            Ordering::Forward
-                if pos >= read_node(page, |node: &NodeReadHandler<KS, PS>| node.len()) =>
-            {
-                let _ = cursor.next_raw_candidate();
-                cursor.skip_deleted_current();
-            }
-            _ => {
-                cursor.current = Self::read_current(page, pos);
-                cursor.skip_deleted_current();
-            }
+            keys: Vec::new(),
+            follow: NodeCellRef::default(),
         }
-        trace!(
-            "Created cursor with pos {}, current {:?}, ordering: {:?}",
-            cursor.index,
-            cursor.current,
-            cursor.ordering
-        );
-        cursor
     }
 
-    fn read_current(node: &NodeCellRef, pos: usize) -> Option<EntryKey> {
-        read_node(node, |node: &NodeReadHandler<KS, PS>| {
-            // node can be empty only if the node have been changed in the middle
-            // if so the node should be reloaded from the outside by `read_node` function
-            if node.is_empty_node() {
-                None
-            } else {
-                Some(node.extnode().keys.as_slice_immute()[pos].clone())
-            }
-        })
+    // Build a cursor from a page snapshot taken by the caller inside a
+    // validated read. `index == usize::MAX` means there is no valid position
+    // in this snapshot and the cursor must move to the following page first;
+    // `initialize` settles that.
+    pub(super) fn from_snapshot(
+        keys: Vec<EntryKey>,
+        index: usize,
+        page: NodeCellRef,
+        follow: NodeCellRef,
+        ordering: Ordering,
+        deletion: Arc<DeletionSet>,
+        filter_deleted: bool,
+    ) -> Self {
+        RTCursor {
+            index,
+            ordering,
+            page: Some(page),
+            marker: PhantomData,
+            current: None,
+            deletion,
+            filter_deleted,
+            keys,
+            follow,
+        }
+    }
+
+    // Settle the initial position: establish `current`, moving to the next
+    // page or past deleted keys as needed. Called once, outside any read
+    // closure.
+    pub(super) fn initialize(&mut self) {
+        if self.index < self.keys.len() {
+            self.current = Some(self.keys[self.index].clone());
+        } else if self.load_following_page() {
+            self.current = Some(self.keys[self.index].clone());
+        } else {
+            self.current = None;
+            self.page = None;
+            return;
+        }
+        if self.current_is_deleted() {
+            self.advance();
+        }
     }
 
     fn current_is_deleted(&self) -> bool {
@@ -81,120 +111,94 @@ where
                 .unwrap_or(false)
     }
 
-    fn skip_deleted_current(&mut self) {
-        while self.current_is_deleted() {
-            let _ = self.next_raw_candidate();
+    // Read one page of the sibling chain without side effects on the cursor.
+    fn read_page(page_ref: &NodeCellRef, ordering: Ordering) -> PageSnap {
+        if page_ref.is_default() {
+            return PageSnap::End;
         }
+        read_node(page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
+            &NodeData::External(ref n) => {
+                let follow = match ordering {
+                    Ordering::Forward => n.next.clone(),
+                    Ordering::Backward => n.prev.clone(),
+                };
+                if n.len == 0 {
+                    PageSnap::Skip(follow)
+                } else {
+                    PageSnap::Page(n.keys.as_slice_immute()[..n.len].to_vec(), follow)
+                }
+            }
+            &NodeData::Empty(ref n) => PageSnap::Skip(match ordering {
+                Ordering::Forward => n.right.clone(),
+                Ordering::Backward => n.left.clone().unwrap_or_default(),
+            }),
+            &NodeData::None => PageSnap::End,
+            &NodeData::Internal(_) => unreachable!("cursor reached an internal node"),
+        })
     }
 
-    fn next_raw_candidate(&mut self) -> Option<EntryKey> {
+    // Move the snapshot to the next page in iteration direction. Returns false
+    // when the chain ends; on success `index` points at the first candidate of
+    // the new snapshot.
+    fn load_following_page(&mut self) -> bool {
+        let mut follow = mem::take(&mut self.follow);
         loop {
-            let search_result = if self.page.is_some() {
-                let current_page = self.page.clone().unwrap();
-                read_node(&current_page, |page: &NodeReadHandler<KS, PS>| {
-                    let mut other_current;
-                    // let ext_page = page.extnode();
-                    // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
-                    match self.ordering {
-                        Ordering::Forward => {
-                            if page.is_empty() || self.index + 1 >= page.len() {
-                                let next_node_ref = page.right_ref().unwrap();
-                                if next_node_ref.is_default() {
-                                    // No next page, return current item (last item) then stop
-                                    let mut other_current = None;
-                                    mem::swap(&mut self.current, &mut other_current);
-                                    self.page = None;
-                                    return Some(other_current);
-                                }
-                                return read_node(
-                                    next_node_ref,
-                                    |next_node: &NodeReadHandler<KS, PS>| {
-                                        let mut other_current;
-                                        if next_node.is_none() {
-                                            // Return the current item (last item in the tree) before stopping
-                                            // After this, current will be None
-                                            other_current = None;
-                                            mem::swap(&mut self.current, &mut other_current);
-                                            self.page = None;
-                                            return Some(other_current);
-                                        } else if next_node.is_empty() {
-                                            return None;
-                                        } else if next_node.is_ext() {
-                                            self.index = 0;
-                                            self.page = Some(next_node_ref.clone());
-                                            other_current =
-                                                Self::read_current(next_node_ref, self.index);
-                                            mem::swap(&mut self.current, &mut other_current);
-                                            return Some(other_current);
-                                        } else {
-                                            unreachable!()
-                                        }
-                                    },
-                                );
-                            } else {
-                                self.index += 1;
-                                // debug!("Advancing cursor to index {}", self.index);
-                            }
-                        }
-                        Ordering::Backward => {
-                            if page.is_empty() || self.index == 0 {
-                                let prev_node_ref = page.left_ref().unwrap();
-                                if prev_node_ref.is_default() {
-                                    // No prev page, return current item (first item in reverse) then stop
-                                    let mut other_current = None;
-                                    mem::swap(&mut self.current, &mut other_current);
-                                    self.page = None;
-                                    return Some(other_current);
-                                }
-                                return read_node(
-                                    prev_node_ref,
-                                    |prev_node: &NodeReadHandler<KS, PS>| {
-                                        let mut other_current;
-                                        if prev_node.is_none() {
-                                            // Return the current item (last item in backward traversal) before stopping
-                                            // After this, current will be None
-                                            other_current = None;
-                                            mem::swap(&mut self.current, &mut other_current);
-                                            self.page = None;
-                                            return Some(other_current);
-                                        } else if prev_node.is_empty() {
-                                            return None;
-                                        } else if prev_node.is_ext() {
-                                            self.index = prev_node.len() - 1;
-                                            self.page = Some(prev_node_ref.clone());
-                                            other_current =
-                                                Self::read_current(prev_node_ref, self.index);
-                                            mem::swap(&mut self.current, &mut other_current);
-                                            return Some(other_current);
-                                        } else {
-                                            unreachable!()
-                                        }
-                                    },
-                                );
-                            } else {
-                                self.index -= 1;
-                                // debug!("Advancing cursor to index {}", self.index);
-                            }
-                        }
+            match Self::read_page(&follow, self.ordering) {
+                PageSnap::End => return false,
+                PageSnap::Skip(next) => {
+                    if next.is_default() {
+                        return false;
                     }
-                    other_current = Self::read_current(&current_page, self.index);
-                    mem::swap(&mut self.current, &mut other_current);
-                    Some(other_current)
-                })
-            } else {
-                Some(None)
-            };
-
-            if let Some(res) = search_result {
-                return res;
+                    follow = next;
+                }
+                PageSnap::Page(keys, next_follow) => {
+                    debug_assert!(!keys.is_empty());
+                    self.index = match self.ordering {
+                        Ordering::Forward => 0,
+                        Ordering::Backward => keys.len() - 1,
+                    };
+                    self.keys = keys;
+                    self.page = Some(follow);
+                    self.follow = next_follow;
+                    return true;
+                }
             }
         }
     }
 
-    fn next_candidate(&mut self) -> Option<EntryKey> {
-        let res = self.next_raw_candidate();
-        self.skip_deleted_current();
-        res
+    // Advance `current` to the next non-deleted key, or None at the end.
+    fn advance(&mut self) {
+        loop {
+            let stepped = match self.ordering {
+                Ordering::Forward => {
+                    if self.index < self.keys.len() && self.index + 1 < self.keys.len() {
+                        self.index += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Ordering::Backward => {
+                    if self.index > 0 && self.index <= self.keys.len() {
+                        self.index -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if !stepped && !self.load_following_page() {
+                self.current = None;
+                self.page = None;
+                return;
+            }
+            let candidate = &self.keys[self.index];
+            if self.filter_deleted && self.deletion.contains(candidate) {
+                continue;
+            }
+            self.current = Some(candidate.clone());
+            return;
+        }
     }
 }
 
@@ -203,16 +207,15 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // TODO: Copy current after next
+    // Returns the current key and advances to the following one.
     fn next(&mut self) -> Option<EntryKey> {
-        if let Some(swapped_old_candidate) = self.next_candidate() {
-            return Some(swapped_old_candidate);
-        } else {
-            return None;
+        let out = self.current.take();
+        if out.is_some() {
+            self.advance();
         }
+        out
     }
 
-    // TODO: Use copied key reference
     fn current(&self) -> Option<&EntryKey> {
         self.current.as_ref()
     }

@@ -126,10 +126,24 @@ where
                         .take(remain_slots)
                         .collect_vec();
                     trace!("Merge by merge sort with {:?}", ext_node.id);
-                    ext_node.merge_sort(selection.as_slice());
+                    let duplicates = ext_node.merge_sort(selection.as_slice());
+                    if duplicates > 0 {
+                        // merge_with_keys adds the full batch size to the tree
+                        // length afterwards; keys already present must not count.
+                        tree.len.fetch_sub(duplicates, Relaxed);
+                    }
                     merging_pos += selection.len();
                 } else if remain_slots == 0 {
                     let insert_pos = current_guard.search(&start_key);
+                    if insert_pos < current_guard.len()
+                        && &current_guard.extnode().keys.as_slice_immute()[insert_pos] == start_key
+                    {
+                        // Key already present; the split path below would
+                        // blindly duplicate it.
+                        tree.len.fetch_sub(1, Relaxed);
+                        merging_pos += 1;
+                        continue;
+                    }
                     let target_node_ref = current_guard.node_ref().clone();
                     let right_node_ref = current_guard.right_ref().unwrap();
                     trace!(
