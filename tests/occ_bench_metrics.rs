@@ -2,6 +2,9 @@ use std::{fs, time::Duration};
 
 use serde_json::Value;
 
+#[path = "../benches/occ_support/fixture.rs"]
+mod fixture;
+
 #[path = "../benches/occ_support/metrics.rs"]
 mod metrics;
 
@@ -102,4 +105,19 @@ fn run_report_replaces_a_scenario_by_name() {
     let persisted: RunReport = serde_json::from_slice(&bytes).expect("parse typed report");
     assert_eq!(persisted.scenarios.len(), 1);
     assert_eq!(persisted.scenarios.get("repeatable-read"), Some(&second));
+}
+
+#[test]
+fn benchmark_port_plan_allocates_non_overlapping_clusters() {
+    let plan = fixture::PortPlan::new(39_400);
+    assert_eq!(plan.single_server(), "127.0.0.1:39400");
+    assert_eq!(plan.single(3), "127.0.0.1:39430");
+    assert_eq!(
+        plan.cluster(2),
+        vec![
+            "127.0.0.1:39420".to_string(),
+            "127.0.0.1:39421".to_string(),
+            "127.0.0.1:39422".to_string(),
+        ]
+    );
 }
