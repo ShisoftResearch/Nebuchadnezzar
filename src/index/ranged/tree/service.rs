@@ -22,6 +22,21 @@ use std::time::{Duration, Instant};
 pub type IdBlock = [Id; MIGRATE_SIZE]; // Fixed size for ID arrays (not related to tree node size)
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(RANGED_TREE_RPC_SERVICE) as u64;
 
+// How many tree migrations may run concurrently. Each holds its source and
+// target trees in memory, so this is bounded well below the core count.
+// Tunable via NEB_MAX_MIGRATIONS.
+fn max_concurrent_migrations() -> usize {
+    std::env::var("NEB_MAX_MIGRATIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| (n.get() / 16).clamp(2, 16))
+                .unwrap_or(4)
+        })
+}
+
 pub fn generate_scoped_service_id(group_name: &str, database_name: &str) -> u64 {
     if group_name == database_name || group_name.is_empty() || database_name.is_empty() {
         DEFAULT_SERVICE_ID
@@ -864,7 +879,12 @@ impl TreeService {
             // every ~60 seconds to ensure durability even without explicit shutdown.
             const CHECKPOINT_INTERVAL_LOOPS: u32 = 120; // 120 * 500ms = 60s
             let mut checkpoint_counter: u32 = 0;
-            let mut split_backoff_until = StdHashMap::<Id, Instant>::new();
+            // Migrations run as bounded-concurrency background tasks so many
+            // oversized trees split in parallel instead of one at a time.
+            // Shared across tasks; guarded because tasks touch it concurrently.
+            let split_backoff_until =
+                Arc::new(parking_lot::Mutex::new(StdHashMap::<Id, Instant>::new()));
+            let migration_slots = Arc::new(tokio::sync::Semaphore::new(max_concurrent_migrations()));
 
             loop {
                 let mut fast_mode = false;
@@ -902,39 +922,30 @@ impl TreeService {
                     if tree.should_split() {
                         if tree_prop_snapshot.migration.is_some() {
                             debug!(
-                                "Skipping split for {:?}: migration already active, tree_count={}, ideal_cap={}, epoch={}",
-                                dist_tree.id,
-                                tree.count(),
-                                tree.ideal_capacity(),
-                                tree_prop_snapshot.epoch
+                                "Skipping split for {:?}: migration already active",
+                                dist_tree.id
                             );
                             continue;
                         }
-
-                        let now = Instant::now();
-                        if let Some(backoff_until) = split_backoff_until.get(&dist_tree.id) {
-                            if *backoff_until > now {
-                                debug!(
-                                    "Skipping split for {:?}: retry backoff active for {:?}, tree_count={}, ideal_cap={}",
-                                    dist_tree.id,
-                                    backoff_until.saturating_duration_since(now),
-                                    tree.count(),
-                                    tree.ideal_capacity()
-                                );
-                                continue;
+                        {
+                            let now = Instant::now();
+                            let mut backoff = split_backoff_until.lock();
+                            if let Some(backoff_until) = backoff.get(&dist_tree.id) {
+                                if *backoff_until > now {
+                                    continue;
+                                }
                             }
+                            backoff.remove(&dist_tree.id);
                         }
-                        split_backoff_until.remove(&dist_tree.id);
-
-                        let split_started = Instant::now();
-                        info!(
-                            "LSM Tree reached split threshold {:?}, start migration; tree_count={}, ideal_cap={}, epoch={}",
-                            dist_tree.id,
-                            tree.count(),
-                            tree.ideal_capacity(),
-                            tree_prop_snapshot.epoch
-                        );
-                        // Tree oversized, need to migrate
+                        // Take a migration slot without blocking the loop; if
+                        // all slots are busy, revisit this tree next tick.
+                        let Ok(permit) = migration_slots.clone().try_acquire_owned() else {
+                            continue;
+                        };
+                        // pivot_key is O(log n); compute it and mark the tree
+                        // migrating synchronously so the next loop iteration
+                        // skips this tree while the migration runs in the
+                        // background. Every task exit clears the marker.
                         let Some(pivot_key) = tree.pivot_key() else {
                             warn!(
                                 "Skipping migration for {:?}: oversized tree has no pivot key",
@@ -943,19 +954,6 @@ impl TreeService {
                             continue;
                         };
                         let migration_target_id = Id::rand();
-                        let source_upper = { dist_tree.prop.read().boundary.upper.clone() };
-                        debug!(
-                            "Creating migration target tree {:?} split at {:?}",
-                            migration_target_id, pivot_key
-                        );
-                        let migration_tree = Arc::new(DistTree::new(
-                            migration_target_id,
-                            RangedTree::create(&client, &migration_target_id).await,
-                            Boundary::new(pivot_key.clone(), source_upper),
-                            None,
-                            INITIAL_TREE_EPOCH,
-                        ));
-                        pending_migrations.insert(migration_target_id, migration_tree.clone());
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();
                             dist_tree_prop.migration = Some(Migration {
@@ -963,212 +961,193 @@ impl TreeService {
                                 target_id: migration_target_id,
                             });
                         }
-                        debug!("Marking migration for tree {:?}", dist_tree.id);
-                        if let Err(e) = tree
-                            .mark_migration(&dist_tree.id, Some(migration_target_id), &client)
-                            .await
-                        {
-                            warn!(
-                                "Failed to mark LSM tree migration for oversized tree {:?}: {:?}",
-                                dist_tree.id, e
+                        fast_mode = true;
+                        let dist_tree = dist_tree.clone();
+                        let client = client.clone();
+                        let sm_client = sm_client.clone();
+                        let pending_migrations = pending_migrations.clone();
+                        let split_backoff_until = split_backoff_until.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let tree = &dist_tree.tree;
+                            let split_started = Instant::now();
+                            info!(
+                                "LSM Tree reached split threshold {:?}, start migration to {:?}; tree_count={}, ideal_cap={}",
+                                dist_tree.id,
+                                migration_target_id,
+                                tree.count(),
+                                tree.ideal_capacity(),
                             );
-                        }
-                        let buffer_size = MIGRATE_SIZE << 4;
-                        // Move only the upper half. The source tree is frozen
-                        // for the whole migration window (writes get
-                        // OpResult::Migrating and retry against fresh
-                        // placement), so a single bulk pass captures
-                        // everything — no reconcile re-scan is needed. Seek
-                        // straight to the pivot instead of scanning (and
-                        // skipping) the entire lower half that stays behind.
-                        let mut cursor = tree.seek(&pivot_key, Ordering::Forward);
-                        let mut entry_buffer = Vec::with_capacity(buffer_size);
-                        debug!(
-                            "Start moving keys from {:?} to {:?}",
-                            dist_tree.id, migration_target_id
-                        );
-                        // next() yields the current key (the first >= pivot
-                        // after the seek) and advances, so this walks every
-                        // key from the pivot to the end exactly once.
-                        while let Some(entry) = cursor.next() {
-                            debug_assert!(entry >= pivot_key);
-                            entry_buffer.push(entry);
-                            if entry_buffer.len() >= buffer_size {
-                                entry_buffer.dedup();
-                                debug!("Merging entry buffer, size {}", entry_buffer.len());
-                                migration_tree.tree.merge_keys(entry_buffer);
-                                entry_buffer = Vec::with_capacity(buffer_size);
-                            }
-                        }
-                        entry_buffer.dedup();
-                        if !entry_buffer.is_empty() {
-                            debug!("Merging last batch of keys, size {}", entry_buffer.len());
-                            migration_tree.tree.merge_keys(entry_buffer);
-                        }
-                        debug!("Waiting for new tree {:?} persisted", migration_target_id);
-                        storage::wait_until_updated().await;
-
-                        debug!(
-                            "Publishing new tree {:?} head before placement split",
-                            migration_target_id
-                        );
-                        if let Err(e) = migration_tree
-                            .tree
-                            .mark_migration(&migration_target_id, None, &client)
-                            .await
-                        {
-                            warn!(
-                                "Failed to publish target tree {:?} before split from {:?}: {:?}",
-                                migration_target_id, dist_tree.id, e
-                            );
-                            pending_migrations.remove(&migration_target_id);
-                            {
-                                let mut dist_prop = dist_tree.prop.write();
-                                dist_prop.migration = None;
-                            }
-                            if let Err(unmark_err) =
-                                tree.mark_migration(&dist_tree.id, None, &client).await
+                            let source_upper = { dist_tree.prop.read().boundary.upper.clone() };
+                            let migration_tree = Arc::new(DistTree::new(
+                                migration_target_id,
+                                RangedTree::create(&client, &migration_target_id).await,
+                                Boundary::new(pivot_key.clone(), source_upper),
+                                None,
+                                INITIAL_TREE_EPOCH,
+                            ));
+                            pending_migrations.insert(migration_target_id, migration_tree.clone());
+                            if let Err(e) = tree
+                                .mark_migration(&dist_tree.id, Some(migration_target_id), &client)
+                                .await
                             {
                                 warn!(
-                                    "Failed to clear migration marker for tree {:?} after target publish failure: {:?}",
-                                    dist_tree.id, unmark_err
+                                    "Failed to mark LSM tree migration for oversized tree {:?}: {:?}",
+                                    dist_tree.id, e
                                 );
                             }
-                            continue;
-                        }
+                            let buffer_size = MIGRATE_SIZE << 4;
+                            // Move only the upper half. The source tree is
+                            // frozen for the whole migration window (writes get
+                            // OpResult::Migrating and retry against fresh
+                            // placement), so a single bulk pass captures
+                            // everything. Seek straight to the pivot instead of
+                            // scanning the lower half that stays behind.
+                            let mut cursor = tree.seek(&pivot_key, Ordering::Forward);
+                            let mut entry_buffer = Vec::with_capacity(buffer_size);
+                            while let Some(entry) = cursor.next() {
+                                debug_assert!(entry >= pivot_key);
+                                entry_buffer.push(entry);
+                                if entry_buffer.len() >= buffer_size {
+                                    entry_buffer.dedup();
+                                    migration_tree.tree.merge_keys(entry_buffer);
+                                    entry_buffer = Vec::with_capacity(buffer_size);
+                                }
+                            }
+                            entry_buffer.dedup();
+                            if !entry_buffer.is_empty() {
+                                migration_tree.tree.merge_keys(entry_buffer);
+                            }
+                            storage::wait_until_updated().await;
 
-                        debug!("Calling placement for split to {:?}", migration_target_id);
-                        match sm_client.locate_key(&pivot_key).await {
-                            Ok((_lower, placement, _upper)) => {
-                                debug!(
-                                    "Preflighted split for source {:?} at pivot {:?}; current placement tree {:?}, epoch {}",
-                                    dist_tree.id, pivot_key, placement.id, placement.epoch
+                            if let Err(e) = migration_tree
+                                .tree
+                                .mark_migration(&migration_target_id, None, &client)
+                                .await
+                            {
+                                warn!(
+                                    "Failed to publish target tree {:?} before split from {:?}: {:?}",
+                                    migration_target_id, dist_tree.id, e
                                 );
+                                pending_migrations.remove(&migration_target_id);
+                                {
+                                    let mut dist_prop = dist_tree.prop.write();
+                                    dist_prop.migration = None;
+                                }
+                                if let Err(unmark_err) =
+                                    tree.mark_migration(&dist_tree.id, None, &client).await
+                                {
+                                    warn!(
+                                        "Failed to clear migration marker for tree {:?} after target publish failure: {:?}",
+                                        dist_tree.id, unmark_err
+                                    );
+                                }
+                                return;
                             }
-                            Err(e) => {
+
+                            if let Err(e) = sm_client.locate_key(&pivot_key).await {
                                 warn!(
                                     "Failed to preflight split for source {:?} at pivot {:?}: {:?}",
                                     dist_tree.id, pivot_key, e
                                 );
                             }
-                        }
-                        let target_boundary = migration_tree.prop.read().boundary.clone();
-                        let split_committed = match sm_client
-                            .split(&dist_tree.id, &migration_target_id, &pivot_key)
-                            .await
-                        {
-                            Ok(()) => true,
-                            Err(e) => {
-                                warn!(
-                                    "Placement split from {:?} to {:?} at {:?} returned error: {:?}",
-                                    dist_tree.id, migration_target_id, pivot_key, e
-                                );
-                                if Self::split_visible_in_placement(
-                                    &sm_client,
-                                    &pivot_key,
-                                    migration_target_id,
-                                )
+                            let target_boundary = migration_tree.prop.read().boundary.clone();
+                            let split_committed = match sm_client
+                                .split(&dist_tree.id, &migration_target_id, &pivot_key)
                                 .await
-                                {
+                            {
+                                Ok(()) => true,
+                                Err(e) => {
                                     warn!(
-                                        "Placement split from {:?} to {:?} at {:?} appears committed despite RPC error after {:?}; continuing",
-                                        dist_tree.id,
-                                        migration_target_id,
-                                        pivot_key,
-                                        split_started.elapsed()
+                                        "Placement split from {:?} to {:?} at {:?} returned error: {:?}",
+                                        dist_tree.id, migration_target_id, pivot_key, e
                                     );
-                                    true
-                                } else {
-                                    warn!(
-                                        "Placement split from {:?} to {:?} at {:?} did not become visible after {:?}; rolling back in-memory migration state and backing off",
-                                        dist_tree.id,
+                                    if Self::split_visible_in_placement(
+                                        &sm_client,
+                                        &pivot_key,
                                         migration_target_id,
-                                        pivot_key,
-                                        split_started.elapsed()
-                                    );
-                                    Self::rollback_pending_split(
-                                        &dist_tree,
-                                        migration_target_id,
-                                        &pending_migrations,
-                                        &client,
                                     )
-                                    .await;
-                                    split_backoff_until.insert(
-                                        dist_tree.id,
-                                        Instant::now()
-                                            + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
-                                    );
-                                    false
+                                    .await
+                                    {
+                                        true
+                                    } else {
+                                        warn!(
+                                            "Placement split from {:?} to {:?} did not become visible after {:?}; rolling back and backing off",
+                                            dist_tree.id,
+                                            migration_target_id,
+                                            split_started.elapsed()
+                                        );
+                                        Self::rollback_pending_split(
+                                            &dist_tree,
+                                            migration_target_id,
+                                            &pending_migrations,
+                                            &client,
+                                        )
+                                        .await;
+                                        split_backoff_until.lock().insert(
+                                            dist_tree.id,
+                                            Instant::now()
+                                                + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                        );
+                                        false
+                                    }
                                 }
+                            };
+                            if !split_committed {
+                                return;
                             }
-                        };
-                        if !split_committed {
-                            continue;
-                        }
-                        let target_loaded = Self::ensure_split_target_loaded(
-                            &client,
-                            migration_target_id,
-                            target_boundary,
-                            INITIAL_TREE_EPOCH,
-                        )
-                        .await;
-                        if !target_loaded {
-                            split_backoff_until.insert(
-                                dist_tree.id,
-                                Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
-                            );
-                        } else {
-                            split_backoff_until.remove(&dist_tree.id);
-                        }
-                        // Update routing state on the source tree immediately; actual pruning runs in the background.
-                        {
-                            let mut dist_prop = dist_tree.prop.write();
-                            dist_prop.boundary.upper = pivot_key.clone();
-                            dist_prop.epoch += 1;
-                        }
-                        let source_tree = dist_tree.clone();
-                        let pivot_for_retain = pivot_key.clone();
-                        let client_for_retain = client.clone();
-                        let pending_migrations = pending_migrations.clone();
-                        tokio::spawn(async move {
-                            let retain_tree = source_tree.clone();
-                            let retain_pivot = pivot_for_retain.clone();
+                            let target_loaded = Self::ensure_split_target_loaded(
+                                &client,
+                                migration_target_id,
+                                target_boundary,
+                                INITIAL_TREE_EPOCH,
+                            )
+                            .await;
+                            if !target_loaded {
+                                split_backoff_until.lock().insert(
+                                    dist_tree.id,
+                                    Instant::now() + Duration::from_millis(SPLIT_RETRY_BACKOFF_MS),
+                                );
+                            } else {
+                                split_backoff_until.lock().remove(&dist_tree.id);
+                            }
+                            // Update routing on the source immediately; pruning
+                            // (retain) runs in the background below.
+                            {
+                                let mut dist_prop = dist_tree.prop.write();
+                                dist_prop.boundary.upper = pivot_key.clone();
+                                dist_prop.epoch += 1;
+                            }
+                            let source_tree = dist_tree.clone();
+                            let retain_pivot = pivot_key.clone();
                             let retain_result = tokio::task::spawn_blocking(move || {
-                                retain_tree.tree.retain(&retain_pivot);
+                                source_tree.tree.retain(&retain_pivot);
                             })
                             .await;
                             if let Err(e) = retain_result {
-                                warn!(
-                                    "Background retain failed for tree {:?}: {:?}",
-                                    source_tree.id, e
-                                );
+                                warn!("Background retain failed for tree {:?}: {:?}", dist_tree.id, e);
                                 return;
                             }
-
                             storage::wait_until_updated().await;
                             {
-                                let mut dist_prop = source_tree.prop.write();
+                                let mut dist_prop = dist_tree.prop.write();
                                 dist_prop.migration = None;
                             }
-                            debug!("Unmark migration {:?}", source_tree.id);
-                            if let Err(e) = source_tree
+                            if let Err(e) = dist_tree
                                 .tree
-                                .mark_migration(&source_tree.id, None, &client_for_retain)
+                                .mark_migration(&dist_tree.id, None, &client)
                                 .await
                             {
-                                warn!(
-                                    "Failed to publish retained tree {:?}: {:?}",
-                                    source_tree.id, e
-                                );
+                                warn!("Failed to publish retained tree {:?}: {:?}", dist_tree.id, e);
                             }
                             pending_migrations.remove(&migration_target_id);
+                            debug!(
+                                "LSM tree migration from {:?} to {:?} succeed in {:?}",
+                                dist_tree.id,
+                                migration_target_id,
+                                split_started.elapsed()
+                            );
                         });
-                        debug!(
-                            "LSM tree migration from {:?} to {:?} succeed in {:?}",
-                            dist_tree.id,
-                            migration_target_id,
-                            split_started.elapsed()
-                        );
                     }
                 }
                 if !fast_mode {
