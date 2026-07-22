@@ -104,6 +104,77 @@ pub(crate) fn install_prepare_result_observer(tid: TxnId, id: Id) -> PrepareResu
     PrepareResultObserverHandle { key, state }
 }
 
+#[cfg(test)]
+struct AbortEntryDelayState {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    released: AtomicBool,
+    released_notify: Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct AbortEntryDelayHandle {
+    tid: TxnId,
+    state: Arc<AbortEntryDelayState>,
+}
+
+#[cfg(test)]
+impl AbortEntryDelayHandle {
+    pub(crate) async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    pub(crate) fn release(&self) {
+        if !self.state.released.swap(true, Ordering::SeqCst) {
+            self.state.released_notify.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AbortEntryDelayHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = abort_entry_delay_hooks().lock();
+        let owns_registration = hooks
+            .get(&self.tid)
+            .map(|state| Arc::ptr_eq(state, &self.state))
+            .unwrap_or(false);
+        if owns_registration {
+            hooks.remove(&self.tid);
+        }
+    }
+}
+
+#[cfg(test)]
+static ABORT_ENTRY_DELAY_HOOKS: OnceLock<
+    parking_lot::Mutex<BTreeMap<TxnId, Arc<AbortEntryDelayState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn abort_entry_delay_hooks(
+) -> &'static parking_lot::Mutex<BTreeMap<TxnId, Arc<AbortEntryDelayState>>> {
+    ABORT_ENTRY_DELAY_HOOKS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_abort_entry_delay(tid: TxnId) -> AbortEntryDelayHandle {
+    let state = Arc::new(AbortEntryDelayState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    abort_entry_delay_hooks()
+        .lock()
+        .insert(tid.clone(), state.clone());
+    AbortEntryDelayHandle { tid, state }
+}
+
 /// Dependencies needed by TransactionManager, extracted from NebServer to break cyclic dependency
 pub struct TransactionManagerDeps {
     pub database_runtime: Arc<crate::server::DatabaseRuntime>,
@@ -288,6 +359,22 @@ impl TransactionManager {
     }
 
     #[cfg(test)]
+    fn take_abort_entry_delay(tid: &TxnId) -> Option<Arc<AbortEntryDelayState>> {
+        abort_entry_delay_hooks().lock().remove(tid)
+    }
+
+    #[cfg(test)]
+    async fn await_abort_entry_delay(state: &Arc<AbortEntryDelayState>) {
+        state.entered.store(true, Ordering::SeqCst);
+        state.entered_notify.notify_waiters();
+        let notified = state.released_notify.notified();
+        if state.released.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    #[cfg(test)]
     fn notify_prepare_results_observed(tid: &TxnId, objects: &BTreeMap<Id, DataObject>) {
         let states: Vec<_> = {
             let mut observers = prepare_result_observers().lock();
@@ -407,7 +494,14 @@ impl Service for TransactionManager {
         debug!("TXN ABORT IN MGR {:?}", &tid);
         async move {
             let txn_lock = self.get_transaction(&tid)?;
+            #[cfg(test)]
+            if let Some(state) = Self::take_abort_entry_delay(&tid) {
+                Self::await_abort_entry_delay(&state).await;
+            }
             let mut txn = txn_lock.lock().await;
+            if txn.state == TxnState::Cleanup {
+                return Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup));
+            }
             let result = if txn.state != TxnState::Aborted {
                 let changed_objs = &txn.affected_objects;
                 match self.data_sites_for_objs(changed_objs).await {
@@ -420,7 +514,9 @@ impl Service for TransactionManager {
             } else {
                 Ok(AbortResult::Success(None))
             };
-            self.cleanup_transaction_guarded(&tid, &mut txn);
+            if matches!(result, Ok(AbortResult::Success(_))) {
+                self.cleanup_transaction_guarded(&tid, &mut txn);
+            }
             result
         }
         .boxed()
@@ -1073,31 +1169,101 @@ impl TransactionManager {
     ) -> Result<AbortResult, TMError> {
         let abort_futures: FuturesUnordered<_> = changed_objs
             .iter()
-            .map(|(ref server_id, _)| {
-                let data_site = data_sites.get(*server_id).unwrap();
-                async move { data_site.abort(self.get_clock(), tid.clone()).await }
+            .map(|(server_id, _)| {
+                let server_id = *server_id;
+                let data_site = data_sites.get(&server_id).unwrap().clone();
+                async move {
+                    (
+                        server_id,
+                        data_site.abort(self.get_clock(), tid.clone()).await,
+                    )
+                }
             })
             .collect();
         let abort_results: Vec<_> = abort_futures.collect().await;
         let mut rollback_failures = Vec::new();
-        for result in abort_results {
+        let mut sites_to_end = BTreeSet::new();
+        let mut first_failure = None;
+        let mut first_error = None;
+
+        for (server_id, result) in abort_results {
             match result {
                 Ok(asr) => {
                     let payload = asr.payload;
                     self.merge_clock(&asr.clock);
                     match payload {
                         AbortResult::Success(failures) => {
+                            sites_to_end.insert(server_id);
                             if let Some(mut failures) = failures {
                                 rollback_failures.append(&mut failures);
                             }
                         }
-                        _ => return Ok(payload),
+                        AbortResult::CheckFailed(CheckError::AlreadyAborted) => {
+                            sites_to_end.insert(server_id);
+                        }
+                        AbortResult::CheckFailed(CheckError::NotExisted) => {
+                            // A prior attempt already ended this participant.
+                        }
+                        failure if first_failure.is_none() => first_failure = Some(failure),
+                        _ => {}
                     }
                 }
-                Err(_) => return Err(TMError::AssertionError),
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(TMError::RPCErrorFromCellServer)
+                }
+                Err(_) => {}
             }
         }
-        self.sites_end(tid, changed_objs, data_sites).await?;
+
+        let end_futures: FuturesUnordered<_> = sites_to_end
+            .iter()
+            .map(|server_id| {
+                let server_id = *server_id;
+                let data_site = data_sites.get(&server_id).unwrap().clone();
+                async move {
+                    (
+                        server_id,
+                        data_site.end(self.get_clock(), tid.clone()).await,
+                    )
+                }
+            })
+            .collect();
+        let end_results: Vec<_> = end_futures.collect().await;
+        for (server_id, result) in end_results {
+            match result {
+                Ok(response) => {
+                    self.merge_clock(&response.clock);
+                    match response.payload {
+                        EndResult::Success | EndResult::CheckFailed(CheckError::NotExisted) => {}
+                        other => {
+                            error!(
+                                "Abort cleanup could not end participant {} for {:?}: {:?}",
+                                server_id, tid, other
+                            );
+                            if first_error.is_none() {
+                                first_error = Some(TMError::AssertionError);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        "Abort cleanup could not reach participant {} for {:?}: {:?}",
+                        server_id, tid, error
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(TMError::RPCErrorFromCellServer);
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if let Some(failure) = first_failure {
+            return Ok(failure);
+        }
         Ok(AbortResult::Success(if rollback_failures.is_empty() {
             None
         } else {
@@ -1864,6 +2030,7 @@ mod tests {
             match abort_result {
                 Ok(AbortResult::Success(_))
                 | Ok(AbortResult::CheckFailed(CheckError::AlreadyAborted))
+                | Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup))
                 | Err(TMError::TransactionNotFound) => {}
                 other => panic!("unexpected abort result in race: {:?}", other),
             }
@@ -1972,6 +2139,7 @@ mod tests {
                 match abort_result {
                     Ok(AbortResult::Success(_))
                     | Ok(AbortResult::CheckFailed(CheckError::AlreadyAborted))
+                    | Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup))
                     | Err(TMError::TransactionNotFound) => {}
                     other => panic!("unexpected abort result in race: {:?}", other),
                 }

@@ -117,6 +117,33 @@ pub(crate) fn install_prepare_delay_for_cell(tid: TxnId, id: Id) -> PrepareDelay
     PrepareDelayHandle { key, state }
 }
 
+#[cfg(test)]
+pub(crate) struct AbortCannotEndHandle {
+    key: (TxnId, Id),
+}
+
+#[cfg(test)]
+impl Drop for AbortCannotEndHandle {
+    fn drop(&mut self) {
+        abort_cannot_end_hooks().lock().remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+static ABORT_CANNOT_END_HOOKS: OnceLock<Mutex<BTreeSet<(TxnId, Id)>>> = OnceLock::new();
+
+#[cfg(test)]
+fn abort_cannot_end_hooks() -> &'static Mutex<BTreeSet<(TxnId, Id)>> {
+    ABORT_CANNOT_END_HOOKS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_abort_cannot_end_for_cell(tid: TxnId, id: Id) -> AbortCannotEndHandle {
+    let key = (tid, id);
+    abort_cannot_end_hooks().lock().insert(key.clone());
+    AbortCannotEndHandle { key }
+}
+
 type CommitHistory = BTreeMap<Id, CellHistory>;
 type CellMetaMutex = Arc<Mutex<CellMeta>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
@@ -346,6 +373,19 @@ impl DataManager {
             .map(|op| (tid.clone(), op.id))
             .find(|key| hooks.contains_key(key))?;
         hooks.remove(&delayed_key)
+    }
+
+    #[cfg(test)]
+    fn take_matching_abort_cannot_end(tid: &TxnId, affected_cells: &[Id]) -> bool {
+        let mut hooks = abort_cannot_end_hooks().lock();
+        let Some(key) = affected_cells
+            .iter()
+            .map(|id| (tid.clone(), *id))
+            .find(|key| hooks.contains(key))
+        else {
+            return false;
+        };
+        hooks.remove(&key)
     }
 
     #[cfg(test)]
@@ -3412,6 +3452,10 @@ impl Service for DataManager {
         let mut txn = txn_lock.lock();
         if txn.state == TxnState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
+        }
+        #[cfg(test)]
+        if Self::take_matching_abort_cannot_end(&tid, &txn.affected_cells) {
+            return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
         }
 
         if txn.history.is_empty() {

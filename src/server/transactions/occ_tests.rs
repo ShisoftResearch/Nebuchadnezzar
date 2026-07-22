@@ -564,6 +564,179 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn abort_queued_behind_commit_reports_already_cleanup() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5365";
+    let group = "txn_occ_commit_abort_cleanup_race";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90115);
+
+    let mut initial = counter_cell(schema.id, cell_id, 1, "commit-abort-seed");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    let first = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    let committed = counter_cell(schema.id, cell_id, 9, "commit-abort-committed");
+    assert_eq!(
+        txn.update(tid.clone(), committed.clone())
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+
+    let abort_delay = transactions::manager::install_abort_entry_delay(tid.clone());
+    let abort_client = txn.clone();
+    let abort_tid = tid.clone();
+    let abort_task =
+        tokio::spawn(async move { abort_client.abort(abort_tid).await.unwrap().unwrap() });
+    abort_delay.wait_until_entered().await;
+
+    assert_eq!(txn.commit(tid).await.unwrap().unwrap(), EndResult::Success);
+    abort_delay.release();
+    assert_eq!(
+        abort_task.await.unwrap(),
+        AbortResult::CheckFailed(CheckError::AlreadyCleanup)
+    );
+    assert_eq!(runtime.txn_manager().unwrap().transaction_count(), 0);
+
+    let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(persisted.data, committed.data);
+    assert!(persisted.header.version > first.header.version);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
+    let _ = env_logger::try_init();
+    let addresses = ["127.0.0.1:5366", "127.0.0.1:5367"];
+    let group = "txn_occ_partial_abort_retry";
+    let servers = start_occ_test_cluster(&addresses, group).await;
+    let schema = install_occ_schema_on_servers(&servers);
+    let ((success_id, success_server_id), (fail_id, fail_server_id)) =
+        ids_on_distinct_servers(&servers[0]);
+    let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
+        .iter()
+        .map(|server| (server.server_id, server.clone()))
+        .collect();
+    let success_server = servers_by_id
+        .get(&success_server_id)
+        .expect("successful abort participant should exist");
+    let fail_server = servers_by_id
+        .get(&fail_server_id)
+        .expect("failing abort participant should exist");
+
+    let mut success_seed = counter_cell(schema.id, success_id, 1, "partial-abort-success-seed");
+    success_server
+        .current_database()
+        .chunks()
+        .write_cell(&mut success_seed)
+        .unwrap();
+    let mut fail_seed = counter_cell(schema.id, fail_id, 2, "partial-abort-fail-seed");
+    fail_server
+        .current_database()
+        .chunks()
+        .write_cell(&mut fail_seed)
+        .unwrap();
+
+    let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
+    let manager = servers[0].current_database().txn_manager().unwrap().clone();
+    let tid = txn.begin().await.unwrap().unwrap();
+    let success_first = accepted_cell(txn.read(tid.clone(), success_id).await.unwrap().unwrap());
+    let fail_first = accepted_cell(txn.read(tid.clone(), fail_id).await.unwrap().unwrap());
+    assert_eq!(score_of(&success_first), 1);
+    assert_eq!(score_of(&fail_first), 2);
+
+    assert_eq!(
+        txn.update(
+            tid.clone(),
+            counter_cell(schema.id, success_id, 11, "partial-abort-success-update"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.update(
+            tid.clone(),
+            counter_cell(schema.id, fail_id, 12, "partial-abort-fail-update"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+
+    let _forced_failure =
+        transactions::data_site::install_abort_cannot_end_for_cell(tid.clone(), fail_id);
+    assert_eq!(
+        txn.abort(tid.clone()).await.unwrap().unwrap(),
+        AbortResult::CheckFailed(CheckError::CannotEnd)
+    );
+    assert_eq!(
+        manager.transaction_count(),
+        1,
+        "a partial abort failure must retain coordinator state for retry"
+    );
+
+    let probe_tid = txn.begin().await.unwrap().unwrap();
+    let released = timeout(
+        Duration::from_secs(1),
+        txn.read(probe_tid.clone(), success_id),
+    )
+    .await
+    .expect("the successful abort participant should release its lock")
+    .unwrap()
+    .unwrap();
+    assert_eq!(score_of(&accepted_cell(released)), 1);
+    abort_txn(&txn, probe_tid).await;
+
+    assert!(matches!(
+        txn.abort(tid.clone()).await.unwrap().unwrap(),
+        AbortResult::Success(_)
+    ));
+    assert_eq!(manager.transaction_count(), 0);
+
+    let verify_tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        score_of(&accepted_cell(
+            txn.read(verify_tid.clone(), success_id)
+                .await
+                .unwrap()
+                .unwrap()
+        )),
+        1
+    );
+    assert_eq!(
+        score_of(&accepted_cell(
+            txn.read(verify_tid.clone(), fail_id)
+                .await
+                .unwrap()
+                .unwrap()
+        )),
+        2
+    );
+    abort_txn(&txn, verify_tid).await;
+
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repeatable_full_read_uses_first_snapshot() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5330";
