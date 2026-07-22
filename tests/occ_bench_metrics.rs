@@ -14,9 +14,9 @@ fn nearest_rank_percentiles_are_deterministic() {
 
     let summary = metrics.summary(Duration::from_secs(1));
 
-    assert_eq!(summary.latency_p50_ns, 50_000_000);
-    assert_eq!(summary.latency_p95_ns, 95_000_000);
-    assert_eq!(summary.latency_p99_ns, 99_000_000);
+    assert_eq!(summary.p50_ns, 50_000_000);
+    assert_eq!(summary.p95_ns, 95_000_000);
+    assert_eq!(summary.p99_ns, 99_000_000);
 }
 
 #[test]
@@ -50,9 +50,9 @@ fn run_report_replaces_a_scenario_by_name() {
         not_realizable: 0,
         logical_retries: 0,
         commits_per_second: 0.5,
-        latency_p50_ns: 2_000_000,
-        latency_p95_ns: 2_000_000,
-        latency_p99_ns: 2_000_000,
+        p50_ns: 2_000_000,
+        p95_ns: 2_000_000,
+        p99_ns: 2_000_000,
         unexpected: Vec::new(),
         invariants_passed: true,
     };
@@ -62,9 +62,9 @@ fn run_report_replaces_a_scenario_by_name() {
         not_realizable: 0,
         logical_retries: 0,
         commits_per_second: 1.0,
-        latency_p50_ns: 1_000_000,
-        latency_p95_ns: 1_000_000,
-        latency_p99_ns: 1_000_000,
+        p50_ns: 1_000_000,
+        p95_ns: 1_000_000,
+        p99_ns: 1_000_000,
         unexpected: Vec::new(),
         invariants_passed: true,
     };
