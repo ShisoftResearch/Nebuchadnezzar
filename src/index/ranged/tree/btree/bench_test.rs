@@ -126,3 +126,52 @@ fn bench_scan() {
     }
     report("scan_full", n * ROUNDS, start);
 }
+
+fn rss_kb() -> usize {
+    std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with("VmRSS"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap()
+}
+
+// Measures the in-memory cost of the tree alone (no server, no RPC).
+#[test]
+#[ignore]
+fn bench_memory_per_key_sequential() {
+    let n = bench_n();
+    let tree = BenchTree::new(&deletion_set());
+    let before = rss_kb();
+    for i in 0..n {
+        tree.insert(&key_of(i));
+    }
+    let after = rss_kb();
+    println!(
+        "BENCH mem_seq: {} keys, {} MB, {:.1} bytes/key",
+        n,
+        (after - before) / 1024,
+        (after - before) as f64 * 1024.0 / n as f64
+    );
+}
+
+#[test]
+#[ignore]
+fn bench_memory_per_key_random() {
+    let n = bench_n();
+    let mut keys: Vec<u64> = (0..n).collect();
+    keys.shuffle(&mut rand::rng());
+    let tree = BenchTree::new(&deletion_set());
+    let before = rss_kb();
+    for i in &keys {
+        tree.insert(&key_of(*i));
+    }
+    let after = rss_kb();
+    println!(
+        "BENCH mem_rand: {} keys, {} MB, {:.1} bytes/key",
+        n,
+        (after - before) / 1024,
+        (after - before) as f64 * 1024.0 / n as f64
+    );
+}

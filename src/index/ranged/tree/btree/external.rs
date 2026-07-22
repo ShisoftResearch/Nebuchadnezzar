@@ -248,7 +248,15 @@ where
     ) -> (NodeCellRef, EntryKey) {
         // cached.dump();
         let keys_1 = &mut self.keys;
-        let pivot = self.len / 2;
+        // Append-aware split: a key landing past the last slot keeps the
+        // left page completely full and opens a fresh right page (sequential
+        // writers otherwise leave every page half empty and split twice as
+        // often). Mid-page inserts split at the middle as usual.
+        let pivot = if pos == self.len {
+            self.len
+        } else {
+            self.len / 2
+        };
         let new_page_id = BPlusTree::<KS, PS>::new_page_id();
         let mut keys_2 = keys_1.split_at_pivot(pivot, self.len);
         let mut keys_1_len = pivot;

@@ -176,6 +176,7 @@ where
         pos: usize,
         padding_ptr_pos: bool,
     ) -> (NodeCellRef, EntryKey) {
+        let appending = pos == self.len;
         let mut keys = self.keys.to_vec(self.len);
         keys.insert(pos, key);
 
@@ -183,7 +184,14 @@ where
         let mut ptrs = self.ptrs.as_slice_immute()[..self.len + 1].to_vec();
         ptrs.insert(ptr_insert_pos, new_node);
 
-        let pivot = keys.len() / 2;
+        // Append-aware split, mirroring the external nodes: rightmost
+        // inserts leave the left node nearly full and give the right node a
+        // single key (internal nodes cannot be keyless).
+        let pivot = if appending {
+            keys.len() - 2
+        } else {
+            keys.len() / 2
+        };
         let pivot_key = keys[pivot].clone();
 
         let left_keys = keys[..pivot].to_vec();
