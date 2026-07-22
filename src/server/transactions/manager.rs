@@ -499,20 +499,28 @@ impl Service for TransactionManager {
                 Self::await_abort_entry_delay(&state).await;
             }
             let mut txn = txn_lock.lock().await;
-            if txn.state == TxnState::Cleanup {
-                return Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup));
-            }
-            let result = if txn.state != TxnState::Aborted {
-                let changed_objs = &txn.affected_objects;
-                match self.data_sites_for_objs(changed_objs).await {
-                    Ok(data_sites) => {
-                        debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                        self.sites_abort(&tid, changed_objs, &data_sites).await // with end
-                    }
-                    Err(error) => Err(error),
+            match txn.state {
+                TxnState::Cleanup => {
+                    return Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup));
                 }
-            } else {
-                Ok(AbortResult::Success(None))
+                TxnState::Committed => {
+                    return Ok(AbortResult::CheckFailed(CheckError::AlreadyCommitted));
+                }
+                TxnState::Started | TxnState::Prepared => {
+                    // Once abort is accepted, commit must remain illegal even when
+                    // participant rollback needs to be retried.
+                    txn.state = TxnState::Aborted;
+                }
+                TxnState::Aborted => {}
+            }
+            txn.last_activity = get_time();
+            let changed_objs = &txn.affected_objects;
+            let result = match self.data_sites_for_objs(changed_objs).await {
+                Ok(data_sites) => {
+                    debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
+                    self.sites_abort(&tid, changed_objs, &data_sites).await // with end
+                }
+                Err(error) => Err(error),
             };
             if matches!(result, Ok(AbortResult::Success(_))) {
                 self.cleanup_transaction_guarded(&tid, &mut txn);
@@ -1374,11 +1382,11 @@ impl TransactionManager {
                     if let Some(txn_mutex) = self.transactions.get(tid) {
                         // Try to get the lock without blocking
                         if let Some(txn_guard) = txn_mutex.try_lock() {
-                            // Clean up if:
-                            // 1. Transaction is old AND
-                            // 2. NOT in Prepared state (those should be cleaned by commit/abort)
+                            // Only Started transactions can be abandoned safely.
+                            // Prepared transactions need a commit/abort decision, and
+                            // Aborted transactions may still need rollback retries.
                             if txn_guard.last_activity < cutoff
-                                && txn_guard.state != TxnState::Prepared
+                                && txn_guard.state == TxnState::Started
                             {
                                 return Some(tid.clone());
                             }
@@ -1597,6 +1605,31 @@ mod tests {
             TransactionManager::reduce_prepare_results(results),
             Err(TMError::RPCErrorFromCellServer)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_cleanup_preserves_abort_decisions_for_retry() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5370";
+        let group = "txn_manager_stale_abort_retry";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let txn = scoped_txn_client_for_database(address, group, group).await;
+        let tid = txn.begin().await.unwrap().unwrap();
+
+        let txn_lock = manager.get_transaction(&tid).unwrap();
+        {
+            let mut txn_guard = txn_lock.lock().await;
+            txn_guard.state = TxnState::Aborted;
+            txn_guard.last_activity = 0;
+        }
+
+        assert_eq!(manager.cleanup_stale_transactions(1), 0);
+        assert_eq!(manager.transaction_count(), 1);
+        assert_eq!(txn_lock.lock().await.state, TxnState::Aborted);
+
+        manager.cleanup_transaction(&tid);
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]

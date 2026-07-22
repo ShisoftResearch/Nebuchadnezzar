@@ -691,6 +691,11 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
         1,
         "a partial abort failure must retain coordinator state for retry"
     );
+    assert_eq!(
+        txn.commit(tid.clone()).await.unwrap(),
+        Err(TMError::InvalidTransactionState(TxnState::Aborted)),
+        "an accepted abort decision must make commit permanently illegal"
+    );
 
     let probe_tid = txn.begin().await.unwrap().unwrap();
     let released = timeout(
