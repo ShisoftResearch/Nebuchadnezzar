@@ -284,9 +284,11 @@ mod occ_type_tests {
 
     #[test]
     fn txn_priority_canonicalizes_duplicate_components_by_max_counter() {
-        let older = TxnPriority::new(clock(&[(1, 1), (1, 3)]), 20);
+        let older = TxnPriority::new(raw_clock(&[(1, 1), (1, 3)]), 20);
         let younger = TxnPriority::new(clock(&[(1, 3), (2, 1)]), 10);
 
+        assert_eq!(older.tid.relation(&younger.tid), Relation::Before);
+        assert_eq!(younger.tid.relation(&older.tid), Relation::After);
         let forward = catch_unwind(|| older.compare_age(&younger));
         let reverse = catch_unwind(|| younger.compare_age(&older));
 
@@ -296,9 +298,11 @@ mod occ_type_tests {
 
     #[test]
     fn txn_priority_preserves_causal_order_for_unsorted_zero_components() {
-        let older = TxnPriority::new(clock(&[(3, 0), (2, 1), (1, 1)]), 20);
-        let younger = TxnPriority::new(clock(&[(4, 1), (2, 1), (1, 1), (3, 0)]), 10);
+        let older = TxnPriority::new(raw_clock(&[(3, 0), (2, 1), (1, 1)]), 20);
+        let younger = TxnPriority::new(raw_clock(&[(4, 1), (2, 1), (1, 1), (3, 0)]), 10);
 
+        assert_eq!(older.tid.relation(&younger.tid), Relation::Before);
+        assert_eq!(younger.tid.relation(&older.tid), Relation::After);
         assert_eq!(older.compare_age(&younger), Ordering::Less);
         assert_eq!(younger.compare_age(&older), Ordering::Greater);
     }
