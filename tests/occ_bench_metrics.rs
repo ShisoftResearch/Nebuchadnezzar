@@ -8,7 +8,11 @@ mod fixture;
 #[path = "../benches/occ_support/metrics.rs"]
 mod metrics;
 
+#[path = "../benches/occ_support/workloads.rs"]
+mod workloads;
+
 use metrics::{BatchMetrics, RunReport, ScenarioSummary};
+use workloads::{AttemptOutcome, AttemptTally};
 
 #[test]
 fn nearest_rank_percentiles_are_deterministic() {
@@ -45,6 +49,19 @@ fn retries_and_failures_cannot_be_counted_as_throughput() {
     assert_eq!(summary.commits_per_second, 0.5);
     assert_eq!(summary.unexpected, vec![String::from("rpc disconnected")]);
     assert!(!summary.invariants_passed);
+}
+
+#[test]
+fn retryable_attempts_do_not_advance_success_target() {
+    let tally = AttemptTally::from_outcomes([
+        AttemptOutcome::Retryable,
+        AttemptOutcome::Committed,
+        AttemptOutcome::Unexpected("bad state".to_string()),
+    ]);
+    assert_eq!(tally.attempts, 3);
+    assert_eq!(tally.committed, 1);
+    assert_eq!(tally.not_realizable, 1);
+    assert_eq!(tally.unexpected, vec!["bad state"]);
 }
 
 #[test]

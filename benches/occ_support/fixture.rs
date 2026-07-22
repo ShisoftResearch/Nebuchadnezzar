@@ -152,6 +152,38 @@ impl OccFixture {
             .expect("write OCC benchmark counter");
     }
 
+    pub async fn score(&self, id: Id) -> u64 {
+        let cell = self
+            .client
+            .read_cell(id)
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "read OCC benchmark score RPC failed for {:?}: {:?}",
+                    id, err
+                )
+            })
+            .unwrap_or_else(|err| {
+                panic!("read OCC benchmark score failed for {:?}: {:?}", id, err)
+            });
+        *cell.data["score"].u64().unwrap_or_else(|| {
+            panic!(
+                "OCC benchmark cell {:?} is missing a u64 score field: {:?}",
+                id, cell.data
+            )
+        })
+    }
+
+    pub async fn sum_scores(&self, ids: &[Id]) -> u64 {
+        let mut total = 0u64;
+        for id in ids {
+            total = total.checked_add(self.score(*id).await).unwrap_or_else(|| {
+                panic!("OCC benchmark score sum overflow while reading {:?}", id)
+            });
+        }
+        total
+    }
+
     pub fn ids_for_server(&self, server_id: u64, count: usize, start: u64) -> Vec<Id> {
         if count == 0 {
             return Vec::new();
