@@ -2,7 +2,8 @@ use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
 use crate::server::Peer;
 use bifrost::rpc::{RPCError, ServiceClient, ServiceClientWithId, DEFAULT_CLIENT_POOL};
-use bifrost::vector_clock::StandardVectorClock;
+use bifrost::vector_clock::{Relation, StandardVectorClock};
+use std::cmp::Ordering;
 use std::io;
 use std::sync::Arc;
 
@@ -15,6 +16,54 @@ mod tests;
 pub mod undo_log;
 
 pub type TxnId = StandardVectorClock;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub enum CellExpectation {
+    Present(u64),
+    Absent,
+}
+
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
+pub enum PrepareIntent {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct PrepareOp {
+    pub id: Id,
+    pub expectation: CellExpectation,
+    pub intent: PrepareIntent,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct TxnPriority {
+    pub tid: TxnId,
+    pub coordinator_id: u64,
+}
+
+impl TxnPriority {
+    pub fn new(tid: TxnId, coordinator_id: u64) -> Self {
+        Self {
+            tid,
+            coordinator_id,
+        }
+    }
+
+    pub fn compare_age(&self, other: &Self) -> Ordering {
+        match self.tid.relation(&other.tid) {
+            Relation::Before => Ordering::Less,
+            Relation::After => Ordering::Greater,
+            Relation::Equal | Relation::Concurrent => self
+                .coordinator_id
+                .cmp(&other.coordinator_id)
+                .then_with(|| {
+                    bifrost::utils::serde::serialize(&self.tid)
+                        .cmp(&bifrost::utils::serde::serialize(&other.tid))
+                }),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub enum TxnExecResult<A, E>
@@ -174,4 +223,33 @@ pub async fn new_async_client_for_database(
     Ok(manager::AsyncServiceClient::new_with_service_id(
         service_id, &client,
     ))
+}
+
+#[cfg(test)]
+mod occ_type_tests {
+    use super::{TxnId, TxnPriority};
+    use bifrost::vector_clock::StandardVectorClock;
+    use std::cmp::Ordering;
+
+    fn clock(entries: &[(u64, u64)]) -> TxnId {
+        StandardVectorClock::from_vec(entries.to_vec())
+    }
+
+    #[test]
+    fn txn_priority_preserves_causal_order() {
+        let older = TxnPriority::new(clock(&[(1, 1)]), 9);
+        let newer = TxnPriority::new(clock(&[(1, 2)]), 9);
+
+        assert_eq!(older.compare_age(&newer), Ordering::Less);
+        assert_eq!(newer.compare_age(&older), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_totally_orders_concurrent_clocks_by_coordinator() {
+        let left = TxnPriority::new(clock(&[(1, 1)]), 10);
+        let right = TxnPriority::new(clock(&[(2, 1)]), 20);
+
+        assert_eq!(left.compare_age(&right), Ordering::Less);
+        assert_eq!(right.compare_age(&left), Ordering::Greater);
+    }
 }
