@@ -44,6 +44,8 @@ enum PageSnap {
     Page(Vec<EntryKey>, NodeCellRef),
     // Node holds no data (empty page or tombstone); continue with this ref.
     Skip(NodeCellRef),
+    // A speculative pointer clone failed (target condemned); re-read.
+    Retry,
     // End of the chain.
     End,
 }
@@ -127,7 +129,9 @@ where
     // closure.
     pub(super) fn initialize(&mut self) {
         if self.lazy {
-            if self.current_deleted || self.current_is_deleted() {
+            // Snapshot-time verdict from the seek closure; iteration relies
+            // on snapshot-time filtering throughout.
+            if self.current_deleted {
                 self.advance();
             }
             return;
@@ -139,20 +143,7 @@ where
         } else {
             self.current = None;
             self.page = None;
-            return;
         }
-        if self.current_is_deleted() {
-            self.advance();
-        }
-    }
-
-    fn current_is_deleted(&self) -> bool {
-        self.filter_deleted
-            && self
-                .current
-                .as_ref()
-                .map(|key| self.deletion.contains(key))
-                .unwrap_or(false)
     }
 
     // Read one page of the sibling chain without side effects on the cursor.
@@ -171,13 +162,19 @@ where
         }
         read_node(page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::External(ref n) => {
-                let follow = match ordering {
-                    Ordering::Forward => n.next.clone(),
-                    Ordering::Backward => n.prev.clone(),
+                let follow_src = match ordering {
+                    Ordering::Forward => &n.next,
+                    Ordering::Backward => &n.prev,
                 };
+                let Some(follow) = follow_src.try_clone_speculative() else {
+                    return PageSnap::Retry;
+                };
+                // One emptiness check per page instead of one hash lookup
+                // per key when nothing is tombstoned (the common case).
+                let filtering = filter_deleted && deletion.len() > 0;
                 let keys: Vec<EntryKey> = n.keys.as_slice_immute()[..n.len]
                     .iter()
-                    .filter(|k| !filter_deleted || !deletion.contains(k))
+                    .filter(|k| !filtering || !deletion.contains(k))
                     .cloned()
                     .collect();
                 if keys.is_empty() {
@@ -186,10 +183,19 @@ where
                     PageSnap::Page(keys, follow)
                 }
             }
-            &NodeData::Empty(ref n) => PageSnap::Skip(match ordering {
-                Ordering::Forward => n.right.clone(),
-                Ordering::Backward => n.left.clone().unwrap_or_default(),
-            }),
+            &NodeData::Empty(ref n) => {
+                let next = match ordering {
+                    Ordering::Forward => n.right.try_clone_speculative(),
+                    Ordering::Backward => match n.left.as_ref() {
+                        Some(l) => l.try_clone_speculative(),
+                        None => Some(NodeCellRef::default()),
+                    },
+                };
+                match next {
+                    Some(next) => PageSnap::Skip(next),
+                    None => PageSnap::Retry,
+                }
+            }
             &NodeData::None => PageSnap::End,
             &NodeData::Internal(_) => unreachable!("cursor reached an internal node"),
         })
@@ -202,6 +208,7 @@ where
         let mut follow = mem::take(&mut self.follow);
         loop {
             match Self::read_page(&follow, self.ordering, &self.deletion, self.filter_deleted) {
+                PageSnap::Retry => continue,
                 PageSnap::End => return false,
                 PageSnap::Skip(next) => {
                     if next.is_default() {
@@ -238,13 +245,15 @@ where
             Some(r) => r.clone(),
             None => return,
         };
-        let snap = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
+        let snap = loop {
+            let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::External(ref n) => {
                 let keys = &n.keys.as_slice_immute()[..n.len];
+                let filtering = self.filter_deleted && self.deletion.len() > 0;
                 let snap = |range: &[EntryKey]| -> Vec<EntryKey> {
                     range
                         .iter()
-                        .filter(|k| !self.filter_deleted || !self.deletion.contains(k))
+                        .filter(|k| !filtering || !self.deletion.contains(k))
                         .cloned()
                         .collect()
                 };
@@ -255,22 +264,42 @@ where
                             Ok(i) => i + 1,
                             Err(i) => i,
                         };
-                        PageSnap::Page(snap(&keys[pos..]), n.next.clone())
+                        match n.next.try_clone_speculative() {
+                            Some(follow) => PageSnap::Page(snap(&keys[pos..]), follow),
+                            None => PageSnap::Retry,
+                        }
                     }
                     Ordering::Backward => {
                         // Keys strictly smaller than the current one.
                         let pos = keys.binary_search(&cur).unwrap_or_else(|i| i);
-                        PageSnap::Page(snap(&keys[..pos]), n.prev.clone())
+                        match n.prev.try_clone_speculative() {
+                            Some(follow) => PageSnap::Page(snap(&keys[..pos]), follow),
+                            None => PageSnap::Retry,
+                        }
                     }
                 }
             }
-            &NodeData::Empty(ref e) => PageSnap::Skip(match self.ordering {
-                Ordering::Forward => e.right.clone(),
-                Ordering::Backward => e.left.clone().unwrap_or_default(),
-            }),
+            &NodeData::Empty(ref e) => {
+                let next = match self.ordering {
+                    Ordering::Forward => e.right.try_clone_speculative(),
+                    Ordering::Backward => match e.left.as_ref() {
+                        Some(l) => l.try_clone_speculative(),
+                        None => Some(NodeCellRef::default()),
+                    },
+                };
+                match next {
+                    Some(next) => PageSnap::Skip(next),
+                    None => PageSnap::Retry,
+                }
+            }
             &NodeData::None => PageSnap::End,
             &NodeData::Internal(_) => unreachable!("cursor reached an internal node"),
-        });
+            });
+            match attempt {
+                PageSnap::Retry => continue,
+                other => break other,
+            }
+        };
         match snap {
             PageSnap::Page(keys, follow) => {
                 // Sentinel positions: "before the first" for Forward (wraps to
@@ -295,6 +324,8 @@ where
                 self.keys = Vec::new();
                 self.follow = NodeCellRef::default();
             }
+            // The retry loop above never breaks with Retry.
+            PageSnap::Retry => unreachable!(),
         }
     }
 
@@ -329,11 +360,9 @@ where
                 self.page = None;
                 return;
             }
-            let candidate = &self.keys[self.index];
-            if self.filter_deleted && self.deletion.contains(candidate) {
-                continue;
-            }
-            self.current = Some(candidate.clone());
+            // Snapshots are filtered against the deletion set when they are
+            // taken; no per-yield lookup is needed.
+            self.current = Some(self.keys[self.index].clone());
             return;
         }
     }

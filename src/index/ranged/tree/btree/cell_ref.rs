@@ -135,6 +135,36 @@ impl NodeCellRef {
         unsafe { self.inner.as_ref().unwrap().counter.load(Ordering::Acquire) }
     }
 
+    // Clone a ref whose pointer was read out of NODE DATA without holding
+    // that node's latch. The pointee may already have hit refcount zero with
+    // its destruction queued; incrementing from zero would resurrect it and
+    // double-free later. Returns None in that case — callers retry their
+    // optimistic read (the version check would have failed anyway).
+    //
+    // Caller contract: an epoch pin must be active from before the pointer
+    // bytes were read until this call returns (read_node pins), so the
+    // pointee's memory is still valid to probe. Modeled in
+    // docs/tla/SeqlockReclaim.tla.
+    pub fn try_clone_speculative(&self) -> Option<Self> {
+        if self.is_default() {
+            return Some(Self::default());
+        }
+        unsafe {
+            let inner = self.inner.as_ref().unwrap();
+            inner
+                .counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                    if c == 0 {
+                        None
+                    } else {
+                        Some(c + 1)
+                    }
+                })
+                .ok()
+                .map(|_| NodeCellRef { inner: self.inner })
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub unsafe fn capture_backtrace(&self) {
         self.inner.as_mut().unwrap().backtrace = std::thread::current().id();
@@ -151,13 +181,56 @@ impl Clone for NodeCellRef {
         if !self.is_default() {
             unsafe {
                 let inner = self.inner.as_ref().unwrap();
-                inner.counter.fetch_add(1, Ordering::AcqRel);
+                let prev = inner.counter.fetch_add(1, Ordering::AcqRel);
+                // Cloning an owned ref: the ref itself keeps the count >= 1.
+                // Cloning a pointer read out of unlatched node data must go
+                // through try_clone_speculative instead.
+                debug_assert!(prev > 0, "cloned a NodeCellRef with zero refcount");
                 return NodeCellRef { inner: self.inner };
             }
         }
         Self::default()
     }
 }
+
+// Runs the recursive destruction of a node whose refcount reached zero.
+// Called from an epoch-deferred closure: by then, every reader whose pinned
+// section could still observe a stale pointer to this node has exited, and
+// zero-count nodes are unreachable from live node data, so the cascade may
+// free eagerly.
+unsafe fn destroy_cascade(root: *mut NodeRefInner<dyn AnyNode>) {
+    let mut stack = VecDeque::new();
+    stack.push_front(Box::from_raw(root));
+    let mut freed_ref_count = 0;
+    while let Some(node) = stack.pop_front() {
+        freed_ref_count += 1;
+        let all_sub_refs = node.obj.take_all_refs();
+        trace!(
+            "Reference {:?} have {} sub refrences",
+            node.as_ref() as *const _,
+            all_sub_refs.len()
+        );
+        for r in all_sub_refs.into_iter() {
+            let sub_ref_rc = r
+                .inner
+                .as_ref()
+                .unwrap()
+                .counter
+                .fetch_sub(1, Ordering::AcqRel);
+            trace!("Sub ref {:?} have rc {}", r.inner, sub_ref_rc);
+            if sub_ref_rc <= 1 {
+                // Can be eager-dropped
+                stack.push_front(Box::from_raw(r.inner));
+            }
+            forget(r);
+        }
+    }
+    trace!("Freed {} objects with reference counting", freed_ref_count);
+}
+
+// Wrapper making the raw pointer movable into the deferred closure.
+struct DeferredDestroy(*mut NodeRefInner<dyn AnyNode>);
+unsafe impl Send for DeferredDestroy {}
 
 impl Drop for NodeCellRef {
     fn drop(&mut self) {
@@ -166,33 +239,15 @@ impl Drop for NodeCellRef {
                 let inner = self.inner.as_ref().unwrap();
                 let c = inner.counter.fetch_sub(1, Ordering::AcqRel);
                 if c == 1 {
-                    let mut stack = VecDeque::new();
-                    stack.push_front(Box::from_raw(self.inner));
-                    let mut freed_ref_count = 0;
-                    while let Some(node) = stack.pop_front() {
-                        freed_ref_count += 1;
-                        let all_sub_refs = node.obj.take_all_refs();
-                        trace!(
-                            "Reference {:?} have {} sub refrences",
-                            node.as_ref() as *const _,
-                            all_sub_refs.len()
-                        );
-                        for r in all_sub_refs.into_iter() {
-                            let sub_ref_rc = r
-                                .inner
-                                .as_ref()
-                                .unwrap()
-                                .counter
-                                .fetch_sub(1, Ordering::AcqRel);
-                            trace!("Sub ref {:?} have rc {}", r.inner, sub_ref_rc);
-                            if sub_ref_rc <= 1 {
-                                // Can be eager-dropped
-                                stack.push_front(Box::from_raw(r.inner));
-                            }
-                            forget(r);
-                        }
-                    }
-                    trace!("Freed {} objects with reference counting", freed_ref_count);
+                    // Defer the destruction past the current epoch: optimistic
+                    // readers may still probe this node's counter through a
+                    // stale pointer until their pinned sections end.
+                    let target = DeferredDestroy(self.inner);
+                    let guard = crossbeam_epoch::pin();
+                    guard.defer_unchecked(move || {
+                        let target = target;
+                        destroy_cascade(target.0);
+                    });
                 }
             }
         }

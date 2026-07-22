@@ -201,22 +201,20 @@ where
             &NodeData::Empty(_) => "empty",
         }
     }
+    // Peeks at the right sibling without touching its refcount: this runs
+    // inside optimistic read closures where the sibling pointer may be stale
+    // and the sibling's count may already be zero (destruction deferred by
+    // the epoch; the caller's pin keeps the memory valid). Cloning here
+    // would resurrect such a node — see NodeCellRef::try_clone_speculative.
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
         if self.is_empty() || (self.len() > 0 && self.right_bound() <= key) {
-            let right_node = read_unchecked::<KS, PS>(self.right_ref().unwrap());
+            let right_ref = self.right_ref().unwrap();
+            let right_node = peek_data::<KS, PS>(right_ref);
             if !right_node.is_none()
                 && (self.is_empty() || (right_node.len() > 0 && right_node.first_key() <= *key))
             {
-                trace!(
-                    "found key to put to right page {:?}/{:?}",
-                    key,
-                    if right_node.is_empty() {
-                        min_entry_key()
-                    } else {
-                        right_node.first_key()
-                    }
-                );
-                return Some(self.right_ref().unwrap());
+                trace!("found key to put to right page {:?}", key);
+                return Some(right_ref);
             }
         }
         return None;
@@ -427,6 +425,18 @@ where
     cc_num != expected
 }
 
+// Borrow a node's data through a ref that may itself have been read out of
+// unlatched node data. Requires an active epoch pin (read_node provides
+// one); the data may be torn mid-write, like read_unchecked, but the memory
+// cannot be freed while pinned.
+pub fn peek_data<'a, KS, PS>(node: &'a NodeCellRef) -> &'a NodeData<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    unsafe { &*node.deref::<KS, PS>().data.get() }
+}
+
 pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(
     node: &NodeCellRef,
     mut func: F,
@@ -435,6 +445,11 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    // Pin the epoch for the whole optimistic read: closures peek at sibling
+    // and child pointers whose targets may have deferred destructions
+    // pending; the pin keeps that memory valid until the closure returns
+    // (docs/tla/SeqlockReclaim.tla).
+    let _epoch = crossbeam_epoch::pin();
     let mut handler = read_unchecked(node);
     if node.is_default() || handler.is_none() {
         return func(&handler);

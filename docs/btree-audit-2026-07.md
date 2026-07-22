@@ -157,6 +157,24 @@ Lesson applied: latch-order changes get a model before they get committed.
   `rebalance_candidate`, `NodeData::remove` and their helpers (their
   parent-before-child latch order would deadlock against the live paths).
 
+### Epoch-based reclamation (closes the reader use-after-free)
+
+The seqlock reader UAF window is closed: node destruction is deferred
+through crossbeam-epoch (`NodeCellRef::drop` queues the destruction
+cascade; `read_node` pins the epoch for the whole optimistic read), and
+pointers read out of unlatched node data are cloned with
+`try_clone_speculative` (increment-only-if-nonzero) so a condemned node can
+never be resurrected or double-freed; failed clones retry the optimistic
+read. `key_at_right_node` peeks at the sibling through a borrowed reference
+without touching its refcount. Protocol modeled in
+`docs/tla/SeqlockReclaim.tla`: TLC shows the pre-fix code violates
+`NoUseAfterFree`, pin-without-guarded-clone violates `NoResurrection`, and
+the shipped variant passes all invariants. Cursor snapshots now also filter
+tombstones once per page with an emptiness fast path, which removed the
+legacy per-yield hash lookup (scans roughly doubled again). Exclusive-path
+walks (level merge pruning, clear, verification, reconstruction) still use
+plain clones by design and remain non-concurrent-safe as documented.
+
 ## Known remaining risks (documented, not fixed)
 
 - **Seqlock reads are formally data races.** `read_node` closures read node
@@ -165,11 +183,6 @@ Lesson applied: latch-order changes get a model before they get committed.
   current hardware; `search_unwindable`'s `catch_unwind` is a band-aid for
   torn reads). A rigorous fix means routing reads through atomics or seqlock
   primitives.
-- **Use-after-free window on child refs.** A closure can clone a
-  `NodeCellRef` read from node data *before* version validation. If a writer
-  concurrently removed that child and dropped the last reference, the clone's
-  refcount increment touches freed memory. Narrow window; a real fix needs
-  deferred reclamation (crossbeam-epoch is already a dependency).
 - **`NodeCellRef::deref` casts between `Node<KS, PS>` instantiations** (and
   the all-`None` default node) assuming identical enum layout across generic
   instantiations — not guaranteed by repr(Rust), true in practice.
@@ -206,6 +219,9 @@ v1.8.0, Java 21):
 | BLinkInsert | Fixed + 1 merger | pass: merger install serialized, no deadlock |
 | DeletionReclaim | grace+undo draft | `QuiescentCorrect` **violated** (loses inserts; design rejected) |
 | DeletionReclaim | latched compaction | pass with 2 concurrent users (398 states) |
+| SeqlockReclaim | NoPin (pre-fix code) | `NoUseAfterFree` **violated** |
+| SeqlockReclaim | Pin, plain clone | `NoResurrection` **violated** (resurrected clone) |
+| SeqlockReclaim | Pin + try_clone (shipped) | pass |
 
 Run: `java -cp tla2tools.jar tlc2.TLC -config <cfg> <spec>.tla`
 

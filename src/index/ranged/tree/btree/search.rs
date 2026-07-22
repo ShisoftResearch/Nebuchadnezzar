@@ -26,7 +26,11 @@ where
             let node = &**node_handler;
             if let Some(right_node) = node.key_at_right_node(key) {
                 trace!("Search found a node at the right side");
-                return Err(right_node.clone());
+                // Pointer read from unlatched data: clone speculatively and
+                // retry on this node if its target is already condemned.
+                return Err(right_node
+                    .try_clone_speculative()
+                    .unwrap_or_else(|| node_ref.clone()));
             }
             let pos = match node.search_unwindable(key) {
                 Ok(pos) => pos,
@@ -71,7 +75,9 @@ where
                     Ok(match found {
                         Some(idx) => RTCursor::from_lazy(
                             all[idx].clone(),
-                            filter_deleted && deletion.contains(&all[idx]),
+                            filter_deleted
+                                && deletion.len() > 0
+                                && deletion.contains(&all[idx]),
                             node_ref.clone(),
                             ordering,
                             deletion.clone(),
@@ -80,9 +86,12 @@ where
                         None => {
                             // Off-page position: hand the follow ref to the
                             // cursor and let initialize() move on.
-                            let follow = match ordering {
-                                Ordering::Forward => n.next.clone(),
-                                Ordering::Backward => n.prev.clone(),
+                            let follow_src = match ordering {
+                                Ordering::Forward => &n.next,
+                                Ordering::Backward => &n.prev,
+                            };
+                            let Some(follow) = follow_src.try_clone_speculative() else {
+                                return Err(node_ref.clone());
                             };
                             RTCursor::from_snapshot(
                                 Vec::new(),
@@ -105,9 +114,14 @@ where
                     );
                     let next_node_ref = &n.ptrs.as_slice_immute()[pos];
                     debug_assert!(pos <= n.len);
-                    Err(next_node_ref.clone())
+                    Err(next_node_ref
+                        .try_clone_speculative()
+                        .unwrap_or_else(|| node_ref.clone()))
                 }
-                &NodeData::Empty(ref n) => Err(n.right.clone()),
+                &NodeData::Empty(ref n) => Err(n
+                    .right
+                    .try_clone_speculative()
+                    .unwrap_or_else(|| node_ref.clone())),
                 &NodeData::None => Ok(RTCursor::empty(
                     ordering,
                     deletion.clone(),
@@ -152,11 +166,16 @@ where
                         return Err(node_ref.clone());
                     }
                 };
-                let sub_node = n.ptrs.as_slice_immute()[pos].clone();
-                Ok(MutSearchResult::Internal(sub_node))
+                match n.ptrs.as_slice_immute()[pos].try_clone_speculative() {
+                    Some(sub_node) => Ok(MutSearchResult::Internal(sub_node)),
+                    None => Err(node_ref.clone()),
+                }
             }
             &NodeData::External(_) => Ok(MutSearchResult::External),
-            &NodeData::Empty(ref n) => Err(n.right.clone()),
+            &NodeData::Empty(ref n) => Err(n
+                .right
+                .try_clone_speculative()
+                .unwrap_or_else(|| node_ref.clone())),
             &NodeData::None => unreachable!(),
         }) {
             Ok(res) => return res,
@@ -176,11 +195,16 @@ where
 {
     let res = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
         &NodeData::Internal(ref n) => {
-            let sub_node = n.ptrs.as_slice_immute()[0].clone();
-            Ok(MutSearchResult::Internal(sub_node))
+            match n.ptrs.as_slice_immute()[0].try_clone_speculative() {
+                Some(sub_node) => Ok(MutSearchResult::Internal(sub_node)),
+                None => Err(node_ref.clone()),
+            }
         }
         &NodeData::External(_) => Ok(MutSearchResult::External),
-        &NodeData::Empty(ref n) => Err(n.right.clone()),
+        &NodeData::Empty(ref n) => Err(n
+            .right
+            .try_clone_speculative()
+            .unwrap_or_else(|| node_ref.clone())),
         &NodeData::None => unreachable!(),
     });
     res.unwrap_or_else(|e| mut_first::<KS, PS>(&e))

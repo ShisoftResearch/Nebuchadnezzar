@@ -20,6 +20,12 @@ pub enum ChangingNode {
     Modified(NodeModified),
 }
 
+enum NeighborStep {
+    Found(Id),
+    Follow(NodeCellRef),
+    Retry,
+}
+
 pub struct NodeModified {
     pub node: NodeCellRef,
     pub deletion: Arc<DeletionSet>,
@@ -150,6 +156,7 @@ where
     // neighbor.
     fn live_neighbor_id(start: &NodeCellRef, forward: bool) -> Id {
         let mut node_ref = start.clone();
+        let mut retries = 0;
         loop {
             if node_ref.is_default() {
                 return Id::unit_id();
@@ -159,27 +166,47 @@ where
                     Self::neighbor_step(&**node, forward)
                 })
             } else {
+                // Unvalidated walk (must not wait leftward); pin so a
+                // condemned tombstone's memory stays readable.
+                let _epoch = crossbeam_epoch::pin();
                 Self::neighbor_step(&*read_unchecked::<KS, PS>(&node_ref), forward)
             };
             match step {
-                Ok(id) => return id,
-                Err(next) => node_ref = next,
+                NeighborStep::Found(id) => return id,
+                NeighborStep::Follow(next) => node_ref = next,
+                NeighborStep::Retry => {
+                    retries += 1;
+                    if retries > 16 {
+                        // The persisted link is advisory; reconstruction
+                        // re-derives chains. Give up rather than spin.
+                        return Id::unit_id();
+                    }
+                }
             }
         }
     }
 
-    fn neighbor_step(node: &NodeData<KS, PS>, forward: bool) -> Result<Id, NodeCellRef> {
+    fn neighbor_step(node: &NodeData<KS, PS>, forward: bool) -> NeighborStep {
         match node {
-            &NodeData::External(ref n) => Ok(n.id),
-            &NodeData::Empty(ref e) => Err(if forward {
-                e.right.clone()
-            } else {
-                e.left.clone().unwrap_or_default()
-            }),
-            &NodeData::None => Ok(Id::unit_id()),
+            &NodeData::External(ref n) => NeighborStep::Found(n.id),
+            &NodeData::Empty(ref e) => {
+                let next = if forward {
+                    e.right.try_clone_speculative()
+                } else {
+                    match e.left.as_ref() {
+                        Some(l) => l.try_clone_speculative(),
+                        None => Some(NodeCellRef::default()),
+                    }
+                };
+                match next {
+                    Some(next) => NeighborStep::Follow(next),
+                    None => NeighborStep::Retry,
+                }
+            }
+            &NodeData::None => NeighborStep::Found(Id::unit_id()),
             &NodeData::Internal(_) => {
                 warn!("external sibling chain reached an internal node");
-                Ok(Id::unit_id())
+                NeighborStep::Found(Id::unit_id())
             }
         }
     }
