@@ -334,6 +334,22 @@ impl LeafKeys {
         *len -= 1;
     }
 
+    // Replace the whole content atomically (swap + epoch retire); safe
+    // against concurrent optimistic readers of the old buffer.
+    pub fn set(&self, keys: &[EntryKey]) {
+        let capacity = self.capacity().max(keys.len()).max(1);
+        let plen = common_prefix_of(keys);
+        let mut prefix = [0u8; KEY_SIZE];
+        if let Some(first) = keys.first() {
+            prefix.copy_from_slice(first.as_slice());
+        }
+        let mut nb = SuffixBuf::alloc(&prefix[..plen], capacity);
+        for (i, k) in keys.iter().enumerate() {
+            nb.write_entry(i, k);
+        }
+        self.swap_buf(nb);
+    }
+
     // Replace the whole content (bulk rebuild under the page latch).
     pub fn set_from(&mut self, keys: &[EntryKey], len: &mut usize) {
         let capacity = self.capacity();
@@ -361,8 +377,15 @@ impl LeafKeys {
 
 impl Drop for LeafKeys {
     fn drop(&mut self) {
+        // Defer the buffer free: a LeafKeys can be dropped by replacing a
+        // node's key structure while pinned optimistic readers still hold a
+        // stale view of the old buffer (docs/tla/SeqlockReclaim.tla).
+        let old = self.buf.load(Ordering::Relaxed);
+        let guard = crossbeam_epoch::pin();
         unsafe {
-            drop(Box::from_raw(self.buf.load(Ordering::Relaxed)));
+            guard.defer_unchecked(move || {
+                drop(Box::from_raw(old));
+            });
         }
     }
 }

@@ -1,127 +1,60 @@
+use super::leaf_keys::LeafKeys;
 use super::Slice;
 use super::*;
-use crate::index::KEY_SIZE;
 use std::any::Any;
 use std::marker::PhantomData;
 use std::{mem, panic};
 
-#[derive(Clone, Debug)]
+// Prefix-compressed pivot storage for internal nodes, sharing LeafKeys'
+// reader-safe buffer: optimistic readers reach the suffixes through one
+// atomic pointer to a self-describing allocation, and replaced buffers are
+// epoch-retired instead of freed under a live stale view (the plain-Vec
+// predecessor freed its allocation immediately on rebuild).
 pub struct InternalKeys {
-    blob: InternalKeysBlob,
+    inner: LeafKeys,
 }
 
-#[derive(Clone, Debug)]
-struct InternalKeysBlob {
-    shared_prefix: [u8; KEY_SIZE],
-    shared_prefix_len: u8,
-    suffixes: Vec<u8>,
+impl std::fmt::Debug for InternalKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
 }
 
 impl InternalKeys {
-    fn empty() -> Self {
-        Self {
-            blob: InternalKeysBlob {
-                shared_prefix: [0; KEY_SIZE],
-                shared_prefix_len: 0,
-                suffixes: Vec::new(),
-            },
+    pub fn from_keys(keys: &[EntryKey]) -> Self {
+        InternalKeys {
+            inner: LeafKeys::from_keys(keys, keys.len().max(1)),
         }
     }
 
-    pub fn from_keys(keys: &[EntryKey]) -> Self {
-        if keys.is_empty() {
-            return Self::empty();
-        }
-
-        let first = keys[0].as_slice();
-        let mut prefix_len = KEY_SIZE;
-        for key in &keys[1..] {
-            let bytes = key.as_slice();
-            let mut i = 0;
-            while i < prefix_len && bytes[i] == first[i] {
-                i += 1;
-            }
-            prefix_len = i;
-            if prefix_len == 0 {
-                break;
-            }
-        }
-
-        let mut shared_prefix = [0; KEY_SIZE];
-        shared_prefix[..prefix_len].copy_from_slice(&first[..prefix_len]);
-        let mut suffixes = Vec::with_capacity(keys.len() * (KEY_SIZE - prefix_len));
-        for key in keys {
-            let tail = &key.as_slice()[prefix_len..];
-            suffixes.extend_from_slice(tail);
-        }
-
-        Self {
-            blob: InternalKeysBlob {
-                shared_prefix,
-                shared_prefix_len: prefix_len as u8,
-                suffixes,
-            },
-        }
+    // Atomically replace the pivots of a published node (swap + epoch
+    // retire); used by in-place rebuilds under the node's write latch.
+    pub fn set(&self, keys: &[EntryKey]) {
+        self.inner.set(keys);
     }
 
     pub fn key_at(&self, index: usize) -> EntryKey {
-        let prefix_len = self.blob.shared_prefix_len as usize;
-        let suffix_len = KEY_SIZE - prefix_len;
-        let start = index * suffix_len;
-        let end = start + suffix_len;
-        debug_assert!(end <= self.blob.suffixes.len());
-        let mut key = EntryKey::new();
-        key.as_mut_slice()[..prefix_len].copy_from_slice(&self.blob.shared_prefix[..prefix_len]);
-        key.as_mut_slice()[prefix_len..].copy_from_slice(&self.blob.suffixes[start..end]);
-        key
+        self.inner.key_at(index)
     }
 
     #[inline]
     pub fn cmp_at(&self, index: usize, key: &EntryKey) -> std::cmp::Ordering {
-        let prefix_len = self.blob.shared_prefix_len as usize;
-        let key_bytes = key.as_slice();
-
-        let prefix_cmp = self.blob.shared_prefix[..prefix_len].cmp(&key_bytes[..prefix_len]);
-        if prefix_cmp != std::cmp::Ordering::Equal {
-            return prefix_cmp;
-        }
-
-        let suffix_len = KEY_SIZE - prefix_len;
-        let start = index * suffix_len;
-        let end = start + suffix_len;
-        debug_assert!(end <= self.blob.suffixes.len());
-        self.blob.suffixes[start..end].cmp(&key_bytes[prefix_len..])
+        self.inner.cmp_at(index, key)
     }
 
     pub fn to_vec(&self, len: usize) -> Vec<EntryKey> {
-        (0..len).map(|i| self.key_at(i)).collect()
+        self.inner.to_vec(0..len)
     }
 
     // Routing search over `len` keys: returns the child position for `key`,
-    // with keys equal to a pivot routing right. The shared prefix is compared
-    // once up front so the binary search only touches the stored suffixes.
+    // with keys equal to a pivot routing right.
     pub fn search(&self, len: usize, key: &EntryKey) -> usize {
-        let prefix_len = self.blob.shared_prefix_len as usize;
-        let key_bytes = key.as_slice();
-        match self.blob.shared_prefix[..prefix_len].cmp(&key_bytes[..prefix_len]) {
-            std::cmp::Ordering::Greater => return 0, // every stored key > key
-            std::cmp::Ordering::Less => return len,  // every stored key < key
-            std::cmp::Ordering::Equal => {}
+        let pos = self.inner.search(len, key);
+        if pos < len && self.inner.cmp_at(pos, key) == std::cmp::Ordering::Equal {
+            pos + 1
+        } else {
+            pos
         }
-        let suffix_len = KEY_SIZE - prefix_len;
-        let key_suffix = &key_bytes[prefix_len..];
-        let mut left = 0;
-        let mut right = len;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let start = mid * suffix_len;
-            match self.blob.suffixes[start..start + suffix_len].cmp(key_suffix) {
-                std::cmp::Ordering::Less => left = mid + 1,
-                std::cmp::Ordering::Greater => right = mid,
-                std::cmp::Ordering::Equal => return mid + 1,
-            }
-        }
-        left
     }
 }
 
@@ -151,7 +84,7 @@ where
 
     pub fn new(len: usize, right_bound: EntryKey) -> Box<Self> {
         Box::new(InNode::<KS, PS> {
-            keys: InternalKeys::empty(),
+            keys: InternalKeys::from_keys(&[]),
             ptrs: PS::init(),
             right: NodeCellRef::default(),
             right_bound,
@@ -199,7 +132,7 @@ where
         let left_ptrs = ptrs[..pivot + 1].to_vec();
         let right_ptrs = ptrs[pivot + 1..].to_vec();
 
-        self.keys = InternalKeys::from_keys(left_keys.as_slice());
+        self.keys.set(left_keys.as_slice());
         self.len = left_keys.len();
         for (i, ptr) in left_ptrs.iter().enumerate() {
             self.ptrs.as_slice()[i] = ptr.clone();
@@ -245,7 +178,7 @@ where
         let mut new_node_ptrs = self.len + 1;
         let ptr_padding = if padding_ptr_pos { 1 } else { 0 };
         new_node_len += 1;
-        self.keys = InternalKeys::from_keys(keys.as_slice());
+        self.keys.set(keys.as_slice());
         self.ptrs
             .insert_at(new_node, pos + ptr_padding, &mut new_node_ptrs);
         self.len = new_node_len;
