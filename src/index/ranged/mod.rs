@@ -148,10 +148,13 @@ mod tests {
         workers: usize,
         duration: Duration,
     ) {
+        // Sized for large machines: at ~200 cores the 30-minute soak inserts
+        // on the order of a billion keys; a 32GB chunk fills with page cells
+        // and migrations retry forever against the full chunk.
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_size: 32 * 1024 * 1024 * 1024,
-                db_size: 32 * 1024 * 1024 * 1024,
+                chunk_size: 256 * 1024 * 1024 * 1024,
+                db_size: 256 * 1024 * 1024 * 1024,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
