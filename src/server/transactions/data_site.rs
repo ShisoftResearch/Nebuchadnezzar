@@ -1116,6 +1116,332 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_retry_rejects_different_ops_without_overwriting_original_prepare() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5328";
+        let group = "txn_data_site_prepare_retry_ops_mismatch";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_a = Id::new(0, 99006);
+        let cell_b = Id::new(0, 99007);
+        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 7, 0);
+        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 8, 0);
+        let tid = StandardVectorClock::from_vec(vec![(15, 1)]);
+        let coordinator_id = 15;
+        let requester = TxnPriority::new(tid.clone(), coordinator_id);
+        let op_a = PrepareOp {
+            id: cell_a,
+            expectation: CellExpectation::Present(version_a),
+            intent: PrepareIntent::Write,
+        };
+        let op_b = PrepareOp {
+            id: cell_b,
+            expectation: CellExpectation::Present(version_b),
+            intent: PrepareIntent::Write,
+        };
+
+        let first = <DataManager as Service>::prepare(
+            &manager,
+            coordinator_id,
+            tid.clone(),
+            tid.clone(),
+            vec![op_a.clone()],
+        )
+        .await
+        .payload;
+        assert_eq!(first, DMPrepareResult::Success);
+
+        let second = <DataManager as Service>::prepare(
+            &manager,
+            coordinator_id,
+            tid.clone(),
+            tid.clone(),
+            vec![op_b.clone()],
+        )
+        .await
+        .payload;
+
+        assert_eq!(second, DMPrepareResult::StateError(TxnState::Prepared));
+
+        let txn = manager.get_or_create_transaction(&tid);
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert_eq!(txn.coordinator_id, Some(coordinator_id));
+        assert_eq!(txn.affected_cells, vec![cell_a]);
+        assert_eq!(txn.certified.len(), 1);
+        assert_eq!(txn.certified.get(&cell_a), Some(&op_a));
+        assert_eq!(txn.certified.get(&cell_b), None);
+        drop(txn);
+
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_a).lock().owner,
+            Some(requester)
+        );
+        assert_eq!(
+            manager
+                .cells
+                .get(&cell_b)
+                .map(|meta| meta.lock().owner.clone()),
+            None
+        );
+
+        let abort_result = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort_result, AbortResult::Success(None));
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end_result, EndResult::Success);
+        assert!(manager.cell_meta_mutex(&cell_a).lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_retry_rejects_different_coordinator_without_state_or_owner_change() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5329";
+        let group = "txn_data_site_prepare_retry_coordinator_mismatch";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99008);
+        let version = seed_cell_version(&runtime, schema.id, cell_id, 9, 0);
+        let tid = StandardVectorClock::from_vec(vec![(16, 1)]);
+        let original_coordinator = 16;
+        let requester = TxnPriority::new(tid.clone(), original_coordinator);
+        let op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+
+        let first = <DataManager as Service>::prepare(
+            &manager,
+            original_coordinator,
+            tid.clone(),
+            tid.clone(),
+            vec![op.clone()],
+        )
+        .await
+        .payload;
+        assert_eq!(first, DMPrepareResult::Success);
+
+        let second = <DataManager as Service>::prepare(
+            &manager,
+            99,
+            tid.clone(),
+            tid.clone(),
+            vec![op.clone()],
+        )
+        .await
+        .payload;
+
+        assert_eq!(second, DMPrepareResult::StateError(TxnState::Prepared));
+
+        let txn = manager.get_or_create_transaction(&tid);
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert_eq!(txn.coordinator_id, Some(original_coordinator));
+        assert_eq!(txn.affected_cells, vec![cell_id]);
+        assert_eq!(txn.certified.len(), 1);
+        assert_eq!(txn.certified.get(&cell_id), Some(&op));
+        drop(txn);
+
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(requester)
+        );
+
+        let abort_result = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort_result, AbortResult::Success(None));
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end_result, EndResult::Success);
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_retry_accepts_exact_same_payload_and_reacquires_missing_owner() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5330";
+        let group = "txn_data_site_prepare_retry_idempotent";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_a = Id::new(0, 99009);
+        let cell_b = Id::new(0, 99010);
+        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 10, 0);
+        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 11, 0);
+        let tid = StandardVectorClock::from_vec(vec![(17, 1)]);
+        let coordinator_id = 17;
+        let requester = TxnPriority::new(tid.clone(), coordinator_id);
+        let op_a = PrepareOp {
+            id: cell_a,
+            expectation: CellExpectation::Present(version_a),
+            intent: PrepareIntent::Write,
+        };
+        let op_b = PrepareOp {
+            id: cell_b,
+            expectation: CellExpectation::Present(version_b),
+            intent: PrepareIntent::Read,
+        };
+
+        let first = <DataManager as Service>::prepare(
+            &manager,
+            coordinator_id,
+            tid.clone(),
+            tid.clone(),
+            vec![op_b.clone(), op_a.clone()],
+        )
+        .await
+        .payload;
+        assert_eq!(first, DMPrepareResult::Success);
+
+        {
+            let meta = manager.cell_meta_mutex(&cell_a);
+            let mut meta = meta.lock();
+            meta.owner = None;
+            meta.lock_acquired_at = None;
+        }
+
+        let second = <DataManager as Service>::prepare(
+            &manager,
+            coordinator_id,
+            tid.clone(),
+            tid.clone(),
+            vec![op_a.clone(), op_b.clone()],
+        )
+        .await
+        .payload;
+
+        assert_eq!(second, DMPrepareResult::Success);
+
+        let txn = manager.get_or_create_transaction(&tid);
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert_eq!(txn.coordinator_id, Some(coordinator_id));
+        assert_eq!(txn.affected_cells, vec![cell_a, cell_b]);
+        assert_eq!(txn.certified.len(), 2);
+        assert_eq!(txn.certified.get(&cell_a), Some(&op_a));
+        assert_eq!(txn.certified.get(&cell_b), Some(&op_b));
+        drop(txn);
+
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_a).lock().owner,
+            Some(requester.clone())
+        );
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_b).lock().owner,
+            Some(requester)
+        );
+
+        let abort_result = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort_result, AbortResult::Success(None));
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end_result, EndResult::Success);
+        assert!(manager.cell_meta_mutex(&cell_a).lock().owner.is_none());
+        assert!(manager.cell_meta_mutex(&cell_b).lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_retry_exact_payload_does_not_blindly_succeed_with_foreign_owner() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5331";
+        let group = "txn_data_site_prepare_retry_foreign_owner";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99011);
+        let version = seed_cell_version(&runtime, schema.id, cell_id, 12, 0);
+        let tid = StandardVectorClock::from_vec(vec![(18, 1)]);
+        let coordinator_id = 18;
+        let requester = TxnPriority::new(tid.clone(), coordinator_id);
+        let foreign_owner = TxnPriority::new(StandardVectorClock::from_vec(vec![(1, 1)]), 1);
+        let op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+
+        let first = <DataManager as Service>::prepare(
+            &manager,
+            coordinator_id,
+            tid.clone(),
+            tid.clone(),
+            vec![op.clone()],
+        )
+        .await
+        .payload;
+        assert_eq!(first, DMPrepareResult::Success);
+
+        {
+            let meta = manager.cell_meta_mutex(&cell_id);
+            let mut meta = meta.lock();
+            meta.owner = Some(foreign_owner.clone());
+            meta.lock_acquired_at = Some(get_time());
+        }
+
+        let second = <DataManager as Service>::prepare(
+            &manager,
+            coordinator_id,
+            tid.clone(),
+            tid.clone(),
+            vec![op.clone()],
+        )
+        .await
+        .payload;
+
+        assert_eq!(second, DMPrepareResult::NotRealizable);
+
+        let txn = manager.get_or_create_transaction(&tid);
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert_eq!(txn.coordinator_id, Some(coordinator_id));
+        assert_eq!(txn.affected_cells, vec![cell_id]);
+        assert_eq!(txn.certified.len(), 1);
+        assert_eq!(txn.certified.get(&cell_id), Some(&op));
+        drop(txn);
+
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(foreign_owner)
+        );
+
+        {
+            let meta = manager.cell_meta_mutex(&cell_id);
+            let mut meta = meta.lock();
+            meta.owner = Some(requester);
+            meta.lock_acquired_at = Some(get_time());
+        }
+
+        let abort_result = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort_result, AbortResult::Success(None));
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end_result, EndResult::Success);
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_clock_wait_die_has_one_younger_requester() {
         let _ = env_logger::try_init();
         let address = "127.0.0.1:5325";
@@ -1502,12 +1828,21 @@ impl Service for DataManager {
             Ok(prepared_ops) => prepared_ops,
             Err(result) => return self.response_with(result),
         };
+        let prepared_ops_by_id: BTreeMap<Id, PrepareOp> =
+            prepared_ops.iter().cloned().map(|op| (op.id, op)).collect();
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
 
         let txn_lock = self.get_or_create_transaction(&tid);
         let mut txn = txn_lock.lock();
-        if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
-            return self.response_with(DMPrepareResult::StateError(txn.state));
+        match txn.state {
+            TxnState::Started => {}
+            TxnState::Prepared => {
+                if txn.coordinator_id != Some(coordinator_id) || txn.certified != prepared_ops_by_id
+                {
+                    return self.response_with(DMPrepareResult::StateError(TxnState::Prepared));
+                }
+            }
+            _ => return self.response_with(DMPrepareResult::StateError(txn.state)),
         }
 
         let mut cell_mutices = Vec::with_capacity(prepared_ops.len());
@@ -1569,7 +1904,7 @@ impl Service for DataManager {
             meta.lock_acquired_at = Some(lock_time);
         }
 
-        txn.certified = prepared_ops.into_iter().map(|op| (op.id, op)).collect();
+        txn.certified = prepared_ops_by_id;
         txn.affected_cells = txn.certified.keys().copied().collect();
         txn.coordinator_id = Some(coordinator_id);
         txn.state = TxnState::Prepared;
