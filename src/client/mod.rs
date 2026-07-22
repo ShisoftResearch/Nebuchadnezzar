@@ -348,6 +348,7 @@ impl AsyncClient {
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
+        // Clone only for the rare schema-miss retry path, not on every call.
         match client.upsert_cell(cell.clone()).await? {
             Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
                 self.refresh_owner_schema_cache_for_retry(&client, schema_id)
@@ -356,6 +357,40 @@ impl AsyncClient {
             }
             other => Ok(other),
         }
+    }
+
+    /// Batch upsert: groups cells by owning server and issues one RPC per
+    /// server, amortizing per-cell location lookup and RPC round-trips.
+    /// Results are returned in the same order as `cells`. Used by B-tree
+    /// write-back to drain many dirty pages at once.
+    pub async fn upsert_all_cells(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> Result<Vec<Result<CellHeader, WriteError>>, RPCError> {
+        // Preserve input order: tag each cell with its index, group by server.
+        let mut by_server: HashMap<u64, Vec<(usize, OwnedCell)>> = HashMap::new();
+        for (i, cell) in cells.into_iter().enumerate() {
+            let server_id = self.locate_server_id(&cell.id())?;
+            by_server.entry(server_id).or_default().push((i, cell));
+        }
+        let total: usize = by_server.values().map(|v| v.len()).sum();
+        let mut batches = by_server
+            .into_iter()
+            .map(|(server_id, tagged)| async move {
+                let (indices, batch): (Vec<usize>, Vec<OwnedCell>) = tagged.into_iter().unzip();
+                let client = self.client_by_server_id(server_id).await?;
+                let results = client.upsert_all_cells(batch).await?;
+                Ok::<_, RPCError>((indices, results))
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut out: Vec<Option<Result<CellHeader, WriteError>>> = (0..total).map(|_| None).collect();
+        while let Some(res) = batches.next().await {
+            let (indices, results) = res?;
+            for (idx, r) in indices.into_iter().zip(results) {
+                out[idx] = Some(r);
+            }
+        }
+        Ok(out.into_iter().map(|r| r.unwrap()).collect())
     }
     pub async fn remove_cell(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;

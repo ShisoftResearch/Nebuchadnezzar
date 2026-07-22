@@ -127,6 +127,15 @@ impl NodeCellRef {
         future::ready(()).boxed()
     }
 
+    // Serialize this node to a cell under its write latch, for batched
+    // write-back. None if the node holds nothing to persist.
+    pub fn build_cell(&self, deletion: &DeletionSet) -> Option<crate::ram::cell::OwnedCell> {
+        if self.is_default() {
+            return None;
+        }
+        unsafe { self.inner.as_ref().unwrap().obj.build_cell(self, deletion) }
+    }
+
     pub fn ptr_eq(&self, other: &Self) -> bool {
         std::ptr::addr_eq(self.inner, other.inner)
     }

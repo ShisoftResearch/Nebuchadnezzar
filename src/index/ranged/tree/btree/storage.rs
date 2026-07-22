@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use futures::FutureExt;
 
 // Write-back state is scoped per server instance, keyed by the identity of
 // the server's AsyncClient. Sharing one process-wide queue meant two servers
@@ -165,36 +164,90 @@ impl WriteBackHub {
             tokio::spawn(async move {
                 let _alive = WorkerAlive { hub: hub.clone() };
                 debug!("B-tree write-back worker {} started", worker_id);
+                // Group commit: drain a batch of dirty pages, serialize them
+                // (each under its own node latch), and flush the whole batch
+                // in one upsert_all_cells RPC — amortizing per-cell location
+                // lookup and RPC round-trips across the batch.
+                const BATCH: usize = 256;
                 loop {
                     if hub.should_stop.load(Ordering::SeqCst) {
                         debug!("B-tree write-back worker {} stopping", worker_id);
                         break;
                     }
-                    match hub.queue.pop() {
-                        Some((id, changing)) => {
-                            let _completion = CompletionGuard {
-                                hub: hub.clone(),
-                                id,
-                            };
-                            if let Err(e) = AssertUnwindSafe(process_change(changing))
-                                .catch_unwind()
-                                .await
-                            {
-                                let msg = e
-                                    .downcast_ref::<&str>()
-                                    .map(|s| s.to_string())
-                                    .or_else(|| e.downcast_ref::<String>().cloned())
-                                    .unwrap_or_else(|| "<non-string panic>".to_string());
-                                error!(
-                                    "write-back worker {}: persisting change {} panicked: {}",
-                                    worker_id, id, msg
-                                );
+                    // CompletionGuards are held for the whole batch so the
+                    // progress chain still advances even if the task is
+                    // cancelled mid-flush (drop records the id).
+                    let mut guards: Vec<CompletionGuard> = Vec::new();
+                    let mut cells: Vec<crate::ram::cell::OwnedCell> = Vec::new();
+                    let mut deletes: Vec<(crate::ram::types::Id, Arc<client::AsyncClient>)> =
+                        Vec::new();
+                    let mut batch_client: Option<Arc<client::AsyncClient>> = None;
+                    for _ in 0..BATCH {
+                        let Some((id, changing)) = hub.queue.pop() else {
+                            break;
+                        };
+                        let guard = CompletionGuard {
+                            hub: hub.clone(),
+                            id,
+                        };
+                        match changing {
+                            external::ChangingNode::Modified(m) => {
+                                if batch_client.is_none() {
+                                    batch_client = Some(m.client.clone());
+                                }
+                                let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                    m.node.build_cell(&m.deletion)
+                                }));
+                                match built {
+                                    Ok(Some(cell)) => cells.push(cell),
+                                    Ok(None) => {}
+                                    Err(_) => error!(
+                                        "write-back worker {}: build_cell panicked for change {}",
+                                        worker_id, id
+                                    ),
+                                }
+                            }
+                            external::ChangingNode::DeletedWithClient(cid, cl) => {
+                                deletes.push((cid, cl));
                             }
                         }
-                        None => {
-                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        guards.push(guard);
+                    }
+
+                    if cells.is_empty() && deletes.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+
+                    if !cells.is_empty() {
+                        let client = batch_client.expect("cells present implies a client");
+                        match client.upsert_all_cells(cells).await {
+                            Ok(results) => {
+                                for r in results {
+                                    if let Err(e) = r {
+                                        warn!("write-back batch: cell update rejected: {:?}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("write-back batch upsert RPC error: {:?}", e);
+                            }
                         }
                     }
+                    for (cid, cl) in deletes {
+                        match cl.remove_cell(cid).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                warn!("write-back: cell removal rejected for {:?}: {:?}", cid, e)
+                            }
+                            Err(e) => {
+                                error!("write-back: cell removal RPC error for {:?}: {:?}", cid, e)
+                            }
+                        }
+                    }
+                    // guards drop here, recording completion for every id in
+                    // the batch.
+                    drop(guards);
                 }
                 debug!("B-tree write-back worker {} stopped", worker_id);
             });
@@ -248,34 +301,6 @@ impl WriteBackHub {
             .clear();
         self.counter.store(0, Ordering::SeqCst);
         while self.queue.pop().is_some() {}
-    }
-}
-
-async fn process_change(changing: external::ChangingNode) {
-    match changing {
-        external::ChangingNode::Modified(modified) => {
-            modified
-                .node
-                .persist(&modified.deletion, &modified.client)
-                .await;
-        }
-        external::ChangingNode::DeletedWithClient(cell_id, client) => {
-            match client.remove_cell(cell_id).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(
-                        "write-back: cell removal rejected for {:?}: {:?}",
-                        cell_id, e
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "write-back: cell removal RPC error for {:?}: {:?}",
-                        cell_id, e
-                    );
-                }
-            }
-        }
     }
 }
 

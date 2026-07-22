@@ -313,6 +313,12 @@ pub trait AnyNode: Any + Send + Sync + 'static {
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<'_, ()>;
+    // Synchronous half of persist: clear the dirty flag, compact tombstones,
+    // and serialize the page to a cell — all under the node's write latch.
+    // Returns None for a node with nothing to persist (empty/tombstone). The
+    // caller batches the returned cells into one upsert_all_cells RPC.
+    fn build_cell(&self, node_ref: &NodeCellRef, deletion: &DeletionSet)
+        -> Option<crate::ram::cell::OwnedCell>;
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef>;
 }
 
@@ -626,27 +632,7 @@ where
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<'_, ()> {
-        let mut guard = write_node::<KS, PS>(node_ref);
-        // Clear the coalescing flag before reading the data: any touch after
-        // this point re-queues the node, so the snapshot below plus the next
-        // queue entry always cover the latest state.
-        self.dirty.store(false, Release);
-        let cell = match &mut *guard {
-            &mut NodeData::External(ref mut node) => {
-                // Compact tombstoned keys while the latch is held; this also
-                // drops their tombstones (see remove_contains).
-                node.remove_contains(&*deletion);
-                Some(node.to_cell(&*deletion))
-            }
-            &mut NodeData::Empty(_) => None,
-            other => {
-                error!(
-                    "Cannot persist internal or other type of nodes, type {}",
-                    other.type_name()
-                );
-                unreachable!();
-            }
-        };
+        let cell = self.build_cell(node_ref, deletion);
         let neb = neb.clone();
         async move {
             if let Some(cell) = cell {
@@ -668,6 +654,34 @@ where
             }
         }
         .boxed()
+    }
+
+    fn build_cell(
+        &self,
+        node_ref: &NodeCellRef,
+        deletion: &DeletionSet,
+    ) -> Option<crate::ram::cell::OwnedCell> {
+        let mut guard = write_node::<KS, PS>(node_ref);
+        // Clear the coalescing flag before reading the data: any touch after
+        // this point re-queues the node, so the snapshot below plus the next
+        // queue entry always cover the latest state.
+        self.dirty.store(false, Release);
+        match &mut *guard {
+            &mut NodeData::External(ref mut node) => {
+                // Compact tombstoned keys while the latch is held; this also
+                // drops their tombstones (see remove_contains).
+                node.remove_contains(&*deletion);
+                Some(node.to_cell(&*deletion))
+            }
+            &mut NodeData::Empty(_) => None,
+            other => {
+                error!(
+                    "Cannot persist internal or other type of nodes, type {}",
+                    other.type_name()
+                );
+                unreachable!();
+            }
+        }
     }
 
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef> {

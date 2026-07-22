@@ -34,6 +34,7 @@ service! {
     rpc head_cell(key: Id) -> Result<CellHeader, ReadError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc upsert_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
+    rpc upsert_all_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
     rpc remove_cell(key: Id) -> Result<(), WriteError>;
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
@@ -197,6 +198,23 @@ impl Service for NebRPCService {
                 }
                 other => other,
             }
+        }
+        .boxed()
+    }
+    fn upsert_all_cells(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> BoxFuture<'_, Vec<Result<CellHeader, WriteError>>> {
+        // One RPC round-trip for many pages: the chunk write and index
+        // maintenance still happen per cell, but the per-call dispatch and
+        // marshaling overhead is amortized across the batch. Reuses the
+        // single-cell handler so schema-miss retry behavior is identical.
+        async move {
+            let mut results = Vec::with_capacity(cells.len());
+            for cell in cells {
+                results.push(self.upsert_cell(cell).await);
+            }
+            results
         }
         .boxed()
     }
