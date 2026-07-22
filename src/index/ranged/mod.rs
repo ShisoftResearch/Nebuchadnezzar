@@ -70,6 +70,9 @@ mod tests {
         ));
         client.new_schema_with_id(schema()).await.unwrap().unwrap();
 
+        // This test derives its key count from the migration threshold and
+        // needs migration to trigger at a small scale; pin depth to 2.
+        btree::set_tree_depth(2);
         let test_capacity =
             btree::ideal_capacity_from_node_size(btree::level::BTREE_NODE_SIZE) * multiplier;
         let mut futs = FuturesUnordered::new();

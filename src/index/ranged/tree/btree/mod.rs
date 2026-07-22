@@ -26,7 +26,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
 use std::sync::Arc;
 
 pub mod cell_ref;
@@ -372,8 +372,37 @@ pub trait LevelTree: Sync + Send {
     fn last_node_digest(&self, node: &NodeCellRef) -> Option<(usize, NodeCellRef, EntryKey)>;
 }
 
+// How many B+ tree levels a tree may fill before it is considered oversized
+// and migrates. A fixed depth of 2 (size^2 ~= 16K keys for a 128-fanout node)
+// split large datasets into tens of thousands of tiny trees, so migration
+// churn dominated. Depth 3 (~2M keys) is still a shallow, fast tree but needs
+// ~120x fewer migrations for a billion keys. Default is read once from
+// NEB_TREE_DEPTH (clamped to 2..=4); set_tree_depth overrides it (tests that
+// must trigger migration at small scale pin it to 2).
+static TREE_DEPTH: AtomicU32 = AtomicU32::new(0);
+
+fn resolve_tree_depth() -> u32 {
+    let cached = TREE_DEPTH.load(Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let d = std::env::var("NEB_TREE_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|d| d.clamp(2, 4))
+        .unwrap_or(3);
+    TREE_DEPTH.store(d, Relaxed);
+    d
+}
+
+/// Override the migration depth threshold (clamped 2..=4). Used by tests to
+/// force migration at a small key count, and available for runtime tuning.
+pub fn set_tree_depth(depth: u32) {
+    TREE_DEPTH.store(depth.clamp(2, 4), Relaxed);
+}
+
 pub fn ideal_capacity_from_node_size(size: usize) -> usize {
-    size.pow(2) // B+ tree has 2-level depth
+    size.pow(resolve_tree_depth())
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
