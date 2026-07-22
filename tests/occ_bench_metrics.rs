@@ -121,3 +121,17 @@ fn benchmark_port_plan_allocates_non_overlapping_clusters() {
         ]
     );
 }
+
+#[test]
+fn benchmark_ids_probe_budget_scales_and_floors() {
+    assert_eq!(fixture::ids_probe_budget(0), 10_000);
+    assert_eq!(fixture::ids_probe_budget(1), 10_000);
+    assert_eq!(fixture::ids_probe_budget(20), 20 * 1024);
+}
+
+#[test]
+#[should_panic(expected = "Port plan overflow")]
+fn benchmark_port_plan_panics_on_slot_overflow() {
+    let plan = fixture::PortPlan::new(u16::MAX - 5);
+    let _ = plan.single(1);
+}

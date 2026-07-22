@@ -13,6 +13,10 @@ use neb::{
 };
 use tokio::time::{sleep, Duration};
 
+const PORT_SLOT_STRIDE: u16 = 10;
+const PORT_CLUSTER_WIDTH: u16 = 3;
+const MIN_IDS_PROBE_BUDGET: usize = 10_000;
+
 #[derive(Clone, Copy, Debug)]
 pub struct PortPlan {
     pub base: u16,
@@ -28,13 +32,17 @@ impl PortPlan {
     }
 
     pub fn single(&self, slot: u16) -> String {
-        format!("127.0.0.1:{}", self.base + slot * 10)
+        format!("127.0.0.1:{}", checked_port_plan_port(self.base, slot, 0))
     }
 
     pub fn cluster(&self, slot: u16) -> Vec<String> {
-        let cluster_base = self.base + slot * 10;
-        (0..3)
-            .map(|offset| format!("127.0.0.1:{}", cluster_base + offset))
+        (0..PORT_CLUSTER_WIDTH)
+            .map(|offset| {
+                format!(
+                    "127.0.0.1:{}",
+                    checked_port_plan_port(self.base, slot, offset)
+                )
+            })
             .collect()
     }
 }
@@ -145,9 +153,29 @@ impl OccFixture {
     }
 
     pub fn ids_for_server(&self, server_id: u64, count: usize, start: u64) -> Vec<Id> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let available_server_ids: Vec<u64> =
+            self.servers.iter().map(|server| server.server_id).collect();
+        assert!(
+            available_server_ids.contains(&server_id),
+            "OCC fixture group={} does not contain server_id={} in active servers {:?}",
+            self.group,
+            server_id,
+            available_server_ids
+        );
+
+        let max_probes = ids_probe_budget(count);
         let mut ids = Vec::with_capacity(count);
-        let mut candidate = start;
-        while ids.len() < count {
+        for probe in 0..max_probes {
+            let candidate = start.checked_add(probe as u64).unwrap_or_else(|| {
+                panic!(
+                    "OCC fixture probe overflow for group={} server_id={} count={} start={} max_probes={}",
+                    self.group, server_id, count, start, max_probes
+                )
+            });
             let id = Id::new(candidate, candidate.rotate_left(17));
             if self
                 .client
@@ -157,9 +185,15 @@ impl OccFixture {
             {
                 ids.push(id);
             }
-            candidate += 1;
+            if ids.len() == count {
+                return ids;
+            }
         }
-        ids
+
+        panic!(
+            "OCC fixture exhausted id probes for group={} server_id={} count={} start={} max_probes={}",
+            self.group, server_id, count, start, max_probes
+        );
     }
 
     pub async fn shutdown(self) {
@@ -167,6 +201,10 @@ impl OccFixture {
             server.shutdown().await;
         }
     }
+}
+
+pub(crate) fn ids_probe_budget(count: usize) -> usize {
+    count.saturating_mul(1024).max(MIN_IDS_PROBE_BUDGET)
 }
 
 pub fn counter_cell(schema: u32, id: Id, score: u64, payload_bytes: usize) -> OwnedCell {
@@ -181,6 +219,18 @@ pub fn counter_cell(schema: u32, id: Id, score: u64, payload_bytes: usize) -> Ow
         OwnedValue::String("x".repeat(payload_bytes.max(1))),
     );
     OwnedCell::new_with_id(schema, &id, OwnedValue::Map(data))
+}
+
+fn checked_port_plan_port(base: u16, slot: u16, offset: u16) -> u16 {
+    slot.checked_mul(PORT_SLOT_STRIDE)
+        .and_then(|slot_offset| base.checked_add(slot_offset))
+        .and_then(|slot_base| slot_base.checked_add(offset))
+        .unwrap_or_else(|| {
+            panic!(
+                "Port plan overflow for base={} slot={} offset={}",
+                base, slot, offset
+            )
+        })
 }
 
 fn benchmark_server_options() -> ServerOptions {
