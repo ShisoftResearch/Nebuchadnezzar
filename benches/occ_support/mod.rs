@@ -1,6 +1,6 @@
 pub mod fixture;
 pub mod metrics;
-pub mod workloads {}
+pub mod workloads;
 
 pub const DEFAULT_BASE_PORT: u16 = 39_400;
 
