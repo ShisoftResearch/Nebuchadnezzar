@@ -58,7 +58,10 @@ async fn start_occ_test_cluster(addresses: &[&str], group: &str) -> Vec<Arc<NebS
         enable_recovery: false,
         disable_storage_locks: true,
     };
-    let meta_servers = addresses.iter().map(|address| address.to_string()).collect();
+    let meta_servers = addresses
+        .iter()
+        .map(|address| address.to_string())
+        .collect();
     let mut servers = Vec::with_capacity(addresses.len());
     for address in addresses {
         servers.push(
@@ -173,6 +176,25 @@ async fn abort_txn(txn: &Arc<transactions::manager::AsyncServiceClient>, tid: tr
     let _ = txn.abort(tid).await;
 }
 
+async fn wait_for_transaction_count(
+    manager: &Arc<transactions::manager::TransactionManager>,
+    expected: usize,
+    timeout_duration: Duration,
+) {
+    let started = tokio::time::Instant::now();
+    loop {
+        let current = manager.transaction_count();
+        if current == expected {
+            return;
+        }
+        assert!(
+            started.elapsed() < timeout_duration,
+            "timed out waiting for transaction count {expected}, current {current}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     let _ = env_logger::try_init();
@@ -180,7 +202,8 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     let group = "txn_occ_prepare_settle_cleanup";
     let servers = start_occ_test_cluster(&addresses, group).await;
     let schema = install_occ_schema_on_servers(&servers);
-    let ((slow_id, slow_server_id), (fail_id, fail_server_id)) = ids_on_distinct_servers(&servers[0]);
+    let ((slow_id, slow_server_id), (fail_id, fail_server_id)) =
+        ids_on_distinct_servers(&servers[0]);
     let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
         .iter()
         .map(|server| (server.server_id, server.clone()))
@@ -228,18 +251,16 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
         .unwrap();
     assert!(external_header.version > fail_first.header.version);
 
-    let slow_prepare = transactions::data_site::install_prepare_delay_for_cell(slow_id);
+    let slow_prepare =
+        transactions::data_site::install_prepare_delay_for_cell(tid.clone(), slow_id);
+    let fast_failure = transactions::manager::install_prepare_result_observer(tid.clone(), fail_id);
     let prepare_client = txn.clone();
     let prepare_tid = tid.clone();
-    let mut prepare_task = tokio::spawn(async move {
-        prepare_client
-            .prepare(prepare_tid)
-            .await
-            .unwrap()
-            .unwrap()
-    });
+    let mut prepare_task =
+        tokio::spawn(async move { prepare_client.prepare(prepare_tid).await.unwrap().unwrap() });
 
     slow_prepare.wait_until_entered().await;
+    fast_failure.wait_until_observed().await;
     let early_prepare = timeout(Duration::from_millis(250), &mut prepare_task).await;
     slow_prepare.release();
 
@@ -254,7 +275,14 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
         prepare_result,
         TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
     );
-    assert_eq!(servers[0].current_database().txn_manager().unwrap().transaction_count(), 0);
+    assert_eq!(
+        servers[0]
+            .current_database()
+            .txn_manager()
+            .unwrap()
+            .transaction_count(),
+        0
+    );
 
     let retry_tid = txn.begin().await.unwrap().unwrap();
     let retry_first = accepted_cell(txn.read(retry_tid.clone(), slow_id).await.unwrap().unwrap());
@@ -296,7 +324,159 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     assert_eq!(persisted_fail.data, external_fail.data);
 
     for server in &servers {
-        assert_eq!(server.current_database().txn_manager().unwrap().transaction_count(), 0);
+        assert_eq!(
+            server
+                .current_database()
+                .txn_manager()
+                .unwrap()
+                .transaction_count(),
+            0
+        );
+    }
+
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_background() {
+    let _ = env_logger::try_init();
+    let addresses = ["127.0.0.1:5362", "127.0.0.1:5363"];
+    let group = "txn_occ_prepare_cancellation_cleanup";
+    let servers = start_occ_test_cluster(&addresses, group).await;
+    let schema = install_occ_schema_on_servers(&servers);
+    let ((slow_id, slow_server_id), (fail_id, fail_server_id)) =
+        ids_on_distinct_servers(&servers[0]);
+    let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
+        .iter()
+        .map(|server| (server.server_id, server.clone()))
+        .collect();
+    let slow_server = servers_by_id
+        .get(&slow_server_id)
+        .expect("slow cell owner should exist");
+    let fail_server = servers_by_id
+        .get(&fail_server_id)
+        .expect("fast-failure cell owner should exist");
+
+    let mut slow_seed = counter_cell(schema.id, slow_id, 1, "counter_cancel_slow_seed");
+    slow_server
+        .current_database()
+        .chunks()
+        .write_cell(&mut slow_seed)
+        .unwrap();
+
+    let mut fail_seed = counter_cell(schema.id, fail_id, 2, "counter_cancel_fail_seed");
+    fail_server
+        .current_database()
+        .chunks()
+        .write_cell(&mut fail_seed)
+        .unwrap();
+
+    let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
+    let manager = servers[0].current_database().txn_manager().unwrap().clone();
+    let tid = txn.begin().await.unwrap().unwrap();
+    let slow_first = accepted_cell(txn.read(tid.clone(), slow_id).await.unwrap().unwrap());
+    let fail_first = accepted_cell(txn.read(tid.clone(), fail_id).await.unwrap().unwrap());
+
+    assert_eq!(score_of(&slow_first), 1);
+    assert_eq!(score_of(&fail_first), 2);
+
+    let fail_update = counter_cell(schema.id, fail_id, 9, "counter_cancel_fail_txn");
+    assert_eq!(
+        txn.update(tid.clone(), fail_update).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    let mut external_fail = counter_cell(schema.id, fail_id, 12, "counter_cancel_fail_external");
+    let external_header = fail_server
+        .current_database()
+        .chunks()
+        .update_cell(&mut external_fail)
+        .unwrap();
+    assert!(external_header.version > fail_first.header.version);
+
+    let slow_prepare =
+        transactions::data_site::install_prepare_delay_for_cell(tid.clone(), slow_id);
+    let fast_failure = transactions::manager::install_prepare_result_observer(tid.clone(), fail_id);
+    let prepare_tid = tid.clone();
+    let manager_for_prepare = manager.clone();
+    let mut caller_prepare = tokio::spawn(async move {
+        <transactions::manager::TransactionManager as transactions::manager::Service>::prepare(
+            manager_for_prepare.as_ref(),
+            prepare_tid,
+        )
+        .await
+    });
+
+    slow_prepare.wait_until_entered().await;
+    fast_failure.wait_until_observed().await;
+    let still_waiting = timeout(Duration::from_millis(250), &mut caller_prepare).await;
+    assert!(
+        still_waiting.is_err(),
+        "prepare returned before the delayed participant was released: {:?}",
+        still_waiting
+    );
+
+    caller_prepare.abort();
+    let caller_join = caller_prepare.await;
+    assert!(
+        matches!(&caller_join, Err(error) if error.is_cancelled()),
+        "caller-side prepare task should be cancelled, got {:?}",
+        caller_join
+    );
+
+    slow_prepare.release();
+    wait_for_transaction_count(&manager, 0, Duration::from_secs(2)).await;
+
+    let retry_tid = txn.begin().await.unwrap().unwrap();
+    let retry_first = accepted_cell(txn.read(retry_tid.clone(), slow_id).await.unwrap().unwrap());
+    assert_eq!(score_of(&retry_first), 1);
+
+    let retry_update = counter_cell(schema.id, slow_id, 15, "counter_cancel_slow_retry");
+    assert_eq!(
+        txn.update(retry_tid.clone(), retry_update.clone())
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(retry_tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert!(
+        matches!(
+            txn.commit(retry_tid.clone()).await.unwrap().unwrap(),
+            EndResult::Success | EndResult::SomeLocksNotReleased { .. }
+        ),
+        "retry transaction should commit after background cleanup"
+    );
+
+    let persisted_slow = slow_server
+        .current_database()
+        .chunks()
+        .read_cell(&slow_id)
+        .unwrap()
+        .to_owned();
+    let persisted_fail = fail_server
+        .current_database()
+        .chunks()
+        .read_cell(&fail_id)
+        .unwrap()
+        .to_owned();
+    assert_eq!(persisted_slow.data, retry_update.data);
+    assert_eq!(persisted_fail.data, external_fail.data);
+
+    for server in &servers {
+        assert_eq!(
+            server
+                .current_database()
+                .txn_manager()
+                .unwrap()
+                .transaction_count(),
+            0
+        );
     }
 
     for server in servers {

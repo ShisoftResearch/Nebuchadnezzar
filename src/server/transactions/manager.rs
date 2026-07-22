@@ -19,7 +19,12 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::Weak;
 use std::time::Duration;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
@@ -33,6 +38,69 @@ pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
         "TXN_MANAGER_RPC_SERVICE-{}-{}",
         group, database_name
     ))
+}
+
+#[cfg(test)]
+struct PrepareResultObserverState {
+    observed: AtomicBool,
+    notify: Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct PrepareResultObserverHandle {
+    key: (TxnId, Id),
+    state: Arc<PrepareResultObserverState>,
+}
+
+#[cfg(test)]
+impl PrepareResultObserverHandle {
+    pub(crate) async fn wait_until_observed(&self) {
+        let notified = self.state.notify.notified();
+        if self.state.observed.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+#[cfg(test)]
+impl Drop for PrepareResultObserverHandle {
+    fn drop(&mut self) {
+        let mut observers = prepare_result_observers().lock();
+        let owns_registration = observers
+            .get(&self.key)
+            .map(|state| Arc::ptr_eq(state, &self.state))
+            .unwrap_or(false);
+        if owns_registration {
+            observers.remove(&self.key);
+        }
+        self.state.observed.store(true, Ordering::SeqCst);
+        self.state.notify.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+static PREPARE_RESULT_OBSERVERS: OnceLock<
+    parking_lot::Mutex<BTreeMap<(TxnId, Id), Arc<PrepareResultObserverState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn prepare_result_observers(
+) -> &'static parking_lot::Mutex<BTreeMap<(TxnId, Id), Arc<PrepareResultObserverState>>> {
+    PREPARE_RESULT_OBSERVERS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_prepare_result_observer(tid: TxnId, id: Id) -> PrepareResultObserverHandle {
+    let key = (tid, id);
+    let state = Arc::new(PrepareResultObserverState {
+        observed: AtomicBool::new(false),
+        notify: Notify::new(),
+    });
+    prepare_result_observers()
+        .lock()
+        .insert(key.clone(), state.clone());
+    PrepareResultObserverHandle { key, state }
 }
 
 /// Dependencies needed by TransactionManager, extracted from NebServer to break cyclic dependency
@@ -114,6 +182,7 @@ dispatch_rpc_service_functions!(TransactionManager);
 service_with_id!(TransactionManager, DEFAULT_SERVICE_ID);
 
 pub struct TransactionManager {
+    self_ref: Weak<TransactionManager>,
     deps: Arc<TransactionManagerDeps>,
     transactions: LFMap<TxnId, TxnMutex>,
     txn_ids: parking_lot::Mutex<BTreeSet<TxnId>>, // Track TxnIds for iteration (PtrHashMap doesn't support iteration)
@@ -139,7 +208,8 @@ impl TransactionManager {
         wait_config: WaitConfig,
     ) -> Arc<TransactionManager> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let manager = Arc::new(Self {
+        let manager = Arc::new_cyclic(|self_ref| Self {
+            self_ref: self_ref.clone(),
             deps,
             transactions: LFMap::with_capacity(128),
             txn_ids: parking_lot::Mutex::new(BTreeSet::new()),
@@ -185,6 +255,31 @@ impl TransactionManager {
         debug!("Backing off for {}ms (attempt {})", backoff_ms, attempt);
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         Ok(())
+    }
+
+    fn spawn_prepare_lifecycle(
+        &self,
+        tid: TxnId,
+    ) -> Result<tokio::task::JoinHandle<Result<TMPrepareResult, TMError>>, TMError> {
+        let manager = self.self_ref.upgrade().ok_or(TMError::Other)?;
+        Ok(tokio::spawn(async move {
+            manager.run_prepare_lifecycle(tid).await
+        }))
+    }
+
+    #[cfg(test)]
+    fn notify_prepare_results_observed(tid: &TxnId, objects: &BTreeMap<Id, DataObject>) {
+        let states: Vec<_> = {
+            let mut observers = prepare_result_observers().lock();
+            objects
+                .keys()
+                .filter_map(|id| observers.remove(&(tid.clone(), *id)))
+                .collect()
+        };
+        for state in states {
+            state.observed.store(true, Ordering::SeqCst);
+            state.notify.notify_waiters();
+        }
     }
 }
 
@@ -255,22 +350,18 @@ impl Service for TransactionManager {
 
     fn prepare(&self, tid: TxnId) -> BoxFuture<'_, Result<TMPrepareResult, TMError>> {
         async move {
-            // Note: Automatic retry with fresh timestamps removed because it changes
-            // the transaction ID mid-flight, breaking the client's reference.
-            // For remaining NotRealizable errors, clients should retry with a new transaction.
-            let result = self.do_prepare(&tid).await;
-            // If prepare failed, abort the transaction to release locks and clean up
-            match &result {
-                Ok(TMPrepareResult::Success) => {
-                    // Transaction prepared successfully, will be cleaned up on commit/abort
-                }
-                Ok(_) | Err(_) => {
-                    // Prepare failed or error occurred, abort to release locks and clean up
-                    // This prevents memory leaks from abandoned transactions
-                    let _ = self.abort(tid.clone()).await;
+            let prepare_tid = tid.clone();
+            let prepare_task = self.spawn_prepare_lifecycle(tid)?;
+            match prepare_task.await {
+                Ok(result) => result,
+                Err(join_error) => {
+                    error!(
+                        "prepare lifecycle task failed for {:?}: {:?}",
+                        prepare_tid, join_error
+                    );
+                    Err(TMError::Other)
                 }
             }
-            result
         }
         .boxed()
     }
@@ -878,14 +969,17 @@ impl TransactionManager {
             .iter()
             .map(|(server, objs)| async move {
                 let data_site = data_sites.get(server).unwrap().clone();
-                TransactionManager::site_prepare(
+                let result = TransactionManager::site_prepare(
                     &self.deps,
                     &self.wait_config,
                     &tid,
                     &objs,
                     &data_site,
                 )
-                .await
+                .await;
+                #[cfg(test)]
+                Self::notify_prepare_results_observed(tid, objs);
+                result
             })
             .collect();
         let results: Vec<Result<DMPrepareResult, TMError>> = prepare_futures.collect().await;
@@ -1144,6 +1238,23 @@ impl TransactionManager {
         };
         Ok(conclusion)
     }
+
+    async fn run_prepare_lifecycle(
+        self: Arc<Self>,
+        tid: TxnId,
+    ) -> Result<TMPrepareResult, TMError> {
+        // Note: Automatic retry with fresh timestamps removed because it changes
+        // the transaction ID mid-flight, breaking the client's reference.
+        // For remaining NotRealizable errors, clients should retry with a new transaction.
+        let result = self.do_prepare(&tid).await;
+        match &result {
+            Ok(TMPrepareResult::Success) => {}
+            Ok(_) | Err(_) => {
+                let _ = self.abort(tid.clone()).await;
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -1274,6 +1385,20 @@ mod tests {
         assert_eq!(
             TransactionManager::reduce_prepare_results(results).unwrap(),
             DMPrepareResult::NotRealizable
+        );
+    }
+
+    #[test]
+    fn prepare_result_reduction_prefers_rpc_error_after_all_votes_settle() {
+        let results = vec![
+            Ok(DMPrepareResult::NotRealizable),
+            Err(TMError::RPCErrorFromCellServer),
+            Ok(DMPrepareResult::Success),
+        ];
+
+        assert_eq!(
+            TransactionManager::reduce_prepare_results(results),
+            Err(TMError::RPCErrorFromCellServer)
         );
     }
 

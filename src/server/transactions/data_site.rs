@@ -53,6 +53,7 @@ struct PrepareDelayState {
 
 #[cfg(test)]
 pub(crate) struct PrepareDelayHandle {
+    key: (TxnId, Id),
     state: Arc<PrepareDelayState>,
 }
 
@@ -60,11 +61,7 @@ pub(crate) struct PrepareDelayHandle {
 impl PrepareDelayHandle {
     pub(crate) async fn wait_until_entered(&self) {
         let notified = self.state.entered_notify.notified();
-        if self
-            .state
-            .entered
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.state.entered.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         notified.await;
@@ -82,24 +79,42 @@ impl PrepareDelayHandle {
 }
 
 #[cfg(test)]
-static PREPARE_DELAY_HOOKS: OnceLock<Mutex<BTreeMap<Id, Arc<PrepareDelayState>>>> =
+impl Drop for PrepareDelayHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = prepare_delay_hooks().lock();
+        let owns_registration = hooks
+            .get(&self.key)
+            .map(|state| Arc::ptr_eq(state, &self.state))
+            .unwrap_or(false);
+        if owns_registration {
+            hooks.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+static PREPARE_DELAY_HOOKS: OnceLock<Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDelayState>>>> =
     OnceLock::new();
 
 #[cfg(test)]
-fn prepare_delay_hooks() -> &'static Mutex<BTreeMap<Id, Arc<PrepareDelayState>>> {
+fn prepare_delay_hooks() -> &'static Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDelayState>>> {
     PREPARE_DELAY_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
-pub(crate) fn install_prepare_delay_for_cell(id: Id) -> PrepareDelayHandle {
+pub(crate) fn install_prepare_delay_for_cell(tid: TxnId, id: Id) -> PrepareDelayHandle {
+    let key = (tid, id);
     let state = Arc::new(PrepareDelayState {
         entered: AtomicBool::new(false),
         entered_notify: Notify::new(),
         released: AtomicBool::new(false),
         released_notify: Notify::new(),
     });
-    prepare_delay_hooks().lock().insert(id, state.clone());
-    PrepareDelayHandle { state }
+    prepare_delay_hooks()
+        .lock()
+        .insert(key.clone(), state.clone());
+    PrepareDelayHandle { key, state }
 }
 
 type CommitHistory = BTreeMap<Id, CellHistory>;
@@ -321,11 +336,16 @@ impl DataManager {
     }
 
     #[cfg(test)]
-    fn matching_prepare_delay(prepared_ops: &[PrepareOp]) -> Option<Arc<PrepareDelayState>> {
-        let hooks = prepare_delay_hooks().lock();
-        prepared_ops
+    fn take_matching_prepare_delay(
+        tid: &TxnId,
+        prepared_ops: &[PrepareOp],
+    ) -> Option<Arc<PrepareDelayState>> {
+        let mut hooks = prepare_delay_hooks().lock();
+        let delayed_key = prepared_ops
             .iter()
-            .find_map(|op| hooks.get(&op.id).cloned())
+            .map(|op| (tid.clone(), op.id))
+            .find(|key| hooks.contains_key(key))?;
+        hooks.remove(&delayed_key)
     }
 
     #[cfg(test)]
@@ -335,21 +355,10 @@ impl DataManager {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         state.entered_notify.notify_waiters();
         let notified = state.released_notify.notified();
-        if state
-            .released
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if state.released.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
         notified.await;
-    }
-
-    #[cfg(test)]
-    fn clear_prepare_delay(prepared_ops: &[PrepareOp]) {
-        let mut hooks = prepare_delay_hooks().lock();
-        for op in prepared_ops {
-            hooks.remove(&op.id);
-        }
     }
 
     fn canonical_prepare_ops(ops: Vec<PrepareOp>) -> Result<Vec<PrepareOp>, DMPrepareResult> {
@@ -1190,6 +1199,22 @@ mod tests {
         assert_ne!(
             generate_scoped_service_id(group, "db_a"),
             generate_scoped_service_id(group, "db_b")
+        );
+    }
+
+    #[test]
+    fn dropped_prepare_delay_handle_removes_its_registration() {
+        let id = Id::new(0, 99012);
+        let tid = StandardVectorClock::from_vec(vec![(31, 12)]);
+        let key = (tid.clone(), id);
+        {
+            let _handle = install_prepare_delay_for_cell(tid, id);
+            assert!(prepare_delay_hooks().lock().contains_key(&key));
+        }
+
+        assert!(
+            !prepare_delay_hooks().lock().contains_key(&key),
+            "dropping the handle should remove its global registration"
         );
     }
 
@@ -3237,7 +3262,7 @@ impl Service for DataManager {
                 Err(result) => return self.response_with(result).await,
             };
             #[cfg(test)]
-            if let Some(state) = Self::matching_prepare_delay(&prepared_ops) {
+            if let Some(state) = Self::take_matching_prepare_delay(&tid, &prepared_ops) {
                 Self::await_prepare_delay(&state).await;
             }
 
@@ -3327,9 +3352,6 @@ impl Service for DataManager {
                 debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
                 DMPrepareResult::Success
             };
-
-            #[cfg(test)]
-            Self::clear_prepare_delay(&prepared_ops);
 
             self.response_with(result).await
         }
