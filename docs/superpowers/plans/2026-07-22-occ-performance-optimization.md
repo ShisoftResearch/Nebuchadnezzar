@@ -2033,3 +2033,57 @@ git commit -m "docs: record OCC benchmark procedure"
 ```
 
 Do not create an empty commit when the README was already complete in Task 5.
+
+## Task 11: Borrow Wait-Die Owners Instead of Cloning Priorities
+
+**Files:**
+- Modify: `src/server/transactions/data_site.rs:3289-3390`
+
+- [ ] **Step 1: Add a failing test-only owner-clone observation**
+
+Add a `cfg(test)` atomic counter beside the existing participant test hooks. Increment
+it immediately before the full `TxnPriority` clone used to inspect `CellMeta::owner` in
+the prepare conflict path. Reset the counter before the conflicting second prepare in
+`prepare_retry_exact_payload_does_not_blindly_succeed_with_foreign_owner`, then assert
+that the conflict returns `NotRealizable`, leaves the foreign owner intact, and performs
+zero owner snapshot clones.
+
+- [ ] **Step 2: Run the focused test and verify RED**
+
+```bash
+cargo test --lib server::transactions::data_site::tests::prepare_retry_exact_payload_does_not_blindly_succeed_with_foreign_owner -- --exact
+```
+
+Expected: the existing wait-die and ownership assertions pass, but the new counter
+assertion fails with one owner snapshot clone.
+
+- [ ] **Step 3: Borrow the owner during the conflict decision**
+
+Change only the participant prepare conflict check from cloning `meta.owner` to borrowing
+it with `as_ref()`. Preserve the exact stale-lock reclamation, requester age comparison,
+`Wait`, `NotRealizable`, logging, and lock-publication behavior. Do not change owner
+representation, timestamps, certification, retry rules, or validation.
+
+- [ ] **Step 4: Verify correctness and the targeted performance gate**
+
+```bash
+cargo test --lib server::transactions::data_site::tests::prepare_retry_exact_payload_does_not_blindly_succeed_with_foreign_owner -- --exact
+cargo test --lib server::transactions::data_site::tests::concurrent_clock_wait_die_has_one_younger_requester -- --exact
+cargo test --lib server::transactions::occ_tests -- --test-threads=1
+```
+
+On `192.168.10.17`, run stable exact `occ/hot_rmw/8` and `occ/hot_rmw/32`
+measurements serially with `numactl --cpunodebind=0 --membind=0`. Use Criterion sample
+mean/derived throughput as canonical, require CV at most 5%, and use the custom JSON p95
+as the latest-batch diagnostic. Retain only if a stable target improves throughput or p95
+by at least 5%; if it passes, run the full portfolio and enforce the existing aggregate,
+secondary throughput, secondary p95, invariant, and unexpected-outcome policy. Otherwise
+revert the counter, test assertion, and production change and record the rejected
+hypothesis.
+
+- [ ] **Step 5: Commit only an accepted change**
+
+```bash
+git add src/server/transactions/data_site.rs
+git commit -m "perf(txn): borrow owners during wait-die checks"
+```
