@@ -85,6 +85,46 @@ pub struct LeafKeys {
     buf: AtomicPtr<SuffixBuf>,
 }
 
+// A snapshot of a key range in compressed form: the shared prefix is
+// pre-filled into a template key and only the suffix bytes are stored.
+// Reconstruction happens per yielded key instead of per snapshotted key.
+pub struct PackedKeys {
+    template: EntryKey,
+    prefix_len: usize,
+    width: usize,
+    suffixes: Vec<u8>,
+    len: usize,
+}
+
+impl PackedKeys {
+    pub fn empty() -> Self {
+        PackedKeys {
+            template: EntryKey::new(),
+            prefix_len: KEY_SIZE,
+            width: 0,
+            suffixes: Vec::new(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn key(&self, index: usize) -> EntryKey {
+        debug_assert!(index < self.len);
+        let mut key = self.template.clone();
+        if self.width > 0 {
+            key.as_mut_slice()[self.prefix_len..].copy_from_slice(
+                &self.suffixes[index * self.width..(index + 1) * self.width],
+            );
+        }
+        key
+    }
+}
+
 fn common_prefix_of(keys: &[EntryKey]) -> usize {
     if keys.is_empty() {
         return KEY_SIZE;
@@ -163,6 +203,24 @@ impl LeafKeys {
 
     pub fn cmp_at(&self, index: usize, key: &EntryKey) -> std::cmp::Ordering {
         self.load().cmp_at(index, key)
+    }
+
+    // Copy a range without reconstructing the keys: one memcpy of the
+    // suffix bytes. Used by cursor snapshots when no tombstone filtering is
+    // needed.
+    pub fn packed_snapshot(&self, range: std::ops::Range<usize>) -> PackedKeys {
+        let b = self.load();
+        let w = b.suffix_len();
+        let pl = b.prefix_len;
+        let mut template = EntryKey::new();
+        template.as_mut_slice()[..pl].copy_from_slice(&b.prefix[..pl]);
+        PackedKeys {
+            template,
+            prefix_len: pl,
+            width: w,
+            suffixes: b.data[range.start * w..range.end * w].to_vec(),
+            len: range.len(),
+        }
     }
 
     pub fn to_vec(&self, range: std::ops::Range<usize>) -> Vec<EntryKey> {

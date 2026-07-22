@@ -1,3 +1,4 @@
+use super::leaf_keys::PackedKeys;
 use super::*;
 
 // Runtime cursor for iteration.
@@ -23,7 +24,7 @@ where
     pub deletion: Arc<DeletionSet>,
     pub filter_deleted: bool,
     // Snapshot of the current page's keys, in key order.
-    keys: Vec<EntryKey>,
+    keys: SnapKeys,
     // Next page to visit in iteration direction (next for Forward, prev for
     // Backward). Default ref means the iteration ends after this snapshot.
     follow: NodeCellRef,
@@ -38,10 +39,42 @@ where
     current_deleted: bool,
 }
 
+// Page snapshot storage. Packed keeps the page's compressed form (one
+// suffix memcpy at snapshot time, per-key reconstruction only at yield);
+// Full materializes every key and is used when tombstone filtering must be
+// applied inside the validated read (see DeletionReclaim.tla — the filter
+// and the snapshot must be atomic with respect to reclamation).
+pub(super) enum SnapKeys {
+    Full(Vec<EntryKey>),
+    Packed(PackedKeys),
+}
+
+impl SnapKeys {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            SnapKeys::Full(v) => v.len(),
+            SnapKeys::Packed(p) => p.len(),
+        }
+    }
+
+    #[inline]
+    fn key(&self, index: usize) -> EntryKey {
+        match self {
+            SnapKeys::Full(v) => v[index].clone(),
+            SnapKeys::Packed(p) => p.key(index),
+        }
+    }
+
+    fn empty() -> Self {
+        SnapKeys::Full(Vec::new())
+    }
+}
+
 // Result of reading one page while walking the sibling chain.
 enum PageSnap {
     // Keys of an external page plus the ref to follow afterwards.
-    Page(Vec<EntryKey>, NodeCellRef),
+    Page(SnapKeys, NodeCellRef),
     // Node holds no data (empty page or tombstone); continue with this ref.
     Skip(NodeCellRef),
     // A speculative pointer clone failed (target condemned); re-read.
@@ -64,7 +97,7 @@ where
             current: None,
             deletion,
             filter_deleted,
-            keys: Vec::new(),
+            keys: SnapKeys::empty(),
             follow: NodeCellRef::default(),
             lazy: false,
             current_deleted: false,
@@ -92,7 +125,7 @@ where
             current: None,
             deletion,
             filter_deleted,
-            keys,
+            keys: SnapKeys::Full(keys),
             follow,
             lazy: false,
             current_deleted: false,
@@ -117,7 +150,7 @@ where
             current: Some(current),
             deletion,
             filter_deleted,
-            keys: Vec::new(),
+            keys: SnapKeys::empty(),
             follow: NodeCellRef::default(),
             lazy: true,
             current_deleted,
@@ -137,9 +170,9 @@ where
             return;
         }
         if self.index < self.keys.len() {
-            self.current = Some(self.keys[self.index].clone());
+            self.current = Some(self.keys.key(self.index));
         } else if self.load_following_page() {
-            self.current = Some(self.keys[self.index].clone());
+            self.current = Some(self.keys.key(self.index));
         } else {
             self.current = None;
             self.page = None;
@@ -172,13 +205,18 @@ where
                 // One emptiness check per page instead of one hash lookup
                 // per key when nothing is tombstoned (the common case).
                 let filtering = filter_deleted && deletion.len() > 0;
-                let keys: Vec<EntryKey> = n
-                    .keys
-                    .to_vec(0..n.len)
-                    .into_iter()
-                    .filter(|k| !filtering || !deletion.contains(k))
-                    .collect();
-                if keys.is_empty() {
+                let keys = if filtering {
+                    SnapKeys::Full(
+                        n.keys
+                            .to_vec(0..n.len)
+                            .into_iter()
+                            .filter(|k| !deletion.contains(k))
+                            .collect(),
+                    )
+                } else {
+                    SnapKeys::Packed(n.keys.packed_snapshot(0..n.len))
+                };
+                if keys.len() == 0 {
                     PageSnap::Skip(follow)
                 } else {
                     PageSnap::Page(keys, follow)
@@ -218,7 +256,7 @@ where
                     follow = next;
                 }
                 PageSnap::Page(keys, next_follow) => {
-                    debug_assert!(!keys.is_empty());
+                    debug_assert!(keys.len() > 0);
                     self.index = match self.ordering {
                         Ordering::Forward => 0,
                         Ordering::Backward => keys.len() - 1,
@@ -250,12 +288,18 @@ where
             let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::External(ref n) => {
                 let filtering = self.filter_deleted && self.deletion.len() > 0;
-                let snap = |range: std::ops::Range<usize>| -> Vec<EntryKey> {
-                    n.keys
-                        .to_vec(range)
-                        .into_iter()
-                        .filter(|k| !filtering || !self.deletion.contains(k))
-                        .collect()
+                let snap = |range: std::ops::Range<usize>| -> SnapKeys {
+                    if filtering {
+                        SnapKeys::Full(
+                            n.keys
+                                .to_vec(range)
+                                .into_iter()
+                                .filter(|k| !self.deletion.contains(k))
+                                .collect(),
+                        )
+                    } else {
+                        SnapKeys::Packed(n.keys.packed_snapshot(range))
+                    }
                 };
                 match self.ordering {
                     Ordering::Forward => {
@@ -320,12 +364,12 @@ where
                     Ordering::Forward => usize::MAX,
                     Ordering::Backward => 0,
                 };
-                self.keys = Vec::new();
+                self.keys = SnapKeys::empty();
                 self.follow = next;
             }
             PageSnap::End => {
                 self.index = 0;
-                self.keys = Vec::new();
+                self.keys = SnapKeys::empty();
                 self.follow = NodeCellRef::default();
             }
             // The retry loop above never breaks with Retry.
@@ -366,7 +410,7 @@ where
             }
             // Snapshots are filtered against the deletion set when they are
             // taken; no per-yield lookup is needed.
-            self.current = Some(self.keys[self.index].clone());
+            self.current = Some(self.keys.key(self.index));
             return;
         }
     }
