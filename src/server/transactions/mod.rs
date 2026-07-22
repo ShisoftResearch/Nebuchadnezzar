@@ -1,7 +1,7 @@
 use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
 use crate::server::Peer;
-use bifrost::rpc::{RPCError, ServiceClient, ServiceClientWithId, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::{RPCError, ServiceClient, DEFAULT_CLIENT_POOL};
 use bifrost::vector_clock::{Relation, StandardVectorClock};
 use std::cmp::Ordering;
 use std::io;
@@ -44,11 +44,6 @@ pub struct TxnPriority {
     pub coordinator_id: u64,
 }
 
-#[derive(Deserialize)]
-struct TxnIdWire {
-    map: Vec<(u64, u64)>,
-}
-
 impl TxnPriority {
     pub fn new(tid: TxnId, coordinator_id: u64) -> Self {
         Self {
@@ -58,7 +53,7 @@ impl TxnPriority {
     }
 
     pub fn compare_age(&self, other: &Self) -> Ordering {
-        match semantic_relation(&self.tid, &other.tid) {
+        match self.tid.relation(&other.tid) {
             Relation::Before => Ordering::Less,
             Relation::After => Ordering::Greater,
             Relation::Equal | Relation::Concurrent => self
@@ -70,84 +65,6 @@ impl TxnPriority {
                 }),
         }
     }
-}
-
-fn semantic_relation(left: &TxnId, right: &TxnId) -> Relation {
-    let left = normalized_clock_entries(left);
-    let right = normalized_clock_entries(right);
-    let mut left_before = false;
-    let mut right_before = false;
-    let mut left_idx = 0;
-    let mut right_idx = 0;
-
-    while left_idx < left.len() || right_idx < right.len() {
-        match (left.get(left_idx), right.get(right_idx)) {
-            (Some((left_key, left_value)), Some((right_key, right_value))) => {
-                if left_key == right_key {
-                    if left_value < right_value {
-                        left_before = true;
-                    } else if left_value > right_value {
-                        right_before = true;
-                    }
-                    left_idx += 1;
-                    right_idx += 1;
-                } else if left_key < right_key {
-                    if *left_value > 0 {
-                        right_before = true;
-                    }
-                    left_idx += 1;
-                } else {
-                    if *right_value > 0 {
-                        left_before = true;
-                    }
-                    right_idx += 1;
-                }
-            }
-            (Some((_, left_value)), None) => {
-                if *left_value > 0 {
-                    right_before = true;
-                }
-                left_idx += 1;
-            }
-            (None, Some((_, right_value))) => {
-                if *right_value > 0 {
-                    left_before = true;
-                }
-                right_idx += 1;
-            }
-            (None, None) => break,
-        }
-    }
-
-    match (left_before, right_before) {
-        (false, false) => Relation::Equal,
-        (true, false) => Relation::Before,
-        (false, true) => Relation::After,
-        (true, true) => Relation::Concurrent,
-    }
-}
-
-fn normalized_clock_entries(clock: &TxnId) -> Vec<(u64, u64)> {
-    let bytes = bifrost::utils::serde::serialize(clock);
-    let mut wire = bifrost::utils::serde::deserialize::<TxnIdWire>(&bytes)
-        .unwrap_or_else(|| panic!("failed to deserialize TxnId for semantic ordering"));
-    wire.map.sort_unstable_by_key(|(server_id, _)| *server_id);
-    let mut canonical: Vec<(u64, u64)> = Vec::with_capacity(wire.map.len());
-    for (server_id, counter) in wire.map {
-        if let Some((last_server_id, last_counter)) = canonical.last_mut() {
-            if *last_server_id == server_id {
-                *last_counter = (*last_counter).max(counter);
-                if *last_counter == 0 {
-                    canonical.pop();
-                }
-                continue;
-            }
-        }
-        if counter > 0 {
-            canonical.push((server_id, counter));
-        }
-    }
-    canonical
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
@@ -312,14 +229,19 @@ pub async fn new_async_client_for_database(
 
 #[cfg(test)]
 mod occ_type_tests {
-    use super::{semantic_relation, TxnId, TxnPriority};
+    use super::{TxnId, TxnPriority};
     use bifrost::utils::serde::serialize;
     use bifrost::vector_clock::{Relation, StandardVectorClock};
+    use serde_json::json;
     use std::cmp::Ordering;
     use std::panic::catch_unwind;
 
     fn clock(entries: &[(u64, u64)]) -> TxnId {
         StandardVectorClock::from_vec(entries.to_vec())
+    }
+
+    fn raw_clock(entries: &[(u64, u64)]) -> TxnId {
+        serde_json::from_value(json!({ "map": entries })).unwrap()
     }
 
     #[test]
@@ -383,11 +305,11 @@ mod occ_type_tests {
 
     #[test]
     fn txn_priority_tie_breaks_semantically_equal_unsorted_zero_clocks_by_tid_bytes() {
-        let left = TxnPriority::new(clock(&[(2, 0), (1, 1)]), 10);
-        let right = TxnPriority::new(clock(&[(1, 1), (3, 0)]), 10);
+        let left = TxnPriority::new(raw_clock(&[(2, 0), (1, 1)]), 10);
+        let right = TxnPriority::new(raw_clock(&[(1, 1), (3, 0)]), 10);
         let expected = serialize(&left.tid).cmp(&serialize(&right.tid));
 
-        assert_eq!(semantic_relation(&left.tid, &right.tid), Relation::Equal);
+        assert_eq!(left.tid.relation(&right.tid), Relation::Equal);
         assert_ne!(expected, Ordering::Equal);
         assert_eq!(left.compare_age(&right), expected);
         assert_eq!(right.compare_age(&left), expected.reverse());
