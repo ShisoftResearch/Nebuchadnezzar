@@ -140,6 +140,18 @@ The participant stores the certified expectations in its local transaction state
 
 Timestamp read/write metadata may remain for cleanup, scheduling, and compatibility, but it is not the authority for version correctness. Concurrent vector-clock timestamps must not cause a stale version to pass certification.
 
+### Total Wait-Die priority
+
+Wait-Die requires a total transaction priority, but transaction IDs are vector clocks and concurrent vector clocks have no natural order. Certification therefore derives a separate `TxnPriority` from the transaction ID and coordinator server ID:
+
+1. Causally ordered vector clocks retain their causal order.
+2. Concurrent vector clocks are ordered by coordinator server ID.
+3. Transaction IDs from the same coordinator are causally ordered; equality identifies the same transaction.
+
+The per-cell ownership record stores both transaction ID and coordinator server ID. Every participant uses the same comparator, so exactly one of two conflicting transactions is older. A younger requester aborts and an older requester may wait. Wait edges can only point from older to younger priorities and therefore cannot form a cycle, including across participants.
+
+This total priority is used only for contention scheduling. Cell-version expectations remain the correctness authority.
+
 ## Commit and Direct-Write Boundary
 
 Commit applies operations while certification ownership remains held.
@@ -164,6 +176,7 @@ This design does not compare transaction vector clocks to decide whether an obse
 - Expected-present cell missing: `DMPrepareResult::NotRealizable`.
 - Expected-absent cell present: `DMPrepareResult::NotRealizable`.
 - Certification owner conflict: existing Wait-Die `Wait` or `NotRealizable` behavior.
+- Concurrent-vector-clock owner conflict: causal order followed by coordinator-ID tie-breaking determines the Wait-Die result.
 - Storage changed after prepare through a non-participating path: `DMCommitResult::CellChanged` followed by abort/undo.
 - Missing target during blind update/remove discovery: existing `WriteError`.
 
