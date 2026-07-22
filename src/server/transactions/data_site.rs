@@ -240,6 +240,9 @@ impl DataManager {
                 return Err(DMPrepareResult::NotRealizable);
             }
         }
+        if by_id.is_empty() {
+            return Err(DMPrepareResult::NotRealizable);
+        }
         Ok(by_id.into_values().collect())
     }
 
@@ -315,12 +318,6 @@ impl DataManager {
             }
         }
         failures
-    }
-    #[inline]
-    fn update_cell_write(&self, cell_id: &Id, tid: &TxnId) {
-        let meta_ref = self.cell_meta_mutex(cell_id);
-        let mut meta = meta_ref.lock();
-        meta.write = tid.clone();
     }
     #[inline]
     fn wipe_out_transaction(&self, tid: &TxnId) {
@@ -576,21 +573,49 @@ impl DataManager {
             return result;
         }
 
+        let Some(coordinator_id) = txn.coordinator_id else {
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
+        };
+        let expected_owner = TxnPriority::new(tid.clone(), coordinator_id);
+        let guarded_cell_ids: Vec<Id> = txn
+            .affected_cells
+            .iter()
+            .copied()
+            .chain(txn.certified.keys().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut cell_mutexes = Vec::with_capacity(guarded_cell_ids.len());
+        for cell_id in &guarded_cell_ids {
+            cell_mutexes.push(self.cell_meta_mutex(cell_id));
+        }
+        let mut cell_guards = Vec::with_capacity(cell_mutexes.len());
+        for cell_mutex in &cell_mutexes {
+            cell_guards.push(cell_mutex.lock());
+        }
+        if cell_guards
+            .iter()
+            .any(|meta| meta.owner.as_ref() != Some(&expected_owner))
+        {
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
+        }
+
         crate::ram::chunk::set_transaction_context(true);
         let mut write_error: Option<(Id, WriteError)> = None;
         {
             for cell_op in cells {
                 match cell_op {
                     CommitOp::Read(_, _) | CommitOp::None => {
-                        return DMCommitResult::CheckFailed(CheckError::CannotEnd);
+                        unreachable!("validate_commit_subset rejects non-mutation commit ops")
                     }
                     CommitOp::Write(mut cell) => {
                         let cell_id = cell.id();
-                        let (should_skip, write_ts) = {
-                            let meta_ref = self.cell_meta_mutex(&cell_id);
-                            let meta = meta_ref.lock();
-                            (effective_ts < &meta.write, meta.write.clone())
-                        };
+                        let meta_index = guarded_cell_ids
+                            .binary_search(&cell_id)
+                            .expect("prepared cell metadata must exist");
+                        let meta = &mut cell_guards[meta_index];
+                        let should_skip = effective_ts < &meta.write;
+                        let write_ts = meta.write.clone();
 
                         if should_skip {
                             debug!(
@@ -617,7 +642,7 @@ impl DataManager {
                                 }
                                 txn.history
                                     .insert(cell_id, CellHistory::new(None, header.version));
-                                self.update_cell_write(&cell_id, effective_ts);
+                                meta.write = effective_ts.clone();
                             }
                             Err(error) => {
                                 write_error = Some((cell.id(), error));
@@ -626,6 +651,21 @@ impl DataManager {
                         };
                     }
                     CommitOp::Remove(ref cell_id) => {
+                        let meta_index = guarded_cell_ids
+                            .binary_search(cell_id)
+                            .expect("prepared cell metadata must exist");
+                        let meta = &mut cell_guards[meta_index];
+                        let should_skip = effective_ts < &meta.write;
+                        let write_ts = meta.write.clone();
+
+                        if should_skip {
+                            debug!(
+                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
+                                cell_id, effective_ts, write_ts
+                            );
+                            continue;
+                        }
+
                         let (cell_addr, orig_version, old_cell_ref) = {
                             let shared_cell = match self.chunks().read_cell(cell_id) {
                                 Ok(cell) => cell,
@@ -678,7 +718,7 @@ impl DataManager {
                             Ok(()) => {
                                 txn.history
                                     .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
-                                self.update_cell_write(cell_id, effective_ts);
+                                meta.write = effective_ts.clone();
                                 txn.segment_guards.push(guard);
                             }
                             Err(error) => {
@@ -689,6 +729,21 @@ impl DataManager {
                     }
                     CommitOp::Update(mut cell) => {
                         let cell_id = cell.id();
+                        let meta_index = guarded_cell_ids
+                            .binary_search(&cell_id)
+                            .expect("prepared cell metadata must exist");
+                        let meta = &mut cell_guards[meta_index];
+                        let should_skip = effective_ts < &meta.write;
+                        let write_ts = meta.write.clone();
+
+                        if should_skip {
+                            debug!(
+                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
+                                cell_id, effective_ts, write_ts
+                            );
+                            continue;
+                        }
+
                         let (cell_addr, orig_version) = {
                             match self.chunks().location_for_read(&cell_id).and_then(|loc| {
                                 let addr = *loc;
@@ -749,7 +804,7 @@ impl DataManager {
                                     cell_id,
                                     CellHistory::new(old_cell_ref, cell.header.version),
                                 );
-                                self.update_cell_write(&cell_id, effective_ts);
+                                meta.write = effective_ts.clone();
                                 txn.segment_guards.push(guard);
                             }
                             Err(error) => {
@@ -955,6 +1010,7 @@ mod tests {
     }
 
     fn prepare_local_txn(manager: &Arc<DataManager>, tid: &TxnId, affected_cells: Vec<Id>) {
+        let owner = TxnPriority::new(tid.clone(), 0);
         let txn_lock = manager.get_or_create_transaction(tid);
         let mut txn = txn_lock.lock();
         txn.state = TxnState::Prepared;
@@ -976,6 +1032,15 @@ mod tests {
         txn.coordinator_id = Some(0);
         txn.history.clear();
         txn.last_activity = get_time();
+        drop(txn);
+
+        let lock_time = get_time();
+        for id in affected_cells {
+            let meta = manager.cell_meta_mutex(&id);
+            let mut meta = meta.lock();
+            meta.owner = Some(owner.clone());
+            meta.lock_acquired_at = Some(lock_time);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1112,6 +1177,28 @@ mod tests {
         assert_eq!(result, DMPrepareResult::NotRealizable);
         let meta = manager.cell_meta_mutex(&cell_id);
         assert!(meta.lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_rejects_empty_prepare_ops_without_creating_transaction_state() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5345";
+        let group = "txn_data_site_prepare_empty_ops";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = StandardVectorClock::from_vec(vec![(19, 1)]);
+
+        assert!(manager.find_transaction(&tid).is_none());
+
+        let result =
+            <DataManager as Service>::prepare(&manager, 19, tid.clone(), tid.clone(), vec![])
+                .await
+                .payload;
+
+        assert_eq!(result, DMPrepareResult::NotRealizable);
+        assert!(manager.find_transaction(&tid).is_none());
+        assert_eq!(manager.cells.len(), 0);
         server.shutdown().await;
     }
 
@@ -1271,7 +1358,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_retry_accepts_exact_same_payload_and_reacquires_missing_owner() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5330";
+        let address = "127.0.0.1:5343";
         let group = "txn_data_site_prepare_retry_idempotent";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -1360,7 +1447,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_retry_exact_payload_does_not_blindly_succeed_with_foreign_owner() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5331";
+        let address = "127.0.0.1:5344";
         let group = "txn_data_site_prepare_retry_foreign_owner";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -1741,6 +1828,195 @@ mod tests {
 
         server.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_validation_rejects_missing_coordinator_without_mutating_storage() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5347";
+        let group = "txn_data_site_commit_missing_coordinator";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8204);
+        let initial_score = 13;
+        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let tid = manager.txn_peer.clock.inc();
+        let expected_owner = TxnPriority::new(tid.clone(), 0);
+
+        prepare_local_txn(&manager, &tid, vec![cell_id]);
+        {
+            let txn_lock = manager.txns.get(&tid).expect("txn should exist");
+            let mut txn = txn_lock.lock();
+            txn.coordinator_id = None;
+            txn.certified.insert(
+                cell_id,
+                PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_version),
+                    intent: PrepareIntent::Write,
+                },
+            );
+        }
+
+        let result = <DataManager as Service>::commit(
+            &manager,
+            tid.clone(),
+            tid.clone(),
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                99,
+                "counter_missing_coordinator_updated",
+            ))],
+        )
+        .await
+        .payload;
+
+        assert_eq!(result, DMCommitResult::CheckFailed(CheckError::CannotEnd));
+
+        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*persisted.data["score"].u64().unwrap(), initial_score);
+        assert_eq!(persisted.header.version, initial_version);
+
+        let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
+        let txn = txn_lock.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert!(txn.history.is_empty());
+        drop(txn);
+
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(expected_owner)
+        );
+
+        {
+            let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
+            let mut txn = txn_lock.lock();
+            txn.coordinator_id = Some(0);
+        }
+
+        let abort_result = <DataManager as Service>::abort(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(abort_result, AbortResult::Success(None));
+        let end_result = <DataManager as Service>::end(&manager, tid.clone(), tid.clone())
+            .await
+            .payload;
+        assert_eq!(end_result, EndResult::Success);
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_validation_rejects_stale_prepared_owner_before_storage_mutation() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5346";
+        let group = "txn_data_site_commit_stale_owner";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8205);
+        let initial_score = 21;
+        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let t1 = StandardVectorClock::from_vec(vec![(21, 1)]);
+        let t2 = StandardVectorClock::from_vec(vec![(22, 1)]);
+        let t1_owner = TxnPriority::new(t1.clone(), 21);
+        let t2_owner = TxnPriority::new(t2.clone(), 22);
+        let prepare_op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_version),
+            intent: PrepareIntent::Write,
+        };
+
+        let first = <DataManager as Service>::prepare(
+            &manager,
+            21,
+            t1.clone(),
+            t1.clone(),
+            vec![prepare_op.clone()],
+        )
+        .await
+        .payload;
+        assert_eq!(first, DMPrepareResult::Success);
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(t1_owner)
+        );
+
+        {
+            let meta = manager.cell_meta_mutex(&cell_id);
+            let mut meta = meta.lock();
+            meta.lock_acquired_at = Some(get_time() - LOCK_TIMEOUT_MS - 1);
+        }
+
+        let second = <DataManager as Service>::prepare(
+            &manager,
+            22,
+            t2.clone(),
+            t2.clone(),
+            vec![prepare_op],
+        )
+        .await
+        .payload;
+        assert_eq!(second, DMPrepareResult::Success);
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(t2_owner.clone())
+        );
+
+        let commit = <DataManager as Service>::commit(
+            &manager,
+            t1.clone(),
+            t1.clone(),
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                99,
+                "counter_stale_owner_commit",
+            ))],
+        )
+        .await
+        .payload;
+
+        assert_eq!(commit, DMCommitResult::CheckFailed(CheckError::CannotEnd));
+
+        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*persisted.data["score"].u64().unwrap(), initial_score);
+        assert_eq!(persisted.header.version, initial_version);
+
+        let t1_txn_lock = manager.txns.get(&t1).expect("t1 should remain tracked");
+        let t1_txn = t1_txn_lock.lock();
+        assert_eq!(t1_txn.state, TxnState::Prepared);
+        assert!(t1_txn.history.is_empty());
+        drop(t1_txn);
+
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(t2_owner.clone())
+        );
+
+        let abort_t2 = <DataManager as Service>::abort(&manager, t2.clone(), t2.clone())
+            .await
+            .payload;
+        assert_eq!(abort_t2, AbortResult::Success(None));
+        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone())
+            .await
+            .payload;
+        assert_eq!(end_t2, EndResult::Success);
+
+        let abort_t1 = <DataManager as Service>::abort(&manager, t1.clone(), t1.clone())
+            .await
+            .payload;
+        assert_eq!(abort_t1, AbortResult::Success(None));
+        let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
+            .await
+            .payload;
+        assert_eq!(end_t1, EndResult::Success);
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+        server.shutdown().await;
+    }
 }
 
 impl Service for DataManager {
@@ -1863,6 +2139,8 @@ impl Service for DataManager {
                         .unwrap_or(0);
 
                     if lock_age > LOCK_TIMEOUT_MS {
+                        // Lock expiry is treated as lease expiry; the old owner can no longer commit
+                        // once certification ownership is revalidated during commit.
                         warn!(
                             "PREPARE: Reclaiming stale lock on cell (held for {}ms by {:?}), now claimed by {:?}",
                             lock_age, owner, requester
