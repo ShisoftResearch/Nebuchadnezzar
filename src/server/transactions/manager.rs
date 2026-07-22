@@ -360,11 +360,11 @@ impl Service for TransactionManager {
                         Ok(TxnExecResult::Accepted(()))
                     } else {
                         let data_obj = txn.data.get_mut(&id).unwrap();
-                        if !data_obj.cell.is_none() {
+                        if data_obj.cell.is_some() {
                             return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
                         }
                         data_obj.cell = Some(cell);
-                        data_obj.new = true;
+                        data_obj.new = matches!(data_obj.expectation, CellExpectation::Absent);
                         data_obj.changed = true;
                         Ok(TxnExecResult::Accepted(()))
                     }
@@ -390,8 +390,13 @@ impl Service for TransactionManager {
                     // cell is already owned by the async block, no need to clone
                     if txn.data.contains_key(&id) {
                         let data_obj = txn.data.get_mut(&id).unwrap();
+                        if data_obj.cell.is_none()
+                            && matches!(data_obj.expectation, CellExpectation::Absent)
+                        {
+                            return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
+                        }
                         data_obj.cell = Some(cell);
-                        data_obj.changed = true
+                        data_obj.changed = true;
                     } else {
                         let expectation = CellExpectation::Present(cell.header.version);
                         txn.data.insert(
@@ -534,6 +539,10 @@ impl TransactionManager {
     }
 
     fn select_from_cell(&self, cell: &OwnedCell, fields: &[u64]) -> Result<OwnedCell, ReadError> {
+        if fields.is_empty() {
+            return Ok(cell.clone());
+        }
+
         let schema_id = cell.header.schema;
         let schema = self
             .deps
@@ -553,7 +562,7 @@ impl TransactionManager {
                 trace!("Get into map for txn select {:?}", path);
                 selected.push(map.get_in_by_ids(path.iter()).clone());
             } else {
-                selected.push(OwnedValue::Null);
+                selected.push(map.get_by_key_id(*field).clone());
             }
         }
 
@@ -819,25 +828,7 @@ impl TransactionManager {
                 let ops: Vec<CommitOp> = objs
                     .iter()
                     .map(|(cell_id, data_obj)| {
-                        if !data_obj.changed {
-                            match data_obj.expectation {
-                                CellExpectation::Present(version) => {
-                                    CommitOp::Read(*cell_id, version)
-                                }
-                                CellExpectation::Absent => CommitOp::None,
-                            }
-                        } else if data_obj.cell.is_none() && !data_obj.new {
-                            CommitOp::Remove(*cell_id)
-                        } else if let Some(ref cell) = data_obj.cell {
-                            // Avoid unnecessary conditional logic - just check new flag
-                            if data_obj.new {
-                                CommitOp::Write(cell.clone())
-                            } else {
-                                CommitOp::Update(cell.clone())
-                            }
-                        } else {
-                            CommitOp::None
-                        }
+                        Self::commit_op_for_changed_data_obj(*cell_id, data_obj)
                     })
                     .collect();
                 async move {
@@ -863,6 +854,20 @@ impl TransactionManager {
         }
         Ok(DMCommitResult::Success)
     }
+
+    fn commit_op_for_changed_data_obj(cell_id: Id, data_obj: &DataObject) -> CommitOp {
+        assert!(
+            data_obj.changed,
+            "unchanged observations should not be sent to commit"
+        );
+        match (&data_obj.cell, data_obj.new) {
+            (None, false) => CommitOp::Remove(cell_id),
+            (Some(cell), true) => CommitOp::Write(cell.clone()),
+            (Some(cell), false) => CommitOp::Update(cell.clone()),
+            (None, true) => panic!("invalid changed transaction state for {:?}", cell_id),
+        }
+    }
+
     async fn sites_abort(
         &self,
         tid: &TxnId,
@@ -1121,6 +1126,38 @@ mod tests {
         let mut cell =
             crate::ram::cell::OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data));
         runtime.chunks().write_cell(&mut cell).unwrap();
+    }
+
+    fn counter_cell(schema_id: u32, id: Id, score: u64) -> OwnedCell {
+        let mut data = OwnedMap::new();
+        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("score"), OwnedValue::U64(score));
+        data.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("cell-{score}")),
+        );
+        OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
+    }
+
+    #[test]
+    fn changed_existing_replacement_builds_update_commit_op() {
+        let id = Id::new(0, 7001);
+        let cell = counter_cell(1, id, 9);
+        let commit_op = TransactionManager::commit_op_for_changed_data_obj(
+            id,
+            &DataObject {
+                server: 1,
+                cell: Some(cell.clone()),
+                expectation: CellExpectation::Present(3),
+                changed: true,
+                new: false,
+            },
+        );
+
+        match commit_op {
+            CommitOp::Update(updated) => assert_eq!(updated.data, cell.data),
+            other => panic!("expected update commit op, got {:?}", other),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
