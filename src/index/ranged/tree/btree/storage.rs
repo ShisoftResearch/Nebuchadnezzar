@@ -1,19 +1,18 @@
 use super::external;
 use crate::client;
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+struct WriteBackRuntime {
+    _runtime: tokio::runtime::Runtime,
+}
+
+static WRITE_BACK_RUNTIME: OnceLock<WriteBackRuntime> = OnceLock::new();
+
 lazy_static! {
-    // Initialize to MAX to indicate "nothing processed yet"
-    // This prevents the race where counter=1, progress=0 looks like "operation 0 done"
     pub static ref CHANGE_PROGRESS: AtomicUsize = AtomicUsize::new(usize::MAX);
-    // Flag to indicate whether the write-back task is running
-    static ref WB_STARTED: AtomicBool = AtomicBool::new(false);
-    // Flag to signal the write-back task to stop
-    static ref WB_SHOULD_STOP: AtomicBool = AtomicBool::new(false);
-    // Track completed operations that finished ahead of earlier queue ids.
     static ref OUT_OF_ORDER_COMPLETIONS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
 }
 
@@ -50,83 +49,60 @@ fn record_completed_change(id: usize) {
     }
 }
 
-pub fn start_external_nodes_write_back(_client: &Arc<client::AsyncClient>) {
-    // Check if already started using atomic compare-exchange
-    if WB_STARTED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-        .is_err()
-    {
-        // Already started, nothing to do
-        return;
-    }
-
-    // Reset the stop flag
-    WB_SHOULD_STOP.store(false, Ordering::SeqCst);
-
-    for worker_id in 0..write_back_worker_count() {
-        tokio::spawn(async move {
-            debug!("B-tree write-back worker {} started", worker_id);
-            loop {
-                if WB_SHOULD_STOP.load(Ordering::SeqCst) {
-                    debug!("B-tree write-back worker {} stopping", worker_id);
-                    break;
-                }
-
-                match external::CHANGED_NODES.pop() {
-                    Some((id, changing)) => {
-                        match changing {
-                            external::ChangingNode::Modified(modified) => {
-                                modified
-                                    .node
-                                    .persist(&modified.deletion, &modified.client)
-                                    .await;
-                            }
-                            external::ChangingNode::DeletedWithClient(id, client) => {
-                                let _ = client.remove_cell(id).await.unwrap();
-                            }
+async fn run_write_back_worker(worker_id: usize) {
+    debug!("B-tree write-back worker {} started", worker_id);
+    loop {
+        match external::CHANGED_NODES.pop() {
+            Some((id, changing)) => {
+                match changing {
+                    external::ChangingNode::Modified(modified) => {
+                        modified
+                            .node
+                            .persist(&modified.deletion, &modified.client)
+                            .await;
+                    }
+                    external::ChangingNode::DeletedWithClient(id, client) => {
+                        if let Err(error) = client.remove_cell(id).await {
+                            warn!(
+                                "B-tree write-back could not delete external node {:?}: {:?}",
+                                id, error
+                            );
                         }
-                        record_completed_change(id);
                     }
-                    None => {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    #[cfg(test)]
+                    external::ChangingNode::Probe(sender) => {
+                        let _ = sender.send(());
                     }
                 }
+                record_completed_change(id);
             }
-            debug!("B-tree write-back worker {} stopped", worker_id);
-        });
+            None => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
     }
 }
 
-/// Reset write-back state for server restart
-/// This should be called during server shutdown after wait_until_updated()
-pub async fn reset_write_back_state() {
-    // Signal the task to stop
-    WB_SHOULD_STOP.store(true, Ordering::SeqCst);
+fn ensure_write_back_runtime() -> &'static WriteBackRuntime {
+    WRITE_BACK_RUNTIME.get_or_init(|| {
+        let worker_count = write_back_worker_count();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_count)
+            .thread_name("neb-btree-write-back")
+            .enable_all()
+            .build()
+            .expect("create ranged B-tree write-back runtime");
+        for worker_id in 0..worker_count {
+            runtime.spawn(run_write_back_worker(worker_id));
+        }
+        WriteBackRuntime { _runtime: runtime }
+    })
+}
 
-    // Wait briefly to allow workers to see the stop signal and exit.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // Reset the started flag so a new task can be started on restart
-    WB_STARTED.store(false, Ordering::SeqCst);
-
-    // Reset progress to initial state
-    CHANGE_PROGRESS.store(usize::MAX, Ordering::SeqCst);
-    OUT_OF_ORDER_COMPLETIONS
-        .lock()
-        .expect("write-back completion lock poisoned")
-        .clear();
-
-    // Reset the counter
-    external::CHANGE_COUNTER.store(0, Ordering::SeqCst);
-
-    // Drain any remaining items from the queue (they should already be processed)
-    while external::CHANGED_NODES.pop().is_some() {}
-
-    debug!("B-tree write-back state reset");
+pub fn start_external_nodes_write_back(_client: &Arc<client::AsyncClient>) {
+    let _ = ensure_write_back_runtime();
 }
 
 pub async fn wait_until_updated() {
-    if !WB_STARTED.load(Ordering::Acquire) {
+    if WRITE_BACK_RUNTIME.get().is_none() {
         return;
     }
     let counter = external::CHANGE_COUNTER.load(Ordering::Acquire);
@@ -159,4 +135,31 @@ pub async fn wait_until_updated() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     debug!("Write back updated, {} cells", ops_remaining);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn write_back_manager_outlives_the_runtime_that_initialized_it() {
+        let caller_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create caller runtime");
+        caller_runtime.block_on(async {
+            ensure_write_back_runtime();
+            tokio::task::yield_now().await;
+        });
+        drop(caller_runtime);
+
+        let (probe_sender, probe_receiver) = mpsc::channel();
+        let change_id = external::CHANGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        external::CHANGED_NODES.push((change_id, external::ChangingNode::Probe(probe_sender)));
+
+        probe_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("process write-back manager should survive caller runtime teardown");
+    }
 }

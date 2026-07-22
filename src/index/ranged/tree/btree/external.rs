@@ -19,6 +19,8 @@ pub const PREV_FIELD: &'static str = "prev";
 pub enum ChangingNode {
     DeletedWithClient(Id, Arc<AsyncClient>),
     Modified(NodeModified),
+    #[cfg(test)]
+    Probe(std::sync::mpsc::Sender<()>),
 }
 
 pub struct NodeModified {
