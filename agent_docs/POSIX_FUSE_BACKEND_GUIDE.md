@@ -16,7 +16,7 @@ Neb is a good substrate for this role because it already provides:
 - rich typed schemas
 - hash lookup for point operations
 - ranged indexes for ordered scans
-- transactional updates with read committed visibility
+- version-certified optimistic commits with repeatable cell reads
 - tiered memory with blob-first eviction behavior
 - explicit durability for transactional writes at commit time
 
@@ -311,12 +311,13 @@ If you want stronger guarantees such as cross-host visibility ordering or extern
 
 ## Read and Cache Semantics
 
-Neb provides read committed transactions, not full external linearizability.
+Neb provides repeatable cell reads and version-certified optimistic commits. It does not provide predicate/range phantom protection or full external linearizability.
 
 That means:
 
-- readers see committed data
-- the database preserves internal transactional consistency
+- transactions reread the same committed cell versions consistently
+- optimistic commit certification rejects stale cell updates
+- predicate or range scans still need higher-level handling if phantoms matter
 - the database does not, by itself, define all POSIX cache and coherence rules
 
 For a FUSE filesystem, the daemon must therefore own:
@@ -339,7 +340,7 @@ Multi-node FUSE is where you must be strict:
 
 - do not use Neb alone as the lock authority for POSIX byte-range locks
 - do not assume real-time ordering from timestamp transactions
-- do not build lease correctness on top of read committed semantics alone
+- do not build lease correctness on top of Neb transaction semantics alone
 
 If multiple clients mount the same namespace concurrently, use a separate lease or coordination layer for:
 

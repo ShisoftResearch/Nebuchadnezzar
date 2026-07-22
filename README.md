@@ -10,7 +10,7 @@ Distributed in-memory Key-Value store, optional transaction, made to power the [
 * Shared-nothing distributed architecture
 * Rich-typed schema (scalar, array, map, nested, length-variable data types)
 * Hash based low overhead primal key-value operations 
-* Timestamp transactions, read committed
+* Version-certified OCC transactions with repeatable cell reads
 * Non-blocking LSM-tree (B+ tree based) for range query
 
 Nebuchadnezzar (aka Neb) have already been converted from it's former [Clojure version](https://github.com/shisoft/Nebuchadnezzar/tree/clojure-version) and will stay with rust afterwards.  
