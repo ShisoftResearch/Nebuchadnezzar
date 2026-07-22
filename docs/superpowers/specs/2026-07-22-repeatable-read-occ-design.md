@@ -16,11 +16,11 @@ The repository still contains most of the original OCC data model:
 
 The working certification path was removed in stages:
 
-1. Commit `cb4e2f3b` added read-version validation.
-2. Commit `a0c04e3d` retained read locations while validating them.
-3. Commit `abbfe385` commented out that validation after a deadlock.
-4. Commit `583208e8` removed the commented implementation.
-5. Commit `fa894d2b` filtered unchanged reads out of `generate_affected_objs`, so read observations no longer reach participants.
+1. On 2017-05-27, commit `cb4e2f3b` added read-version validation.
+2. On 2017-05-27, commit `a0c04e3d` retained read locations while validating them.
+3. On 2017-05-28, commit `abbfe385` commented out that validation after a deadlock.
+4. On 2017-07-18, commit `583208e8` removed the commented implementation.
+5. On 2025-05-02, commit `fa894d2b` filtered unchanged reads out of `generate_affected_objs`, so read observations no longer reach participants.
 
 The current timestamp checks are not a substitute for version certification. Transaction IDs are vector clocks, and causally concurrent vector clocks have no `<` or `>` ordering. Two coordinators can therefore accept stale read-modify-write transactions and lose an update.
 
