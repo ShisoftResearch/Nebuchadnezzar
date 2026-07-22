@@ -81,7 +81,7 @@ This is the primary optimization score and should expose coordinator, prepare, c
 - Every rejected transaction retries the complete operation from a new transaction and fresh read.
 - Each sample ends after a fixed number of successful increments, not a fixed number of attempts.
 - Verify that the final counter delta equals the number of successful commits.
-- Report throughput, latency, `NotRealizable` count, Wait-Die waits, retries per success, and unexpected errors.
+- Report throughput, latency, `NotRealizable` count, complete-transaction retries per success, and unexpected errors. Internal Wait-Die `Wait` responses are not reported because the unchanged public coordinator API consumes them before returning.
 
 This prevents an implementation from appearing faster merely by rejecting more work.
 
