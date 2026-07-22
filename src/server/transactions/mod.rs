@@ -12,6 +12,8 @@ mod corruption_tests;
 pub mod data_site;
 pub mod manager;
 #[cfg(test)]
+mod occ_tests;
+#[cfg(test)]
 mod tests;
 pub mod undo_log;
 

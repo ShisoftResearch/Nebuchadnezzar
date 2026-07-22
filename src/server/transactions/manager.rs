@@ -82,7 +82,7 @@ impl Default for WaitConfig {
 struct DataObject {
     server: u64,
     cell: Option<OwnedCell>,
-    version: Option<u64>,
+    expectation: CellExpectation,
     changed: bool,
     new: bool,
 }
@@ -200,22 +200,7 @@ impl Service for TransactionManager {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            if let Some(data_obj) = txn.data.get(&id) {
-                match data_obj.cell {
-                    Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.clone())), // read from cache
-                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-                }
-            }
-            match self.get_data_site_by_id(&id).await {
-                Ok((server_id, server)) => {
-                    self.read_from_site(server_id, &server, &tid, &id, &mut txn)
-                        .await
-                }
-                Err(e) => {
-                    error!("{:?}", e);
-                    Err(TMError::CannotLocateCellServer)
-                }
-            }
+            self.read_cached_full_cell(&tid, &id, &mut txn).await
         }
         .boxed()
     }
@@ -227,24 +212,17 @@ impl Service for TransactionManager {
     ) -> BoxFuture<'_, Result<TxnExecResult<CellHeader, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
-            let txn = txn_mutex.lock().await;
+            let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            if let Some(data_obj) = txn.data.get(&id) {
-                match data_obj.cell {
-                    Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.header.clone())),
-                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-                }
-            }
-            match self.get_data_site_by_id(&id).await {
-                Ok((server_id, server)) => {
-                    self.head_from_site(server_id, &server, &tid, &id, &txn)
-                        .await
-                }
-                Err(e) => {
-                    error!("{:?}", e);
-                    Err(TMError::CannotLocateCellServer)
-                }
-            }
+            Ok(
+                match self.read_cached_full_cell(&tid, &id, &mut txn).await? {
+                    TxnExecResult::Accepted(cell) => TxnExecResult::Accepted(cell.header),
+                    TxnExecResult::Rejected => TxnExecResult::Rejected,
+                    TxnExecResult::Wait => TxnExecResult::Wait,
+                    TxnExecResult::Error(error) => TxnExecResult::Error(error),
+                    TxnExecResult::StateError(state) => TxnExecResult::StateError(state),
+                },
+            )
         }
         .boxed()
     }
@@ -256,54 +234,20 @@ impl Service for TransactionManager {
     ) -> BoxFuture<'_, Result<TxnExecResult<OwnedCell, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
-            let txn = txn_mutex.lock().await;
+            let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            if let Some(data_obj) = txn.data.get(&id) {
-                match data_obj.cell {
-                    Some(ref cell) => {
-                        let schema_id = cell.header.schema;
-                        if let Some(schema) = self.deps.schemas().get(&schema_id) {
-                            if let OwnedValue::Map(map) = &cell.data {
-                                let mut res = vec![];
-                                'SEARCH: for field in &fields {
-                                    if let Some(index_path) = schema.id_index.get(field) {
-                                        let path =
-                                            index_path.iter().map(|id| *id as u64).collect_vec();
-                                        trace!("Get into map for txn select {:?}", path);
-                                        let val = map.get_in_by_ids(path.iter()).clone();
-                                        res.push(val);
-                                        continue 'SEARCH;
-                                    }
-                                    res.push(OwnedValue::Null);
-                                }
-                                return Ok(TxnExecResult::Accepted(OwnedCell {
-                                    header: cell.header,
-                                    data: OwnedValue::Array(res),
-                                }));
-                            } else {
-                                return Ok(TxnExecResult::Error(
-                                    ReadError::CellTypeIsNotMapForSelect,
-                                ));
-                            }
-                        } else {
-                            return Ok(TxnExecResult::Error(ReadError::SchemaDoesNotExisted(
-                                schema_id,
-                            )));
-                        }
-                    } // read from cache
-                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-                }
-            }
-            match self.get_data_site_by_id(&id).await {
-                Ok((server_id, server)) => {
-                    self.read_selected_from_site(server_id, &server, &tid, &id, &fields, &txn)
-                        .await
-                }
-                Err(e) => {
-                    error!("{:?}", e);
-                    Err(TMError::CannotLocateCellServer)
-                }
-            }
+            Ok(
+                match self.read_cached_full_cell(&tid, &id, &mut txn).await? {
+                    TxnExecResult::Accepted(cell) => match self.select_from_cell(&cell, &fields) {
+                        Ok(selected) => TxnExecResult::Accepted(selected),
+                        Err(error) => TxnExecResult::Error(error),
+                    },
+                    TxnExecResult::Rejected => TxnExecResult::Rejected,
+                    TxnExecResult::Wait => TxnExecResult::Wait,
+                    TxnExecResult::Error(error) => TxnExecResult::Error(error),
+                    TxnExecResult::StateError(state) => TxnExecResult::StateError(state),
+                },
+            )
         }
         .boxed()
     }
@@ -408,8 +352,8 @@ impl Service for TransactionManager {
                             DataObject {
                                 server: server_id,
                                 cell: Some(cell),
+                                expectation: CellExpectation::Absent,
                                 new: true,
-                                version: None,
                                 changed: true,
                             },
                         );
@@ -420,6 +364,7 @@ impl Service for TransactionManager {
                             return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
                         }
                         data_obj.cell = Some(cell);
+                        data_obj.new = true;
                         data_obj.changed = true;
                         Ok(TxnExecResult::Accepted(()))
                     }
@@ -448,13 +393,14 @@ impl Service for TransactionManager {
                         data_obj.cell = Some(cell);
                         data_obj.changed = true
                     } else {
+                        let expectation = CellExpectation::Present(cell.header.version);
                         txn.data.insert(
                             id,
                             DataObject {
                                 server: server_id,
                                 cell: Some(cell),
+                                expectation,
                                 new: false,
-                                version: None,
                                 changed: true,
                             },
                         );
@@ -500,8 +446,8 @@ impl Service for TransactionManager {
                             DataObject {
                                 server: server_id,
                                 cell: None,
+                                expectation: CellExpectation::Absent,
                                 new: false,
-                                version: None,
                                 changed: true,
                             },
                         );
@@ -564,6 +510,59 @@ impl TransactionManager {
             _ => Err(TMError::TransactionNotFound),
         }
     }
+    async fn read_cached_full_cell<'a>(
+        &self,
+        tid: &TxnId,
+        id: &Id,
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        txn.last_activity = bifrost::utils::time::get_time();
+        if let Some(data_obj) = txn.data.get(id) {
+            return Ok(match &data_obj.cell {
+                Some(cell) => TxnExecResult::Accepted(cell.clone()),
+                None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
+            });
+        }
+
+        match self.get_data_site_by_id(id).await {
+            Ok((server_id, server)) => self.read_from_site(server_id, &server, tid, id, txn).await,
+            Err(error) => {
+                error!("{:?}", error);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
+    }
+
+    fn select_from_cell(&self, cell: &OwnedCell, fields: &[u64]) -> Result<OwnedCell, ReadError> {
+        let schema_id = cell.header.schema;
+        let schema = self
+            .deps
+            .schemas()
+            .get(&schema_id)
+            .ok_or(ReadError::SchemaDoesNotExisted(schema_id))?;
+
+        let map = match &cell.data {
+            OwnedValue::Map(map) => map,
+            _ => return Err(ReadError::CellTypeIsNotMapForSelect),
+        };
+
+        let mut selected = Vec::with_capacity(fields.len());
+        for field in fields {
+            if let Some(index_path) = schema.id_index.get(field) {
+                let path = index_path.iter().map(|id| *id as u64).collect_vec();
+                trace!("Get into map for txn select {:?}", path);
+                selected.push(map.get_in_by_ids(path.iter()).clone());
+            } else {
+                selected.push(OwnedValue::Null);
+            }
+        }
+
+        Ok(OwnedCell {
+            header: cell.header.clone(),
+            data: OwnedValue::Array(selected),
+        })
+    }
+
     async fn read_from_site<'a>(
         &self,
         server_id: u64,
@@ -610,7 +609,7 @@ impl TransactionManager {
                                 if data_obj.cell.is_none() {
                                     let version = cell.header.version;
                                     data_obj.cell = Some(cell);
-                                    data_obj.version = Some(version);
+                                    data_obj.expectation = CellExpectation::Present(version);
                                 }
                                 return Ok(TxnExecResult::Accepted(
                                     data_obj.cell.as_ref().unwrap().clone(),
@@ -623,7 +622,7 @@ impl TransactionManager {
                                     id.clone(),
                                     DataObject {
                                         server: server_id,
-                                        version: Some(version),
+                                        expectation: CellExpectation::Present(version),
                                         cell: Some(cell),
                                         new: false,
                                         changed: false,
@@ -631,6 +630,20 @@ impl TransactionManager {
                                 );
                                 return Ok(result);
                             }
+                        }
+                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                            let result = TxnExecResult::Error(ReadError::CellDoesNotExisted);
+                            txn.data.insert(
+                                id.clone(),
+                                DataObject {
+                                    server: server_id,
+                                    cell: None,
+                                    expectation: CellExpectation::Absent,
+                                    changed: false,
+                                    new: false,
+                                },
+                            );
+                            return Ok(result);
                         }
                         TxnExecResult::Wait => {
                             // Backoff and retry
@@ -649,13 +662,11 @@ impl TransactionManager {
         }
     }
 
-    async fn head_from_site<'a>(
+    async fn observe_head_from_site(
         &self,
-        _server_id: u64,
         server: &Arc<data_site::AsyncServiceClient>,
         tid: &TxnId,
         id: &Id,
-        _txn: &TxnGuard<'a>,
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
@@ -685,60 +696,6 @@ impl TransactionManager {
                         _ => {}
                     }
                     return Ok(dsr.payload);
-                }
-                Err(e) => {
-                    error!("{:?}", e);
-                    return Err(TMError::RPCErrorFromCellServer);
-                }
-            }
-        }
-    }
-    async fn read_selected_from_site<'a>(
-        &self,
-        _server_id: u64,
-        server: &Arc<data_site::AsyncServiceClient>,
-        tid: &TxnId,
-        id: &Id,
-        fields: &Vec<u64>,
-        _txn: &TxnGuard<'a>,
-    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
-        let start_time = std::time::Instant::now();
-        let mut attempt = 0u32;
-        let self_server_id = self.deps.server_id;
-
-        loop {
-            // Check timeout
-            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
-                warn!(
-                    "Read selected timeout for transaction {:?} on cell {:?}",
-                    tid, id
-                );
-                return Ok(TxnExecResult::Rejected);
-            }
-
-            let read_response = server
-                .read_selected(
-                    self_server_id,
-                    self.get_clock(),
-                    tid.to_owned(),
-                    id.clone(),
-                    fields.to_owned(),
-                )
-                .await;
-            match read_response {
-                Ok(dsr) => {
-                    self.merge_clock(&dsr.clock);
-                    let payload = dsr.payload;
-                    match payload {
-                        TxnExecResult::Wait => {
-                            // Backoff and retry
-                            Self::backoff_wait(attempt, &self.wait_config).await?;
-                            attempt += 1;
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    return Ok(payload);
                 }
                 Err(e) => {
                     error!("{:?}", e);
@@ -862,8 +819,13 @@ impl TransactionManager {
                 let ops: Vec<CommitOp> = objs
                     .iter()
                     .map(|(cell_id, data_obj)| {
-                        if data_obj.version.is_some() && !data_obj.changed {
-                            CommitOp::Read(*cell_id, data_obj.version.unwrap())
+                        if !data_obj.changed {
+                            match data_obj.expectation {
+                                CellExpectation::Present(version) => {
+                                    CommitOp::Read(*cell_id, version)
+                                }
+                                CellExpectation::Absent => CommitOp::None,
+                            }
                         } else if data_obj.cell.is_none() && !data_obj.new {
                             CommitOp::Remove(*cell_id)
                         } else if let Some(ref cell) = data_obj.cell {
