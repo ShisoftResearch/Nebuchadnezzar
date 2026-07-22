@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dovahkiin::types::Map as _;
+use dovahkiin::types::{Map as _, Value as _};
 use neb::{
     ram::{
         cell::{OwnedCell, ReadError},
@@ -19,7 +19,7 @@ use neb::{
     },
 };
 
-use super::fixture::OccFixture;
+use super::fixture::{counter_cell, OccFixture};
 use super::metrics::BatchMetrics;
 
 const MAX_ATTEMPTS_PER_LOGICAL_OPERATION: u64 = 10_000;
@@ -738,13 +738,74 @@ async fn blind_remove_once(fixture: &OccFixture, id: Id) -> AttemptOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectionObservation {
+    version: u64,
+    score: Option<u64>,
+}
+
+fn projected_observations_match(observations: &[ProjectionObservation]) -> bool {
+    let Some(first) = observations.first() else {
+        return false;
+    };
+
+    let mut expected_score = None;
+    for observation in observations {
+        if observation.version != first.version {
+            return false;
+        }
+        if let Some(score) = observation.score {
+            match expected_score {
+                Some(expected_score) if expected_score != score => return false,
+                Some(_) => {}
+                None => expected_score = Some(score),
+            }
+        }
+    }
+
+    true
+}
+
+fn selected_score(cell: &OwnedCell, id: Id) -> Result<u64, AttemptOutcome> {
+    let values = cell.data.uni_array();
+    values
+        .as_ref()
+        .and_then(|values| values.first())
+        .and_then(|value| value.u64())
+        .copied()
+        .ok_or_else(|| {
+            AttemptOutcome::Unexpected(format!(
+                "transactional selected read returned no u64 score for {:?}: {:?}",
+                id, cell.data
+            ))
+        })
+}
+
+fn full_score(cell: &OwnedCell, id: Id) -> Result<u64, AttemptOutcome> {
+    match &cell.data {
+        OwnedValue::Map(map) => map.get("score").u64().copied().ok_or_else(|| {
+            AttemptOutcome::Unexpected(format!(
+                "transactional full read returned no u64 score for {:?}: {:?}",
+                id, cell.data
+            ))
+        }),
+        other => Err(AttemptOutcome::Unexpected(format!(
+            "transactional full read returned non-map data for {:?}: {:?}",
+            id, other
+        ))),
+    }
+}
+
 async fn transactional_head_version(
     fixture: &OccFixture,
     tid: TxnId,
     id: Id,
-) -> Result<u64, AttemptOutcome> {
+) -> Result<ProjectionObservation, AttemptOutcome> {
     match fixture.txn.head(tid.clone(), id).await {
-        Ok(Ok(TxnExecResult::Accepted(header))) => Ok(header.version),
+        Ok(Ok(TxnExecResult::Accepted(header))) => Ok(ProjectionObservation {
+            version: header.version,
+            score: None,
+        }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
         Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::Unexpected(format!(
             "transactional head waited unexpectedly for {:?}",
@@ -773,13 +834,16 @@ async fn transactional_selected_version(
     fixture: &OccFixture,
     tid: TxnId,
     id: Id,
-) -> Result<u64, AttemptOutcome> {
+) -> Result<ProjectionObservation, AttemptOutcome> {
     match fixture
         .txn
         .read_selected(tid.clone(), id, vec![bifrost_hasher::hash_str("score")])
         .await
     {
-        Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(cell.header.version),
+        Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(ProjectionObservation {
+            version: cell.header.version,
+            score: Some(selected_score(&cell, id)?),
+        }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
         Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::Unexpected(format!(
             "transactional selected read waited unexpectedly for {:?}",
@@ -808,9 +872,12 @@ async fn transactional_full_version(
     fixture: &OccFixture,
     tid: TxnId,
     id: Id,
-) -> Result<u64, AttemptOutcome> {
+) -> Result<ProjectionObservation, AttemptOutcome> {
     match fixture.txn.read(tid.clone(), id).await {
-        Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(cell.header.version),
+        Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(ProjectionObservation {
+            version: cell.header.version,
+            score: Some(full_score(&cell, id)?),
+        }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
         Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::Unexpected(format!(
             "transactional full read waited unexpectedly for {:?}",
@@ -835,12 +902,12 @@ async fn transactional_full_version(
     }
 }
 
-async fn projected_versions(
+async fn projected_observations(
     fixture: &OccFixture,
     tid: TxnId,
     id: Id,
     mode: ProjectionMode,
-) -> Result<Vec<u64>, AttemptOutcome> {
+) -> Result<Vec<ProjectionObservation>, AttemptOutcome> {
     match mode {
         ProjectionMode::Head => Ok(vec![
             transactional_head_version(fixture, tid.clone(), id).await?,
@@ -864,8 +931,8 @@ async fn projected_read_once(fixture: &OccFixture, id: Id, mode: ProjectionMode)
         Err(outcome) => return outcome,
     };
 
-    let versions = match projected_versions(fixture, tid.clone(), id, mode).await {
-        Ok(versions) => versions,
+    let observations = match projected_observations(fixture, tid.clone(), id, mode).await {
+        Ok(observations) => observations,
         Err(AttemptOutcome::Retryable) => {
             return retry_after_abort(
                 fixture,
@@ -890,13 +957,13 @@ async fn projected_read_once(fixture: &OccFixture, id: Id, mode: ProjectionMode)
         }
     };
 
-    if !versions.iter().all(|version| *version == versions[0]) {
+    if !projected_observations_match(&observations) {
         return unexpected_after_abort(
             fixture,
             tid.clone(),
             format!(
-                "projected read observed mismatched versions for {:?} in {:?}: {:?}",
-                id, mode, versions
+                "projected read observed mismatched values for {:?} in {:?}: {:?}",
+                id, mode, observations
             ),
         )
         .await;
@@ -1019,35 +1086,78 @@ pub async fn run_blind_update_batch(
     let expected_delta = operations;
     let score_before = fixture.sum_scores(ids.as_ref()).await;
 
-    let mut batch = run_sequential_fixed_success(
-        fixture.clone(),
-        ids.clone(),
-        operations,
-        "blind update",
-        |fixture, logical_index, id| {
-            Box::pin(async move {
-                match fixture.client.read_cell(id).await {
-                    Ok(Ok(cell)) => Ok(cell),
-                    Ok(Err(err)) => Err(format!(
+    let mut metrics = BatchMetrics::default();
+    let mut elapsed = Duration::default();
+
+    'operations: for logical_index in 0..operations {
+        let id = cyclic_id(ids.as_ref(), logical_index);
+        let mut attempts = 0u64;
+        let mut retries = 0u64;
+        let mut logical_elapsed = Duration::default();
+
+        loop {
+            if attempts == MAX_ATTEMPTS_PER_LOGICAL_OPERATION {
+                elapsed += logical_elapsed;
+                metrics.attempts += attempts;
+                metrics.logical_retries += retries;
+                metrics.record_unexpected(format!(
+                    "blind update logical operation {} exceeded max attempts {}",
+                    logical_index, MAX_ATTEMPTS_PER_LOGICAL_OPERATION
+                ));
+                break 'operations;
+            }
+
+            let template = match fixture.client.read_cell(id).await {
+                Ok(Ok(cell)) => cell,
+                Ok(Err(err)) => {
+                    elapsed += logical_elapsed;
+                    metrics.attempts += attempts;
+                    metrics.logical_retries += retries;
+                    metrics.record_unexpected(format!(
                         "blind update setup read failed for logical operation {} on {:?}: {:?}",
                         logical_index, id, err
-                    )),
-                    Err(err) => Err(format!(
+                    ));
+                    break 'operations;
+                }
+                Err(err) => {
+                    elapsed += logical_elapsed;
+                    metrics.attempts += attempts;
+                    metrics.logical_retries += retries;
+                    metrics.record_unexpected(format!(
                         "blind update setup read RPC error for logical operation {} on {:?}: {:?}",
                         logical_index, id, err
-                    )),
+                    ));
+                    break 'operations;
                 }
-            })
-        },
-        |fixture, _logical_index, _id, template| {
-            Box::pin(async move {
-                let outcome = blind_update_once(&fixture, template.clone()).await;
-                (template, outcome)
-            })
-        },
-        |_fixture, _logical_index, _id, _template| Box::pin(async move { Ok(()) }),
-    )
-    .await;
+            };
+
+            let attempt_started = Instant::now();
+            let outcome = blind_update_once(&fixture, template).await;
+            logical_elapsed += attempt_started.elapsed();
+            attempts += 1;
+
+            match outcome {
+                AttemptOutcome::Committed => {
+                    elapsed += logical_elapsed;
+                    metrics.record_success(logical_elapsed, attempts, retries);
+                    break;
+                }
+                AttemptOutcome::Retryable => {
+                    retries += 1;
+                    metrics.record_retryable();
+                }
+                AttemptOutcome::Unexpected(message) => {
+                    elapsed += logical_elapsed;
+                    metrics.attempts += attempts;
+                    metrics.logical_retries += retries;
+                    metrics.record_unexpected(message);
+                    break 'operations;
+                }
+            }
+        }
+    }
+
+    let mut batch = finalize_sequential_fixed_success(metrics, elapsed, operations, "blind update");
 
     let score_after = fixture.sum_scores(ids.as_ref()).await;
     match score_after.checked_sub(score_before) {
@@ -1083,8 +1193,21 @@ pub async fn run_blind_remove_batch(
         "blind remove",
         |fixture, logical_index, id| {
             Box::pin(async move {
-                fixture.seed_counter(id, logical_index).await;
-                Ok(())
+                match fixture
+                    .client
+                    .write_cell(counter_cell(fixture.schema.id, id, logical_index, 0))
+                    .await
+                {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(err)) => Err(format!(
+                        "blind remove setup write failed for logical operation {} on {:?}: {:?}",
+                        logical_index, id, err
+                    )),
+                    Err(err) => Err(format!(
+                        "blind remove setup write RPC error for logical operation {} on {:?}: {:?}",
+                        logical_index, id, err
+                    )),
+                }
             })
         },
         |fixture, _logical_index, id, setup| {
@@ -1224,6 +1347,24 @@ mod tests {
 
         assert_eq!(map.fields.len(), initial_fields);
         assert_eq!(map.get("score").u64().copied(), Some(3));
+    }
+
+    #[test]
+    fn projected_observations_reject_score_mismatches() {
+        assert!(!projected_observations_match(&[
+            ProjectionObservation {
+                version: 7,
+                score: None,
+            },
+            ProjectionObservation {
+                version: 7,
+                score: Some(3),
+            },
+            ProjectionObservation {
+                version: 7,
+                score: Some(4),
+            },
+        ]));
     }
 
     #[test]
