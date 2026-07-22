@@ -44,44 +44,56 @@ where
                         ordering,
                         &n.keys.as_slice_immute()[..n.len]
                     );
-                    // Snapshot only the part of the page the cursor can still
-                    // visit in its direction; the rest is never read.
+                    // Capture only the key at the found position; the rest of
+                    // the page is snapshotted lazily on the first advance.
                     let all = &n.keys.as_slice_immute()[..n.len];
-                    let (keys, index, follow) = match ordering {
+                    let found = match ordering {
                         Ordering::Forward => {
                             if pos < n.len {
-                                (all[pos..].to_vec(), 0, n.next.clone())
+                                Some(pos)
                             } else {
-                                (Vec::new(), usize::MAX, n.next.clone())
+                                None
                             }
                         }
                         Ordering::Backward => {
                             // Position at the largest key <= the seek key; when
                             // no such key exists in this page, fall through to
-                            // the previous page (usize::MAX sentinel).
-                            let index = if pos < n.len && &all[pos] == key {
-                                pos
+                            // the previous page.
+                            if pos < n.len && &all[pos] == key {
+                                Some(pos)
                             } else if pos > 0 {
-                                pos - 1
+                                Some(pos - 1)
                             } else {
-                                usize::MAX
-                            };
-                            if index == usize::MAX {
-                                (Vec::new(), usize::MAX, n.prev.clone())
-                            } else {
-                                (all[..=index].to_vec(), index, n.prev.clone())
+                                None
                             }
                         }
                     };
-                    Ok(RTCursor::from_snapshot(
-                        keys,
-                        index,
-                        node_ref.clone(),
-                        follow,
-                        ordering,
-                        deletion.clone(),
-                        filter_deleted,
-                    ))
+                    Ok(match found {
+                        Some(idx) => RTCursor::from_lazy(
+                            all[idx].clone(),
+                            node_ref.clone(),
+                            ordering,
+                            deletion.clone(),
+                            filter_deleted,
+                        ),
+                        None => {
+                            // Off-page position: hand the follow ref to the
+                            // cursor and let initialize() move on.
+                            let follow = match ordering {
+                                Ordering::Forward => n.next.clone(),
+                                Ordering::Backward => n.prev.clone(),
+                            };
+                            RTCursor::from_snapshot(
+                                Vec::new(),
+                                usize::MAX,
+                                node_ref.clone(),
+                                follow,
+                                ordering,
+                                deletion.clone(),
+                                filter_deleted,
+                            )
+                        }
+                    })
                 }
                 &NodeData::Internal(ref n) => {
                     trace!(

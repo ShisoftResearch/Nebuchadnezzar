@@ -104,6 +104,38 @@ pervasively on hot paths. Fixed: the `impl_slice_ops!` macro now implements
 `as_slice_immute` directly (`&self -> &[T]`), and the UB default was removed
 from the trait.
 
+### F6 (high): write-back worker fleet dies with its runtime and never respawns
+Found while chasing a "deadlocked" `migration_stress_insert_only` run: the
+process was fully parked with `CHANGE_PROGRESS` frozen exactly at the value
+where the previous test ended. `start_external_nodes_write_back` spawned its
+workers once per process (`WB_STARTED` latch) onto whichever tokio runtime
+called it first; when that runtime is dropped (test teardown, in-process
+restart) the workers die silently while the latch stays set, so every later
+server instance runs with zero write-back workers and `wait_until_updated`
+polls forever.
+
+*Fixes* (`storage.rs`): live-worker accounting via RAII guards with
+respawn-on-zero; drop-safe completion recording (a popped change id is
+recorded even if persisting panics or the task is cancelled — one lost id
+used to stall the progress chain permanently); worker panics caught and
+logged; `remove_cell().unwrap()` replaced with logged errors;
+`wait_until_updated` bails out with a warning when no worker is alive.
+`ExtNode::to_cell` also no longer panics on `Empty` tombstone neighbors
+(that panic previously killed a worker task).
+
+**Process note — a deadlock introduced and caught during this audit.** The
+first version of the `to_cell` neighbor fix resolved the *left* neighbor
+with a waiting `read_node` while holding the node's own write latch. That
+leftward wait closes a cycle with the tree's global left-before-right latch
+order (splits and `write_targeted` hold a page while acquiring its right
+sibling) and deadlocked the very next stress run — 8 threads spinning in
+`write_node`, one persist worker holding a page while read-spinning on its
+left neighbor. The original code's `read_unchecked` on `prev` existed
+precisely to avoid this. The corrected version waits only rightward;
+`docs/tla/PersistLatch.tla` now models this protocol — TLC finds the
+deadlock with `WaitLeft = TRUE` and proves the fixed variant deadlock-free.
+Lesson applied: latch-order changes get a model before they get committed.
+
 ## Known remaining risks (documented, not fixed)
 
 - **Seqlock reads are formally data races.** `read_node` closures read node
@@ -148,6 +180,8 @@ v1.8.0, Java 21):
 | BLinkInsert | Buggy=FALSE, seeded stale | pass (139 states) |
 | BLinkInsert | Buggy=TRUE, seeded stale | `SingleParent` **violated** (= F2.1) |
 | BLinkInsert | Buggy=TRUE, organic | `HeightOK` **violated** (= F2.2) |
+| PersistLatch | WaitLeft=TRUE | **Deadlock reached** (the reverted to_cell variant) |
+| PersistLatch | WaitLeft=FALSE | pass, deadlock-free (6448 states) |
 
 Run: `java -cp tla2tools.jar tlc2.TLC -config <cfg> <spec>.tla`
 

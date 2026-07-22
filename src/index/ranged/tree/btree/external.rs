@@ -141,23 +141,56 @@ where
         }))
     }
 
+    // Resolve the id of the nearest live external neighbor, skipping Empty
+    // tombstones left behind by merges and migrations (calling extnode() on
+    // one of those panics, which used to kill write-back workers).
+    //
+    // The caller (persist/to_cell) holds this node's write latch. Waiting on
+    // a neighbor is only safe rightward — that matches the global latch order
+    // (splits and write_targeted hold a node while acquiring its right
+    // sibling). The backward walk must use an unvalidated read: a leftward
+    // wait here deadlocks against a rightward waiter holding the left
+    // neighbor.
+    fn live_neighbor_id(start: &NodeCellRef, forward: bool) -> Id {
+        let mut node_ref = start.clone();
+        loop {
+            if node_ref.is_default() {
+                return Id::unit_id();
+            }
+            let step = if forward {
+                read_node(&node_ref, |node: &NodeReadHandler<KS, PS>| {
+                    Self::neighbor_step(&**node, forward)
+                })
+            } else {
+                Self::neighbor_step(&*read_unchecked::<KS, PS>(&node_ref), forward)
+            };
+            match step {
+                Ok(id) => return id,
+                Err(next) => node_ref = next,
+            }
+        }
+    }
+
+    fn neighbor_step(node: &NodeData<KS, PS>, forward: bool) -> Result<Id, NodeCellRef> {
+        match node {
+            &NodeData::External(ref n) => Ok(n.id),
+            &NodeData::Empty(ref e) => Err(if forward {
+                e.right.clone()
+            } else {
+                e.left.clone().unwrap_or_default()
+            }),
+            &NodeData::None => Ok(Id::unit_id()),
+            &NodeData::Internal(_) => {
+                warn!("external sibling chain reached an internal node");
+                Ok(Id::unit_id())
+            }
+        }
+    }
+
     pub fn to_cell(&self, deleted: &DeletionSet) -> OwnedCell {
         let mut value = OwnedValue::Map(OwnedMap::new());
-        let prev_id = {
-            let node = read_unchecked::<KS, PS>(&self.prev);
-            if node.is_none() {
-                Id::unit_id()
-            } else {
-                node.extnode().id
-            }
-        };
-        let next_id = read_node(&self.next, |node: &NodeReadHandler<KS, PS>| {
-            if node.is_none() {
-                Id::unit_id()
-            } else {
-                node.extnode().id
-            }
-        });
+        let prev_id = Self::live_neighbor_id(&self.prev, false);
+        let next_id = Self::live_neighbor_id(&self.next, true);
 
         value[*NEXT_PAGE_KEY_HASH] = OwnedValue::Id(next_id);
         value[*PREV_PAGE_KEY_HASH] = OwnedValue::Id(prev_id);

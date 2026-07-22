@@ -27,6 +27,11 @@ where
     // Next page to visit in iteration direction (next for Forward, prev for
     // Backward). Default ref means the iteration ends after this snapshot.
     follow: NodeCellRef,
+    // When set, only `current` was captured at seek time; the rest of its
+    // page is snapshotted on the first advance (point seeks never pay for a
+    // tail copy). Position is re-derived from `current` by binary search, so
+    // the deferred read stays correct if the page split in between.
+    lazy: bool,
 }
 
 // Result of reading one page while walking the sibling chain.
@@ -55,6 +60,7 @@ where
             filter_deleted,
             keys: Vec::new(),
             follow: NodeCellRef::default(),
+            lazy: false,
         }
     }
 
@@ -81,6 +87,30 @@ where
             filter_deleted,
             keys,
             follow,
+            lazy: false,
+        }
+    }
+
+    // Build a cursor that has captured only the key at the seek position;
+    // the rest of the page is read on first advance.
+    pub(super) fn from_lazy(
+        current: EntryKey,
+        page: NodeCellRef,
+        ordering: Ordering,
+        deletion: Arc<DeletionSet>,
+        filter_deleted: bool,
+    ) -> Self {
+        RTCursor {
+            index: usize::MAX,
+            ordering,
+            page: Some(page),
+            marker: PhantomData,
+            current: Some(current),
+            deletion,
+            filter_deleted,
+            keys: Vec::new(),
+            follow: NodeCellRef::default(),
+            lazy: true,
         }
     }
 
@@ -88,6 +118,12 @@ where
     // page or past deleted keys as needed. Called once, outside any read
     // closure.
     pub(super) fn initialize(&mut self) {
+        if self.lazy {
+            if self.current_is_deleted() {
+                self.advance();
+            }
+            return;
+        }
         if self.index < self.keys.len() {
             self.current = Some(self.keys[self.index].clone());
         } else if self.load_following_page() {
@@ -166,13 +202,85 @@ where
         }
     }
 
+    // Snapshot the part of the current page that lies beyond `current` in
+    // iteration direction. Runs once per lazy cursor, on first advance. The
+    // position is re-derived from the current key, which keeps the snapshot
+    // correct even if the page changed since the seek.
+    fn materialize_tail(&mut self) {
+        self.lazy = false;
+        let cur = match &self.current {
+            Some(k) => k.clone(),
+            None => return,
+        };
+        let page_ref = match &self.page {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let snap = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
+            &NodeData::External(ref n) => {
+                let keys = &n.keys.as_slice_immute()[..n.len];
+                match self.ordering {
+                    Ordering::Forward => {
+                        // First key strictly greater than the current one.
+                        let pos = match keys.binary_search(&cur) {
+                            Ok(i) => i + 1,
+                            Err(i) => i,
+                        };
+                        PageSnap::Page(keys[pos..].to_vec(), n.next.clone())
+                    }
+                    Ordering::Backward => {
+                        // Keys strictly smaller than the current one.
+                        let pos = keys.binary_search(&cur).unwrap_or_else(|i| i);
+                        PageSnap::Page(keys[..pos].to_vec(), n.prev.clone())
+                    }
+                }
+            }
+            &NodeData::Empty(ref e) => PageSnap::Skip(match self.ordering {
+                Ordering::Forward => e.right.clone(),
+                Ordering::Backward => e.left.clone().unwrap_or_default(),
+            }),
+            &NodeData::None => PageSnap::End,
+            &NodeData::Internal(_) => unreachable!("cursor reached an internal node"),
+        });
+        match snap {
+            PageSnap::Page(keys, follow) => {
+                // Sentinel positions: "before the first" for Forward (wraps to
+                // 0 on the next step), "after the last" for Backward.
+                self.index = match self.ordering {
+                    Ordering::Forward => usize::MAX,
+                    Ordering::Backward => keys.len(),
+                };
+                self.keys = keys;
+                self.follow = follow;
+            }
+            PageSnap::Skip(next) => {
+                self.index = match self.ordering {
+                    Ordering::Forward => usize::MAX,
+                    Ordering::Backward => 0,
+                };
+                self.keys = Vec::new();
+                self.follow = next;
+            }
+            PageSnap::End => {
+                self.index = 0;
+                self.keys = Vec::new();
+                self.follow = NodeCellRef::default();
+            }
+        }
+    }
+
     // Advance `current` to the next non-deleted key, or None at the end.
     fn advance(&mut self) {
+        if self.lazy {
+            self.materialize_tail();
+        }
         loop {
             let stepped = match self.ordering {
                 Ordering::Forward => {
-                    if self.index < self.keys.len() && self.index + 1 < self.keys.len() {
-                        self.index += 1;
+                    // usize::MAX marks "before the first key" and wraps to 0.
+                    let next = self.index.wrapping_add(1);
+                    if next < self.keys.len() {
+                        self.index = next;
                         true
                     } else {
                         false
@@ -209,6 +317,11 @@ where
 {
     // Returns the current key and advances to the following one.
     fn next(&mut self) -> Option<EntryKey> {
+        if self.lazy && self.current.is_some() {
+            // Materialize while `current` is still set; it anchors the
+            // deferred page read.
+            self.materialize_tail();
+        }
         let out = self.current.take();
         if out.is_some() {
             self.advance();
