@@ -15,6 +15,41 @@ use metrics::{BatchMetrics, RunReport, ScenarioSummary};
 use workloads::{run_fixed_success_rmw, AttemptOutcome, AttemptTally, BatchSpec};
 
 #[test]
+fn occ_driver_routes_all_groups_through_flat_sampling_helper() {
+    let driver = include_str!("../benches/occ_transactions.rs");
+    let compact_driver: String = driver
+        .chars()
+        .filter(|char| !char.is_whitespace())
+        .collect();
+
+    assert_eq!(
+        driver.matches(".benchmark_group(").count(),
+        1,
+        "all OCC groups must be constructed by one shared helper"
+    );
+    assert!(
+        compact_driver.contains("fnocc_group"),
+        "OCC driver must define a shared occ_group helper"
+    );
+    assert!(
+        compact_driver.contains(".sampling_mode(SamplingMode::Flat)"),
+        "OCC group helper must enforce flat Criterion sampling"
+    );
+    assert_eq!(
+        compact_driver
+            .matches(".throughput(Throughput::Elements(1))")
+            .count(),
+        1,
+        "OCC group helper must centralize logical-operation throughput"
+    );
+    assert_eq!(
+        compact_driver.matches("occ_group(").count(),
+        4,
+        "all four OCC group construction sites must call the shared helper"
+    );
+}
+
+#[test]
 fn nearest_rank_percentiles_are_deterministic() {
     let mut metrics = BatchMetrics::one_success(Duration::from_millis(1));
     for millis in 2..=100 {

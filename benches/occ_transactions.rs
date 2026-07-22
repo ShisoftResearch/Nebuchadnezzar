@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
+    SamplingMode, Throughput,
+};
 use neb::ram::types::Id;
 use tokio::runtime::Runtime;
 
@@ -73,6 +76,13 @@ fn finish_fixture(runtime: Runtime, fixture: Arc<OccFixture>) {
     runtime.shutdown_background();
 }
 
+fn occ_group<'a>(criterion: &'a mut Criterion, name: &str) -> BenchmarkGroup<'a, WallTime> {
+    let mut group = criterion.benchmark_group(name);
+    group.sampling_mode(SamplingMode::Flat);
+    group.throughput(Throughput::Elements(1));
+    group
+}
+
 fn register_rmw(
     criterion: &mut Criterion,
     runtime: &Runtime,
@@ -81,8 +91,7 @@ fn register_rmw(
     ids: Arc<Vec<Id>>,
     cases: &[(usize, usize)],
 ) {
-    let mut group = criterion.benchmark_group(group_name);
-    group.throughput(Throughput::Elements(1));
+    let mut group = occ_group(criterion, group_name);
 
     for &(concurrency, cells_per_txn) in cases {
         let fixture = fixture.clone();
@@ -212,8 +221,7 @@ fn projected_reads(criterion: &mut Criterion) {
     seed(&runtime, &fixture, ids.as_ref(), 64 * 1024);
 
     let runtime_ref = &runtime;
-    let mut group = criterion.benchmark_group("occ/projected_reads");
-    group.throughput(Throughput::Elements(1));
+    let mut group = occ_group(criterion, "occ/projected_reads");
     for (name, mode) in [
         ("head", ProjectionMode::Head),
         ("selected", ProjectionMode::Selected),
@@ -254,8 +262,7 @@ fn blind_mutations(criterion: &mut Criterion) {
 
     let runtime_ref = &runtime;
     {
-        let mut group = criterion.benchmark_group("occ/blind_update");
-        group.throughput(Throughput::Elements(1));
+        let mut group = occ_group(criterion, "occ/blind_update");
         let fixture = fixture.clone();
         let ids = update_ids.clone();
         group.bench_with_input(BenchmarkId::from_parameter(1), &(), |bench, _| {
@@ -274,8 +281,7 @@ fn blind_mutations(criterion: &mut Criterion) {
     }
 
     {
-        let mut group = criterion.benchmark_group("occ/blind_remove");
-        group.throughput(Throughput::Elements(1));
+        let mut group = occ_group(criterion, "occ/blind_remove");
         let fixture = fixture.clone();
         let ids = remove_ids.clone();
         group.bench_with_input(BenchmarkId::from_parameter(1), &(), |bench, _| {
