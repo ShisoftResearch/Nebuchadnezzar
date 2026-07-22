@@ -629,6 +629,9 @@ impl DataManager {
         {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
+        if let Err(result) = self.validate_commit_storage_state(&txn, &cells) {
+            return result;
+        }
 
         crate::ram::chunk::set_transaction_context(true);
         let mut write_error: Option<(Id, WriteError)> = None;
@@ -943,6 +946,102 @@ impl DataManager {
 
             if !valid {
                 return Err(DMCommitResult::CheckFailed(CheckError::CannotEnd));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_commit_storage_state(
+        &self,
+        txn: &Transaction,
+        cells: &[CommitOp],
+    ) -> Result<(), DMCommitResult> {
+        for op in cells {
+            match op {
+                CommitOp::Write(cell) => match self.chunks().read_cell(&cell.id()) {
+                    Ok(_) => {
+                        return Err(Self::map_commit_write_error(
+                            txn,
+                            cell.id(),
+                            WriteError::CellAlreadyExisted,
+                        ));
+                    }
+                    Err(ReadError::CellDoesNotExisted) => {}
+                    Err(read_error) => {
+                        return Err(DMCommitResult::WriteError(
+                            cell.id(),
+                            WriteError::ReadError(read_error),
+                        ));
+                    }
+                },
+                CommitOp::Update(cell) => {
+                    let cell_id = cell.id();
+                    let expected_version = txn
+                        .certified_present_version(&cell_id)
+                        .expect("commit payload validation requires present certification");
+                    let current_version = match self.chunks().read_cell(&cell_id) {
+                        Ok(shared_cell) => shared_cell.header.version,
+                        Err(read_error) => {
+                            return Err(Self::map_commit_write_error(
+                                txn,
+                                cell_id,
+                                WriteError::ReadError(read_error),
+                            ));
+                        }
+                    };
+                    if current_version != expected_version {
+                        return Err(Self::map_commit_write_error(
+                            txn,
+                            cell_id,
+                            WriteError::CellVersionMismatch,
+                        ));
+                    }
+                }
+                CommitOp::Remove(cell_id) => {
+                    let expected_version = txn
+                        .certified_present_version(cell_id)
+                        .expect("commit payload validation requires present certification");
+                    let current_version = match self.chunks().read_cell(cell_id) {
+                        Ok(shared_cell) => shared_cell.header.version,
+                        Err(read_error) => {
+                            return Err(Self::map_commit_write_error(
+                                txn,
+                                *cell_id,
+                                WriteError::ReadError(read_error),
+                            ));
+                        }
+                    };
+                    if current_version != expected_version {
+                        return Err(Self::map_commit_write_error(
+                            txn,
+                            *cell_id,
+                            WriteError::CellVersionMismatch,
+                        ));
+                    }
+                }
+                CommitOp::Read(cell_id, version) => {
+                    let current_version = match self.chunks().read_cell(cell_id) {
+                        Ok(shared_cell) => shared_cell.header.version,
+                        Err(read_error) => {
+                            return Err(Self::map_commit_write_error(
+                                txn,
+                                *cell_id,
+                                WriteError::ReadError(read_error),
+                            ));
+                        }
+                    };
+                    if current_version != *version {
+                        return Err(Self::map_commit_write_error(
+                            txn,
+                            *cell_id,
+                            WriteError::CellVersionMismatch,
+                        ));
+                    }
+                }
+                CommitOp::None => {
+                    return Err(DMCommitResult::CheckFailed(CheckError::CannotEnd));
+                }
             }
         }
 
@@ -2686,6 +2785,88 @@ mod tests {
         assert_eq!(after_a.header.version, before_a.header.version);
         assert_eq!(after_b.data, before_b.data);
         assert_eq!(after_b.header.version, before_b.header.version);
+
+        let txn = manager.txns.get(&tid).expect("txn should remain tracked");
+        let txn = txn.lock();
+        assert_eq!(txn.state, TxnState::Prepared);
+        assert!(txn.history.is_empty());
+        drop(txn);
+
+        abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_prevalidates_current_storage_state_before_partial_write() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5357";
+        let group = "txn_data_site_commit_storage_prevalidation";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_a = Id::new(0, 8217);
+        let cell_b = Id::new(0, 8218);
+        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 15, 0);
+        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 25, 0);
+        let tid = StandardVectorClock::from_vec(vec![(36, 1)]);
+
+        let prepare = prepare_ops_local(
+            &manager,
+            36,
+            &tid,
+            vec![
+                PrepareOp {
+                    id: cell_a,
+                    expectation: CellExpectation::Present(version_a),
+                    intent: PrepareIntent::Write,
+                },
+                PrepareOp {
+                    id: cell_b,
+                    expectation: CellExpectation::Present(version_b),
+                    intent: PrepareIntent::Write,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::Success);
+
+        let before_a = runtime.chunks().read_cell(&cell_a).unwrap().to_owned();
+        let before_b = runtime.chunks().read_cell(&cell_b).unwrap().to_owned();
+
+        let mut external_b = counter_cell(schema.id, cell_b, 26, "counter_prevalidate_external_b");
+        let external_b_header = runtime.chunks().update_cell(&mut external_b).unwrap();
+        assert!(external_b_header.version > version_b);
+
+        let commit = commit_ops_local(
+            &manager,
+            &tid,
+            vec![
+                CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_a,
+                    115,
+                    "counter_prevalidate_storage_a",
+                )),
+                CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_b,
+                    126,
+                    "counter_prevalidate_storage_b",
+                )),
+            ],
+        )
+        .await;
+
+        assert_eq!(commit, DMCommitResult::CellChanged(cell_b));
+
+        let after_a = runtime.chunks().read_cell(&cell_a).unwrap().to_owned();
+        let after_b = runtime.chunks().read_cell(&cell_b).unwrap().to_owned();
+        assert_eq!(after_a.data, before_a.data);
+        assert_eq!(after_a.header.version, before_a.header.version);
+        assert_eq!(after_b.data, external_b.data);
+        assert_eq!(after_b.header.version, external_b_header.version);
+        assert_ne!(after_b.header.version, before_b.header.version);
 
         let txn = manager.txns.get(&tid).expect("txn should remain tracked");
         let txn = txn.lock();
