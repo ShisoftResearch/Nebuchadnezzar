@@ -485,6 +485,85 @@ async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_backgroun
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5364";
+    let group = "txn_occ_prepare_success_cancellation_cleanup";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90114);
+
+    let mut initial = counter_cell(schema.id, cell_id, 1, "counter_cancel_success_seed");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let manager = runtime.txn_manager().unwrap().clone();
+    let tid = txn.begin().await.unwrap().unwrap();
+    let first = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(score_of(&first), 1);
+
+    let pending = counter_cell(schema.id, cell_id, 9, "counter_cancel_success_pending");
+    assert_eq!(
+        txn.update(tid.clone(), pending).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    let delayed_prepare =
+        transactions::data_site::install_prepare_delay_for_cell(tid.clone(), cell_id);
+    let prepare_tid = tid.clone();
+    let manager_for_prepare = manager.clone();
+    let caller_prepare = tokio::spawn(async move {
+        <transactions::manager::TransactionManager as transactions::manager::Service>::prepare(
+            manager_for_prepare.as_ref(),
+            prepare_tid,
+        )
+        .await
+    });
+
+    delayed_prepare.wait_until_entered().await;
+    caller_prepare.abort();
+    assert!(caller_prepare.await.unwrap_err().is_cancelled());
+    delayed_prepare.release();
+
+    wait_for_transaction_count(&manager, 0, Duration::from_secs(2)).await;
+    let rolled_back = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(score_of(&rolled_back), 1);
+    assert!(rolled_back.header.version > first.header.version);
+
+    let retry_tid = txn.begin().await.unwrap().unwrap();
+    let retry_first = accepted_cell(txn.read(retry_tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(score_of(&retry_first), 1);
+    let retry = counter_cell(schema.id, cell_id, 15, "counter_cancel_success_retry");
+    assert_eq!(
+        txn.update(retry_tid.clone(), retry.clone())
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(retry_tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert!(matches!(
+        txn.commit(retry_tid).await.unwrap().unwrap(),
+        EndResult::Success | EndResult::SomeLocksNotReleased { .. }
+    ));
+    assert_eq!(
+        runtime
+            .chunks()
+            .read_cell(&cell_id)
+            .unwrap()
+            .to_owned()
+            .data,
+        retry.data
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repeatable_full_read_uses_first_snapshot() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5330";

@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::sync::Weak;
 use std::time::Duration;
+use tokio::sync::oneshot;
 #[cfg(test)]
 use tokio::sync::Notify;
 
@@ -260,11 +261,30 @@ impl TransactionManager {
     fn spawn_prepare_lifecycle(
         &self,
         tid: TxnId,
-    ) -> Result<tokio::task::JoinHandle<Result<TMPrepareResult, TMError>>, TMError> {
+    ) -> Result<
+        (
+            oneshot::Receiver<Result<TMPrepareResult, TMError>>,
+            oneshot::Sender<()>,
+        ),
+        TMError,
+    > {
         let manager = self.self_ref.upgrade().ok_or(TMError::Other)?;
-        Ok(tokio::spawn(async move {
-            manager.run_prepare_lifecycle(tid).await
-        }))
+        let (result_sender, result_receiver) = oneshot::channel();
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = manager.clone().run_prepare_lifecycle(tid.clone()).await;
+            let prepared = matches!(&result, Ok(TMPrepareResult::Success));
+            if result_sender.send(result).is_err() {
+                if prepared {
+                    let _ = manager.abort(tid).await;
+                }
+                return;
+            }
+            if prepared && ack_receiver.await.is_err() {
+                let _ = manager.abort(tid).await;
+            }
+        });
+        Ok((result_receiver, ack_sender))
     }
 
     #[cfg(test)]
@@ -351,13 +371,16 @@ impl Service for TransactionManager {
     fn prepare(&self, tid: TxnId) -> BoxFuture<'_, Result<TMPrepareResult, TMError>> {
         async move {
             let prepare_tid = tid.clone();
-            let prepare_task = self.spawn_prepare_lifecycle(tid)?;
-            match prepare_task.await {
-                Ok(result) => result,
-                Err(join_error) => {
+            let (result_receiver, ack_sender) = self.spawn_prepare_lifecycle(tid)?;
+            match result_receiver.await {
+                Ok(result) => {
+                    let _ = ack_sender.send(());
+                    result
+                }
+                Err(receive_error) => {
                     error!(
                         "prepare lifecycle task failed for {:?}: {:?}",
-                        prepare_tid, join_error
+                        prepare_tid, receive_error
                     );
                     Err(TMError::Other)
                 }
