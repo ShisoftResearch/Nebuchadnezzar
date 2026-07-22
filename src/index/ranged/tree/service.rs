@@ -974,22 +974,24 @@ impl TreeService {
                             );
                         }
                         let buffer_size = MIGRATE_SIZE << 4;
-                        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+                        // Move only the upper half. The source tree is frozen
+                        // for the whole migration window (writes get
+                        // OpResult::Migrating and retry against fresh
+                        // placement), so a single bulk pass captures
+                        // everything — no reconcile re-scan is needed. Seek
+                        // straight to the pivot instead of scanning (and
+                        // skipping) the entire lower half that stays behind.
+                        let mut cursor = tree.seek(&pivot_key, Ordering::Forward);
                         let mut entry_buffer = Vec::with_capacity(buffer_size);
                         debug!(
                             "Start moving keys from {:?} to {:?}",
                             dist_tree.id, migration_target_id
                         );
-                        while let Some(entry) = cursor.current().cloned() {
-                            if entry >= pivot_key {
-                                entry_buffer.push(entry);
-                            }
-                            break;
-                        }
+                        // next() yields the current key (the first >= pivot
+                        // after the seek) and advances, so this walks every
+                        // key from the pivot to the end exactly once.
                         while let Some(entry) = cursor.next() {
-                            if entry < pivot_key {
-                                continue;
-                            }
+                            debug_assert!(entry >= pivot_key);
                             entry_buffer.push(entry);
                             if entry_buffer.len() >= buffer_size {
                                 entry_buffer.dedup();
@@ -999,19 +1001,9 @@ impl TreeService {
                             }
                         }
                         entry_buffer.dedup();
-                        debug!("Merging last batch of keys, size {}", entry_buffer.len());
-                        migration_tree.tree.merge_keys(entry_buffer);
-                        let mut reconcile_cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
-                        if let Some(entry) = reconcile_cursor.current().cloned() {
-                            if entry >= pivot_key {
-                                let _ = migration_tree.tree.insert(&entry);
-                            }
-                        }
-                        while let Some(entry) = reconcile_cursor.next() {
-                            if entry < pivot_key {
-                                continue;
-                            }
-                            let _ = migration_tree.tree.insert(&entry);
+                        if !entry_buffer.is_empty() {
+                            debug!("Merging last batch of keys, size {}", entry_buffer.len());
+                            migration_tree.tree.merge_keys(entry_buffer);
                         }
                         debug!("Waiting for new tree {:?} persisted", migration_target_id);
                         storage::wait_until_updated().await;
