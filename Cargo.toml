@@ -81,3 +81,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [[bench]]
 name = "inverted_index"
 harness = false
+
+[[bench]]
+name = "occ_transactions"
+harness = false

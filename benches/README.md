@@ -77,3 +77,35 @@ search/1000_docs/single_word  time:   [345.67 us 356.78 us 367.89 us]
 - Benchmarks use temporary directories that are cleaned up automatically
 - For accurate results, run benchmarks in release mode: `cargo bench --release`
 
+## OCC transaction benchmarks
+
+Run a local smoke pass with:
+
+```bash
+NEB_OCC_BENCH_REVISION="$(git rev-parse HEAD)" \
+NEB_OCC_BENCH_LABEL=smoke \
+  cargo bench --bench occ_transactions -- --test
+```
+
+Save a baseline with:
+
+```bash
+NEB_OCC_BENCH_REVISION="$(git rev-parse HEAD)" \
+NEB_OCC_BENCH_LABEL=occ-initial \
+  cargo bench --bench occ_transactions -- --save-baseline occ-initial
+```
+
+`NEB_OCC_BENCH_BASE_PORT` moves the loopback port range used by the fixtures. The
+transaction report JSON is written under `target/occ-bench/`, while Criterion's
+HTML reports and baselines are written under `target/criterion/`.
+
+Each scenario reports attempts, commits, `NotRealizable` outcomes, logical
+retries, p50/p95/p99 latency, and unexpected errors/invariant failures. A change
+is accepted when targeted stable throughput or p95 improves by at least 5%, the
+geometric-mean/aggregate throughput does not decline, secondary throughput is no
+worse than 3%, secondary p95 is no worse than 5%, unexpected errors remain zero,
+and all correctness suites pass.
+
+Accurate performance work should run on a dedicated idle host. This project's
+controlled loop uses `192.168.10.17` with identical NUMA binding for every
+baseline and candidate; remote execution is intentionally not hardcoded in Rust.
