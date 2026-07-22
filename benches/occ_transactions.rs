@@ -22,6 +22,9 @@ use occ_support::{
     },
 };
 
+const OCC_SAMPLE_SIZE: usize = 10;
+const OCC_MEASUREMENT_SECONDS: u64 = 10;
+
 static RUN_REPORT: OnceLock<Mutex<RunReport>> = OnceLock::new();
 
 fn report() -> &'static Mutex<RunReport> {
@@ -79,6 +82,8 @@ fn finish_fixture(runtime: Runtime, fixture: Arc<OccFixture>) {
 fn occ_group<'a>(criterion: &'a mut Criterion, name: &str) -> BenchmarkGroup<'a, WallTime> {
     let mut group = criterion.benchmark_group(name);
     group.sampling_mode(SamplingMode::Flat);
+    group.sample_size(OCC_SAMPLE_SIZE);
+    group.measurement_time(Duration::from_secs(OCC_MEASUREMENT_SECONDS));
     group.throughput(Throughput::Elements(1));
     group
 }

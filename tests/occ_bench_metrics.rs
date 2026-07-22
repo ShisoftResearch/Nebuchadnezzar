@@ -35,6 +35,28 @@ fn occ_driver_routes_all_groups_through_flat_sampling_helper() {
         compact_driver.contains(".sampling_mode(SamplingMode::Flat)"),
         "OCC group helper must enforce flat Criterion sampling"
     );
+    assert!(
+        compact_driver.contains("constOCC_SAMPLE_SIZE:usize=10;"),
+        "OCC driver must name the confirmed 10-sample window"
+    );
+    assert!(
+        compact_driver.contains("constOCC_MEASUREMENT_SECONDS:u64=10;"),
+        "OCC driver must name the confirmed 10-second measurement window"
+    );
+    assert_eq!(
+        compact_driver
+            .matches(".sample_size(OCC_SAMPLE_SIZE)")
+            .count(),
+        1,
+        "OCC group helper must centralize the confirmed sample count"
+    );
+    assert_eq!(
+        compact_driver
+            .matches(".measurement_time(Duration::from_secs(OCC_MEASUREMENT_SECONDS))")
+            .count(),
+        1,
+        "OCC group helper must centralize the confirmed measurement time"
+    );
     assert_eq!(
         compact_driver
             .matches(".throughput(Throughput::Elements(1))")
