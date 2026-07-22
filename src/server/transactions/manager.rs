@@ -823,11 +823,27 @@ impl TransactionManager {
                 return Ok(DMPrepareResult::NotRealizable); // Give up
             }
 
-            let self_server_id = deps.server_id;
-            let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
+            let coordinator_id = deps.server_id;
+            let prepare_ops: Vec<_> = objs
+                .iter()
+                .map(|(id, data_obj)| PrepareOp {
+                    id: *id,
+                    expectation: data_obj.expectation.clone(),
+                    intent: if data_obj.changed {
+                        PrepareIntent::Write
+                    } else {
+                        PrepareIntent::Read
+                    },
+                })
+                .collect();
             let deps_for_clock = deps.clone();
             let prepare_payload = data_site
-                .prepare(self_server_id, deps.clock.to_clock(), tid.clone(), cell_ids)
+                .prepare(
+                    coordinator_id,
+                    deps.clock.to_clock(),
+                    tid.clone(),
+                    prepare_ops,
+                )
                 .await
                 .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
                 .map(move |prepare_res| -> DMPrepareResult {

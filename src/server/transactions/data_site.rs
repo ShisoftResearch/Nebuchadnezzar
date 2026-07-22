@@ -64,13 +64,15 @@ type TxnMutex = Arc<Mutex<Transaction>>;
 pub struct CellMeta {
     read: TxnId,
     write: TxnId,
-    owner: Option<TxnId>, // transaction that owns the cell (write lock) during prepare/commit
+    owner: Option<TxnPriority>, // transaction that owns the cell during prepare/commit
     lock_acquired_at: Option<i64>, // timestamp when lock was acquired (milliseconds since epoch)
 }
 
 struct Transaction {
     state: TxnState,
     affected_cells: Vec<Id>,
+    certified: BTreeMap<Id, PrepareOp>,
+    coordinator_id: Option<u64>,
     last_activity: i64,
     history: CommitHistory,
     /// RAII guards that hold segment references during this transaction
@@ -109,7 +111,7 @@ service! {
     rpc read_partial_raw(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>;
     rpc head(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<CellHeader, ReadError>>;
     // two phase commit
-    rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>) -> DataSiteResponse<DMPrepareResult>;
+    rpc prepare(coordinator_id: u64, clock :StandardVectorClock, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
     rpc commit(clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
 
     // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
@@ -194,6 +196,8 @@ impl DataManager {
             let txn = Arc::new(Mutex::new(Transaction {
                 state: TxnState::Started,
                 affected_cells: Vec::with_capacity(8), // Pre-allocate for common case
+                certified: BTreeMap::new(),
+                coordinator_id: None,
                 last_activity: get_time(),
                 history: BTreeMap::new(),
                 segment_guards: Vec::with_capacity(4), // Pre-allocate for common case
@@ -227,6 +231,26 @@ impl DataManager {
         T: 'static,
     {
         future::ready(DataSiteResponse::new(&self.txn_peer, data)).boxed()
+    }
+
+    fn canonical_prepare_ops(ops: Vec<PrepareOp>) -> Result<Vec<PrepareOp>, DMPrepareResult> {
+        let mut by_id = BTreeMap::new();
+        for op in ops {
+            if by_id.insert(op.id, op).is_some() {
+                return Err(DMPrepareResult::NotRealizable);
+            }
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    fn prepare_expectation_matches(&self, op: &PrepareOp) -> bool {
+        match (&op.expectation, self.chunks().head_cell(&op.id)) {
+            (CellExpectation::Present(expected_version), Ok(head)) => {
+                head.version == *expected_version
+            }
+            (CellExpectation::Absent, Err(ReadError::CellDoesNotExisted)) => true,
+            _ => false,
+        }
     }
 
     #[inline]
@@ -411,7 +435,7 @@ impl DataManager {
     /// Option 6: Provides detailed failure information for retry logic
     fn attempt_lock_release(
         &self,
-        tid: &TxnId,
+        expected_owner: Option<&TxnPriority>,
         affected_cell_ids: &[Id],
     ) -> (usize, Vec<LockReleaseFailure>) {
         let mut released_count = 0;
@@ -422,9 +446,8 @@ impl DataManager {
             if let Some(cell_mutex) = self.cells.get(cell_id) {
                 let mut meta = cell_mutex.lock();
 
-                // Verify this transaction owns the lock
-                match &meta.owner {
-                    Some(owner_tid) if owner_tid == tid => {
+                match (expected_owner, &meta.owner) {
+                    (Some(expected_owner), Some(owner)) if owner == expected_owner => {
                         // Release the lock
                         let lock_age = meta
                             .lock_acquired_at
@@ -437,38 +460,57 @@ impl DataManager {
 
                         debug!(
                             "Released lock on cell {:?} owned by {:?} (held for {}ms)",
-                            cell_id, tid, lock_age
+                            cell_id, expected_owner, lock_age
                         );
                     }
-                    Some(other_tid) => {
-                        // Lock owned by different transaction - this is a problem
-                        let reason =
-                            format!("Cell lock owned by different transaction: {:?}", other_tid);
+                    (Some(expected_owner), Some(owner)) => {
+                        let reason = format!(
+                            "Cell lock owned by different transaction: expected {:?}, found {:?}",
+                            expected_owner, owner
+                        );
                         warn!(
                             "Cannot release lock on cell {:?} for {:?}: {}",
-                            cell_id, tid, reason
+                            cell_id, expected_owner, reason
                         );
                         failures.push(LockReleaseFailure {
                             cell_id: *cell_id,
                             reason,
                         });
                     }
-                    None => {
-                        // Lock not held - might have been released already or never acquired
+                    (Some(expected_owner), None) => {
                         debug!(
                             "Lock on cell {:?} not held by {:?} (already released or never acquired)",
-                            cell_id, tid
+                            cell_id, expected_owner
                         );
-                        // Don't count as failure if lock was already released
+                        released_count += 1;
+                    }
+                    (None, Some(owner)) => {
+                        let reason = format!(
+                            "Missing coordinator id for release; cell still owned by {:?}",
+                            owner
+                        );
+                        warn!(
+                            "Cannot release lock on cell {:?} without expected owner: {}",
+                            cell_id, reason
+                        );
+                        failures.push(LockReleaseFailure {
+                            cell_id: *cell_id,
+                            reason,
+                        });
+                    }
+                    (None, None) => {
+                        debug!(
+                            "Lock on cell {:?} already released before coordinator was known",
+                            cell_id
+                        );
                         released_count += 1;
                     }
                 }
             } else {
-                // Cell metadata not found - Option 5: Metadata cleanup protection
                 let reason = "Cell metadata not found (may have been cleaned up)".to_string();
                 warn!(
                     "Cannot release lock on cell {:?} for {:?}: {}",
-                    cell_id, tid, reason
+                    cell_id, expected_owner, reason
                 );
                 failures.push(LockReleaseFailure {
                     cell_id: *cell_id,
@@ -798,9 +840,16 @@ impl DataManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ram::cell::OwnedCell;
+    use crate::ram::schema::Schema;
     use crate::ram::segs::SEGMENT_SIZE;
+    use crate::ram::tests::default_fields;
+    use crate::ram::types::{Id, OwnedMap, OwnedValue};
     use crate::server::{NebServer, ServerOptions, Service as NebService};
+    use bifrost::rpc::DEFAULT_CLIENT_POOL;
+    use dovahkiin::types::Map as OwnedMapTrait;
     use futures::future::join_all;
+    use lightning::map::Map as LFMapTrait;
     use std::sync::Arc;
 
     #[test]
@@ -850,13 +899,255 @@ mod tests {
         DataManager::new(runtime, crate::server::Peer::new(&address.to_string()))
     }
 
+    async fn data_site_client_for_database(
+        address: &str,
+        group: &str,
+        database_name: &str,
+    ) -> Arc<AsyncServiceClient> {
+        let client = DEFAULT_CLIENT_POOL.get(&address.to_string()).await.unwrap();
+        AsyncServiceClient::new_with_service_id(
+            generate_scoped_service_id(group, database_name),
+            &client,
+        )
+    }
+
+    fn install_prepare_test_schema(runtime: &Arc<crate::server::DatabaseRuntime>) -> Schema {
+        let schema = Schema::new_with_id(
+            990,
+            &String::from("txn_prepare_cert"),
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        runtime.meta().schemas.debug_only_new_schema(schema.clone());
+        schema
+    }
+
+    fn counter_cell(schema_id: u32, id: Id, score: u64, name: &str) -> OwnedCell {
+        let mut data = OwnedMap::new();
+        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("score"), OwnedValue::U64(score));
+        data.insert(&String::from("name"), OwnedValue::String(name.to_string()));
+        OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
+    }
+
+    fn seed_cell_version(
+        runtime: &Arc<crate::server::DatabaseRuntime>,
+        schema_id: u32,
+        id: Id,
+        score: u64,
+        version_steps: usize,
+    ) -> u64 {
+        let mut cell = counter_cell(schema_id, id, score, "prepare-seed-0");
+        let mut header = runtime.chunks().write_cell(&mut cell).unwrap();
+        for step in 0..version_steps {
+            let next_score = score + step as u64 + 1;
+            let mut updated = counter_cell(
+                schema_id,
+                id,
+                next_score,
+                &format!("prepare-seed-{}", step + 1),
+            );
+            header = runtime.chunks().update_cell(&mut updated).unwrap();
+        }
+        header.version
+    }
+
     fn prepare_local_txn(manager: &Arc<DataManager>, tid: &TxnId, affected_cells: Vec<Id>) {
         let txn_lock = manager.get_or_create_transaction(tid);
         let mut txn = txn_lock.lock();
         txn.state = TxnState::Prepared;
-        txn.affected_cells = affected_cells;
+        txn.certified = affected_cells
+            .iter()
+            .copied()
+            .map(|id| {
+                (
+                    id,
+                    PrepareOp {
+                        id,
+                        expectation: CellExpectation::Absent,
+                        intent: PrepareIntent::Write,
+                    },
+                )
+            })
+            .collect();
+        txn.affected_cells = txn.certified.keys().copied().collect();
+        txn.coordinator_id = Some(0);
         txn.history.clear();
         txn.last_activity = get_time();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_rejects_a_stale_present_version() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5323";
+        let group = "txn_data_site_prepare_stale_present";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let client = data_site_client_for_database(address, group, group).await;
+        let cell_id = Id::new(0, 99001);
+        let version = seed_cell_version(&runtime, schema.id, cell_id, 3, 0);
+        let tid = StandardVectorClock::from_vec(vec![(11, 1)]);
+
+        let result = client
+            .prepare(
+                11,
+                tid.clone(),
+                tid.clone(),
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(version + 1),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await
+            .unwrap()
+            .payload;
+
+        assert_eq!(result, DMPrepareResult::NotRealizable);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_rejects_a_present_cell_when_absence_was_observed() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5324";
+        let group = "txn_data_site_prepare_present_vs_absent";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let client = data_site_client_for_database(address, group, group).await;
+        let cell_id = Id::new(0, 99002);
+        seed_cell_version(&runtime, schema.id, cell_id, 4, 0);
+        let tid = StandardVectorClock::from_vec(vec![(12, 1)]);
+
+        let result = client
+            .prepare(
+                12,
+                tid.clone(),
+                tid.clone(),
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Absent,
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await
+            .unwrap()
+            .payload;
+
+        assert_eq!(result, DMPrepareResult::NotRealizable);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_rejects_present_expectation_when_cell_is_missing_without_publishing_owner() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5326";
+        let group = "txn_data_site_prepare_missing_present";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99003);
+        let tid = StandardVectorClock::from_vec(vec![(13, 1)]);
+
+        let result = <DataManager as Service>::prepare(
+            &manager,
+            13,
+            tid.clone(),
+            tid.clone(),
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Present(1),
+                intent: PrepareIntent::Read,
+            }],
+        )
+        .await
+        .payload;
+
+        assert_eq!(result, DMPrepareResult::NotRealizable);
+        let txn = manager.get_or_create_transaction(&tid);
+        let txn = txn.lock();
+        assert_ne!(txn.state, TxnState::Prepared);
+        assert!(txn.affected_cells.is_empty());
+        drop(txn);
+
+        let meta = manager.cell_meta_mutex(&cell_id);
+        let meta = meta.lock();
+        assert!(meta.owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_rejects_duplicate_prepare_ops_without_publishing_owner() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5327";
+        let group = "txn_data_site_prepare_duplicate_ops";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99004);
+        let version = seed_cell_version(&runtime, schema.id, cell_id, 5, 0);
+        let tid = StandardVectorClock::from_vec(vec![(14, 1)]);
+        let op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+
+        let result = <DataManager as Service>::prepare(
+            &manager,
+            14,
+            tid.clone(),
+            tid.clone(),
+            vec![op.clone(), op],
+        )
+        .await
+        .payload;
+
+        assert_eq!(result, DMPrepareResult::NotRealizable);
+        let meta = manager.cell_meta_mutex(&cell_id);
+        assert!(meta.lock().owner.is_none());
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_clock_wait_die_has_one_younger_requester() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5325";
+        let group = "txn_data_site_prepare_wait_die_clock";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let client = data_site_client_for_database(address, group, group).await;
+        let cell_id = Id::new(0, 99005);
+        let version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
+        let older_tid = StandardVectorClock::from_vec(vec![(11, 1)]);
+        let younger_tid = StandardVectorClock::from_vec(vec![(22, 1)]);
+        let op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(version),
+            intent: PrepareIntent::Write,
+        };
+
+        let first = client
+            .prepare(11, older_tid.clone(), older_tid.clone(), vec![op.clone()])
+            .await
+            .unwrap()
+            .payload;
+        let second = client
+            .prepare(22, younger_tid.clone(), younger_tid.clone(), vec![op])
+            .await
+            .unwrap()
+            .payload;
+
+        assert_eq!(first, DMPrepareResult::Success);
+        assert_eq!(second, DMPrepareResult::NotRealizable);
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1199,141 +1490,92 @@ impl Service for DataManager {
     }
     fn prepare(
         &self,
-        _server_id: u64,
+        coordinator_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
-        cell_ids: Vec<Id>,
+        ops: Vec<PrepareOp>,
     ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
-        // PREPARE PHASE: Two-Phase Commit with Wait-Die Concurrency Control
-        //
-        // This function implements the first phase of 2PC with a hybrid protocol:
-        // 1. Wait-Die lock-based conflict resolution (NEW)
-        // 2. Timestamp-ordering validation (EXISTING)
-        //
-        // Wait-Die Protocol (prevents deadlock on lock conflicts):
-        // - If cell.owner exists and != tid:
-        //   - Younger txn (tid > owner): DIE → return NotRealizable (abort)
-        //   - Older txn (tid < owner): WAIT → return Wait (TM will backoff & retry)
-        // - This reduces cascading aborts on hot cells vs pure timestamp ordering
-        //
-        // Timestamp Ordering (validates serializability and linearizability - STRICT):
-        // - Check tid >= meta.read (write-after-read constraint)
-        // - Check tid >= meta.write (write-after-write constraint)
-        // - Ensures strict ordering and prevents lost updates
-        //
-        // Lock Acquisition:
-        // - If all checks pass, set meta.owner = Some(tid) for each cell
-        // - cell_ids must be sorted to avoid deadlock on mutex acquisition
-        // - Locks are released in the `end` phase after commit/abort
-        debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
+        debug!("PREPARE FOR {:?}, {} ops", &tid, ops.len());
         self.update_clock(&clock);
 
-        // A write-only transaction may reach a data site for the first time at prepare.
-        // In that case we still need local state to acquire locks and track commit history.
+        let prepared_ops = match Self::canonical_prepare_ops(ops) {
+            Ok(prepared_ops) => prepared_ops,
+            Err(result) => return self.response_with(result),
+        };
+        let requester = TxnPriority::new(tid.clone(), coordinator_id);
+
         let txn_lock = self.get_or_create_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
             return self.response_with(DMPrepareResult::StateError(txn.state));
         }
 
-        let mut cell_mutices = Vec::with_capacity(cell_ids.len());
-        let mut cell_guards = Vec::with_capacity(cell_ids.len());
+        let mut cell_mutices = Vec::with_capacity(prepared_ops.len());
+        let mut cell_guards = Vec::with_capacity(prepared_ops.len());
 
-        for cell_id in &cell_ids {
-            cell_mutices.push(self.cell_meta_mutex(cell_id));
+        for op in &prepared_ops {
+            cell_mutices.push(self.cell_meta_mutex(&op.id));
         }
         for cell_mutex in &cell_mutices {
             let mut meta = cell_mutex.lock();
             let current_time = get_time();
 
-            // Wait-Die Protocol: Check if another transaction owns this cell
-            // This implements lock-based concurrency control to reduce timestamp-ordering aborts
-            if let Some(ref owner_tid) = meta.owner {
-                if owner_tid != &tid {
-                    // Option 2: Check if lock has timed out (stale lock detection)
+            if let Some(owner) = meta.owner.clone() {
+                if owner != requester {
                     let lock_age = meta
                         .lock_acquired_at
                         .map(|acquired| current_time - acquired)
                         .unwrap_or(0);
 
                     if lock_age > LOCK_TIMEOUT_MS {
-                        // Lock is stale - reclaim it
                         warn!(
                             "PREPARE: Reclaiming stale lock on cell (held for {}ms by {:?}), now claimed by {:?}",
-                            lock_age, owner_tid, tid
+                            lock_age, owner, requester
                         );
                         meta.owner = None;
                         meta.lock_acquired_at = None;
-                        // Continue to acquire the lock below
-                    } else if tid > *owner_tid {
-                        // Younger transaction "dies" (aborts immediately)
+                    } else if requester.compare_age(&owner).is_gt() {
                         debug!(
                             "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
-                            tid, owner_tid, lock_age
+                            requester, owner, lock_age
                         );
                         return self.response_with(DMPrepareResult::NotRealizable);
                     } else {
-                        // Older transaction waits for younger owner to release
                         debug!(
                             "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?} (lock age: {}ms)",
-                            tid, owner_tid, lock_age
+                            requester, owner, lock_age
                         );
                         return self.response_with(DMPrepareResult::Wait);
                     }
                 }
             }
 
-            // Timestamp ordering validation (STRICT)
-            // Ensures strict serializability and linearizability
-            //
-            // Read-Write Conflict Check:
-            // Enforce write-after-read constraint - prevents writing with older
-            // timestamp than existing reads
-            if tid < meta.read {
-                debug!(
-                    "PREPARE: Write too late for {:?} (tid: {:?}), cell read timestamp: {:?}",
-                    tid, tid, meta.read
-                );
-                break;
-            }
-
-            // Write-Write Conflict Check (STRICT):
-            // Enforce write-after-write constraint - prevents timestamp inversions
-            // This ensures:
-            // - Linearizability (real-time ordering preserved)
-            // - No lost updates for counters
-            // - No lost edges in edge lists
-            // - Safe for quota enforcement
-            if tid < meta.write {
-                debug!(
-                    "PREPARE: Write conflict for {:?} (tid: {:?}), cell write timestamp: {:?}",
-                    tid, tid, meta.write
-                );
-                break;
-            }
-
             cell_guards.push(meta);
         }
-        if cell_guards.len() != cell_ids.len() {
-            debug!(
-                "SITE PREPARE CELL GUARD MISMATCH: {} expecting {}",
-                cell_ids.len(),
-                cell_guards.len()
-            );
-            return self.response_with(DMPrepareResult::NotRealizable); // need retry
-        } else {
-            let lock_time = get_time();
-            for mut meta in cell_guards {
-                meta.owner = Some(tid.clone()); // set owner to lock this cell
-                meta.lock_acquired_at = Some(lock_time); // Option 1: Record lock acquisition time
-                debug!("Lock acquired for cell by {:?} at {}", tid, lock_time);
+
+        for op in &prepared_ops {
+            if !self.prepare_expectation_matches(op) {
+                debug!(
+                    "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
+                    requester, op.id, op
+                );
+                return self.response_with(DMPrepareResult::NotRealizable);
             }
-            txn.state = TxnState::Prepared;
-            txn.affected_cells = cell_ids; // for cell number check
-            txn.last_activity = get_time(); // check if transaction timeout
-            debug!("SITE PREPARE SUCCESSFUL FOR {:?}", tid);
-            return self.response_with(DMPrepareResult::Success);
         }
+
+        let lock_time = get_time();
+        for meta in &mut cell_guards {
+            meta.owner = Some(requester.clone());
+            meta.lock_acquired_at = Some(lock_time);
+        }
+
+        txn.certified = prepared_ops.into_iter().map(|op| (op.id, op)).collect();
+        txn.affected_cells = txn.certified.keys().copied().collect();
+        txn.coordinator_id = Some(coordinator_id);
+        txn.state = TxnState::Prepared;
+        txn.last_activity = get_time();
+        debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
+        self.response_with(DMPrepareResult::Success)
     }
     fn commit(
         &self,
@@ -1426,7 +1668,7 @@ impl Service for DataManager {
         self.update_clock(&clock);
 
         // Option 6: Two-Phase Lock Release with Verification and Retry
-        let (affected_cell_ids, txn_state) = {
+        let (affected_cell_ids, txn_state, expected_owner) = {
             let Some(txn_lock) = self.find_transaction(&tid) else {
                 return self.response_with(EndResult::CheckFailed(CheckError::NotExisted));
             };
@@ -1440,7 +1682,12 @@ impl Service for DataManager {
                 txn.state,
                 tid
             );
-            (txn.affected_cells.clone(), txn.state)
+            (
+                txn.affected_cells.clone(),
+                txn.state,
+                txn.coordinator_id
+                    .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id)),
+            )
         };
 
         // Attempt lock release with retries
@@ -1457,7 +1704,7 @@ impl Service for DataManager {
             }
 
             let (released_count, failed_releases) =
-                self.attempt_lock_release(&tid, &affected_cell_ids);
+                self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
             let total_cells = affected_cell_ids.len();
 
             if failed_releases.is_empty() {
