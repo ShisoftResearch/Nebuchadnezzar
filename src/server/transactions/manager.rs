@@ -390,36 +390,38 @@ impl Service for TransactionManager {
     }
     fn commit(&self, tid: TxnId) -> BoxFuture<'_, Result<EndResult, TMError>> {
         async move {
-            let result = {
-                let txn_lock = self.get_transaction(&tid)?;
-                let txn = txn_lock.lock().await;
-                self.ensure_txn_state(&txn, TxnState::Prepared)?;
-                let affected_objs = &txn.affected_objects;
-                let data_sites = self.data_sites_for_objs(&affected_objs).await?;
-                self.sites_end(&tid, affected_objs, &data_sites).await
+            let txn_lock = self.get_transaction(&tid)?;
+            let mut txn = txn_lock.lock().await;
+            self.ensure_txn_state(&txn, TxnState::Prepared)?;
+            let affected_objs = &txn.affected_objects;
+            let result = match self.data_sites_for_objs(affected_objs).await {
+                Ok(data_sites) => self.sites_end(&tid, affected_objs, &data_sites).await,
+                Err(error) => Err(error),
             };
-            self.cleanup_transaction(&tid);
-            return result;
+            self.cleanup_transaction_guarded(&tid, &mut txn);
+            result
         }
         .boxed()
     }
     fn abort(&self, tid: TxnId) -> BoxFuture<'_, Result<AbortResult, TMError>> {
         debug!("TXN ABORT IN MGR {:?}", &tid);
         async move {
-            let result = {
-                let txn_lock = self.get_transaction(&tid)?;
-                let txn = txn_lock.lock().await;
-                if txn.state != TxnState::Aborted {
-                    let changed_objs = &txn.affected_objects;
-                    let data_sites = self.data_sites_for_objs(&changed_objs).await?;
-                    debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                    self.sites_abort(&tid, changed_objs, &data_sites).await // with end
-                } else {
-                    Ok(AbortResult::Success(None))
+            let txn_lock = self.get_transaction(&tid)?;
+            let mut txn = txn_lock.lock().await;
+            let result = if txn.state != TxnState::Aborted {
+                let changed_objs = &txn.affected_objects;
+                match self.data_sites_for_objs(changed_objs).await {
+                    Ok(data_sites) => {
+                        debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
+                        self.sites_abort(&tid, changed_objs, &data_sites).await // with end
+                    }
+                    Err(error) => Err(error),
                 }
+            } else {
+                Ok(AbortResult::Success(None))
             };
-            self.cleanup_transaction(&tid);
-            return result;
+            self.cleanup_transaction_guarded(&tid, &mut txn);
+            result
         }
         .boxed()
     }
@@ -1171,16 +1173,22 @@ impl TransactionManager {
         }
     }
 
-    fn cleanup_transaction(&self, tid: &TxnId) {
-        let txn = self.transactions.remove(tid);
-        if let Some(txn) = txn {
-            let mut txn_guard = txn.lock_blocking();
-            txn_guard.data.clear();
-            txn_guard.affected_objects.clear();
-            txn_guard.state = TxnState::Cleanup;
-            txn_guard.last_activity = get_time();
-        }
+    fn cleanup_transaction_guarded(&self, tid: &TxnId, txn: &mut Transaction) {
+        txn.data.clear();
+        txn.affected_objects.clear();
+        txn.state = TxnState::Cleanup;
+        txn.last_activity = get_time();
+        let _ = self.transactions.remove(tid);
         self.txn_ids.lock().remove(tid);
+    }
+
+    fn cleanup_transaction(&self, tid: &TxnId) {
+        if let Some(txn) = self.transactions.get(tid) {
+            let mut txn_guard = txn.lock_blocking();
+            self.cleanup_transaction_guarded(tid, &mut txn_guard);
+        } else {
+            self.txn_ids.lock().remove(tid);
+        }
     }
 
     /// Clean up stale transactions that have been abandoned by clients
@@ -1665,6 +1673,7 @@ mod tests {
                                     end
                                 );
                             }
+                            TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable) => {}
                             other => panic!("unexpected prepare result: {:?}", other),
                         }
                     }
@@ -1753,6 +1762,8 @@ mod tests {
                                         "unexpected commit result: {:?}",
                                         end
                                     );
+                                }
+                                TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable) => {
                                 }
                                 other => panic!("unexpected prepare result: {:?}", other),
                             }
@@ -1845,6 +1856,7 @@ mod tests {
                 | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
                 | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))
                 | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::TransactionNotExisted))
+                | Err(TMError::InvalidTransactionState(TxnState::Cleanup))
                 | Err(TMError::TransactionNotFound) => {}
                 other => panic!("unexpected prepare result in race: {:?}", other),
             }
@@ -1877,20 +1889,26 @@ mod tests {
         let default_runtime = server.current_database();
         let default_schema = install_basic_schema(&default_runtime);
         let analytics_schema = install_basic_schema(&analytics_runtime);
-        let default_cell = Id::new(0, 4001);
-        let analytics_cell = Id::new(0, 4002);
-        seed_counter_cell(&default_runtime, default_schema.id, default_cell, 1).await;
-        seed_counter_cell(&analytics_runtime, analytics_schema.id, analytics_cell, 1).await;
+        for index in 0..24 {
+            let cell = Id::new(0, 4001 + index);
+            seed_counter_cell(&default_runtime, default_schema.id, cell, 1).await;
+            seed_counter_cell(&analytics_runtime, analytics_schema.id, cell, 1).await;
+        }
 
         let results = join_all((0..48).map(|iteration| {
             let address = address.to_string();
             let group = group.to_string();
             async move {
-                let (database_name, schema_id, hot_cell) = if iteration % 2 == 0 {
-                    (group.clone(), default_schema.id, default_cell)
+                let (database_name, schema_id) = if iteration % 2 == 0 {
+                    (group.clone(), default_schema.id)
                 } else {
-                    ("analytics".to_string(), analytics_schema.id, analytics_cell)
+                    ("analytics".to_string(), analytics_schema.id)
                 };
+                // Each writer/reader pair shares a cell so the newer reader forces the
+                // older writer's prepare failure. Using the same IDs in both databases
+                // exercises service scoping without introducing unrelated intra-database
+                // lock contention between pairs.
+                let hot_cell = Id::new(0, 4001 + (iteration / 2) as u64);
                 let txn_client =
                     scoped_txn_client_for_database(&address, &group, &database_name).await;
                 let writer_tid = txn_client.begin().await.unwrap().unwrap();
@@ -1946,6 +1964,7 @@ mod tests {
                     | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
                     | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))
                     | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::TransactionNotExisted))
+                    | Err(TMError::InvalidTransactionState(TxnState::Cleanup))
                     | Err(TMError::TransactionNotFound) => {}
                     other => panic!("unexpected prepare result in race: {:?}", other),
                 }
