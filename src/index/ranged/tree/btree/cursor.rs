@@ -1,5 +1,7 @@
 use super::leaf_keys::PackedKeys;
 use super::*;
+use crate::ram::types::Id;
+use std::cell::UnsafeCell;
 
 // Runtime cursor for iteration.
 //
@@ -16,11 +18,14 @@ where
 {
     pub index: usize,
     pub ordering: Ordering,
-    // Page the current snapshot was taken from; kept so callers can mark the
+    // Page the current snapshot came from; kept so callers can mark the
     // page changed for write-back. None once the cursor is exhausted.
     pub page: Option<NodeCellRef>,
     pub marker: PhantomData<(KS, PS)>,
-    pub current: Option<EntryKey>,
+    // Lazily materialized full key for the current position. Filled at most
+    // once per position (write-once discipline keeps &-aliases sound), and
+    // skipped entirely by id-only consumers via next_id.
+    current: UnsafeCell<Option<EntryKey>>,
     pub deletion: Arc<DeletionSet>,
     pub filter_deleted: bool,
     // Snapshot of the current page's keys, in key order.
@@ -94,7 +99,7 @@ where
             ordering,
             page: None,
             marker: PhantomData,
-            current: None,
+            current: UnsafeCell::new(None),
             deletion,
             filter_deleted,
             keys: SnapKeys::empty(),
@@ -122,7 +127,7 @@ where
             ordering,
             page: Some(page),
             marker: PhantomData,
-            current: None,
+            current: UnsafeCell::new(None),
             deletion,
             filter_deleted,
             keys: SnapKeys::Full(keys),
@@ -147,7 +152,7 @@ where
             ordering,
             page: Some(page),
             marker: PhantomData,
-            current: Some(current),
+            current: UnsafeCell::new(Some(current)),
             deletion,
             filter_deleted,
             keys: SnapKeys::empty(),
@@ -157,26 +162,44 @@ where
         }
     }
 
-    // Settle the initial position: establish `current`, moving to the next
-    // page or past deleted keys as needed. Called once, outside any read
-    // closure.
+    // Settle the initial position, moving to the following page or past a
+    // deleted seek hit as needed. Called once, outside any read closure.
+    // Keys materialize lazily on access.
     pub(super) fn initialize(&mut self) {
         if self.lazy {
             // Snapshot-time verdict from the seek closure; iteration relies
             // on snapshot-time filtering throughout.
             if self.current_deleted {
-                self.advance();
+                self.advance(true);
             }
             return;
         }
-        if self.index < self.keys.len() {
-            self.current = Some(self.keys.key(self.index));
-        } else if self.load_following_page() {
-            self.current = Some(self.keys.key(self.index));
-        } else {
-            self.current = None;
+        if self.index >= self.keys.len() && !self.load_following_page() {
             self.page = None;
         }
+    }
+
+    #[inline]
+    fn position_valid(&self) -> bool {
+        self.index < self.keys.len() || unsafe { (*self.current.get()).is_some() }
+    }
+
+    // Fill the current-key cache from the snapshot. At most one write per
+    // position; later calls only read, so references handed out by
+    // `current()` are never invalidated behind the caller's back.
+    #[inline]
+    fn fill_current(&self) {
+        unsafe {
+            let cell = self.current.get();
+            if (*cell).is_none() && self.index < self.keys.len() {
+                *cell = Some(self.keys.key(self.index));
+            }
+        }
+    }
+
+    fn take_current(&mut self) -> Option<EntryKey> {
+        self.fill_current();
+        self.current.get_mut().take()
     }
 
     // Read one page of the sibling chain without side effects on the cursor.
@@ -276,7 +299,7 @@ where
     // correct even if the page changed since the seek.
     fn materialize_tail(&mut self) {
         self.lazy = false;
-        let cur = match &self.current {
+        let cur = match self.current.get_mut() {
             Some(k) => k.clone(),
             None => return,
         };
@@ -377,11 +400,13 @@ where
         }
     }
 
-    // Advance `current` to the next non-deleted key, or None at the end.
-    fn advance(&mut self) {
+    // Move to the following position. `materialize` pre-fills the key cache
+    // (the full-key iteration hot path); id-only traversal skips it.
+    fn advance(&mut self, materialize: bool) {
         if self.lazy {
             self.materialize_tail();
         }
+        *self.current.get_mut() = None;
         loop {
             let stepped = match self.ordering {
                 Ordering::Forward => {
@@ -404,13 +429,16 @@ where
                 }
             };
             if !stepped && !self.load_following_page() {
-                self.current = None;
+                self.keys = SnapKeys::empty();
+                self.index = 0;
                 self.page = None;
                 return;
             }
             // Snapshots are filtered against the deletion set when they are
             // taken; no per-yield lookup is needed.
-            self.current = Some(self.keys.key(self.index));
+            if materialize {
+                *self.current.get_mut() = Some(self.keys.key(self.index));
+            }
             return;
         }
     }
@@ -423,19 +451,46 @@ where
 {
     // Returns the current key and advances to the following one.
     fn next(&mut self) -> Option<EntryKey> {
-        if self.lazy && self.current.is_some() {
-            // Materialize while `current` is still set; it anchors the
+        if self.lazy && self.current.get_mut().is_some() {
+            // Materialize while the anchor key is still set; it anchors the
             // deferred page read.
             self.materialize_tail();
         }
-        let out = self.current.take();
+        // The cache is eagerly refilled by advance(true) on this path, so
+        // the take is a plain move; the build fallback covers a cursor that
+        // last advanced id-only.
+        let out = match self.current.get_mut().take() {
+            Some(k) => Some(k),
+            None if self.index < self.keys.len() => Some(self.keys.key(self.index)),
+            None => None,
+        };
         if out.is_some() {
-            self.advance();
+            self.advance(true);
         }
         out
     }
 
+    // Id-only traversal: skips full key materialization for packed
+    // snapshots (the id is extracted straight from the suffix bytes).
+    fn next_id(&mut self) -> Option<Id> {
+        let id = if let Some(k) = self.current.get_mut() {
+            Some(k.id())
+        } else if self.index < self.keys.len() {
+            Some(match &self.keys {
+                SnapKeys::Packed(p) => p.id_at(self.index),
+                SnapKeys::Full(v) => v[self.index].id(),
+            })
+        } else {
+            None
+        };
+        if id.is_some() {
+            self.advance(false);
+        }
+        id
+    }
+
     fn current(&self) -> Option<&EntryKey> {
-        self.current.as_ref()
+        self.fill_current();
+        unsafe { (*self.current.get()).as_ref() }
     }
 }

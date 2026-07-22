@@ -175,3 +175,27 @@ fn bench_memory_per_key_random() {
         (after - before) as f64 * 1024.0 / n as f64
     );
 }
+
+#[test]
+#[ignore]
+fn bench_scan_ids() {
+    let n = bench_n();
+    let tree = BenchTree::new(&deletion_set());
+    for i in 0..n {
+        tree.insert(&key_of(i));
+    }
+    const ROUNDS: u64 = 10;
+    let start = Instant::now();
+    for _ in 0..ROUNDS {
+        let mut cursor = tree.seek(&min_entry_key(), Ordering::Forward);
+        let mut count = 0u64;
+        let mut sum = 0u64;
+        while let Some(id) = cursor.next_id() {
+            sum = sum.wrapping_add(id.lower);
+            count += 1;
+        }
+        assert_eq!(count, n);
+        std::hint::black_box(sum);
+    }
+    report("scan_ids", n * ROUNDS, start);
+}

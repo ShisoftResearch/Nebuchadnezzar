@@ -55,6 +55,10 @@ pub trait Slice<T: Default>: Send + Sync {
 pub trait Cursor: Send {
     fn next(&mut self) -> Option<EntryKey>;
     fn current(&self) -> Option<&EntryKey>;
+    // Id-only traversal; implementations may skip materializing full keys.
+    fn next_id(&mut self) -> Option<crate::ram::types::Id> {
+        self.next().map(|k| k.id())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]

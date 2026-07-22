@@ -16,7 +16,9 @@
 // crossbeam-epoch — the same swap-and-defer protocol verified in
 // docs/tla/SeqlockReclaim.tla (readers hold no reference past their pinned
 // section, so the refcount-resurrection cases do not apply).
+use crate::index::entry::ID_SIZE;
 use crate::index::{EntryKey, KEY_SIZE};
+use crate::ram::types::Id;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 struct SuffixBuf {
@@ -122,6 +124,33 @@ impl PackedKeys {
             );
         }
         key
+    }
+
+    // Extract only the Id (the key's trailing ID_SIZE bytes) without
+    // materializing the full key: consumers that resolve ids (the common
+    // case) skip one 32-byte reconstruction per yield.
+    #[inline]
+    pub fn id_at(&self, index: usize) -> Id {
+        debug_assert!(index < self.len);
+        const ID_START: usize = KEY_SIZE - ID_SIZE;
+        let mut id_bytes = [0u8; ID_SIZE];
+        let pl = self.prefix_len;
+        if pl > ID_START {
+            // Part (or all) of the id is shared in the prefix.
+            let shared = pl - ID_START;
+            id_bytes[..shared].copy_from_slice(&self.template.as_slice()[ID_START..pl]);
+            let sfx = &self.suffixes[index * self.width..(index + 1) * self.width];
+            id_bytes[shared..].copy_from_slice(sfx);
+        } else {
+            // The id lies entirely inside the suffix.
+            let off = ID_START - pl;
+            let sfx = &self.suffixes[index * self.width..(index + 1) * self.width];
+            id_bytes[..].copy_from_slice(&sfx[off..off + ID_SIZE]);
+        }
+        Id {
+            higher: u64::from_be_bytes(id_bytes[..8].try_into().unwrap()),
+            lower: u64::from_be_bytes(id_bytes[8..].try_into().unwrap()),
+        }
     }
 }
 
@@ -387,6 +416,30 @@ mod tests {
         let right = lk.split_off(1, len);
         assert_eq!(right.key_at(0), key_of(1, 30));
         assert_eq!(right.key_at(1), key_of(2, 5));
+    }
+
+    #[test]
+    fn packed_id_extraction() {
+        // prefix covering part of the id (shared higher half)
+        let keys: Vec<EntryKey> = (0..10u64).map(|n| key_of(7, n * 3)).collect();
+        let lk = LeafKeys::from_keys(&keys, 16);
+        let packed = lk.packed_snapshot(0..10);
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(packed.id_at(i), k.id(), "id mismatch at {}", i);
+            assert_eq!(packed.key(i), *k);
+        }
+        // prefix shorter than the id boundary (diverging higher halves)
+        let keys2: Vec<EntryKey> = (0..10u64).map(|n| key_of(n + 1, n)).collect();
+        let lk2 = LeafKeys::from_keys(&keys2, 16);
+        let packed2 = lk2.packed_snapshot(0..10);
+        for (i, k) in keys2.iter().enumerate() {
+            assert_eq!(packed2.id_at(i), k.id(), "id mismatch at {}", i);
+        }
+        // single key: prefix is the whole key, zero-width suffixes
+        let keys3 = vec![key_of(3, 9)];
+        let lk3 = LeafKeys::from_keys(&keys3, 4);
+        let packed3 = lk3.packed_snapshot(0..1);
+        assert_eq!(packed3.id_at(0), keys3[0].id());
     }
 
     // Differential test against a plain Vec<EntryKey> model.
