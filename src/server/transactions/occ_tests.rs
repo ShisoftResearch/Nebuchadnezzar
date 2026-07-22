@@ -432,3 +432,53 @@ async fn repeatable_blind_remove_missing_errors_immediately() {
     abort_txn(&txn, tid).await;
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn occ_mixed_read_write_prepare_commit_updates_only_changed_cell() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5341";
+    let group = "txn_occ_mixed_read_write_commit";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let read_id = Id::new(0, 90110);
+    let write_id = Id::new(0, 90111);
+
+    let mut read_seed = counter_cell(schema.id, read_id, 3, "counter_mixed_read_seed");
+    runtime.chunks().write_cell(&mut read_seed).unwrap();
+
+    let mut write_seed = counter_cell(schema.id, write_id, 5, "counter_mixed_write_seed");
+    runtime.chunks().write_cell(&mut write_seed).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    let observed_read = accepted_cell(txn.read(tid.clone(), read_id).await.unwrap().unwrap());
+    assert_eq!(observed_read.data, read_seed.data);
+
+    let updated_write = counter_cell(schema.id, write_id, 12, "counter_mixed_write_updated");
+    assert_eq!(
+        txn.update(tid.clone(), updated_write.clone())
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    assert_eq!(
+        txn.prepare(tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(tid.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let persisted_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
+    let persisted_write = runtime.chunks().read_cell(&write_id).unwrap().to_owned();
+    assert_eq!(persisted_read.data, read_seed.data);
+    assert_eq!(score_of(&persisted_write), 12);
+    assert_eq!(persisted_write.data, updated_write.data);
+
+    server.shutdown().await;
+}

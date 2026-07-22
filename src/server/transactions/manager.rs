@@ -890,8 +890,10 @@ impl TransactionManager {
                 let data_site = data_sites.get(server_id).unwrap().clone();
                 let ops: Vec<CommitOp> = objs
                     .iter()
-                    .map(|(cell_id, data_obj)| {
-                        Self::commit_op_for_changed_data_obj(*cell_id, data_obj)
+                    .filter_map(|(cell_id, data_obj)| {
+                        data_obj
+                            .changed
+                            .then(|| Self::commit_op_for_changed_data_obj(*cell_id, data_obj))
                     })
                     .collect();
                 async move {

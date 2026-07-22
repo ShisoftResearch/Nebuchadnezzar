@@ -532,11 +532,21 @@ impl DataManager {
 
         let prepared_cells_num = txn.affected_cells.len();
         let arrived_cells_num = cells.len();
-        if prepared_cells_num != arrived_cells_num {
+        if arrived_cells_num > prepared_cells_num {
             return DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(
                 prepared_cells_num,
                 arrived_cells_num,
             ));
+        }
+        let prepared_cell_ids: BTreeSet<_> = txn.affected_cells.iter().copied().collect();
+        let mut committed_cell_ids = BTreeSet::new();
+        for cell_id in cells.iter().map(Self::commit_op_cell_id) {
+            if !prepared_cell_ids.contains(&cell_id) || !committed_cell_ids.insert(cell_id) {
+                return DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(
+                    prepared_cells_num,
+                    arrived_cells_num,
+                ));
+            }
         }
 
         crate::ram::chunk::set_transaction_context(true);
@@ -759,6 +769,14 @@ impl DataManager {
         }
 
         DMCommitResult::Success
+    }
+
+    fn commit_op_cell_id(op: &CommitOp) -> Id {
+        match op {
+            CommitOp::Write(cell) | CommitOp::Update(cell) => cell.id(),
+            CommitOp::Remove(id) | CommitOp::Read(id, _) => *id,
+            CommitOp::None => panic!("None CommitOp should not appear in data site"),
+        }
     }
 }
 
