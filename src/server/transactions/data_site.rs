@@ -603,7 +603,7 @@ impl DataManager {
             TxnState::Prepared => {}
         };
 
-        if let Err(result) = Self::validate_commit_subset(&txn.affected_cells, &cells) {
+        if let Err(result) = Self::validate_commit_subset(&txn, &cells) {
             return result;
         }
         if let Err(result) = Self::validate_commit_payload(&txn, &cells) {
@@ -888,11 +888,8 @@ impl DataManager {
         DMCommitResult::Success
     }
 
-    fn validate_commit_subset(
-        affected_cells: &[Id],
-        cells: &[CommitOp],
-    ) -> Result<(), DMCommitResult> {
-        let prepared_cells_num = affected_cells.len();
+    fn validate_commit_subset(txn: &Transaction, cells: &[CommitOp]) -> Result<(), DMCommitResult> {
+        let prepared_cells_num = txn.certified.len();
         let arrived_cells_num = cells.len();
         if arrived_cells_num > prepared_cells_num {
             return Err(DMCommitResult::CheckFailed(
@@ -900,18 +897,25 @@ impl DataManager {
             ));
         }
 
-        let prepared_cell_ids: BTreeSet<_> = affected_cells.iter().copied().collect();
         let mut committed_cell_ids = BTreeSet::new();
         for op in cells {
             let cell_id = match Self::commit_op_cell_id(op) {
                 Ok(cell_id) => cell_id,
                 Err(error) => return Err(DMCommitResult::CheckFailed(error)),
             };
-            if !prepared_cell_ids.contains(&cell_id) || !committed_cell_ids.insert(cell_id) {
+            if !txn.certified.contains_key(&cell_id) || !committed_cell_ids.insert(cell_id) {
                 return Err(DMCommitResult::CheckFailed(
                     CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num),
                 ));
             }
+        }
+
+        if txn.certified.iter().any(|(cell_id, op)| {
+            op.intent == PrepareIntent::Write && !committed_cell_ids.contains(cell_id)
+        }) {
+            return Err(DMCommitResult::CheckFailed(
+                CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num),
+            ));
         }
 
         Ok(())
@@ -1979,18 +1983,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_validation_accepts_empty_subset_and_rejects_invalid_mutation_subsets() {
+    async fn commit_validation_requires_certified_writes_and_allows_read_only_empty_commits() {
         let _ = env_logger::try_init();
         let address = "127.0.0.1:5287";
         let group = "txn_data_site_commit_subset_validation";
         let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let affected_a = Id::new(0, 8201);
-        let affected_b = Id::new(0, 8202);
-        let unprepared = Id::new(0, 8203);
+        let write_id = Id::new(0, 8201);
+        let read_id = Id::new(0, 8202);
+        let read_only_id = Id::new(0, 8203);
+        let unprepared = Id::new(0, 8204);
+        let write_version = seed_cell_version(&runtime, schema.id, write_id, 7, 0);
+        let read_version = seed_cell_version(&runtime, schema.id, read_id, 9, 0);
+        let read_only_version = seed_cell_version(&runtime, schema.id, read_only_id, 11, 0);
+
+        let read_only_tid = manager.txn_peer.clock.inc();
+        let read_only_prepare = prepare_ops_local(
+            &manager,
+            0,
+            &read_only_tid,
+            vec![PrepareOp {
+                id: read_only_id,
+                expectation: CellExpectation::Present(read_only_version),
+                intent: PrepareIntent::Read,
+            }],
+        )
+        .await;
+        assert_eq!(read_only_prepare, DMPrepareResult::Success);
+
+        let read_only_before = runtime
+            .chunks()
+            .read_cell(&read_only_id)
+            .unwrap()
+            .to_owned();
+        let read_only_result = <DataManager as Service>::commit(
+            &manager,
+            read_only_tid.clone(),
+            read_only_tid.clone(),
+            vec![],
+        )
+        .await
+        .payload;
+        assert_eq!(read_only_result, DMCommitResult::Success);
+        assert_eq!(
+            manager.txns.get(&read_only_tid).unwrap().lock().state,
+            TxnState::Committed
+        );
+        let read_only_after = runtime
+            .chunks()
+            .read_cell(&read_only_id)
+            .unwrap()
+            .to_owned();
+        assert_eq!(read_only_after.data, read_only_before.data);
+        assert_eq!(
+            read_only_after.header.version,
+            read_only_before.header.version
+        );
 
         let empty_tid = manager.txn_peer.clock.inc();
-        prepare_local_txn(&manager, &empty_tid, vec![affected_a, affected_b]);
+        let empty_prepare = prepare_ops_local(
+            &manager,
+            0,
+            &empty_tid,
+            vec![
+                PrepareOp {
+                    id: write_id,
+                    expectation: CellExpectation::Present(write_version),
+                    intent: PrepareIntent::Write,
+                },
+                PrepareOp {
+                    id: read_id,
+                    expectation: CellExpectation::Present(read_version),
+                    intent: PrepareIntent::Read,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(empty_prepare, DMPrepareResult::Success);
+
+        let empty_before_write = runtime.chunks().read_cell(&write_id).unwrap().to_owned();
+        let empty_before_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
         let empty_result = <DataManager as Service>::commit(
             &manager,
             empty_tid.clone(),
@@ -1999,14 +2073,97 @@ mod tests {
         )
         .await
         .payload;
-        assert_eq!(empty_result, DMCommitResult::Success);
+        assert_eq!(
+            empty_result,
+            DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(2, 0))
+        );
         assert_eq!(
             manager.txns.get(&empty_tid).unwrap().lock().state,
-            TxnState::Committed
+            TxnState::Prepared
         );
+        let empty_after_write = runtime.chunks().read_cell(&write_id).unwrap().to_owned();
+        let empty_after_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
+        assert_eq!(empty_after_write.data, empty_before_write.data);
+        assert_eq!(
+            empty_after_write.header.version,
+            empty_before_write.header.version
+        );
+        assert_eq!(empty_after_read.data, empty_before_read.data);
+        assert_eq!(
+            empty_after_read.header.version,
+            empty_before_read.header.version
+        );
+        assert!(manager
+            .txns
+            .get(&empty_tid)
+            .unwrap()
+            .lock()
+            .history
+            .is_empty());
+        abort_and_end_local(&manager, &empty_tid).await;
+
+        let partial_tid = manager.txn_peer.clock.inc();
+        let partial_prepare = prepare_ops_local(
+            &manager,
+            0,
+            &partial_tid,
+            vec![
+                PrepareOp {
+                    id: write_id,
+                    expectation: CellExpectation::Present(write_version),
+                    intent: PrepareIntent::Write,
+                },
+                PrepareOp {
+                    id: read_id,
+                    expectation: CellExpectation::Present(read_version),
+                    intent: PrepareIntent::Read,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(partial_prepare, DMPrepareResult::Success);
+
+        let partial_before_write = runtime.chunks().read_cell(&write_id).unwrap().to_owned();
+        let partial_before_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
+        let partial_result = <DataManager as Service>::commit(
+            &manager,
+            partial_tid.clone(),
+            partial_tid.clone(),
+            vec![CommitOp::Read(read_id, read_version)],
+        )
+        .await
+        .payload;
+        assert_eq!(
+            partial_result,
+            DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(2, 1))
+        );
+        assert_eq!(
+            manager.txns.get(&partial_tid).unwrap().lock().state,
+            TxnState::Prepared
+        );
+        let partial_after_write = runtime.chunks().read_cell(&write_id).unwrap().to_owned();
+        let partial_after_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
+        assert_eq!(partial_after_write.data, partial_before_write.data);
+        assert_eq!(
+            partial_after_write.header.version,
+            partial_before_write.header.version
+        );
+        assert_eq!(partial_after_read.data, partial_before_read.data);
+        assert_eq!(
+            partial_after_read.header.version,
+            partial_before_read.header.version
+        );
+        assert!(manager
+            .txns
+            .get(&partial_tid)
+            .unwrap()
+            .lock()
+            .history
+            .is_empty());
+        abort_and_end_local(&manager, &partial_tid).await;
 
         let extra_tid = manager.txn_peer.clock.inc();
-        prepare_local_txn(&manager, &extra_tid, vec![affected_a, affected_b]);
+        prepare_local_txn(&manager, &extra_tid, vec![write_id, read_id]);
         let extra_result = <DataManager as Service>::commit(
             &manager,
             extra_tid.clone(),
@@ -2025,12 +2182,12 @@ mod tests {
         );
 
         let duplicate_tid = manager.txn_peer.clock.inc();
-        prepare_local_txn(&manager, &duplicate_tid, vec![affected_a, affected_b]);
+        prepare_local_txn(&manager, &duplicate_tid, vec![write_id, read_id]);
         let duplicate_result = <DataManager as Service>::commit(
             &manager,
             duplicate_tid.clone(),
             duplicate_tid.clone(),
-            vec![CommitOp::Remove(affected_a), CommitOp::Remove(affected_a)],
+            vec![CommitOp::Remove(write_id), CommitOp::Remove(write_id)],
         )
         .await
         .payload;
