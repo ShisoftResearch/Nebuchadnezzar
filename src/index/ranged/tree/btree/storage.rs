@@ -35,8 +35,18 @@ lazy_static! {
 }
 
 fn write_back_worker_count() -> usize {
+    // Scale with the machine: page persistence (to_cell serialization plus a
+    // cell upsert) is the drain bottleneck, and a fixed cap of 8 leaves a
+    // large host almost idle while a big write-back backlog clears. Use about
+    // a quarter of the cores, bounded to keep cell-store contention sane, and
+    // allow an explicit override for tuning.
+    if let Ok(v) = std::env::var("NEB_WRITEBACK_WORKERS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(1);
+        }
+    }
     std::thread::available_parallelism()
-        .map(|n| n.get().clamp(2, 8))
+        .map(|n| (n.get() / 4).clamp(4, 64))
         .unwrap_or(4)
 }
 
