@@ -42,6 +42,11 @@ pub struct TxnPriority {
     pub coordinator_id: u64,
 }
 
+#[derive(Deserialize)]
+struct TxnIdWire {
+    map: Vec<(u64, u64)>,
+}
+
 impl TxnPriority {
     pub fn new(tid: TxnId, coordinator_id: u64) -> Self {
         Self {
@@ -51,7 +56,7 @@ impl TxnPriority {
     }
 
     pub fn compare_age(&self, other: &Self) -> Ordering {
-        match self.tid.relation(&other.tid) {
+        match semantic_relation(&self.tid, &other.tid) {
             Relation::Before => Ordering::Less,
             Relation::After => Ordering::Greater,
             Relation::Equal | Relation::Concurrent => self
@@ -63,6 +68,76 @@ impl TxnPriority {
                 }),
         }
     }
+}
+
+fn semantic_relation(left: &TxnId, right: &TxnId) -> Relation {
+    let left = normalized_clock_entries(left);
+    let right = normalized_clock_entries(right);
+    let mut left_before = false;
+    let mut right_before = false;
+    let mut left_idx = 0;
+    let mut right_idx = 0;
+
+    while left_idx < left.len() || right_idx < right.len() {
+        match (left.get(left_idx), right.get(right_idx)) {
+            (Some((left_key, left_value)), Some((right_key, right_value))) => {
+                if left_key == right_key {
+                    if left_value < right_value {
+                        left_before = true;
+                    } else if left_value > right_value {
+                        right_before = true;
+                    }
+                    left_idx += 1;
+                    right_idx += 1;
+                } else if left_key < right_key {
+                    if *left_value > 0 {
+                        right_before = true;
+                    }
+                    left_idx += 1;
+                } else {
+                    if *right_value > 0 {
+                        left_before = true;
+                    }
+                    right_idx += 1;
+                }
+            }
+            (Some((_, left_value)), None) => {
+                if *left_value > 0 {
+                    right_before = true;
+                }
+                left_idx += 1;
+            }
+            (None, Some((_, right_value))) => {
+                if *right_value > 0 {
+                    left_before = true;
+                }
+                right_idx += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    match (left_before, right_before) {
+        (false, false) => Relation::Equal,
+        (true, false) => Relation::Before,
+        (false, true) => Relation::After,
+        (true, true) => Relation::Concurrent,
+    }
+}
+
+fn normalized_clock_entries(clock: &TxnId) -> Vec<(u64, u64)> {
+    let bytes = bifrost::utils::serde::serialize(clock);
+    let mut wire = bifrost::utils::serde::deserialize::<TxnIdWire>(&bytes)
+        .unwrap_or_else(|| panic!("failed to deserialize TxnId for semantic ordering"));
+    wire.map.sort_unstable_by_key(|(server_id, _)| *server_id);
+    for pair in wire.map.windows(2) {
+        assert_ne!(
+            pair[0].0, pair[1].0,
+            "duplicate TxnId component for server {}",
+            pair[0].0
+        );
+    }
+    wire.map
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
@@ -228,6 +303,7 @@ pub async fn new_async_client_for_database(
 #[cfg(test)]
 mod occ_type_tests {
     use super::{TxnId, TxnPriority};
+    use bifrost::utils::serde::serialize;
     use bifrost::vector_clock::StandardVectorClock;
     use std::cmp::Ordering;
 
@@ -251,5 +327,25 @@ mod occ_type_tests {
 
         assert_eq!(left.compare_age(&right), Ordering::Less);
         assert_eq!(right.compare_age(&left), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_preserves_causal_order_with_missing_components() {
+        let older = TxnPriority::new(clock(&[(1, 1)]), 20);
+        let younger = TxnPriority::new(clock(&[(1, 1), (2, 1)]), 10);
+
+        assert_eq!(older.compare_age(&younger), Ordering::Less);
+        assert_eq!(younger.compare_age(&older), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_totally_orders_same_coordinator_concurrent_clocks_by_tid_bytes() {
+        let left = TxnPriority::new(clock(&[(1, 1)]), 10);
+        let right = TxnPriority::new(clock(&[(2, 1)]), 10);
+        let expected = serialize(&left.tid).cmp(&serialize(&right.tid));
+
+        assert_ne!(expected, Ordering::Equal);
+        assert_eq!(left.compare_age(&right), expected);
+        assert_eq!(right.compare_age(&left), expected.reverse());
     }
 }
