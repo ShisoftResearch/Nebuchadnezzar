@@ -402,3 +402,33 @@ async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
 
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeatable_blind_remove_missing_errors_immediately() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5340";
+    let group = "txn_occ_repeatable_blind_remove_missing";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let missing_id = Id::new(0, 90109);
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    assert_eq!(
+        txn.remove(tid.clone(), missing_id).await.unwrap().unwrap(),
+        TxnExecResult::Error(WriteError::CellDoesNotExisted)
+    );
+
+    let created = counter_cell(schema.id, missing_id, 8, "counter_blind_remove_missing");
+    assert_eq!(
+        txn.write(tid.clone(), created).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    let written = accepted_cell(txn.read(tid.clone(), missing_id).await.unwrap().unwrap());
+    assert_eq!(score_of(&written), 8);
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}

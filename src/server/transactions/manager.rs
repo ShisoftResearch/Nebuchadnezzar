@@ -399,7 +399,29 @@ impl Service for TransactionManager {
                         data_obj.cell = Some(cell);
                         data_obj.changed = true;
                     } else {
-                        let expectation = CellExpectation::Present(cell.header.version);
+                        let server = self
+                            .get_data_site(server_id)
+                            .await
+                            .map_err(|_| TMError::CannotLocateCellServer)?;
+                        let expectation = match self
+                            .observe_version(&server, &tid, id.clone())
+                            .await?
+                        {
+                            TxnExecResult::Accepted(version) => CellExpectation::Present(version),
+                            TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                                return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
+                            }
+                            TxnExecResult::Error(error) => {
+                                return Ok(TxnExecResult::Error(WriteError::ReadError(error)));
+                            }
+                            TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
+                            TxnExecResult::StateError(state) => {
+                                return Ok(TxnExecResult::StateError(state));
+                            }
+                            TxnExecResult::Wait => {
+                                unreachable!("observe_version retries waits before returning")
+                            }
+                        };
                         txn.data.insert(
                             id,
                             DataObject {
@@ -447,12 +469,35 @@ impl Service for TransactionManager {
                             txn.data.remove(&id);
                         }
                     } else {
+                        let server = self
+                            .get_data_site(server_id)
+                            .await
+                            .map_err(|_| TMError::CannotLocateCellServer)?;
+                        let expectation = match self
+                            .observe_version(&server, &tid, id.clone())
+                            .await?
+                        {
+                            TxnExecResult::Accepted(version) => CellExpectation::Present(version),
+                            TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                                return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
+                            }
+                            TxnExecResult::Error(error) => {
+                                return Ok(TxnExecResult::Error(WriteError::ReadError(error)));
+                            }
+                            TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
+                            TxnExecResult::StateError(state) => {
+                                return Ok(TxnExecResult::StateError(state));
+                            }
+                            TxnExecResult::Wait => {
+                                unreachable!("observe_version retries waits before returning")
+                            }
+                        };
                         txn.data.insert(
                             id,
                             DataObject {
                                 server: server_id,
                                 cell: None,
-                                expectation: CellExpectation::Absent,
+                                expectation,
                                 new: false,
                                 changed: true,
                             },
@@ -714,15 +759,32 @@ impl TransactionManager {
             }
         }
     }
+    async fn observe_version(
+        &self,
+        server: &Arc<data_site::AsyncServiceClient>,
+        tid: &TxnId,
+        id: Id,
+    ) -> Result<TxnExecResult<u64, ReadError>, TMError> {
+        Ok(match self.observe_head_from_site(server, tid, &id).await? {
+            TxnExecResult::Accepted(header) => TxnExecResult::Accepted(header.version),
+            TxnExecResult::Rejected => TxnExecResult::Rejected,
+            TxnExecResult::Error(error) => TxnExecResult::Error(error),
+            TxnExecResult::StateError(state) => TxnExecResult::StateError(state),
+            TxnExecResult::Wait => unreachable!("observe_head_from_site retries waits"),
+        })
+    }
     fn generate_affected_objs(&self, txn: &mut TxnGuard) {
+        let has_writes = txn.data.values().any(|data_obj| data_obj.changed);
         let mut affected_objs = AffectedObjs::new();
-        for (id, data_obj) in txn.data.drain() {
-            if data_obj.changed {
+        if has_writes {
+            for (id, data_obj) in txn.data.drain() {
                 affected_objs
                     .entry(data_obj.server)
-                    .or_insert_with(|| BTreeMap::new())
+                    .or_insert_with(BTreeMap::new)
                     .insert(id, data_obj);
             }
+        } else {
+            txn.data.clear();
         }
         txn.affected_objects = affected_objs;
     }
@@ -1159,6 +1221,194 @@ mod tests {
             CommitOp::Update(updated) => assert_eq!(updated.data, cell.data),
             other => panic!("expected update commit op, got {:?}", other),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn affected_objs_retains_read_dependencies_for_rw_transaction() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5297";
+        let group = "txn_manager_affected_objs_rw";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let read_id = Id::new(0, 7101);
+        let write_id = Id::new(0, 7102);
+        let txn_mutex = Mutex::new(Transaction {
+            data: HashMap::from([
+                (
+                    read_id,
+                    DataObject {
+                        server: 1,
+                        cell: Some(counter_cell(1, read_id, 1)),
+                        expectation: CellExpectation::Present(3),
+                        changed: false,
+                        new: false,
+                    },
+                ),
+                (
+                    write_id,
+                    DataObject {
+                        server: 1,
+                        cell: Some(counter_cell(1, write_id, 2)),
+                        expectation: CellExpectation::Present(4),
+                        changed: true,
+                        new: false,
+                    },
+                ),
+            ]),
+            affected_objects: AffectedObjs::new(),
+            state: TxnState::Started,
+            last_activity: get_time(),
+        });
+
+        let mut txn = txn_mutex.lock().await;
+        manager.generate_affected_objs(&mut txn);
+
+        assert!(
+            txn.data.is_empty(),
+            "drained transaction data should be cleared"
+        );
+        let participant = txn
+            .affected_objects
+            .get(&1)
+            .expect("read-write transaction should keep participant dependencies");
+        assert_eq!(participant.len(), 2);
+        assert!(participant.contains_key(&read_id));
+        assert!(participant.contains_key(&write_id));
+
+        drop(txn);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn affected_objs_read_only_transaction_clears_cached_data_locally() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5298";
+        let group = "txn_manager_affected_objs_ro";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let read_id = Id::new(0, 7201);
+        let txn_mutex = Mutex::new(Transaction {
+            data: HashMap::from([(
+                read_id,
+                DataObject {
+                    server: 1,
+                    cell: Some(counter_cell(1, read_id, 3)),
+                    expectation: CellExpectation::Present(8),
+                    changed: false,
+                    new: false,
+                },
+            )]),
+            affected_objects: AffectedObjs::new(),
+            state: TxnState::Started,
+            last_activity: get_time(),
+        });
+
+        let mut txn = txn_mutex.lock().await;
+        manager.generate_affected_objs(&mut txn);
+
+        assert!(
+            txn.data.is_empty(),
+            "read-only transaction cache should be cleared"
+        );
+        assert!(
+            txn.affected_objects.is_empty(),
+            "read-only transaction should not retain participants for prepare"
+        );
+
+        drop(txn);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blind_mutation_records_update_version() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5338";
+        let group = "txn_occ_blind_update_version";
+        let server = start_manager_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_basic_schema(&runtime);
+        let cell_id = Id::new(0, 7301);
+
+        let mut seeded = counter_cell(schema.id, cell_id, 2);
+        runtime.chunks().write_cell(&mut seeded).unwrap();
+        let original = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+
+        let txn = scoped_txn_client_for_database(address, group, group).await;
+        let tid = txn.begin().await.unwrap().unwrap();
+
+        let blind_update = counter_cell(schema.id, cell_id, 7);
+        assert_eq!(
+            txn.update(tid.clone(), blind_update)
+                .await
+                .unwrap()
+                .unwrap(),
+            TxnExecResult::Accepted(())
+        );
+
+        let txn_lock = runtime
+            .txn_manager()
+            .unwrap()
+            .transactions
+            .get(&tid)
+            .expect("transaction should still be live after blind update");
+        let txn_state = txn_lock.lock().await;
+        let data_obj = txn_state
+            .data
+            .get(&cell_id)
+            .expect("blind update should cache the target cell");
+        assert_eq!(
+            data_obj.expectation,
+            CellExpectation::Present(original.header.version)
+        );
+        assert!(data_obj.changed);
+
+        drop(txn_state);
+        let _ = txn.abort(tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blind_mutation_records_remove_version() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5339";
+        let group = "txn_occ_blind_remove_version";
+        let server = start_manager_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_basic_schema(&runtime);
+        let cell_id = Id::new(0, 7302);
+
+        let mut seeded = counter_cell(schema.id, cell_id, 4);
+        runtime.chunks().write_cell(&mut seeded).unwrap();
+        let original = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+
+        let txn = scoped_txn_client_for_database(address, group, group).await;
+        let tid = txn.begin().await.unwrap().unwrap();
+
+        assert_eq!(
+            txn.remove(tid.clone(), cell_id).await.unwrap().unwrap(),
+            TxnExecResult::Accepted(())
+        );
+
+        let txn_lock = runtime
+            .txn_manager()
+            .unwrap()
+            .transactions
+            .get(&tid)
+            .expect("transaction should still be live after blind remove");
+        let txn_state = txn_lock.lock().await;
+        let data_obj = txn_state
+            .data
+            .get(&cell_id)
+            .expect("blind remove should cache the target cell");
+        assert_eq!(
+            data_obj.expectation,
+            CellExpectation::Present(original.header.version)
+        );
+        assert!(data_obj.changed);
+
+        drop(txn_state);
+        let _ = txn.abort(tid).await;
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
