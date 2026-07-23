@@ -109,3 +109,39 @@ and all correctness suites pass.
 Accurate performance work should run on a dedicated idle host. This project's
 controlled loop uses `192.168.10.17` with identical NUMA binding for every
 baseline and candidate; remote execution is intentionally not hardcoded in Rust.
+
+### OCC phase profiling
+
+`occ_phase_profile` is a non-default diagnostic feature. Default builds contain
+no phase clocks or counter updates. Run
+`scripts/check-occ-phase-profile-default.sh` to build the default release
+library object under `target/release/deps/` and confirm that no
+`phase_profile` symbols are present.
+
+Collect profiling data with:
+
+```bash
+NEB_OCC_BENCH_LABEL=phase-profile \
+NEB_OCC_BENCH_REVISION="$(git rev-parse HEAD)" \
+  cargo bench --features occ_phase_profile --bench occ_transactions -- \
+  'occ/independent_rmw/1$'
+```
+
+Each phase reports `total_ns`, `invocation_count`, `ns_per_invocation`, and
+`ns_per_commit`.
+
+Coordinator barriers include participant RPC work, while participant timings are
+nested diagnostics. Never sum participant time into coordinator time. Summed
+phase time may exceed wall-clock time under concurrency and is not a
+percentage.
+
+If a snapshot is requested while phase guards are still active, the snapshot is
+invalid and the code panics instead of publishing partial data. Treat snapshot
+batches as quiescent or otherwise serialize them.
+
+The controlled profiling portfolio is exactly `independent_rmw/1`,
+`hot_rmw/8`, `hot_rmw/32`, `multi_cell/8`, `multi_participant/1`, and
+`multi_participant/4`, run serially on `192.168.10.17` with NUMA node 0
+binding.
+
+Generated profiling artifacts stay under `target/` and are not committed.
