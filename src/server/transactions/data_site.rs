@@ -295,6 +295,10 @@ service! {
     rpc read_selected(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
     rpc read_partial_raw(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>;
     rpc head(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, pin: bool) -> DataSiteResponse<TxnExecResult<CellHeader, ReadError>>;
+    // Release any read pins held for a transaction (partial reads pin versions).
+    // Best-effort and idempotent: called by the coordinator on commit/abort so a
+    // transaction that merely pinned reads on a server does not linger there.
+    rpc release_read_pins(tid: TxnId) -> DataSiteResponse<()>;
     // two phase commit
     rpc prepare(coordinator_id: u64, clock :StandardVectorClock, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
     rpc commit(clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
@@ -1748,6 +1752,74 @@ mod tests {
             "a non-pinning transaction must see the current version B"
         );
         assert_eq!(current_cell.header.version, version_b);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_read_pins_drains_pins_and_wipes_pin_only_transaction() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5359";
+        let group = "txn_data_site_release_read_pins";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99023);
+
+        // Seed a version, then pin it with a partial read (head with pin=true),
+        // which creates a participant transaction holding a segment guard.
+        let mut cell = counter_cell(schema.id, cell_id, 500, "A");
+        let version = runtime.chunks().write_cell(&mut cell).unwrap().version;
+
+        let tid = StandardVectorClock::from_vec(vec![(44, 1)]);
+        let head =
+            <DataManager as Service>::head(&manager, 44, tid.clone(), tid.clone(), cell_id, true)
+                .await
+                .payload;
+        assert!(
+            matches!(head, TxnExecResult::Accepted(ref h) if h.version == version),
+            "partial read must observe the seeded version"
+        );
+
+        // The pin created a participant transaction with a non-empty pin set.
+        // Clone the Arc so we can still inspect the pin set after a wipe removes
+        // the map entry.
+        let txn = manager
+            .find_transaction(&tid)
+            .expect("partial read must create a participant transaction");
+        assert!(
+            !txn.lock().pinned_reads.is_empty(),
+            "partial read must record a pinned read"
+        );
+
+        // Releasing the read pins drains the pin set and, because the transaction
+        // is pin-only (Started, no certified/affected state), wipes it entirely.
+        let released = <DataManager as Service>::release_read_pins(&manager, tid.clone())
+            .await
+            .payload;
+        assert_eq!(released, ());
+        assert!(
+            txn.lock().pinned_reads.is_empty(),
+            "release_read_pins must drain the pinned reads"
+        );
+        assert!(
+            manager.find_transaction(&tid).is_none(),
+            "release_read_pins must wipe a pin-only participant transaction"
+        );
+        assert!(
+            !manager.txns_sorted.lock().contains(&tid),
+            "release_read_pins must drop the txns_sorted entry too"
+        );
+
+        // Releasing an unknown transaction is idempotent and still succeeds.
+        let unknown_tid = StandardVectorClock::from_vec(vec![(45, 9)]);
+        let released_unknown =
+            <DataManager as Service>::release_read_pins(&manager, unknown_tid.clone())
+                .await
+                .payload;
+        assert_eq!(released_unknown, ());
+        assert!(manager.find_transaction(&unknown_tid).is_none());
 
         server.shutdown().await;
     }
@@ -3747,6 +3819,36 @@ impl Service for DataManager {
             Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
+    }
+    /// Releases any read pins held for `tid`, dropping their segment guards.
+    ///
+    /// Called by the coordinator on commit/abort for every server it pinned a
+    /// read on — including servers it never wrote to, which therefore receive no
+    /// `end`. Best-effort and idempotent:
+    /// - If the transaction is absent (stale cleanup already reclaimed it, or it
+    ///   was ended after a write), this is a no-op and still succeeds.
+    /// - If present, its pinned reads are drained. When the transaction is
+    ///   pin-only (state `Started`, with no certified/affected state), it was
+    ///   created solely to hold pins, so it is wiped out entirely — leaving no
+    ///   lingering `Transaction` or `txns_sorted` entry.
+    ///
+    /// Never fails, so a best-effort coordinator release cannot break commit or
+    /// abort. It does not touch cell locks, history, or two-phase-commit state.
+    fn release_read_pins(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<()>> {
+        if let Some(txn_lock) = self.find_transaction(&tid) {
+            let pin_only = {
+                let mut txn = txn_lock.lock();
+                // Dropping the guards here releases the pinned segment references.
+                txn.pinned_reads.drain();
+                txn.state == TxnState::Started
+                    && txn.certified.is_empty()
+                    && txn.affected_cells.is_empty()
+            };
+            if pin_only {
+                self.wipe_out_transaction(&tid);
+            }
+        }
+        self.response_with(())
     }
     // TODO: Link this function in transaction manager
     fn read_partial_raw(

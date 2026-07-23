@@ -11,7 +11,7 @@ use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
 use lightning::map::{Map as LFMapT, PtrHashMap as LFMap};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
@@ -251,6 +251,11 @@ struct Transaction {
     affected_objects: AffectedObjs,
     state: TxnState,
     last_activity: i64, // Unix timestamp in milliseconds for detecting stale transactions
+    /// Server ids on which this transaction pinned a read version (via a partial
+    /// `head(pin=true)` / `read_selected`). Tracked separately from `data` so it
+    /// survives `generate_affected_objs` draining `data`, letting commit/abort
+    /// release those pins even on servers the transaction never wrote to.
+    pinned_servers: HashSet<u64>,
 }
 
 service! {
@@ -494,6 +499,12 @@ impl Service for TransactionManager {
                 }
                 Err(error) => Err(error),
             };
+            // Release read pins on every server this transaction pinned a read on
+            // (read `pinned_servers` before cleanup wipes it). This covers servers
+            // that were only read — they are absent from `affected_objects` and so
+            // are never `sites_end`ed above. Best-effort; never fails the commit.
+            let pinned_servers = std::mem::take(&mut txn.pinned_servers);
+            self.release_pinned_reads(&tid, &pinned_servers).await;
             self.cleanup_transaction_guarded(&tid, &mut txn);
             result
         }
@@ -541,6 +552,12 @@ impl Service for TransactionManager {
                 Err(error) => Err(error),
             };
             if Self::abort_cleanup_complete(&result) {
+                // Release read pins on every server this transaction pinned a read
+                // on (read `pinned_servers` before cleanup wipes it). Servers that
+                // were only read are absent from `affected_objects` and so receive
+                // no abort/end above. Best-effort; never fails the abort.
+                let pinned_servers = std::mem::take(&mut txn.pinned_servers);
+                self.release_pinned_reads(&tid, &pinned_servers).await;
                 self.cleanup_transaction_guarded(&tid, &mut txn);
             }
             result
@@ -559,6 +576,7 @@ impl Service for TransactionManager {
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
                     last_activity: now,
+                    pinned_servers: HashSet::new(),
                 })),
             )
             .is_some()
@@ -1092,6 +1110,11 @@ impl TransactionManager {
                     match dsr.payload {
                         TxnExecResult::Accepted(header) => {
                             let version = header.version;
+                            // The participant pinned the served version and holds
+                            // a segment guard for it. Remember this server so the
+                            // pin is released promptly on commit/abort, even if a
+                            // buffered write later shadows the read locally.
+                            txn.pinned_servers.insert(server_id);
                             if let Some(data_obj) = txn.data.get_mut(id) {
                                 // Read-your-writes: a buffered write/remove shadows the pin.
                                 if data_obj.changed {
@@ -1203,6 +1226,11 @@ impl TransactionManager {
                     match dsr.payload {
                         TxnExecResult::Accepted(projection) => {
                             let version = projection.header.version;
+                            // The participant pinned the served version and holds
+                            // a segment guard for it. Remember this server so the
+                            // pin is released promptly on commit/abort, even if a
+                            // buffered write later shadows the read locally.
+                            txn.pinned_servers.insert(server_id);
                             if let Some(data_obj) = txn.data.get_mut(id) {
                                 // Read-your-writes: a buffered write/remove shadows the pin.
                                 if data_obj.changed {
@@ -1655,6 +1683,30 @@ impl TransactionManager {
         }
         Ok(EndResult::Success)
     }
+    /// Best-effort, idempotent release of read pins on every server this
+    /// transaction pinned a read on. Runs on commit/abort for both read-only and
+    /// read-write transactions: a server the transaction only *read* (pinned) is
+    /// never `sites_end`ed, so its pin (and the pin-only participant transaction)
+    /// would otherwise linger until slow stale cleanup. Individual failures are
+    /// logged at debug and ignored — the participant's stale cleanup remains the
+    /// backstop, and a release must never fail commit/abort.
+    async fn release_pinned_reads(&self, tid: &TxnId, pinned_servers: &HashSet<u64>) {
+        for &server_id in pinned_servers {
+            match self.get_data_site(server_id).await {
+                Ok(data_site) => match data_site.release_read_pins(tid.clone()).await {
+                    Ok(response) => self.merge_clock(&response.clock),
+                    Err(error) => debug!(
+                        "release_read_pins RPC to server {} for {:?} failed: {:?}",
+                        server_id, tid, error
+                    ),
+                },
+                Err(error) => debug!(
+                    "cannot locate server {} to release read pins for {:?}: {:?}",
+                    server_id, tid, error
+                ),
+            }
+        }
+    }
     fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
         if txn.state == state {
             return Ok(());
@@ -1693,6 +1745,7 @@ impl TransactionManager {
     fn cleanup_transaction_guarded(&self, tid: &TxnId, txn: &mut Transaction) {
         txn.data.clear();
         txn.affected_objects.clear();
+        txn.pinned_servers.clear();
         txn.state = TxnState::Cleanup;
         txn.last_activity = get_time();
         let _ = self.transactions.remove(tid);
@@ -2094,6 +2147,7 @@ mod tests {
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
             last_activity: get_time(),
+            pinned_servers: HashSet::new(),
         });
 
         let mut txn = txn_mutex.lock().await;
@@ -2138,6 +2192,7 @@ mod tests {
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
             last_activity: get_time(),
+            pinned_servers: HashSet::new(),
         });
 
         let mut txn = txn_mutex.lock().await;
