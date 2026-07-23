@@ -2186,3 +2186,87 @@ base, and record the rejected hypothesis.
 git add src/server/transactions/data_site.rs
 git commit -m "perf(txn): deduplicate transaction segment guards"
 ```
+
+## Task 13: Share Immutable Write Timestamps Across Committed Cells
+
+**Files:**
+- Modify: `src/server/transactions/data_site.rs:160-180,330-590,718-1020`
+- Test: `src/server/transactions/data_site.rs`
+
+- [ ] **Step 1: Add a failing shared-timestamp test**
+
+Add
+`multi_cell_commit_shares_one_write_timestamp_allocation` in the
+`data_site.rs` test module. On a fresh server, seed two cells, prepare both with
+`Present(version)` write intents, then commit two updates with an RPC clock
+that is causally newer than the transaction ID. Read both `CellMeta` entries
+and assert:
+
+```rust
+assert_eq!(write_a.as_ref(), &newer_commit_clock);
+assert_eq!(write_b.as_ref(), &newer_commit_clock);
+assert!(Arc::ptr_eq(&write_a, &write_b));
+```
+
+End the committed transaction successfully. The value assertions retain the
+effective-timestamp selection and ordering contract; `Arc::ptr_eq` proves both
+cells share one immutable allocation rather than only equal clock values.
+
+- [ ] **Step 2: Run the test and verify RED**
+
+```bash
+cargo test --lib server::transactions::data_site::tests::multi_cell_commit_shares_one_write_timestamp_allocation -- --exact
+```
+
+Expected: the test does not compile against the current owned `TxnId`
+`CellMeta::write` field because it cannot use `Arc::ptr_eq`.
+
+- [ ] **Step 3: Share one immutable timestamp per participant commit**
+
+Change only `CellMeta::write` from `TxnId` to `Arc<TxnId>` and initialize it
+with `Arc::new(TxnId::new())`. Update cleanup and read-timestamp comparisons to
+borrow `meta.write.as_ref()` while preserving the exact vector-clock
+relations.
+
+After all commit payload, owner, and storage prevalidation succeeds, create one
+`Arc<TxnId>` from the effective commit timestamp. The `Write`, `Update`, and
+`Remove` success branches assign `Arc::clone` of that same value to their cell
+metadata. Thomas Write Rule comparisons and debug logging borrow the existing
+clock; do not clone a clock solely for logging.
+
+`CellMeta` is local, nonserialized participant metadata. Do not change
+transaction IDs, RPC payloads, prepare expectations, owner priority, storage
+versions, rollback history, clocks merged from responses, or any distributed
+phase.
+
+- [ ] **Step 4: Verify timestamp ordering and OCC behavior**
+
+```bash
+cargo test --lib server::transactions::data_site::tests::multi_cell_commit_shares_one_write_timestamp_allocation -- --exact
+cargo test --lib server::transactions::data_site::tests::commit_rejects_change_after_certification -- --exact
+cargo test --lib server::transactions::data_site::tests::concurrent_vector_clock_stale_update_rejected_after_committed_peer_changes_version -- --exact
+cargo test --lib server::transactions::data_site::tests::concurrent_clock_wait_die_has_one_younger_requester -- --exact
+git diff --check
+```
+
+Expected: all tests pass, including concurrent-clock ordering and Wait-Die
+tie-breaking behavior.
+
+- [ ] **Step 5: Run the targeted benchmark and retain-or-revert gate**
+
+On `192.168.10.17`, run exact default-feature `occ/multi_cell/8` serially with
+`numactl --cpunodebind=0 --membind=0` against the saved stable baseline.
+Criterion sample mean/derived throughput is canonical, CV must be at most 5%,
+and custom JSON p95 is the latest-batch diagnostic.
+
+Retain only if stable throughput or p95 improves by at least 5%. If it passes,
+run the complete stable portfolio and enforce the aggregate, secondary,
+invariant, unexpected-outcome, and correctness gates. Otherwise preserve the
+audit patch, restore the accepted base, and document the rejection.
+
+- [ ] **Step 6: Commit only an accepted change**
+
+```bash
+git add src/server/transactions/data_site.rs
+git commit -m "perf(txn): share committed write timestamps"
+```
