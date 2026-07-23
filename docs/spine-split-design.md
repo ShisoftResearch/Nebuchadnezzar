@@ -71,3 +71,36 @@ exploration gated on whether the subtree-count change is worth it.
 
 Step 1 is cheap and de-risks the hard part (the recursion). Steps 2–3 are the
 investment, taken only if step 1 validates.
+
+## Balance (all leaves at one depth)
+
+A B+ tree keeps every leaf at the same depth. The spine cut assembles the
+moved side bottom-up as `[boundary child's right part] ++ right siblings` at
+each level. This stays balanced only when the moved part at every level
+combines subtrees of *equal* height. It does **not** when the boundary leaf
+sits mid-page and is the last child of a middle subtree: that side collapses a
+level short, and a higher level then makes it a sibling of a taller subtree —
+leaves at two depths.
+
+Two facts contain this:
+
+1. **The source side has always had this.** Both the spine split and the older
+   leaf-rebuild `split_off` truncate the *source* spine in place, so a
+   mid-subtree pivot can leave the source a level short in either method
+   (measured: 101/400 random pivots for leaf-rebuild). The moved side differs:
+   leaf-rebuild rebuilds it (always balanced), the spine cut shares it.
+2. **The balancer never triggers it.** Migration splits at `mid_key()` — a
+   subtree-boundary separator — so every node on the path moves *whole*. At
+   such pivots both sides are always balanced (tested: 500/500 random trees,
+   both methods).
+
+`split_off_spine` still guards itself: an O(height) read-only pass
+(`simulate_spine_split`) replays the height arithmetic and, if a *mid-leaf*
+pivot would unbalance the moved side, falls back to the balanced leaf-rebuild
+`split_off`. So the spine split is never worse than the proven path on balance,
+and any residual source imbalance (mid-leaf pivots only, never from the
+balancer) self-heals on the next reconstruct from the durable leaf chain.
+
+Tests: `spine_split_no_balance_regression` (moved side always balanced; source
+no worse than leaf-rebuild), `split_at_mid_key_is_balanced_both_methods` (the
+production pivot is always balanced both sides).

@@ -485,14 +485,96 @@ where
     (len, height, first_leaf)
 }
 
-/// Spine-structural split (prototype). Same contract as `split_off` but cuts
-/// the spine in O(height) node touches; `moved_len`/height are still derived by
-/// a validation walk of the moved chain.
+// Read-only simulation of the spine split's height arithmetic. Returns the
+// subtree's full height plus the heights of the moved (right) and kept (left)
+// parts this node would produce, or None if either part would end up with
+// children of differing heights (an unbalanced tree). The spine cut is only
+// balanced when the moved/kept part at every level combines subtrees of equal
+// height; a mid-leaf pivot whose boundary leaf is the last child of a middle
+// subtree collapses one side a level short, which this catches. The migration
+// always splits at a root separator (whole subtrees move) and passes.
+struct SplitSim {
+    full: usize,
+    moved_h: Option<usize>,
+    kept_h: Option<usize>,
+    kept: bool,
+}
+
+fn simulate_spine_split<KS, PS>(node_ref: &NodeCellRef, pivot: &EntryKey) -> Option<SplitSim>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    match &*read_unchecked::<KS, PS>(node_ref) {
+        &NodeData::External(ref n) => {
+            let ki = n.search(pivot);
+            Some(if ki >= n.len {
+                SplitSim { full: 0, moved_h: None, kept_h: Some(0), kept: true }
+            } else if ki == 0 {
+                SplitSim { full: 0, moved_h: Some(0), kept_h: None, kept: false }
+            } else {
+                SplitSim { full: 0, moved_h: Some(0), kept_h: Some(0), kept: true }
+            })
+        }
+        &NodeData::Internal(ref n) => {
+            let index = n.search(pivot);
+            let child = simulate_spine_split::<KS, PS>(&n.ptrs.as_slice_immute()[index], pivot)?;
+            let och = child.full; // children are all this height in a balanced source
+            let full = och + 1;
+            let num_sibs = n.len - index; // ptrs[index+1 ..= len]
+
+            let num_moved = (child.moved_h.is_some() as usize) + num_sibs;
+            let moved_h = if num_moved == 0 {
+                None
+            } else if num_moved == 1 {
+                if child.moved_h.is_some() { child.moved_h } else { Some(och) }
+            } else {
+                if let Some(c) = child.moved_h {
+                    if c != och {
+                        return None; // moved part would mix heights
+                    }
+                }
+                Some(och + 1)
+            };
+
+            let num_kept = index + (child.kept as usize);
+            let kept_h = if num_kept == 0 {
+                None
+            } else if num_kept == 1 {
+                if child.kept { child.kept_h } else { Some(och) }
+            } else {
+                if child.kept {
+                    if child.kept_h != Some(och) {
+                        return None; // kept part would mix heights
+                    }
+                }
+                Some(och + 1)
+            };
+
+            Some(SplitSim { full, moved_h, kept_h, kept: num_kept > 0 })
+        }
+        &NodeData::Empty(ref n) => simulate_spine_split::<KS, PS>(&n.right, pivot),
+        &NodeData::None => {
+            Some(SplitSim { full: 0, moved_h: None, kept_h: None, kept: false })
+        }
+    }
+}
+
+/// Structurally split `tree` at `pivot` in O(height) node touches by cutting the
+/// root-to-pivot spine. Same contract as `split_off`. For pivots that would land
+/// mid-leaf in a way that unbalances the tree (never produced by the balancer,
+/// which splits at a subtree boundary), it falls back to the leaf-rebuild
+/// `split_off`, which is always balanced.
 pub fn split_off_spine<KS, PS>(tree: &BPlusTree<KS, PS>, pivot: &EntryKey) -> Option<SplitOff>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    // Read-only: if the spine cut would unbalance either side, use the proven
+    // leaf-rebuild split instead. The balancer's separator pivots always pass.
+    if simulate_spine_split::<KS, PS>(&tree.get_root(), pivot).is_none() {
+        return split_off::<KS, PS>(tree, pivot);
+    }
     let res = split_node_spine::<KS, PS>(tree, &tree.get_root(), pivot);
     let Some(new_root) = res.right else {
         return None;
