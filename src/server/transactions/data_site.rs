@@ -298,7 +298,7 @@ service! {
     // Release any read pins held for a transaction (partial reads pin versions).
     // Best-effort and idempotent: called by the coordinator on commit/abort so a
     // transaction that merely pinned reads on a server does not linger there.
-    rpc release_read_pins(tid: TxnId) -> DataSiteResponse<()>;
+    rpc release_read_pins(tids: Vec<TxnId>) -> DataSiteResponse<()>;
     // two phase commit
     rpc prepare(coordinator_id: u64, clock :StandardVectorClock, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
     rpc commit(clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
@@ -711,14 +711,12 @@ impl DataManager {
             return Some(location);
         }
 
-        // Capture the current version's address and version. The SharedCell read
-        // guard is dropped at the end of this block, before we take the
-        // transaction lock, to keep critical sections small and avoid holding a
-        // cell guard across the transaction lock.
-        let (addr, version) = {
-            let shared_cell = self.chunks().read_cell(id).ok()?;
-            (shared_cell.cell_guard().get_ptr(), shared_cell.header.version)
-        };
+        // Capture the current version's address and version cheaply: an index
+        // lookup plus a header decode. Materializing the cell value here (e.g.
+        // via `read_cell`) would parse the whole payload just to learn where it
+        // lives, defeating the point of pinning partial reads. The index guard
+        // is released inside the call, before we take the transaction lock.
+        let (addr, version) = self.chunks().cell_location_and_version(id).ok()?;
         let chunk = self.chunks().locate_chunk_by_partition(id.higher);
         let chunk_idx = chunk.id;
         let (segment_id, _seq_id) = chunk.get_cell_segment_info(addr);
@@ -1795,7 +1793,7 @@ mod tests {
 
         // Releasing the read pins drains the pin set and, because the transaction
         // is pin-only (Started, no certified/affected state), wipes it entirely.
-        let released = <DataManager as Service>::release_read_pins(&manager, tid.clone())
+        let released = <DataManager as Service>::release_read_pins(&manager, vec![tid.clone()])
             .await
             .payload;
         assert_eq!(released, ());
@@ -1815,7 +1813,7 @@ mod tests {
         // Releasing an unknown transaction is idempotent and still succeeds.
         let unknown_tid = StandardVectorClock::from_vec(vec![(45, 9)]);
         let released_unknown =
-            <DataManager as Service>::release_read_pins(&manager, unknown_tid.clone())
+            <DataManager as Service>::release_read_pins(&manager, vec![unknown_tid.clone()])
                 .await
                 .payload;
         assert_eq!(released_unknown, ());
@@ -3752,17 +3750,23 @@ impl Service for DataManager {
         // Instrumentation: this is the whole-cell transfer path. Coordinator
         // tests assert header/projection-only reads never reach here.
         FULL_READ_RPC_COUNT.fetch_add(1, Relaxed);
-        if let Err(r) = self.prepare_read(&clock, &tid, &id) {
-            return r;
-        }
         // A full read never creates a pin. It only serves from an existing pin
         // when a prior partial read (head/read_selected) in this transaction
         // already snapshotted the cell, so both reads repeat the same version.
+        // Pinned serves deliberately skip `prepare_read`: the version was
+        // admitted for this transaction when the pin was created, so re-running
+        // the ReadTooLate check or waiting on a committing owner could only
+        // spuriously reject or delay a read whose (immutable) outcome cannot
+        // change.
+        self.update_clock(&clock);
         if let Some(location) = self.existing_read_pin(&tid, &id) {
             return match self.chunks().read_cell_at(&id, location) {
                 Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
             };
+        }
+        if let Err(r) = self.prepare_read(&clock, &tid, &id) {
+            return r;
         }
         match self.chunks().read_cell(&id) {
             Ok(cell) => self.response_with(TxnExecResult::Accepted(cell.to_owned())),
@@ -3777,6 +3781,16 @@ impl Service for DataManager {
         id: Id,
         fields: Vec<u64>,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
+        // Serve an already-pinned cell from its immutable snapshot without
+        // `prepare_read` (see `read` for why re-checking could only spuriously
+        // reject or delay it).
+        self.update_clock(&clock);
+        if let Some(location) = self.existing_read_pin(&tid, &id) {
+            return match self.chunks().read_selected_at(&id, location, &fields[..]) {
+                Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
+                Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
+            };
+        }
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
@@ -3800,13 +3814,25 @@ impl Service for DataManager {
         id: Id,
         pin: bool,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
-        if let Err(r) = self.prepare_read(&clock, &tid, &id) {
-            return r;
-        }
         // A partial read (pin=true) snapshots the read version so the same
         // transaction repeats it. The blind version-observation path (pin=false,
         // e.g. `observe_head_from_site`) must NOT pin or create a transaction; it
         // serves the current header as the original (pre-pinning) code did.
+        if pin {
+            // Serve an already-pinned cell from its immutable snapshot without
+            // `prepare_read` (see `read` for why re-checking could only
+            // spuriously reject or delay it).
+            self.update_clock(&clock);
+            if let Some(location) = self.existing_read_pin(&tid, &id) {
+                return match self.chunks().head_at(&id, location) {
+                    Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
+                    Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
+                };
+            }
+        }
+        if let Err(r) = self.prepare_read(&clock, &tid, &id) {
+            return r;
+        }
         if pin {
             if let Some(location) = self.ensure_read_pin(&tid, &id) {
                 return match self.chunks().head_at(&id, location) {
@@ -3820,11 +3846,13 @@ impl Service for DataManager {
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
     }
-    /// Releases any read pins held for `tid`, dropping their segment guards.
+    /// Releases any read pins held for the given transactions, dropping their
+    /// segment guards.
     ///
-    /// Called by the coordinator on commit/abort for every server it pinned a
-    /// read on — including servers it never wrote to, which therefore receive no
-    /// `end`. Best-effort and idempotent:
+    /// Called by the coordinator's periodic release flusher with a batch of
+    /// completed transactions that pinned reads on this server without writing
+    /// to it (write servers drop their pins in `end`). Best-effort and
+    /// idempotent per transaction:
     /// - If the transaction is absent (stale cleanup already reclaimed it, or it
     ///   was ended after a write), this is a no-op and still succeeds.
     /// - If present, its pinned reads are drained. When the transaction is
@@ -3834,18 +3862,20 @@ impl Service for DataManager {
     ///
     /// Never fails, so a best-effort coordinator release cannot break commit or
     /// abort. It does not touch cell locks, history, or two-phase-commit state.
-    fn release_read_pins(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<()>> {
-        if let Some(txn_lock) = self.find_transaction(&tid) {
-            let pin_only = {
-                let mut txn = txn_lock.lock();
-                // Dropping the guards here releases the pinned segment references.
-                txn.pinned_reads.drain();
-                txn.state == TxnState::Started
-                    && txn.certified.is_empty()
-                    && txn.affected_cells.is_empty()
-            };
-            if pin_only {
-                self.wipe_out_transaction(&tid);
+    fn release_read_pins(&self, tids: Vec<TxnId>) -> BoxFuture<'_, DataSiteResponse<()>> {
+        for tid in tids {
+            if let Some(txn_lock) = self.find_transaction(&tid) {
+                let pin_only = {
+                    let mut txn = txn_lock.lock();
+                    // Dropping the guards here releases the pinned segment references.
+                    txn.pinned_reads.drain();
+                    txn.state == TxnState::Started
+                        && txn.certified.is_empty()
+                        && txn.affected_cells.is_empty()
+                };
+                if pin_only {
+                    self.wipe_out_transaction(&tid);
+                }
             }
         }
         self.response_with(())

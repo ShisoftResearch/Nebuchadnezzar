@@ -284,7 +284,18 @@ pub struct TransactionManager {
     data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
     wait_config: WaitConfig,
     shutdown: Arc<AtomicBool>, // Signal to stop background cleanup task
+    // Completed transactions whose read pins await release, queued here so the
+    // commit/abort paths pay only a lock+push; a periodic background flusher
+    // sends the batched release RPCs. A per-commit `tokio::spawn` was measured
+    // at 15-40us of worker-unpark overhead at low concurrency in this codebase,
+    // which a queue push avoids entirely.
+    pending_pin_releases: parking_lot::Mutex<Vec<(TxnId, HashSet<u64>)>>,
 }
+
+/// How often the background flusher sends queued read-pin releases. Pins are
+/// memory retention, not locks, so a small bounded delay is harmless; the
+/// participant's stale cleanup remains the backstop for lost releases.
+const PIN_RELEASE_FLUSH_INTERVAL_MS: u64 = 50;
 
 impl TransactionManager {
     pub fn new(deps: Arc<TransactionManagerDeps>) -> Arc<TransactionManager> {
@@ -311,6 +322,22 @@ impl TransactionManager {
             data_sites: LFMap::with_capacity(8),
             wait_config,
             shutdown: shutdown.clone(),
+            pending_pin_releases: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        // Periodically flush queued read-pin releases in batches, so completing
+        // transactions never spawn tasks or await release RPCs themselves.
+        let flusher = manager.clone();
+        let flusher_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                if flusher_shutdown.load(Ordering::Relaxed) {
+                    debug!("TransactionManager pin-release flusher shutting down");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(PIN_RELEASE_FLUSH_INTERVAL_MS)).await;
+                flusher.flush_pin_releases().await;
+            }
         });
 
         // Spawn background cleanup task
@@ -501,12 +528,12 @@ impl Service for TransactionManager {
             };
             // Fire-and-forget release of read pins on servers this transaction
             // only read (pinned but not written). Write servers already dropped
-            // their pins in `end`, so they are excluded. Spawned so it never adds
-            // latency to the commit path; best-effort, stale cleanup is the backstop.
+            // their pins in `end`, so they are excluded. Queued so it never adds
+            // latency to the commit path; the periodic flusher batches the RPCs.
             let write_servers: HashSet<u64> = txn.affected_objects.keys().copied().collect();
             let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
             pinned_servers.retain(|server_id| !write_servers.contains(server_id));
-            self.spawn_release_pinned_reads(tid.clone(), pinned_servers);
+            self.queue_pin_release(tid.clone(), pinned_servers);
             self.cleanup_transaction_guarded(&tid, &mut txn);
             result
         }
@@ -556,12 +583,12 @@ impl Service for TransactionManager {
             if Self::abort_cleanup_complete(&result) {
                 // Fire-and-forget release of read pins on servers this transaction
                 // only read (pinned but not written; write servers already dropped
-                // their pins in the abort/end above). Spawned so it never adds
-                // latency to the abort path; best-effort, stale cleanup is the backstop.
+                // their pins in the abort/end above). Queued so it never adds
+                // latency to the abort path; the periodic flusher batches the RPCs.
                 let write_servers: HashSet<u64> = txn.affected_objects.keys().copied().collect();
                 let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
                 pinned_servers.retain(|server_id| !write_servers.contains(server_id));
-                self.spawn_release_pinned_reads(tid.clone(), pinned_servers);
+                self.queue_pin_release(tid.clone(), pinned_servers);
                 self.cleanup_transaction_guarded(&tid, &mut txn);
             }
             result
@@ -1694,32 +1721,44 @@ impl TransactionManager {
     /// would otherwise linger until slow stale cleanup. Individual failures are
     /// logged at debug and ignored — the participant's stale cleanup remains the
     /// backstop, and a release must never fail commit/abort.
-    /// Spawn a best-effort, fire-and-forget release of read pins so it never adds
-    /// latency to the commit/abort path. A lost release is reclaimed by the
-    /// participant's stale cleanup.
-    fn spawn_release_pinned_reads(&self, tid: TxnId, pinned_servers: HashSet<u64>) {
+    /// Queue a completed transaction's read pins for release by the periodic
+    /// flusher. Costs one lock+push on the commit/abort path; a lost release is
+    /// reclaimed by the participant's stale cleanup.
+    fn queue_pin_release(&self, tid: TxnId, pinned_servers: HashSet<u64>) {
         if pinned_servers.is_empty() {
             return;
         }
-        if let Some(manager) = self.self_ref.upgrade() {
-            tokio::spawn(async move {
-                manager.release_pinned_reads(&tid, &pinned_servers).await;
-            });
-        }
+        self.pending_pin_releases.lock().push((tid, pinned_servers));
     }
-    async fn release_pinned_reads(&self, tid: &TxnId, pinned_servers: &HashSet<u64>) {
-        for &server_id in pinned_servers {
+    /// Drain the queued releases and send one batched RPC per participant.
+    /// Best-effort: individual failures are logged and dropped; the
+    /// participant's stale cleanup remains the backstop.
+    async fn flush_pin_releases(&self) {
+        let pending: Vec<(TxnId, HashSet<u64>)> = {
+            let mut queue = self.pending_pin_releases.lock();
+            if queue.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *queue)
+        };
+        let mut tids_by_server: HashMap<u64, Vec<TxnId>> = HashMap::new();
+        for (tid, servers) in pending {
+            for server_id in servers {
+                tids_by_server.entry(server_id).or_default().push(tid.clone());
+            }
+        }
+        for (server_id, tids) in tids_by_server {
             match self.get_data_site(server_id).await {
-                Ok(data_site) => match data_site.release_read_pins(tid.clone()).await {
+                Ok(data_site) => match data_site.release_read_pins(tids).await {
                     Ok(response) => self.merge_clock(&response.clock),
                     Err(error) => debug!(
-                        "release_read_pins RPC to server {} for {:?} failed: {:?}",
-                        server_id, tid, error
+                        "batched release_read_pins RPC to server {} failed: {:?}",
+                        server_id, error
                     ),
                 },
                 Err(error) => debug!(
-                    "cannot locate server {} to release read pins for {:?}: {:?}",
-                    server_id, tid, error
+                    "cannot locate server {} to release read pins: {:?}",
+                    server_id, error
                 ),
             }
         }

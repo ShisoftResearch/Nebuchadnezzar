@@ -618,6 +618,16 @@ impl Chunk {
         header_from_chunk_raw(*CellGuard::for_read(hash, self)?).map(|pair| pair.0)
     }
 
+    // Cheap capture of the current cell's raw address and version: an index
+    // lookup plus a header decode, with no value materialization. Used by
+    // repeatable-read pinning, where parsing the payload just to learn where it
+    // lives would defeat the point of pinning.
+    pub(crate) fn cell_location_and_version(&self, hash: u64) -> Result<(usize, u64), ReadError> {
+        let location = *CellGuard::for_read(hash, self)?;
+        let (header, _) = header_from_chunk_raw(location)?;
+        Ok((location, header.version))
+    }
+
     // By-address header read: decodes the header stored at a caller-pinned raw
     // `location` instead of resolving through the cell index. Used by
     // repeatable-read pinning, where the caller already holds a segment guard
@@ -1708,6 +1718,12 @@ impl Chunks {
     pub fn head_at(&self, key: &Id, location: usize) -> Result<CellHeader, ReadError> {
         let chunk = self.locate_chunk_by_partition(key.higher);
         return chunk.head_at(location);
+    }
+    // Cheap capture of the current cell's raw address and version (index lookup
+    // + header decode, no value materialization). See `Chunk::cell_location_and_version`.
+    pub fn cell_location_and_version(&self, key: &Id) -> Result<(usize, u64), ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.cell_location_and_version(hash);
     }
     pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
