@@ -1015,8 +1015,11 @@ impl TransactionManager {
 
             // Use the transaction's own timestamp for internal blind observations so the
             // read timestamp recorded at the data site cannot advance beyond this tid.
+            // Blind version observation: never pin. Blind update/remove targets
+            // are written, not re-read, so pinning here would waste a segment
+            // guard and needlessly materialize a participant transaction.
             let head_response = server
-                .head(self_server_id, tid.clone(), tid.to_owned(), *id)
+                .head(self_server_id, tid.clone(), tid.to_owned(), *id, false)
                 .await;
             match head_response {
                 Ok(dsr) => {
