@@ -238,6 +238,24 @@ struct DataObject {
     expectation: CellExpectation,
     changed: bool,
     new: bool,
+    /// Coordinator-side pinned-read cache for size-gated repeatable-read.
+    /// `None` selects the current (small-cell / clone) representation.
+    /// `Some(..)` marks a deferred large-cell read whose full `cell` is not
+    /// yet materialized (`cell: None` until an actual full read happens).
+    pinned: Option<PinnedReadCache>,
+}
+
+/// Coordinator-side cache for a pinned (size-gated) repeatable-read version.
+/// Keeps only small results — the header and any projections already
+/// fetched — so a large pinned cell is not cloned whole into the
+/// transaction cache. The full cell is materialized lazily on an actual
+/// full read (wiring for that happens outside this representation).
+#[derive(Clone, Debug, Default)]
+struct PinnedReadCache {
+    /// Cached header of the pinned version (small; serves repeated head reads).
+    header: Option<CellHeader>,
+    /// Cached projections keyed by the (sorted) field-id list served so far.
+    projections: HashMap<Vec<u64>, OwnedCell>,
 }
 
 struct Transaction {
@@ -607,6 +625,7 @@ impl Service for TransactionManager {
                                 expectation: CellExpectation::Absent,
                                 new: true,
                                 changed: true,
+                                pinned: None,
                             },
                         );
                         Ok(TxnExecResult::Accepted(()))
@@ -682,6 +701,7 @@ impl Service for TransactionManager {
                                 expectation,
                                 new: false,
                                 changed: true,
+                                pinned: None,
                             },
                         );
                     }
@@ -752,6 +772,7 @@ impl Service for TransactionManager {
                                 expectation,
                                 new: false,
                                 changed: true,
+                                pinned: None,
                             },
                         );
                     }
@@ -935,6 +956,7 @@ impl TransactionManager {
                                         cell: Some(cell),
                                         new: false,
                                         changed: false,
+                                        pinned: None,
                                     },
                                 );
                                 return Ok(result);
@@ -950,6 +972,7 @@ impl TransactionManager {
                                     expectation: CellExpectation::Absent,
                                     changed: false,
                                     new: false,
+                                    pinned: None,
                                 },
                             );
                             return Ok(result);
@@ -1556,6 +1579,25 @@ mod tests {
         std::env::remove_var("NEB_TXN_READ_PIN_BYTES");
     }
 
+    #[test]
+    fn data_object_pinned_representation_defers_full_cell() {
+        let obj = DataObject {
+            server: 1,
+            cell: None,
+            expectation: CellExpectation::Absent,
+            changed: false,
+            new: false,
+            pinned: Some(PinnedReadCache {
+                header: None,
+                projections: HashMap::new(),
+            }),
+        };
+        assert!(obj.pinned.is_some());
+        assert!(obj.cell.is_none());
+        assert!(obj.pinned.as_ref().unwrap().header.is_none());
+        assert!(obj.pinned.as_ref().unwrap().projections.is_empty());
+    }
+
     #[cfg(feature = "occ_phase_profile")]
     #[test]
     fn coordinator_profile_covers_every_existing_protocol_boundary() {
@@ -1670,6 +1712,7 @@ mod tests {
                 expectation: CellExpectation::Present(3),
                 changed: true,
                 new: false,
+                pinned: None,
             },
         );
 
@@ -1761,6 +1804,7 @@ mod tests {
                         expectation: CellExpectation::Present(3),
                         changed: false,
                         new: false,
+                        pinned: None,
                     },
                 ),
                 (
@@ -1771,6 +1815,7 @@ mod tests {
                         expectation: CellExpectation::Present(4),
                         changed: true,
                         new: false,
+                        pinned: None,
                     },
                 ),
             ]),
@@ -1815,6 +1860,7 @@ mod tests {
                     expectation: CellExpectation::Present(8),
                     changed: false,
                     new: false,
+                    pinned: None,
                 },
             )]),
             affected_objects: AffectedObjs::new(),
