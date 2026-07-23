@@ -305,3 +305,49 @@ cheaper). Later increments, each its own spec:
 - **Engine under active repair.** This increment touches the transaction read
   path and the pin lifecycle, not the cleaner internals or the cell format, so
   it stays clear of the storage-engine areas currently being repaired.
+
+## Benchmark results: 2026-07-23, host 192.168.10.239 (Genoa, 192 cores, 1 NUMA node)
+
+The dedicated benchmark host `192.168.10.17` was unreachable, so measurement ran
+on `192.168.10.239` — a shared machine (load average 1-4 during runs), which
+caps result quality: only `projected_reads/head` and `selected` achieved CV <= 5%;
+the write scenarios were noise-dominated there.
+
+Baseline = pre-pinning branch HEAD (`4ac86c69`), candidate = the pinning feature
+after the review fixes (`0c99f28e`, `adaced90`). Both built and run identically,
+NUMA-bound, sequentially.
+
+Interleaved A/B x3 (means, CV in parentheses):
+
+| Scenario | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| `occ/projected_reads/head` | 30,760 (1.5%) | 32,769 (1.5%) | **+6.5%** |
+| `occ/projected_reads/mixed` | 32,859 (18.9%) | 24,621 (16.6%) | **-25.1%** |
+| `occ/independent_rmw/1` | 37,138 (34.6%) | 43,528 (9.4%) | +17.2% (noise) |
+| `occ/hot_rmw/8` | 25,514 (9.3%) | 29,173 (16.4%) | +14.3% (noise) |
+
+Single-process solo runs of `projected_reads` alone showed a larger head win
+(+71.8%, 49.6k vs 28.9k, p95 -29.5%) and `selected` at -1%; `blind_update/1`
+and `multi_cell/8` were unchanged (-1%, within noise).
+
+Interpretation:
+
+- The head win is real and mechanistic: header reads no longer materialize the
+  64 KiB payload (the review fix replacing `read_cell` with
+  `cell_location_and_version` in `ensure_read_pin` is what unlocked it).
+- The mixed regression is real and **structural**: a partial read followed by a
+  full read costs two RPCs and two parses under deferral, versus the baseline's
+  one prefetching RPC and one parse. In-process, where transfer is nearly free,
+  deferral cannot beat prefetching on that pattern. The win deferral was
+  designed for — avoiding an expensive large-cell *network* transfer — is not
+  exercised by this loopback/in-process benchmark.
+- `selected` is a wash because projecting a field from a large map still walks
+  the stored layout; an early-exit field reader is a possible follow-up.
+- No write-path scenario shows a detectable regression once measured
+  interleaved; pin bookkeeping is skipped entirely on unpinned paths.
+
+Against the acceptance policy (target >= +5%, no secondary scenario worse than
+-3%): `head` clears the target bar, but `mixed` fails the secondary bar by a
+wide margin, so the feature as a whole does not pass the in-process gate. A
+formal verdict for networked deployments would need a multi-host benchmark, and
+stable write-scenario confirmation needs the quiet dedicated host.
