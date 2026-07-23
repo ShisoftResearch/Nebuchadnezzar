@@ -386,3 +386,51 @@ fn structural_split_off_randomized() {
         assert_eq!(moved, exp_moved, "moved partition wrong (n={}, pivot={})", n, pivot_v);
     }
 }
+
+// Spine-structural split must produce the exact same partition as the proven
+// leaf-rebuild split_off, and both trees must verify in order.
+#[test]
+fn spine_split_matches_split_off() {
+    use super::split_off::split_off_spine;
+    use rand::prelude::*;
+    let _ = env_logger::try_init();
+    let mut rng = rand::rng();
+    for _round in 0..300 {
+        let n = rng.random_range(0..400u64);
+        let deletion = deletion_set();
+        let tree = TinyTree::new(&deletion);
+        let mut model: Vec<u64> = Vec::new();
+        for _ in 0..n {
+            let k = rng.random_range(0..2000u64);
+            if !model.contains(&k) {
+                model.push(k);
+                assert!(tree.insert(&key_of(k)));
+            }
+        }
+        model.sort();
+        let pivot_v = rng.random_range(0..2001u64);
+        let pivot = key_of(pivot_v);
+        let res = split_off_spine(&tree, &pivot);
+
+        let mut src: Vec<u64> = vec![];
+        let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
+        while let Some(k) = c.next() {
+            src.push(k.id().lower);
+        }
+        assert!(verification::is_tree_in_order(&tree, 0), "spine src not in order (n={}, pivot={})", n, pivot_v);
+        let mut moved: Vec<u64> = vec![];
+        if let Some(so) = res {
+            let nt = TinyTree::from_root(so.new_root, so.new_head_id, so.moved_len, so.new_height, &deletion);
+            assert!(verification::is_tree_in_order(&nt, 0), "spine moved not in order (n={}, pivot={})", n, pivot_v);
+            let mut c = nt.seek(&min_entry_key(), Ordering::Forward);
+            while let Some(k) = c.next() {
+                moved.push(k.id().lower);
+            }
+            assert_eq!(moved.len(), so.moved_len, "spine moved_len (n={}, pivot={})", n, pivot_v);
+        }
+        let exp_src: Vec<u64> = model.iter().cloned().filter(|&k| key_of(k) < pivot).collect();
+        let exp_moved: Vec<u64> = model.iter().cloned().filter(|&k| key_of(k) >= pivot).collect();
+        assert_eq!(src, exp_src, "spine source partition (n={}, pivot={})", n, pivot_v);
+        assert_eq!(moved, exp_moved, "spine moved partition (n={}, pivot={})", n, pivot_v);
+    }
+}

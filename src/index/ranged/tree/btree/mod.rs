@@ -387,16 +387,16 @@ fn resolve_tree_depth() -> u32 {
     if cached != 0 {
         return cached;
     }
-    // Default depth 2 (~16K keys) keeps each tree small so a structural split
-    // is near-instant and clears its migration marker fast — larger trees make
-    // the O(leaves) spine rebuild slow enough to hold the marker across a
-    // client readback. Raise via NEB_TREE_DEPTH for fewer, larger shards once
-    // the migration marker window is decoupled from the global write-back drain.
+    // Default depth 3 (~2M keys): with the spine-structural split each
+    // migration is ~O(log n) regardless of tree size and the marker window is
+    // decoupled from the global write-back drain, so large shards no longer
+    // stall. Fewer, larger shards mean ~120x fewer migrations for a billion
+    // keys. Tunable via NEB_TREE_DEPTH (clamped 2..=4).
     let d = std::env::var("NEB_TREE_DEPTH")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .map(|d| d.clamp(2, 4))
-        .unwrap_or(2);
+        .unwrap_or(3);
     TREE_DEPTH.store(d, Relaxed);
     d
 }

@@ -199,3 +199,33 @@ fn bench_scan_ids() {
     }
     report("scan_ids", n * ROUNDS, start);
 }
+
+#[test]
+#[ignore]
+fn bench_split_methods() {
+    use super::split_off::{split_off, split_off_spine};
+    let n = bench_n();
+    let mid = key_of(n / 2);
+
+    // leaf-rebuild split
+    let tree = BenchTree::new(&deletion_set());
+    for i in 0..n { tree.insert(&key_of(i)); }
+    let start = Instant::now();
+    let r = split_off(&tree, &mid);
+    let e1 = start.elapsed();
+    let moved1 = r.map(|s| s.moved_len).unwrap_or(0);
+
+    // spine split
+    let tree2 = BenchTree::new(&deletion_set());
+    for i in 0..n { tree2.insert(&key_of(i)); }
+    let start = Instant::now();
+    let r2 = split_off_spine(&tree2, &mid);
+    let e2 = start.elapsed();
+    let moved2 = r2.map(|s| s.moved_len).unwrap_or(0);
+
+    println!(
+        "BENCH split: n={} leaf_rebuild={:.3}ms (moved {}) spine={:.3}ms (moved {})",
+        n, e1.as_secs_f64() * 1000.0, moved1, e2.as_secs_f64() * 1000.0, moved2
+    );
+    assert_eq!(moved1, moved2);
+}

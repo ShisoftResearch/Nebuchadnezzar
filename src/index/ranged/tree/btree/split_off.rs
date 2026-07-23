@@ -256,3 +256,278 @@ where
         &NodeData::None => false,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Spine-structural split prototype (docs/spine-split-design.md).
+//
+// Cuts the root-to-pivot path instead of rebuilding a spine over the moved
+// leaves: each node on the path splits into a left part (kept) and a right
+// part (moved); whole subtrees right of the path move by pointer. O(height)
+// node touches. `moved_len` is still counted by walking the moved leaf chain
+// here — that O(leaves) walk exists only to validate the structure against
+// split_off; the real version needs subtree counts in InNode.
+// ---------------------------------------------------------------------------
+
+struct NodeSplitResult {
+    kept: bool,
+    right: Option<NodeCellRef>,
+    right_first_leaf: Option<NodeCellRef>,
+}
+
+fn build_internal<KS, PS>(
+    ptrs: Vec<NodeCellRef>,
+    keys: Vec<EntryKey>,
+    right_bound: EntryKey,
+) -> NodeCellRef
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    debug_assert_eq!(keys.len() + 1, ptrs.len());
+    let mut innode = InNode::<KS, PS>::new(keys.len(), right_bound);
+    innode.keys = super::internal::InternalKeys::from_keys(&keys);
+    for (i, p) in ptrs.into_iter().enumerate() {
+        innode.ptrs.as_slice()[i] = p;
+    }
+    NodeCellRef::new(Node::with_internal(innode))
+}
+
+fn split_node_spine<KS, PS>(
+    tree: &BPlusTree<KS, PS>,
+    node_ref: &NodeCellRef,
+    pivot: &EntryKey,
+) -> NodeSplitResult
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    match &*read_unchecked::<KS, PS>(node_ref) {
+        &NodeData::External(_) => {
+            let mut node = write_node::<KS, PS>(node_ref);
+            let n = node.extnode_mut(tree);
+            let key_index = n.search(pivot);
+            if key_index >= n.len {
+                // Entirely < pivot; stays. Its right sibling leaves move, so
+                // sever this leaf's forward link.
+                n.next = NodeCellRef::default();
+                drop(node);
+                external::make_changed(node_ref, tree);
+                NodeSplitResult { kept: true, right: None, right_first_leaf: None }
+            } else if key_index == 0 {
+                // Whole leaf moves; it heads the moved chain.
+                let prev_ref = n.prev.clone();
+                n.prev = NodeCellRef::default();
+                let this_ref = node.node_ref().clone();
+                drop(node);
+                if !prev_ref.is_default() {
+                    {
+                        let mut prev = write_node::<KS, PS>(&prev_ref);
+                        if let Some(nx) = prev.right_ref_mut() {
+                            *nx = NodeCellRef::default();
+                        }
+                    }
+                    external::make_changed(&prev_ref, tree);
+                }
+                external::make_changed(&this_ref, tree);
+                NodeSplitResult {
+                    kept: false,
+                    right: Some(this_ref.clone()),
+                    right_first_leaf: Some(this_ref),
+                }
+            } else {
+                // Straddle: left keeps [0..key_index], right = new leaf.
+                let moved_keys = n.keys.to_vec(key_index..n.len);
+                let captured_next = mem::take(&mut n.next);
+                let right_bound = mem::replace(&mut n.right_bound, pivot.clone());
+                n.len = key_index;
+                let new_id = BPlusTree::<KS, PS>::new_page_id();
+                let mut moved_leaf = ExtNode::<KS, PS>::new(new_id, right_bound);
+                moved_leaf.keys = LeafKeys::from_keys(&moved_keys, KS::slice_len());
+                moved_leaf.len = moved_keys.len();
+                moved_leaf.next = captured_next.clone();
+                moved_leaf.prev = NodeCellRef::default();
+                drop(node);
+                let moved_ref = NodeCellRef::new(Node::with_external(moved_leaf));
+                if !captured_next.is_default() {
+                    {
+                        let mut nxt = write_node::<KS, PS>(&captured_next);
+                        if let Some(prev) = nxt.left_ref_mut() {
+                            *prev = moved_ref.clone();
+                        }
+                    }
+                    external::make_changed(&captured_next, tree);
+                }
+                external::make_changed(node_ref, tree);
+                external::make_changed(&moved_ref, tree);
+                NodeSplitResult {
+                    kept: true,
+                    right: Some(moved_ref.clone()),
+                    right_first_leaf: Some(moved_ref),
+                }
+            }
+        }
+        &NodeData::Internal(_) => {
+            // Snapshot the node's pointers and keys under the read.
+            let (index, ptrs, keys, orig_right_bound) = {
+                let g = read_unchecked::<KS, PS>(node_ref);
+                let n = g.innode();
+                let index = n.search(pivot);
+                let ptrs = n.ptrs.as_slice_immute()[..n.len + 1].to_vec();
+                let keys = n.keys.to_vec(n.len);
+                (index, ptrs, keys, n.right_bound.clone())
+            };
+            let child_res = split_node_spine::<KS, PS>(tree, &ptrs[index], pivot);
+
+            // Moved side: [child_res.right?] ++ ptrs[index+1..].
+            let mut right_ptrs: Vec<NodeCellRef> = Vec::new();
+            let mut right_keys: Vec<EntryKey> = Vec::new();
+            if let Some(cr) = child_res.right.clone() {
+                right_ptrs.push(cr);
+            }
+            for i in (index + 1)..ptrs.len() {
+                if !right_ptrs.is_empty() {
+                    // separator preceding ptrs[i] is keys[i-1]
+                    right_keys.push(keys[i - 1].clone());
+                }
+                right_ptrs.push(ptrs[i].clone());
+            }
+            let right = if right_ptrs.is_empty() {
+                None
+            } else if right_ptrs.len() == 1 {
+                Some(right_ptrs.pop().unwrap())
+            } else {
+                Some(build_internal::<KS, PS>(right_ptrs, right_keys, orig_right_bound))
+            };
+
+            // Kept side: ptrs[0..index] ++ (child kept ? ptrs[index] : none).
+            let mut kept_ptrs: Vec<NodeCellRef> = ptrs[..index].to_vec();
+            let kept_keys: Vec<EntryKey>;
+            if child_res.kept {
+                kept_ptrs.push(ptrs[index].clone());
+                // index+1 ptrs, separators keys[0..index]
+                kept_keys = keys[..index].to_vec();
+            } else {
+                // index ptrs, separators keys[0..index-1]
+                kept_keys = if index >= 1 { keys[..index - 1].to_vec() } else { vec![] };
+            }
+
+            let mut node = write_node::<KS, PS>(node_ref);
+            let kept = if kept_ptrs.is_empty() {
+                *node = NodeData::Empty(Box::new(Default::default()));
+                false
+            } else if kept_ptrs.len() == 1 {
+                let child = kept_ptrs[0].clone();
+                *node = NodeData::Empty(Box::new(node::EmptyNode {
+                    left: Some(child.clone()),
+                    right: child,
+                }));
+                true
+            } else {
+                let innode = node.innode_mut();
+                innode.keys = super::internal::InternalKeys::from_keys(&kept_keys);
+                for (i, p) in kept_ptrs.iter().enumerate() {
+                    innode.ptrs.as_slice()[i] = p.clone();
+                }
+                for i in kept_ptrs.len()..(KS::slice_len() + 1) {
+                    innode.ptrs.as_slice()[i] = NodeCellRef::default();
+                }
+                innode.len = kept_ptrs.len() - 1;
+                innode.right = NodeCellRef::default();
+                innode.right_bound = pivot.clone();
+                true
+            };
+            drop(node);
+            NodeSplitResult { kept, right, right_first_leaf: child_res.right_first_leaf }
+        }
+        &NodeData::Empty(ref n) => split_node_spine::<KS, PS>(tree, &n.right, pivot),
+        &NodeData::None => NodeSplitResult { kept: true, right: None, right_first_leaf: None },
+    }
+}
+
+// Returns (moved_len, height, leftmost_leaf) for the moved subtree.
+fn count_and_height<KS, PS>(root: &NodeCellRef) -> (usize, usize, NodeCellRef)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    // height: descend leftmost
+    let mut height = 0;
+    let mut cur = root.clone();
+    loop {
+        let (descend, is_internal) = match &*read_unchecked::<KS, PS>(&cur) {
+            &NodeData::Internal(ref n) => (Some(n.ptrs.as_slice_immute()[0].clone()), true),
+            &NodeData::Empty(ref n) => (Some(n.right.clone()), false),
+            _ => (None, false),
+        };
+        match descend {
+            Some(c) => {
+                if is_internal {
+                    height += 1;
+                }
+                cur = c;
+            }
+            None => break,
+        }
+    }
+    let first_leaf = cur.clone();
+    // count: walk the leaf chain from the leftmost leaf
+    let mut len = 0;
+    let mut leaf = cur;
+    while !leaf.is_default() {
+        let (n_len, next) = match &*read_unchecked::<KS, PS>(&leaf) {
+            &NodeData::External(ref n) => (n.len, n.next.clone()),
+            &NodeData::Empty(ref n) => (0, n.right.clone()),
+            _ => break,
+        };
+        len += n_len;
+        leaf = next;
+    }
+    (len, height, first_leaf)
+}
+
+/// Spine-structural split (prototype). Same contract as `split_off` but cuts
+/// the spine in O(height) node touches; `moved_len`/height are still derived by
+/// a validation walk of the moved chain.
+pub fn split_off_spine<KS, PS>(tree: &BPlusTree<KS, PS>, pivot: &EntryKey) -> Option<SplitOff>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let res = split_node_spine::<KS, PS>(tree, &tree.get_root(), pivot);
+    let Some(new_root) = res.right else {
+        return None;
+    };
+    let (moved_len, new_height, head) = count_and_height::<KS, PS>(&new_root);
+    // The moved chain's head prev pointed back into the source; sever it.
+    if !head.is_default() {
+        {
+            let mut hg = write_node::<KS, PS>(&head);
+            if let Some(prev) = hg.left_ref_mut() {
+                *prev = NodeCellRef::default();
+            }
+        }
+        external::make_changed(&head, tree);
+    }
+    let new_head_id = read_unchecked::<KS, PS>(&head).ext_id();
+    if moved_len == 0 {
+        return None;
+    }
+    if !res.kept {
+        let empty = NodeCellRef::new(Node::<KS, PS>::new_external(
+            tree.head_page_id,
+            max_entry_key(),
+        ));
+        *tree.root.write() = empty;
+        tree.height.store(0, std::sync::atomic::Ordering::Release);
+    } else {
+        let root_ref = tree.get_root();
+        let mut root_guard = write_node::<KS, PS>(&root_ref);
+        if root_guard.is_empty_node() {
+            if let Some(left) = root_guard.left_ref_mut() {
+                *left = NodeCellRef::default();
+            }
+        }
+    }
+    tree.len.fetch_sub(moved_len, std::sync::atomic::Ordering::Release);
+    Some(SplitOff { new_root, new_height, moved_len, new_head_id })
+}
