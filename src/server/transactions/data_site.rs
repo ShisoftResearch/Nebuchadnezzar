@@ -531,6 +531,7 @@ impl DataManager {
         }
 
         // Second pass: re-check and remove (prevents TOCTOU race)
+        let empty_clock = TxnId::new();
         for (cell_id_ref, cell_meta) in cells_to_evict {
             let cell_id = cell_id_ref.deref();
 
@@ -541,6 +542,19 @@ impl DataManager {
                 meta.write < oldest_transaction
                     && meta.read < oldest_transaction
                     && meta.owner.is_none() // Don't evict if locked by a transaction
+                    // Skip metas that have never been stamped (both clocks still
+                    // empty). Such a meta belongs to an in-flight prepare that has
+                    // created it via `cell_meta_mutex` but not yet assigned its
+                    // owner (an insert prepare stamps neither `read` nor `write`
+                    // before acquiring the owner). The owner check above cannot see
+                    // that pending acquisition, and the removal below runs after
+                    // this lock is released, so evicting here would race the
+                    // prepare and orphan the lock it is about to take. Read/observe
+                    // paths stamp `read` before prepare, so update/remove metas are
+                    // never empty at this point; the only cost is that a genuinely
+                    // abandoned empty meta is reclaimed on a later pass (once it is
+                    // stamped or re-accessed) rather than now.
+                    && !(meta.read == empty_clock && meta.write == empty_clock)
             };
 
             if should_evict {
@@ -3258,6 +3272,89 @@ mod tests {
         drop(txn);
 
         abort_and_end_local(&manager, &tid).await;
+        server.shutdown().await;
+    }
+
+    // Regression guard for the `cell_meta_cleanup` orphan race.
+    //
+    // `cell_meta_cleanup`'s second pass checks `owner.is_none()` under the meta
+    // lock but then calls `self.cells.remove` AFTER releasing that lock. An
+    // in-flight INSERT prepare creates its cell meta via `cell_meta_mutex` (empty
+    // read/write clocks, `owner = None`, pushed onto `cell_list`) and only later,
+    // in the same synchronous region, assigns `owner = Some(..)`. Because the
+    // background cleanup task runs on another worker thread (it is signalled on
+    // every transaction `end`, see `cleanup_signal.store(true, ..)`), it could
+    // lock the fresh meta first, evict it, and remove it from `self.cells` before
+    // the prepare acquires the owner — orphaning the acquired lock (the cell map
+    // would then hold no entry, and the next `cell_meta_mutex` would mint a fresh
+    // unowned meta). The orphan is fail-safe rather than a lost update (`write_cell`
+    // rejects a duplicate insert with `CellAlreadyExisted` and the participant
+    // `commit` re-checks `owner`, so the orphaned transaction spuriously aborts
+    // with `CannotEnd`), but it is still an incorrect spurious abort.
+    //
+    // The fix leaves metas whose `read` and `write` clocks are both still empty
+    // (the in-flight-insert window) for a later pass. This test drives the window
+    // deterministically and asserts the owned meta stays map-resident.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cell_meta_cleanup_must_not_orphan_a_lock_being_acquired_by_insert_prepare() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5372";
+        let group = "txn_ds_cleanup_insert_race";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+
+        // The preparing insert transaction is registered exactly as real prepare
+        // does via `get_or_create_transaction`, so the cleanup watermark `oldest`
+        // is this (non-empty) clock. A freshly created insert meta carries empty
+        // read/write clocks, which sort strictly below `oldest`, so only the
+        // racy `owner.is_none()` check stands between it and eviction.
+        let insert_tid = StandardVectorClock::from_vec(vec![(7, 9)]);
+        let _txn = manager.get_or_create_transaction(&insert_tid);
+
+        // Model prepare mid-flight: the meta exists (owner not yet acquired).
+        let insert_id = Id::new(0, 90501);
+        let meta_in_prepare = manager.cell_meta_mutex(&insert_id);
+        assert!(
+            manager.cells.get(&insert_id).is_some(),
+            "precondition: the in-flight insert meta is registered in the cell map"
+        );
+        assert!(
+            meta_in_prepare.lock().owner.is_none(),
+            "precondition: prepare has not yet acquired the owner"
+        );
+
+        // The background cleanup pass runs during that window.
+        manager.cell_meta_cleanup().await;
+
+        // Prepare now finishes acquiring the owner on the meta it created.
+        {
+            let mut meta = meta_in_prepare.lock();
+            meta.owner = Some(TxnPriority::new(insert_tid.clone(), 0));
+            meta.lock_acquired_at = Some(get_time());
+        }
+
+        // Safety property: the cell map must still resolve to the meta prepare
+        // acquired its owner on. If cleanup removed the entry during the window,
+        // a subsequent `cell_meta_mutex` would mint a fresh, unowned meta and the
+        // acquired lock is orphaned.
+        let visible = manager.cells.get(&insert_id);
+        let same_meta = visible
+            .as_ref()
+            .is_some_and(|m| Arc::ptr_eq(m, &meta_in_prepare));
+        assert!(
+            same_meta,
+            "cell_meta_cleanup orphaned the in-flight insert lock: after prepare \
+             acquired its owner, the cell map no longer resolves to that owned meta \
+             (present={}, same_arc={})",
+            visible.is_some(),
+            same_meta
+        );
+        assert_eq!(
+            visible.unwrap().lock().owner,
+            Some(TxnPriority::new(insert_tid, 0)),
+            "the meta visible to other transactions must reflect the acquired owner"
+        );
+
         server.shutdown().await;
     }
 }
