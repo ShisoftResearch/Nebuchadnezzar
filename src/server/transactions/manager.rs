@@ -965,6 +965,8 @@ impl TransactionManager {
         tid: &TxnId,
         id: &Id,
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
         let self_server_id = self.deps.server_id;
