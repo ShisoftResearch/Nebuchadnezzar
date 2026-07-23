@@ -618,6 +618,15 @@ impl Chunk {
         header_from_chunk_raw(*CellGuard::for_read(hash, self)?).map(|pair| pair.0)
     }
 
+    // By-address header read: decodes the header stored at a caller-pinned raw
+    // `location` instead of resolving through the cell index. Used by
+    // repeatable-read pinning, where the caller already holds a segment guard
+    // that keeps the bytes at `location` alive even after the cell index has
+    // moved on to a newer version.
+    pub(crate) fn head_at(&self, location: usize) -> Result<CellHeader, ReadError> {
+        header_from_chunk_raw(location).map(|pair| pair.0)
+    }
+
     // Cheap probe for the current cell's stored entry byte length, without
     // materializing (decoding) its value. Mirrors `head_cell`'s locate path.
     pub(crate) fn cell_stored_len(&self, hash: u64) -> Result<usize, ReadError> {
@@ -628,6 +637,12 @@ impl Chunk {
 
     pub fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
         SharedCell::from_chunk_raw(hash, CellGuard::for_read(hash, self)?, self).map(|(c, _)| c)
+    }
+
+    // By-address full-cell read: materializes the cell exactly as stored at
+    // `location`, bypassing the cell index entirely. See `head_at`.
+    pub fn read_cell_at(&self, hash: u64, location: usize) -> Result<OwnedCell, ReadError> {
+        SharedCellData::from_chunk_raw(hash, location, self).map(|(cell, _)| cell.to_owned())
     }
 
     fn read_selected(
@@ -642,6 +657,18 @@ impl Chunk {
             SharedCellData::from_data(hdr, val),
             loc,
         ))
+    }
+
+    // By-address projected read: same field-projection logic as `read_selected`,
+    // but pinned to `location` instead of following the cell index.
+    fn read_selected_at(
+        &self,
+        location: usize,
+        fields: &[u64],
+        need_header: bool,
+    ) -> Result<OwnedCell, ReadError> {
+        let (val, hdr) = select_from_chunk_raw(location, self, fields, need_header)?;
+        Ok(SharedCellData::from_data(hdr, val).to_owned())
     }
 
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
@@ -1643,6 +1670,14 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
+    // By-address full-cell read: materializes the cell exactly as stored at
+    // `location`, regardless of where the cell index currently points. Used by
+    // repeatable-read pinning to re-read a specific version whose address and
+    // segment guard were captured earlier.
+    pub fn read_cell_at(&self, key: &Id, location: usize) -> Result<OwnedCell, ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.read_cell_at(hash, location);
+    }
     pub fn read_selected(
         &self,
         key: &Id,
@@ -1651,6 +1686,17 @@ impl Chunks {
     ) -> Result<SharedCell<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields, need_header);
+    }
+    // By-address projected read: same field-projection logic as `read_selected`,
+    // pinned to `location` instead of the cell index.
+    pub fn read_selected_at(
+        &self,
+        key: &Id,
+        location: usize,
+        fields: &[u64],
+    ) -> Result<OwnedCell, ReadError> {
+        let chunk = self.locate_chunk_by_partition(key.higher);
+        return chunk.read_selected_at(location, fields, true);
     }
     pub fn read_partial_raw(
         &self,
@@ -1664,6 +1710,12 @@ impl Chunks {
     pub fn head_cell(&self, key: &Id) -> Result<CellHeader, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.head_cell(hash);
+    }
+    // By-address header read: same as `head_cell` but pinned to `location`
+    // instead of resolving through the cell index.
+    pub fn head_at(&self, key: &Id, location: usize) -> Result<CellHeader, ReadError> {
+        let chunk = self.locate_chunk_by_partition(key.higher);
+        return chunk.head_at(location);
     }
     // Cheap probe for a stored cell's total entry byte length, without
     // materializing the value. Used to decide pin-vs-clone by size.
@@ -2045,6 +2097,7 @@ mod tests {
     use super::*;
     use crate::ram::schema::{Field, LocalSchemasCache};
     use crate::ram::types::Map;
+    use bifrost_hasher::hash_str;
     use dovahkiin::types::Type;
     use env_logger;
 
@@ -2098,5 +2151,55 @@ mod tests {
 
         // A missing id returns an error.
         assert!(chunks.cell_stored_len(&Id::new(0, 987654321)).is_err());
+    }
+
+    #[test]
+    fn read_at_returns_pinned_version_after_update() {
+        let _ = env_logger::try_init();
+        let (chunks, schema) = setup_test_chunks();
+
+        let id = Id::new(1, 42);
+        let mut cell = payload_cell(schema.id, &id, 16);
+        chunks.write_cell(&mut cell).unwrap();
+
+        // Capture version A's raw address and its full/selected contents.
+        let addr = {
+            let sc = chunks.read_cell(&id).unwrap();
+            sc.cell_guard().get_ptr()
+        };
+        let full_before = chunks.read_cell(&id).unwrap().to_owned();
+        let selected_before = chunks
+            .read_selected(&id, &[hash_str("data")], true)
+            .unwrap()
+            .to_owned();
+
+        // Update the cell in place: the cell index now serves version B at a
+        // different address.
+        let mut updated = payload_cell(schema.id, &id, 32);
+        chunks.update_cell(&mut updated).unwrap();
+
+        // Sanity check: by-id reads now observe the new version.
+        let full_after = chunks.read_cell(&id).unwrap().to_owned();
+        assert_ne!(full_after.data, full_before.data);
+        assert!(full_after.header.version > full_before.header.version);
+
+        // Reading BY ADDRESS still returns the OLD version (copy-on-write).
+        let pinned = chunks.read_cell_at(&id, addr).unwrap();
+        assert_eq!(pinned.data, full_before.data);
+        assert_eq!(pinned.header.version, full_before.header.version);
+
+        // head_at agrees with the pinned header.
+        let h = chunks.head_at(&id, addr).unwrap();
+        assert_eq!(h.version, full_before.header.version);
+
+        // read_selected_at returns the pinned projection, not the new one.
+        let selected_pinned = chunks
+            .read_selected_at(&id, addr, &[hash_str("data")])
+            .unwrap();
+        assert_eq!(selected_pinned.data, selected_before.data);
+
+        // An invalid (unit) address still errors like the by-id path.
+        assert!(chunks.head_at(&id, 0).is_err());
+        assert!(chunks.read_cell_at(&id, 0).is_err());
     }
 }
