@@ -61,10 +61,7 @@ impl TxnPriority {
             Relation::Equal | Relation::Concurrent => self
                 .coordinator_id
                 .cmp(&other.coordinator_id)
-                .then_with(|| {
-                    bifrost::utils::serde::serialize(&self.tid)
-                        .cmp(&bifrost::utils::serde::serialize(&other.tid))
-                }),
+                .then_with(|| self.tid.deterministic_cmp(&other.tid)),
         }
     }
 }
@@ -232,7 +229,6 @@ pub async fn new_async_client_for_database(
 #[cfg(test)]
 mod occ_type_tests {
     use super::{TxnId, TxnPriority};
-    use bifrost::utils::serde::serialize;
     use bifrost::vector_clock::{Relation, StandardVectorClock};
     use serde_json::json;
     use std::cmp::Ordering;
@@ -274,10 +270,10 @@ mod occ_type_tests {
     }
 
     #[test]
-    fn txn_priority_totally_orders_same_coordinator_concurrent_clocks_by_tid_bytes() {
+    fn txn_priority_totally_orders_same_coordinator_concurrent_clocks_without_serialization() {
         let left = TxnPriority::new(clock(&[(1, 1)]), 10);
         let right = TxnPriority::new(clock(&[(2, 1)]), 10);
-        let expected = serialize(&left.tid).cmp(&serialize(&right.tid));
+        let expected = left.tid.deterministic_cmp(&right.tid);
 
         assert_ne!(expected, Ordering::Equal);
         assert_eq!(left.compare_age(&right), expected);
@@ -310,10 +306,10 @@ mod occ_type_tests {
     }
 
     #[test]
-    fn txn_priority_tie_breaks_semantically_equal_unsorted_zero_clocks_by_tid_bytes() {
+    fn txn_priority_tie_breaks_semantically_equal_unsorted_zero_clocks_by_deterministic_cmp() {
         let left = TxnPriority::new(raw_clock(&[(2, 0), (1, 1)]), 10);
         let right = TxnPriority::new(raw_clock(&[(1, 1), (3, 0)]), 10);
-        let expected = serialize(&left.tid).cmp(&serialize(&right.tid));
+        let expected = left.tid.deterministic_cmp(&right.tid);
 
         assert_eq!(left.tid.relation(&right.tid), Relation::Equal);
         assert_ne!(expected, Ordering::Equal);
