@@ -1242,6 +1242,32 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "occ_phase_profile")]
+    #[test]
+    fn participant_profile_covers_every_existing_protocol_boundary() {
+        let source = include_str!("data_site.rs");
+        let (before_tests, after_test_marker) = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("data_site.rs should contain the private test module");
+        let (_, after_tests) = after_test_marker
+            .split_once("\n}\n\nimpl Service for DataManager {")
+            .expect("data_site.rs should resume production code after the private test module");
+        let production_source =
+            format!("{before_tests}\n\nimpl Service for DataManager {{{after_tests}");
+
+        for phase in [
+            "Phase::ParticipantPrepare",
+            "Phase::ParticipantCommit",
+            "Phase::ParticipantAbort",
+            "Phase::ParticipantEnd",
+        ] {
+            assert!(
+                production_source.contains(phase),
+                "missing participant guard for {phase}"
+            );
+        }
+    }
+
     #[test]
     fn dropped_prepare_delay_handle_removes_its_registration() {
         let id = Id::new(0, 99012);
@@ -3295,6 +3321,9 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
         debug!("PREPARE FOR {:?}, {} ops", &tid, ops.len());
         async move {
+            #[cfg(feature = "occ_phase_profile")]
+            let _phase_guard =
+                super::phase_profile::guard(super::phase_profile::Phase::ParticipantPrepare);
             self.update_clock(&clock);
 
             let prepared_ops = match Self::canonical_prepare_ops(ops) {
@@ -3403,6 +3432,9 @@ impl Service for DataManager {
         tid: TxnId,
         cells: Vec<CommitOp>,
     ) -> BoxFuture<'_, DataSiteResponse<DMCommitResult>> {
+        #[cfg(feature = "occ_phase_profile")]
+        let phase_guard =
+            super::phase_profile::guard(super::phase_profile::Phase::ParticipantCommit);
         self.update_clock(&clock);
 
         let effective_ts = if clock > tid {
@@ -3424,6 +3456,8 @@ impl Service for DataManager {
                 move || self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells)
             });
             return async move {
+                #[cfg(feature = "occ_phase_profile")]
+                let _phase_guard = phase_guard;
                 let (payload, request_results) = scoped_commit.await;
                 let pending_results = IndexBuilder::await_indices().await;
                 self.warn_on_index_wait_results(
@@ -3437,6 +3471,8 @@ impl Service for DataManager {
             .boxed();
         }
 
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = phase_guard;
         self.response_with(self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells))
     }
     fn abort(
@@ -3445,6 +3481,9 @@ impl Service for DataManager {
         tid: TxnId,
     ) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard =
+            super::phase_profile::guard(super::phase_profile::Phase::ParticipantAbort);
         self.update_clock(&clock);
         let Some(txn_lock) = self.find_transaction(&tid) else {
             return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted));
@@ -3519,6 +3558,8 @@ impl Service for DataManager {
         tid: TxnId,
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
         self.update_clock(&clock);
 
         // Option 6: Two-Phase Lock Release with Verification and Retry
