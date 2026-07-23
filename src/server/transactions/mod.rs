@@ -13,6 +13,8 @@ pub mod data_site;
 pub mod manager;
 #[cfg(test)]
 mod occ_tests;
+#[cfg(feature = "occ_phase_profile")]
+pub mod phase_profile;
 #[cfg(test)]
 mod tests;
 pub mod undo_log;

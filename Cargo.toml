@@ -58,6 +58,7 @@ default = [
 
 cleaner = []
 combine_cleaner = ["cleaner"]
+occ_phase_profile = []
 
 # Enable CRC32 checksum verification during eviction and promotion
 debug_verify_checksums = ["tiered_memory"]
