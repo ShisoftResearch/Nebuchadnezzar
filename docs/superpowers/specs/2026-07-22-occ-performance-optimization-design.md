@@ -411,6 +411,31 @@ stable hot-8 p95 regression exceeded the 5% secondary limit, and throughput
 did not improve. The candidate was therefore rejected before the full
 portfolio and preserved only as an audit patch.
 
+### Rejected transaction-segment-guard deduplication attempt
+
+Patch digest `9b0075cd8208` retained only the first
+`SegmentReferenceGuard` for each `(chunk_id, segment_id)` touched by successful
+update and remove operations. Multiple rollback snapshots in the same segment
+remained protected by that one segment-level reference, and the existing
+post-mutation durability loop consequently called `force_wal_sync` once per
+unique retained segment rather than once per mutated cell. Storage
+prevalidation, version-conditional mutation, history and undo capture,
+rollback, ownership checks, and every distributed phase were unchanged.
+
+A focused two-cell test first failed with two retained guards for one old
+segment. After the change it retained one guard, kept both history entries,
+aborted the committed transaction, restored both original values, and advanced
+both rollback versions beyond their committed versions. The existing storage
+prevalidation and post-certification change tests passed. Independent static
+review approved the segment lifetime, rollback, and durability behavior.
+
+The default-feature `occ/multi_cell/8` comparison on `192.168.10.17` was
+stable: base CV was 4.46% and candidate CV was 2.38%. Criterion throughput
+changed -0.60%, while p95 changed from 7.338 ms to 7.350 ms (+0.16%).
+The workload invariant passed and the `unexpected` outcome list was empty.
+Because neither target metric improved by 5%, the candidate was rejected
+before the full portfolio and preserved only as an audit patch.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
