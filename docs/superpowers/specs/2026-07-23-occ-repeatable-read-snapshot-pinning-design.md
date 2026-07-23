@@ -1,4 +1,33 @@
-# OCC Repeatable-Read Snapshot Pinning (Size-Gated)
+# OCC Repeatable-Read Snapshot Pinning
+
+## Design revision (2026-07-23): shape-gated, not size-gated
+
+This design was refined during implementation. The trigger for pinning is the read
+**shape**, not the cell **size**. Pinning exists so a version stays stable for a *later*
+read within the same transaction; the reads that need that are the **partial** ones
+(`head`/`read_selected`), which may be followed by a full read. A full `read` never needs
+it — the coordinator has the whole cell and caches it as today.
+
+Final approach:
+- The participant pins the version it serves on a `head`/`read_selected` (partial) read and
+  serves that transaction's later reads of the cell from the pin; a full `read` does not
+  pin.
+- The coordinator issues **shape-specific** participant RPCs (`head`→`head`,
+  `selected`→`read_selected`, full→`read`), caches the small results, and serves a later
+  full read from the pin. A `head` on a large cell therefore transfers only the header,
+  never the whole cell — that is the `projected_reads` win.
+- No cell-format change and no read-RPC return-type change. The only protocol tweak is a
+  `pin: bool` on the `head` RPC so the blind-update version-observation path
+  (`observe_head_from_site`) passes `false` and stays pin-free.
+- There is no size threshold, size probe, or response envelope. The sections below that
+  describe a size threshold, a `cell_stored_len` probe, or an enriched
+  `{pinned, full_small_cell}` response envelope are **superseded** by this revision; they
+  remain for historical context.
+
+Trade-off: a *transactional partial* read of a *small* cell also pins (briefly, cheap).
+Non-transactional reads and the common small-cell *full* read (rmw, multi_cell) are
+untouched, so the zero-overhead-on-non-transactional property holds and there is no
+small-cell regression in the portfolio.
 
 ## Summary
 

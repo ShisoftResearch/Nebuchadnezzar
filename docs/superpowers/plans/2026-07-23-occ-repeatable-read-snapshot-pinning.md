@@ -12,6 +12,20 @@
 
 ---
 
+## Revision (2026-07-23): shape-gated pinning supersedes the size-gated tasks below
+
+The design was refined to **shape-gated** pinning (pin on `head`/`read_selected`, not on
+full `read`; no size threshold, no response envelope, no cell-format change). See the spec's
+"Design revision" section. Task status under the revision:
+
+- **Done and kept:** Task 1.1 (participant `PinnedReadSet`), Task 1.2 (`read_cell_at`/`head_at`/`read_selected_at`), Task 2.1 (`DataObject.pinned`).
+- **To remove (now unused):** Task 0.1 (`read_pin_threshold_bytes`) and Task 0.2 (`cell_stored_len`) — the shape gate needs no size threshold or probe.
+- **To rework:** Task 1.3 — the participant pins on partial reads (`head` with a new `pin: bool` param, and `read_selected`), not by size; full `read` does not pin; `observe_head_from_site` passes `pin=false`.
+- **Replaces 2.2a/2.2b:** the coordinator issues shape-specific participant RPCs (`head`→`head`, `selected`→`read_selected`, full→`read`), caches small results in `DataObject.pinned`, and serves a later full read from the pin. No RPC return-type change.
+- **Unchanged:** Phase 3 (pin lifecycle), Phase 4 (correctness tests), Phase 5 (benchmark).
+
+Remaining execution order: (R1) rework participant to shape-gated pinning + `head` `pin` flag; (R2) coordinator shape-specific reads; (R3) remove 0.1/0.2 dead code; (R4) Phase 3 lifecycle; (R5) Phase 4 tests; (R6) Phase 5 benchmark. The size-gated task text below is retained for historical context only.
+
 ## File Structure
 
 - `src/server/transactions/manager.rs` — coordinator. `WaitConfig`/new read-pin config, `DataObject` gains a pinned-read representation, `read_cached_full_cell` gains the size-gate branch, coordinator `head`/`read`/`read_selected` serve from the small-result cache or fetch the pinned version, read-only pin release on commit/abort.
