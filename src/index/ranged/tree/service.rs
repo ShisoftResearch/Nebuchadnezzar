@@ -944,18 +944,10 @@ impl TreeService {
                         };
                         let migration_target_id = Id::rand();
                         let source_upper = { dist_tree.prop.read().boundary.upper.clone() };
-                        debug!(
-                            "Creating migration target tree {:?} split at {:?}",
-                            migration_target_id, pivot_key
-                        );
-                        let migration_tree = Arc::new(DistTree::new(
-                            migration_target_id,
-                            RangedTree::create(&client, &migration_target_id).await,
-                            Boundary::new(pivot_key.clone(), source_upper),
-                            None,
-                            INITIAL_TREE_EPOCH,
-                        ));
-                        pending_migrations.insert(migration_target_id, migration_tree.clone());
+                        // Freeze the source before touching its structure: with
+                        // the marker set, apply_in_ranged_tree returns Migrating
+                        // and rejects writes, so no writer races the split
+                        // (docs/tla/StructuralSplit.tla).
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();
                             dist_tree_prop.migration = Some(Migration {
@@ -973,38 +965,38 @@ impl TreeService {
                                 dist_tree.id, e
                             );
                         }
-                        let buffer_size = MIGRATE_SIZE << 4;
-                        // Move only the upper half. The source tree is frozen
-                        // for the whole migration window (writes get
-                        // OpResult::Migrating and retry against fresh
-                        // placement), so a single bulk pass captures
-                        // everything — no reconcile re-scan is needed. Seek
-                        // straight to the pivot instead of scanning (and
-                        // skipping) the entire lower half that stays behind.
-                        let mut cursor = tree.seek(&pivot_key, Ordering::Forward);
-                        let mut entry_buffer = Vec::with_capacity(buffer_size);
+                        // Structural split: re-parent the leaves >= pivot into a
+                        // new tree sharing the source's leaf nodes — O(leaves)
+                        // instead of copying every key. This also truncates the
+                        // source, so no separate retain pass is needed.
                         debug!(
-                            "Start moving keys from {:?} to {:?}",
-                            dist_tree.id, migration_target_id
+                            "Structurally splitting {:?} at {:?} into {:?}",
+                            dist_tree.id, pivot_key, migration_target_id
                         );
-                        // next() yields the current key (the first >= pivot
-                        // after the seek) and advances, so this walks every
-                        // key from the pivot to the end exactly once.
-                        while let Some(entry) = cursor.next() {
-                            debug_assert!(entry >= pivot_key);
-                            entry_buffer.push(entry);
-                            if entry_buffer.len() >= buffer_size {
-                                entry_buffer.dedup();
-                                debug!("Merging entry buffer, size {}", entry_buffer.len());
-                                migration_tree.tree.merge_keys(entry_buffer);
-                                entry_buffer = Vec::with_capacity(buffer_size);
+                        let Some((moved_tree, moved_len)) = tree.split_off(&pivot_key, &client)
+                        else {
+                            // Nothing moved (pivot past every key); undo the
+                            // marker and try again later.
+                            warn!(
+                                "Structural split of {:?} moved no keys; clearing marker",
+                                dist_tree.id
+                            );
+                            {
+                                let mut dist_prop = dist_tree.prop.write();
+                                dist_prop.migration = None;
                             }
-                        }
-                        entry_buffer.dedup();
-                        if !entry_buffer.is_empty() {
-                            debug!("Merging last batch of keys, size {}", entry_buffer.len());
-                            migration_tree.tree.merge_keys(entry_buffer);
-                        }
+                            let _ = tree.mark_migration(&dist_tree.id, None, &client).await;
+                            continue;
+                        };
+                        debug!("Structural split moved {} keys", moved_len);
+                        let migration_tree = Arc::new(DistTree::new(
+                            migration_target_id,
+                            moved_tree,
+                            Boundary::new(pivot_key.clone(), source_upper),
+                            None,
+                            INITIAL_TREE_EPOCH,
+                        ));
+                        pending_migrations.insert(migration_target_id, migration_tree.clone());
                         debug!("Waiting for new tree {:?} persisted", migration_target_id);
                         storage::wait_until_updated().await;
 
@@ -1120,49 +1112,20 @@ impl TreeService {
                         } else {
                             split_backoff_until.remove(&dist_tree.id);
                         }
-                        // Update routing state on the source tree immediately; actual pruning runs in the background.
+                        // The structural split already truncated the source, so
+                        // there is no background retain to run. Update routing
+                        // and clear the migration marker in place.
                         {
                             let mut dist_prop = dist_tree.prop.write();
                             dist_prop.boundary.upper = pivot_key.clone();
                             dist_prop.epoch += 1;
+                            dist_prop.migration = None;
                         }
-                        let source_tree = dist_tree.clone();
-                        let pivot_for_retain = pivot_key.clone();
-                        let client_for_retain = client.clone();
-                        let pending_migrations = pending_migrations.clone();
-                        tokio::spawn(async move {
-                            let retain_tree = source_tree.clone();
-                            let retain_pivot = pivot_for_retain.clone();
-                            let retain_result = tokio::task::spawn_blocking(move || {
-                                retain_tree.tree.retain(&retain_pivot);
-                            })
-                            .await;
-                            if let Err(e) = retain_result {
-                                warn!(
-                                    "Background retain failed for tree {:?}: {:?}",
-                                    source_tree.id, e
-                                );
-                                return;
-                            }
-
-                            storage::wait_until_updated().await;
-                            {
-                                let mut dist_prop = source_tree.prop.write();
-                                dist_prop.migration = None;
-                            }
-                            debug!("Unmark migration {:?}", source_tree.id);
-                            if let Err(e) = source_tree
-                                .tree
-                                .mark_migration(&source_tree.id, None, &client_for_retain)
-                                .await
-                            {
-                                warn!(
-                                    "Failed to publish retained tree {:?}: {:?}",
-                                    source_tree.id, e
-                                );
-                            }
-                            pending_migrations.remove(&migration_target_id);
-                        });
+                        storage::wait_until_updated().await;
+                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
+                            warn!("Failed to publish split source tree {:?}: {:?}", dist_tree.id, e);
+                        }
+                        pending_migrations.remove(&migration_target_id);
                         debug!(
                             "LSM tree migration from {:?} to {:?} succeed in {:?}",
                             dist_tree.id,

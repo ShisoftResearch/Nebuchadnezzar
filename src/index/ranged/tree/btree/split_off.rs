@@ -79,9 +79,13 @@ where
 }
 
 // Walk the moved leaf chain starting at `head`, fixing the head's prev to Nil
-// and feeding every leaf to the constructor in order. Counts moved keys.
-fn capture_moved_chain<KS, PS>(head: NodeCellRef, ctx: &mut SplitCtx<KS, PS>)
-where
+// and feeding every leaf to the constructor in order. Counts moved keys. Only
+// the head's pointers change, so only it is marked for write-back.
+fn capture_moved_chain<KS, PS>(
+    tree: &BPlusTree<KS, PS>,
+    head: NodeCellRef,
+    ctx: &mut SplitCtx<KS, PS>,
+) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
@@ -97,8 +101,7 @@ where
                         // the internal chain links stay intact for the new tree.
                         n.prev = NodeCellRef::default();
                     }
-                    let next = n.next.clone();
-                    (next, n.len, n.keys.key_at(0), true)
+                    (n.next.clone(), n.len, n.keys.key_at(0), true)
                 }
                 // The moved chain is a leaf chain; nothing else should appear.
                 _ => {
@@ -109,6 +112,10 @@ where
         };
         if !is_ext {
             break;
+        }
+        if first {
+            // The head's prev pointer changed; persist it.
+            external::make_changed(&cur, tree);
         }
         if len > 0 {
             if first {
@@ -143,7 +150,7 @@ where
                 // right of it moves; sever and capture.
                 let moved_first = mem::take(&mut n.next);
                 drop(node);
-                capture_moved_chain::<KS, PS>(moved_first, ctx);
+                capture_moved_chain::<KS, PS>(tree, moved_first, ctx);
                 return true;
             }
             if key_index == 0 {
@@ -158,12 +165,15 @@ where
                 // Sever the source predecessor's forward link into the moved
                 // chain, if this leaf was not the source head.
                 if !prev_ref.is_default() {
-                    let mut prev = write_node::<KS, PS>(&prev_ref);
-                    if let Some(nx) = prev.right_ref_mut() {
-                        *nx = NodeCellRef::default();
+                    {
+                        let mut prev = write_node::<KS, PS>(&prev_ref);
+                        if let Some(nx) = prev.right_ref_mut() {
+                            *nx = NodeCellRef::default();
+                        }
                     }
+                    external::make_changed(&prev_ref, tree);
                 }
-                capture_moved_chain::<KS, PS>(this_ref, ctx);
+                capture_moved_chain::<KS, PS>(tree, this_ref, ctx);
                 return false;
             }
             // The leaf straddles pivot: keys[0..key_index] stay, keys[key_index..]
@@ -183,12 +193,15 @@ where
             // The leaf that followed the boundary now sits behind the freshly
             // created head; repoint its back-link into the new tree.
             if !captured_next.is_default() {
-                let mut nxt = write_node::<KS, PS>(&captured_next);
-                if let Some(prev) = nxt.left_ref_mut() {
-                    *prev = moved_ref.clone();
+                {
+                    let mut nxt = write_node::<KS, PS>(&captured_next);
+                    if let Some(prev) = nxt.left_ref_mut() {
+                        *prev = moved_ref.clone();
+                    }
                 }
+                external::make_changed(&captured_next, tree);
             }
-            capture_moved_chain::<KS, PS>(moved_ref, ctx);
+            capture_moved_chain::<KS, PS>(tree, moved_ref, ctx);
             true
         }
         &NodeData::Internal(ref n) => {

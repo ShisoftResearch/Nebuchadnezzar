@@ -285,6 +285,25 @@ impl RangedTree {
         self.tree.merge_with_keys(keys);
     }
 
+    /// Structurally split off keys `>= pivot` into a new tree that shares this
+    /// tree's leaf nodes — O(leaves) instead of copying every key. The caller
+    /// must hold this tree frozen (migration marker) so no writer races the
+    /// split. Returns the new tree and how many keys moved, or None if nothing
+    /// moves. The new tree shares this tree's deletion set: the key ranges are
+    /// disjoint, so a tombstone only affects the one tree that holds its key.
+    pub fn split_off(&self, pivot: &EntryKey, client: &Arc<AsyncClient>) -> Option<(RangedTree, usize)> {
+        let so = super::btree::split_off::split_off(&self.tree, pivot)?;
+        let mut new_tree = DiskTree::from_root(
+            so.new_root,
+            so.new_head_id,
+            so.moved_len,
+            so.new_height,
+            &self.tree.deletion,
+        );
+        new_tree.set_writeback_client(client);
+        Some((RangedTree { tree: new_tree }, so.moved_len))
+    }
+
     /// Get ideal capacity for this tree
     pub fn ideal_capacity(&self) -> usize {
         self.tree.ideal_capacity() * 2
