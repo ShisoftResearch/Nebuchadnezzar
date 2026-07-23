@@ -997,9 +997,15 @@ impl TreeService {
                             INITIAL_TREE_EPOCH,
                         ));
                         pending_migrations.insert(migration_target_id, migration_tree.clone());
-                        debug!("Waiting for new tree {:?} persisted", migration_target_id);
-                        storage::wait_until_updated().await;
-
+                        // No global write-back drain here: the new tree's leaf
+                        // cells are already durable (they are the source's
+                        // shared leaves), mark_migration below writes its
+                        // metadata cell synchronously, and the O(1) seam-pointer
+                        // changes persist asynchronously (recovery reconstructs
+                        // forward from the head, tolerating a stale head prev).
+                        // Waiting for the whole insert backlog would hold the
+                        // source's migration marker for minutes and fail client
+                        // readbacks against a "migrating" tree.
                         debug!(
                             "Publishing new tree {:?} head before placement split",
                             migration_target_id
@@ -1114,14 +1120,17 @@ impl TreeService {
                         }
                         // The structural split already truncated the source, so
                         // there is no background retain to run. Update routing
-                        // and clear the migration marker in place.
+                        // and clear the migration marker in place. No global
+                        // drain: the metadata cell is written synchronously
+                        // below and the seam-pointer changes persist async, so
+                        // the serial balancer is not stalled on the whole
+                        // write-back backlog after every migration.
                         {
                             let mut dist_prop = dist_tree.prop.write();
                             dist_prop.boundary.upper = pivot_key.clone();
                             dist_prop.epoch += 1;
                             dist_prop.migration = None;
                         }
-                        storage::wait_until_updated().await;
                         if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
                             warn!("Failed to publish split source tree {:?}: {:?}", dist_tree.id, e);
                         }
