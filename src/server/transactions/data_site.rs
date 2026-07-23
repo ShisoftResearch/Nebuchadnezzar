@@ -16,7 +16,7 @@ use lightning::linked_list::LinkedList;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -173,6 +173,45 @@ pub struct CellMeta {
     lock_acquired_at: Option<i64>, // timestamp when lock was acquired (milliseconds since epoch)
 }
 
+/// A single pinned read: the location of a specific version of a cell within
+/// its segment, together with the version number that was pinned.
+#[derive(Clone, Copy, Debug)]
+struct PinnedRead {
+    location: usize,
+    version: u64,
+}
+
+/// Per-transaction record of pinned reads for large cells. When a transaction
+/// reads a LARGE cell under repeatable-read semantics, the participant pins
+/// that specific version (holding a segment reference guard) and remembers
+/// its location here, instead of the coordinator cloning the whole cell.
+///
+/// The guard is `Option` so a pin can be recorded (e.g. in tests) without
+/// necessarily holding a live segment reference.
+#[derive(Default)]
+struct PinnedReadSet {
+    entries: HashMap<Id, (PinnedRead, Option<SegmentReferenceGuard>)>,
+}
+
+impl PinnedReadSet {
+    fn insert(&mut self, id: Id, pin: PinnedRead, guard: Option<SegmentReferenceGuard>) {
+        self.entries.insert(id, (pin, guard));
+    }
+
+    fn get(&self, id: &Id) -> Option<&PinnedRead> {
+        self.entries.get(id).map(|(pin, _)| pin)
+    }
+
+    /// Empties the set, dropping any held segment guards.
+    fn drain(&mut self) {
+        self.entries.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 struct Transaction {
     state: TxnState,
     affected_cells: Vec<Id>,
@@ -183,6 +222,8 @@ struct Transaction {
     /// RAII guards that hold segment references during this transaction
     /// Automatically released when guards are dropped (no leak risk)
     segment_guards: Vec<SegmentReferenceGuard>,
+    /// Pinned versions of LARGE cells read under repeatable-read semantics.
+    pinned_reads: PinnedReadSet,
 }
 
 #[derive(Debug)]
@@ -330,6 +371,7 @@ impl DataManager {
                 last_activity: get_time(),
                 history: BTreeMap::new(),
                 segment_guards: Vec::with_capacity(4), // Pre-allocate for common case
+                pinned_reads: PinnedReadSet::default(),
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -1246,6 +1288,25 @@ mod tests {
     use futures::future::join_all;
     use lightning::map::Map as LFMapTrait;
     use std::sync::Arc;
+
+    #[test]
+    fn pinned_read_set_records_and_returns_entry() {
+        let mut set = PinnedReadSet::default();
+        set.insert(
+            Id::new(0, 42),
+            PinnedRead {
+                location: 0x1000,
+                version: 7,
+            },
+            None,
+        );
+        assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.version), Some(7));
+        assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.location), Some(0x1000));
+        assert!(set.get(&Id::new(0, 99)).is_none());
+        assert!(!set.is_empty());
+        set.drain();
+        assert!(set.is_empty());
+    }
 
     #[test]
     fn scoped_data_manager_service_ids_differ_between_databases() {
