@@ -268,6 +268,38 @@ performance claim. The next participant-commit iteration targets redundant
 canonical-ID lookup structures, which does not move the point at which storage
 or rollback state is observed.
 
+### Rejected commit-lookup-structure attempt
+
+The next candidate, patch digest `5258f0483495`, removed the commit and abort
+`BTreeSet` union rebuild, retained the sorted certified IDs created by prepare,
+and combined commit subset and payload validation into one linear pass.
+Malformed, duplicate, and unsorted commit RPC payloads were rejected before
+ownership or storage work. The coordinator remains compatible because it
+generates participant operations from an ID-keyed `BTreeMap`.
+
+The new canonical-order test failed before the production change and passed
+afterward. Seven focused commit, storage-prevalidation, stale-version, and
+rollback tests passed, and an independent static review found no loss of
+certification, owner-lock, rollback, or distributed-phase guarantees.
+
+Default-feature release benchmarks ran serially on `192.168.10.17`, pinned to
+NUMA node 0. Every reported workload invariant passed and every `unexpected`
+outcome list was empty. The stable comparisons were:
+
+| Scenario | Base CV | Candidate CV | Throughput change | Base p95 | Candidate p95 | p95 change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `occ/independent_rmw/1` | 2.00% | 2.30% | +4.42% | 107.567 us | 97.512 us | -9.35% |
+| `occ/multi_cell/8` | 4.46% | 2.48% | +0.81% | 7.338 ms | 7.248 ms | -1.24% |
+| `occ/hot_rmw/8` | 2.74% | 4.29% | -2.39% | 304.384 us | 349.777 us | +14.91% |
+| `occ/hot_rmw/32` | 3.13% | 2.87% | -4.94% | 21.527 ms | 22.756 ms | +5.71% |
+
+`occ/multi_participant/1` remained above the 5% CV limit in all three base
+runs (8.57%, 6.44%, and 6.05%) and was excluded from the retain/revert
+calculation. Across the four stable scenarios, geometric-mean throughput
+decreased 0.59%. The candidate therefore failed both the portfolio geometric
+mean gate and the secondary throughput/p95 limits. It was quarantined without
+a production commit despite improving independent-transaction p95 latency.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
