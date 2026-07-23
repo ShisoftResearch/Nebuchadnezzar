@@ -653,6 +653,66 @@ impl DataManager {
         return Ok(());
     }
 
+    /// Repeatable-read pinning for LARGE cells.
+    ///
+    /// Must be called AFTER `prepare_read` has succeeded (so the cell-meta lock
+    /// is already released). Returns `Some(location)` when the read should be
+    /// served from a specific stored version (a raw segment address), or `None`
+    /// when the caller should fall back to a normal current read.
+    ///
+    /// Behavior:
+    /// - If this transaction already pinned the cell, returns that pinned
+    ///   location so the read repeats the original version even if the current
+    ///   cell has since advanced.
+    /// - Otherwise, if the current cell is larger than the pin threshold, it
+    ///   captures the current version's address, acquires a segment reference
+    ///   guard to keep it alive, records the pin on a (created-if-needed)
+    ///   participant transaction, and returns that address.
+    /// - If the cell is small, does not exist, or the guard cannot be acquired,
+    ///   returns `None` (no pin, no transaction created for the small case).
+    fn ensure_read_pin(&self, tid: &TxnId, id: &Id) -> Option<usize> {
+        // Serve an already-pinned cell from its pin (repeatability). The
+        // transaction lock is taken briefly and released before returning.
+        if let Some(txn_lock) = self.find_transaction(tid) {
+            if let Some(pin) = txn_lock.lock().pinned_reads.get(id).copied() {
+                return Some(pin.location);
+            }
+        }
+
+        // Size gate: cheap stored-length probe, no value materialization.
+        let stored_len = self.chunks().cell_stored_len(id).ok()?;
+        if stored_len <= super::manager::read_pin_threshold_bytes() {
+            return None;
+        }
+
+        // Large cell: capture the current version's address and version. The
+        // SharedCell read guard is dropped at the end of this block, before we
+        // take the transaction lock, to keep critical sections small and avoid
+        // holding a cell guard across the transaction lock.
+        let (addr, version) = {
+            let shared_cell = self.chunks().read_cell(id).ok()?;
+            (shared_cell.cell_guard().get_ptr(), shared_cell.header.version)
+        };
+        let chunk = self.chunks().locate_chunk_by_partition(id.higher);
+        let chunk_idx = chunk.id;
+        let (segment_id, _seq_id) = chunk.get_cell_segment_info(addr);
+
+        // Keep the pinned version's segment alive for the transaction's lifetime.
+        // If it cannot be acquired (segment freed/evicted), fall back gracefully.
+        let guard = self.acquire_segment_guard(chunk_idx, segment_id)?;
+
+        let txn_lock = self.get_or_create_transaction(tid);
+        let mut txn = txn_lock.lock();
+        // A concurrent read for the same transaction may have pinned first; keep
+        // the earliest pin so all reads remain mutually repeatable.
+        if let Some(existing) = txn.pinned_reads.get(id).copied() {
+            return Some(existing.location);
+        }
+        txn.pinned_reads
+            .insert(*id, PinnedRead { location: addr, version }, Some(guard));
+        Some(addr)
+    }
+
     /// Attempt to release locks for a transaction
     /// Returns (number of locks released, Vec of failures)
     /// Option 5: Ensures metadata isn't cleaned up while locks are held
@@ -1451,6 +1511,18 @@ mod tests {
         OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
     }
 
+    // A cell whose stored length is well above the default 4096-byte read-pin
+    // threshold. The multi-KiB `name` payload makes the participant pin the read
+    // version; `score` is a small, distinct marker used to tell versions apart.
+    fn large_cell(schema_id: u32, id: Id, score: u64, marker: &str) -> OwnedCell {
+        let mut data = OwnedMap::new();
+        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("score"), OwnedValue::U64(score));
+        let payload = format!("{}-{}", marker, "x".repeat(8192));
+        data.insert(&String::from("name"), OwnedValue::String(payload));
+        OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
+    }
+
     fn seed_cell_version(
         runtime: &Arc<crate::server::DatabaseRuntime>,
         schema_id: u32,
@@ -1568,6 +1640,90 @@ mod tests {
             .payload;
 
         assert_eq!(result, DMPrepareResult::NotRealizable);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_cell_read_is_pinned_and_repeatable_across_an_update() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5361";
+        let group = "txn_data_site_pinned_large_read";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99021);
+
+        // Seed version A (a LARGE cell so the participant pins the read version).
+        let score_a: u64 = 100;
+        let mut cell_a = large_cell(schema.id, cell_id, score_a, "A");
+        let version_a = runtime.chunks().write_cell(&mut cell_a).unwrap().version;
+
+        let tid = StandardVectorClock::from_vec(vec![(41, 1)]);
+
+        // First head pins version A for this transaction.
+        let head_a = <DataManager as Service>::head(&manager, 41, tid.clone(), tid.clone(), cell_id)
+            .await
+            .payload;
+        let header_a = match head_a {
+            TxnExecResult::Accepted(header) => header,
+            other => panic!("expected head to be accepted, got {:?}", other),
+        };
+        assert_eq!(header_a.version, version_a);
+
+        // Externally advance the cell to version B (a distinct LARGE payload).
+        let score_b: u64 = 200;
+        let mut cell_b = large_cell(schema.id, cell_id, score_b, "B");
+        let version_b = runtime.chunks().update_cell(&mut cell_b).unwrap().version;
+        assert_ne!(version_a, version_b);
+
+        // The pinning transaction must still observe version A on read.
+        let read_pinned =
+            <DataManager as Service>::read(&manager, 41, tid.clone(), tid.clone(), cell_id)
+                .await
+                .payload;
+        let pinned_cell = match read_pinned {
+            TxnExecResult::Accepted(cell) => cell,
+            other => panic!("expected read to be accepted, got {:?}", other),
+        };
+        assert_eq!(
+            *pinned_cell.data["score"].u64().unwrap(),
+            score_a,
+            "pinned read must serve version A's data, not version B's"
+        );
+        assert_eq!(
+            pinned_cell.header.version, version_a,
+            "pinned read must serve version A, not version B"
+        );
+
+        // And a subsequent head from the same transaction is still version A.
+        let head_again =
+            <DataManager as Service>::head(&manager, 41, tid.clone(), tid.clone(), cell_id)
+                .await
+                .payload;
+        let header_again = match head_again {
+            TxnExecResult::Accepted(header) => header,
+            other => panic!("expected head to be accepted, got {:?}", other),
+        };
+        assert_eq!(header_again.version, version_a);
+
+        // A different transaction, never having pinned, sees the current version B.
+        let other_tid = StandardVectorClock::from_vec(vec![(42, 1)]);
+        let read_current =
+            <DataManager as Service>::read(&manager, 42, other_tid.clone(), other_tid.clone(), cell_id)
+                .await
+                .payload;
+        let current_cell = match read_current {
+            TxnExecResult::Accepted(cell) => cell,
+            other => panic!("expected read to be accepted, got {:?}", other),
+        };
+        assert_eq!(
+            *current_cell.data["score"].u64().unwrap(),
+            score_b,
+            "a non-pinning transaction must see the current version B"
+        );
+        assert_eq!(current_cell.header.version, version_b);
+
         server.shutdown().await;
     }
 
@@ -3433,12 +3589,17 @@ impl Service for DataManager {
         id: Id,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
-            r
-        } else {
-            match self.chunks().read_cell(&id) {
-                Ok(cell) => self.response_with(TxnExecResult::Accepted(cell.to_owned())),
+            return r;
+        }
+        if let Some(location) = self.ensure_read_pin(&tid, &id) {
+            return match self.chunks().read_cell_at(&id, location) {
+                Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-            }
+            };
+        }
+        match self.chunks().read_cell(&id) {
+            Ok(cell) => self.response_with(TxnExecResult::Accepted(cell.to_owned())),
+            Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
     }
     fn read_selected(
@@ -3451,6 +3612,12 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
+        }
+        if let Some(location) = self.ensure_read_pin(&tid, &id) {
+            return match self.chunks().read_selected_at(&id, location, &fields[..]) {
+                Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
+                Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
+            };
         }
         match self.chunks().read_selected(&id, &fields[..], true) {
             // Need header for version check
@@ -3467,6 +3634,12 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
+        }
+        if let Some(location) = self.ensure_read_pin(&tid, &id) {
+            return match self.chunks().head_at(&id, location) {
+                Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
+                Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
+            };
         }
         match self.chunks().head_cell(&id) {
             Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
