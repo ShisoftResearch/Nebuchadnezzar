@@ -250,6 +250,24 @@ plan must return without mutation. The candidate is retained only if the
 targeted stable benchmark improves by at least 5% and the complete correctness
 and non-regression gates pass.
 
+### Rejected storage-prevalidation-reuse attempt
+
+The first implementation attempt was rejected during correctness review before
+remote benchmarking. It captured rollback cells, segment guards, and undo-log
+restore coordinates during the early all-operations validation pass. A
+nontransactional remove and recreate can reuse the same stored version (a new
+cell starts at version 1 and its first write stores version 2). The final
+version predicate could therefore accept that replacement while abort recovery
+restored the older prevalidation snapshot and coordinates.
+
+Preserving rollback correctness requires capturing the overwritten cell,
+location, segment guard, and undo record from the final storage mutation guard,
+not from the earlier observation. That change would broaden the iteration into
+a storage mutation API redesign, so the candidate was quarantined without a
+performance claim. The next participant-commit iteration targets redundant
+canonical-ID lookup structures, which does not move the point at which storage
+or rollback state is observed.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
