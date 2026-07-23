@@ -11,14 +11,21 @@ use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
 use lightning::map::{Map as LFMapT, PtrHashMap as LFMap};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::Weak;
 use std::time::Duration;
+use tokio::sync::oneshot;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
@@ -32,6 +39,140 @@ pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
         "TXN_MANAGER_RPC_SERVICE-{}-{}",
         group, database_name
     ))
+}
+
+#[cfg(test)]
+struct PrepareResultObserverState {
+    observed: AtomicBool,
+    notify: Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct PrepareResultObserverHandle {
+    key: (TxnId, Id),
+    state: Arc<PrepareResultObserverState>,
+}
+
+#[cfg(test)]
+impl PrepareResultObserverHandle {
+    pub(crate) async fn wait_until_observed(&self) {
+        let notified = self.state.notify.notified();
+        if self.state.observed.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+#[cfg(test)]
+impl Drop for PrepareResultObserverHandle {
+    fn drop(&mut self) {
+        let mut observers = prepare_result_observers().lock();
+        let owns_registration = observers
+            .get(&self.key)
+            .map(|state| Arc::ptr_eq(state, &self.state))
+            .unwrap_or(false);
+        if owns_registration {
+            observers.remove(&self.key);
+        }
+        self.state.observed.store(true, Ordering::SeqCst);
+        self.state.notify.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+static PREPARE_RESULT_OBSERVERS: OnceLock<
+    parking_lot::Mutex<BTreeMap<(TxnId, Id), Arc<PrepareResultObserverState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn prepare_result_observers(
+) -> &'static parking_lot::Mutex<BTreeMap<(TxnId, Id), Arc<PrepareResultObserverState>>> {
+    PREPARE_RESULT_OBSERVERS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_prepare_result_observer(tid: TxnId, id: Id) -> PrepareResultObserverHandle {
+    let key = (tid, id);
+    let state = Arc::new(PrepareResultObserverState {
+        observed: AtomicBool::new(false),
+        notify: Notify::new(),
+    });
+    prepare_result_observers()
+        .lock()
+        .insert(key.clone(), state.clone());
+    PrepareResultObserverHandle { key, state }
+}
+
+#[cfg(test)]
+struct AbortEntryDelayState {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    released: AtomicBool,
+    released_notify: Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct AbortEntryDelayHandle {
+    tid: TxnId,
+    state: Arc<AbortEntryDelayState>,
+}
+
+#[cfg(test)]
+impl AbortEntryDelayHandle {
+    pub(crate) async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    pub(crate) fn release(&self) {
+        if !self.state.released.swap(true, Ordering::SeqCst) {
+            self.state.released_notify.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AbortEntryDelayHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = abort_entry_delay_hooks().lock();
+        let owns_registration = hooks
+            .get(&self.tid)
+            .map(|state| Arc::ptr_eq(state, &self.state))
+            .unwrap_or(false);
+        if owns_registration {
+            hooks.remove(&self.tid);
+        }
+    }
+}
+
+#[cfg(test)]
+static ABORT_ENTRY_DELAY_HOOKS: OnceLock<
+    parking_lot::Mutex<BTreeMap<TxnId, Arc<AbortEntryDelayState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn abort_entry_delay_hooks(
+) -> &'static parking_lot::Mutex<BTreeMap<TxnId, Arc<AbortEntryDelayState>>> {
+    ABORT_ENTRY_DELAY_HOOKS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_abort_entry_delay(tid: TxnId) -> AbortEntryDelayHandle {
+    let state = Arc::new(AbortEntryDelayState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    abort_entry_delay_hooks()
+        .lock()
+        .insert(tid.clone(), state.clone());
+    AbortEntryDelayHandle { tid, state }
 }
 
 /// Dependencies needed by TransactionManager, extracted from NebServer to break cyclic dependency
@@ -82,9 +223,27 @@ impl Default for WaitConfig {
 struct DataObject {
     server: u64,
     cell: Option<OwnedCell>,
-    version: Option<u64>,
+    expectation: CellExpectation,
     changed: bool,
     new: bool,
+    /// Coordinator-side pinned-read cache for size-gated repeatable-read.
+    /// `None` selects the current (small-cell / clone) representation.
+    /// `Some(..)` marks a deferred large-cell read whose full `cell` is not
+    /// yet materialized (`cell: None` until an actual full read happens).
+    pinned: Option<PinnedReadCache>,
+}
+
+/// Coordinator-side cache for a pinned (size-gated) repeatable-read version.
+/// Keeps only small results — the header and any projections already
+/// fetched — so a large pinned cell is not cloned whole into the
+/// transaction cache. The full cell is materialized lazily on an actual
+/// full read (wiring for that happens outside this representation).
+#[derive(Clone, Debug, Default)]
+struct PinnedReadCache {
+    /// Cached header of the pinned version (small; serves repeated head reads).
+    header: Option<CellHeader>,
+    /// Cached projections keyed by the (sorted) field-id list served so far.
+    projections: HashMap<Vec<u64>, OwnedCell>,
 }
 
 struct Transaction {
@@ -92,6 +251,11 @@ struct Transaction {
     affected_objects: AffectedObjs,
     state: TxnState,
     last_activity: i64, // Unix timestamp in milliseconds for detecting stale transactions
+    /// Server ids on which this transaction pinned a read version (via a partial
+    /// `head(pin=true)` / `read_selected`). Tracked separately from `data` so it
+    /// survives `generate_affected_objs` draining `data`, letting commit/abort
+    /// release those pins even on servers the transaction never wrote to.
+    pinned_servers: HashSet<u64>,
 }
 
 service! {
@@ -113,13 +277,25 @@ dispatch_rpc_service_functions!(TransactionManager);
 service_with_id!(TransactionManager, DEFAULT_SERVICE_ID);
 
 pub struct TransactionManager {
+    self_ref: Weak<TransactionManager>,
     deps: Arc<TransactionManagerDeps>,
     transactions: LFMap<TxnId, TxnMutex>,
     txn_ids: parking_lot::Mutex<BTreeSet<TxnId>>, // Track TxnIds for iteration (PtrHashMap doesn't support iteration)
     data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
     wait_config: WaitConfig,
     shutdown: Arc<AtomicBool>, // Signal to stop background cleanup task
+    // Completed transactions whose read pins await release, queued here so the
+    // commit/abort paths pay only a lock+push; a periodic background flusher
+    // sends the batched release RPCs. A per-commit `tokio::spawn` was measured
+    // at 15-40us of worker-unpark overhead at low concurrency in this codebase,
+    // which a queue push avoids entirely.
+    pending_pin_releases: parking_lot::Mutex<Vec<(TxnId, HashSet<u64>)>>,
 }
+
+/// How often the background flusher sends queued read-pin releases. Pins are
+/// memory retention, not locks, so a small bounded delay is harmless; the
+/// participant's stale cleanup remains the backstop for lost releases.
+const PIN_RELEASE_FLUSH_INTERVAL_MS: u64 = 50;
 
 impl TransactionManager {
     pub fn new(deps: Arc<TransactionManagerDeps>) -> Arc<TransactionManager> {
@@ -138,13 +314,30 @@ impl TransactionManager {
         wait_config: WaitConfig,
     ) -> Arc<TransactionManager> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let manager = Arc::new(Self {
+        let manager = Arc::new_cyclic(|self_ref| Self {
+            self_ref: self_ref.clone(),
             deps,
             transactions: LFMap::with_capacity(128),
             txn_ids: parking_lot::Mutex::new(BTreeSet::new()),
             data_sites: LFMap::with_capacity(8),
             wait_config,
             shutdown: shutdown.clone(),
+            pending_pin_releases: parking_lot::Mutex::new(Vec::new()),
+        });
+
+        // Periodically flush queued read-pin releases in batches, so completing
+        // transactions never spawn tasks or await release RPCs themselves.
+        let flusher = manager.clone();
+        let flusher_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                if flusher_shutdown.load(Ordering::Relaxed) {
+                    debug!("TransactionManager pin-release flusher shutting down");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(PIN_RELEASE_FLUSH_INTERVAL_MS)).await;
+                flusher.flush_pin_releases().await;
+            }
         });
 
         // Spawn background cleanup task
@@ -185,6 +378,66 @@ impl TransactionManager {
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         Ok(())
     }
+
+    fn spawn_prepare_lifecycle(
+        &self,
+        tid: TxnId,
+    ) -> Result<
+        (
+            oneshot::Receiver<Result<TMPrepareResult, TMError>>,
+            oneshot::Sender<()>,
+        ),
+        TMError,
+    > {
+        let manager = self.self_ref.upgrade().ok_or(TMError::Other)?;
+        let (result_sender, result_receiver) = oneshot::channel();
+        let (ack_sender, ack_receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let result = manager.clone().run_prepare_lifecycle(tid.clone()).await;
+            let prepared = matches!(&result, Ok(TMPrepareResult::Success));
+            if result_sender.send(result).is_err() {
+                if prepared {
+                    let _ = manager.abort(tid).await;
+                }
+                return;
+            }
+            if prepared && ack_receiver.await.is_err() {
+                let _ = manager.abort(tid).await;
+            }
+        });
+        Ok((result_receiver, ack_sender))
+    }
+
+    #[cfg(test)]
+    fn take_abort_entry_delay(tid: &TxnId) -> Option<Arc<AbortEntryDelayState>> {
+        abort_entry_delay_hooks().lock().remove(tid)
+    }
+
+    #[cfg(test)]
+    async fn await_abort_entry_delay(state: &Arc<AbortEntryDelayState>) {
+        state.entered.store(true, Ordering::SeqCst);
+        state.entered_notify.notify_waiters();
+        let notified = state.released_notify.notified();
+        if state.released.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    #[cfg(test)]
+    fn notify_prepare_results_observed(tid: &TxnId, objects: &BTreeMap<Id, DataObject>) {
+        let states: Vec<_> = {
+            let mut observers = prepare_result_observers().lock();
+            objects
+                .keys()
+                .filter_map(|id| observers.remove(&(tid.clone(), *id)))
+                .collect()
+        };
+        for state in states {
+            state.observed.store(true, Ordering::SeqCst);
+            state.notify.notify_waiters();
+        }
+    }
 }
 
 impl Service for TransactionManager {
@@ -200,22 +453,7 @@ impl Service for TransactionManager {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            if let Some(data_obj) = txn.data.get(&id) {
-                match data_obj.cell {
-                    Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.clone())), // read from cache
-                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-                }
-            }
-            match self.get_data_site_by_id(&id).await {
-                Ok((server_id, server)) => {
-                    self.read_from_site(server_id, &server, &tid, &id, &mut txn)
-                        .await
-                }
-                Err(e) => {
-                    error!("{:?}", e);
-                    Err(TMError::CannotLocateCellServer)
-                }
-            }
+            self.full_read(&tid, &id, &mut txn).await
         }
         .boxed()
     }
@@ -227,24 +465,9 @@ impl Service for TransactionManager {
     ) -> BoxFuture<'_, Result<TxnExecResult<CellHeader, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
-            let txn = txn_mutex.lock().await;
+            let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            if let Some(data_obj) = txn.data.get(&id) {
-                match data_obj.cell {
-                    Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.header.clone())),
-                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-                }
-            }
-            match self.get_data_site_by_id(&id).await {
-                Ok((server_id, server)) => {
-                    self.head_from_site(server_id, &server, &tid, &id, &txn)
-                        .await
-                }
-                Err(e) => {
-                    error!("{:?}", e);
-                    Err(TMError::CannotLocateCellServer)
-                }
-            }
+            self.head_read(&tid, &id, &mut txn).await
         }
         .boxed()
     }
@@ -256,111 +479,124 @@ impl Service for TransactionManager {
     ) -> BoxFuture<'_, Result<TxnExecResult<OwnedCell, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
-            let txn = txn_mutex.lock().await;
+            let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            if let Some(data_obj) = txn.data.get(&id) {
-                match data_obj.cell {
-                    Some(ref cell) => {
-                        let schema_id = cell.header.schema;
-                        if let Some(schema) = self.deps.schemas().get(&schema_id) {
-                            if let OwnedValue::Map(map) = &cell.data {
-                                let mut res = vec![];
-                                'SEARCH: for field in &fields {
-                                    if let Some(index_path) = schema.id_index.get(field) {
-                                        let path =
-                                            index_path.iter().map(|id| *id as u64).collect_vec();
-                                        trace!("Get into map for txn select {:?}", path);
-                                        let val = map.get_in_by_ids(path.iter()).clone();
-                                        res.push(val);
-                                        continue 'SEARCH;
-                                    }
-                                    res.push(OwnedValue::Null);
-                                }
-                                return Ok(TxnExecResult::Accepted(OwnedCell {
-                                    header: cell.header,
-                                    data: OwnedValue::Array(res),
-                                }));
-                            } else {
-                                return Ok(TxnExecResult::Error(
-                                    ReadError::CellTypeIsNotMapForSelect,
-                                ));
-                            }
-                        } else {
-                            return Ok(TxnExecResult::Error(ReadError::SchemaDoesNotExisted(
-                                schema_id,
-                            )));
-                        }
-                    } // read from cache
-                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-                }
-            }
-            match self.get_data_site_by_id(&id).await {
-                Ok((server_id, server)) => {
-                    self.read_selected_from_site(server_id, &server, &tid, &id, &fields, &txn)
-                        .await
-                }
-                Err(e) => {
-                    error!("{:?}", e);
-                    Err(TMError::CannotLocateCellServer)
-                }
-            }
+            self.selected_read(&tid, &id, &fields, &mut txn).await
         }
         .boxed()
     }
 
     fn prepare(&self, tid: TxnId) -> BoxFuture<'_, Result<TMPrepareResult, TMError>> {
         async move {
-            // Note: Automatic retry with fresh timestamps removed because it changes
-            // the transaction ID mid-flight, breaking the client's reference.
-            // For remaining NotRealizable errors, clients should retry with a new transaction.
-            let result = self.do_prepare(&tid).await;
-            // If prepare failed, abort the transaction to release locks and clean up
-            match &result {
-                Ok(TMPrepareResult::Success) => {
-                    // Transaction prepared successfully, will be cleaned up on commit/abort
+            let prepare_tid = tid.clone();
+            let (result_receiver, ack_sender) = self.spawn_prepare_lifecycle(tid)?;
+            match result_receiver.await {
+                Ok(result) => {
+                    let _ = ack_sender.send(());
+                    result
                 }
-                Ok(_) | Err(_) => {
-                    // Prepare failed or error occurred, abort to release locks and clean up
-                    // This prevents memory leaks from abandoned transactions
-                    let _ = self.abort(tid.clone()).await;
+                Err(receive_error) => {
+                    error!(
+                        "prepare lifecycle task failed for {:?}: {:?}",
+                        prepare_tid, receive_error
+                    );
+                    Err(TMError::Other)
                 }
             }
-            result
         }
         .boxed()
     }
     fn commit(&self, tid: TxnId) -> BoxFuture<'_, Result<EndResult, TMError>> {
         async move {
-            let result = {
-                let txn_lock = self.get_transaction(&tid)?;
-                let txn = txn_lock.lock().await;
-                self.ensure_txn_state(&txn, TxnState::Prepared)?;
-                let affected_objs = &txn.affected_objects;
-                let data_sites = self.data_sites_for_objs(&affected_objs).await?;
-                self.sites_end(&tid, affected_objs, &data_sites).await
+            let txn_lock = self.get_transaction(&tid)?;
+            let mut txn = txn_lock.lock().await;
+            self.ensure_txn_state(&txn, TxnState::Prepared)?;
+            let affected_objs = &txn.affected_objects;
+            let result = match {
+                #[cfg(feature = "occ_phase_profile")]
+                let _phase_guard =
+                    super::phase_profile::guard(super::phase_profile::Phase::EndParticipantLookup);
+                self.data_sites_for_objs(affected_objs).await
+            } {
+                Ok(data_sites) => {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard =
+                        super::phase_profile::guard(super::phase_profile::Phase::EndCleanup);
+                    self.sites_end(&tid, affected_objs, &data_sites).await
+                }
+                Err(error) => Err(error),
             };
-            self.cleanup_transaction(&tid);
-            return result;
+            // Fire-and-forget release of read pins on servers this transaction
+            // only read (pinned but not written). Write servers already dropped
+            // their pins in `end`, so they are excluded. Queued so it never adds
+            // latency to the commit path; the periodic flusher batches the RPCs.
+            // Write-only transactions (no pins) skip this entirely.
+            if !txn.pinned_servers.is_empty() {
+                let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
+                pinned_servers.retain(|server_id| !txn.affected_objects.contains_key(server_id));
+                self.queue_pin_release(tid.clone(), pinned_servers);
+            }
+            self.cleanup_transaction_guarded(&tid, &mut txn);
+            result
         }
         .boxed()
     }
     fn abort(&self, tid: TxnId) -> BoxFuture<'_, Result<AbortResult, TMError>> {
         debug!("TXN ABORT IN MGR {:?}", &tid);
         async move {
-            let result = {
-                let txn_lock = self.get_transaction(&tid)?;
-                let txn = txn_lock.lock().await;
-                if txn.state != TxnState::Aborted {
-                    let changed_objs = &txn.affected_objects;
-                    let data_sites = self.data_sites_for_objs(&changed_objs).await?;
-                    debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                    self.sites_abort(&tid, changed_objs, &data_sites).await // with end
-                } else {
-                    Ok(AbortResult::Success(None))
+            let txn_lock = self.get_transaction(&tid)?;
+            #[cfg(test)]
+            if let Some(state) = Self::take_abort_entry_delay(&tid) {
+                Self::await_abort_entry_delay(&state).await;
+            }
+            let mut txn = txn_lock.lock().await;
+            match txn.state {
+                TxnState::Cleanup => {
+                    return Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup));
                 }
+                TxnState::Committed => {
+                    return Ok(AbortResult::CheckFailed(CheckError::AlreadyCommitted));
+                }
+                TxnState::Started | TxnState::Prepared => {
+                    // Once abort is accepted, commit must remain illegal even when
+                    // participant rollback needs to be retried.
+                    txn.state = TxnState::Aborted;
+                }
+                TxnState::Aborted => {}
+            }
+            txn.last_activity = get_time();
+            let changed_objs = &txn.affected_objects;
+            let result = match {
+                #[cfg(feature = "occ_phase_profile")]
+                let _phase_guard = super::phase_profile::guard(
+                    super::phase_profile::Phase::AbortParticipantLookup,
+                );
+                self.data_sites_for_objs(changed_objs).await
+            } {
+                Ok(data_sites) => {
+                    debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard =
+                        super::phase_profile::guard(super::phase_profile::Phase::AbortCleanup);
+                    self.sites_abort(&tid, changed_objs, &data_sites).await // with end
+                }
+                Err(error) => Err(error),
             };
-            self.cleanup_transaction(&tid);
-            return result;
+            if Self::abort_cleanup_complete(&result) {
+                // Fire-and-forget release of read pins on servers this transaction
+                // only read (pinned but not written; write servers already dropped
+                // their pins in the abort/end above). Queued so it never adds
+                // latency to the abort path; the periodic flusher batches the RPCs.
+                // Write-only transactions (no pins) skip this entirely.
+                if !txn.pinned_servers.is_empty() {
+                    let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
+                    pinned_servers
+                        .retain(|server_id| !txn.affected_objects.contains_key(server_id));
+                    self.queue_pin_release(tid.clone(), pinned_servers);
+                }
+                self.cleanup_transaction_guarded(&tid, &mut txn);
+            }
+            result
         }
         .boxed()
     }
@@ -376,6 +612,7 @@ impl Service for TransactionManager {
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
                     last_activity: now,
+                    pinned_servers: HashSet::new(),
                 })),
             )
             .is_some()
@@ -408,18 +645,21 @@ impl Service for TransactionManager {
                             DataObject {
                                 server: server_id,
                                 cell: Some(cell),
+                                expectation: CellExpectation::Absent,
                                 new: true,
-                                version: None,
                                 changed: true,
+                                pinned: None,
                             },
                         );
                         Ok(TxnExecResult::Accepted(()))
                     } else {
                         let data_obj = txn.data.get_mut(&id).unwrap();
-                        if !data_obj.cell.is_none() {
+                        if data_obj.cell.is_some() {
                             return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
                         }
                         data_obj.cell = Some(cell);
+                        data_obj.new = matches!(data_obj.expectation, CellExpectation::Absent)
+                            && !data_obj.changed;
                         data_obj.changed = true;
                         Ok(TxnExecResult::Accepted(()))
                     }
@@ -445,17 +685,46 @@ impl Service for TransactionManager {
                     // cell is already owned by the async block, no need to clone
                     if txn.data.contains_key(&id) {
                         let data_obj = txn.data.get_mut(&id).unwrap();
+                        if data_obj.cell.is_none()
+                            && matches!(data_obj.expectation, CellExpectation::Absent)
+                        {
+                            return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
+                        }
                         data_obj.cell = Some(cell);
-                        data_obj.changed = true
+                        data_obj.changed = true;
                     } else {
+                        let server = self
+                            .get_data_site(server_id)
+                            .await
+                            .map_err(|_| TMError::CannotLocateCellServer)?;
+                        let expectation = match self
+                            .observe_version(&server, &tid, id.clone())
+                            .await?
+                        {
+                            TxnExecResult::Accepted(version) => CellExpectation::Present(version),
+                            TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                                return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
+                            }
+                            TxnExecResult::Error(error) => {
+                                return Ok(TxnExecResult::Error(WriteError::ReadError(error)));
+                            }
+                            TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
+                            TxnExecResult::StateError(state) => {
+                                return Ok(TxnExecResult::StateError(state));
+                            }
+                            TxnExecResult::Wait => {
+                                unreachable!("observe_version retries waits before returning")
+                            }
+                        };
                         txn.data.insert(
                             id,
                             DataObject {
                                 server: server_id,
                                 cell: Some(cell),
+                                expectation,
                                 new: false,
-                                version: None,
                                 changed: true,
+                                pinned: None,
                             },
                         );
                     }
@@ -495,14 +764,38 @@ impl Service for TransactionManager {
                             txn.data.remove(&id);
                         }
                     } else {
+                        let server = self
+                            .get_data_site(server_id)
+                            .await
+                            .map_err(|_| TMError::CannotLocateCellServer)?;
+                        let expectation = match self
+                            .observe_version(&server, &tid, id.clone())
+                            .await?
+                        {
+                            TxnExecResult::Accepted(version) => CellExpectation::Present(version),
+                            TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                                return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
+                            }
+                            TxnExecResult::Error(error) => {
+                                return Ok(TxnExecResult::Error(WriteError::ReadError(error)));
+                            }
+                            TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
+                            TxnExecResult::StateError(state) => {
+                                return Ok(TxnExecResult::StateError(state));
+                            }
+                            TxnExecResult::Wait => {
+                                unreachable!("observe_version retries waits before returning")
+                            }
+                        };
                         txn.data.insert(
                             id,
                             DataObject {
                                 server: server_id,
                                 cell: None,
+                                expectation,
                                 new: false,
-                                version: None,
                                 changed: true,
+                                pinned: None,
                             },
                         );
                     }
@@ -564,6 +857,158 @@ impl TransactionManager {
             _ => Err(TMError::TransactionNotFound),
         }
     }
+    /// Coordinator full read. Read-your-writes and an already-materialized full
+    /// cell shadow everything; a buffered remove and repeatable absence both
+    /// read as missing. Otherwise the whole cell is fetched once via the
+    /// participant `read` RPC — this is the single path that materializes the
+    /// whole cell — and, if a prior partial read pinned the cell, the
+    /// participant serves that pinned version so the full read is repeatable.
+    async fn full_read<'a>(
+        &self,
+        tid: &TxnId,
+        id: &Id,
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        txn.last_activity = bifrost::utils::time::get_time();
+        if let Some(data_obj) = txn.data.get(id) {
+            if let Some(cell) = &data_obj.cell {
+                return Ok(TxnExecResult::Accepted(cell.clone()));
+            }
+            // A buffered remove within this transaction, or repeatable absence.
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+                return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+            }
+            // A prior partial read pinned the cell but never materialized the
+            // whole cell: fall through to fetch it once from the pinned version.
+        }
+
+        match self.get_data_site_by_id(id).await {
+            Ok((server_id, server)) => self.read_from_site(server_id, &server, tid, id, txn).await,
+            Err(error) => {
+                error!("{:?}", error);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
+    }
+
+    /// Coordinator header read. Read-your-writes and an already-materialized full
+    /// cell shadow everything; a buffered remove and repeatable absence read as
+    /// missing; an already-pinned header is served from cache. Otherwise a
+    /// `head(pin=true)` participant RPC pins the version and returns only the
+    /// header — the whole cell is never transferred. The observed version is
+    /// recorded as `Present(version)` so the read is certified at prepare.
+    async fn head_read<'a>(
+        &self,
+        tid: &TxnId,
+        id: &Id,
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+        txn.last_activity = bifrost::utils::time::get_time();
+        if let Some(data_obj) = txn.data.get(id) {
+            if let Some(cell) = &data_obj.cell {
+                return Ok(TxnExecResult::Accepted(cell.header.clone()));
+            }
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+                return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+            }
+            if let Some(header) = data_obj.pinned.as_ref().and_then(|p| p.header.as_ref()) {
+                return Ok(TxnExecResult::Accepted(header.clone()));
+            }
+            // Pinned (e.g. only a projection was fetched so far) but the header
+            // is not cached yet: fall through to fetch the header from the pin.
+        }
+
+        match self.get_data_site_by_id(id).await {
+            Ok((server_id, server)) => self.head_from_site(server_id, &server, tid, id, txn).await,
+            Err(error) => {
+                error!("{:?}", error);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
+    }
+
+    /// Coordinator projected read. Read-your-writes and an already-materialized
+    /// full cell shadow everything (the projection is computed locally); a
+    /// buffered remove and repeatable absence read as missing; an already-cached
+    /// projection for these exact fields is served from cache. Otherwise a
+    /// `read_selected` participant RPC pins the version and returns only the
+    /// projection — the whole cell is never transferred. The projection's
+    /// version is recorded as `Present(version)` so the read is certified.
+    async fn selected_read<'a>(
+        &self,
+        tid: &TxnId,
+        id: &Id,
+        fields: &[u64],
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        txn.last_activity = bifrost::utils::time::get_time();
+        if let Some(data_obj) = txn.data.get(id) {
+            if let Some(cell) = &data_obj.cell {
+                return Ok(match self.select_from_cell(cell, fields) {
+                    Ok(selected) => TxnExecResult::Accepted(selected),
+                    Err(error) => TxnExecResult::Error(error),
+                });
+            }
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+                return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+            }
+            if let Some(projection) = data_obj
+                .pinned
+                .as_ref()
+                .and_then(|p| p.projections.get(fields))
+            {
+                return Ok(TxnExecResult::Accepted(projection.clone()));
+            }
+            // Pinned but this exact projection is not cached yet: fall through
+            // to fetch it from the pinned version.
+        }
+
+        match self.get_data_site_by_id(id).await {
+            Ok((server_id, server)) => {
+                self.selected_from_site(server_id, &server, tid, id, fields, txn)
+                    .await
+            }
+            Err(error) => {
+                error!("{:?}", error);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
+    }
+
+    fn select_from_cell(&self, cell: &OwnedCell, fields: &[u64]) -> Result<OwnedCell, ReadError> {
+        if fields.is_empty() {
+            return Ok(cell.clone());
+        }
+
+        let schema_id = cell.header.schema;
+        let schema = self
+            .deps
+            .schemas()
+            .get(&schema_id)
+            .ok_or(ReadError::SchemaDoesNotExisted(schema_id))?;
+
+        let map = match &cell.data {
+            OwnedValue::Map(map) => map,
+            _ => return Err(ReadError::CellTypeIsNotMapForSelect),
+        };
+
+        let mut selected = Vec::with_capacity(fields.len());
+        for field in fields {
+            if let Some(index_path) = schema.id_index.get(field) {
+                let path = index_path.iter().map(|id| *id as u64).collect_vec();
+                trace!("Get into map for txn select {:?}", path);
+                selected.push(map.get_in_by_ids(path.iter()).clone());
+            } else {
+                selected.push(map.get_by_key_id(*field).clone());
+            }
+        }
+
+        Ok(OwnedCell {
+            header: cell.header.clone(),
+            data: OwnedValue::Array(selected),
+        })
+    }
+
     async fn read_from_site<'a>(
         &self,
         server_id: u64,
@@ -572,6 +1017,8 @@ impl TransactionManager {
         id: &Id,
         txn: &mut TxnGuard<'a>,
     ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
         let self_server_id = self.deps.server_id;
@@ -610,7 +1057,7 @@ impl TransactionManager {
                                 if data_obj.cell.is_none() {
                                     let version = cell.header.version;
                                     data_obj.cell = Some(cell);
-                                    data_obj.version = Some(version);
+                                    data_obj.expectation = CellExpectation::Present(version);
                                 }
                                 return Ok(TxnExecResult::Accepted(
                                     data_obj.cell.as_ref().unwrap().clone(),
@@ -623,14 +1070,30 @@ impl TransactionManager {
                                     id.clone(),
                                     DataObject {
                                         server: server_id,
-                                        version: Some(version),
+                                        expectation: CellExpectation::Present(version),
                                         cell: Some(cell),
                                         new: false,
                                         changed: false,
+                                        pinned: None,
                                     },
                                 );
                                 return Ok(result);
                             }
+                        }
+                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                            let result = TxnExecResult::Error(ReadError::CellDoesNotExisted);
+                            txn.data.insert(
+                                id.clone(),
+                                DataObject {
+                                    server: server_id,
+                                    cell: None,
+                                    expectation: CellExpectation::Absent,
+                                    changed: false,
+                                    new: false,
+                                    pinned: None,
+                                },
+                            );
+                            return Ok(result);
                         }
                         TxnExecResult::Wait => {
                             // Backoff and retry
@@ -649,14 +1112,242 @@ impl TransactionManager {
         }
     }
 
+    /// Issues a `head(pin=true)` participant RPC, pinning the served version so a
+    /// later read in the same transaction repeats it, and caches only the header
+    /// (never the whole cell). Records `Present(version)` for certification, or
+    /// `Absent` on a missing cell (repeatable absence).
     async fn head_from_site<'a>(
         &self,
-        _server_id: u64,
+        server_id: u64,
         server: &Arc<data_site::AsyncServiceClient>,
         tid: &TxnId,
         id: &Id,
-        _txn: &TxnGuard<'a>,
+        txn: &mut TxnGuard<'a>,
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
+        let start_time = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let self_server_id = self.deps.server_id;
+
+        loop {
+            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
+                warn!("Head timeout for transaction {:?} on cell {:?}", tid, id);
+                return Ok(TxnExecResult::Rejected);
+            }
+
+            // Partial read: pin=true snapshots the served version for repeatability.
+            let head_response = server
+                .head(self_server_id, self.get_clock(), tid.to_owned(), *id, true)
+                .await;
+            match head_response {
+                Ok(dsr) => {
+                    self.merge_clock(&dsr.clock);
+                    match dsr.payload {
+                        TxnExecResult::Accepted(header) => {
+                            let version = header.version;
+                            // The participant pinned the served version and holds
+                            // a segment guard for it. Remember this server so the
+                            // pin is released promptly on commit/abort, even if a
+                            // buffered write later shadows the read locally.
+                            txn.pinned_servers.insert(server_id);
+                            if let Some(data_obj) = txn.data.get_mut(id) {
+                                // Read-your-writes: a buffered write/remove shadows the pin.
+                                if data_obj.changed {
+                                    return Ok(match &data_obj.cell {
+                                        Some(cell) => TxnExecResult::Accepted(cell.header.clone()),
+                                        None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
+                                    });
+                                }
+                                // Cache the header on the existing pinned entry;
+                                // its recorded version is already Present(version).
+                                let pinned =
+                                    data_obj.pinned.get_or_insert_with(PinnedReadCache::default);
+                                if pinned.header.is_none() {
+                                    pinned.header = Some(header.clone());
+                                }
+                                return Ok(TxnExecResult::Accepted(header));
+                            }
+                            // Record the header-only read so it is in the certified
+                            // read set as Present(version) — no whole-cell transfer.
+                            txn.data.insert(
+                                id.clone(),
+                                DataObject {
+                                    server: server_id,
+                                    cell: None,
+                                    expectation: CellExpectation::Present(version),
+                                    changed: false,
+                                    new: false,
+                                    pinned: Some(PinnedReadCache {
+                                        header: Some(header.clone()),
+                                        projections: HashMap::new(),
+                                    }),
+                                },
+                            );
+                            return Ok(TxnExecResult::Accepted(header));
+                        }
+                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                            if !txn.data.contains_key(id) {
+                                txn.data.insert(
+                                    id.clone(),
+                                    DataObject {
+                                        server: server_id,
+                                        cell: None,
+                                        expectation: CellExpectation::Absent,
+                                        changed: false,
+                                        new: false,
+                                        pinned: None,
+                                    },
+                                );
+                            }
+                            return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+                        }
+                        TxnExecResult::Wait => {
+                            Self::backoff_wait(attempt, &self.wait_config).await?;
+                            attempt += 1;
+                            continue;
+                        }
+                        other => return Ok(other),
+                    }
+                }
+                Err(e) => {
+                    error!("{:?}", e);
+                    return Err(TMError::RPCErrorFromCellServer);
+                }
+            }
+        }
+    }
+
+    /// Issues a `read_selected` participant RPC, pinning the served version so a
+    /// later read in the same transaction repeats it, and caches only the
+    /// returned projection (never the whole cell) keyed by the exact requested
+    /// field order. Records `Present(version)` for certification, or `Absent` on
+    /// a missing cell (repeatable absence).
+    async fn selected_from_site<'a>(
+        &self,
+        server_id: u64,
+        server: &Arc<data_site::AsyncServiceClient>,
+        tid: &TxnId,
+        id: &Id,
+        fields: &[u64],
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
+        let start_time = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let self_server_id = self.deps.server_id;
+
+        loop {
+            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
+                warn!(
+                    "Selected read timeout for transaction {:?} on cell {:?}",
+                    tid, id
+                );
+                return Ok(TxnExecResult::Rejected);
+            }
+
+            let read_response = server
+                .read_selected(
+                    self_server_id,
+                    self.get_clock(),
+                    tid.to_owned(),
+                    id.clone(),
+                    fields.to_vec(),
+                )
+                .await;
+            match read_response {
+                Ok(dsr) => {
+                    self.merge_clock(&dsr.clock);
+                    match dsr.payload {
+                        TxnExecResult::Accepted(projection) => {
+                            let version = projection.header.version;
+                            // The participant pinned the served version and holds
+                            // a segment guard for it. Remember this server so the
+                            // pin is released promptly on commit/abort, even if a
+                            // buffered write later shadows the read locally.
+                            txn.pinned_servers.insert(server_id);
+                            if let Some(data_obj) = txn.data.get_mut(id) {
+                                // Read-your-writes: a buffered write/remove shadows the pin.
+                                if data_obj.changed {
+                                    return Ok(match &data_obj.cell {
+                                        Some(cell) => match self.select_from_cell(cell, fields) {
+                                            Ok(selected) => TxnExecResult::Accepted(selected),
+                                            Err(error) => TxnExecResult::Error(error),
+                                        },
+                                        None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
+                                    });
+                                }
+                                // Cache the projection on the existing pinned entry;
+                                // its recorded version is already Present(version).
+                                let pinned =
+                                    data_obj.pinned.get_or_insert_with(PinnedReadCache::default);
+                                pinned
+                                    .projections
+                                    .entry(fields.to_vec())
+                                    .or_insert_with(|| projection.clone());
+                                return Ok(TxnExecResult::Accepted(projection));
+                            }
+                            // Record the projection-only read so it is in the
+                            // certified read set as Present(version).
+                            let mut projections = HashMap::new();
+                            projections.insert(fields.to_vec(), projection.clone());
+                            txn.data.insert(
+                                id.clone(),
+                                DataObject {
+                                    server: server_id,
+                                    cell: None,
+                                    expectation: CellExpectation::Present(version),
+                                    changed: false,
+                                    new: false,
+                                    pinned: Some(PinnedReadCache {
+                                        header: None,
+                                        projections,
+                                    }),
+                                },
+                            );
+                            return Ok(TxnExecResult::Accepted(projection));
+                        }
+                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                            if !txn.data.contains_key(id) {
+                                txn.data.insert(
+                                    id.clone(),
+                                    DataObject {
+                                        server: server_id,
+                                        cell: None,
+                                        expectation: CellExpectation::Absent,
+                                        changed: false,
+                                        new: false,
+                                        pinned: None,
+                                    },
+                                );
+                            }
+                            return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+                        }
+                        TxnExecResult::Wait => {
+                            Self::backoff_wait(attempt, &self.wait_config).await?;
+                            attempt += 1;
+                            continue;
+                        }
+                        other => return Ok(other),
+                    }
+                }
+                Err(e) => {
+                    error!("{:?}", e);
+                    return Err(TMError::RPCErrorFromCellServer);
+                }
+            }
+        }
+    }
+
+    async fn observe_head_from_site(
+        &self,
+        server: &Arc<data_site::AsyncServiceClient>,
+        tid: &TxnId,
+        id: &Id,
+    ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
         let self_server_id = self.deps.server_id;
@@ -668,8 +1359,13 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Rejected);
             }
 
+            // Use the transaction's own timestamp for internal blind observations so the
+            // read timestamp recorded at the data site cannot advance beyond this tid.
+            // Blind version observation: never pin. Blind update/remove targets
+            // are written, not re-read, so pinning here would waste a segment
+            // guard and needlessly materialize a participant transaction.
             let head_response = server
-                .head(self_server_id, self.get_clock(), tid.to_owned(), *id)
+                .head(self_server_id, tid.clone(), tid.to_owned(), *id, false)
                 .await;
             match head_response {
                 Ok(dsr) => {
@@ -693,69 +1389,32 @@ impl TransactionManager {
             }
         }
     }
-    async fn read_selected_from_site<'a>(
+    async fn observe_version(
         &self,
-        _server_id: u64,
         server: &Arc<data_site::AsyncServiceClient>,
         tid: &TxnId,
-        id: &Id,
-        fields: &Vec<u64>,
-        _txn: &TxnGuard<'a>,
-    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
-        let start_time = std::time::Instant::now();
-        let mut attempt = 0u32;
-        let self_server_id = self.deps.server_id;
-
-        loop {
-            // Check timeout
-            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
-                warn!(
-                    "Read selected timeout for transaction {:?} on cell {:?}",
-                    tid, id
-                );
-                return Ok(TxnExecResult::Rejected);
-            }
-
-            let read_response = server
-                .read_selected(
-                    self_server_id,
-                    self.get_clock(),
-                    tid.to_owned(),
-                    id.clone(),
-                    fields.to_owned(),
-                )
-                .await;
-            match read_response {
-                Ok(dsr) => {
-                    self.merge_clock(&dsr.clock);
-                    let payload = dsr.payload;
-                    match payload {
-                        TxnExecResult::Wait => {
-                            // Backoff and retry
-                            Self::backoff_wait(attempt, &self.wait_config).await?;
-                            attempt += 1;
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    return Ok(payload);
-                }
-                Err(e) => {
-                    error!("{:?}", e);
-                    return Err(TMError::RPCErrorFromCellServer);
-                }
-            }
-        }
+        id: Id,
+    ) -> Result<TxnExecResult<u64, ReadError>, TMError> {
+        Ok(match self.observe_head_from_site(server, tid, &id).await? {
+            TxnExecResult::Accepted(header) => TxnExecResult::Accepted(header.version),
+            TxnExecResult::Rejected => TxnExecResult::Rejected,
+            TxnExecResult::Error(error) => TxnExecResult::Error(error),
+            TxnExecResult::StateError(state) => TxnExecResult::StateError(state),
+            TxnExecResult::Wait => unreachable!("observe_head_from_site retries waits"),
+        })
     }
     fn generate_affected_objs(&self, txn: &mut TxnGuard) {
+        let has_writes = txn.data.values().any(|data_obj| data_obj.changed);
         let mut affected_objs = AffectedObjs::new();
-        for (id, data_obj) in txn.data.drain() {
-            if data_obj.changed {
+        if has_writes {
+            for (id, data_obj) in txn.data.drain() {
                 affected_objs
                     .entry(data_obj.server)
-                    .or_insert_with(|| BTreeMap::new())
+                    .or_insert_with(BTreeMap::new)
                     .insert(id, data_obj);
             }
+        } else {
+            txn.data.clear();
         }
         txn.affected_objects = affected_objs;
     }
@@ -792,11 +1451,27 @@ impl TransactionManager {
                 return Ok(DMPrepareResult::NotRealizable); // Give up
             }
 
-            let self_server_id = deps.server_id;
-            let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
+            let coordinator_id = deps.server_id;
+            let prepare_ops: Vec<_> = objs
+                .iter()
+                .map(|(id, data_obj)| PrepareOp {
+                    id: *id,
+                    expectation: data_obj.expectation.clone(),
+                    intent: if data_obj.changed {
+                        PrepareIntent::Write
+                    } else {
+                        PrepareIntent::Read
+                    },
+                })
+                .collect();
             let deps_for_clock = deps.clone();
             let prepare_payload = data_site
-                .prepare(self_server_id, deps.clock.to_clock(), tid.clone(), cell_ids)
+                .prepare(
+                    coordinator_id,
+                    deps.clock.to_clock(),
+                    tid.clone(),
+                    prepare_ops,
+                )
                 .await
                 .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
                 .map(move |prepare_res| -> DMPrepareResult {
@@ -826,28 +1501,25 @@ impl TransactionManager {
         affected_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
     ) -> Result<DMPrepareResult, TMError> {
-        let mut prepare_futures: FuturesUnordered<_> = affected_objs
-            .into_iter()
+        let prepare_futures: FuturesUnordered<_> = affected_objs
+            .iter()
             .map(|(server, objs)| async move {
                 let data_site = data_sites.get(server).unwrap().clone();
-                TransactionManager::site_prepare(
+                let result = TransactionManager::site_prepare(
                     &self.deps,
                     &self.wait_config,
                     &tid,
                     &objs,
                     &data_site,
                 )
-                .await
+                .await;
+                #[cfg(test)]
+                Self::notify_prepare_results_observed(tid, objs);
+                result
             })
             .collect();
-        while let Some(result) = prepare_futures.next().await {
-            match result {
-                Ok(DMPrepareResult::Success) => {}
-                Ok(res) => return Ok(res),
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(DMPrepareResult::Success)
+        let results: Vec<Result<DMPrepareResult, TMError>> = prepare_futures.collect().await;
+        Self::reduce_prepare_results(results)
     }
     async fn sites_commit(
         &self,
@@ -861,21 +1533,10 @@ impl TransactionManager {
                 let data_site = data_sites.get(server_id).unwrap().clone();
                 let ops: Vec<CommitOp> = objs
                     .iter()
-                    .map(|(cell_id, data_obj)| {
-                        if data_obj.version.is_some() && !data_obj.changed {
-                            CommitOp::Read(*cell_id, data_obj.version.unwrap())
-                        } else if data_obj.cell.is_none() && !data_obj.new {
-                            CommitOp::Remove(*cell_id)
-                        } else if let Some(ref cell) = data_obj.cell {
-                            // Avoid unnecessary conditional logic - just check new flag
-                            if data_obj.new {
-                                CommitOp::Write(cell.clone())
-                            } else {
-                                CommitOp::Update(cell.clone())
-                            }
-                        } else {
-                            CommitOp::None
-                        }
+                    .filter_map(|(cell_id, data_obj)| {
+                        data_obj
+                            .changed
+                            .then(|| Self::commit_op_for_changed_data_obj(*cell_id, data_obj))
                     })
                     .collect();
                 async move {
@@ -901,6 +1562,20 @@ impl TransactionManager {
         }
         Ok(DMCommitResult::Success)
     }
+
+    fn commit_op_for_changed_data_obj(cell_id: Id, data_obj: &DataObject) -> CommitOp {
+        assert!(
+            data_obj.changed,
+            "unchanged observations should not be sent to commit"
+        );
+        match (&data_obj.cell, data_obj.new) {
+            (None, false) => CommitOp::Remove(cell_id),
+            (Some(cell), true) => CommitOp::Write(cell.clone()),
+            (Some(cell), false) => CommitOp::Update(cell.clone()),
+            (None, true) => panic!("invalid changed transaction state for {:?}", cell_id),
+        }
+    }
+
     async fn sites_abort(
         &self,
         tid: &TxnId,
@@ -909,31 +1584,101 @@ impl TransactionManager {
     ) -> Result<AbortResult, TMError> {
         let abort_futures: FuturesUnordered<_> = changed_objs
             .iter()
-            .map(|(ref server_id, _)| {
-                let data_site = data_sites.get(*server_id).unwrap();
-                async move { data_site.abort(self.get_clock(), tid.clone()).await }
+            .map(|(server_id, _)| {
+                let server_id = *server_id;
+                let data_site = data_sites.get(&server_id).unwrap().clone();
+                async move {
+                    (
+                        server_id,
+                        data_site.abort(self.get_clock(), tid.clone()).await,
+                    )
+                }
             })
             .collect();
         let abort_results: Vec<_> = abort_futures.collect().await;
         let mut rollback_failures = Vec::new();
-        for result in abort_results {
+        let mut sites_to_end = BTreeSet::new();
+        let mut first_failure = None;
+        let mut first_error = None;
+
+        for (server_id, result) in abort_results {
             match result {
                 Ok(asr) => {
                     let payload = asr.payload;
                     self.merge_clock(&asr.clock);
                     match payload {
                         AbortResult::Success(failures) => {
+                            sites_to_end.insert(server_id);
                             if let Some(mut failures) = failures {
                                 rollback_failures.append(&mut failures);
                             }
                         }
-                        _ => return Ok(payload),
+                        AbortResult::CheckFailed(CheckError::AlreadyAborted) => {
+                            sites_to_end.insert(server_id);
+                        }
+                        AbortResult::CheckFailed(CheckError::NotExisted) => {
+                            // A prior attempt already ended this participant.
+                        }
+                        failure if first_failure.is_none() => first_failure = Some(failure),
+                        _ => {}
                     }
                 }
-                Err(_) => return Err(TMError::AssertionError),
+                Err(_) if first_error.is_none() => {
+                    first_error = Some(TMError::RPCErrorFromCellServer)
+                }
+                Err(_) => {}
             }
         }
-        self.sites_end(tid, changed_objs, data_sites).await?;
+
+        let end_futures: FuturesUnordered<_> = sites_to_end
+            .iter()
+            .map(|server_id| {
+                let server_id = *server_id;
+                let data_site = data_sites.get(&server_id).unwrap().clone();
+                async move {
+                    (
+                        server_id,
+                        data_site.end(self.get_clock(), tid.clone()).await,
+                    )
+                }
+            })
+            .collect();
+        let end_results: Vec<_> = end_futures.collect().await;
+        for (server_id, result) in end_results {
+            match result {
+                Ok(response) => {
+                    self.merge_clock(&response.clock);
+                    match response.payload {
+                        EndResult::Success | EndResult::CheckFailed(CheckError::NotExisted) => {}
+                        other => {
+                            error!(
+                                "Abort cleanup could not end participant {} for {:?}: {:?}",
+                                server_id, tid, other
+                            );
+                            if first_error.is_none() {
+                                first_error = Some(TMError::AssertionError);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        "Abort cleanup could not reach participant {} for {:?}: {:?}",
+                        server_id, tid, error
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(TMError::RPCErrorFromCellServer);
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if let Some(failure) = first_failure {
+            return Ok(failure);
+        }
         Ok(AbortResult::Success(if rollback_failures.is_empty() {
             None
         } else {
@@ -974,6 +1719,55 @@ impl TransactionManager {
         }
         Ok(EndResult::Success)
     }
+    /// Best-effort, idempotent release of read pins on every server this
+    /// transaction pinned a read on. Runs on commit/abort for both read-only and
+    /// read-write transactions: a server the transaction only *read* (pinned) is
+    /// never `sites_end`ed, so its pin (and the pin-only participant transaction)
+    /// would otherwise linger until slow stale cleanup. Individual failures are
+    /// logged at debug and ignored — the participant's stale cleanup remains the
+    /// backstop, and a release must never fail commit/abort.
+    /// Queue a completed transaction's read pins for release by the periodic
+    /// flusher. Costs one lock+push on the commit/abort path; a lost release is
+    /// reclaimed by the participant's stale cleanup.
+    fn queue_pin_release(&self, tid: TxnId, pinned_servers: HashSet<u64>) {
+        if pinned_servers.is_empty() {
+            return;
+        }
+        self.pending_pin_releases.lock().push((tid, pinned_servers));
+    }
+    /// Drain the queued releases and send one batched RPC per participant.
+    /// Best-effort: individual failures are logged and dropped; the
+    /// participant's stale cleanup remains the backstop.
+    async fn flush_pin_releases(&self) {
+        let pending: Vec<(TxnId, HashSet<u64>)> = {
+            let mut queue = self.pending_pin_releases.lock();
+            if queue.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *queue)
+        };
+        let mut tids_by_server: HashMap<u64, Vec<TxnId>> = HashMap::new();
+        for (tid, servers) in pending {
+            for server_id in servers {
+                tids_by_server.entry(server_id).or_default().push(tid.clone());
+            }
+        }
+        for (server_id, tids) in tids_by_server {
+            match self.get_data_site(server_id).await {
+                Ok(data_site) => match data_site.release_read_pins(tids).await {
+                    Ok(response) => self.merge_clock(&response.clock),
+                    Err(error) => debug!(
+                        "batched release_read_pins RPC to server {} failed: {:?}",
+                        server_id, error
+                    ),
+                },
+                Err(error) => debug!(
+                    "cannot locate server {} to release read pins: {:?}",
+                    server_id, error
+                ),
+            }
+        }
+    }
     fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
         if txn.state == state {
             return Ok(());
@@ -984,16 +1778,52 @@ impl TransactionManager {
     fn ensure_rw_state(&self, txn: &TxnGuard) -> Result<(), TMError> {
         self.ensure_txn_state(txn, TxnState::Started)
     }
-    fn cleanup_transaction(&self, tid: &TxnId) {
-        let txn = self.transactions.remove(tid);
-        if let Some(txn) = txn {
-            let mut txn_guard = txn.lock_blocking();
-            txn_guard.data.clear();
-            txn_guard.affected_objects.clear();
-            txn_guard.state = TxnState::Cleanup;
-            txn_guard.last_activity = get_time();
+
+    fn reduce_prepare_results<I>(results: I) -> Result<DMPrepareResult, TMError>
+    where
+        I: IntoIterator<Item = Result<DMPrepareResult, TMError>>,
+    {
+        let mut first_failure = None;
+        let mut first_error = None;
+
+        for result in results {
+            match result {
+                Ok(DMPrepareResult::Success) => {}
+                Ok(other) if first_failure.is_none() => first_failure = Some(other),
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
         }
+
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(first_failure.unwrap_or(DMPrepareResult::Success))
+        }
+    }
+
+    fn cleanup_transaction_guarded(&self, tid: &TxnId, txn: &mut Transaction) {
+        txn.data.clear();
+        txn.affected_objects.clear();
+        txn.pinned_servers.clear();
+        txn.state = TxnState::Cleanup;
+        txn.last_activity = get_time();
+        let _ = self.transactions.remove(tid);
         self.txn_ids.lock().remove(tid);
+    }
+
+    fn cleanup_transaction(&self, tid: &TxnId) {
+        if let Some(txn) = self.transactions.get(tid) {
+            let mut txn_guard = txn.lock_blocking();
+            self.cleanup_transaction_guarded(tid, &mut txn_guard);
+        } else {
+            self.txn_ids.lock().remove(tid);
+        }
+    }
+
+    fn abort_cleanup_complete(result: &Result<AbortResult, TMError>) -> bool {
+        matches!(result, Ok(AbortResult::Success(None)))
     }
 
     /// Clean up stale transactions that have been abandoned by clients
@@ -1013,11 +1843,11 @@ impl TransactionManager {
                     if let Some(txn_mutex) = self.transactions.get(tid) {
                         // Try to get the lock without blocking
                         if let Some(txn_guard) = txn_mutex.try_lock() {
-                            // Clean up if:
-                            // 1. Transaction is old AND
-                            // 2. NOT in Prepared state (those should be cleaned by commit/abort)
+                            // Only Started transactions can be abandoned safely.
+                            // Prepared transactions need a commit/abort decision, and
+                            // Aborted transactions may still need rollback retries.
                             if txn_guard.last_activity < cutoff
-                                && txn_guard.state != TxnState::Prepared
+                                && txn_guard.state == TxnState::Started
                             {
                                 return Some(tid.clone());
                             }
@@ -1048,14 +1878,34 @@ impl TransactionManager {
             let mut txn = txn_mutex.lock().await;
             let result = {
                 self.ensure_rw_state(&txn)?;
-                self.generate_affected_objs(&mut txn);
+                {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard = super::phase_profile::guard(
+                        super::phase_profile::Phase::AffectedObjectGrouping,
+                    );
+                    self.generate_affected_objs(&mut txn);
+                }
                 let affect_objs = &txn.affected_objects;
-                let data_sites = self.data_sites_for_objs(&affect_objs).await?;
-                let sites_prepare_result =
-                    self.sites_prepare(&tid, affect_objs, &data_sites).await?;
+                let data_sites = {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard = super::phase_profile::guard(
+                        super::phase_profile::Phase::PrepareParticipantLookup,
+                    );
+                    self.data_sites_for_objs(affect_objs).await?
+                };
+                let sites_prepare_result = {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard =
+                        super::phase_profile::guard(super::phase_profile::Phase::PrepareBarrier);
+                    self.sites_prepare(&tid, affect_objs, &data_sites).await?
+                };
                 if sites_prepare_result == DMPrepareResult::Success {
-                    let sites_commit_result =
-                        self.sites_commit(&tid, affect_objs, &data_sites).await?;
+                    let sites_commit_result = {
+                        #[cfg(feature = "occ_phase_profile")]
+                        let _phase_guard =
+                            super::phase_profile::guard(super::phase_profile::Phase::CommitBarrier);
+                        self.sites_commit(&tid, affect_objs, &data_sites).await?
+                    };
                     match sites_commit_result {
                         DMCommitResult::Success => TMPrepareResult::Success,
                         _ => TMPrepareResult::DMCommitError(sites_commit_result),
@@ -1073,6 +1923,23 @@ impl TransactionManager {
             result
         };
         Ok(conclusion)
+    }
+
+    async fn run_prepare_lifecycle(
+        self: Arc<Self>,
+        tid: TxnId,
+    ) -> Result<TMPrepareResult, TMError> {
+        // Note: Automatic retry with fresh timestamps removed because it changes
+        // the transaction ID mid-flight, breaking the client's reference.
+        // For remaining NotRealizable errors, clients should retry with a new transaction.
+        let result = self.do_prepare(&tid).await;
+        match &result {
+            Ok(TMPrepareResult::Success) => {}
+            Ok(_) | Err(_) => {
+                let _ = self.abort(tid.clone()).await;
+            }
+        }
+        result
     }
 }
 
@@ -1095,6 +1962,53 @@ mod tests {
             generate_scoped_service_id(group, "db_a"),
             generate_scoped_service_id(group, "db_b")
         );
+    }
+
+
+    #[test]
+    fn data_object_pinned_representation_defers_full_cell() {
+        let obj = DataObject {
+            server: 1,
+            cell: None,
+            expectation: CellExpectation::Absent,
+            changed: false,
+            new: false,
+            pinned: Some(PinnedReadCache {
+                header: None,
+                projections: HashMap::new(),
+            }),
+        };
+        assert!(obj.pinned.is_some());
+        assert!(obj.cell.is_none());
+        assert!(obj.pinned.as_ref().unwrap().header.is_none());
+        assert!(obj.pinned.as_ref().unwrap().projections.is_empty());
+    }
+
+    #[cfg(feature = "occ_phase_profile")]
+    #[test]
+    fn coordinator_profile_covers_every_existing_protocol_boundary() {
+        let source = include_str!("manager.rs");
+        let production_source = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production_source, _)| production_source)
+            .unwrap_or(source);
+        for phase in [
+            "Phase::ReadSiteRpc",
+            "Phase::AffectedObjectGrouping",
+            "Phase::PrepareParticipantLookup",
+            "Phase::PrepareBarrier",
+            "Phase::CommitBarrier",
+            "Phase::AbortParticipantLookup",
+            "Phase::AbortCleanup",
+            "Phase::EndParticipantLookup",
+            "Phase::EndCleanup",
+        ] {
+            assert!(
+                production_source.contains(phase),
+                "expected manager.rs to reference {}",
+                phase
+            );
+        }
     }
 
     async fn scoped_txn_client_for_database(
@@ -1161,6 +2075,295 @@ mod tests {
         runtime.chunks().write_cell(&mut cell).unwrap();
     }
 
+    fn counter_cell(schema_id: u32, id: Id, score: u64) -> OwnedCell {
+        let mut data = OwnedMap::new();
+        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("score"), OwnedValue::U64(score));
+        data.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("cell-{score}")),
+        );
+        OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
+    }
+
+    #[test]
+    fn changed_existing_replacement_builds_update_commit_op() {
+        let id = Id::new(0, 7001);
+        let cell = counter_cell(1, id, 9);
+        let commit_op = TransactionManager::commit_op_for_changed_data_obj(
+            id,
+            &DataObject {
+                server: 1,
+                cell: Some(cell.clone()),
+                expectation: CellExpectation::Present(3),
+                changed: true,
+                new: false,
+                pinned: None,
+            },
+        );
+
+        match commit_op {
+            CommitOp::Update(updated) => assert_eq!(updated.data, cell.data),
+            other => panic!("expected update commit op, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn prepare_result_reduction_waits_for_all_and_returns_first_failure() {
+        let results = vec![
+            Ok(DMPrepareResult::Success),
+            Ok(DMPrepareResult::NotRealizable),
+            Ok(DMPrepareResult::Success),
+        ];
+
+        assert_eq!(
+            TransactionManager::reduce_prepare_results(results).unwrap(),
+            DMPrepareResult::NotRealizable
+        );
+    }
+
+    #[test]
+    fn prepare_result_reduction_prefers_rpc_error_after_all_votes_settle() {
+        let results = vec![
+            Ok(DMPrepareResult::NotRealizable),
+            Err(TMError::RPCErrorFromCellServer),
+            Ok(DMPrepareResult::Success),
+        ];
+
+        assert_eq!(
+            TransactionManager::reduce_prepare_results(results),
+            Err(TMError::RPCErrorFromCellServer)
+        );
+    }
+
+    #[test]
+    fn abort_cleanup_requires_empty_rollback_failures() {
+        assert!(TransactionManager::abort_cleanup_complete(&Ok(
+            AbortResult::Success(None)
+        )));
+        assert!(!TransactionManager::abort_cleanup_complete(&Ok(
+            AbortResult::Success(Some(vec![]))
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_cleanup_preserves_abort_decisions_for_retry() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5370";
+        let group = "txn_manager_stale_abort_retry";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let txn = scoped_txn_client_for_database(address, group, group).await;
+        let tid = txn.begin().await.unwrap().unwrap();
+
+        let txn_lock = manager.get_transaction(&tid).unwrap();
+        {
+            let mut txn_guard = txn_lock.lock().await;
+            txn_guard.state = TxnState::Aborted;
+            txn_guard.last_activity = 0;
+        }
+
+        assert_eq!(manager.cleanup_stale_transactions(1), 0);
+        assert_eq!(manager.transaction_count(), 1);
+        assert_eq!(txn_lock.lock().await.state, TxnState::Aborted);
+
+        manager.cleanup_transaction(&tid);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn affected_objs_retains_read_dependencies_for_rw_transaction() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5288";
+        let group = "txn_manager_affected_objs_rw";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let read_id = Id::new(0, 7101);
+        let write_id = Id::new(0, 7102);
+        let txn_mutex = Mutex::new(Transaction {
+            data: HashMap::from([
+                (
+                    read_id,
+                    DataObject {
+                        server: 1,
+                        cell: Some(counter_cell(1, read_id, 1)),
+                        expectation: CellExpectation::Present(3),
+                        changed: false,
+                        new: false,
+                        pinned: None,
+                    },
+                ),
+                (
+                    write_id,
+                    DataObject {
+                        server: 1,
+                        cell: Some(counter_cell(1, write_id, 2)),
+                        expectation: CellExpectation::Present(4),
+                        changed: true,
+                        new: false,
+                        pinned: None,
+                    },
+                ),
+            ]),
+            affected_objects: AffectedObjs::new(),
+            state: TxnState::Started,
+            last_activity: get_time(),
+            pinned_servers: HashSet::new(),
+        });
+
+        let mut txn = txn_mutex.lock().await;
+        manager.generate_affected_objs(&mut txn);
+
+        assert!(
+            txn.data.is_empty(),
+            "drained transaction data should be cleared"
+        );
+        let participant = txn
+            .affected_objects
+            .get(&1)
+            .expect("read-write transaction should keep participant dependencies");
+        assert_eq!(participant.len(), 2);
+        assert!(participant.contains_key(&read_id));
+        assert!(participant.contains_key(&write_id));
+
+        drop(txn);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn affected_objs_read_only_transaction_clears_cached_data_locally() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5298";
+        let group = "txn_manager_affected_objs_ro";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let read_id = Id::new(0, 7201);
+        let txn_mutex = Mutex::new(Transaction {
+            data: HashMap::from([(
+                read_id,
+                DataObject {
+                    server: 1,
+                    cell: Some(counter_cell(1, read_id, 3)),
+                    expectation: CellExpectation::Present(8),
+                    changed: false,
+                    new: false,
+                    pinned: None,
+                },
+            )]),
+            affected_objects: AffectedObjs::new(),
+            state: TxnState::Started,
+            last_activity: get_time(),
+            pinned_servers: HashSet::new(),
+        });
+
+        let mut txn = txn_mutex.lock().await;
+        manager.generate_affected_objs(&mut txn);
+
+        assert!(
+            txn.data.is_empty(),
+            "read-only transaction cache should be cleared"
+        );
+        assert!(
+            txn.affected_objects.is_empty(),
+            "read-only transaction should not retain participants for prepare"
+        );
+
+        drop(txn);
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blind_mutation_records_update_version() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5338";
+        let group = "txn_occ_blind_update_version";
+        let server = start_manager_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_basic_schema(&runtime);
+        let cell_id = Id::new(0, 7301);
+
+        let mut seeded = counter_cell(schema.id, cell_id, 2);
+        runtime.chunks().write_cell(&mut seeded).unwrap();
+        let original = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+
+        let txn = scoped_txn_client_for_database(address, group, group).await;
+        let tid = txn.begin().await.unwrap().unwrap();
+
+        let blind_update = counter_cell(schema.id, cell_id, 7);
+        assert_eq!(
+            txn.update(tid.clone(), blind_update)
+                .await
+                .unwrap()
+                .unwrap(),
+            TxnExecResult::Accepted(())
+        );
+
+        let txn_lock = runtime
+            .txn_manager()
+            .unwrap()
+            .transactions
+            .get(&tid)
+            .expect("transaction should still be live after blind update");
+        let txn_state = txn_lock.lock().await;
+        let data_obj = txn_state
+            .data
+            .get(&cell_id)
+            .expect("blind update should cache the target cell");
+        assert_eq!(
+            data_obj.expectation,
+            CellExpectation::Present(original.header.version)
+        );
+        assert!(data_obj.changed);
+
+        drop(txn_state);
+        let _ = txn.abort(tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blind_mutation_records_remove_version() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5339";
+        let group = "txn_occ_blind_remove_version";
+        let server = start_manager_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_basic_schema(&runtime);
+        let cell_id = Id::new(0, 7302);
+
+        let mut seeded = counter_cell(schema.id, cell_id, 4);
+        runtime.chunks().write_cell(&mut seeded).unwrap();
+        let original = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+
+        let txn = scoped_txn_client_for_database(address, group, group).await;
+        let tid = txn.begin().await.unwrap().unwrap();
+
+        assert_eq!(
+            txn.remove(tid.clone(), cell_id).await.unwrap().unwrap(),
+            TxnExecResult::Accepted(())
+        );
+
+        let txn_lock = runtime
+            .txn_manager()
+            .unwrap()
+            .transactions
+            .get(&tid)
+            .expect("transaction should still be live after blind remove");
+        let txn_state = txn_lock.lock().await;
+        let data_obj = txn_state
+            .data
+            .get(&cell_id)
+            .expect("blind remove should cache the target cell");
+        assert_eq!(
+            data_obj.expectation,
+            CellExpectation::Present(original.header.version)
+        );
+        assert!(data_obj.changed);
+
+        drop(txn_state);
+        let _ = txn.abort(tid).await;
+        server.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_transaction_commits_leave_manager_empty() {
         let _ = env_logger::try_init();
@@ -1213,6 +2416,7 @@ mod tests {
                                     end
                                 );
                             }
+                            TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable) => {}
                             other => panic!("unexpected prepare result: {:?}", other),
                         }
                     }
@@ -1302,6 +2506,8 @@ mod tests {
                                         end
                                     );
                                 }
+                                TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable) => {
+                                }
                                 other => panic!("unexpected prepare result: {:?}", other),
                             }
                         }
@@ -1389,9 +2595,11 @@ mod tests {
             );
 
             match prepare_result {
-                Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
+                Ok(TMPrepareResult::Success)
+                | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
                 | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))
                 | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::TransactionNotExisted))
+                | Err(TMError::InvalidTransactionState(TxnState::Cleanup))
                 | Err(TMError::TransactionNotFound) => {}
                 other => panic!("unexpected prepare result in race: {:?}", other),
             }
@@ -1399,6 +2607,7 @@ mod tests {
             match abort_result {
                 Ok(AbortResult::Success(_))
                 | Ok(AbortResult::CheckFailed(CheckError::AlreadyAborted))
+                | Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup))
                 | Err(TMError::TransactionNotFound) => {}
                 other => panic!("unexpected abort result in race: {:?}", other),
             }
@@ -1424,20 +2633,26 @@ mod tests {
         let default_runtime = server.current_database();
         let default_schema = install_basic_schema(&default_runtime);
         let analytics_schema = install_basic_schema(&analytics_runtime);
-        let default_cell = Id::new(0, 4001);
-        let analytics_cell = Id::new(0, 4002);
-        seed_counter_cell(&default_runtime, default_schema.id, default_cell, 1).await;
-        seed_counter_cell(&analytics_runtime, analytics_schema.id, analytics_cell, 1).await;
+        for index in 0..24 {
+            let cell = Id::new(0, 4001 + index);
+            seed_counter_cell(&default_runtime, default_schema.id, cell, 1).await;
+            seed_counter_cell(&analytics_runtime, analytics_schema.id, cell, 1).await;
+        }
 
         let results = join_all((0..48).map(|iteration| {
             let address = address.to_string();
             let group = group.to_string();
             async move {
-                let (database_name, schema_id, hot_cell) = if iteration % 2 == 0 {
-                    (group.clone(), default_schema.id, default_cell)
+                let (database_name, schema_id) = if iteration % 2 == 0 {
+                    (group.clone(), default_schema.id)
                 } else {
-                    ("analytics".to_string(), analytics_schema.id, analytics_cell)
+                    ("analytics".to_string(), analytics_schema.id)
                 };
+                // Each writer/reader pair shares a cell so the newer reader forces the
+                // older writer's prepare failure. Using the same IDs in both databases
+                // exercises service scoping without introducing unrelated intra-database
+                // lock contention between pairs.
+                let hot_cell = Id::new(0, 4001 + (iteration / 2) as u64);
                 let txn_client =
                     scoped_txn_client_for_database(&address, &group, &database_name).await;
                 let writer_tid = txn_client.begin().await.unwrap().unwrap();
@@ -1489,9 +2704,11 @@ mod tests {
                 );
 
                 match prepare_result {
-                    Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
+                    Ok(TMPrepareResult::Success)
+                    | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))
                     | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))
                     | Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::TransactionNotExisted))
+                    | Err(TMError::InvalidTransactionState(TxnState::Cleanup))
                     | Err(TMError::TransactionNotFound) => {}
                     other => panic!("unexpected prepare result in race: {:?}", other),
                 }
@@ -1499,6 +2716,7 @@ mod tests {
                 match abort_result {
                     Ok(AbortResult::Success(_))
                     | Ok(AbortResult::CheckFailed(CheckError::AlreadyAborted))
+                    | Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup))
                     | Err(TMError::TransactionNotFound) => {}
                     other => panic!("unexpected abort result in race: {:?}", other),
                 }

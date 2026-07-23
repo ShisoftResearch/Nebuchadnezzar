@@ -1,8 +1,9 @@
 use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
 use crate::server::Peer;
-use bifrost::rpc::{RPCError, ServiceClient, ServiceClientWithId, DEFAULT_CLIENT_POOL};
-use bifrost::vector_clock::StandardVectorClock;
+use bifrost::rpc::{RPCError, ServiceClient, DEFAULT_CLIENT_POOL};
+use bifrost::vector_clock::{Relation, StandardVectorClock};
+use std::cmp::Ordering;
 use std::io;
 use std::sync::Arc;
 
@@ -11,10 +12,59 @@ mod corruption_tests;
 pub mod data_site;
 pub mod manager;
 #[cfg(test)]
+mod occ_tests;
+#[cfg(feature = "occ_phase_profile")]
+pub mod phase_profile;
+#[cfg(test)]
 mod tests;
 pub mod undo_log;
 
 pub type TxnId = StandardVectorClock;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub enum CellExpectation {
+    Present(u64),
+    Absent,
+}
+
+#[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
+pub enum PrepareIntent {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct PrepareOp {
+    pub id: Id,
+    pub expectation: CellExpectation,
+    pub intent: PrepareIntent,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
+pub struct TxnPriority {
+    pub tid: TxnId,
+    pub coordinator_id: u64,
+}
+
+impl TxnPriority {
+    pub fn new(tid: TxnId, coordinator_id: u64) -> Self {
+        Self {
+            tid,
+            coordinator_id,
+        }
+    }
+
+    pub fn compare_age(&self, other: &Self) -> Ordering {
+        match self.tid.relation(&other.tid) {
+            Relation::Before => Ordering::Less,
+            Relation::After => Ordering::Greater,
+            Relation::Equal | Relation::Concurrent => self
+                .coordinator_id
+                .cmp(&other.coordinator_id)
+                .then_with(|| self.tid.deterministic_cmp(&other.tid)),
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub enum TxnExecResult<A, E>
@@ -174,4 +224,96 @@ pub async fn new_async_client_for_database(
     Ok(manager::AsyncServiceClient::new_with_service_id(
         service_id, &client,
     ))
+}
+
+#[cfg(test)]
+mod occ_type_tests {
+    use super::{TxnId, TxnPriority};
+    use bifrost::vector_clock::{Relation, StandardVectorClock};
+    use serde_json::json;
+    use std::cmp::Ordering;
+    use std::panic::catch_unwind;
+
+    fn clock(entries: &[(u64, u64)]) -> TxnId {
+        StandardVectorClock::from_vec(entries.to_vec())
+    }
+
+    fn raw_clock(entries: &[(u64, u64)]) -> TxnId {
+        serde_json::from_value(json!({ "map": entries })).unwrap()
+    }
+
+    #[test]
+    fn txn_priority_preserves_causal_order() {
+        let older = TxnPriority::new(clock(&[(1, 1)]), 9);
+        let newer = TxnPriority::new(clock(&[(1, 2)]), 9);
+
+        assert_eq!(older.compare_age(&newer), Ordering::Less);
+        assert_eq!(newer.compare_age(&older), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_totally_orders_concurrent_clocks_by_coordinator() {
+        let left = TxnPriority::new(clock(&[(1, 1)]), 10);
+        let right = TxnPriority::new(clock(&[(2, 1)]), 20);
+
+        assert_eq!(left.compare_age(&right), Ordering::Less);
+        assert_eq!(right.compare_age(&left), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_preserves_causal_order_with_missing_components() {
+        let older = TxnPriority::new(clock(&[(1, 1)]), 20);
+        let younger = TxnPriority::new(clock(&[(1, 1), (2, 1)]), 10);
+
+        assert_eq!(older.compare_age(&younger), Ordering::Less);
+        assert_eq!(younger.compare_age(&older), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_totally_orders_same_coordinator_concurrent_clocks_without_serialization() {
+        let left = TxnPriority::new(clock(&[(1, 1)]), 10);
+        let right = TxnPriority::new(clock(&[(2, 1)]), 10);
+        let expected = left.tid.deterministic_cmp(&right.tid);
+
+        assert_ne!(expected, Ordering::Equal);
+        assert_eq!(left.compare_age(&right), expected);
+        assert_eq!(right.compare_age(&left), expected.reverse());
+    }
+
+    #[test]
+    fn txn_priority_canonicalizes_duplicate_components_by_max_counter() {
+        let older = TxnPriority::new(raw_clock(&[(1, 1), (1, 3)]), 20);
+        let younger = TxnPriority::new(clock(&[(1, 3), (2, 1)]), 10);
+
+        assert_eq!(older.tid.relation(&younger.tid), Relation::Before);
+        assert_eq!(younger.tid.relation(&older.tid), Relation::After);
+        let forward = catch_unwind(|| older.compare_age(&younger));
+        let reverse = catch_unwind(|| younger.compare_age(&older));
+
+        assert_eq!(forward.unwrap(), Ordering::Less);
+        assert_eq!(reverse.unwrap(), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_preserves_causal_order_for_unsorted_zero_components() {
+        let older = TxnPriority::new(raw_clock(&[(3, 0), (2, 1), (1, 1)]), 20);
+        let younger = TxnPriority::new(raw_clock(&[(4, 1), (2, 1), (1, 1), (3, 0)]), 10);
+
+        assert_eq!(older.tid.relation(&younger.tid), Relation::Before);
+        assert_eq!(younger.tid.relation(&older.tid), Relation::After);
+        assert_eq!(older.compare_age(&younger), Ordering::Less);
+        assert_eq!(younger.compare_age(&older), Ordering::Greater);
+    }
+
+    #[test]
+    fn txn_priority_tie_breaks_semantically_equal_unsorted_zero_clocks_by_deterministic_cmp() {
+        let left = TxnPriority::new(raw_clock(&[(2, 0), (1, 1)]), 10);
+        let right = TxnPriority::new(raw_clock(&[(1, 1), (3, 0)]), 10);
+        let expected = left.tid.deterministic_cmp(&right.tid);
+
+        assert_eq!(left.tid.relation(&right.tid), Relation::Equal);
+        assert_ne!(expected, Ordering::Equal);
+        assert_eq!(left.compare_age(&right), expected);
+        assert_eq!(right.compare_age(&left), expected.reverse());
+    }
 }
