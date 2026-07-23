@@ -40,9 +40,34 @@ fn report_path(label: &str) -> PathBuf {
     PathBuf::from("target/occ-bench").join(format!("{label}.json"))
 }
 
+#[cfg(feature = "occ_phase_profile")]
+fn reset_phase_profile() {
+    neb::server::transactions::phase_profile::reset()
+        .unwrap_or_else(|active| panic!("reset OCC phase profile with active guards: {active:?}"));
+}
+
+#[cfg(not(feature = "occ_phase_profile"))]
+fn reset_phase_profile() {}
+
+#[cfg(feature = "occ_phase_profile")]
+fn snapshot_phase_profile(summary: &mut occ_support::metrics::ScenarioSummary) {
+    let snapshot = neb::server::transactions::phase_profile::snapshot();
+    summary
+        .attach_phase_snapshot(&snapshot)
+        .unwrap_or_else(|error| match error {
+            occ_support::metrics::PhaseSnapshotError::ActiveGuards(active_guards) => {
+                panic!("snapshot OCC phase profile with active guards: {active_guards}")
+            }
+        });
+}
+
+#[cfg(not(feature = "occ_phase_profile"))]
+fn snapshot_phase_profile(_: &mut occ_support::metrics::ScenarioSummary) {}
+
 fn publish(scenario: &str, batch: TimedBatch) -> Duration {
     let elapsed = batch.elapsed;
-    let summary = batch.metrics.summary(elapsed);
+    let mut summary = batch.metrics.summary(elapsed);
+    snapshot_phase_profile(&mut summary);
     let mut report = report().lock().expect("lock OCC benchmark report");
     report.record(scenario, summary.clone());
     let path = report_path(&report.label);
@@ -110,6 +135,7 @@ fn register_rmw(
                 let ids = ids.clone();
                 let scenario = scenario.clone();
                 bench.iter_custom(move |iterations| {
+                    reset_phase_profile();
                     let batch = runtime.block_on(run_fixed_success_rmw(
                         fixture.clone(),
                         ids.clone(),
@@ -240,6 +266,7 @@ fn projected_reads(criterion: &mut Criterion) {
             let ids = ids.clone();
             let scenario = scenario.clone();
             bench.iter_custom(move |iterations| {
+                reset_phase_profile();
                 let batch = runtime_ref.block_on(run_projected_read_batch(
                     fixture.clone(),
                     ids.clone(),
@@ -274,6 +301,7 @@ fn blind_mutations(criterion: &mut Criterion) {
             let fixture = fixture.clone();
             let ids = ids.clone();
             bench.iter_custom(move |iterations| {
+                reset_phase_profile();
                 let batch = runtime_ref.block_on(run_blind_update_batch(
                     fixture.clone(),
                     ids.clone(),
@@ -293,6 +321,7 @@ fn blind_mutations(criterion: &mut Criterion) {
             let fixture = fixture.clone();
             let ids = ids.clone();
             bench.iter_custom(move |iterations| {
+                reset_phase_profile();
                 let batch = runtime_ref.block_on(run_blind_remove_batch(
                     fixture.clone(),
                     ids.clone(),

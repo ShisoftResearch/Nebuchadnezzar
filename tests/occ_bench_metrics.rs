@@ -118,6 +118,25 @@ fn retries_and_failures_cannot_be_counted_as_throughput() {
 
 #[cfg(feature = "occ_phase_profile")]
 #[test]
+fn occ_driver_brackets_every_workload_batch_with_phase_registry_calls() {
+    let driver = include_str!("../benches/occ_transactions.rs");
+
+    assert_eq!(
+        driver.matches("reset_phase_profile();").count(),
+        4,
+        "OCC driver must reset the phase registry once per workload batch entry point"
+    );
+    assert_eq!(
+        driver
+            .matches("snapshot_phase_profile(&mut summary);")
+            .count(),
+        1,
+        "OCC driver must snapshot the phase registry exactly once when publishing summaries"
+    );
+}
+
+#[cfg(feature = "occ_phase_profile")]
+#[test]
 fn phase_snapshot_reports_per_invocation_and_per_commit_costs() {
     let mut phases = [PhaseMeasurement::default(); PHASE_COUNT];
     phases[Phase::PrepareBarrier as usize] = PhaseMeasurement {
