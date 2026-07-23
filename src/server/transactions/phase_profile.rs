@@ -61,6 +61,7 @@ struct Registry {
     active_guards: AtomicUsize,
 }
 
+#[must_use = "keep the phase profiling guard alive for the scope you want to measure"]
 pub struct Guard {
     registry: &'static Registry,
     phase: Phase,
@@ -70,7 +71,7 @@ pub struct Guard {
 static REGISTRY: Registry = Registry::new();
 
 impl Phase {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Phase::ReadSiteRpc => "read_site_rpc",
             Phase::AffectedObjectGrouping => "affected_object_grouping",
@@ -177,14 +178,32 @@ impl Drop for Guard {
     }
 }
 
+#[must_use = "bind the returned guard to keep timing active until the measured scope ends"]
 pub fn guard(phase: Phase) -> Guard {
     REGISTRY.guard(phase)
 }
 
+/// Resets accumulated phase measurements for a new benchmark interval.
+///
+/// Intended for quiescent, serialized benchmark boundaries only. This is not a
+/// synchronization barrier or seqlock; callers must ensure no concurrent guard
+/// creation or drop is racing with the reset, and must not treat it as making
+/// other threads observe a globally ordered cutoff.
+///
+/// The reset rejects guards that are already active when it checks
+/// `active_guards`, but it cannot prevent a new guard from starting
+/// concurrently after that check. Callers must provide that external
+/// quiescence.
 pub fn reset() -> Result<(), ActiveGuards> {
     REGISTRY.reset()
 }
 
+/// Returns the current accumulated measurements and active guard count.
+///
+/// Intended for quiescent, serialized benchmark boundaries only. This is not a
+/// synchronization barrier or seqlock; callers must ensure no concurrent guard
+/// creation or drop is racing with the snapshot if they want to treat the
+/// returned values as final for an interval.
 pub fn snapshot() -> Snapshot {
     REGISTRY.snapshot()
 }
@@ -193,6 +212,8 @@ pub fn snapshot() -> Snapshot {
 mod tests {
     use super::*;
     use std::{thread, time::Duration};
+
+    const PARTICIPANT_END_NAME_IS_CONST: &str = Phase::ParticipantEnd.as_str();
 
     fn local_registry() -> &'static Registry {
         Box::leak(Box::new(Registry::new()))
@@ -286,5 +307,32 @@ mod tests {
 
         assert_eq!(registry.reset(), Ok(()));
         assert_eq!(registry.snapshot().active_guards, 0);
+    }
+
+    #[test]
+    fn concurrent_guard_drops_record_every_invocation() {
+        const THREADS: usize = 4;
+        const GUARDS_PER_THREAD: usize = 128;
+
+        let registry = local_registry();
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..GUARDS_PER_THREAD {
+                        let _guard = registry.guard(Phase::ParticipantAbort);
+                    }
+                });
+            }
+        });
+
+        let snapshot = registry.snapshot();
+
+        assert_eq!(PARTICIPANT_END_NAME_IS_CONST, "participant_end");
+        assert_eq!(
+            snapshot.phases[Phase::ParticipantAbort as usize].invocation_count,
+            (THREADS * GUARDS_PER_THREAD) as u64
+        );
+        assert_eq!(snapshot.active_guards, 0);
     }
 }
