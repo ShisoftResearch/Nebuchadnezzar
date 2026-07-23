@@ -97,15 +97,24 @@ fn ensure_write_back_runtime() -> &'static WriteBackRuntime {
     })
 }
 
+fn should_initialize_runtime_before_wait(runtime_started: bool, change_counter: usize) -> bool {
+    !runtime_started && change_counter > 0
+}
+
 pub fn start_external_nodes_write_back(_client: &Arc<client::AsyncClient>) {
     let _ = ensure_write_back_runtime();
 }
 
 pub async fn wait_until_updated() {
-    if WRITE_BACK_RUNTIME.get().is_none() {
+    let counter = external::CHANGE_COUNTER.load(Ordering::Acquire);
+    let runtime_started = WRITE_BACK_RUNTIME.get().is_some();
+
+    if should_initialize_runtime_before_wait(runtime_started, counter) {
+        let _ = ensure_write_back_runtime();
+    } else if !runtime_started {
         return;
     }
-    let counter = external::CHANGE_COUNTER.load(Ordering::Acquire);
+
     if counter == 0 {
         return;
     }
@@ -141,6 +150,13 @@ pub async fn wait_until_updated() {
 mod tests {
     use super::*;
     use std::{sync::mpsc, time::Duration};
+
+    #[test]
+    fn wait_until_updated_initializes_runtime_for_queued_work_before_startup() {
+        assert!(should_initialize_runtime_before_wait(false, 1));
+        assert!(!should_initialize_runtime_before_wait(false, 0));
+        assert!(!should_initialize_runtime_before_wait(true, 1));
+    }
 
     #[test]
     fn write_back_manager_outlives_the_runtime_that_initialized_it() {
