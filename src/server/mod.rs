@@ -895,6 +895,12 @@ pub struct NebServer {
     pub membership: Arc<ObserverClient>,
     pub member_pool: Arc<rpc::ClientPool>,
     pub txn_peer: Peer,
+    /// Per-server Hybrid Logical Clock source (node = server_id), shared by
+    /// every database's transaction manager (coordinator) and data manager
+    /// (participant) hosted on this server. Not yet consumed; wiring only
+    /// (see docs/superpowers/specs/2026-07-23-hlc-txn-id-design.md).
+    #[allow(dead_code)]
+    pub hlc: Arc<bifrost::hlc::HlcSource>,
     pub raft_service: Arc<raft::RaftService>,
     pub raft_client: Arc<RaftClient>,
     pub server_id: u64,
@@ -1091,6 +1097,7 @@ impl NebServer {
         conshasing: &Arc<ConsistentHashing>,
         member_pool: &Arc<rpc::ClientPool>,
         txn_peer: &Peer,
+        hlc: &Arc<bifrost::hlc::HlcSource>,
         register_schema_state_machine: bool,
         pre_acquired_storage_locks: Option<Arc<StorageDirectoryLocks>>,
     ) -> Result<Arc<DatabaseRuntime>, ServerError> {
@@ -1292,6 +1299,7 @@ impl NebServer {
                     rpc_server.server_id,
                     conshasing,
                     member_pool,
+                    hlc,
                 )
                 .await,
             )
@@ -1332,6 +1340,7 @@ impl NebServer {
                         rpc_server,
                         database_runtime.clone(),
                         txn_peer.clone(),
+                        hlc.clone(),
                     )
                     .await
                 }
@@ -1426,6 +1435,7 @@ impl NebServer {
             &self.consh,
             &self.member_pool,
             &self.txn_peer,
+            &self.hlc,
             needs_schema_registration,
             None,
         )
@@ -1714,6 +1724,10 @@ impl NebServer {
         .await?;
         let member_pool = Arc::new(rpc::ClientPool::new());
         let txn_peer = Peer::new(server_addr);
+        // One HLC source per server process (node = server_id), shared by every
+        // database's transaction manager (coordinator) and data manager
+        // (participant) hosted on this server.
+        let hlc = Arc::new(bifrost::hlc::HlcSource::new(rpc_server.server_id));
         let shared_memory_pool = opts
             .tiered_config
             .as_ref()
@@ -1743,6 +1757,7 @@ impl NebServer {
             &conshasing,
             &member_pool,
             &txn_peer,
+            &hlc,
             false,
             Some(startup_storage_locks),
         )
@@ -1780,6 +1795,7 @@ impl NebServer {
             raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
             txn_peer: txn_peer,
+            hlc,
             group_name: group_name.clone(),
             database_name: database_name.to_string(),
             neb_client: database_runtime.neb_client.clone(),
@@ -2089,6 +2105,7 @@ pub async fn init_txn_manager(
     server_id: u64,
     consh: &Arc<ConsistentHashing>,
     member_pool: &Arc<ClientPool>,
+    hlc: &Arc<bifrost::hlc::HlcSource>,
 ) -> Arc<TransactionManager> {
     let deps = Arc::new(transactions::manager::TransactionManagerDeps {
         database_runtime: database_runtime.clone(),
@@ -2096,6 +2113,7 @@ pub async fn init_txn_manager(
         server_id: server_id,
         consh: consh.clone(),
         member_pool: member_pool.clone(),
+        hlc: hlc.clone(),
     });
     let txn_manager = transactions::manager::TransactionManager::new(deps);
     rpc_server
@@ -2113,6 +2131,7 @@ pub async fn init_txn_data_site_service(
     rpc_server: &Arc<Server>,
     database_runtime: Arc<DatabaseRuntime>,
     txn_peer: Peer,
+    hlc: Arc<bifrost::hlc::HlcSource>,
 ) {
     rpc_server
         .register_service_with_id(
@@ -2120,7 +2139,7 @@ pub async fn init_txn_data_site_service(
                 database_runtime.group_name(),
                 database_runtime.database_name(),
             ),
-            &transactions::data_site::DataManager::new(database_runtime, txn_peer),
+            &transactions::data_site::DataManager::new(database_runtime, txn_peer, hlc),
         )
         .await;
 }

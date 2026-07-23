@@ -288,6 +288,11 @@ pub struct DataManager {
     database_runtime: Arc<DatabaseRuntime>,
     txn_peer: Peer,
     cleanup_signal: Arc<AtomicBool>,
+    /// Per-server Hybrid Logical Clock source (node = server_id), shared with
+    /// the coordinator-side `TransactionManager`. Not yet consumed; wiring
+    /// only (see docs/superpowers/specs/2026-07-23-hlc-txn-id-design.md).
+    #[allow(dead_code)]
+    hlc: Arc<bifrost::hlc::HlcSource>,
 }
 
 service! {
@@ -316,7 +321,11 @@ dispatch_rpc_service_functions!(DataManager);
 service_with_id!(DataManager, DEFAULT_SERVICE_ID);
 
 impl DataManager {
-    pub fn new(database_runtime: Arc<DatabaseRuntime>, txn_peer: Peer) -> Arc<Self> {
+    pub fn new(
+        database_runtime: Arc<DatabaseRuntime>,
+        txn_peer: Peer,
+        hlc: Arc<bifrost::hlc::HlcSource>,
+    ) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             cells: LFMap::with_capacity(256),
@@ -326,6 +335,7 @@ impl DataManager {
             database_runtime,
             txn_peer,
             cleanup_signal: cleanup_signal.clone(),
+            hlc,
         });
         let manager_clone = manager.clone();
         tokio::spawn(async move {
@@ -1499,7 +1509,11 @@ mod tests {
             .ensure_database_runtime(database_name)
             .await
             .expect("database runtime");
-        DataManager::new(runtime, crate::server::Peer::new(&address.to_string()))
+        DataManager::new(
+            runtime,
+            crate::server::Peer::new(&address.to_string()),
+            server.hlc.clone(),
+        )
     }
 
     async fn data_site_client_for_database(

@@ -182,6 +182,11 @@ pub struct TransactionManagerDeps {
     pub server_id: u64,
     pub consh: Arc<ConsistentHashing>,
     pub member_pool: Arc<ClientPool>,
+    /// Per-server Hybrid Logical Clock source (node = server_id), shared with
+    /// the participant-side `DataManager`. Not yet consumed; wiring only
+    /// (see docs/superpowers/specs/2026-07-23-hlc-txn-id-design.md).
+    #[allow(dead_code)]
+    pub hlc: Arc<bifrost::hlc::HlcSource>,
 }
 
 impl TransactionManagerDeps {
