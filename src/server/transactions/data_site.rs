@@ -1254,6 +1254,15 @@ mod tests {
             .expect("data_site.rs should resume production code after the private test module");
         let production_source =
             format!("{before_tests}\n\nimpl Service for DataManager {{{after_tests}");
+        let end_method_tail = production_source
+            .split_once("\n    fn end(")
+            .map(|(_, end_method_tail)| end_method_tail)
+            .expect("expected data_site.rs to define Service::end");
+        let async_move_offset = end_method_tail
+            .find("async move {")
+            .expect("expected Service::end to return an async cleanup future");
+        let before_async_move = &end_method_tail[..async_move_offset];
+        let async_move_and_after = &end_method_tail[async_move_offset..];
 
         for phase in [
             "Phase::ParticipantPrepare",
@@ -1266,6 +1275,18 @@ mod tests {
                 "missing participant guard for {phase}"
             );
         }
+
+        assert!(
+            before_async_move.contains("let phase_guard =")
+                && before_async_move.contains("Phase::ParticipantEnd"),
+            "expected Service::end to bind a named participant end guard before its async cleanup future",
+        );
+        assert!(
+            async_move_and_after.contains(
+                "async move {\n            #[cfg(feature = \"occ_phase_profile\")]\n            let _phase_guard = phase_guard;"
+            ),
+            "expected Service::end async cleanup future to retain the participant end guard",
+        );
     }
 
     #[test]
@@ -3559,7 +3580,7 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
-        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
+        let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
         self.update_clock(&clock);
 
         // Option 6: Two-Phase Lock Release with Verification and Retry
@@ -3651,6 +3672,8 @@ impl Service for DataManager {
             retry_attempt += 1;
         }
         async move {
+            #[cfg(feature = "occ_phase_profile")]
+            let _phase_guard = phase_guard;
             // Release all segment references before wiping out transaction
             let guards_to_drop = {
                 if let Some(txn_lock) = self.find_transaction(&tid) {
