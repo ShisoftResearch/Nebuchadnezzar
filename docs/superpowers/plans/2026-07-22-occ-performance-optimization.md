@@ -2087,3 +2087,102 @@ hypothesis.
 git add src/server/transactions/data_site.rs
 git commit -m "perf(txn): borrow owners during wait-die checks"
 ```
+
+## Task 12: Retain and Sync One Guard per Transaction Segment
+
+**Files:**
+- Modify: `src/server/transactions/data_site.rs:718-1020`
+- Test: `src/server/transactions/data_site.rs`
+
+- [ ] **Step 1: Add a failing same-segment guard and rollback test**
+
+Add
+`commit_retains_one_guard_per_segment_and_rolls_back_every_cell` in the
+`data_site.rs` test module. On a fresh server, seed two small cells in the same
+partition and assert from `address_of` plus `get_cell_segment_info` that their
+old versions occupy the same `(chunk_id, segment_id)`. Prepare both as
+`Present(version)` writes and commit two updates in one transaction.
+
+Before abort, inspect the tracked committed transaction and assert:
+
+```rust
+assert_eq!(txn.history.len(), 2);
+assert_eq!(txn.segment_guards.len(), 1);
+assert_eq!(
+    (
+        txn.segment_guards[0].chunk_id(),
+        txn.segment_guards[0].segment_id(),
+    ),
+    old_segment_key,
+);
+```
+
+Record both committed versions, then abort the committed transaction. Verify
+both cells were restored to their original values and that each rollback
+version is greater than its committed version. End the transaction
+successfully. This proves one segment reference protects every rollback entry
+in that segment without regressing the monotonic versions required by OCC and
+same-version ABA protection.
+
+- [ ] **Step 2: Run the test and verify RED**
+
+```bash
+cargo test --lib server::transactions::data_site::tests::commit_retains_one_guard_per_segment_and_rolls_back_every_cell -- --exact
+```
+
+Expected: the commit and two-cell history assertions pass, but the guard-count
+assertion fails because the current update path retains two guards for the same
+segment.
+
+- [ ] **Step 3: Retain only the first guard for each segment**
+
+Add a small helper that accepts the newly acquired
+`SegmentReferenceGuard`, compares both `chunk_id()` and `segment_id()` against
+the guards already retained by the transaction, and pushes it only when that
+segment is not already protected. A duplicate guard is dropped immediately.
+
+Use the helper only after a successful `CommitOp::Update` or
+`CommitOp::Remove`, replacing the two direct
+`txn.segment_guards.push(guard)` calls. Do not change the `CommitOp::Write`
+path, storage prevalidation, version-conditional mutation, undo/history
+capture, owner validation, rollback, cleanup, or any distributed phase.
+
+The existing post-mutation loop remains the durability barrier. Because the
+retained guards are unique by `(chunk_id, segment_id)`, it invokes
+`force_wal_sync` exactly once for each protected segment after all transaction
+mutations have completed. A segment-level `sync_all` covers all WAL writes to
+that segment; duplicate calls before any later transaction mutation add no
+durability.
+
+- [ ] **Step 4: Verify rollback, prevalidation, and commit behavior**
+
+```bash
+cargo test --lib server::transactions::data_site::tests::commit_retains_one_guard_per_segment_and_rolls_back_every_cell -- --exact
+cargo test --lib server::transactions::data_site::tests::commit_prevalidates_current_storage_state_before_partial_write -- --exact
+cargo test --lib server::transactions::data_site::tests::commit_rejects_change_after_certification -- --exact
+git diff --check
+```
+
+Expected: every test passes. The new test must verify both restored cells, not
+only the guard count.
+
+- [ ] **Step 5: Run the targeted benchmark and retain-or-revert gate**
+
+On `192.168.10.17`, run exact default-feature
+`occ/multi_cell/8` measurements serially with
+`numactl --cpunodebind=0 --membind=0` against the saved stable baseline. Use
+Criterion sample mean/derived throughput as canonical, require CV at most 5%,
+and use the custom JSON p95 as the latest-batch diagnostic.
+
+Retain only if stable multi-cell throughput or p95 improves by at least 5%.
+If it passes, run the complete stable portfolio and enforce the aggregate,
+secondary throughput, secondary p95, invariant, unexpected-outcome, and
+correctness policies. Otherwise preserve the audit patch, restore the accepted
+base, and record the rejected hypothesis.
+
+- [ ] **Step 6: Commit only an accepted change**
+
+```bash
+git add src/server/transactions/data_site.rs
+git commit -m "perf(txn): deduplicate transaction segment guards"
+```
