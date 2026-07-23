@@ -235,29 +235,57 @@ git add src/server/transactions/manager.rs
 git commit -m "feat(txn): add coordinator pinned-read data-object representation"
 ```
 
-### Task 2.2: Size-gate the coordinator read; cache small results; defer full fetch
+### Design decision (2026-07-23): enriched read responses
+
+The coordinator must choose "cache the whole cell (small) vs. defer + cache only small
+results (large)," but only learns a cell's size from the participant, and today's read
+RPCs carry no size signal and never return a full cell alongside a header. A header-only
+RPC for a small cell would also break repeatable reads (a `head` then a later full `read`,
+with a concurrent update in between, would see two versions, since small cells are not
+pinned). Resolution: **enrich the participant read responses** so each carries the
+requested shape, the version, a `pinned: bool`, and — for `head`/`read_selected` on a
+**small** cell — the full cell too, so the coordinator caches it once and serves all shapes
+locally (today's consistent, single-RPC small-cell behavior). Large cells return only the
+requested shape + `pinned = true`. This splits original Task 2.2 into 2.2a (participant
+envelope, behavior-preserving) and 2.2b (coordinator deferral logic, the win).
+
+### Task 2.2a: Enriched participant read-response envelope (behavior-preserving)
 
 **Files:**
-- Modify: `src/server/transactions/manager.rs` — `read_cached_full_cell` (804), `read_from_site` (861), `head`/`read`/`read_selected` service methods (397-456).
+- Modify: `src/server/transactions/data_site.rs` — the `service!` read RPC return types (`read`, `read_selected`, `head`), their handlers, and the `ensure_read_pin`/read paths added in 1.3.
+- Modify: `src/server/transactions/manager.rs` — the coordinator call sites of those RPCs, to extract the existing shape from the new envelope (behavior UNCHANGED this task).
 
-- [ ] **Step 1: Write the failing integration test** (`occ_tests.rs`): a transaction does `head` then `read_selected` on a large cell; assert both succeed and are consistent, and assert (via a counter/instrumentation added on the data-site full-`read` path) that **no full-cell `read` RPC** was issued for a header+selected-only transaction; then do a full `read` and assert exactly one full fetch occurs and equals the pinned version.
+- [ ] **Step 1: Write the failing test** — a participant `head`/`read_selected`/`read` returns the new envelope with `pinned` set correctly (true for a large cell, false for a small one) and, for `head`/`read_selected` on a small cell, `full_small_cell` populated; for a large cell `full_small_cell` is `None`.
 
 - [ ] **Step 2: Run — expect FAIL.**
 
-- [ ] **Step 3: Implement.** In `read_from_site`, branch on whether the participant returned a pinned small result:
-  - `head`: request `head` from the participant; store the header in the `DataObject` (pinned). Repeated `head` serves from the cached header.
-  - `read_selected`: request the projection; cache it keyed by field list.
-  - full `read`: if `cell` is not yet materialized, issue the full read (served by the participant from the pin) and store it.
-  Keep certification recording (`CellExpectation::Present(version)`) exactly as today. Sub-threshold cells keep the current clone-into-`cell` path.
+- [ ] **Step 3: Implement** the envelope types and change the three RPCs to return them:
+  - `head` → `TxnExecResult<HeadReply, ReadError>` where `HeadReply { header: CellHeader, pinned: bool, full_small_cell: Option<OwnedCell> }`.
+  - `read_selected` → `TxnExecResult<SelectedReply, ReadError>` where `SelectedReply { selected: OwnedCell, pinned: bool, full_small_cell: Option<OwnedCell> }`.
+  - `read` → `TxnExecResult<ReadReply, ReadError>` where `ReadReply { cell: OwnedCell, pinned: bool }`.
+  Handlers set `pinned` from whether `ensure_read_pin` pinned the cell; for a small cell (`ensure_read_pin` returned `None`) on `head`/`read_selected`, also read and attach the full current cell as `full_small_cell`. Update the coordinator call sites to just extract `header`/`selected`/`cell` and ignore the new fields for now — **behavior must be identical to before this task.**
+
+- [ ] **Step 4: Run — expect PASS**, plus `cargo check --lib`.
+
+- [ ] **Step 5: Commit** `git commit -m "feat(txn): enrich participant read responses with pinned/full-small-cell\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"`
+
+### Task 2.2b: Coordinator size-gate + deferred full fetch (the win)
+
+**Files:**
+- Modify: `src/server/transactions/manager.rs` — `read_cached_full_cell` (804), `read_from_site` (861), `head`/`read`/`read_selected` service methods (397-456), using the `DataObject.pinned` cache from Task 2.1.
+
+- [ ] **Step 1: Write the failing integration test** (`occ_tests.rs`): a transaction does `head` then `read_selected` on a large cell; assert both succeed and are consistent, and assert (via an instrumentation counter on the participant full-`read` handler) that **no full-cell fetch** occurred for a header+selected-only transaction; then a full `read` triggers exactly one full fetch equal to the pinned version. Also assert a **small** cell read as `head` then full stays consistent under a concurrent update (served from the coordinator's cached full cell).
+
+- [ ] **Step 2: Run — expect FAIL.**
+
+- [ ] **Step 3: Implement** the coordinator branch on the envelope's `pinned`:
+  - `pinned = false` (small): behavior as today — cache the full cell (`full_small_cell` for head/selected, or the returned `cell` for a full read) into `DataObject.cell`; serve all shapes locally.
+  - `pinned = true` (large): set `DataObject.pinned = Some(..)`; cache the header (`head`) / projection (`read_selected`) in the pinned cache; do NOT materialize the full cell. A full `read` fetches from the participant (served from the pin) once and stores it in `DataObject.cell`. Repeated head/selected serve from the pinned cache.
+  Keep `CellExpectation::Present(version)` certification recording exactly as today.
 
 - [ ] **Step 4: Run — expect PASS**, plus the full gate suite.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/server/transactions/manager.rs
-git commit -m "feat(txn): size-gate coordinator reads and defer full-cell fetch"
-```
+- [ ] **Step 5: Commit** `git commit -m "feat(txn): size-gate coordinator reads and defer full-cell fetch\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"`
 
 ---
 

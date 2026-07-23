@@ -159,6 +159,19 @@ cell never transfers or clones the whole cell. Read-your-writes is unchanged: a
 buffered write shadows the pinned read exactly as it shadows a cached cell
 today.
 
+**Read-response protocol (decided 2026-07-23).** The coordinator cannot know a
+cell's size before reading it, and the participant read RPCs must therefore
+carry the size decision back. Each participant read response is enriched to a
+small envelope carrying the requested shape, the version, a `pinned: bool`, and
+— for `head`/`read_selected` on a **small** cell — the full cell as well
+(`full_small_cell`). A small cell is thus fetched whole on its first access (the
+coordinator caches it and serves every shape locally, preserving today's
+single-RPC, consistent small-cell behavior); a large cell returns only the
+requested shape with `pinned = true`, and the coordinator defers the full-cell
+transfer until an actual full read. This avoids a repeatable-read violation that
+a header-only response would cause for a small cell updated between a `head` and
+a later full read.
+
 ### Certification (unchanged)
 
 The coordinator records the observed version as `CellExpectation::Present`
