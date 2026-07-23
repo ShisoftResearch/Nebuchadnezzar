@@ -300,6 +300,29 @@ decreased 0.59%. The candidate therefore failed both the portfolio geometric
 mean gate and the secondary throughput/p95 limits. It was quarantined without
 a production commit despite improving independent-transaction p95 latency.
 
+### Rejected prepare-payload-reuse attempt
+
+Patch digest `4efd95f3a160` moved construction of the sorted
+`Vec<PrepareOp>` outside the coordinator's Wait-Die retry loop. Each retry still
+cloned the by-value RPC payload, took a fresh clock snapshot, sent a fresh
+prepare RPC, merged the response clock, and repeated backoff and participant
+certification. A focused payload-order/expectation/intent test passed, and an
+independent static review approved the protocol behavior.
+
+The default-feature hot-cell comparison on `192.168.10.17` was stable and
+correct:
+
+| Scenario | Base CV | Candidate CV | Throughput change | Base p95 | Candidate p95 | p95 change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `occ/hot_rmw/8` | 2.74% | 3.99% | -0.60% | 304.384 us | 235.416 us | -22.66% |
+| `occ/hot_rmw/32` | 3.13% | 3.64% | -6.17% | 21.527 ms | 22.002 ms | +2.21% |
+
+Both workload invariants passed and both `unexpected` outcome lists were
+empty. Although hot-8 p95 cleared the improvement threshold, the stable
+hot-32 throughput regression exceeded the 3% secondary limit. The candidate
+was therefore quarantined without a production commit. Reconstructing
+`PrepareOp` values is not treated as the dominant high-contention cost.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
