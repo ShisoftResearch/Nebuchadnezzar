@@ -2270,3 +2270,107 @@ audit patch, restore the accepted base, and document the rejection.
 git add src/server/transactions/data_site.rs
 git commit -m "perf(txn): share committed write timestamps"
 ```
+
+## Task 14: Compare Canonical Wait-Die Clocks Without Serialization
+
+**Files:**
+- Modify in Bifrost: `../bifrost/src/vector_clock/mod.rs`
+- Modify: `src/server/transactions/mod.rs:49-70,240-330`
+
+The linked Bifrost worktree has unrelated user changes, but
+`src/vector_clock/mod.rs` is clean at the start of this task. Preserve every
+other Bifrost path and scope any stash or commit to this file only.
+
+- [ ] **Step 1: Add failing deterministic clock-order tests**
+
+In Bifrost, add tests for a new
+`VectorClock::deterministic_cmp(&self, other)` method:
+
+- two distinct canonical concurrent clocks compare non-equal and reverse
+  antisymmetrically;
+- causally equal canonical clocks compare equal;
+- semantically equal but noncanonical deserialized clocks fall back to a
+  deterministic raw-map tie-break so distinct representations are still
+  ordered antisymmetrically.
+
+In Nebuchadnezzar, change the same-coordinator concurrent-priority test to
+derive its expected order from `tid.deterministic_cmp(&other.tid)` rather than
+serialized bytes. Keep the causal-order and coordinator-first tests unchanged.
+
+- [ ] **Step 2: Run the tests and verify RED**
+
+```bash
+cargo test --manifest-path ../bifrost/Cargo.toml \
+  vector_clock::test::deterministic_cmp_totally_orders_canonical_clocks -- --exact
+cargo test --lib \
+  server::transactions::occ_type_tests::txn_priority_totally_orders_same_coordinator_concurrent_clocks_without_serialization \
+  -- --exact
+```
+
+Expected: compilation fails because `deterministic_cmp` does not exist.
+
+- [ ] **Step 3: Add allocation-free canonical comparison with a fallback**
+
+In `VectorClock`, add a private `map_is_canonical` check: every counter is
+nonzero and component keys are strictly increasing. Change the existing
+causal-relation implementation to compare stored map slices directly when both
+clocks are canonical; retain the existing clone/canonicalize path whenever
+either map is noncanonical. This preserves semantics for deserialized
+unsorted, duplicate, or zero-valued maps.
+
+Add `pub fn deterministic_cmp(&self, other: &Self) -> Ordering`. For canonical
+clocks, compare their stored canonical `Vec<(S, u64)>` values lexicographically
+without allocation. For a noncanonical input, compare canonicalized maps first
+and then raw stored maps as a deterministic tie-break when the semantic clocks
+are equal. The result must be antisymmetric and total for distinct stored
+representations.
+
+In `TxnPriority::compare_age`, preserve causal `Before` and `After` decisions
+and the coordinator-ID comparison. Replace only the final two
+`serde::serialize` calls with `self.tid.deterministic_cmp(&other.tid)`.
+
+The concurrent tie-break may choose a different older transaction than the old
+serialized-byte order, but it remains deterministic and total on every node.
+Wait-Die requires a consistent total order, not the historical byte ordering.
+Do not change prepare retries, ownership publication, transaction IDs, RPCs,
+or any distributed phase.
+
+- [ ] **Step 4: Verify clock and Wait-Die correctness**
+
+```bash
+cargo test --manifest-path ../bifrost/Cargo.toml vector_clock::test -- --test-threads=1
+cargo test --lib server::transactions::occ_type_tests::txn_priority -- --test-threads=1
+cargo test --lib server::transactions::data_site::tests::prepare_retry_exact_payload_does_not_blindly_succeed_with_foreign_owner -- --exact
+cargo test --lib server::transactions::data_site::tests::concurrent_clock_wait_die_has_one_younger_requester -- --exact
+git diff --check
+git -C ../bifrost diff --check -- src/vector_clock/mod.rs
+```
+
+Expected: canonical, noncanonical, causal, total-order, and Wait-Die tests pass.
+No Bifrost file other than `src/vector_clock/mod.rs` is added to this
+candidate.
+
+- [ ] **Step 5: Run the targeted benchmark and retain-or-revert gate**
+
+Deploy only the two candidate files to the isolated sources on
+`192.168.10.17`. Run exact default-feature `occ/hot_rmw/8` and
+`occ/hot_rmw/32` serially with NUMA-node-0 pinning against the saved stable
+baseline. Criterion sample mean/throughput is canonical, CV must be at most 5%,
+and JSON p95 is the latest-batch diagnostic.
+
+Retain only if one stable target improves throughput or p95 by at least 5%.
+If it passes, run the complete stable portfolio and all correctness gates.
+Otherwise preserve scoped audit patches in both repositories, restore both
+remote files to the accepted base, and document the rejection.
+
+- [ ] **Step 6: Commit only an accepted change**
+
+Commit the Bifrost vector-clock change separately without staging its unrelated
+dirty files, then commit the Nebuchadnezzar priority change:
+
+```bash
+git -C ../bifrost add src/vector_clock/mod.rs
+git -C ../bifrost commit -m "perf(vector-clock): compare canonical clocks without allocation"
+git add src/server/transactions/mod.rs
+git commit -m "perf(txn): avoid serializing wait-die clocks"
+```
