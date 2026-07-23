@@ -436,6 +436,37 @@ The workload invariant passed and the `unexpected` outcome list was empty.
 Because neither target metric improved by 5%, the candidate was rejected
 before the full portfolio and preserved only as an audit patch.
 
+### Rejected shared write-timestamp attempt
+
+Patch digest `3671f1fc4468` changed participant-local `CellMeta::write` from an
+owned vector clock to an immutable `Arc<TxnId>`. After commit prevalidation,
+one allocation held the effective timestamp and successful multi-cell
+mutations shared it. Cleanup, read ordering, and Thomas Write Rule comparisons
+borrowed the same clock value. Effective timestamp selection, storage
+versions, prepare expectations, rollback, ownership, RPC payloads, and every
+distributed phase were unchanged.
+
+A focused test first failed because two metadata entries exposed owned clocks.
+After the change, a commit with an RPC clock causally newer than its transaction
+ID stored that effective clock in both cells and `Arc::ptr_eq` confirmed one
+shared allocation. Post-certification conflict, concurrent stale-update, and
+concurrent-clock Wait-Die tests passed. Independent static review approved the
+immutable representation and all comparison and success/error paths.
+
+Three default-feature `occ/multi_cell/8` runs were collected on
+`192.168.10.17`. All workload invariants passed and all `unexpected` lists
+were empty:
+
+| Run | Candidate CV | Throughput change | Base p95 | Candidate p95 | p95 change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 15.00% | +3.16% | 7.338 ms | 7.386 ms | +0.66% |
+| 2 | 41.06% | +33.83% | 7.338 ms | 5.196 ms | -29.19% |
+| 3 | 2.93% | -2.62% | 7.338 ms | 7.433 ms | +1.29% |
+
+The first two runs exceeded the 5% CV limit. The stable third run improved
+neither target metric and regressed both. The candidate was therefore rejected
+before the full portfolio and preserved only as an audit patch.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
