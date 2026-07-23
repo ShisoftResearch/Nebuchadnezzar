@@ -172,6 +172,14 @@ fn assert_missing(result: TxnExecResult<OwnedCell, ReadError>) {
     );
 }
 
+fn assert_missing_head(result: TxnExecResult<crate::ram::cell::CellHeader, ReadError>) {
+    assert!(
+        matches!(result, TxnExecResult::Error(ReadError::CellDoesNotExisted)),
+        "expected missing header result, got {:?}",
+        result
+    );
+}
+
 async fn abort_txn(txn: &Arc<transactions::manager::AsyncServiceClient>, tid: transactions::TxnId) {
     let _ = txn.abort(tid).await;
 }
@@ -1378,6 +1386,184 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
     assert_eq!(score_of(&after_read), 7);
     let after_write = runtime.chunks().read_cell(&write_id).unwrap().to_owned();
     assert_eq!(score_of(&after_write), 0);
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn head_pin_survives_concurrent_non_transactional_overwrite() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5382";
+    let group = "txn_occ_pin_survives_overwrite";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90133);
+
+    // Seed version A.
+    let mut version_a = counter_cell(schema.id, cell_id, 100, "counter_overwrite_a");
+    runtime.chunks().write_cell(&mut version_a).unwrap();
+    let version_a_version = version_a.header.version;
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    // head pins version A at the participant for this transaction.
+    let head_a = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(head_a.version, version_a_version);
+
+    // Overwrite the cell NON-transactionally: this writes a NEW version B and
+    // only marks version A dead (copy-on-write) rather than mutating it in place.
+    let mut version_b = counter_cell(schema.id, cell_id, 200, "counter_overwrite_b");
+    let version_b_header = runtime.chunks().update_cell(&mut version_b).unwrap();
+    assert!(version_b_header.version > head_a.version);
+
+    // Force a deterministic storage cleaner pass between the overwrite and the
+    // pinned reads below. `Cleaner::clean` (src/ram/cleaner/mod.rs) is the real
+    // GC entry point reachable off `chunks()` (it is used the same way in
+    // src/ram/tiered/tests.rs and src/ram/tests/chunk.rs); calling it with
+    // full=true, wait=true makes any reclamation work run synchronously instead
+    // of racing the background cleaner thread.
+    //
+    // NOTE: occ_tests servers are started via `start_occ_test_server` with
+    // chunk_size == db_size == SEGMENT_SIZE, so this database has exactly one
+    // chunk holding exactly one segment (Chunk::new divides `size` into
+    // `size / SEGMENT_SIZE` segments). The combine-cleaner only ever considers
+    // combining when it has >= 2 segment candidates, so in this fixture it can
+    // never find a second segment to combine version A's dead bytes into. The
+    // call below is therefore a genuine, real cleaner pass, but it cannot itself
+    // reclaim anything under this particular layout. What actually protects the
+    // pinned bytes from reclamation (once there is something to reclaim) is the
+    // `SegmentReferenceGuard` held by the pinning transaction's participant
+    // entry (see `PinnedReadSet` / `ensure_read_pin` in data_site.rs); the
+    // assertions below rely on that guard together with copy-on-write
+    // immutability of already-written cell bytes.
+    let _ = crate::ram::cleaner::Cleaner::clean(&runtime.chunks().list[0], true, true);
+
+    // In the SAME tid: both a full read and another head must still observe
+    // version A, not version B.
+    let full_a = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(full_a.header.version, head_a.version);
+    assert_eq!(score_of(&full_a), 100);
+
+    let head_a_again = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(head_a_again.version, head_a.version);
+
+    // A different, fresh transaction that never pinned sees the current version B.
+    let tid2 = txn.begin().await.unwrap().unwrap();
+    let full_b = accepted_cell(txn.read(tid2.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(full_b.header.version, version_b_header.version);
+    assert_eq!(score_of(&full_b), 200);
+
+    abort_txn(&txn, tid).await;
+    abort_txn(&txn, tid2).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn head_pin_survives_concurrent_transactional_remove() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5383";
+    let group = "txn_occ_pin_survives_remove";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90134);
+
+    // Seed version A.
+    let mut version_a = counter_cell(schema.id, cell_id, 42, "counter_remove_pin_seed");
+    runtime.chunks().write_cell(&mut version_a).unwrap();
+    let version_a_version = version_a.header.version;
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    // head pins version A for tid.
+    let head_a = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(head_a.version, version_a_version);
+
+    // A concurrent transaction removes the cell and commits.
+    let tid2 = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.remove(tid2.clone(), cell_id).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid2.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(tid2.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    // The cell is now genuinely removed/tombstoned in raw storage.
+    assert!(
+        runtime.chunks().read_cell(&cell_id).is_err(),
+        "the cell must be gone from storage after the concurrent remove commits"
+    );
+
+    // The ORIGINAL tid still returns version A on a full read: the pinned
+    // version survives the remove.
+    let full_a = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(full_a.header.version, head_a.version);
+    assert_eq!(score_of(&full_a), 42);
+
+    // ...and on a repeated head, too.
+    let head_a_again = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(head_a_again.version, head_a.version);
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn head_pin_caches_absence_across_concurrent_transactional_insert() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5384";
+    let group = "txn_occ_pin_absence_insert";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let missing_id = Id::new(0, 90135);
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    // The cell is absent. head observes CellDoesNotExisted and the coordinator
+    // caches the absence (CellExpectation::Absent) for tid.
+    assert_missing_head(txn.head(tid.clone(), missing_id).await.unwrap().unwrap());
+
+    // Concurrently, a different transaction inserts the cell transactionally
+    // (write, then prepare/commit) and it becomes visible in storage.
+    let tid2 = txn.begin().await.unwrap().unwrap();
+    let inserted = counter_cell(schema.id, missing_id, 77, "counter_absence_insert");
+    assert_eq!(
+        txn.write(tid2.clone(), inserted.clone())
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid2.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(tid2.clone()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    // The insert is really there in raw storage.
+    let persisted = runtime.chunks().read_cell(&missing_id).unwrap().to_owned();
+    assert_eq!(score_of(&persisted), 77);
+
+    // The ORIGINAL tid still observes repeatable absence on both head and a
+    // full read: the first observation of absence is stable within tid, even
+    // though the cell now exists.
+    assert_missing_head(txn.head(tid.clone(), missing_id).await.unwrap().unwrap());
+    assert_missing(txn.read(tid.clone(), missing_id).await.unwrap().unwrap());
 
     abort_txn(&txn, tid).await;
     server.shutdown().await;
