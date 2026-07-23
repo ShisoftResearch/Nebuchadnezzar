@@ -341,6 +341,47 @@ invariants passed and the `unexpected` outcome list was empty. Because neither
 target metric improved by 5%, the candidate was rejected before the full
 portfolio and preserved only as an audit patch.
 
+### Rejected projected-read snapshot-clone attempt
+
+Patch digest `a95606d68097` changed the coordinator's first-read path to move the
+participant's owned `OwnedCell` response directly into the transaction cache.
+A full `read` cloned that cached snapshot once for its RPC return, while `head`
+cloned only the header and `read_selected` projected directly from the borrowed
+cached cell. The transaction cache still retained the complete first snapshot,
+including missing observations, so later full reads remained repeatable.
+Wait-Die retries, response-clock merging, error/state mappings, read-your-writes,
+read expectations, participant prepare certification, and every distributed
+phase were unchanged.
+
+The clone-observation test first failed with two full-snapshot clones. After the
+refactor it showed zero clones for one header plus one selected read, followed
+by exactly one clone for a full read of the same cached version and value. The
+focused full, selected-then-full, and header-then-full repeatable-read tests
+passed. An independent static review initially rejected a vacuous test hook;
+after the full-read control was added, re-review approved the production and
+test behavior.
+
+Default-feature release benchmarks ran serially on `192.168.10.17`, pinned to
+NUMA node 0, against the saved `projection-cache-base`. Every run passed its
+workload invariants and had an empty `unexpected` list:
+
+| Run and scenario | Candidate CV | Throughput change | Base p95 | Candidate p95 | p95 change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| run 1, `head` | 7.80% | +7.78% | 92.832 us | 82.098 us | -11.56% |
+| run 1, `selected` | 14.83% | +2.80% | 92.276 us | 96.764 us | +4.86% |
+| run 1, `mixed` | 17.74% | +43.15% | 93.548 us | 79.629 us | -14.88% |
+| run 2, `head` | 2.62% | -3.73% | 92.832 us | 98.873 us | +6.51% |
+| run 2, `selected` | 13.50% | +10.94% | 92.276 us | 77.823 us | -15.66% |
+| run 2, `mixed` | 5.51% | +16.36% | 93.548 us | 81.710 us | -12.65% |
+| run 3, `mixed` | 1.00% | +2.42% | 93.548 us | 91.424 us | -2.27% |
+
+The saved base CVs were 3.32% for `head`, 4.19% for `selected`, and 3.35%
+for `mixed`. The apparent large gains did not reproduce within the 5% CV
+limit. The stable mixed confirmation improved neither throughput nor p95 by
+5%, while the stable second header run crossed both regression limits.
+The candidate was therefore rejected before the full portfolio and preserved
+only as an audit patch.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
