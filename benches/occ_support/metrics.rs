@@ -101,6 +101,7 @@ pub struct ScenarioSummary {
     pub unexpected: Vec<String>,
     pub invariants_passed: bool,
     #[cfg(feature = "occ_phase_profile")]
+    #[serde(default)]
     pub phases: BTreeMap<String, PhaseSummary>,
 }
 

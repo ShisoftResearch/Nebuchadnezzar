@@ -3,6 +3,9 @@ use std::{fs, sync::Arc, time::Duration};
 use serde_json::Value;
 
 #[cfg(feature = "occ_phase_profile")]
+use serde_json::json;
+
+#[cfg(feature = "occ_phase_profile")]
 use neb::server::transactions::phase_profile::{Phase, PhaseMeasurement, Snapshot, PHASE_COUNT};
 
 #[path = "../benches/occ_support/fixture.rs"]
@@ -172,13 +175,87 @@ fn phase_snapshot_rejects_active_guards_without_publishing_partial_results() {
 
     let mut summary =
         BatchMetrics::one_success(Duration::from_nanos(900)).summary(Duration::from_nanos(900));
+    let valid_snapshot = Snapshot {
+        phases,
+        active_guards: 0,
+    };
 
-    assert!(summary.phases.is_empty());
+    summary.attach_phase_snapshot(&valid_snapshot).unwrap();
+    let before_rejected_attach = summary.phases.clone();
+
+    assert!(!before_rejected_attach.is_empty());
     assert_eq!(
         summary.attach_phase_snapshot(&snapshot),
         Err(PhaseSnapshotError::ActiveGuards(1))
     );
-    assert!(summary.phases.is_empty());
+    assert_eq!(summary.phases, before_rejected_attach);
+}
+
+#[cfg(feature = "occ_phase_profile")]
+#[test]
+fn phase_snapshot_uses_zero_ratios_for_zero_denominators() {
+    let mut phases = [PhaseMeasurement::default(); PHASE_COUNT];
+    phases[Phase::PrepareBarrier as usize] = PhaseMeasurement {
+        total_ns: 1_200,
+        invocation_count: 3,
+    };
+    phases[Phase::ParticipantEnd as usize] = PhaseMeasurement {
+        total_ns: 777,
+        invocation_count: 0,
+    };
+    let snapshot = Snapshot {
+        phases,
+        active_guards: 0,
+    };
+
+    let mut summary = BatchMetrics::default().summary(Duration::from_nanos(1));
+    summary.attach_phase_snapshot(&snapshot).unwrap();
+
+    let prepare_barrier = summary
+        .phases
+        .get("prepare_barrier")
+        .expect("prepare_barrier summary");
+    assert_eq!(prepare_barrier.ns_per_invocation, 400.0);
+    assert_eq!(prepare_barrier.ns_per_commit, 0.0);
+
+    let participant_end = summary
+        .phases
+        .get("participant_end")
+        .expect("participant_end summary");
+    assert_eq!(participant_end.total_ns, 777);
+    assert_eq!(participant_end.invocation_count, 0);
+    assert_eq!(participant_end.ns_per_invocation, 0.0);
+    assert_eq!(participant_end.ns_per_commit, 0.0);
+}
+
+#[cfg(feature = "occ_phase_profile")]
+#[test]
+fn run_report_deserializes_legacy_scenario_json_without_phases_field() {
+    let report_json = json!({
+        "label": "occ-legacy",
+        "revision": "deadbeef",
+        "scenarios": {
+            "repeatable-read": {
+                "committed": 1,
+                "attempts": 1,
+                "not_realizable": 0,
+                "logical_retries": 0,
+                "commits_per_second": 1.0,
+                "p50_ns": 100,
+                "p95_ns": 100,
+                "p99_ns": 100,
+                "unexpected": [],
+                "invariants_passed": true
+            }
+        }
+    });
+
+    let report: RunReport = serde_json::from_value(report_json).expect("deserialize legacy report");
+    let scenario = report
+        .scenarios
+        .get("repeatable-read")
+        .expect("repeatable-read scenario");
+    assert!(scenario.phases.is_empty());
 }
 
 #[test]
