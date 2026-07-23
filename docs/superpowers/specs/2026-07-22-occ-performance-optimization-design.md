@@ -382,6 +382,35 @@ limit. The stable mixed confirmation improved neither throughput nor p95 by
 The candidate was therefore rejected before the full portfolio and preserved
 only as an audit patch.
 
+### Rejected Wait-Die owner-borrow attempt
+
+Patch digest `dd23dd277509` changed the participant prepare-conflict check from
+cloning `CellMeta::owner` to borrowing it while the metadata lock remained
+held. Stale-lock reclamation, requester age comparison, `Wait` and
+`NotRealizable` outcomes, logging, owner publication, certification, and every
+distributed phase remained unchanged.
+
+Test-build instrumentation counted `TxnPriority::clone` directly. The focused
+foreign-owner test failed with one clone before the change and passed with zero
+afterward; the concurrent-clock Wait-Die test also passed. Release builds
+retained the normal derived `Clone` implementation, so the counter added no
+benchmark-path work. An independent static review approved the borrow lifetime,
+test control, and protocol behavior.
+
+The default-feature hot-cell comparisons on `192.168.10.17` were stable and
+correct:
+
+| Scenario | Base CV | Candidate CV | Throughput change | Base p95 | Candidate p95 | p95 change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `occ/hot_rmw/8` | 2.74% | 2.08% | -1.79% | 304.384 us | 352.768 us | +15.90% |
+| `occ/hot_rmw/32` | 3.13% | 3.50% | -1.18% | 21.527 ms | 19.777 ms | -8.13% |
+
+Both workload invariants passed and both `unexpected` outcome lists were
+empty. Although hot-32 p95 cleared the target improvement threshold, the
+stable hot-8 p95 regression exceeded the 5% secondary limit, and throughput
+did not improve. The candidate was therefore rejected before the full
+portfolio and preserved only as an audit patch.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
