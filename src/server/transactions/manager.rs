@@ -530,10 +530,12 @@ impl Service for TransactionManager {
             // only read (pinned but not written). Write servers already dropped
             // their pins in `end`, so they are excluded. Queued so it never adds
             // latency to the commit path; the periodic flusher batches the RPCs.
-            let write_servers: HashSet<u64> = txn.affected_objects.keys().copied().collect();
-            let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
-            pinned_servers.retain(|server_id| !write_servers.contains(server_id));
-            self.queue_pin_release(tid.clone(), pinned_servers);
+            // Write-only transactions (no pins) skip this entirely.
+            if !txn.pinned_servers.is_empty() {
+                let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
+                pinned_servers.retain(|server_id| !txn.affected_objects.contains_key(server_id));
+                self.queue_pin_release(tid.clone(), pinned_servers);
+            }
             self.cleanup_transaction_guarded(&tid, &mut txn);
             result
         }
@@ -585,10 +587,13 @@ impl Service for TransactionManager {
                 // only read (pinned but not written; write servers already dropped
                 // their pins in the abort/end above). Queued so it never adds
                 // latency to the abort path; the periodic flusher batches the RPCs.
-                let write_servers: HashSet<u64> = txn.affected_objects.keys().copied().collect();
-                let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
-                pinned_servers.retain(|server_id| !write_servers.contains(server_id));
-                self.queue_pin_release(tid.clone(), pinned_servers);
+                // Write-only transactions (no pins) skip this entirely.
+                if !txn.pinned_servers.is_empty() {
+                    let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
+                    pinned_servers
+                        .retain(|server_id| !txn.affected_objects.contains_key(server_id));
+                    self.queue_pin_release(tid.clone(), pinned_servers);
+                }
                 self.cleanup_transaction_guarded(&tid, &mut txn);
             }
             result

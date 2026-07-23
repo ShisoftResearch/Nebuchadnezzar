@@ -3757,9 +3757,10 @@ impl Service for DataManager {
         // admitted for this transaction when the pin was created, so re-running
         // the ReadTooLate check or waiting on a committing owner could only
         // spuriously reject or delay a read whose (immutable) outcome cannot
-        // change.
-        self.update_clock(&clock);
+        // change. The clock merge `prepare_read` would have done happens here;
+        // the fall-through path merges inside `prepare_read` (never twice).
         if let Some(location) = self.existing_read_pin(&tid, &id) {
+            self.update_clock(&clock);
             return match self.chunks().read_cell_at(&id, location) {
                 Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
@@ -3783,9 +3784,9 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
         // Serve an already-pinned cell from its immutable snapshot without
         // `prepare_read` (see `read` for why re-checking could only spuriously
-        // reject or delay it).
-        self.update_clock(&clock);
+        // reject or delay it; the clock merge happens exactly once per path).
         if let Some(location) = self.existing_read_pin(&tid, &id) {
+            self.update_clock(&clock);
             return match self.chunks().read_selected_at(&id, location, &fields[..]) {
                 Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
@@ -3821,9 +3822,10 @@ impl Service for DataManager {
         if pin {
             // Serve an already-pinned cell from its immutable snapshot without
             // `prepare_read` (see `read` for why re-checking could only
-            // spuriously reject or delay it).
-            self.update_clock(&clock);
+            // spuriously reject or delay it; the clock merge happens exactly
+            // once per path).
             if let Some(location) = self.existing_read_pin(&tid, &id) {
+                self.update_clock(&clock);
                 return match self.chunks().head_at(&id, location) {
                     Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
                     Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
