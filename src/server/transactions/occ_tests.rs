@@ -1240,3 +1240,145 @@ async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
 
     server.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shape_gated_reads_defer_full_cell_fetch() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5380";
+    let group = "txn_occ_shape_gated_defer";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90130);
+
+    let mut initial = counter_cell(schema.id, cell_id, 0, "counter_shape_gated_initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+    let seeded_version = initial.header.version;
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    // Step 1: a header read and a projected read must NOT transfer the whole cell.
+    let before_partial = transactions::data_site::full_read_rpc_count();
+
+    let head = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(head.version, seeded_version);
+
+    let selected = accepted_cell(
+        txn.read_selected(tid.clone(), cell_id, vec![hash_str("score")])
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(selected_score_of(&selected), 0);
+    assert_eq!(selected.header.version, head.version);
+
+    assert_eq!(
+        transactions::data_site::full_read_rpc_count(),
+        before_partial,
+        "head/read_selected must not issue a full-cell participant read"
+    );
+
+    // A concurrent update advances the current version; the pin must keep the txn
+    // observing its snapshot for the later full read.
+    let mut updated = counter_cell(schema.id, cell_id, 9, "counter_shape_gated_updated");
+    let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
+    assert!(updated_header.version > head.version);
+
+    // Step 2: the full read fetches the whole cell exactly once, served from the
+    // pinned version so it is consistent with the earlier partial reads.
+    let before_full = transactions::data_site::full_read_rpc_count();
+    let full = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(
+        transactions::data_site::full_read_rpc_count(),
+        before_full + 1,
+        "the full read must fetch the whole cell exactly once"
+    );
+    assert_eq!(full.header.version, head.version);
+    assert_eq!(score_of(&full), 0);
+
+    // Repeated reads of every shape are consistent and transfer nothing further
+    // (served from the now-materialized full cell).
+    let before_repeat = transactions::data_site::full_read_rpc_count();
+    let head_again = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
+    let full_again = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    let selected_again = accepted_cell(
+        txn.read_selected(tid.clone(), cell_id, vec![hash_str("score")])
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(head_again.version, head.version);
+    assert_eq!(full_again.header.version, head.version);
+    assert_eq!(score_of(&full_again), 0);
+    assert_eq!(selected_again.header.version, head.version);
+    assert_eq!(selected_score_of(&selected_again), 0);
+    assert_eq!(
+        transactions::data_site::full_read_rpc_count(),
+        before_repeat,
+        "repeated reads must be served from cache without another transfer"
+    );
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5381";
+    let group = "txn_occ_shape_gated_certify";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let read_id = Id::new(0, 90131);
+    let write_id = Id::new(0, 90132);
+
+    let mut read_seed = counter_cell(schema.id, read_id, 0, "counter_certify_read_seed");
+    runtime.chunks().write_cell(&mut read_seed).unwrap();
+    let read_version = read_seed.header.version;
+    let mut write_seed = counter_cell(schema.id, write_id, 0, "counter_certify_write_seed");
+    runtime.chunks().write_cell(&mut write_seed).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    // A header-only read must still enter the certified read set as Present(version)
+    // without transferring the whole cell.
+    let before_partial = transactions::data_site::full_read_rpc_count();
+    let head = accepted_head(txn.head(tid.clone(), read_id).await.unwrap().unwrap());
+    assert_eq!(head.version, read_version);
+    assert_eq!(
+        transactions::data_site::full_read_rpc_count(),
+        before_partial,
+        "head must not transfer the whole cell"
+    );
+
+    // A write on a different cell makes this a read-write transaction so prepare runs.
+    let write_update = counter_cell(schema.id, write_id, 5, "counter_certify_write_update");
+    assert_eq!(
+        txn.update(tid.clone(), write_update).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    // A concurrent writer advances the header-read cell past the pinned version.
+    let mut conflicting = counter_cell(schema.id, read_id, 7, "counter_certify_conflict");
+    let conflicting_header = runtime.chunks().update_cell(&mut conflicting).unwrap();
+    assert!(conflicting_header.version > head.version);
+
+    // Certification must abort the transaction: the header-only read's recorded
+    // version no longer matches the current stored version.
+    assert_eq!(
+        txn.prepare(tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
+    );
+
+    // The conflicting write survived; the aborted txn wrote nothing.
+    let after_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
+    assert_eq!(score_of(&after_read), 7);
+    let after_write = runtime.chunks().read_cell(&write_id).unwrap().to_owned();
+    assert_eq!(score_of(&after_write), 0);
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}

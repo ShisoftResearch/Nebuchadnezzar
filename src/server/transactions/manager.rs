@@ -433,7 +433,7 @@ impl Service for TransactionManager {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            self.read_cached_full_cell(&tid, &id, &mut txn).await
+            self.full_read(&tid, &id, &mut txn).await
         }
         .boxed()
     }
@@ -447,15 +447,7 @@ impl Service for TransactionManager {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            Ok(
-                match self.read_cached_full_cell(&tid, &id, &mut txn).await? {
-                    TxnExecResult::Accepted(cell) => TxnExecResult::Accepted(cell.header),
-                    TxnExecResult::Rejected => TxnExecResult::Rejected,
-                    TxnExecResult::Wait => TxnExecResult::Wait,
-                    TxnExecResult::Error(error) => TxnExecResult::Error(error),
-                    TxnExecResult::StateError(state) => TxnExecResult::StateError(state),
-                },
-            )
+            self.head_read(&tid, &id, &mut txn).await
         }
         .boxed()
     }
@@ -469,18 +461,7 @@ impl Service for TransactionManager {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
-            Ok(
-                match self.read_cached_full_cell(&tid, &id, &mut txn).await? {
-                    TxnExecResult::Accepted(cell) => match self.select_from_cell(&cell, &fields) {
-                        Ok(selected) => TxnExecResult::Accepted(selected),
-                        Err(error) => TxnExecResult::Error(error),
-                    },
-                    TxnExecResult::Rejected => TxnExecResult::Rejected,
-                    TxnExecResult::Wait => TxnExecResult::Wait,
-                    TxnExecResult::Error(error) => TxnExecResult::Error(error),
-                    TxnExecResult::StateError(state) => TxnExecResult::StateError(state),
-                },
-            )
+            self.selected_read(&tid, &id, &fields, &mut txn).await
         }
         .boxed()
     }
@@ -834,7 +815,13 @@ impl TransactionManager {
             _ => Err(TMError::TransactionNotFound),
         }
     }
-    async fn read_cached_full_cell<'a>(
+    /// Coordinator full read. Read-your-writes and an already-materialized full
+    /// cell shadow everything; a buffered remove and repeatable absence both
+    /// read as missing. Otherwise the whole cell is fetched once via the
+    /// participant `read` RPC — this is the single path that materializes the
+    /// whole cell — and, if a prior partial read pinned the cell, the
+    /// participant serves that pinned version so the full read is repeatable.
+    async fn full_read<'a>(
         &self,
         tid: &TxnId,
         id: &Id,
@@ -842,14 +829,103 @@ impl TransactionManager {
     ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
         txn.last_activity = bifrost::utils::time::get_time();
         if let Some(data_obj) = txn.data.get(id) {
-            return Ok(match &data_obj.cell {
-                Some(cell) => TxnExecResult::Accepted(cell.clone()),
-                None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
-            });
+            if let Some(cell) = &data_obj.cell {
+                return Ok(TxnExecResult::Accepted(cell.clone()));
+            }
+            // A buffered remove within this transaction, or repeatable absence.
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+                return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+            }
+            // A prior partial read pinned the cell but never materialized the
+            // whole cell: fall through to fetch it once from the pinned version.
         }
 
         match self.get_data_site_by_id(id).await {
             Ok((server_id, server)) => self.read_from_site(server_id, &server, tid, id, txn).await,
+            Err(error) => {
+                error!("{:?}", error);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
+    }
+
+    /// Coordinator header read. Read-your-writes and an already-materialized full
+    /// cell shadow everything; a buffered remove and repeatable absence read as
+    /// missing; an already-pinned header is served from cache. Otherwise a
+    /// `head(pin=true)` participant RPC pins the version and returns only the
+    /// header — the whole cell is never transferred. The observed version is
+    /// recorded as `Present(version)` so the read is certified at prepare.
+    async fn head_read<'a>(
+        &self,
+        tid: &TxnId,
+        id: &Id,
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+        txn.last_activity = bifrost::utils::time::get_time();
+        if let Some(data_obj) = txn.data.get(id) {
+            if let Some(cell) = &data_obj.cell {
+                return Ok(TxnExecResult::Accepted(cell.header.clone()));
+            }
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+                return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+            }
+            if let Some(header) = data_obj.pinned.as_ref().and_then(|p| p.header.as_ref()) {
+                return Ok(TxnExecResult::Accepted(header.clone()));
+            }
+            // Pinned (e.g. only a projection was fetched so far) but the header
+            // is not cached yet: fall through to fetch the header from the pin.
+        }
+
+        match self.get_data_site_by_id(id).await {
+            Ok((server_id, server)) => self.head_from_site(server_id, &server, tid, id, txn).await,
+            Err(error) => {
+                error!("{:?}", error);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
+    }
+
+    /// Coordinator projected read. Read-your-writes and an already-materialized
+    /// full cell shadow everything (the projection is computed locally); a
+    /// buffered remove and repeatable absence read as missing; an already-cached
+    /// projection for these exact fields is served from cache. Otherwise a
+    /// `read_selected` participant RPC pins the version and returns only the
+    /// projection — the whole cell is never transferred. The projection's
+    /// version is recorded as `Present(version)` so the read is certified.
+    async fn selected_read<'a>(
+        &self,
+        tid: &TxnId,
+        id: &Id,
+        fields: &[u64],
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        txn.last_activity = bifrost::utils::time::get_time();
+        if let Some(data_obj) = txn.data.get(id) {
+            if let Some(cell) = &data_obj.cell {
+                return Ok(match self.select_from_cell(cell, fields) {
+                    Ok(selected) => TxnExecResult::Accepted(selected),
+                    Err(error) => TxnExecResult::Error(error),
+                });
+            }
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+                return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+            }
+            if let Some(projection) = data_obj
+                .pinned
+                .as_ref()
+                .and_then(|p| p.projections.get(fields))
+            {
+                return Ok(TxnExecResult::Accepted(projection.clone()));
+            }
+            // Pinned but this exact projection is not cached yet: fall through
+            // to fetch it from the pinned version.
+        }
+
+        match self.get_data_site_by_id(id).await {
+            Ok((server_id, server)) => {
+                self.selected_from_site(server_id, &server, tid, id, fields, txn)
+                    .await
+            }
             Err(error) => {
                 error!("{:?}", error);
                 Err(TMError::CannotLocateCellServer)
@@ -979,6 +1055,224 @@ impl TransactionManager {
                         }
                         TxnExecResult::Wait => {
                             // Backoff and retry
+                            Self::backoff_wait(attempt, &self.wait_config).await?;
+                            attempt += 1;
+                            continue;
+                        }
+                        other => return Ok(other),
+                    }
+                }
+                Err(e) => {
+                    error!("{:?}", e);
+                    return Err(TMError::RPCErrorFromCellServer);
+                }
+            }
+        }
+    }
+
+    /// Issues a `head(pin=true)` participant RPC, pinning the served version so a
+    /// later read in the same transaction repeats it, and caches only the header
+    /// (never the whole cell). Records `Present(version)` for certification, or
+    /// `Absent` on a missing cell (repeatable absence).
+    async fn head_from_site<'a>(
+        &self,
+        server_id: u64,
+        server: &Arc<data_site::AsyncServiceClient>,
+        tid: &TxnId,
+        id: &Id,
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
+        let start_time = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let self_server_id = self.deps.server_id;
+
+        loop {
+            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
+                warn!("Head timeout for transaction {:?} on cell {:?}", tid, id);
+                return Ok(TxnExecResult::Rejected);
+            }
+
+            // Partial read: pin=true snapshots the served version for repeatability.
+            let head_response = server
+                .head(self_server_id, self.get_clock(), tid.to_owned(), *id, true)
+                .await;
+            match head_response {
+                Ok(dsr) => {
+                    self.merge_clock(&dsr.clock);
+                    match dsr.payload {
+                        TxnExecResult::Accepted(header) => {
+                            let version = header.version;
+                            if let Some(data_obj) = txn.data.get_mut(id) {
+                                // Read-your-writes: a buffered write/remove shadows the pin.
+                                if data_obj.changed {
+                                    return Ok(match &data_obj.cell {
+                                        Some(cell) => TxnExecResult::Accepted(cell.header.clone()),
+                                        None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
+                                    });
+                                }
+                                // Cache the header on the existing pinned entry;
+                                // its recorded version is already Present(version).
+                                let pinned =
+                                    data_obj.pinned.get_or_insert_with(PinnedReadCache::default);
+                                if pinned.header.is_none() {
+                                    pinned.header = Some(header.clone());
+                                }
+                                return Ok(TxnExecResult::Accepted(header));
+                            }
+                            // Record the header-only read so it is in the certified
+                            // read set as Present(version) — no whole-cell transfer.
+                            txn.data.insert(
+                                id.clone(),
+                                DataObject {
+                                    server: server_id,
+                                    cell: None,
+                                    expectation: CellExpectation::Present(version),
+                                    changed: false,
+                                    new: false,
+                                    pinned: Some(PinnedReadCache {
+                                        header: Some(header.clone()),
+                                        projections: HashMap::new(),
+                                    }),
+                                },
+                            );
+                            return Ok(TxnExecResult::Accepted(header));
+                        }
+                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                            if !txn.data.contains_key(id) {
+                                txn.data.insert(
+                                    id.clone(),
+                                    DataObject {
+                                        server: server_id,
+                                        cell: None,
+                                        expectation: CellExpectation::Absent,
+                                        changed: false,
+                                        new: false,
+                                        pinned: None,
+                                    },
+                                );
+                            }
+                            return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+                        }
+                        TxnExecResult::Wait => {
+                            Self::backoff_wait(attempt, &self.wait_config).await?;
+                            attempt += 1;
+                            continue;
+                        }
+                        other => return Ok(other),
+                    }
+                }
+                Err(e) => {
+                    error!("{:?}", e);
+                    return Err(TMError::RPCErrorFromCellServer);
+                }
+            }
+        }
+    }
+
+    /// Issues a `read_selected` participant RPC, pinning the served version so a
+    /// later read in the same transaction repeats it, and caches only the
+    /// returned projection (never the whole cell) keyed by the exact requested
+    /// field order. Records `Present(version)` for certification, or `Absent` on
+    /// a missing cell (repeatable absence).
+    async fn selected_from_site<'a>(
+        &self,
+        server_id: u64,
+        server: &Arc<data_site::AsyncServiceClient>,
+        tid: &TxnId,
+        id: &Id,
+        fields: &[u64],
+        txn: &mut TxnGuard<'a>,
+    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
+        let start_time = std::time::Instant::now();
+        let mut attempt = 0u32;
+        let self_server_id = self.deps.server_id;
+
+        loop {
+            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
+                warn!(
+                    "Selected read timeout for transaction {:?} on cell {:?}",
+                    tid, id
+                );
+                return Ok(TxnExecResult::Rejected);
+            }
+
+            let read_response = server
+                .read_selected(
+                    self_server_id,
+                    self.get_clock(),
+                    tid.to_owned(),
+                    id.clone(),
+                    fields.to_vec(),
+                )
+                .await;
+            match read_response {
+                Ok(dsr) => {
+                    self.merge_clock(&dsr.clock);
+                    match dsr.payload {
+                        TxnExecResult::Accepted(projection) => {
+                            let version = projection.header.version;
+                            if let Some(data_obj) = txn.data.get_mut(id) {
+                                // Read-your-writes: a buffered write/remove shadows the pin.
+                                if data_obj.changed {
+                                    return Ok(match &data_obj.cell {
+                                        Some(cell) => match self.select_from_cell(cell, fields) {
+                                            Ok(selected) => TxnExecResult::Accepted(selected),
+                                            Err(error) => TxnExecResult::Error(error),
+                                        },
+                                        None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
+                                    });
+                                }
+                                // Cache the projection on the existing pinned entry;
+                                // its recorded version is already Present(version).
+                                let pinned =
+                                    data_obj.pinned.get_or_insert_with(PinnedReadCache::default);
+                                pinned
+                                    .projections
+                                    .entry(fields.to_vec())
+                                    .or_insert_with(|| projection.clone());
+                                return Ok(TxnExecResult::Accepted(projection));
+                            }
+                            // Record the projection-only read so it is in the
+                            // certified read set as Present(version).
+                            let mut projections = HashMap::new();
+                            projections.insert(fields.to_vec(), projection.clone());
+                            txn.data.insert(
+                                id.clone(),
+                                DataObject {
+                                    server: server_id,
+                                    cell: None,
+                                    expectation: CellExpectation::Present(version),
+                                    changed: false,
+                                    new: false,
+                                    pinned: Some(PinnedReadCache {
+                                        header: None,
+                                        projections,
+                                    }),
+                                },
+                            );
+                            return Ok(TxnExecResult::Accepted(projection));
+                        }
+                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
+                            if !txn.data.contains_key(id) {
+                                txn.data.insert(
+                                    id.clone(),
+                                    DataObject {
+                                        server: server_id,
+                                        cell: None,
+                                        expectation: CellExpectation::Absent,
+                                        changed: false,
+                                        new: false,
+                                        pinned: None,
+                                    },
+                                );
+                            }
+                            return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+                        }
+                        TxnExecResult::Wait => {
                             Self::backoff_wait(attempt, &self.wait_config).await?;
                             attempt += 1;
                             continue;

@@ -17,7 +17,7 @@ use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -31,6 +31,21 @@ pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
         "TXN_DATA_MANAGER_RPC_SERVICE-{}-{}",
         group, database_name
     ))
+}
+
+// Test-only instrumentation: counts how many full-cell participant `read` RPCs
+// this process has served. Coordinator tests assert that a `head`/`read_selected`
+// (shape-gated partial read) does NOT transfer the whole cell, i.e. does not
+// increment this counter. The increment is a cheap relaxed add always compiled
+// in; only tests read it via `full_read_rpc_count`.
+static FULL_READ_RPC_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of full-cell participant `read` RPCs served since process start.
+/// Test-only accessor; used to prove header/projection-only reads never fetch
+/// the whole cell.
+#[cfg(test)]
+pub(crate) fn full_read_rpc_count() -> usize {
+    FULL_READ_RPC_COUNT.load(Relaxed)
 }
 
 // Lock timeout in milliseconds - locks held longer than this are considered stale
@@ -3662,6 +3677,9 @@ impl Service for DataManager {
         tid: TxnId,
         id: Id,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
+        // Instrumentation: this is the whole-cell transfer path. Coordinator
+        // tests assert header/projection-only reads never reach here.
+        FULL_READ_RPC_COUNT.fetch_add(1, Relaxed);
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
