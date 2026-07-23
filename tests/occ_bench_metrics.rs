@@ -2,6 +2,9 @@ use std::{fs, sync::Arc, time::Duration};
 
 use serde_json::Value;
 
+#[cfg(feature = "occ_phase_profile")]
+use neb::server::transactions::phase_profile::{Phase, PhaseMeasurement, Snapshot, PHASE_COUNT};
+
 #[path = "../benches/occ_support/fixture.rs"]
 mod fixture;
 
@@ -11,6 +14,8 @@ mod metrics;
 #[path = "../benches/occ_support/workloads.rs"]
 mod workloads;
 
+#[cfg(feature = "occ_phase_profile")]
+use metrics::PhaseSnapshotError;
 use metrics::{BatchMetrics, RunReport, ScenarioSummary};
 use workloads::{run_fixed_success_rmw, AttemptOutcome, AttemptTally, BatchSpec};
 
@@ -108,6 +113,74 @@ fn retries_and_failures_cannot_be_counted_as_throughput() {
     assert!(!summary.invariants_passed);
 }
 
+#[cfg(feature = "occ_phase_profile")]
+#[test]
+fn phase_snapshot_reports_per_invocation_and_per_commit_costs() {
+    let mut phases = [PhaseMeasurement::default(); PHASE_COUNT];
+    phases[Phase::PrepareBarrier as usize] = PhaseMeasurement {
+        total_ns: 1_200,
+        invocation_count: 3,
+    };
+    let snapshot = Snapshot {
+        phases,
+        active_guards: 0,
+    };
+
+    let mut metrics = BatchMetrics::default();
+    metrics.record_success(Duration::from_nanos(900), 1, 0);
+    metrics.record_success(Duration::from_nanos(900), 1, 0);
+
+    let mut summary = metrics.summary(Duration::from_nanos(1_800));
+    summary.attach_phase_snapshot(&snapshot).unwrap();
+
+    let prepare_barrier = summary
+        .phases
+        .get("prepare_barrier")
+        .expect("prepare_barrier summary");
+    assert_eq!(prepare_barrier.total_ns, 1_200);
+    assert_eq!(prepare_barrier.invocation_count, 3);
+    assert_eq!(prepare_barrier.ns_per_invocation, 400.0);
+    assert_eq!(prepare_barrier.ns_per_commit, 600.0);
+
+    let summary_json = serde_json::to_value(&summary).expect("serialize summary");
+    let phases_json = summary_json
+        .get("phases")
+        .and_then(Value::as_object)
+        .expect("serialized phases");
+    assert_eq!(
+        phases_json
+            .get("prepare_barrier")
+            .and_then(Value::as_object)
+            .and_then(|phase| phase.get("total_ns")),
+        Some(&Value::from(1_200_u64))
+    );
+    assert!(phases_json.contains_key("participant_end"));
+}
+
+#[cfg(feature = "occ_phase_profile")]
+#[test]
+fn phase_snapshot_rejects_active_guards_without_publishing_partial_results() {
+    let mut phases = [PhaseMeasurement::default(); PHASE_COUNT];
+    phases[Phase::PrepareBarrier as usize] = PhaseMeasurement {
+        total_ns: 1_200,
+        invocation_count: 3,
+    };
+    let snapshot = Snapshot {
+        phases,
+        active_guards: 1,
+    };
+
+    let mut summary =
+        BatchMetrics::one_success(Duration::from_nanos(900)).summary(Duration::from_nanos(900));
+
+    assert!(summary.phases.is_empty());
+    assert_eq!(
+        summary.attach_phase_snapshot(&snapshot),
+        Err(PhaseSnapshotError::ActiveGuards(1))
+    );
+    assert!(summary.phases.is_empty());
+}
+
 #[test]
 fn retryable_attempts_do_not_advance_success_target() {
     let tally = AttemptTally::from_outcomes([
@@ -135,6 +208,8 @@ fn run_report_replaces_a_scenario_by_name() {
         p99_ns: 2_000_000,
         unexpected: Vec::new(),
         invariants_passed: true,
+        #[cfg(feature = "occ_phase_profile")]
+        phases: std::collections::BTreeMap::new(),
     };
     let second = ScenarioSummary {
         committed: 1,
@@ -147,6 +222,8 @@ fn run_report_replaces_a_scenario_by_name() {
         p99_ns: 1_000_000,
         unexpected: Vec::new(),
         invariants_passed: true,
+        #[cfg(feature = "occ_phase_profile")]
+        phases: std::collections::BTreeMap::new(),
     };
 
     report.record("repeatable-read", first);
@@ -175,6 +252,8 @@ fn run_report_replaces_a_scenario_by_name() {
     assert!(!scenario.contains_key("latency_p50_ns"));
     assert!(!scenario.contains_key("latency_p95_ns"));
     assert!(!scenario.contains_key("latency_p99_ns"));
+    #[cfg(not(feature = "occ_phase_profile"))]
+    assert!(!scenario.contains_key("phases"));
 
     let persisted: RunReport = serde_json::from_slice(&bytes).expect("parse typed report");
     assert_eq!(persisted.scenarios.len(), 1);

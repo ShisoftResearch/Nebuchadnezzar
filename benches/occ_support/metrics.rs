@@ -7,6 +7,9 @@ use std::{
 
 use serde_derive::{Deserialize, Serialize};
 
+#[cfg(feature = "occ_phase_profile")]
+use neb::server::transactions::phase_profile::{Snapshot, PHASES};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BatchMetrics {
     latency_ns: Vec<u64>,
@@ -64,8 +67,25 @@ impl BatchMetrics {
             p99_ns: nearest_rank_percentile(&latency_ns, 99),
             unexpected: self.unexpected.clone(),
             invariants_passed: self.unexpected.is_empty(),
+            #[cfg(feature = "occ_phase_profile")]
+            phases: BTreeMap::new(),
         }
     }
+}
+
+#[cfg(feature = "occ_phase_profile")]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PhaseSummary {
+    pub total_ns: u64,
+    pub invocation_count: u64,
+    pub ns_per_invocation: f64,
+    pub ns_per_commit: f64,
+}
+
+#[cfg(feature = "occ_phase_profile")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhaseSnapshotError {
+    ActiveGuards(usize),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -80,6 +100,48 @@ pub struct ScenarioSummary {
     pub p99_ns: u64,
     pub unexpected: Vec<String>,
     pub invariants_passed: bool,
+    #[cfg(feature = "occ_phase_profile")]
+    pub phases: BTreeMap<String, PhaseSummary>,
+}
+
+#[cfg(feature = "occ_phase_profile")]
+impl ScenarioSummary {
+    pub fn attach_phase_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), PhaseSnapshotError> {
+        if snapshot.active_guards != 0 {
+            return Err(PhaseSnapshotError::ActiveGuards(snapshot.active_guards));
+        }
+
+        let phases = PHASES
+            .iter()
+            .copied()
+            .map(|phase| {
+                let measurement = snapshot.phases[phase as usize];
+                let ns_per_invocation = if measurement.invocation_count == 0 {
+                    0.0
+                } else {
+                    measurement.total_ns as f64 / measurement.invocation_count as f64
+                };
+                let ns_per_commit = if self.committed == 0 {
+                    0.0
+                } else {
+                    measurement.total_ns as f64 / self.committed as f64
+                };
+
+                (
+                    phase.as_str().to_string(),
+                    PhaseSummary {
+                        total_ns: measurement.total_ns,
+                        invocation_count: measurement.invocation_count,
+                        ns_per_invocation,
+                        ns_per_commit,
+                    },
+                )
+            })
+            .collect();
+
+        self.phases = phases;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
