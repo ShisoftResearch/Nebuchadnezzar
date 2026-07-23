@@ -1367,6 +1367,7 @@ impl DataManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::transactions::test_hlc;
     use crate::ram::cell::OwnedCell;
     use crate::ram::schema::Schema;
     use crate::ram::segs::SEGMENT_SIZE;
@@ -1457,7 +1458,7 @@ mod tests {
     #[test]
     fn dropped_prepare_delay_handle_removes_its_registration() {
         let id = Id::new(0, 99012);
-        let tid = StandardVectorClock::from_vec(vec![(31, 12)]);
+        let tid = test_hlc(12, 31);
         let key = (tid.clone(), id);
         {
             let _handle = install_prepare_delay_for_cell(tid, id);
@@ -1652,7 +1653,7 @@ mod tests {
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::new(0, 99001);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 3, 0);
-        let tid = StandardVectorClock::from_vec(vec![(11, 1)]);
+        let tid = test_hlc(1, 11);
 
         let result = client
             .prepare(
@@ -1691,7 +1692,7 @@ mod tests {
         let mut cell_a = counter_cell(schema.id, cell_id, score_a, "A");
         let version_a = runtime.chunks().write_cell(&mut cell_a).unwrap().version;
 
-        let tid = StandardVectorClock::from_vec(vec![(41, 1)]);
+        let tid = test_hlc(1, 41);
 
         // A partial read (head with pin=true) pins version A for this transaction.
         let head_a =
@@ -1741,7 +1742,7 @@ mod tests {
         assert_eq!(header_again.version, version_a);
 
         // A different transaction, never having pinned, sees the current version B.
-        let other_tid = StandardVectorClock::from_vec(vec![(42, 1)]);
+        let other_tid = test_hlc(1, 42);
         let read_current =
             <DataManager as Service>::read(&manager, 42, other_tid.clone(), other_tid.clone(), cell_id)
                 .await
@@ -1776,7 +1777,7 @@ mod tests {
         let mut cell = counter_cell(schema.id, cell_id, 500, "A");
         let version = runtime.chunks().write_cell(&mut cell).unwrap().version;
 
-        let tid = StandardVectorClock::from_vec(vec![(44, 1)]);
+        let tid = test_hlc(1, 44);
         let head =
             <DataManager as Service>::head(&manager, 44, tid.clone(), tid.clone(), cell_id, true)
                 .await
@@ -1817,7 +1818,7 @@ mod tests {
         );
 
         // Releasing an unknown transaction is idempotent and still succeeds.
-        let unknown_tid = StandardVectorClock::from_vec(vec![(45, 9)]);
+        let unknown_tid = test_hlc(9, 45);
         let released_unknown =
             <DataManager as Service>::release_read_pins(&manager, vec![unknown_tid.clone()])
                 .await
@@ -1844,7 +1845,7 @@ mod tests {
         let mut cell_a = counter_cell(schema.id, cell_id, score_a, "A");
         let version_a = runtime.chunks().write_cell(&mut cell_a).unwrap().version;
 
-        let tid = StandardVectorClock::from_vec(vec![(43, 1)]);
+        let tid = test_hlc(1, 43);
 
         // A blind head (pin=false, the version-observation path) must NOT pin and
         // must NOT create a participant transaction.
@@ -1903,7 +1904,7 @@ mod tests {
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::new(0, 99002);
         seed_cell_version(&runtime, schema.id, cell_id, 4, 0);
-        let tid = StandardVectorClock::from_vec(vec![(12, 1)]);
+        let tid = test_hlc(1, 12);
 
         let result = client
             .prepare(
@@ -1934,7 +1935,7 @@ mod tests {
         install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99003);
-        let tid = StandardVectorClock::from_vec(vec![(13, 1)]);
+        let tid = test_hlc(1, 13);
 
         let result = <DataManager as Service>::prepare(
             &manager,
@@ -1974,7 +1975,7 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99004);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 5, 0);
-        let tid = StandardVectorClock::from_vec(vec![(14, 1)]);
+        let tid = test_hlc(1, 14);
         let op = PrepareOp {
             id: cell_id,
             expectation: CellExpectation::Present(version),
@@ -2004,7 +2005,7 @@ mod tests {
         let group = "txn_data_site_prepare_empty_ops";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
-        let tid = StandardVectorClock::from_vec(vec![(19, 1)]);
+        let tid = test_hlc(1, 19);
 
         assert!(manager.find_transaction(&tid).is_none());
 
@@ -2032,7 +2033,7 @@ mod tests {
         let cell_b = Id::new(0, 99007);
         let version_a = seed_cell_version(&runtime, schema.id, cell_a, 7, 0);
         let version_b = seed_cell_version(&runtime, schema.id, cell_b, 8, 0);
-        let tid = StandardVectorClock::from_vec(vec![(15, 1)]);
+        let tid = test_hlc(1, 15);
         let coordinator_id = 15;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
         let op_a = PrepareOp {
@@ -2114,7 +2115,7 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99008);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 9, 0);
-        let tid = StandardVectorClock::from_vec(vec![(16, 1)]);
+        let tid = test_hlc(1, 16);
         let original_coordinator = 16;
         let requester = TxnPriority::new(tid.clone(), original_coordinator);
         let op = PrepareOp {
@@ -2185,7 +2186,7 @@ mod tests {
         let cell_b = Id::new(0, 99010);
         let version_a = seed_cell_version(&runtime, schema.id, cell_a, 10, 0);
         let version_b = seed_cell_version(&runtime, schema.id, cell_b, 11, 0);
-        let tid = StandardVectorClock::from_vec(vec![(17, 1)]);
+        let tid = test_hlc(1, 17);
         let coordinator_id = 17;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
         let op_a = PrepareOp {
@@ -2272,10 +2273,10 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99011);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 12, 0);
-        let tid = StandardVectorClock::from_vec(vec![(18, 1)]);
+        let tid = test_hlc(1, 18);
         let coordinator_id = 18;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
-        let foreign_owner = TxnPriority::new(StandardVectorClock::from_vec(vec![(1, 1)]), 1);
+        let foreign_owner = TxnPriority::new(test_hlc(1, 1), 1);
         let op = PrepareOp {
             id: cell_id,
             expectation: CellExpectation::Present(version),
@@ -2356,8 +2357,8 @@ mod tests {
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::new(0, 99005);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
-        let older_tid = StandardVectorClock::from_vec(vec![(11, 1)]);
-        let younger_tid = StandardVectorClock::from_vec(vec![(22, 1)]);
+        let older_tid = test_hlc(1, 11);
+        let younger_tid = test_hlc(1, 22);
         let op = PrepareOp {
             id: cell_id,
             expectation: CellExpectation::Present(version),
@@ -2387,7 +2388,7 @@ mod tests {
         let group = "txn_data_site_same_tid";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
-        let tid = manager.txn_peer.clock.inc();
+        let tid = manager.hlc.now();
 
         let results = join_all((0..32).map(|_| {
             let manager = manager.clone();
@@ -2422,7 +2423,7 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99011);
         seed_cell_version(&runtime, schema.id, cell_id, 7, 0);
-        let tid = StandardVectorClock::from_vec(vec![(31, 1)]);
+        let tid = test_hlc(1, 31);
 
         let response =
             <DataManager as Service>::read(&manager, 31, tid.clone(), tid.clone(), cell_id)
@@ -2445,7 +2446,7 @@ mod tests {
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
         let tids = (0..64)
-            .map(|_| manager.txn_peer.clock.inc())
+            .map(|_| manager.hlc.now())
             .collect::<Vec<_>>();
 
         for tid in &tids {
@@ -2482,7 +2483,7 @@ mod tests {
         let server = start_transaction_test_server(address, group).await;
         let default_manager = data_manager_for_database(&server, address, group).await;
         let analytics_manager = data_manager_for_database(&server, address, "analytics").await;
-        let shared_tid = default_manager.txn_peer.clock.inc();
+        let shared_tid = default_manager.hlc.now();
 
         default_manager
             .get_or_create_transaction(&shared_tid)
@@ -2531,10 +2532,10 @@ mod tests {
         let group = "txn_data_site_end_race";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
-        let tid = manager.txn_peer.clock.inc();
+        let tid = manager.hlc.now();
         manager.get_or_create_transaction(&tid).lock().state = TxnState::Aborted;
 
-        let end_clock = manager.txn_peer.clock.to_clock();
+        let end_clock = manager.hlc.now();
         let left_manager = manager.clone();
         let right_manager = manager.clone();
         let left_tid = tid.clone();
@@ -2586,7 +2587,7 @@ mod tests {
         let affected_id = Id::new(0, 8101);
 
         for ops in [vec![CommitOp::Read(affected_id, 1)], vec![CommitOp::None]] {
-            let tid = manager.txn_peer.clock.inc();
+            let tid = manager.hlc.now();
             prepare_local_txn(&manager, &tid, vec![affected_id]);
 
             let result = <DataManager as Service>::commit(&manager, tid.clone(), tid.clone(), ops)
@@ -2621,7 +2622,7 @@ mod tests {
         let read_version = seed_cell_version(&runtime, schema.id, read_id, 9, 0);
         let read_only_version = seed_cell_version(&runtime, schema.id, read_only_id, 11, 0);
 
-        let read_only_tid = manager.txn_peer.clock.inc();
+        let read_only_tid = manager.hlc.now();
         let read_only_prepare = prepare_ops_local(
             &manager,
             0,
@@ -2664,7 +2665,7 @@ mod tests {
             read_only_before.header.version
         );
 
-        let empty_tid = manager.txn_peer.clock.inc();
+        let empty_tid = manager.hlc.now();
         let empty_prepare = prepare_ops_local(
             &manager,
             0,
@@ -2724,7 +2725,7 @@ mod tests {
             .is_empty());
         abort_and_end_local(&manager, &empty_tid).await;
 
-        let partial_tid = manager.txn_peer.clock.inc();
+        let partial_tid = manager.hlc.now();
         let partial_prepare = prepare_ops_local(
             &manager,
             0,
@@ -2784,7 +2785,7 @@ mod tests {
             .is_empty());
         abort_and_end_local(&manager, &partial_tid).await;
 
-        let extra_tid = manager.txn_peer.clock.inc();
+        let extra_tid = manager.hlc.now();
         prepare_local_txn(&manager, &extra_tid, vec![write_id, read_id]);
         let extra_result = <DataManager as Service>::commit(
             &manager,
@@ -2803,7 +2804,7 @@ mod tests {
             TxnState::Prepared
         );
 
-        let duplicate_tid = manager.txn_peer.clock.inc();
+        let duplicate_tid = manager.hlc.now();
         prepare_local_txn(&manager, &duplicate_tid, vec![write_id, read_id]);
         let duplicate_result = <DataManager as Service>::commit(
             &manager,
@@ -2837,7 +2838,7 @@ mod tests {
         let cell_id = Id::new(0, 8204);
         let initial_score = 13;
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
-        let tid = manager.txn_peer.clock.inc();
+        let tid = manager.hlc.now();
         let expected_owner = TxnPriority::new(tid.clone(), 0);
 
         prepare_local_txn(&manager, &tid, vec![cell_id]);
@@ -2916,8 +2917,8 @@ mod tests {
         let cell_id = Id::new(0, 8205);
         let initial_score = 21;
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
-        let t1 = StandardVectorClock::from_vec(vec![(21, 1)]);
-        let t2 = StandardVectorClock::from_vec(vec![(22, 1)]);
+        let t1 = test_hlc(1, 21);
+        let t2 = test_hlc(1, 22);
         let t1_owner = TxnPriority::new(t1.clone(), 21);
         let t2_owner = TxnPriority::new(t2.clone(), 22);
         let prepare_op = PrepareOp {
@@ -3027,7 +3028,7 @@ mod tests {
         let initial_score = 41;
         let committed_score = 55;
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
-        let tid = StandardVectorClock::from_vec(vec![(23, 1)]);
+        let tid = test_hlc(1, 23);
         let owner = TxnPriority::new(tid.clone(), 23);
         let prepare_op = PrepareOp {
             id: cell_id,
@@ -3119,8 +3120,8 @@ mod tests {
         let initial_score = 61;
         let committed_score = 77;
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
-        let t1 = StandardVectorClock::from_vec(vec![(24, 1)]);
-        let t2 = StandardVectorClock::from_vec(vec![(25, 1)]);
+        let t1 = test_hlc(1, 24);
+        let t2 = test_hlc(1, 25);
         let t1_owner = TxnPriority::new(t1.clone(), 24);
         let t2_owner = TxnPriority::new(t2.clone(), 25);
         let t1_prepare = PrepareOp {
@@ -3245,18 +3246,18 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8210);
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 0, 0);
-        let t1 = StandardVectorClock::from_vec(vec![(11, 1)]);
-        let t2 = StandardVectorClock::from_vec(vec![(22, 1)]);
+        let t1 = test_hlc(1, 11);
+        let t2 = test_hlc(1, 22);
         let prepare_op = PrepareOp {
             id: cell_id,
             expectation: CellExpectation::Present(initial_version),
             intent: PrepareIntent::Write,
         };
 
-        assert_eq!(
-            t1.relation(&t2),
-            bifrost::vector_clock::Relation::Concurrent
-        );
+        // (Dropped the `t1.relation(&t2) == Concurrent` precondition: HLC is a
+        // total order with no `Concurrent` relation. The behaviour under test —
+        // a stale-versioned update from a peer being rejected after another peer
+        // commits a new version — does not depend on the two tids' relative age.)
 
         let prepare_t1 = prepare_ops_local(&manager, 11, &t1, vec![prepare_op.clone()]).await;
         assert_eq!(prepare_t1, DMPrepareResult::Success);
@@ -3300,7 +3301,7 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8211);
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 1, 0);
-        let tid = StandardVectorClock::from_vec(vec![(31, 1)]);
+        let tid = test_hlc(1, 31);
 
         let prepare = prepare_ops_local(
             &manager,
@@ -3357,7 +3358,7 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8212);
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 2, 0);
-        let tid = StandardVectorClock::from_vec(vec![(32, 1)]);
+        let tid = test_hlc(1, 32);
 
         let prepare = prepare_ops_local(
             &manager,
@@ -3404,7 +3405,7 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8216);
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
-        let tid = StandardVectorClock::from_vec(vec![(35, 1)]);
+        let tid = test_hlc(1, 35);
 
         let prepare = prepare_ops_local(
             &manager,
@@ -3464,7 +3465,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8213);
-        let tid = StandardVectorClock::from_vec(vec![(33, 1)]);
+        let tid = test_hlc(1, 33);
 
         let prepare = prepare_ops_local(
             &manager,
@@ -3522,7 +3523,7 @@ mod tests {
         let cell_b = Id::new(0, 8215);
         let version_a = seed_cell_version(&runtime, schema.id, cell_a, 3, 0);
         let version_b = seed_cell_version(&runtime, schema.id, cell_b, 4, 0);
-        let tid = StandardVectorClock::from_vec(vec![(34, 1)]);
+        let tid = test_hlc(1, 34);
 
         let prepare = prepare_ops_local(
             &manager,
@@ -3588,7 +3589,7 @@ mod tests {
         let cell_b = Id::new(0, 8218);
         let version_a = seed_cell_version(&runtime, schema.id, cell_a, 15, 0);
         let version_b = seed_cell_version(&runtime, schema.id, cell_b, 25, 0);
-        let tid = StandardVectorClock::from_vec(vec![(36, 1)]);
+        let tid = test_hlc(1, 36);
 
         let prepare = prepare_ops_local(
             &manager,
@@ -3690,7 +3691,7 @@ mod tests {
         // is this (non-empty) clock. A freshly created insert meta carries empty
         // read/write clocks, which sort strictly below `oldest`, so only the
         // racy `owner.is_none()` check stands between it and eviction.
-        let insert_tid = StandardVectorClock::from_vec(vec![(7, 9)]);
+        let insert_tid = test_hlc(9, 7);
         let _txn = manager.get_or_create_transaction(&insert_tid);
 
         // Model prepare mid-flight: the meta exists (owner not yet acquired).

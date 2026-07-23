@@ -222,54 +222,71 @@ pub async fn new_async_client_for_database(
     ))
 }
 
+/// Shared test-support constructor for transaction ids. Placed at module top
+/// level (not inside a `#[cfg(test)] mod`) so child test modules can reach it
+/// via `super::test_hlc` / `crate::server::transactions::test_hlc`. The old
+/// vector-clock `from_vec(vec![(server, counter)])` maps to `test_hlc(counter,
+/// server)`: the counter drove age ordering and is now the HLC `ts`, the server
+/// id is now the HLC `node`.
+#[cfg(test)]
+pub fn test_hlc(ts: u64, node: u64) -> TxnId {
+    bifrost::hlc::Hlc { ts, node }
+}
+
 #[cfg(test)]
 mod occ_type_tests {
-    use super::{TxnId, TxnPriority};
-    use bifrost::vector_clock::{Relation, StandardVectorClock};
-    use serde_json::json;
+    use super::{test_hlc, TxnPriority};
     use std::cmp::Ordering;
-    use std::panic::catch_unwind;
-
-    fn clock(entries: &[(u64, u64)]) -> TxnId {
-        StandardVectorClock::from_vec(entries.to_vec())
-    }
-
-    fn raw_clock(entries: &[(u64, u64)]) -> TxnId {
-        serde_json::from_value(json!({ "map": entries })).unwrap()
-    }
 
     #[test]
     fn txn_priority_preserves_causal_order() {
-        let older = TxnPriority::new(clock(&[(1, 1)]), 9);
-        let newer = TxnPriority::new(clock(&[(1, 2)]), 9);
+        // Same node, increasing ts models a causal chain from one coordinator;
+        // the older (smaller ts) event compares as `Less`.
+        let older = TxnPriority::new(test_hlc(1, 1), 9);
+        let newer = TxnPriority::new(test_hlc(2, 1), 9);
 
         assert_eq!(older.compare_age(&newer), Ordering::Less);
         assert_eq!(newer.compare_age(&older), Ordering::Greater);
     }
 
     #[test]
-    fn txn_priority_totally_orders_concurrent_clocks_by_coordinator() {
-        let left = TxnPriority::new(clock(&[(1, 1)]), 10);
-        let right = TxnPriority::new(clock(&[(2, 1)]), 20);
+    fn txn_priority_totally_orders_concurrent_clocks() {
+        // Two coordinators issuing at the same ts were "concurrent" under the
+        // old partial order; HLC's `(ts, node)` gives them a plain total order,
+        // so `compare_age` is exactly `tid.cmp` and is antisymmetric.
+        let left = TxnPriority::new(test_hlc(1, 1), 10);
+        let right = TxnPriority::new(test_hlc(1, 2), 20);
 
-        assert_eq!(left.compare_age(&right), Ordering::Less);
-        assert_eq!(right.compare_age(&left), Ordering::Greater);
+        assert_ne!(left.compare_age(&right), Ordering::Equal);
+        assert_eq!(left.compare_age(&right), left.tid.cmp(&right.tid));
+        assert_eq!(right.compare_age(&left), right.tid.cmp(&left.tid));
+        assert_eq!(
+            left.compare_age(&right),
+            right.compare_age(&left).reverse(),
+            "compare_age must be antisymmetric"
+        );
     }
 
     #[test]
-    fn txn_priority_preserves_causal_order_with_missing_components() {
-        let older = TxnPriority::new(clock(&[(1, 1)]), 20);
-        let younger = TxnPriority::new(clock(&[(1, 1), (2, 1)]), 10);
+    fn txn_priority_preserves_causal_order_across_coordinators() {
+        // The younger transaction observed the older's clock before issuing (a
+        // causal edge), so its ts strictly exceeds the older's regardless of
+        // which node minted it.
+        let older = TxnPriority::new(test_hlc(1, 1), 20);
+        let younger = TxnPriority::new(test_hlc(2, 2), 10);
 
         assert_eq!(older.compare_age(&younger), Ordering::Less);
         assert_eq!(younger.compare_age(&older), Ordering::Greater);
     }
 
     #[test]
-    fn txn_priority_totally_orders_same_coordinator_concurrent_clocks_without_serialization() {
-        let left = TxnPriority::new(clock(&[(1, 1)]), 10);
-        let right = TxnPriority::new(clock(&[(2, 1)]), 10);
-        let expected = left.tid.deterministic_cmp(&right.tid);
+    fn txn_priority_totally_orders_concurrent_clocks_from_one_coordinator() {
+        // Even two concurrent tids minted by the same coordinator get a
+        // deterministic total order straight from `(ts, node)` — no
+        // serialization or coordinator tie-break required.
+        let left = TxnPriority::new(test_hlc(1, 1), 10);
+        let right = TxnPriority::new(test_hlc(1, 2), 10);
+        let expected = left.tid.cmp(&right.tid);
 
         assert_ne!(expected, Ordering::Equal);
         assert_eq!(left.compare_age(&right), expected);
@@ -277,39 +294,24 @@ mod occ_type_tests {
     }
 
     #[test]
-    fn txn_priority_canonicalizes_duplicate_components_by_max_counter() {
-        let older = TxnPriority::new(raw_clock(&[(1, 1), (1, 3)]), 20);
-        let younger = TxnPriority::new(clock(&[(1, 3), (2, 1)]), 10);
+    fn compare_age_is_a_total_transitive_order() {
+        // Regression: the old causal + `deterministic_cmp` order produced a
+        // CYCLE on this sparse-lexicographic triple. With vector clocks
+        // A=[(2,5)], B=[(1,1),(2,5)], C=[(1,2)] it yielded A<B, B<C, C<A, so
+        // sorting was ill-defined. HLC's `(ts, node)` is a genuine total order;
+        // encode the same shape and prove transitivity plus a single
+        // consistent sort.
+        let a = TxnPriority::new(test_hlc(5, 2), 2);
+        let b = TxnPriority::new(test_hlc(6, 1), 1);
+        let c = TxnPriority::new(test_hlc(7, 1), 1);
 
-        assert_eq!(older.tid.relation(&younger.tid), Relation::Before);
-        assert_eq!(younger.tid.relation(&older.tid), Relation::After);
-        let forward = catch_unwind(|| older.compare_age(&younger));
-        let reverse = catch_unwind(|| younger.compare_age(&older));
+        assert_eq!(a.compare_age(&b), Ordering::Less);
+        assert_eq!(b.compare_age(&c), Ordering::Less);
+        // a < b and b < c must imply a < c (the old order broke exactly here).
+        assert_eq!(a.compare_age(&c), Ordering::Less);
 
-        assert_eq!(forward.unwrap(), Ordering::Less);
-        assert_eq!(reverse.unwrap(), Ordering::Greater);
-    }
-
-    #[test]
-    fn txn_priority_preserves_causal_order_for_unsorted_zero_components() {
-        let older = TxnPriority::new(raw_clock(&[(3, 0), (2, 1), (1, 1)]), 20);
-        let younger = TxnPriority::new(raw_clock(&[(4, 1), (2, 1), (1, 1), (3, 0)]), 10);
-
-        assert_eq!(older.tid.relation(&younger.tid), Relation::Before);
-        assert_eq!(younger.tid.relation(&older.tid), Relation::After);
-        assert_eq!(older.compare_age(&younger), Ordering::Less);
-        assert_eq!(younger.compare_age(&older), Ordering::Greater);
-    }
-
-    #[test]
-    fn txn_priority_tie_breaks_semantically_equal_unsorted_zero_clocks_by_deterministic_cmp() {
-        let left = TxnPriority::new(raw_clock(&[(2, 0), (1, 1)]), 10);
-        let right = TxnPriority::new(raw_clock(&[(1, 1), (3, 0)]), 10);
-        let expected = left.tid.deterministic_cmp(&right.tid);
-
-        assert_eq!(left.tid.relation(&right.tid), Relation::Equal);
-        assert_ne!(expected, Ordering::Equal);
-        assert_eq!(left.compare_age(&right), expected);
-        assert_eq!(right.compare_age(&left), expected.reverse());
+        let mut sorted = vec![c.clone(), a.clone(), b.clone()];
+        sorted.sort_by(|x, y| x.compare_age(y));
+        assert_eq!(sorted, vec![a, b, c]);
     }
 }

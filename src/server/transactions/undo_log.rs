@@ -922,6 +922,7 @@ impl UndoLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::transactions::test_hlc;
     use crate::ram::cell::ReadError;
     use crate::ram::types::{OwnedMap, OwnedValue};
     use crate::server::transactions::{EndResult, TMPrepareResult, TxnExecResult};
@@ -943,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_undo_entry_serialization() {
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::default();
         let cell_id = Id {
             higher: 1,
             lower: 2,
@@ -969,7 +970,7 @@ mod tests {
 
         let undo_log = UndoLogger::new(log_dir).unwrap();
 
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::default();
         let cell_id = Id {
             higher: 1,
             lower: 2,
@@ -996,7 +997,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::default();
         let cell_id = Id {
             higher: 1,
             lower: 2,
@@ -1026,7 +1027,7 @@ mod tests {
 
         let undo_log = UndoLogger::new(log_dir).unwrap();
 
-        let txn_id = TxnId::new();
+        let txn_id = TxnId::default();
         let cell_id1 = Id {
             higher: 1,
             lower: 2,
@@ -1068,7 +1069,7 @@ mod tests {
         let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
 
         // Transaction 1: Write a new cell
-        let txn1 = TxnId::new();
+        let txn1 = TxnId::default();
         let cell_id1 = Id {
             higher: 100,
             lower: 1,
@@ -1115,7 +1116,7 @@ mod tests {
         let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
 
         // Transaction that will be aborted
-        let txn = TxnId::new();
+        let txn = TxnId::default();
         let cell_id1 = Id {
             higher: 200,
             lower: 1,
@@ -1168,7 +1169,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
-        let txn_incomplete = TxnId::new();
+        let txn_incomplete = TxnId::default();
         let cell_id1 = Id {
             higher: 300,
             lower: 1,
@@ -1243,10 +1244,10 @@ mod tests {
         assert_eq!(entries[2].seq_id, 750);
     }
 
-    /// Test if TxnId (StandardVectorClock) equality works after JSON serialization
+    /// Test if TxnId (Hlc) equality works after JSON serialization
     #[test]
     fn test_txn_id_serialization_equality() {
-        let txn1 = TxnId::new();
+        let txn1 = TxnId::default();
 
         // Serialize and deserialize
         let json = serde_json::to_vec(&txn1).unwrap();
@@ -1289,7 +1290,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
-        let txn = TxnId::new();
+        let txn = TxnId::default();
 
         // Write entry and commit marker
         {
@@ -1390,16 +1391,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
-        // Create unique transaction IDs by incrementing them
-        // (in real system, each would have different server_id in vector clock)
-        let mut txn_committed = TxnId::new();
-        txn_committed.inc(1); // server_id=1
-
-        let mut txn_aborted = TxnId::new();
-        txn_aborted.inc(2); // server_id=2
-
-        let mut txn_incomplete = TxnId::new();
-        txn_incomplete.inc(3); // server_id=3
+        // Create unique transaction IDs (in a real system each coordinator
+        // mints a distinct HLC node).
+        let txn_committed = test_hlc(1, 1); // node=1
+        let txn_aborted = test_hlc(1, 2); // node=2
+        let txn_incomplete = test_hlc(1, 3); // node=3
 
         {
             let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
@@ -1517,7 +1513,7 @@ mod tests {
 
         // Create multiple transactions in first log file
         for i in 0..5 {
-            let txn = TxnId::new();
+            let txn = TxnId::default();
             let entry = UndoLogEntry::new_write(
                 txn.clone(),
                 Id {
@@ -1532,7 +1528,7 @@ mod tests {
 
         // Write more transactions to fill the log
         for i in 5..10 {
-            let txn = TxnId::new();
+            let txn = TxnId::default();
             let entry = UndoLogEntry::new_write(
                 txn.clone(),
                 Id {
@@ -1597,14 +1593,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
-        let txn_incomplete = TxnId::new();
+        let txn_incomplete = TxnId::default();
 
         {
             let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
 
             // Write some committed transactions
             for i in 0..3 {
-                let txn = TxnId::new();
+                let txn = TxnId::default();
                 let entry = UndoLogEntry::new_write(
                     txn.clone(),
                     Id {
@@ -1665,7 +1661,7 @@ mod tests {
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
         let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
-        let txn = TxnId::new();
+        let txn = TxnId::default();
 
         // Write operation: version is the new cell's version
         let write_entry = UndoLogEntry::new_write(
@@ -1804,8 +1800,7 @@ mod tests {
 
             // Log the write as incomplete transaction
             let undo_log = UndoLogger::new(log_dir.to_str().unwrap().to_string()).unwrap();
-            let mut txn_id = TxnId::new();
-            txn_id.inc(1);
+            let txn_id = test_hlc(1, 1);
             let entry = UndoLogEntry::new_write(txn_id, cell_id, cell.header.version);
             undo_log.write_undo_entry(entry).unwrap();
             // No commit marker - simulate crash
@@ -1910,8 +1905,7 @@ mod tests {
         };
 
         // Simulate incomplete transaction that updated the cell
-        let mut txn_id = TxnId::new();
-        txn_id.inc(1);
+        let txn_id = test_hlc(1, 1);
         // Removed seg_id parameter
         let undo_entry = UndoLogEntry::new_restore(
             txn_id.clone(),
