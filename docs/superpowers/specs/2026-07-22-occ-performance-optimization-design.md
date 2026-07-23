@@ -323,6 +323,24 @@ hot-32 throughput regression exceeded the 3% secondary limit. The candidate
 was therefore quarantined without a production commit. Reconstructing
 `PrepareOp` values is not treated as the dominant high-contention cost.
 
+### Rejected linear-prepare-validation attempt
+
+Patch digest `aac112078423` replaced participant prepare's first
+`BTreeMap` canonicalization with a nonempty, sorted-unique linear validation
+and retained the original RPC vector. The certification `BTreeMap`, ownership
+checks, expectation validation, and all distributed phases remained unchanged.
+An initial review found an idempotent-retry test that depended on the old
+silent re-sort; its two payloads were made canonically ordered, the retry,
+duplicate, and unsorted-input tests passed, and static re-review approved the
+candidate.
+
+The stable default-feature `occ/multi_cell/8` comparison on
+`192.168.10.17` had 4.46% base CV and 3.38% candidate CV. Throughput changed
+-1.64%, while p95 improved from 7.338 ms to 7.224 ms (-1.56%). Workload
+invariants passed and the `unexpected` outcome list was empty. Because neither
+target metric improved by 5%, the candidate was rejected before the full
+portfolio and preserved only as an audit patch.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
