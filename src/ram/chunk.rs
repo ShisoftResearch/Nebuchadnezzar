@@ -627,14 +627,6 @@ impl Chunk {
         header_from_chunk_raw(location).map(|pair| pair.0)
     }
 
-    // Cheap probe for the current cell's stored entry byte length, without
-    // materializing (decoding) its value. Mirrors `head_cell`'s locate path.
-    pub(crate) fn cell_stored_len(&self, hash: u64) -> Result<usize, ReadError> {
-        let loc = *CellGuard::for_read(hash, self)?;
-        let (entry, _) = Entry::decode_from(loc, |_, _| {});
-        Ok(entry.content_length as usize)
-    }
-
     pub fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
         SharedCell::from_chunk_raw(hash, CellGuard::for_read(hash, self)?, self).map(|(c, _)| c)
     }
@@ -1717,12 +1709,6 @@ impl Chunks {
         let chunk = self.locate_chunk_by_partition(key.higher);
         return chunk.head_at(location);
     }
-    // Cheap probe for a stored cell's total entry byte length, without
-    // materializing the value. Used to decide pin-vs-clone by size.
-    pub fn cell_stored_len(&self, key: &Id) -> Result<usize, ReadError> {
-        let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.cell_stored_len(hash);
-    }
     pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         chunk.location_for_read(hash)
@@ -2129,28 +2115,6 @@ mod tests {
             header: CellHeader::new(schema_id, id),
             data: data_map_value!(id: id.lower as i32, data: data),
         }
-    }
-
-    #[test]
-    fn cell_stored_len_reflects_payload_size() {
-        let _ = env_logger::try_init();
-        let (chunks, schema) = setup_test_chunks();
-
-        let small_id = Id::new(1, 1);
-        let mut small_cell = payload_cell(schema.id, &small_id, 8);
-        chunks.write_cell(&mut small_cell).unwrap();
-
-        let large_id = Id::new(1, 2);
-        let mut large_cell = payload_cell(schema.id, &large_id, 8192);
-        chunks.write_cell(&mut large_cell).unwrap();
-
-        let s = chunks.cell_stored_len(&small_id).unwrap();
-        let l = chunks.cell_stored_len(&large_id).unwrap();
-        assert!(l > s, "large cell entry ({}) should be bigger than small cell entry ({})", l, s);
-        assert!(l > 4096, "large cell entry ({}) should exceed 4096 bytes", l);
-
-        // A missing id returns an error.
-        assert!(chunks.cell_stored_len(&Id::new(0, 987654321)).is_err());
     }
 
     #[test]

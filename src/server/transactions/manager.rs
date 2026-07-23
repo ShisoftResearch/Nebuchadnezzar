@@ -219,18 +219,6 @@ impl Default for WaitConfig {
     }
 }
 
-/// Cells whose serialized size exceeds this are read via pin-and-defer instead
-/// of being cloned into the coordinator's transaction cache. A few KiB by
-/// default: large enough that small counter cells keep the current clone path.
-pub const DEFAULT_READ_PIN_BYTES: usize = 4096;
-
-pub fn read_pin_threshold_bytes() -> usize {
-    std::env::var("NEB_TXN_READ_PIN_BYTES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_READ_PIN_BYTES)
-}
-
 #[derive(Clone, Debug)]
 struct DataObject {
     server: u64,
@@ -1862,19 +1850,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_pin_threshold_defaults_and_env_override() {
-        // Default when unset.
-        std::env::remove_var("NEB_TXN_READ_PIN_BYTES");
-        assert_eq!(read_pin_threshold_bytes(), DEFAULT_READ_PIN_BYTES);
-        // Override.
-        std::env::set_var("NEB_TXN_READ_PIN_BYTES", "65536");
-        assert_eq!(read_pin_threshold_bytes(), 65536);
-        // Invalid falls back to default.
-        std::env::set_var("NEB_TXN_READ_PIN_BYTES", "not-a-number");
-        assert_eq!(read_pin_threshold_bytes(), DEFAULT_READ_PIN_BYTES);
-        std::env::remove_var("NEB_TXN_READ_PIN_BYTES");
-    }
 
     #[test]
     fn data_object_pinned_representation_defers_full_cell() {
