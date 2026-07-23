@@ -2281,7 +2281,7 @@ The linked Bifrost worktree has unrelated user changes, but
 `src/vector_clock/mod.rs` is clean at the start of this task. Preserve every
 other Bifrost path and scope any stash or commit to this file only.
 
-- [ ] **Step 1: Add failing deterministic clock-order tests**
+- [x] **Step 1: Add failing deterministic clock-order tests**
 
 In Bifrost, add tests for a new
 `VectorClock::deterministic_cmp(&self, other)` method:
@@ -2297,7 +2297,7 @@ In Nebuchadnezzar, change the same-coordinator concurrent-priority test to
 derive its expected order from `tid.deterministic_cmp(&other.tid)` rather than
 serialized bytes. Keep the causal-order and coordinator-first tests unchanged.
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 ```bash
 cargo test --manifest-path ../bifrost/Cargo.toml \
@@ -2309,7 +2309,7 @@ cargo test --lib \
 
 Expected: compilation fails because `deterministic_cmp` does not exist.
 
-- [ ] **Step 3: Add allocation-free canonical comparison with a fallback**
+- [x] **Step 3: Add allocation-free canonical comparison with a fallback**
 
 In `VectorClock`, add a private `map_is_canonical` check: every counter is
 nonzero and component keys are strictly increasing. Change the existing
@@ -2335,7 +2335,7 @@ Wait-Die requires a consistent total order, not the historical byte ordering.
 Do not change prepare retries, ownership publication, transaction IDs, RPCs,
 or any distributed phase.
 
-- [ ] **Step 4: Verify clock and Wait-Die correctness**
+- [x] **Step 4: Verify clock and Wait-Die correctness**
 
 ```bash
 cargo test --manifest-path ../bifrost/Cargo.toml vector_clock::test -- --test-threads=1
@@ -2350,7 +2350,7 @@ Expected: canonical, noncanonical, causal, total-order, and Wait-Die tests pass.
 No Bifrost file other than `src/vector_clock/mod.rs` is added to this
 candidate.
 
-- [ ] **Step 5: Run the targeted benchmark and retain-or-revert gate**
+- [x] **Step 5: Run the targeted benchmark and retain-or-revert gate**
 
 Deploy only the two candidate files to the isolated sources on
 `192.168.10.17`. Run exact default-feature `occ/hot_rmw/8` and
@@ -2363,7 +2363,7 @@ If it passes, run the complete stable portfolio and all correctness gates.
 Otherwise preserve scoped audit patches in both repositories, restore both
 remote files to the accepted base, and document the rejection.
 
-- [ ] **Step 6: Commit only an accepted change**
+- [x] **Step 6: Commit only an accepted change**
 
 Commit the Bifrost vector-clock change separately without staging its unrelated
 dirty files, then commit the Nebuchadnezzar priority change:

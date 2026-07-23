@@ -467,6 +467,53 @@ The first two runs exceeded the 5% CV limit. The stable third run improved
 neither target metric and regressed both. The candidate was therefore rejected
 before the full portfolio and preserved only as an audit patch.
 
+### Accepted allocation-free Wait-Die clock comparison
+
+Patch digest `0cb2e85386fb` removed allocation-heavy vector-clock comparison
+from the canonical transaction path. Bifrost now detects canonical clock maps
+and compares their stored slices directly, while retaining the existing
+clone-and-canonicalize behavior for deserialized clocks containing zero
+counters, unsorted components, or duplicate components. A new
+`deterministic_cmp` method provides an allocation-free total tie-break for
+canonical concurrent clocks and a canonicalized-map-plus-raw-map fallback for
+noncanonical representations.
+
+Nebuchadnezzar changed only the last same-coordinator Wait-Die tie-break from
+two serialized byte vectors to `deterministic_cmp`. Causal `Before` and
+`After` decisions, coordinator ordering, ownership publication, prepare
+retries, transaction IDs, RPCs, certification, commit, abort, and every
+distributed phase remained unchanged.
+
+The focused tests first failed because `deterministic_cmp` did not exist.
+After implementation, all 32 Bifrost vector-clock tests, all seven transaction
+priority tests, and both focused Wait-Die regression tests passed. Independent
+review approved the canonical fast path, noncanonical fallback, total ordering,
+and protocol preservation.
+
+The default-feature portfolio ran serially on NUMA node 0 of
+`192.168.10.17`. Every stable candidate CV was below 5%, every workload
+invariant passed, and every `unexpected` list was empty:
+
+| Scenario | Base CV | Candidate CV | Throughput change | Base p95 | Candidate p95 | p95 change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `occ/independent_rmw/1` | 2.00% | 1.64% | +4.74% | 107.567 us | 96.900 us | -9.92% |
+| `occ/hot_rmw/8` | 2.74% | 2.65% | +15.62% | 304.384 us | 136.460 us | -55.17% |
+| `occ/hot_rmw/32` | 3.13% | 4.64% | +16.88% | 21.527 ms | 14.008 ms | -34.93% |
+| `occ/multi_cell/8` | 4.46% | 4.07% | +8.69% | 7.338 ms | 7.046 ms | -3.98% |
+
+The stable-portfolio geometric-mean throughput improved 11.37%.
+`occ/multi_participant/1` remained excluded from retain/revert arithmetic
+because its saved base CV was 6.05%; its candidate CV was 4.13%, throughput
+changed -0.30%, and the latest-batch p95 diagnostic changed from 106.995 us to
+149.362 us.
+
+The final correctness gate passed 99 transaction tests with one ignored,
+30 tiered-storage tests with five ignored, and all 38 full-text tests.
+`cargo check --lib`, targeted formatting, and both repositories' diff checks
+also passed. The accepted changes were committed as Bifrost `3b8aff2` at
+2026-07-23 06:55:54 UTC and Nebuchadnezzar `819cb9d7` at
+2026-07-23 06:55:59 UTC. Unrelated dirty Bifrost files were not staged.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
