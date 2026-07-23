@@ -618,6 +618,14 @@ impl Chunk {
         header_from_chunk_raw(*CellGuard::for_read(hash, self)?).map(|pair| pair.0)
     }
 
+    // Cheap probe for the current cell's stored entry byte length, without
+    // materializing (decoding) its value. Mirrors `head_cell`'s locate path.
+    pub(crate) fn cell_stored_len(&self, hash: u64) -> Result<usize, ReadError> {
+        let loc = *CellGuard::for_read(hash, self)?;
+        let (entry, _) = Entry::decode_from(loc, |_, _| {});
+        Ok(entry.content_length as usize)
+    }
+
     pub fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
         SharedCell::from_chunk_raw(hash, CellGuard::for_read(hash, self)?, self).map(|(c, _)| c)
     }
@@ -1657,6 +1665,12 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.head_cell(hash);
     }
+    // Cheap probe for a stored cell's total entry byte length, without
+    // materializing the value. Used to decide pin-vs-clone by size.
+    pub fn cell_stored_len(&self, key: &Id) -> Result<usize, ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.cell_stored_len(hash);
+    }
     pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         chunk.location_for_read(hash)
@@ -2023,5 +2037,66 @@ impl<'a> Deref for CellGuard<'a> {
     type Target = usize;
     fn deref(&self) -> &Self::Target {
         &**self.guard.as_ref().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ram::schema::{Field, LocalSchemasCache};
+    use crate::ram::types::Map;
+    use dovahkiin::types::Type;
+    use env_logger;
+
+    const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+    fn setup_test_chunks() -> (Arc<Chunks>, Schema) {
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new("cell_stored_len_test", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            TEST_CHUNK_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        (chunks, schema)
+    }
+
+    fn payload_cell(schema_id: u32, id: &Id, payload_len: usize) -> OwnedCell {
+        let data: Vec<u8> = std::iter::repeat(id.lower as u8).take(payload_len).collect();
+        OwnedCell {
+            header: CellHeader::new(schema_id, id),
+            data: data_map_value!(id: id.lower as i32, data: data),
+        }
+    }
+
+    #[test]
+    fn cell_stored_len_reflects_payload_size() {
+        let _ = env_logger::try_init();
+        let (chunks, schema) = setup_test_chunks();
+
+        let small_id = Id::new(1, 1);
+        let mut small_cell = payload_cell(schema.id, &small_id, 8);
+        chunks.write_cell(&mut small_cell).unwrap();
+
+        let large_id = Id::new(1, 2);
+        let mut large_cell = payload_cell(schema.id, &large_id, 8192);
+        chunks.write_cell(&mut large_cell).unwrap();
+
+        let s = chunks.cell_stored_len(&small_id).unwrap();
+        let l = chunks.cell_stored_len(&large_id).unwrap();
+        assert!(l > s, "large cell entry ({}) should be bigger than small cell entry ({})", l, s);
+        assert!(l > 4096, "large cell entry ({}) should exceed 4096 bytes", l);
+
+        // A missing id returns an error.
+        assert!(chunks.cell_stored_len(&Id::new(0, 987654321)).is_err());
     }
 }
