@@ -173,3 +173,29 @@ records the change.
   scenarios.
 - **Physical-clock anomalies** — absorbed by the monotonic CAS rules; worst
   case is a temporarily larger logical component.
+
+## Validation results (2026-07-23)
+
+Landed as: bifrost `4fce9ac` (Hlc + HlcSource, 6 property tests) and `eaf5fb1`
+(deterministic_cmp removed with its last consumer; vector-clock suite 29/29);
+Nebuchadnezzar `38dbd0f7` (per-server source wiring), `4e243230` (the atomic
+migration: TxnId = Hlc, compare_age = tid.cmp, all clock plumbing on the
+HlcSource, Peer and every vector-clock reference removed from production code),
+`fc9de70d` (test migration: priority tests rewritten by intent, including a
+transitivity regression over the old deterministic_cmp cycle shape),
+`98b778cd` (undo-log recovery rejects pre-HLC transaction ids — this also fixed
+a pre-existing silent-truncation bug where an undecodable txn id caused
+`Err(_) => break`, truncating recovery and reporting success).
+
+Final gates on the migrated tree, all green and identical to pre-migration
+counts: `server::transactions` 110 passed / 0 failed / 1 ignored;
+`ram::tiered` 30 / 0 / 5 ignored; `index::full_text` 38 / 0. bifrost:
+vector_clock 29 / 0 (three deterministic_cmp-specific tests removed with the
+API), hlc 6 / 0.
+
+Known follow-ups: (1) server startup currently logs and continues when undo-log
+recovery fails — with the new explicit pre-HLC rejection this is visible but
+non-fatal; whether it should abort startup is an open product decision.
+(2) A benchmark-host portfolio spot-check (independent_rmw/1, hot_rmw/8,
+blind_update/1) against a pre-HLC baseline remains to be run; expectation is
+neutral-to-positive (16-byte Copy ids, O(1) compares, no clock allocation).
