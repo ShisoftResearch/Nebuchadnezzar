@@ -245,3 +245,144 @@ fn merge_compaction_drops_tombstones() {
     assert_eq!(seen, expected);
     assert!(verification::is_tree_in_order(&tree, 0));
 }
+
+// Structural split: split_off must partition the tree exactly — source keeps
+// keys < pivot, the returned tree gets keys >= pivot, both valid and in order,
+// union == original, disjoint. Modeled in docs/tla/StructuralSplit.tla.
+#[test]
+fn structural_split_off_partitions_exactly() {
+    use super::split_off::split_off;
+    let _ = env_logger::try_init();
+    // Cover clean-cut pivots (page boundaries) and mid-leaf pivots across a
+    // multi-level tree.
+    for &n in &[1u64, 2, 5, 6, 50, 200, 1000] {
+        for pivot_n in [0u64, 1, n / 3, n / 2, n.saturating_sub(1), n] {
+            let deletion = deletion_set();
+            let tree = TinyTree::new(&deletion);
+            for i in 0..n {
+                assert!(tree.insert(&key_of(i * 2))); // even keys 0,2,4,...
+            }
+            let pivot = key_of(pivot_n * 2); // may be a real key or a gap
+            let orig_len = tree.len();
+            let res = split_off(&tree, &pivot);
+
+            // Collect the source's remaining keys.
+            let mut src_keys = vec![];
+            let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
+            while let Some(k) = c.next() {
+                src_keys.push(k);
+            }
+            assert!(
+                verification::is_tree_in_order(&tree, 0),
+                "source not in order after split n={} pivot={}",
+                n,
+                pivot_n
+            );
+            assert!(
+                src_keys.iter().all(|k| k < &pivot),
+                "source kept a key >= pivot (n={}, pivot={})",
+                n,
+                pivot_n
+            );
+
+            let mut moved_keys = vec![];
+            if let Some(so) = res {
+                let new_tree = TinyTree::from_root(
+                    so.new_root,
+                    so.new_head_id,
+                    so.moved_len,
+                    so.new_height,
+                    &deletion,
+                );
+                assert!(
+                    verification::is_tree_in_order(&new_tree, 0),
+                    "moved tree not in order (n={}, pivot={})",
+                    n,
+                    pivot_n
+                );
+                let mut c = new_tree.seek(&min_entry_key(), Ordering::Forward);
+                while let Some(k) = c.next() {
+                    moved_keys.push(k);
+                }
+                assert!(
+                    moved_keys.iter().all(|k| k >= &pivot),
+                    "moved tree has a key < pivot (n={}, pivot={})",
+                    n,
+                    pivot_n
+                );
+                assert_eq!(
+                    moved_keys.len(),
+                    so.moved_len,
+                    "moved_len mismatch (n={}, pivot={})",
+                    n,
+                    pivot_n
+                );
+            }
+
+            // Union is the original set, disjoint, no loss.
+            assert_eq!(
+                src_keys.len() + moved_keys.len(),
+                orig_len,
+                "key count changed: {} + {} != {} (n={}, pivot={})",
+                src_keys.len(),
+                moved_keys.len(),
+                orig_len,
+                n,
+                pivot_n
+            );
+            let mut all: Vec<_> = src_keys.into_iter().chain(moved_keys).collect();
+            all.sort();
+            let expected: Vec<_> = (0..n).map(|i| key_of(i * 2)).collect();
+            assert_eq!(all, expected, "union != original (n={}, pivot={})", n, pivot_n);
+        }
+    }
+}
+
+// Randomized structural split: random key sets and random pivots (including
+// values not present as keys), many rounds, against a Vec model.
+#[test]
+fn structural_split_off_randomized() {
+    use super::split_off::split_off;
+    use rand::prelude::*;
+    let _ = env_logger::try_init();
+    let mut rng = rand::rng();
+    for _round in 0..300 {
+        let n = rng.random_range(0..400u64);
+        let deletion = deletion_set();
+        let tree = TinyTree::new(&deletion);
+        let mut model: Vec<u64> = Vec::new();
+        for _ in 0..n {
+            let k = rng.random_range(0..2000u64);
+            if !model.contains(&k) {
+                model.push(k);
+                assert!(tree.insert(&key_of(k)));
+            }
+        }
+        model.sort();
+        // Pivot: a value in [0, 2001), often between keys.
+        let pivot_v = rng.random_range(0..2001u64);
+        let pivot = key_of(pivot_v);
+        let res = split_off(&tree, &pivot);
+
+        let mut src: Vec<u64> = vec![];
+        let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
+        while let Some(k) = c.next() {
+            src.push(k.id().lower);
+        }
+        assert!(verification::is_tree_in_order(&tree, 0), "src not in order");
+        let mut moved: Vec<u64> = vec![];
+        if let Some(so) = res {
+            let nt = TinyTree::from_root(so.new_root, so.new_head_id, so.moved_len, so.new_height, &deletion);
+            assert!(verification::is_tree_in_order(&nt, 0), "moved not in order");
+            let mut c = nt.seek(&min_entry_key(), Ordering::Forward);
+            while let Some(k) = c.next() {
+                moved.push(k.id().lower);
+            }
+            assert_eq!(moved.len(), so.moved_len, "moved_len");
+        }
+        let exp_src: Vec<u64> = model.iter().cloned().filter(|&k| key_of(k) < pivot).collect();
+        let exp_moved: Vec<u64> = model.iter().cloned().filter(|&k| key_of(k) >= pivot).collect();
+        assert_eq!(src, exp_src, "source partition wrong (n={}, pivot={})", n, pivot_v);
+        assert_eq!(moved, exp_moved, "moved partition wrong (n={}, pivot={})", n, pivot_v);
+    }
+}
