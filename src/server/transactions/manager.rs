@@ -499,12 +499,14 @@ impl Service for TransactionManager {
                 }
                 Err(error) => Err(error),
             };
-            // Release read pins on every server this transaction pinned a read on
-            // (read `pinned_servers` before cleanup wipes it). This covers servers
-            // that were only read — they are absent from `affected_objects` and so
-            // are never `sites_end`ed above. Best-effort; never fails the commit.
-            let pinned_servers = std::mem::take(&mut txn.pinned_servers);
-            self.release_pinned_reads(&tid, &pinned_servers).await;
+            // Fire-and-forget release of read pins on servers this transaction
+            // only read (pinned but not written). Write servers already dropped
+            // their pins in `end`, so they are excluded. Spawned so it never adds
+            // latency to the commit path; best-effort, stale cleanup is the backstop.
+            let write_servers: HashSet<u64> = txn.affected_objects.keys().copied().collect();
+            let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
+            pinned_servers.retain(|server_id| !write_servers.contains(server_id));
+            self.spawn_release_pinned_reads(tid.clone(), pinned_servers);
             self.cleanup_transaction_guarded(&tid, &mut txn);
             result
         }
@@ -552,12 +554,14 @@ impl Service for TransactionManager {
                 Err(error) => Err(error),
             };
             if Self::abort_cleanup_complete(&result) {
-                // Release read pins on every server this transaction pinned a read
-                // on (read `pinned_servers` before cleanup wipes it). Servers that
-                // were only read are absent from `affected_objects` and so receive
-                // no abort/end above. Best-effort; never fails the abort.
-                let pinned_servers = std::mem::take(&mut txn.pinned_servers);
-                self.release_pinned_reads(&tid, &pinned_servers).await;
+                // Fire-and-forget release of read pins on servers this transaction
+                // only read (pinned but not written; write servers already dropped
+                // their pins in the abort/end above). Spawned so it never adds
+                // latency to the abort path; best-effort, stale cleanup is the backstop.
+                let write_servers: HashSet<u64> = txn.affected_objects.keys().copied().collect();
+                let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
+                pinned_servers.retain(|server_id| !write_servers.contains(server_id));
+                self.spawn_release_pinned_reads(tid.clone(), pinned_servers);
                 self.cleanup_transaction_guarded(&tid, &mut txn);
             }
             result
@@ -1690,6 +1694,19 @@ impl TransactionManager {
     /// would otherwise linger until slow stale cleanup. Individual failures are
     /// logged at debug and ignored — the participant's stale cleanup remains the
     /// backstop, and a release must never fail commit/abort.
+    /// Spawn a best-effort, fire-and-forget release of read pins so it never adds
+    /// latency to the commit/abort path. A lost release is reclaimed by the
+    /// participant's stale cleanup.
+    fn spawn_release_pinned_reads(&self, tid: TxnId, pinned_servers: HashSet<u64>) {
+        if pinned_servers.is_empty() {
+            return;
+        }
+        if let Some(manager) = self.self_ref.upgrade() {
+            tokio::spawn(async move {
+                manager.release_pinned_reads(&tid, &pinned_servers).await;
+            });
+        }
+    }
     async fn release_pinned_reads(&self, tid: &TxnId, pinned_servers: &HashSet<u64>) {
         for &server_id in pinned_servers {
             match self.get_data_site(server_id).await {
