@@ -112,11 +112,17 @@ baseline and candidate; remote execution is intentionally not hardcoded in Rust.
 
 ### OCC phase profiling
 
-`occ_phase_profile` is a non-default diagnostic feature. Default builds contain
-no phase clocks or counter updates. Run
-`scripts/check-occ-phase-profile-default.sh` to build the default release
-library object under `target/release/deps/` and confirm that no
-`phase_profile` symbols are present.
+`occ_phase_profile` is a non-default diagnostic feature. Its cfg gates compile
+the phase clocks and counter updates out of default builds. Independently,
+`scripts/check-occ-phase-profile-default.sh` builds the default release library,
+resolves the exact emitted object from Cargo's JSON artifact record, and checks
+the completed `nm` output for `phase_profile`-named symbols. This is a
+symbol-level regression guard, not a semantic proof that no counter update code
+exists.
+
+The check requires a Unix-like environment with Bash, `awk`, `grep`, `mktemp`,
+and `nm`. Set `NM` to the path of a compatible symbol dumper when `nm` is not
+the desired binary.
 
 Collect profiling data with:
 
