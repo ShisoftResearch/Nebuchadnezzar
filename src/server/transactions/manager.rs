@@ -481,8 +481,18 @@ impl Service for TransactionManager {
             let mut txn = txn_lock.lock().await;
             self.ensure_txn_state(&txn, TxnState::Prepared)?;
             let affected_objs = &txn.affected_objects;
-            let result = match self.data_sites_for_objs(affected_objs).await {
-                Ok(data_sites) => self.sites_end(&tid, affected_objs, &data_sites).await,
+            let result = match {
+                #[cfg(feature = "occ_phase_profile")]
+                let _phase_guard =
+                    super::phase_profile::guard(super::phase_profile::Phase::EndParticipantLookup);
+                self.data_sites_for_objs(affected_objs).await
+            } {
+                Ok(data_sites) => {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard =
+                        super::phase_profile::guard(super::phase_profile::Phase::EndCleanup);
+                    self.sites_end(&tid, affected_objs, &data_sites).await
+                }
                 Err(error) => Err(error),
             };
             self.cleanup_transaction_guarded(&tid, &mut txn);
@@ -515,9 +525,18 @@ impl Service for TransactionManager {
             }
             txn.last_activity = get_time();
             let changed_objs = &txn.affected_objects;
-            let result = match self.data_sites_for_objs(changed_objs).await {
+            let result = match {
+                #[cfg(feature = "occ_phase_profile")]
+                let _phase_guard = super::phase_profile::guard(
+                    super::phase_profile::Phase::AbortParticipantLookup,
+                );
+                self.data_sites_for_objs(changed_objs).await
+            } {
                 Ok(data_sites) => {
                     debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard =
+                        super::phase_profile::guard(super::phase_profile::Phase::AbortCleanup);
                     self.sites_abort(&tid, changed_objs, &data_sites).await // with end
                 }
                 Err(error) => Err(error),
@@ -847,6 +866,8 @@ impl TransactionManager {
         id: &Id,
         txn: &mut TxnGuard<'a>,
     ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        #[cfg(feature = "occ_phase_profile")]
+        let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
         let self_server_id = self.deps.server_id;
@@ -1421,14 +1442,34 @@ impl TransactionManager {
             let mut txn = txn_mutex.lock().await;
             let result = {
                 self.ensure_rw_state(&txn)?;
-                self.generate_affected_objs(&mut txn);
+                {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard = super::phase_profile::guard(
+                        super::phase_profile::Phase::AffectedObjectGrouping,
+                    );
+                    self.generate_affected_objs(&mut txn);
+                }
                 let affect_objs = &txn.affected_objects;
-                let data_sites = self.data_sites_for_objs(&affect_objs).await?;
-                let sites_prepare_result =
-                    self.sites_prepare(&tid, affect_objs, &data_sites).await?;
+                let data_sites = {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard = super::phase_profile::guard(
+                        super::phase_profile::Phase::PrepareParticipantLookup,
+                    );
+                    self.data_sites_for_objs(affect_objs).await?
+                };
+                let sites_prepare_result = {
+                    #[cfg(feature = "occ_phase_profile")]
+                    let _phase_guard =
+                        super::phase_profile::guard(super::phase_profile::Phase::PrepareBarrier);
+                    self.sites_prepare(&tid, affect_objs, &data_sites).await?
+                };
                 if sites_prepare_result == DMPrepareResult::Success {
-                    let sites_commit_result =
-                        self.sites_commit(&tid, affect_objs, &data_sites).await?;
+                    let sites_commit_result = {
+                        #[cfg(feature = "occ_phase_profile")]
+                        let _phase_guard =
+                            super::phase_profile::guard(super::phase_profile::Phase::CommitBarrier);
+                        self.sites_commit(&tid, affect_objs, &data_sites).await?
+                    };
                     match sites_commit_result {
                         DMCommitResult::Success => TMPrepareResult::Success,
                         _ => TMPrepareResult::DMCommitError(sites_commit_result),
@@ -1485,6 +1526,33 @@ mod tests {
             generate_scoped_service_id(group, "db_a"),
             generate_scoped_service_id(group, "db_b")
         );
+    }
+
+    #[cfg(feature = "occ_phase_profile")]
+    #[test]
+    fn coordinator_profile_covers_every_existing_protocol_boundary() {
+        let source = include_str!("manager.rs");
+        let production_source = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production_source, _)| production_source)
+            .unwrap_or(source);
+        for phase in [
+            "Phase::ReadSiteRpc",
+            "Phase::AffectedObjectGrouping",
+            "Phase::PrepareParticipantLookup",
+            "Phase::PrepareBarrier",
+            "Phase::CommitBarrier",
+            "Phase::AbortParticipantLookup",
+            "Phase::AbortCleanup",
+            "Phase::EndParticipantLookup",
+            "Phase::EndCleanup",
+        ] {
+            assert!(
+                production_source.contains(phase),
+                "expected manager.rs to reference {}",
+                phase
+            );
+        }
     }
 
     async fn scoped_txn_client_for_database(
