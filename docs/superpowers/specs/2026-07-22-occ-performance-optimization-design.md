@@ -193,6 +193,63 @@ Each iteration follows the same sequence:
 
 Benchmark infrastructure and production optimizations are separate commits. Every accepted production commit includes its before/after benchmark evidence in the commit message body or an adjacent results note.
 
+## Controlled OCC Phase Profile: 2026-07-23
+
+The phase profiler at revision `38f84e702eab2c7b943361db3019db6a5b7a2232`
+was run serially on `192.168.10.17`, pinned to NUMA node 0. The host was idle,
+`numactl` was available, and `kernel.perf_event_paranoid` was `2`. Every accepted
+or quarantined run recorded the expected revision, all 13 phase keys, passing
+workload invariants, and zero unexpected outcomes.
+
+The stable Criterion results were:
+
+| Scenario | Mean throughput | CV | p95 logical latency | Complete retries |
+| --- | ---: | ---: | ---: | ---: |
+| `occ/independent_rmw/1` | 11,494 commits/s | 1.70% | 103.381 us | 0 |
+| `occ/hot_rmw/8` | 9,311 commits/s | 3.25% | 464.885 us | 2,550 |
+| `occ/hot_rmw/32` | 7,397 commits/s | 4.61% | 22.145 ms | 6,877 |
+| `occ/multi_cell/8` | 4,260 commits/s | 3.91% | 7.387 ms | 1,465 |
+| `occ/multi_participant/1` | 10,570 commits/s | 3.24% | 110.333 us | 0 |
+
+The first `independent_rmw/1` run had 9.55% CV and was rejected before the
+stable rerun. The first `hot_rmw/32` run had 5.16% CV and was likewise rejected.
+All three `multi_participant/4` attempts remained correct but had 14.40%,
+19.88%, and 19.09% CV, so that scenario is quarantined and does not influence
+the optimization choice.
+
+For stable `independent_rmw/1`, the non-overlapping coordinator phases summed to
+54.132 us per commit. `commit_barrier` was the largest component at 21.629 us,
+or 39.96% of that sum. Nested `participant_commit` time was 17.630 us, or 81.51%
+of the barrier. Stable `multi_participant/1` confirmed the result:
+`commit_barrier` was again the largest coordinator component at 28.132 us,
+41.08% of the 68.488 us coordinator sum, and nested `participant_commit` was
+23.537 us, or 83.67% of the barrier. These two stable workloads satisfy the
+phase-dominance rule without relying on participant time as an additional
+disjoint component.
+
+A supplementary user-space cycles profile was collected after the phase
+decision. It was not used as throughput evidence because sampling perturbed the
+Criterion result and Criterion's post-sample analysis shared the profile. It
+did confirm that participant commit executes `apply_commit_ops` together with
+chunk read and lookup paths.
+
+The selected first production hypothesis is storage-prevalidation reuse.
+`apply_commit_ops` validates the current storage state of every commit operation
+before mutation, then update and remove paths read the same cells again to
+recover their address, old value, and segment coordinates before issuing a
+version-conditional mutation. The candidate will build an owned mutation plan
+while performing the all-operations prevalidation pass, retain any required
+segment guards and rollback values in that plan, and consume it only after
+every operation has validated.
+
+This optimization does not remove a distributed phase. All participant
+expectations must still pass before the first mutation, participant ownership
+remains held, and `update_cell_by` or `remove_cell_by` must still condition the
+actual mutation on the certified version. Any failure to create the complete
+plan must return without mutation. The candidate is retained only if the
+targeted stable benchmark improves by at least 5% and the complete correctness
+and non-regression gates pass.
+
 ## Initial Hypotheses
 
 The hypotheses are investigated in this order but reordered when benchmark evidence contradicts it.
