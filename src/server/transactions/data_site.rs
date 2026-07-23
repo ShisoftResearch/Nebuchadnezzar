@@ -2,13 +2,13 @@ use super::*;
 use crate::ram::cell::OwnedCellRef;
 use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
-use crate::server::{DatabaseRuntime, Peer};
+use crate::server::DatabaseRuntime;
 use crate::{
     index::builder::IndexBuilder,
     ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
 };
+use bifrost::hlc::Hlc;
 use bifrost::utils::time::get_time;
-use bifrost::vector_clock::StandardVectorClock;
 use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
@@ -286,34 +286,32 @@ pub struct DataManager {
     cell_list: LinkedList<Id>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
     database_runtime: Arc<DatabaseRuntime>,
-    txn_peer: Peer,
     cleanup_signal: Arc<AtomicBool>,
     /// Per-server Hybrid Logical Clock source (node = server_id), shared with
-    /// the coordinator-side `TransactionManager`. Not yet consumed; wiring
-    /// only (see docs/superpowers/specs/2026-07-23-hlc-txn-id-design.md).
-    #[allow(dead_code)]
+    /// the coordinator-side `TransactionManager`. Stamps every participant
+    /// response clock and observes the coordinator's incoming clock.
     hlc: Arc<bifrost::hlc::HlcSource>,
 }
 
 service! {
-    rpc read(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
-    rpc read_selected(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
-    rpc read_partial_raw(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>;
-    rpc head(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, pin: bool) -> DataSiteResponse<TxnExecResult<CellHeader, ReadError>>;
+    rpc read(server_id: u64, clock: Hlc, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
+    rpc read_selected(server_id: u64, clock: Hlc, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
+    rpc read_partial_raw(server_id: u64, clock: Hlc, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>;
+    rpc head(server_id: u64, clock: Hlc, tid: TxnId, id: Id, pin: bool) -> DataSiteResponse<TxnExecResult<CellHeader, ReadError>>;
     // Release any read pins held for a transaction (partial reads pin versions).
     // Best-effort and idempotent: called by the coordinator on commit/abort so a
     // transaction that merely pinned reads on a server does not linger there.
     rpc release_read_pins(tids: Vec<TxnId>) -> DataSiteResponse<()>;
     // two phase commit
-    rpc prepare(coordinator_id: u64, clock :StandardVectorClock, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
-    rpc commit(clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
+    rpc prepare(coordinator_id: u64, clock: Hlc, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
+    rpc commit(clock: Hlc, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
 
     // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
     // for committed transaction, abort need to recover the data according to it's cells history
-    rpc abort(clock :StandardVectorClock, tid: TxnId) -> DataSiteResponse<AbortResult>;
+    rpc abort(clock: Hlc, tid: TxnId) -> DataSiteResponse<AbortResult>;
 
     // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
-    rpc end(clock :StandardVectorClock, tid: TxnId) -> DataSiteResponse<EndResult>;
+    rpc end(clock: Hlc, tid: TxnId) -> DataSiteResponse<EndResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -323,7 +321,6 @@ service_with_id!(DataManager, DEFAULT_SERVICE_ID);
 impl DataManager {
     pub fn new(
         database_runtime: Arc<DatabaseRuntime>,
-        txn_peer: Peer,
         hlc: Arc<bifrost::hlc::HlcSource>,
     ) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
@@ -333,7 +330,6 @@ impl DataManager {
             cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
             database_runtime,
-            txn_peer,
             cleanup_signal: cleanup_signal.clone(),
             hlc,
         });
@@ -367,8 +363,8 @@ impl DataManager {
 
         return manager;
     }
-    fn update_clock(&self, clock: &StandardVectorClock) {
-        self.txn_peer.clock.merge_with(clock);
+    fn update_clock(&self, clock: Hlc) {
+        self.hlc.observe(clock);
     }
     #[inline]
     fn get_or_create_transaction(&self, tid: &TxnId) -> TxnMutex {
@@ -414,8 +410,8 @@ impl DataManager {
         let is_new = self.cells.get(id).is_none();
         let arc = self.cells.get_or_insert(*id, || {
             Arc::new(Mutex::new(CellMeta {
-                read: TxnId::new(),
-                write: TxnId::new(),
+                read: TxnId::default(),
+                write: TxnId::default(),
                 owner: None,
                 lock_acquired_at: None,
             }))
@@ -430,7 +426,7 @@ impl DataManager {
     where
         T: 'static,
     {
-        future::ready(DataSiteResponse::new(&self.txn_peer, data)).boxed()
+        future::ready(DataSiteResponse::new(self.hlc.now(), data)).boxed()
     }
 
     #[cfg(test)]
@@ -580,7 +576,7 @@ impl DataManager {
                 .iter()
                 .next()
                 .cloned()
-                .unwrap_or_else(|| self.txn_peer.clock.to_clock())
+                .unwrap_or_else(|| self.hlc.now())
         };
         let mut cells_to_evict = Vec::new();
 
@@ -602,7 +598,7 @@ impl DataManager {
         }
 
         // Second pass: re-check and remove (prevents TOCTOU race)
-        let empty_clock = TxnId::new();
+        let empty_clock = TxnId::default();
         for (cell_id_ref, cell_meta) in cells_to_evict {
             let cell_id = cell_id_ref.deref();
 
@@ -636,14 +632,14 @@ impl DataManager {
     }
     fn prepare_read<T: Send>(
         &self,
-        clock: &StandardVectorClock,
+        clock: &Hlc,
         tid: &TxnId,
         id: &Id,
     ) -> Result<(), BoxFuture<'_, DataSiteResponse<TxnExecResult<T, ReadError>>>>
     where
         T: 'static + Clone,
     {
-        self.update_clock(clock);
+        self.update_clock(*clock);
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
         let committing = meta.owner.is_some();
@@ -651,7 +647,7 @@ impl DataManager {
         // Use the more recent timestamp between the transaction ID and the incoming clock
         // This allows transactions to proceed even if their original timestamp is stale
         // due to clock updates from concurrent transactions
-        let effective_ts = if clock > tid { clock } else { tid };
+        let effective_ts = clock.max(tid);
         let read_too_late = &meta.write > effective_ts;
 
         // Check timestamp constraints first
@@ -1509,11 +1505,7 @@ mod tests {
             .ensure_database_runtime(database_name)
             .await
             .expect("database runtime");
-        DataManager::new(
-            runtime,
-            crate::server::Peer::new(&address.to_string()),
-            server.hlc.clone(),
-        )
+        DataManager::new(runtime, server.hlc.clone())
     }
 
     async fn data_site_client_for_database(
@@ -3757,7 +3749,7 @@ impl Service for DataManager {
     fn read(
         &self,
         _server_id: u64,
-        clock: StandardVectorClock,
+        clock: Hlc,
         tid: TxnId,
         id: Id,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
@@ -3774,7 +3766,7 @@ impl Service for DataManager {
         // change. The clock merge `prepare_read` would have done happens here;
         // the fall-through path merges inside `prepare_read` (never twice).
         if let Some(location) = self.existing_read_pin(&tid, &id) {
-            self.update_clock(&clock);
+            self.update_clock(clock);
             return match self.chunks().read_cell_at(&id, location) {
                 Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
@@ -3791,7 +3783,7 @@ impl Service for DataManager {
     fn read_selected(
         &self,
         _server_id: u64,
-        clock: StandardVectorClock,
+        clock: Hlc,
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
@@ -3800,7 +3792,7 @@ impl Service for DataManager {
         // `prepare_read` (see `read` for why re-checking could only spuriously
         // reject or delay it; the clock merge happens exactly once per path).
         if let Some(location) = self.existing_read_pin(&tid, &id) {
-            self.update_clock(&clock);
+            self.update_clock(clock);
             return match self.chunks().read_selected_at(&id, location, &fields[..]) {
                 Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
@@ -3824,7 +3816,7 @@ impl Service for DataManager {
     fn head(
         &self,
         _server_id: u64,
-        clock: StandardVectorClock,
+        clock: Hlc,
         tid: TxnId,
         id: Id,
         pin: bool,
@@ -3839,7 +3831,7 @@ impl Service for DataManager {
             // spuriously reject or delay it; the clock merge happens exactly
             // once per path).
             if let Some(location) = self.existing_read_pin(&tid, &id) {
-                self.update_clock(&clock);
+                self.update_clock(clock);
                 return match self.chunks().head_at(&id, location) {
                     Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
                     Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
@@ -3900,7 +3892,7 @@ impl Service for DataManager {
     fn read_partial_raw(
         &self,
         _server_id: u64,
-        clock: StandardVectorClock,
+        clock: Hlc,
         tid: TxnId,
         id: Id,
         offset: usize,
@@ -3917,7 +3909,7 @@ impl Service for DataManager {
     fn prepare(
         &self,
         coordinator_id: u64,
-        clock: StandardVectorClock,
+        clock: Hlc,
         tid: TxnId,
         ops: Vec<PrepareOp>,
     ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
@@ -3926,7 +3918,7 @@ impl Service for DataManager {
             #[cfg(feature = "occ_phase_profile")]
             let _phase_guard =
                 super::phase_profile::guard(super::phase_profile::Phase::ParticipantPrepare);
-            self.update_clock(&clock);
+            self.update_clock(clock);
 
             let prepared_ops = match Self::canonical_prepare_ops(ops) {
                 Ok(prepared_ops) => prepared_ops,
@@ -4030,20 +4022,16 @@ impl Service for DataManager {
     }
     fn commit(
         &self,
-        clock: StandardVectorClock,
+        clock: Hlc,
         tid: TxnId,
         cells: Vec<CommitOp>,
     ) -> BoxFuture<'_, DataSiteResponse<DMCommitResult>> {
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard =
             super::phase_profile::guard(super::phase_profile::Phase::ParticipantCommit);
-        self.update_clock(&clock);
+        self.update_clock(clock);
 
-        let effective_ts = if clock > tid {
-            clock.clone()
-        } else {
-            tid.clone()
-        };
+        let effective_ts = clock.max(tid);
 
         let Some(txn_lock) = self.find_transaction(&tid) else {
             return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted));
@@ -4068,7 +4056,7 @@ impl Service for DataManager {
                         .into_iter()
                         .chain(pending_results.into_iter()),
                 );
-                DataSiteResponse::new(&self.txn_peer, payload)
+                DataSiteResponse::new(self.hlc.now(), payload)
             }
             .boxed();
         }
@@ -4079,14 +4067,14 @@ impl Service for DataManager {
     }
     fn abort(
         &self,
-        clock: StandardVectorClock,
+        clock: Hlc,
         tid: TxnId,
     ) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let _phase_guard =
             super::phase_profile::guard(super::phase_profile::Phase::ParticipantAbort);
-        self.update_clock(&clock);
+        self.update_clock(clock);
         let Some(txn_lock) = self.find_transaction(&tid) else {
             return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted));
         };
@@ -4156,13 +4144,13 @@ impl Service for DataManager {
     }
     fn end(
         &self,
-        clock: StandardVectorClock,
+        clock: Hlc,
         tid: TxnId,
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
-        self.update_clock(&clock);
+        self.update_clock(clock);
 
         // Option 6: Two-Phase Lock Release with Verification and Retry
         let (affected_cell_ids, txn_state, expected_owner) = {

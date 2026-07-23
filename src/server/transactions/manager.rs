@@ -4,8 +4,8 @@ use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::types::{Id, OwnedValue};
 use bifrost::conshash::ConsistentHashing;
 use bifrost::rpc::{ClientPool, RPCClient};
+use bifrost::hlc::Hlc;
 use bifrost::utils::time::get_time;
-use bifrost::vector_clock::{ServerVectorClock, StandardVectorClock};
 use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
@@ -178,14 +178,12 @@ pub(crate) fn install_abort_entry_delay(tid: TxnId) -> AbortEntryDelayHandle {
 /// Dependencies needed by TransactionManager, extracted from NebServer to break cyclic dependency
 pub struct TransactionManagerDeps {
     pub database_runtime: Arc<crate::server::DatabaseRuntime>,
-    pub clock: Arc<ServerVectorClock>,
     pub server_id: u64,
     pub consh: Arc<ConsistentHashing>,
     pub member_pool: Arc<ClientPool>,
     /// Per-server Hybrid Logical Clock source (node = server_id), shared with
-    /// the participant-side `DataManager`. Not yet consumed; wiring only
-    /// (see docs/superpowers/specs/2026-07-23-hlc-txn-id-design.md).
-    #[allow(dead_code)]
+    /// the participant-side `DataManager`. Sources transaction ids and the
+    /// clock stamps carried on every transaction-layer RPC.
     pub hlc: Arc<bifrost::hlc::HlcSource>,
 }
 
@@ -606,7 +604,7 @@ impl Service for TransactionManager {
         .boxed()
     }
     fn begin(&self) -> BoxFuture<'_, Result<TxnId, TMError>> {
-        let id = self.deps.clock.inc();
+        let id = self.deps.hlc.now();
         let now = bifrost::utils::time::get_time();
         if self
             .transactions
@@ -850,11 +848,11 @@ impl TransactionManager {
             )),
         }
     }
-    fn get_clock(&self) -> StandardVectorClock {
-        self.deps.clock.to_clock()
+    fn get_clock(&self) -> Hlc {
+        self.deps.hlc.now()
     }
-    fn merge_clock(&self, clock: &StandardVectorClock) {
-        self.deps.clock.merge_with(clock)
+    fn merge_clock(&self, clock: Hlc) {
+        self.deps.hlc.observe(clock);
     }
     fn get_transaction(&self, tid: &TxnId) -> Result<TxnMutex, TMError> {
         match self.transactions.get(tid) {
@@ -1040,7 +1038,7 @@ impl TransactionManager {
                 .await;
             match read_response {
                 Ok(dsr) => {
-                    self.merge_clock(&dsr.clock);
+                    self.merge_clock(dsr.clock);
                     let payload = dsr.payload;
                     match payload {
                         TxnExecResult::Accepted(cell) => {
@@ -1147,7 +1145,7 @@ impl TransactionManager {
                 .await;
             match head_response {
                 Ok(dsr) => {
-                    self.merge_clock(&dsr.clock);
+                    self.merge_clock(dsr.clock);
                     match dsr.payload {
                         TxnExecResult::Accepted(header) => {
                             let version = header.version;
@@ -1263,7 +1261,7 @@ impl TransactionManager {
                 .await;
             match read_response {
                 Ok(dsr) => {
-                    self.merge_clock(&dsr.clock);
+                    self.merge_clock(dsr.clock);
                     match dsr.payload {
                         TxnExecResult::Accepted(projection) => {
                             let version = projection.header.version;
@@ -1374,7 +1372,7 @@ impl TransactionManager {
                 .await;
             match head_response {
                 Ok(dsr) => {
-                    self.merge_clock(&dsr.clock);
+                    self.merge_clock(dsr.clock);
                     let payload = &dsr.payload;
                     match &payload {
                         &TxnExecResult::Wait => {
@@ -1471,16 +1469,11 @@ impl TransactionManager {
                 .collect();
             let deps_for_clock = deps.clone();
             let prepare_payload = data_site
-                .prepare(
-                    coordinator_id,
-                    deps.clock.to_clock(),
-                    tid.clone(),
-                    prepare_ops,
-                )
+                .prepare(coordinator_id, deps.hlc.now(), tid.clone(), prepare_ops)
                 .await
                 .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
                 .map(move |prepare_res| -> DMPrepareResult {
-                    deps_for_clock.clock.merge_with(&prepare_res.clock);
+                    deps_for_clock.hlc.observe(prepare_res.clock);
                     prepare_res.payload
                 });
             match prepare_payload {
@@ -1554,7 +1547,7 @@ impl TransactionManager {
         let commit_results: Vec<_> = commit_futures.collect().await;
         for result in commit_results {
             if let Ok(dsr) = result {
-                self.merge_clock(&dsr.clock);
+                self.merge_clock(dsr.clock);
                 match dsr.payload {
                     DMCommitResult::Success => {}
                     _ => {
@@ -1610,7 +1603,7 @@ impl TransactionManager {
             match result {
                 Ok(asr) => {
                     let payload = asr.payload;
-                    self.merge_clock(&asr.clock);
+                    self.merge_clock(asr.clock);
                     match payload {
                         AbortResult::Success(failures) => {
                             sites_to_end.insert(server_id);
@@ -1652,7 +1645,7 @@ impl TransactionManager {
         for (server_id, result) in end_results {
             match result {
                 Ok(response) => {
-                    self.merge_clock(&response.clock);
+                    self.merge_clock(response.clock);
                     match response.payload {
                         EndResult::Success | EndResult::CheckFailed(CheckError::NotExisted) => {}
                         other => {
@@ -1707,7 +1700,7 @@ impl TransactionManager {
         for result in end_results {
             match result {
                 Ok(result) => {
-                    self.merge_clock(&result.clock);
+                    self.merge_clock(result.clock);
                     let payload = result.payload;
                     match payload {
                         EndResult::Success => {}
@@ -1760,7 +1753,7 @@ impl TransactionManager {
         for (server_id, tids) in tids_by_server {
             match self.get_data_site(server_id).await {
                 Ok(data_site) => match data_site.release_read_pins(tids).await {
-                    Ok(response) => self.merge_clock(&response.clock),
+                    Ok(response) => self.merge_clock(response.clock),
                     Err(error) => debug!(
                         "batched release_read_pins RPC to server {} failed: {:?}",
                         server_id, error

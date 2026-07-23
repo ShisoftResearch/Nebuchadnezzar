@@ -3,7 +3,6 @@ use crate::ram::chunk::Chunks;
 use crate::ram::entry::Entry;
 use crate::ram::io::reader;
 use crate::ram::types::Id;
-use bifrost::vector_clock::StandardVectorClock;
 use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -13,10 +12,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-pub type TxnId = StandardVectorClock;
+use super::TxnId;
 
 /// Undo log entry stored in the log file
 /// Format: [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][version: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
+///
+/// The `txn_id` is now a serialized `bifrost::hlc::Hlc` (16-byte fixed HLC),
+/// not the former variable-length vector clock; its serialized byte shape
+/// changed with the type.
 ///
 /// All operations store version for verification during recovery:
 /// - Write: version = new cell version (to verify cell unchanged before deletion)

@@ -1,8 +1,7 @@
 use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
-use crate::server::Peer;
+use bifrost::hlc::Hlc;
 use bifrost::rpc::{RPCError, ServiceClient, DEFAULT_CLIENT_POOL};
-use bifrost::vector_clock::{Relation, StandardVectorClock};
 use std::cmp::Ordering;
 use std::io;
 use std::sync::Arc;
@@ -19,7 +18,7 @@ pub mod phase_profile;
 mod tests;
 pub mod undo_log;
 
-pub type TxnId = StandardVectorClock;
+pub type TxnId = bifrost::hlc::Hlc;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum CellExpectation {
@@ -55,14 +54,11 @@ impl TxnPriority {
     }
 
     pub fn compare_age(&self, other: &Self) -> Ordering {
-        match self.tid.relation(&other.tid) {
-            Relation::Before => Ordering::Less,
-            Relation::After => Ordering::Greater,
-            Relation::Equal | Relation::Concurrent => self
-                .coordinator_id
-                .cmp(&other.coordinator_id)
-                .then_with(|| self.tid.deterministic_cmp(&other.tid)),
-        }
+        // HLC is a total order that extends causality (node id is inside the
+        // tid), so classic Wait-Die age comparison is a plain transitive
+        // `cmp` — no partial-order relation, coordinator tie-break, or
+        // deterministic canonicalization needed.
+        self.tid.cmp(&other.tid)
     }
 }
 
@@ -97,14 +93,14 @@ where
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DataSiteResponse<T> {
     pub payload: T,
-    pub clock: StandardVectorClock,
+    pub clock: Hlc,
 }
 
 impl<T> DataSiteResponse<T> {
-    pub fn new(peer: &Peer, data: T) -> DataSiteResponse<T> {
+    pub fn new(clock: Hlc, data: T) -> DataSiteResponse<T> {
         DataSiteResponse {
             payload: data,
-            clock: peer.clock.to_clock(),
+            clock,
         }
     }
 }

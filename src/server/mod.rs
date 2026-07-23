@@ -14,7 +14,6 @@ use bifrost::raft::state_machine::master as sm_master;
 use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use bifrost::rpc::{self, ClientPool};
 use bifrost::rpc::{RPCClient, RPCError, Server, ServiceClient};
-use bifrost::vector_clock::ServerVectorClock;
 use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 // use crate::index::lsmtree;
@@ -894,12 +893,10 @@ pub struct NebServer {
     pub consh: Arc<ConsistentHashing>,
     pub membership: Arc<ObserverClient>,
     pub member_pool: Arc<rpc::ClientPool>,
-    pub txn_peer: Peer,
     /// Per-server Hybrid Logical Clock source (node = server_id), shared by
     /// every database's transaction manager (coordinator) and data manager
-    /// (participant) hosted on this server. Not yet consumed; wiring only
-    /// (see docs/superpowers/specs/2026-07-23-hlc-txn-id-design.md).
-    #[allow(dead_code)]
+    /// (participant) hosted on this server. Sources transaction ids and the
+    /// clock stamps carried on the transaction layer.
     pub hlc: Arc<bifrost::hlc::HlcSource>,
     pub raft_service: Arc<raft::RaftService>,
     pub raft_client: Arc<RaftClient>,
@@ -1096,7 +1093,6 @@ impl NebServer {
         membership_client: &Arc<ObserverClient>,
         conshasing: &Arc<ConsistentHashing>,
         member_pool: &Arc<rpc::ClientPool>,
-        txn_peer: &Peer,
         hlc: &Arc<bifrost::hlc::HlcSource>,
         register_schema_state_machine: bool,
         pre_acquired_storage_locks: Option<Arc<StorageDirectoryLocks>>,
@@ -1272,7 +1268,6 @@ impl NebServer {
             Arc::new(Cleaner::new_and_start(chunks.clone()))
         };
 
-        let clock = txn_peer.clock.clone();
         let transaction_runtime = Arc::new(DatabaseRuntime::new(
             group_name,
             database_name,
@@ -1295,7 +1290,6 @@ impl NebServer {
                 init_txn_manager(
                     rpc_server,
                     &transaction_runtime,
-                    &clock,
                     rpc_server.server_id,
                     conshasing,
                     member_pool,
@@ -1339,7 +1333,6 @@ impl NebServer {
                     init_txn_data_site_service(
                         rpc_server,
                         database_runtime.clone(),
-                        txn_peer.clone(),
                         hlc.clone(),
                     )
                     .await
@@ -1434,7 +1427,6 @@ impl NebServer {
             &self.membership,
             &self.consh,
             &self.member_pool,
-            &self.txn_peer,
             &self.hlc,
             needs_schema_registration,
             None,
@@ -1723,7 +1715,6 @@ impl NebServer {
         )
         .await?;
         let member_pool = Arc::new(rpc::ClientPool::new());
-        let txn_peer = Peer::new(server_addr);
         // One HLC source per server process (node = server_id), shared by every
         // database's transaction manager (coordinator) and data manager
         // (participant) hosted on this server.
@@ -1756,7 +1747,6 @@ impl NebServer {
             membership_client,
             &conshasing,
             &member_pool,
-            &txn_peer,
             &hlc,
             false,
             Some(startup_storage_locks),
@@ -1794,7 +1784,6 @@ impl NebServer {
             raft_service: raft_service.clone(),
             raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
-            txn_peer: txn_peer,
             hlc,
             group_name: group_name.clone(),
             database_name: database_name.to_string(),
@@ -2068,20 +2057,6 @@ pub async fn rpc_client_by_id(
         .map_err(|e| RPCError::IOError(e))
 }
 
-// Peer have a clock, meant to update with other servers in the cluster
-#[derive(Clone)]
-pub struct Peer {
-    pub clock: Arc<ServerVectorClock>,
-}
-
-impl Peer {
-    pub fn new(server_address: &String) -> Peer {
-        Peer {
-            clock: Arc::new(ServerVectorClock::new(server_address)),
-        }
-    }
-}
-
 pub async fn init_cell_rpc_service(
     rpc_server: &Arc<Server>,
     database_runtime: Arc<DatabaseRuntime>,
@@ -2101,7 +2076,6 @@ pub async fn init_cell_rpc_service(
 pub async fn init_txn_manager(
     rpc_server: &Arc<Server>,
     database_runtime: &Arc<DatabaseRuntime>,
-    clock: &Arc<ServerVectorClock>,
     server_id: u64,
     consh: &Arc<ConsistentHashing>,
     member_pool: &Arc<ClientPool>,
@@ -2109,7 +2083,6 @@ pub async fn init_txn_manager(
 ) -> Arc<TransactionManager> {
     let deps = Arc::new(transactions::manager::TransactionManagerDeps {
         database_runtime: database_runtime.clone(),
-        clock: clock.clone(),
         server_id: server_id,
         consh: consh.clone(),
         member_pool: member_pool.clone(),
@@ -2130,7 +2103,6 @@ pub async fn init_txn_manager(
 pub async fn init_txn_data_site_service(
     rpc_server: &Arc<Server>,
     database_runtime: Arc<DatabaseRuntime>,
-    txn_peer: Peer,
     hlc: Arc<bifrost::hlc::HlcSource>,
 ) {
     rpc_server
@@ -2139,7 +2111,7 @@ pub async fn init_txn_data_site_service(
                 database_runtime.group_name(),
                 database_runtime.database_name(),
             ),
-            &transactions::data_site::DataManager::new(database_runtime, txn_peer, hlc),
+            &transactions::data_site::DataManager::new(database_runtime, hlc),
         )
         .await;
 }

@@ -489,7 +489,7 @@ impl AsyncClient {
         let mut retry_reason_counts = HashMap::new();
         let mut last_retry_reason = None;
         let mut txn = Transaction {
-            tid: TxnId::new(),
+            tid: TxnId::default(),
             state: StdCell::new(txn_server::TxnState::Started),
             client: txn_client,
         };
