@@ -19,7 +19,12 @@ use super::TxnId;
 ///
 /// The `txn_id` is now a serialized `bifrost::hlc::Hlc` (16-byte fixed HLC),
 /// not the former variable-length vector clock; its serialized byte shape
-/// changed with the type.
+/// changed with the type. Undo logs written before this migration framed
+/// `txn_id` as a `bifrost::vector_clock::StandardVectorClock`
+/// (`{"map": [[server, counter], ...]}`), which is not a valid `Hlc` and is
+/// rejected at recovery (see `decode_txn_id`) with an explicit "pre-HLC"
+/// error rather than being silently skipped or misparsed. Undo logs from
+/// before the migration must be discarded, not recovered.
 ///
 /// All operations store version for verification during recovery:
 /// - Write: version = new cell version (to verify cell unchanged before deletion)
@@ -70,6 +75,26 @@ impl UndoOpType {
 const ENTRY_TYPE_UNDO: u8 = 1;
 const ENTRY_TYPE_COMMIT: u8 = 2;
 const ENTRY_TYPE_ABORT: u8 = 3;
+
+/// Decode a serialized transaction id from the bytes stored in the undo log.
+///
+/// Before the HLC migration, `TxnId` was `bifrost::vector_clock::StandardVectorClock`,
+/// which serializes as the JSON object `{"map": [[server, counter], ...]}`.
+/// That shape does not deserialize into the current `Hlc { ts, node }`, so any
+/// decode failure here means the log predates the HLC migration (or is
+/// otherwise corrupt): reject it with a hard, actionable error instead of
+/// silently truncating recovery or falling back to a default value.
+fn decode_txn_id(bytes: &[u8]) -> io::Result<TxnId> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "undo log contains pre-HLC transaction ids; discard undo logs from before the HLC migration (serde error: {})",
+                e
+            ),
+        )
+    })
+}
 
 impl UndoLogEntry {
     /// Create a new undo log entry
@@ -174,8 +199,7 @@ impl UndoLogEntry {
             ));
         }
 
-        let txn_id: TxnId = serde_json::from_slice(&bytes[5..5 + txn_id_len])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let txn_id: TxnId = decode_txn_id(&bytes[5..5 + txn_id_len])?;
 
         let mut offset = 5 + txn_id_len;
         let cell_id_higher = u64::from_le_bytes([
@@ -792,11 +816,7 @@ impl UndoLogger {
                 break;
             }
 
-            let txn_id: TxnId =
-                match serde_json::from_slice(&buffer[offset + 5..offset + 5 + txn_id_len]) {
-                    Ok(id) => id,
-                    Err(_) => break,
-                };
+            let txn_id: TxnId = decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])?;
 
             if active_txns.contains(&txn_id) {
                 return Ok(true);
@@ -875,10 +895,7 @@ impl UndoLogger {
                 }
 
                 let txn_id: TxnId =
-                    match serde_json::from_slice(&buffer[offset + 5..offset + 5 + txn_id_len]) {
-                        Ok(id) => id,
-                        Err(_) => break,
-                    };
+                    decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])?;
 
                 match entry_type {
                     ENTRY_TYPE_UNDO => {
@@ -1280,6 +1297,71 @@ mod tests {
             "HashMap should find deserialized key"
         );
         assert_eq!(map.get(&txn2).unwrap(), &vec![1, 2, 3]);
+    }
+
+    /// Confirms the pre-HLC txn-id serde shape this test builds against: the old
+    /// `TxnId = StandardVectorClock` serialized as a JSON object `{"map": [...]}`
+    /// (a named-field struct, never a bare array), which does not coincidentally
+    /// decode as `Hlc { ts, node }`.
+    #[test]
+    fn test_pre_hlc_vector_clock_serde_shape_is_object_with_map_key() {
+        let old_clock = bifrost::vector_clock::StandardVectorClock::from_vec(vec![(1, 2)]);
+        let bytes = serde_json::to_vec(&old_clock).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), r#"{"map":[[1,2]]}"#);
+    }
+
+    /// Undo logs written before the HLC migration framed `txn_id` as a
+    /// serialized `StandardVectorClock` (`{"map": [[server, counter], ...]}`).
+    /// Recovering such a log must fail loudly with an actionable error, not
+    /// silently drop the rest of the file (nor panic).
+    #[test]
+    fn test_recover_rejects_pre_hlc_undo_log() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_str().unwrap().to_string();
+
+        // Build txn-id bytes the OLD way.
+        let old_clock = bifrost::vector_clock::StandardVectorClock::from_vec(vec![(1, 2)]);
+        let old_txn_id_bytes = serde_json::to_vec(&old_clock).unwrap();
+
+        // Hand-assemble one undo entry, framed exactly like
+        // UndoLogEntry::to_bytes() frames a new one:
+        // [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id.higher: u64]
+        // [cell_id.lower: u64][op_type: u8][version: u64][chunk_id: u64]
+        // [seq_id: u64][cell_offset: u64]
+        let mut bytes = Vec::new();
+        bytes.push(ENTRY_TYPE_UNDO);
+        bytes.extend_from_slice(&(old_txn_id_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&old_txn_id_bytes);
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // cell_id.higher
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // cell_id.lower
+        bytes.push(UndoOpType::Write as u8);
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // chunk_id
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // seq_id
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // cell_offset
+
+        // Also exercise the entry-level parser directly with the same
+        // hand-assembled bytes.
+        let entry_parse_err = UndoLogEntry::from_bytes(&bytes)
+            .expect_err("parsing a pre-HLC entry must fail, not panic or succeed");
+        assert!(
+            entry_parse_err.to_string().contains("pre-HLC"),
+            "expected a pre-HLC error message from UndoLogEntry::from_bytes, got: {}",
+            entry_parse_err
+        );
+
+        // Write it as a log file a fresh UndoLogger will pick up on recovery.
+        std::fs::write(format!("{}/undo-0.nlog", log_dir), &bytes).unwrap();
+
+        let undo_log = UndoLogger::new(log_dir).unwrap();
+        let recover_err = undo_log
+            .recover()
+            .expect_err("recovering a pre-HLC undo log must fail, not silently succeed");
+        assert!(
+            recover_err.to_string().contains("pre-HLC"),
+            "expected a pre-HLC error message from recover(), got: {}",
+            recover_err
+        );
     }
 
     /// Debug test: Understand why commit markers aren't being processed during recovery
