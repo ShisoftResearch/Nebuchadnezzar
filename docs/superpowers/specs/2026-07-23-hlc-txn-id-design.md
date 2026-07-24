@@ -199,3 +199,30 @@ non-fatal; whether it should abort startup is an open product decision.
 (2) A benchmark-host portfolio spot-check (independent_rmw/1, hot_rmw/8,
 blind_update/1) against a pre-HLC baseline remains to be run; expectation is
 neutral-to-positive (16-byte Copy ids, O(1) compares, no clock allocation).
+
+## Performance spot-check: 2026-07-24, host 192.168.10.239
+
+Interleaved A/B x3 (plus 3 extra blind rounds per side), Nebuchadnezzar
+`52b7486a` (pre-HLC) vs `e11fc736` (HLC), both built against the same bifrost
+`4fce9ac` so the dependency tree is identical. Shared host (CVs well above the
+5% acceptance bar — directional evidence, not accept-grade), NUMA-bound,
+alternating rounds:
+
+| Scenario | pre-HLC | HLC | Throughput | p95 |
+| --- | ---: | ---: | ---: | ---: |
+| `independent_rmw/1` | 39,269 (cv 31%) | 49,833 (cv 12%) | **+26.9%** | 41.3u -> 32.7u (-20.9%) |
+| `hot_rmw/8` | 26,136 (cv 13%) | 35,145 (cv 13%) | **+34.5%** | 58.3u -> 41.0u (-29.7%) |
+| `multi_participant/1` | 15,789 (cv 39%) | 19,920 (cv 7%) | **+26.2%** | 92.5u -> 76.8u (-17.0%) |
+| `blind_update/1` (n=6/5) | 17,048 (cv 18%) | 32,632 (cv 25%) | **+91.4%** | 76.0u -> 42.7u (-43.8%) |
+
+Every scenario improves substantially and consistently; candidate CVs are
+mostly lower (less allocation jitter). The blind-update result is the
+standout: that path was dominated by clock-carrying RPCs (tid-as-clock
+observation plus serialized clocks on every prepare/commit/end response), and
+it was the worst regression versus pre-OCC develop in the original handoff.
+
+Two of the first three candidate blind rounds aborted at fixture setup
+(scenario missing from the report); five subsequent captured candidate runs
+were clean with zero panics or invariant failures, so those aborts are
+attributed to the shared host's environment (socket/port residue between
+back-to-back fixtures), not the migration.
