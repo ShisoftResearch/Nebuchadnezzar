@@ -201,3 +201,9 @@ callgrind.out.*
 /test-data/
 core
 .worktrees/
+
+# Local agent state
+.claude/
+
+# Locally compiled debug executable
+/test
