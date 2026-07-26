@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, remove_file, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -75,6 +75,41 @@ impl UndoOpType {
 const ENTRY_TYPE_UNDO: u8 = 1;
 const ENTRY_TYPE_COMMIT: u8 = 2;
 const ENTRY_TYPE_ABORT: u8 = 3;
+
+fn collect_undo_log_paths<I>(log_dir_path: &Path, entries: I) -> io::Result<Vec<(u64, PathBuf)>>
+where
+    I: IntoIterator<Item = io::Result<PathBuf>>,
+{
+    let mut log_files = Vec::new();
+    for path in entries {
+        let path = path.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot enumerate entry in undo log directory {}: {}",
+                    log_dir_path.display(),
+                    error
+                ),
+            )
+        })?;
+        if let Some(file_name) = path.file_name() {
+            if let Some(name_str) = file_name.to_str() {
+                if name_str.starts_with("undo-") && name_str.ends_with(".nlog") {
+                    if let Some(seq_str) = name_str
+                        .strip_prefix("undo-")
+                        .and_then(|s| s.strip_suffix(".nlog"))
+                    {
+                        if let Ok(seq) = seq_str.parse::<u64>() {
+                            log_files.push((seq, path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    log_files.sort_by_key(|(seq, _)| *seq);
+    Ok(log_files)
+}
 
 /// Decode a serialized transaction id from the bytes stored in the undo log.
 ///
@@ -892,33 +927,22 @@ impl UndoLogger {
     /// Returns a HashMap of incomplete transactions for rollback
     pub fn recover(&self) -> io::Result<HashMap<TxnId, Vec<UndoLogEntry>>> {
         let log_dir_path = Path::new(&self.log_dir);
-        let mut log_files = Vec::new();
 
         // Collect all log files
-        if let Ok(entries) = std::fs::read_dir(log_dir_path) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if let Some(file_name) = path.file_name() {
-                        if let Some(name_str) = file_name.to_str() {
-                            if name_str.starts_with("undo-") && name_str.ends_with(".nlog") {
-                                if let Some(seq_str) = name_str
-                                    .strip_prefix("undo-")
-                                    .and_then(|s| s.strip_suffix(".nlog"))
-                                {
-                                    if let Ok(seq) = seq_str.parse::<u64>() {
-                                        log_files.push((seq, path));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Sort by sequence number
-        log_files.sort_by_key(|(seq, _)| *seq);
+        let entries = std::fs::read_dir(log_dir_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read undo log directory {}: {}",
+                    log_dir_path.display(),
+                    error
+                ),
+            )
+        })?;
+        let log_files = collect_undo_log_paths(
+            log_dir_path,
+            entries.map(|entry| entry.map(|entry| entry.path())),
+        )?;
 
         // Rebuild in-memory index
         let mut txn_index = HashMap::new();
@@ -1128,6 +1152,54 @@ mod tests {
         let entries = txn_index.get(&txn_id).cloned().unwrap_or_default();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].cell_id, cell_id);
+    }
+
+    #[test]
+    fn recovery_propagates_undo_directory_open_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let undo_log = UndoLogger::new(log_dir.to_string_lossy().into_owned()).unwrap();
+        std::fs::rename(&log_dir, temp_dir.path().join("moved-undo")).unwrap();
+
+        let error = undo_log
+            .recover()
+            .expect_err("a missing undo directory must fail recovery");
+        let message = error.to_string();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            message.contains("cannot read undo log directory"),
+            "{message}"
+        );
+        assert!(
+            message.contains(log_dir.to_string_lossy().as_ref()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn undo_path_collection_propagates_iterator_entry_failure() {
+        let log_dir = Path::new("/injected/undo");
+        let error = collect_undo_log_paths(
+            log_dir,
+            [Err::<std::path::PathBuf, _>(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected iterator entry failure",
+            ))],
+        )
+        .expect_err("an iterator entry failure must fail path collection");
+        let message = error.to_string();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            message.contains("cannot enumerate entry in undo log directory"),
+            "{message}"
+        );
+        assert!(message.contains("/injected/undo"), "{message}");
+        assert!(
+            message.contains("injected iterator entry failure"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -822,6 +822,56 @@ mod startup_discovery_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn undo_directory_failure_stops_the_ordered_startup_barrier() {
+        let temp = tempfile::TempDir::new().expect("tempdir should be created");
+        let log_dir = temp.path().join("undo");
+        let undo_log = UndoLogger::new(log_dir.to_string_lossy().into_owned())
+            .expect("undo log should be created");
+        std::fs::rename(&log_dir, temp.path().join("moved-undo"))
+            .expect("undo directory should be moved out of the recovery path");
+        let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
+        let continued = AtomicBool::new(false);
+        let index_worker_activated = AtomicBool::new(false);
+
+        let result: Result<(), super::ServerError> = async {
+            initialize_recovered_storage(
+                &chunks,
+                RecoverySummary::default(),
+                false,
+                || {},
+                || {
+                    undo_log.recover().map_err(|error| {
+                        super::ServerError::CannotRecoverStorage(error.to_string())
+                    })
+                },
+                || index_worker_activated.store(true, Ordering::Release),
+            )
+            .await?;
+            continued.store(true, Ordering::Release);
+            Ok(())
+        }
+        .await;
+
+        let error = result.expect_err("undo directory failure must fail startup");
+        let message = error.to_string();
+        assert!(
+            matches!(error, super::ServerError::CannotRecoverStorage(_)),
+            "{message}"
+        );
+        assert!(message.contains("undo recovery failed"), "{message}");
+        assert!(
+            message.contains(log_dir.to_string_lossy().as_ref()),
+            "{message}"
+        );
+        assert!(chunks
+            .list
+            .iter()
+            .all(|chunk| chunk.history.recovery_floor() == 0));
+        assert!(!continued.load(Ordering::Acquire));
+        assert!(!index_worker_activated.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn recovery_activates_background_work_only_after_a_successful_floor() {
         let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
         let indexer_attached = AtomicBool::new(false);
