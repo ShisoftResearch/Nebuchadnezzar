@@ -2,18 +2,21 @@ use super::cell::cell_header_from_entry_content_addr;
 use super::chunk::Chunk;
 use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
-use super::segs::{Segment, SegmentClass, SEGMENT_SIZE};
+use super::history::{RevisionNode, RevisionState};
+use super::segs::{Segment, SegmentClass, SegmentReferenceGuard, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
+use super::types::{FromHeader, Id};
 use lightning::aarc::Arc as AArc;
-use lightning::map::WordMap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Discover all segment files in storage directories
 pub fn discover_segment_files(
@@ -92,17 +95,186 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
     cursor
 }
 
-/// Tombstone that needs to be checked after all cells are recovered
-#[derive(Debug, Clone)]
-struct StashedTombstone {
-    hash: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredKind {
+    Present,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryCandidate {
+    entry_addr: usize,
+    entry_size: u32,
     revision_ts: u64,
+    kind: RecoveredKind,
+    segment_seq_id: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScannedRecoveryEntry {
+    id: Id,
     chunk_id: usize,
+    candidate: RecoveryCandidate,
+}
+
+struct RecoveryCandidates {
+    shards: Vec<Mutex<HashMap<Id, RecoveryCandidate>>>,
+    max_revision_ts: AtomicU64,
+}
+
+impl RecoveryCandidates {
+    fn new(shard_count: usize, capacity: usize) -> Self {
+        let shard_count = shard_count.max(1).next_power_of_two();
+        let per_shard_capacity = capacity.div_ceil(shard_count);
+        Self {
+            shards: (0..shard_count)
+                .map(|_| Mutex::new(HashMap::with_capacity(per_shard_capacity)))
+                .collect(),
+            max_revision_ts: AtomicU64::new(0),
+        }
+    }
+
+    fn shard_for(id: &Id, shard_count: usize) -> usize {
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        hasher.finish() as usize & (shard_count - 1)
+    }
+
+    fn consider(&self, chunk: &Chunk, id: Id, candidate: RecoveryCandidate) -> io::Result<usize> {
+        if candidate.revision_ts == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("recovered revision for {id:?} has zero timestamp"),
+            ));
+        }
+        self.max_revision_ts
+            .fetch_max(candidate.revision_ts, Ordering::AcqRel);
+
+        let shard_id = Self::shard_for(&id, self.shards.len());
+        let mut shard = self.shards[shard_id].lock();
+
+        let Some(existing) = shard.get_mut(&id) else {
+            shard.insert(id, candidate);
+            return Ok(0);
+        };
+
+        if candidate.revision_ts > existing.revision_ts {
+            *existing = candidate;
+            return Ok(0);
+        }
+        if candidate.revision_ts < existing.revision_ts {
+            return Ok(0);
+        }
+
+        let (identical, promoted_segments) =
+            if existing.kind == candidate.kind && existing.entry_size == candidate.entry_size {
+                recovered_entries_equal(chunk, *existing, candidate)?
+            } else {
+                (false, 0)
+            };
+        if !identical {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "conflicting recovered copies for {id:?} at revision {}",
+                    candidate.revision_ts
+                ),
+            ));
+        }
+
+        if (candidate.segment_seq_id, candidate.entry_addr)
+            > (existing.segment_seq_id, existing.entry_addr)
+        {
+            *existing = candidate;
+        }
+        Ok(promoted_segments)
+    }
+
+    fn get(&self, id: &Id) -> Option<RecoveryCandidate> {
+        let shard_id = Self::shard_for(id, self.shards.len());
+        self.shards[shard_id].lock().get(id).copied()
+    }
+
+    fn selected(&self) -> Vec<(Id, RecoveryCandidate)> {
+        let mut selected = self
+            .shards
+            .iter()
+            .flat_map(|shard| {
+                shard
+                    .lock()
+                    .iter()
+                    .map(|(id, candidate)| (*id, *candidate))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        selected.sort_unstable_by_key(|(id, _)| (id.higher, id.lower));
+        selected
+    }
+}
+
+fn make_recovered_segment_readable(chunk: &Chunk, segment: &Segment) -> bool {
+    if !segment.is_cold() {
+        return false;
+    }
+    crate::ram::tiered::promotion::promote_segment(segment);
+    if let Some(manager) = &chunk.tiered_manager {
+        manager.increment_hot_count();
+    }
+    true
+}
+
+fn recovered_entries_equal(
+    chunk: &Chunk,
+    left: RecoveryCandidate,
+    right: RecoveryCandidate,
+) -> io::Result<(bool, usize)> {
+    let left_segment = chunk.locate_segment(left.entry_addr).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot materialize recovered entry at 0x{:x}",
+                left.entry_addr
+            ),
+        )
+    })?;
+    let right_segment = chunk.locate_segment(right.entry_addr).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot materialize recovered entry at 0x{:x}",
+                right.entry_addr
+            ),
+        )
+    })?;
+    let mut promoted_segments = usize::from(make_recovered_segment_readable(chunk, &left_segment));
+    if right_segment.id != left_segment.id {
+        promoted_segments += usize::from(make_recovered_segment_readable(chunk, &right_segment));
+    }
+
+    let _left_lease = SegmentReferenceGuard::try_new(left_segment).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "recovered entry segment is exclusively referenced",
+        )
+    })?;
+    let _right_lease = SegmentReferenceGuard::try_new(right_segment).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "recovered duplicate segment is exclusively referenced",
+        )
+    })?;
+    let left_bytes = unsafe {
+        std::slice::from_raw_parts(left.entry_addr as *const u8, left.entry_size as usize)
+    };
+    let right_bytes = unsafe {
+        std::slice::from_raw_parts(right.entry_addr as *const u8, right.entry_size as usize)
+    };
+    Ok((left_bytes == right_bytes, promoted_segments))
 }
 
 #[derive(Debug)]
 struct RecoveryScanResult {
-    stashed_tombstones: Vec<StashedTombstone>,
+    entries: Vec<ScannedRecoveryEntry>,
     segment_class: SegmentClass,
     append_offset: usize,
     dead_space: u32,
@@ -124,6 +296,11 @@ const MIN_RECOVERY_WORD_MAP_CAPACITY: usize = 4_096;
 const MAX_RECOVERY_WORD_MAP_CAPACITY: usize = 1 << 22;
 const RECOVERY_ENTRY_BYTES_ESTIMATE: u64 = 16 * 1024;
 const RECOVERY_SEGMENT_CAPACITY_FACTOR: usize = 2_048;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoverySummary {
+    pub max_revision_ts: u64,
+}
 
 fn recovery_parallelism(config: &RecoveryConfig) -> usize {
     config
@@ -491,33 +668,19 @@ fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
     );
 }
 
-fn current_segment_entry_content_length(
-    data_base: usize,
-    segment_base: usize,
-    data_len: usize,
-    addr: usize,
-) -> Option<u32> {
-    let offset = addr.checked_sub(segment_base)?;
-    if offset >= data_len {
-        return None;
-    }
-
-    let entry_addr = data_base + offset;
-    let (entry, _) = Entry::decode_from(entry_addr, |_, _| {});
-    Some(entry.content_length)
-}
-
-/// Scan recovered segment data from a slice and update the recovery index state.
+/// Scan recovered segment data from a slice and update candidate state.
 ///
 /// The scan runs against the deterministic virtual address range for the segment
 /// before a Segment object is installed. That lets recovery discover the final
-/// segment class and statistics in the same pass that rebuilds the cell index.
+/// segment class and statistics without publishing a current mirror or history
+/// node before duplicate validation completes.
 fn scan_segment_from_data(
     chunk: &Chunk,
     seg_id: u64,
+    segment_seq_id: u64,
     segment_base: usize,
     data: &[u8],
-    revision_map: &WordMap,
+    num_chunks: usize,
 ) -> io::Result<RecoveryScanResult> {
     use byteorder::{LittleEndian, ReadBytesExt};
     use std::io::Cursor;
@@ -526,9 +689,8 @@ fn scan_segment_from_data(
     let bound = data_base + data.len();
 
     let mut cursor = data_base;
-    let mut stashed_tombstones = Vec::new();
+    let mut entries = Vec::new();
     let mut tombstone_count = 0u32;
-    let mut dead_space = 0u64;
     let mut entries_processed = 0u32;
     let mut append_header = data_base;
     let mut detected_class = None;
@@ -644,123 +806,82 @@ fn scan_segment_from_data(
 
         let offset = cursor - data_base;
         let virtual_cursor = segment_base + offset;
+        let entry_size = entry_size as u32;
 
-        if entry_header.entry_type == EntryType::CELL {
-            let content_addr = Entry::content_pos(cursor);
-            let cell_header = cell_header_from_entry_content_addr(content_addr);
-            observe_recovered_segment_class(
-                chunk,
-                seg_id,
-                cell_header.schema,
-                &mut detected_class,
-                &mut mixed_class_warning_emitted,
-                &mut missing_schema_entries,
-                &mut first_missing_schema_id,
-            )?;
-            let hash = cell_header.hash;
-            let new_revision_ts = cell_header.revision_ts;
-
-            // Use revision_map to check the existing revision (concurrent-safe).
-            let mut revision_guard =
-                revision_map.lock_or_insert(hash as usize, new_revision_ts as usize);
-            let existing_revision_ts = *revision_guard as u64;
-
-            if new_revision_ts >= existing_revision_ts {
-                // Our revision is newer or equal, update cell_index and revision_map.
-                *revision_guard = new_revision_ts as usize;
-                drop(revision_guard);
-
-                let mut cell_guard = chunk
-                    .cell_index
-                    .lock_or_insert(hash as usize, virtual_cursor);
-                if *cell_guard != virtual_cursor {
-                    let existing_addr = *cell_guard;
-                    if existing_addr == 0 {
-                        *cell_guard = virtual_cursor;
-                    } else {
-                        if let Some(old_size) = current_segment_entry_content_length(
-                            data_base,
-                            segment_base,
-                            data.len(),
-                            existing_addr,
-                        ) {
-                            dead_space += old_size as u64;
-                        } else if let Some(old_seg) = chunk.locate_segment(existing_addr) {
-                            // Update dead space for old entry if the previous segment is hot.
-                            if !old_seg.is_cold() {
-                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                                old_seg
-                                    .dead_space
-                                    .fetch_add(entry.content_length, Ordering::Relaxed);
-                                old_seg.note_dead_bytes_change();
-                            }
-                        }
-                        *cell_guard = virtual_cursor;
-                    }
-                }
-            } else {
-                // Existing revision is newer, this entry is dead.
-                dead_space += entry_header.content_length as u64;
+        let recovered = match entry_header.entry_type {
+            EntryType::CELL => {
+                let content_addr = Entry::content_pos(cursor);
+                let cell_header = cell_header_from_entry_content_addr(content_addr);
+                observe_recovered_segment_class(
+                    chunk,
+                    seg_id,
+                    cell_header.schema,
+                    &mut detected_class,
+                    &mut mixed_class_warning_emitted,
+                    &mut missing_schema_entries,
+                    &mut first_missing_schema_id,
+                )?;
+                Some((
+                    Id::from_header(&cell_header),
+                    RecoveryCandidate {
+                        entry_addr: virtual_cursor,
+                        entry_size,
+                        revision_ts: cell_header.revision_ts,
+                        kind: RecoveredKind::Present,
+                        segment_seq_id,
+                    },
+                ))
             }
-        } else if entry_header.entry_type == EntryType::TOMBSTONE {
-            let content_addr = Entry::content_pos(cursor);
-            let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
-            let hash = tombstone.hash;
-            tombstone_count += 1;
-
-            // Use lock_or_insert to handle case where no revision exists yet
-            let mut revision_guard =
-                revision_map.lock_or_insert(hash as usize, tombstone.revision_ts as usize);
-            let existing_revision_ts = *revision_guard as u64;
-
-            if tombstone.revision_ts >= existing_revision_ts {
-                // Update revision_map BEFORE releasing lock (prevents race)
-                *revision_guard = tombstone.revision_ts as usize;
-                drop(revision_guard);
-
-                // Tombstone is newer, delete cell from index
-                if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
-                    let existing_addr = *cell_guard;
-                    if existing_addr != 0 {
-                        *cell_guard = 0;
-                        if let Some(old_size) = current_segment_entry_content_length(
-                            data_base,
-                            segment_base,
-                            data.len(),
-                            existing_addr,
-                        ) {
-                            dead_space += old_size as u64;
-                        } else if let Some(target_seg) = chunk.locate_segment(existing_addr) {
-                            if !target_seg.is_cold() {
-                                let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                                target_seg
-                                    .dead_space
-                                    .fetch_add(entry.content_length, Ordering::Relaxed);
-                                target_seg.note_dead_bytes_change();
-                            }
-                        }
-                    }
-                }
-            } else {
-                drop(revision_guard);
-                stashed_tombstones.push(StashedTombstone {
-                    hash,
-                    revision_ts: tombstone.revision_ts,
-                    chunk_id: chunk.id,
-                });
+            EntryType::TOMBSTONE => {
+                let content_addr = Entry::content_pos(cursor);
+                let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
+                tombstone_count += 1;
+                Some((
+                    Id::new(tombstone.partition, tombstone.hash),
+                    RecoveryCandidate {
+                        entry_addr: virtual_cursor,
+                        entry_size,
+                        revision_ts: tombstone.revision_ts,
+                        kind: RecoveredKind::Deleted,
+                        segment_seq_id,
+                    },
+                ))
             }
-        } else {
+            EntryType::UNDECIDED => None,
+        };
+
+        if let Some((id, candidate)) = recovered {
+            if candidate.revision_ts == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("recovered revision for {id:?} has zero timestamp"),
+                ));
+            }
+            if id.higher as usize % num_chunks != chunk.id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "recovered entry for {id:?} is stored in chunk {}, not routed chunk {}",
+                        chunk.id,
+                        id.higher as usize % num_chunks
+                    ),
+                ));
+            }
+            entries.push(ScannedRecoveryEntry {
+                id,
+                chunk_id: chunk.id,
+                candidate,
+            });
         }
 
-        append_header = prev_cursor + entry_size;
-        let new_cursor = prev_cursor + entry_size;
+        append_header = prev_cursor + entry_size as usize;
+        let new_cursor = prev_cursor + entry_size as usize;
         if new_cursor <= prev_cursor {
             break;
         }
         cursor = new_cursor;
     }
     let final_append_offset = append_header - data_base;
-    let dead_space_u32 = dead_space.min(u32::MAX as u64) as u32;
 
     if missing_schema_entries > 0 {
         let first_missing_schema_id = first_missing_schema_id.unwrap_or_default();
@@ -781,79 +902,112 @@ fn scan_segment_from_data(
     }
 
     debug!(
-        "Recovered segment {} scanned from data: {} entries, {} dead bytes, {} stashed tombstones",
-        seg_id,
-        entries_processed,
-        dead_space_u32,
-        stashed_tombstones.len()
+        "Recovered segment {} scanned from data: {} entries",
+        seg_id, entries_processed
     );
 
     Ok(RecoveryScanResult {
-        stashed_tombstones,
+        entries,
         segment_class: detected_class.unwrap_or(SegmentClass::Regular),
         append_offset: final_append_offset,
-        dead_space: dead_space_u32,
+        dead_space: 0,
         tombstones: tombstone_count,
     })
 }
 
-/// Merge stashed tombstones from all threads, keeping latest revision per hash
-fn merge_stashed_tombstones(all_stashed: Vec<Vec<StashedTombstone>>) -> Vec<StashedTombstone> {
-    let mut merged: HashMap<u64, StashedTombstone> = HashMap::new();
+fn rebuild_recovered_current(
+    chunks: &[Chunk],
+    candidates: &RecoveryCandidates,
+    physical_entries: Vec<ScannedRecoveryEntry>,
+) -> io::Result<()> {
+    let selected = candidates.selected();
+    let mut lower_keys = HashMap::new();
 
-    for stashed_list in all_stashed {
-        for tombstone in stashed_list {
-            merged
-                .entry(tombstone.hash)
-                .and_modify(|existing| {
-                    if tombstone.revision_ts > existing.revision_ts {
-                        *existing = tombstone.clone();
-                    }
-                })
-                .or_insert(tombstone);
+    for (id, candidate) in &selected {
+        let expected_chunk_id = id.higher as usize % chunks.len();
+        if chunks[expected_chunk_id]
+            .locate_segment(candidate.entry_addr)
+            .is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "recovered entry for {id:?} is stored outside routed chunk {expected_chunk_id}"
+                ),
+            ));
         }
-    }
-
-    let result: Vec<_> = merged.into_values().collect();
-    info!("Merged {} unique stashed tombstones", result.len());
-    result
-}
-
-/// Apply stashed tombstones to cell indices
-fn apply_stashed_tombstones(stashed: &[StashedTombstone], chunks: &[Chunk]) {
-    info!("Applying {} stashed tombstones...", stashed.len());
-
-    let mut applied_count = 0;
-
-    for tombstone in stashed {
-        let chunk = &chunks[tombstone.chunk_id];
-
-        if let Some(mut guard) = chunk.cell_index.lock(tombstone.hash as usize) {
-            let existing_addr = *guard;
-            if existing_addr == 0 {
-                continue;
-            }
-            let cell_header =
-                cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
-
-            if tombstone.revision_ts >= cell_header.revision_ts {
-                *guard = 0; // Delete cell
-                if let Some(seg) = chunk.locate_segment(existing_addr) {
-                    let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
-                    seg.dead_space
-                        .fetch_add(entry.content_length, Ordering::Relaxed);
-                    seg.note_dead_bytes_change();
-                }
-                applied_count += 1;
-                debug!(
-                "Applied stashed tombstone: deleted cell hash={} revision={} with tombstone revision={}",
-                tombstone.hash, cell_header.revision_ts, tombstone.revision_ts
-            );
+        if let Some(existing_id) = lower_keys.insert((expected_chunk_id, id.lower), *id) {
+            if existing_id != *id {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "recovered ids {existing_id:?} and {id:?} collide in chunk {expected_chunk_id}"
+                    ),
+                ));
             }
         }
     }
 
-    info!("Applied {} stashed tombstones", applied_count);
+    for physical in physical_entries {
+        let selected_candidate = candidates
+            .get(&physical.id)
+            .expect("every validated physical recovery entry has a candidate");
+        if physical.candidate.entry_addr == selected_candidate.entry_addr {
+            continue;
+        }
+        let chunk = &chunks[physical.chunk_id];
+        let segment = chunk
+            .locate_segment(physical.candidate.entry_addr)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "cannot locate non-selected recovered entry at 0x{:x}",
+                        physical.candidate.entry_addr
+                    ),
+                )
+            })?;
+        chunk.mark_dead_entry_with_size(
+            physical.candidate.entry_addr,
+            physical.candidate.entry_size,
+            &segment,
+        );
+    }
+
+    for (id, candidate) in selected {
+        let chunk = &chunks[id.higher as usize % chunks.len()];
+        let state = match candidate.kind {
+            RecoveredKind::Present => RevisionState::CommittedPresent,
+            RecoveredKind::Deleted => RevisionState::CommittedDeleted,
+        };
+        let node = Arc::new(RevisionNode::new(
+            candidate.revision_ts,
+            state,
+            candidate.entry_addr,
+            candidate.entry_size,
+        ));
+        chunk.history.install(id, node, None).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate recovered history head for {id:?}"),
+            )
+        })?;
+
+        if candidate.kind == RecoveredKind::Present {
+            let mut current = chunk
+                .cell_index
+                .lock_or_insert(id.lower as usize, candidate.entry_addr);
+            if *current != candidate.entry_addr && *current != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("conflicting recovered current mirror for {id:?}"),
+                ));
+            }
+            *current = candidate.entry_addr;
+        }
+    }
+
+    Ok(())
 }
 
 /// Count total cells recovered across all chunks
@@ -868,7 +1022,7 @@ pub fn recover_chunks(
     wal_storage: &Option<String>,
     raft_storage: &Option<String>,
     chunks: &[Chunk],
-) -> io::Result<()> {
+) -> io::Result<RecoverySummary> {
     info!("=== Starting streamlined recovery from storage directories ===");
 
     // Phase 1: Discover files
@@ -876,7 +1030,7 @@ pub fn recover_chunks(
         Ok(files) => files,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             info!("No segment files found, starting fresh");
-            return Ok(());
+            return Ok(RecoverySummary::default());
         }
         Err(e) => return Err(e),
     };
@@ -920,7 +1074,9 @@ pub fn recover_chunks(
 
     info!("Processing {} segment files...", files.len());
 
-    let all_stashed_tombstones: Mutex<Vec<StashedTombstone>> = Mutex::new(Vec::new());
+    let candidate_capacity = estimate_recovery_word_map_capacity(&files);
+    let candidates = RecoveryCandidates::new(recovery_parallelism(config), candidate_capacity);
+    let physical_entries: Mutex<Vec<ScannedRecoveryEntry>> = Mutex::new(Vec::new());
     let hot_count = std::sync::atomic::AtomicUsize::new(0);
     let cold_count = std::sync::atomic::AtomicUsize::new(0);
     let segments_processed = std::sync::atomic::AtomicUsize::new(0);
@@ -932,12 +1088,6 @@ pub fn recover_chunks(
         total_files,
         recovery_parallelism(config)
     );
-
-    // Create per-chunk revision maps sized from the actual recovery footprint.
-    let revision_maps: Vec<WordMap> = files_by_chunk
-        .iter()
-        .map(|chunk_files| WordMap::with_capacity(estimate_recovery_word_map_capacity(chunk_files)))
-        .collect();
 
     // Track max seq_id per chunk to update allocators after recovery
     // This ensures new segments continue from where recovered segments left off
@@ -969,8 +1119,7 @@ pub fn recover_chunks(
         files_by_chunk.into_par_iter().enumerate().try_for_each(
             |(chunk_id, chunk_files)| -> io::Result<()> {
                 let chunk = &chunks[chunk_id];
-                let revision_map = &revision_maps[chunk_id];
-                let mut local_stashed = Vec::new();
+                let mut local_entries = Vec::new();
 
                 for file_info in chunk_files {
                     if newer_resident_segment(chunk, file_info.seg_id, file_info.seq_id).is_some() {
@@ -990,9 +1139,10 @@ pub fn recover_chunks(
                     let scan_result = scan_segment_from_data(
                         chunk,
                         file_info.seg_id,
+                        file_info.seq_id,
                         segment_base,
                         &file_data,
-                        revision_map,
+                        chunks.len(),
                     )?;
                     let segment_class = scan_result.segment_class;
 
@@ -1046,9 +1196,26 @@ pub fn recover_chunks(
                     }
 
                     apply_recovery_scan_result(&segment, &scan_result);
+                    for recovered_entry in &scan_result.entries {
+                        let promoted_segments = candidates.consider(
+                            chunk,
+                            recovered_entry.id,
+                            recovered_entry.candidate,
+                        )?;
+                        if promoted_segments > 0 {
+                            planned_global_hot_segments
+                                .fetch_add(promoted_segments, Ordering::Relaxed);
+                            hot_count.fetch_add(promoted_segments, Ordering::Relaxed);
+                            cold_count
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                    Some(current.saturating_sub(promoted_segments))
+                                })
+                                .ok();
+                        }
+                    }
 
                     segment.clear_dirty();
-                    local_stashed.extend(scan_result.stashed_tombstones);
+                    local_entries.extend(scan_result.entries);
                     max_seq_ids[chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
 
                     let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1057,17 +1224,15 @@ pub fn recover_chunks(
                     }
                 }
 
-                if !local_stashed.is_empty() {
-                    all_stashed_tombstones.lock().extend(local_stashed);
+                if !local_entries.is_empty() {
+                    physical_entries.lock().extend(local_entries);
                 }
                 Ok(())
             },
         )
     })?;
 
-    // Version maps are dropped here, freeing all temporary revision tracking memory
-    drop(revision_maps);
-    info!("Version maps freed, recovery memory usage reduced");
+    rebuild_recovered_current(chunks, &candidates, physical_entries.into_inner())?;
 
     // Update allocator next_seq_id for each chunk to continue from max recovered seq_id
     for (chunk_id, max_seq) in max_seq_ids.iter().enumerate() {
@@ -1089,11 +1254,6 @@ pub fn recover_chunks(
         final_hot, final_cold
     );
 
-    // Merge and apply stashed tombstones
-    let stashed = all_stashed_tombstones.into_inner();
-    let merged_tombstones = merge_stashed_tombstones(vec![stashed]);
-    apply_stashed_tombstones(&merged_tombstones, chunks);
-
     // Count recovered cells
     let total_cells = count_recovered_cells(chunks);
 
@@ -1102,7 +1262,9 @@ pub fn recover_chunks(
         total_cells, final_processed, final_hot, final_cold
     );
 
-    Ok(())
+    Ok(RecoverySummary {
+        max_revision_ts: candidates.max_revision_ts.load(Ordering::Acquire),
+    })
 }
 
 /// Create a recovery marker file to indicate recovery is in progress
@@ -1141,7 +1303,6 @@ mod tests {
     use crate::ram::types::Id;
     use crate::server::ServerMeta;
     use dovahkiin::types::Type;
-    use lightning::map::WordMap;
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Arc;
@@ -1258,8 +1419,459 @@ mod tests {
         chunk: &Chunk,
         data: &[u8],
     ) -> io::Result<RecoveryScanResult> {
-        let revision_map = WordMap::with_capacity(128);
-        scan_segment_from_data(chunk, 1, chunk.allocator.addr_by_id(1), data, &revision_map)
+        scan_segment_from_data(chunk, 1, 1, chunk.allocator.addr_by_id(1), data, 1)
+    }
+
+    fn encoded_recovery_cell(id: Id, revision_ts: u64, marker: i32) -> Vec<u8> {
+        let schema = Schema::new(
+            "encoded_recovery_cell",
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data: data_map_value!(id: marker, data: vec![marker as u8; DATA_SIZE]),
+        };
+        chunks
+            .write_cell_at_revision(&mut cell, RevisionWrite::committed(revision_ts))
+            .unwrap();
+        entry_bytes_at(chunks.address_of(&id))
+    }
+
+    fn encoded_recovery_tombstone(
+        id: Id,
+        revision_ts: u64,
+        deleted_segment_seq_id: u64,
+    ) -> Vec<u8> {
+        let mut encoded = vec![0_u8; crate::ram::tombstone::TOMBSTONE_ENTRY_SIZE];
+        Tombstone::put(
+            encoded.as_mut_ptr() as usize,
+            deleted_segment_seq_id,
+            revision_ts,
+            id.higher,
+            id.lower,
+        );
+        encoded
+    }
+
+    struct RecoveredFixture {
+        chunks: Arc<Chunks>,
+        summary: RecoverySummary,
+        _wal_dir: TempDir,
+        _backup_dir: TempDir,
+        _raft_dir: TempDir,
+    }
+
+    fn recover_encoded_entries(entries: &[Vec<u8>]) -> io::Result<RecoveredFixture> {
+        let mut segment = empty_segment_bytes();
+        let mut offset = 0;
+        for entry in entries {
+            segment[offset..offset + entry.len()].copy_from_slice(entry);
+            offset += entry.len();
+        }
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (raft_dir, raft_path) = temp_raft_dir();
+        write_backup_segment(&backup_dir, 0, 0, 1, &segment);
+        let schema = Schema::new(
+            "encoded_recovery_cell",
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema);
+        let (chunks, summary) = Chunks::try_new_with_recovery_and_clock(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+            Arc::new(bifrost::hlc::HlcSource::new(0)),
+            300_000,
+        )?;
+        Ok(RecoveredFixture {
+            chunks,
+            summary,
+            _wal_dir: wal_dir,
+            _backup_dir: backup_dir,
+            _raft_dir: raft_dir,
+        })
+    }
+
+    #[test]
+    fn recovery_rejects_conflicting_equal_timestamps() {
+        let id = Id::new(19, 7);
+        let left = encoded_recovery_cell(id, 200, 1);
+        let right = encoded_recovery_cell(id, 200, 2);
+        let mut segment = empty_segment_bytes();
+        segment[..left.len()].copy_from_slice(&left);
+        segment[left.len()..left.len() + right.len()].copy_from_slice(&right);
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        write_backup_segment(&backup_dir, 0, 0, 1, &segment);
+
+        let result = Chunks::try_new_with_recovery_and_clock(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: LocalSchemasCache::new_local(""),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+            Arc::new(bifrost::hlc::HlcSource::new(0)),
+            300_000,
+        );
+        let err = match result {
+            Ok(_) => panic!("equal timestamps with different logical bytes must be corruption"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn recovery_accepts_identical_cleaner_copies() {
+        let id = Id::new(29, 3);
+        let encoded = encoded_recovery_cell(id, 200, 7);
+        let mut segment = empty_segment_bytes();
+        segment[..encoded.len()].copy_from_slice(&encoded);
+        segment[encoded.len()..encoded.len() * 2].copy_from_slice(&encoded);
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        write_backup_segment(&backup_dir, 0, 0, 1, &segment);
+        let schema = Schema::new(
+            "encoded_recovery_cell",
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema);
+
+        let (chunks, summary) = Chunks::try_new_with_recovery_and_clock(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+            Arc::new(bifrost::hlc::HlcSource::new(0)),
+            300_000,
+        )
+        .unwrap();
+
+        let selected_addr = chunks.address_of(&id);
+        let segment = chunks.list[0].locate_segment(selected_addr).unwrap();
+        assert_eq!(summary.max_revision_ts, 200);
+        assert_eq!(chunks.head_cell(&id).unwrap().revision_ts, 200);
+        assert_eq!(
+            chunks.history_location(&id, 200),
+            Some(segment.addr + encoded.len())
+        );
+        assert_eq!(
+            segment.dead_space.load(Ordering::Acquire),
+            encoded.len() as u32
+        );
+    }
+
+    #[test]
+    fn recovery_selects_largest_revision_across_cell_and_tombstone() {
+        let id = Id::new(31, 5);
+        for entries in [
+            vec![
+                encoded_recovery_cell(id, 100, 1),
+                encoded_recovery_tombstone(id, 200, 1),
+                encoded_recovery_cell(id, 300, 3),
+            ],
+            vec![
+                encoded_recovery_cell(id, 300, 3),
+                encoded_recovery_tombstone(id, 200, 1),
+                encoded_recovery_cell(id, 100, 1),
+            ],
+        ] {
+            let expected_dead = entries.iter().map(Vec::len).sum::<usize>()
+                - entries
+                    .iter()
+                    .find(|entry| {
+                        let header = cell_header_from_entry_content_addr(Entry::content_pos(
+                            entry.as_ptr() as usize,
+                        ));
+                        header.revision_ts == 300
+                    })
+                    .unwrap()
+                    .len();
+            let recovered = recover_encoded_entries(&entries).unwrap();
+            let current = recovered.chunks.read_cell(&id).unwrap().to_owned();
+            let segment = recovered.chunks.list[0]
+                .locate_segment(recovered.chunks.address_of(&id))
+                .unwrap();
+            assert_eq!(recovered.summary.max_revision_ts, 300);
+            assert_eq!(current.header.revision_ts, 300);
+            assert_eq!(*current.data["id"].i32().unwrap(), 3);
+            assert_eq!(
+                segment.dead_space.load(Ordering::Acquire),
+                expected_dead as u32
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_orders_present_and_deleted_revisions_in_both_scan_directions() {
+        let id = Id::new(37, 11);
+        for entries in [
+            vec![
+                encoded_recovery_cell(id, 100, 1),
+                encoded_recovery_tombstone(id, 200, 1),
+            ],
+            vec![
+                encoded_recovery_tombstone(id, 200, 1),
+                encoded_recovery_cell(id, 100, 1),
+            ],
+        ] {
+            let recovered = recover_encoded_entries(&entries).unwrap();
+            assert!(recovered.chunks.read_cell(&id).is_err());
+            assert_eq!(
+                recovered.chunks.list[0]
+                    .history
+                    .current(&id)
+                    .unwrap()
+                    .load()
+                    .0,
+                RevisionState::CommittedDeleted
+            );
+        }
+
+        for entries in [
+            vec![
+                encoded_recovery_tombstone(id, 100, 1),
+                encoded_recovery_cell(id, 200, 2),
+            ],
+            vec![
+                encoded_recovery_cell(id, 200, 2),
+                encoded_recovery_tombstone(id, 100, 1),
+            ],
+        ] {
+            let recovered = recover_encoded_entries(&entries).unwrap();
+            assert_eq!(recovered.chunks.head_cell(&id).unwrap().revision_ts, 200);
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_equal_timestamp_present_deleted_conflict() {
+        let id = Id::new(41, 13);
+        let err = match recover_encoded_entries(&[
+            encoded_recovery_cell(id, 200, 2),
+            encoded_recovery_tombstone(id, 200, 1),
+        ]) {
+            Ok(_) => panic!("equal present/deleted revisions must be corruption"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn recovery_rejects_equal_timestamp_tombstone_content_conflict() {
+        let id = Id::new(43, 17);
+        let err = match recover_encoded_entries(&[
+            encoded_recovery_tombstone(id, 200, 1),
+            encoded_recovery_tombstone(id, 200, 2),
+        ]) {
+            Ok(_) => panic!("same-kind equal revisions with different bytes must be corruption"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn recovery_rejects_zero_revision_timestamps_for_cells_and_tombstones() {
+        let id = Id::new(47, 19);
+        let mut zero_cell = encoded_recovery_cell(id, 1, 1);
+        zero_cell[ENTRY_HEAD_SIZE..ENTRY_HEAD_SIZE + std::mem::size_of::<u64>()].fill(0);
+        for entry in [zero_cell, encoded_recovery_tombstone(id, 0, 1)] {
+            let err = match recover_encoded_entries(&[entry]) {
+                Ok(_) => panic!("persisted zero revision timestamps must be corruption"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn recovered_present_and_deleted_snapshots_respect_the_common_floor() {
+        let present_id = Id::new(53, 23);
+        let deleted_id = Id::new(53, 29);
+        let recovered = recover_encoded_entries(&[
+            encoded_recovery_cell(present_id, 200, 2),
+            encoded_recovery_tombstone(deleted_id, 300, 1),
+        ])
+        .unwrap();
+        recovered
+            .chunks
+            .revision_clock()
+            .try_observe(bifrost::hlc::Hlc {
+                ts: recovered.summary.max_revision_ts,
+                node: recovered.chunks.revision_clock().node(),
+            })
+            .unwrap();
+        let floor = recovered.chunks.establish_recovery_floor().unwrap();
+
+        assert_eq!(
+            recovered
+                .chunks
+                .read_cell_snapshot(&present_id, floor - 1)
+                .unwrap_err(),
+            ReadError::SnapshotTooOld
+        );
+        assert!(matches!(
+            recovered
+                .chunks
+                .read_cell_snapshot(&present_id, floor + 1)
+                .unwrap(),
+            SnapshotRead::Present(_)
+        ));
+        assert!(matches!(
+            recovered
+                .chunks
+                .read_cell_snapshot(&deleted_id, floor + 1)
+                .unwrap(),
+            SnapshotRead::Absent(Some(300))
+        ));
+    }
+
+    #[test]
+    fn recovery_uses_full_ids_and_one_floor_across_chunks() {
+        let first_id = Id::new(0, 77);
+        let second_id = Id::new(1, 77);
+        let first = encoded_recovery_cell(first_id, 200, 1);
+        let second = encoded_recovery_cell(second_id, 300, 2);
+        let mut first_segment = empty_segment_bytes();
+        first_segment[..first.len()].copy_from_slice(&first);
+        let mut second_segment = empty_segment_bytes();
+        second_segment[..second.len()].copy_from_slice(&second);
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        write_backup_segment(&backup_dir, 0, 0, 1, &first_segment);
+        write_backup_segment(&backup_dir, 1, 0, 2, &second_segment);
+        let schema = Schema::new(
+            "encoded_recovery_cell",
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema);
+
+        let (chunks, summary) = Chunks::try_new_with_recovery_and_clock(
+            2,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+            Arc::new(bifrost::hlc::HlcSource::new(0)),
+            300_000,
+        )
+        .unwrap();
+        chunks
+            .revision_clock()
+            .try_observe(bifrost::hlc::Hlc {
+                ts: summary.max_revision_ts,
+                node: chunks.revision_clock().node(),
+            })
+            .unwrap();
+        let floor = chunks.establish_recovery_floor().unwrap();
+
+        assert_eq!(
+            *chunks.read_cell(&first_id).unwrap().data["id"]
+                .i32()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            *chunks.read_cell(&second_id).unwrap().data["id"]
+                .i32()
+                .unwrap(),
+            2
+        );
+        assert_eq!(summary.max_revision_ts, 300);
+        assert!(chunks
+            .list
+            .iter()
+            .all(|chunk| chunk.history.recovery_floor() == floor));
+    }
+
+    #[test]
+    fn recovery_starts_with_no_historical_coverage() {
+        let schema = Schema::new("recovery_floor", None, default_fields(), false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let id = Id::new(23, 9);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data: data_map_value!(id: 9_i32, data: vec![9_u8; DATA_SIZE]),
+        };
+        chunks
+            .write_cell_at_revision(&mut cell, RevisionWrite::committed(200))
+            .unwrap();
+
+        let floor = chunks.establish_recovery_floor().unwrap();
+
+        assert!(floor > 200);
+        assert_eq!(
+            chunks.read_cell_snapshot(&id, 150).unwrap_err(),
+            ReadError::SnapshotTooOld
+        );
+        assert!(matches!(
+            chunks.read_cell_snapshot(&id, floor + 1).unwrap(),
+            SnapshotRead::Present(_)
+        ));
+        assert!(matches!(
+            chunks.read_cell_snapshot(&id, floor).unwrap(),
+            SnapshotRead::Present(_)
+        ));
     }
 
     // Purpose: Validate parsing of segment filenames `{chunk}-{seg}-{seq}.{nlog|nbackup}`

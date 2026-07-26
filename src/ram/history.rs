@@ -522,15 +522,14 @@ impl HistoryIndex {
     }
 
     pub fn resolve(&self, id: &Id, snapshot_ts: u64) -> SnapshotRevision {
+        let recovery_floor = self.recovery_floor.load(Ordering::Acquire);
+        if recovery_floor != 0 && snapshot_ts < recovery_floor {
+            return SnapshotRevision::TooOld;
+        }
         if let Some(chain) = self.chain(id) {
             return chain.resolve(snapshot_ts);
         }
-        let recovery_floor = self.recovery_floor.load(Ordering::Acquire);
-        if recovery_floor != 0 && snapshot_ts <= recovery_floor {
-            SnapshotRevision::TooOld
-        } else {
-            SnapshotRevision::NeverExisted
-        }
+        SnapshotRevision::NeverExisted
     }
 
     pub(crate) fn current(&self, id: &Id) -> Option<Arc<RevisionNode>> {
@@ -607,7 +606,7 @@ impl HistoryIndex {
     }
 
     pub fn set_recovery_floor(&self, revision_ts: u64) {
-        self.recovery_floor.fetch_max(revision_ts, Ordering::AcqRel);
+        self.recovery_floor.store(revision_ts, Ordering::Release);
     }
 
     pub fn recovery_floor(&self) -> u64 {

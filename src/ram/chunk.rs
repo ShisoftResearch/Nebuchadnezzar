@@ -1006,26 +1006,60 @@ impl Chunk {
 
     fn remove_cell_with_guard_at_revision(
         &self,
+        guard: CellGuard<'_>,
+        id: &Id,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        self.remove_cell_with_guard_at_revision_for_indexing(
+            guard,
+            id,
+            write,
+            self.index_builder.is_some(),
+        )
+    }
+
+    fn remove_cell_with_guard_at_revision_for_indexing(
+        &self,
         mut guard: CellGuard<'_>,
         id: &Id,
         write: RevisionWrite,
+        indexing_required: bool,
     ) -> Result<InstalledRevision, WriteError> {
         if guard.is_unassigned() || guard.hash != id.lower {
             return Err(WriteError::CellDoesNotExisted);
         }
-        let hash = id.lower;
         let old_location = guard.get_ptr();
         let old_header = guard.head_cell().map_err(WriteError::ReadError)?;
         if Id::from_header(&old_header) != *id {
             return Err(WriteError::CellDoesNotExisted);
         }
+        let indexed_old_cell = if indexing_required {
+            let schema = self
+                .meta
+                .schemas
+                .get(&old_header.schema)
+                .ok_or(WriteError::SchemaDoesNotExisted(old_header.schema))?;
+            let (_, data_ptr) =
+                header_from_chunk_raw(old_location).map_err(WriteError::ReadError)?;
+            let compression_plan = if schema.compression_plan.is_empty() {
+                None
+            } else {
+                Some(schema.compression_plan.clone())
+            };
+            let old_cell = SharedCellData::from_data_with_plan(
+                old_header,
+                crate::ram::io::reader::read_by_schema(data_ptr, &schema),
+                compression_plan,
+            );
+            Some((old_cell, schema))
+        } else {
+            None
+        };
         let predecessor = self.ensure_present_predecessor(*id, &old_header, old_location)?;
         if write.revision_ts <= predecessor.revision_ts {
             return Err(WriteError::CellRevisionMismatch);
         }
 
-        let (old_cell, schema) = SharedCellData::from_chunk_raw(hash, old_location, self)
-            .map_err(WriteError::ReadError)?;
         let old_segment = self.locate_segment_ensured(old_location, id);
         let pending_entry = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true)?;
         let tombstone_segment = pending_entry.seg.clone();
@@ -1056,18 +1090,21 @@ impl Chunk {
         // History publication is the last fallible step. From here through the
         // current-index transition and secondary-index scheduling, deletion
         // cannot return an error.
-        #[cfg(test)]
-        if !schema.index_fields.is_empty() || schema.is_scannable {
-            self.secondary_index_removal_attempts
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(indexer) = &self.index_builder {
+        if let Some((old_cell, schema)) = indexed_old_cell {
+            #[cfg(test)]
+            if !schema.index_fields.is_empty() || schema.is_scannable {
+                self.secondary_index_removal_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let shared = SharedCell::compose(old_cell, guard);
-            indexer.remove_indices(&shared, &schema);
+            self.index_builder
+                .as_ref()
+                .expect("indexing preflight requires an index builder")
+                .remove_indices(&shared, &schema);
             guard = shared.into_cell_guard();
         }
         guard.remove_index_entry();
-        self.refresh_statistics_for_schema(schema.id);
+        self.refresh_statistics_for_schema(old_header.schema);
         self.history.retire(&chain, &predecessor);
         Ok(InstalledRevision { id: *id, node })
     }
@@ -1081,6 +1118,10 @@ impl Chunk {
     where
         F: Fn(usize, u32) -> Result<T, ReadError>,
     {
+        let recovery_floor = self.history.recovery_floor();
+        if recovery_floor != 0 && snapshot_ts < recovery_floor {
+            return Err(ReadError::SnapshotTooOld);
+        }
         match CellGuard::for_read(id.lower, self) {
             Ok(mut guard) => {
                 let location = guard.get_ptr();
@@ -1907,6 +1948,51 @@ impl Chunks {
         revision_clock: Arc<HlcSource>,
         history_retention_ms: u64,
     ) -> Arc<Chunks> {
+        let (chunks, recovery) = Self::try_new_with_recovery_and_clock(
+            count,
+            size,
+            meta,
+            index_builder,
+            backup_storage,
+            wal_storage,
+            tiered_manager,
+            enable_recovery,
+            raft_storage,
+            revision_clock,
+            history_retention_ms,
+        )
+        .expect("segment recovery failed");
+
+        if enable_recovery {
+            chunks
+                .revision_clock()
+                .try_observe(bifrost::hlc::Hlc {
+                    ts: recovery.max_revision_ts,
+                    node: chunks.revision_clock().node(),
+                })
+                .expect("recovered revision clock exhausted");
+            chunks
+                .establish_recovery_floor()
+                .expect("recovery snapshot floor clock exhausted");
+        }
+
+        chunks
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new_with_recovery_and_clock(
+        count: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        enable_recovery: bool,
+        raft_storage: Option<String>,
+        revision_clock: Arc<HlcSource>,
+        history_retention_ms: u64,
+    ) -> io::Result<(Arc<Chunks>, crate::ram::recovery::RecoverySummary)> {
         use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
         use std::ptr;
 
@@ -2007,8 +2093,7 @@ impl Chunks {
         // Store global pointer for signal handler access
         set_global_chunks(&chunks_arc);
 
-        // Attempt recovery if enabled
-        if enable_recovery {
+        let recovery = if enable_recovery {
             info!("Recovery enabled, attempting to recover from storage");
 
             let config = crate::ram::recovery::RecoveryConfig {
@@ -2017,24 +2102,20 @@ impl Chunks {
                 max_threads: Some(64), // Cap recovery parallelism to reduce contention storms
             };
 
-            match crate::ram::recovery::recover_chunks(
+            let recovery = crate::ram::recovery::recover_chunks(
                 &config,
                 &backup_storage,
                 &wal_storage,
                 &raft_storage,
                 &chunks_arc.list,
-            ) {
-                Ok(()) => {
-                    info!("Recovery completed successfully");
-                }
-                Err(e) => {
-                    error!("Recovery failed: {:?}", e);
-                    error!("Starting with fresh storage");
-                }
-            }
-        }
+            )?;
+            info!("Recovery completed successfully");
+            recovery
+        } else {
+            crate::ram::recovery::RecoverySummary::default()
+        };
 
-        chunks_arc
+        Ok((chunks_arc, recovery))
     }
 
     pub fn next_revision_ts(&self, previous: u64) -> Result<u64, WriteError> {
@@ -2047,6 +2128,22 @@ impl Chunks {
             return Err(WriteError::RevisionClockExhausted);
         }
         Ok(next)
+    }
+
+    pub fn revision_clock(&self) -> &Arc<HlcSource> {
+        &self.revision_clock
+    }
+
+    pub fn establish_recovery_floor(&self) -> Result<u64, WriteError> {
+        let recovery_floor = self
+            .revision_clock
+            .try_now()
+            .map_err(|_| WriteError::RevisionClockExhausted)?
+            .ts;
+        for chunk in &self.list {
+            chunk.history.set_recovery_floor(recovery_floor);
+        }
+        Ok(recovery_floor)
     }
 
     /// Sync all buffered WAL data to disk across all chunks
@@ -2648,6 +2745,77 @@ mod tests {
             header: CellHeader::new(schema_id, id),
             data: data_map_value!(id: id.lower as i32, data: data),
         }
+    }
+
+    fn replace_stored_schema_id(chunks: &Chunks, id: &Id, schema_id: u32) {
+        let entry_addr = chunks.address_of(id);
+        let schema_addr = Entry::content_pos(entry_addr) + size_of::<u64>() + size_of::<u32>();
+        unsafe {
+            (schema_addr as *mut u32).write_unaligned(schema_id);
+        }
+    }
+
+    #[test]
+    fn schema_less_remove_without_indexer_publishes_tombstone() {
+        let (chunks, schema) = setup_test_chunks();
+        let id = Id::new(1, 41);
+        let mut cell = payload_cell(schema.id, &id, 16);
+        chunks.write_cell(&mut cell).unwrap();
+        replace_stored_schema_id(&chunks, &id, schema.id + 10_000);
+
+        chunks.remove_cell(&id).unwrap();
+
+        assert!(matches!(
+            chunks.read_cell(&id),
+            Err(ReadError::CellDoesNotExisted)
+        ));
+        let current = chunks.list[0].history.current(&id).unwrap();
+        assert_eq!(current.load().0, RevisionState::CommittedDeleted);
+        assert!(current.revision_ts > cell.header.revision_ts);
+    }
+
+    #[test]
+    fn indexed_remove_with_missing_schema_is_side_effect_free() {
+        let (chunks, schema) = setup_test_chunks();
+        let id = Id::new(1, 43);
+        let mut cell = payload_cell(schema.id, &id, 16);
+        chunks.write_cell(&mut cell).unwrap();
+        let missing_schema_id = schema.id + 10_000;
+        replace_stored_schema_id(&chunks, &id, missing_schema_id);
+
+        let chunk = &chunks.list[0];
+        let original_addr = chunks.address_of(&id);
+        let original_current = chunk.history.current(&id).unwrap();
+        let original_segment = chunk.locate_segment(original_addr).unwrap();
+        let original_append = original_segment.append_header.load(Ordering::Acquire);
+        let original_tombstones = original_segment.tombstones.load(Ordering::Acquire);
+        let guard = CellGuard::for_write(id.lower, true, chunk).unwrap();
+
+        let result = chunk.remove_cell_with_guard_at_revision_for_indexing(
+            guard,
+            &id,
+            RevisionWrite::committed(cell.header.revision_ts + 1),
+            true,
+        );
+
+        assert!(matches!(
+            result,
+            Err(WriteError::SchemaDoesNotExisted(id)) if id == missing_schema_id
+        ));
+        assert_eq!(chunks.address_of(&id), original_addr);
+        assert!(Arc::ptr_eq(
+            &chunk.history.current(&id).unwrap(),
+            &original_current
+        ));
+        assert_eq!(
+            original_segment.append_header.load(Ordering::Acquire),
+            original_append
+        );
+        assert_eq!(
+            original_segment.tombstones.load(Ordering::Acquire),
+            original_tombstones
+        );
+        assert_eq!(chunks.secondary_index_removal_attempts_for_test(&id), 0);
     }
 
     #[test]

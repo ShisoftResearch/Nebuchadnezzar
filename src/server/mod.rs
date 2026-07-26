@@ -553,8 +553,10 @@ mod startup_discovery_tests {
         database_meta_plane_id, database_meta_plane_seed_nodes,
         discover_databases_for_startup_schema_registration,
         discover_known_databases_from_raft_storage, discover_known_databases_from_storage_roots,
-        shared_meta_plane_id,
+        initialize_recovered_storage, shared_meta_plane_id,
     };
+    use crate::ram::chunk::Chunks;
+    use crate::ram::recovery::RecoverySummary;
 
     #[test]
     fn discovers_only_databases_with_recoverable_raft_state() {
@@ -670,6 +672,65 @@ mod startup_discovery_tests {
         assert!(plane_id.is_type2());
         assert_ne!(plane_id.raw(), 1);
     }
+
+    #[test]
+    fn storage_recovery_observes_clock_before_undo_and_sets_floor_after() {
+        let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
+        let recovered_max = chunks.revision_clock().try_now().unwrap().ts + 100;
+
+        let (compensation_ts, floor) = initialize_recovered_storage(
+            &chunks,
+            RecoverySummary {
+                max_revision_ts: recovered_max,
+            },
+            || {
+                assert!(
+                    chunks
+                        .list
+                        .iter()
+                        .all(|chunk| chunk.history.recovery_floor() == 0),
+                    "the recovery floor must not exist while undo is running"
+                );
+                let compensation_ts = chunks.revision_clock().try_now().unwrap().ts;
+                assert!(compensation_ts > recovered_max);
+                Ok(compensation_ts)
+            },
+        )
+        .unwrap();
+
+        assert!(floor > compensation_ts);
+        assert!(
+            chunks
+                .list
+                .iter()
+                .all(|chunk| chunk.history.recovery_floor() == floor),
+            "every chunk must receive the same post-undo recovery floor"
+        );
+    }
+
+    #[test]
+    fn storage_recovery_refuses_an_exhausted_recovered_clock_before_undo() {
+        let chunks = Chunks::new_dummy(1, crate::ram::segs::SEGMENT_SIZE);
+        let undo_ran = std::sync::atomic::AtomicBool::new(false);
+
+        let result = initialize_recovered_storage(
+            &chunks,
+            RecoverySummary {
+                max_revision_ts: u64::MAX,
+            },
+            || {
+                undo_ran.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(super::ServerError::CannotRecoverStorage(_))
+        ));
+        assert!(!undo_ran.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(chunks.list[0].history.recovery_floor(), 0);
+    }
 }
 
 #[derive(Debug)]
@@ -688,6 +749,7 @@ pub enum ServerError {
     CannotInitializeDatabaseServices(String),
     CannotInitializeSchemaServer(sm_master::ExecError),
     CannotInitializeSchemaPlane(String),
+    CannotRecoverStorage(String),
     StandaloneMustAlsoBeMetaServer,
 }
 
@@ -726,6 +788,9 @@ impl std::fmt::Display for ServerError {
             ServerError::CannotInitializeSchemaPlane(error) => {
                 write!(f, "cannot initialize schema plane: {error}")
             }
+            ServerError::CannotRecoverStorage(error) => {
+                write!(f, "cannot recover storage: {error}")
+            }
             ServerError::StandaloneMustAlsoBeMetaServer => {
                 write!(f, "standalone server must also be a meta server")
             }
@@ -734,6 +799,34 @@ impl std::fmt::Display for ServerError {
 }
 
 impl std::error::Error for ServerError {}
+
+fn recovery_clock_exhausted() -> ServerError {
+    ServerError::CannotRecoverStorage("recovered revision clock is exhausted".to_string())
+}
+
+fn initialize_recovered_storage<T, F>(
+    chunks: &Arc<Chunks>,
+    recovery: crate::ram::recovery::RecoverySummary,
+    recover_undo: F,
+) -> Result<(T, u64), ServerError>
+where
+    F: FnOnce() -> Result<T, ServerError>,
+{
+    chunks
+        .revision_clock()
+        .try_observe(bifrost::hlc::Hlc {
+            ts: recovery.max_revision_ts,
+            node: chunks.revision_clock().node(),
+        })
+        .map_err(|_| recovery_clock_exhausted())?;
+
+    let undo = recover_undo()?;
+    let recovery_floor = chunks
+        .establish_recovery_floor()
+        .map_err(|_| recovery_clock_exhausted())?;
+    info!("MVCC recovery snapshot floor: {}", recovery_floor);
+    Ok((undo, recovery_floor))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerOptions {
@@ -1219,7 +1312,7 @@ impl NebServer {
             None
         };
 
-        let chunks = Chunks::new_with_recovery_and_clock(
+        let (chunks, recovery) = Chunks::try_new_with_recovery_and_clock(
             effective_opts.db_size / effective_opts.chunk_size,
             effective_opts.chunk_size,
             meta_rc.clone(),
@@ -1231,40 +1324,39 @@ impl NebServer {
             effective_opts.raft_storage.clone(),
             hlc.clone(),
             effective_opts.history_retention_ms,
-        );
+        )
+        .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
 
-        if let Some(ref index_builder) = index_builder {
-            index_builder.initialize_inverted_indexer(&chunks);
-        }
-
-        let undo_log = if let Some(ref undo_log_path) = effective_opts.undo_log_storage {
+        let undo_log = if effective_opts.enable_recovery {
+            initialize_recovered_storage(&chunks, recovery, || {
+                let Some(undo_log_path) = effective_opts.undo_log_storage.as_ref() else {
+                    return Ok(None);
+                };
+                let log = transactions::undo_log::UndoLogger::new(undo_log_path.clone())
+                    .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+                let txn_index = log
+                    .recover()
+                    .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+                log.rollback_incomplete_transactions(txn_index, &chunks)
+                    .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+                Ok(Some(log))
+            })?
+            .0
+        } else if let Some(ref undo_log_path) = effective_opts.undo_log_storage {
             match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
-                Ok(log) => {
-                    if effective_opts.enable_recovery {
-                        match log.recover() {
-                            Ok(txn_index) => {
-                                if let Err(e) =
-                                    log.rollback_incomplete_transactions(txn_index, &chunks)
-                                {
-                                    error!("Failed to rollback incomplete transactions: {:?}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to recover undo log: {:?}", e);
-                            }
-                        }
-                    }
-
-                    Some(log)
-                }
-                Err(e) => {
-                    error!("Failed to initialize undo log: {:?}", e);
+                Ok(log) => Some(log),
+                Err(error) => {
+                    error!("Failed to initialize undo log: {:?}", error);
                     None
                 }
             }
         } else {
             None
         };
+
+        if let Some(ref index_builder) = index_builder {
+            index_builder.initialize_inverted_indexer(&chunks);
+        }
 
         let cleaner = if effective_opts.enable_recovery {
             debug!(
