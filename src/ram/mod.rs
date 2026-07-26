@@ -7,6 +7,7 @@ pub mod cleaner;
 pub mod compression;
 pub mod entry;
 pub mod file_manager;
+pub mod history;
 pub mod io;
 pub mod recovery;
 pub mod schema;

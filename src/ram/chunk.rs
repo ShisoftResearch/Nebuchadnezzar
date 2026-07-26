@@ -3,6 +3,7 @@ use crate::query::statistics::{
 };
 use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
+use crate::ram::history::HistoryIndex;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::segment_list::SegmentList;
 use crate::ram::segs::{Segment, SegmentAllocator, SegmentClass, SEGMENT_SIZE, SEGMENT_SIZE_U32};
@@ -172,6 +173,7 @@ pub struct Chunk {
     pub statistics: ChunkStatistics,
     pub revision_clock: Arc<HlcSource>,
     pub history_retention_ms: u64,
+    pub history: Arc<HistoryIndex>,
     /// Shared tiered memory manager for eviction/promotion
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
 }
@@ -327,6 +329,7 @@ impl Chunk {
             .clamp(4_096, 1 << 20)
             .next_power_of_two();
         let index = WordMap::with_capacity(index_capacity);
+        let history = HistoryIndex::new_for_chunk(id, history_retention_ms);
         let chunk = Chunk {
             id,
             segs,
@@ -345,6 +348,7 @@ impl Chunk {
             statistics: ChunkStatistics::new(),
             revision_clock,
             history_retention_ms,
+            history,
             tiered_manager,
         };
         chunk.put_segment(bootstrap_segment);
@@ -1139,6 +1143,19 @@ impl Chunk {
         seg.note_dead_bytes_change();
     }
 
+    pub fn drain_history_dead(&self) {
+        while let Some(dead) = self.history.pop_dead() {
+            if let Some(segment) = self.locate_segment(dead.location) {
+                self.mark_dead_entry_with_size(dead.location, dead.entry_size, &segment);
+            } else {
+                warn!(
+                    "Cannot account expired revision at 0x{:016x}: segment is no longer present in chunk {}",
+                    dead.location, self.id
+                );
+            }
+        }
+    }
+
     // Decodes entry to get size and marks it dead
     // WARNING: Will panic if memory at addr is corrupted!
     // Prefer mark_dead_entry_with_size when size is known
@@ -1419,6 +1436,12 @@ impl Drop for PendingEntry {
             .unwrap();
         self.seg.set_dirty();
         self.seg.decr_references();
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        self.history.shutdown();
     }
 }
 

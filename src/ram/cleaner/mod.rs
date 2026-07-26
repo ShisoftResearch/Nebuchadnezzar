@@ -149,6 +149,7 @@ impl Cleaner {
             );
             return false;
         }
+        chunk.drain_history_dead();
         let num_segs = chunk.segs.len();
         trace!(
             "Cleaning chunk {}, full {}, segs {}, head seg {}",
