@@ -30,6 +30,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: 32 * 1024 * 1024 * 1024,
                 db_size: 32 * 1024 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -158,6 +159,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: 256 * 1024 * 1024 * 1024,
                 db_size: 256 * 1024 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

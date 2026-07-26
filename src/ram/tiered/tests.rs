@@ -1272,6 +1272,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn()
         &ServerOptions {
             chunk_size: 8 * SEGMENT_SIZE,
             db_size: 8 * SEGMENT_SIZE,
+            history_retention_ms: 300_000,
             tiered_config: Some(crate::ram::tiered::TieredConfig {
                 threshold: 0.75,
                 lower_watermark: 0.5,
@@ -1351,6 +1352,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
         &ServerOptions {
             chunk_size: 8 * SEGMENT_SIZE,
             db_size: 8 * SEGMENT_SIZE,
+            history_retention_ms: 300_000,
             tiered_config: Some(crate::ram::tiered::TieredConfig {
                 threshold: 0.75,
                 lower_watermark: 0.5,
@@ -1476,6 +1478,7 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
         &ServerOptions {
             chunk_size: 8 * SEGMENT_SIZE,
             db_size: 8 * SEGMENT_SIZE,
+            history_retention_ms: 300_000,
             tiered_config: Some(crate::ram::tiered::TieredConfig {
                 threshold: 0.75,
                 lower_watermark: 0.5,
@@ -1625,6 +1628,7 @@ async fn test_global_eviction_across_multiple_databases() {
         &ServerOptions {
             chunk_size: 8 * SEGMENT_SIZE,
             db_size: 8 * SEGMENT_SIZE,
+            history_retention_ms: 300_000,
             tiered_config: Some(crate::ram::tiered::TieredConfig {
                 threshold: 0.75,
                 lower_watermark: 0.5,
@@ -1769,6 +1773,7 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
         &ServerOptions {
             chunk_size: 8 * SEGMENT_SIZE,
             db_size: 8 * SEGMENT_SIZE,
+            history_retention_ms: 300_000,
             tiered_config: Some(crate::ram::tiered::TieredConfig {
                 threshold,
                 lower_watermark: 0.5,
@@ -2173,6 +2178,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         &ServerOptions {
             chunk_size: virtual_capacity,
             db_size: virtual_capacity,
+            history_retention_ms: 300_000,
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
@@ -2522,6 +2528,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024, // Reduced from 256MB
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
@@ -2737,6 +2744,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
         &ServerOptions {
             chunk_size: chunk_capacity,
             db_size: chunk_capacity,
+            history_retention_ms: 300_000,
             tiered_config: None, // No tiered memory
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
@@ -3022,6 +3030,7 @@ async fn test_direct_writes_with_tiered_memory() {
         &ServerOptions {
             chunk_size: chunk_capacity,
             db_size: chunk_capacity,
+            history_retention_ms: 300_000,
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),

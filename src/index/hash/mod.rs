@@ -26,7 +26,7 @@ impl HashIndexer {
     fn retryable_write_error(err: &WriteError) -> bool {
         matches!(
             err,
-            WriteError::CellVersionMismatch
+            WriteError::CellRevisionMismatch
                 | WriteError::UserCanceledUpdate
                 | WriteError::DeletionPredictionFailed
                 | WriteError::NetworkingError
@@ -60,7 +60,7 @@ impl HashIndexer {
             match self.neb_client.read_cell(*index_id).await {
                 Ok(Ok(mut cell)) => {
                     // Cell exists - update it with CAS
-                    let version = cell.header.version;
+                    let revision_ts = cell.header.revision_ts;
                     let ids_val = &mut cell[*HASH_INDEX_FIELD_ID];
 
                     if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = ids_val {
@@ -77,9 +77,9 @@ impl HashIndexer {
                         // Use compare-and-swap to update the field atomically
                         match self
                             .neb_client
-                            .compare_version_and_set_field(
+                            .compare_revision_and_set_field(
                                 *index_id,
-                                version,
+                                revision_ts,
                                 *HASH_INDEX_FIELD_ID,
                                 new_value,
                             )
@@ -162,7 +162,7 @@ impl HashIndexer {
             "Max CAS retries exceeded for add_index({:?}, {:?})",
             cell_id, index_id
         );
-        Err(WriteError::CellVersionMismatch)
+        Err(WriteError::CellRevisionMismatch)
     }
 
     pub async fn remove_index(&self, cell_id: &Id, index_id: &Id) -> Result<(), WriteError> {
@@ -177,7 +177,7 @@ impl HashIndexer {
             match self.neb_client.read_cell(*index_id).await {
                 Ok(Ok(mut cell)) => {
                     // Cell exists - update or remove it with CAS
-                    let version = cell.header.version;
+                    let revision_ts = cell.header.revision_ts;
                     let ids_val = &mut cell[*HASH_INDEX_FIELD_ID];
 
                     if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = ids_val {
@@ -197,9 +197,9 @@ impl HashIndexer {
                             let new_value = OwnedValue::PrimArray(OwnedPrimArray::Id(Vec::new()));
                             match self
                                 .neb_client
-                                .compare_version_and_set_field(
+                                .compare_revision_and_set_field(
                                     *index_id,
-                                    version,
+                                    revision_ts,
                                     *HASH_INDEX_FIELD_ID,
                                     new_value,
                                 )
@@ -222,9 +222,9 @@ impl HashIndexer {
 
                             match self
                                 .neb_client
-                                .compare_version_and_set_field(
+                                .compare_revision_and_set_field(
                                     *index_id,
-                                    version,
+                                    revision_ts,
                                     *HASH_INDEX_FIELD_ID,
                                     new_value,
                                 )
@@ -279,7 +279,7 @@ impl HashIndexer {
             "Max CAS retries exceeded for remove_index({:?}, {:?})",
             cell_id, index_id
         );
-        Err(WriteError::CellVersionMismatch)
+        Err(WriteError::CellRevisionMismatch)
     }
 
     pub async fn query(
@@ -400,6 +400,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: 16 * 1024 * 1024,
                 db_size: 16 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -708,7 +709,7 @@ mod tests {
 
             if i % 2 == 0 {
                 tasks.spawn(async move {
-                    let mut last_err = WriteError::CellVersionMismatch;
+                    let mut last_err = WriteError::CellRevisionMismatch;
                     for _ in 0..5 {
                         match indexer.add_index(&cell_id, &index_id).await {
                             Ok(()) => return Ok(()),
@@ -722,7 +723,7 @@ mod tests {
                 });
             } else {
                 tasks.spawn(async move {
-                    let mut last_err = WriteError::CellVersionMismatch;
+                    let mut last_err = WriteError::CellRevisionMismatch;
                     for _ in 0..5 {
                         let op = match indexer.add_index(&cell_id, &index_id).await {
                             Ok(()) => indexer.remove_index(&cell_id, &index_id).await,
@@ -786,7 +787,7 @@ mod tests {
             let index_id = index_id;
 
             tasks.spawn(async move {
-                let mut last_err = WriteError::CellVersionMismatch;
+                let mut last_err = WriteError::CellRevisionMismatch;
                 for _ in 0..5 {
                     let mut op = indexer.add_index(&cell_id, &index_id).await;
                     if op.is_ok() && i % 3 == 0 {

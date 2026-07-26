@@ -739,6 +739,8 @@ impl std::error::Error for ServerError {}
 pub struct ServerOptions {
     pub chunk_size: usize,
     pub db_size: usize,
+    #[serde(default = "default_history_retention_ms")]
+    pub history_retention_ms: u64,
     pub tiered_config: Option<crate::ram::tiered::TieredConfig>,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
@@ -749,6 +751,10 @@ pub struct ServerOptions {
     pub enable_recovery: bool,
     #[serde(default)]
     pub disable_storage_locks: bool,
+}
+
+fn default_history_retention_ms() -> u64 {
+    300_000
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -1213,7 +1219,7 @@ impl NebServer {
             None
         };
 
-        let chunks = Chunks::new_with_recovery(
+        let chunks = Chunks::new_with_recovery_and_clock(
             effective_opts.db_size / effective_opts.chunk_size,
             effective_opts.chunk_size,
             meta_rc.clone(),
@@ -1223,6 +1229,8 @@ impl NebServer {
             tiered_manager,
             effective_opts.enable_recovery,
             effective_opts.raft_storage.clone(),
+            hlc.clone(),
+            effective_opts.history_retention_ms,
         );
 
         if let Some(ref index_builder) = index_builder {
@@ -1330,12 +1338,8 @@ impl NebServer {
                     .await;
                 }
                 Service::Transaction | Service::HashIndexer => {
-                    init_txn_data_site_service(
-                        rpc_server,
-                        database_runtime.clone(),
-                        hlc.clone(),
-                    )
-                    .await
+                    init_txn_data_site_service(rpc_server, database_runtime.clone(), hlc.clone())
+                        .await
                 }
                 Service::RangedIndexer => {
                     wait_for_scoped_cell_rpc_services(

@@ -514,6 +514,7 @@ mod test {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -773,6 +774,7 @@ mod test {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -994,6 +996,7 @@ mod test {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_dir.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_dir.to_str().unwrap().to_string()),
@@ -1183,6 +1186,7 @@ mod test {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_dir.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_dir.to_str().unwrap().to_string()),
@@ -1304,6 +1308,7 @@ mod test {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1410,6 +1415,7 @@ mod test {
             &ServerOptions {
                 chunk_size: 128 * 1024 * 1024,
                 db_size: 128 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1537,6 +1543,7 @@ mod test {
             &ServerOptions {
                 chunk_size: 128 * 1024 * 1024,
                 db_size: 128 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

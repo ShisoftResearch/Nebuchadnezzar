@@ -104,6 +104,7 @@ async fn async_main(args: ProbeArgs) -> Result<(), String> {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: Some(args.backup_storage.clone()),
             wal_storage: Some(args.wal_storage.clone()),

@@ -186,6 +186,7 @@ mod tests {
         ServerOptions {
             chunk_size: 1024,
             db_size: 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: Some("/tmp/backup".to_string()),
             wal_storage: Some("/tmp/wal".to_string()),

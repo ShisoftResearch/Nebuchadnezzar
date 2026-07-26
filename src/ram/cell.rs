@@ -1,7 +1,6 @@
 use crate::ram::chunk::CellGuard;
 use crate::ram::chunk::Chunk;
 use crate::ram::chunk::PendingEntry;
-use crate::ram::clock;
 use crate::ram::compression;
 use crate::ram::entry::*;
 use crate::ram::io::align_address;
@@ -28,18 +27,18 @@ pub const MAX_BLOB_CELL_SIZE: u32 = 2 * 1024 * 1024;
 
 pub type OwnedCellRef = ARef<OwnedCell>;
 
+#[repr(C)]
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Default)]
 pub struct CellHeader {
-    pub version: u64,
-    pub timestamp: u32,
+    pub revision_ts: u64,
+    pub flags: u32,
     pub schema: u32,
     pub partition: u64,
     pub hash: u64,
 }
 
 pub struct WriteToChunkResult {
-    pub new_timestamp: u32,
-    pub new_version: u64,
+    pub revision_ts: u64,
     pub addr: usize,
 }
 
@@ -55,7 +54,8 @@ pub enum WriteError {
     DeletionPredictionFailed,
     NetworkingError,
     DataMismatchSchema(Field, OwnedValue),
-    CellVersionMismatch,
+    CellRevisionMismatch,
+    RevisionClockExhausted,
     CompressionFailed(Field, String),
 }
 
@@ -74,11 +74,10 @@ pub enum ReadError {
 
 impl CellHeader {
     pub fn new(schema: u32, id: &Id) -> CellHeader {
-        let now = clock::now();
         CellHeader {
-            version: 1,
+            revision_ts: 0,
+            flags: 0,
             schema,
-            timestamp: now,
             partition: id.higher,
             hash: id.lower,
         }
@@ -205,11 +204,9 @@ impl OwnedCell {
         &self,
         write_plan: &WritePlan,
         pending_entry: &PendingEntry,
-        old_version: u64,
+        revision_ts: u64,
     ) -> Result<WriteToChunkResult, WriteError> {
         let addr = pending_entry.addr;
-        let new_version = old_version + 1;
-        let new_timestamp = clock::now();
         debug_assert_eq!(align_address(8, addr), addr, "Entry address is not aligned");
         Entry::encode_to(
             addr,
@@ -219,8 +216,8 @@ impl OwnedCell {
                 // write cell header
                 let header = &self.header;
                 let mut cursor = addr_to_header_cursor(content_addr);
-                cursor.write_u64::<Endian>(new_version).unwrap();
-                cursor.write_u32::<Endian>(new_timestamp).unwrap();
+                cursor.write_u64::<Endian>(revision_ts).unwrap();
+                cursor.write_u32::<Endian>(header.flags).unwrap();
                 cursor.write_u32::<Endian>(header.schema).unwrap();
                 cursor.write_u64::<Endian>(header.partition).unwrap();
                 cursor.write_u64::<Endian>(header.hash).unwrap();
@@ -244,11 +241,7 @@ impl OwnedCell {
             self.header,
             write_plan.total_size()
         );
-        return Ok(WriteToChunkResult {
-            new_timestamp,
-            new_version,
-            addr,
-        });
+        return Ok(WriteToChunkResult { revision_ts, addr });
     }
     pub fn id(&self) -> Id {
         self.header.id()
@@ -696,8 +689,8 @@ pub fn cell_hash_from_entry_content_addr(addr: usize) -> u64 {
 pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
     let mut cursor = addr_to_header_cursor(addr);
     let header = CellHeader {
-        version: cursor.read_u64::<Endian>().unwrap(),
-        timestamp: cursor.read_u32::<Endian>().unwrap(),
+        revision_ts: cursor.read_u64::<Endian>().unwrap(),
+        flags: cursor.read_u32::<Endian>().unwrap(),
         schema: cursor.read_u32::<Endian>().unwrap(),
         partition: cursor.read_u64::<Endian>().unwrap(),
         hash: cursor.read_u64::<Endian>().unwrap(),
@@ -706,11 +699,11 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
     return header;
 }
 
-pub fn cell_version_from_entry_content_addr(addr: usize) -> u64 {
+pub fn cell_revision_ts_from_entry_content_addr(addr: usize) -> u64 {
     let mut cursor = addr_to_header_cursor(addr);
-    let version = cursor.read_u64::<Endian>().unwrap();
+    let revision_ts = cursor.read_u64::<Endian>().unwrap();
     release_cursor(cursor);
-    version
+    revision_ts
 }
 
 pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
@@ -722,12 +715,12 @@ pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadErro
     Ok((header, addr + CELL_HEADER_SIZE))
 }
 
-pub fn cell_version_from_chunk_raw(ptr: usize) -> Result<u64, ReadError> {
+pub fn cell_revision_ts_from_chunk_raw(ptr: usize) -> Result<u64, ReadError> {
     if ptr == 0 {
         return Err(ReadError::CellIdIsUnitId);
     }
     let addr = Entry::content_pos(ptr);
-    Ok(cell_version_from_entry_content_addr(addr))
+    Ok(cell_revision_ts_from_entry_content_addr(addr))
 }
 
 pub fn minimal_header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
@@ -736,7 +729,7 @@ pub fn minimal_header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), 
     }
     let mut header = CellHeader::default();
     let addr = Entry::content_pos(ptr);
-    let schema = unsafe { ptr::read((addr + 8 + 4) as *const u32) };
+    let schema = unsafe { ptr::read((addr + 12) as *const u32) };
     header.schema = schema;
     Ok((header, addr + CELL_HEADER_SIZE))
 }
@@ -773,5 +766,21 @@ pub fn select_from_chunk_raw<'v>(
             panic!("{}", msg);
         }
         return Err(ReadError::SchemaDoesNotExisted(*schema_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_header_is_exactly_32_bytes() {
+        assert_eq!(std::mem::size_of::<CellHeader>(), 32);
+        let id = Id::new(11, 22);
+        let header = CellHeader::new(7, &id);
+        assert_eq!(header.revision_ts, 0);
+        assert_eq!(header.flags, 0);
+        assert_eq!(header.schema, 7);
+        assert_eq!(header.id(), id);
     }
 }

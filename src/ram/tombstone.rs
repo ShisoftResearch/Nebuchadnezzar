@@ -6,10 +6,11 @@ use std::{
     mem,
 };
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct Tombstone {
     pub segment_seq_id: u64,
-    pub version: u64,
+    pub revision_ts: u64,
     pub partition: u64,
     pub hash: u64,
 }
@@ -33,7 +34,7 @@ impl Tombstone {
             let mut cursor = addr_to_cursor(addr);
             {
                 write_u64(&mut cursor, self.segment_seq_id);
-                write_u64(&mut cursor, self.version);
+                write_u64(&mut cursor, self.revision_ts);
                 write_u64(&mut cursor, self.partition);
                 write_u64(&mut cursor, self.hash);
             }
@@ -45,7 +46,7 @@ impl Tombstone {
         let mut cursor = addr_to_cursor(addr);
         let tombstone = Tombstone {
             segment_seq_id: cursor.read_u64::<Endian>().unwrap(),
-            version: cursor.read_u64::<Endian>().unwrap(),
+            revision_ts: cursor.read_u64::<Endian>().unwrap(),
             partition: cursor.read_u64::<Endian>().unwrap(),
             hash: cursor.read_u64::<Endian>().unwrap(),
         };
@@ -68,16 +69,27 @@ impl Tombstone {
     pub fn put(
         tombstone_addr: usize,
         segment_seq_id: u64,
-        version: u64,
+        revision_ts: u64,
         partition: u64,
         hash: u64,
     ) {
         Tombstone {
             segment_seq_id,
-            version,
+            revision_ts,
             partition,
             hash,
         }
         .write(tombstone_addr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_tombstone_is_exactly_32_bytes() {
+        assert_eq!(TOMBSTONE_SIZE, 32);
+        assert_eq!(std::mem::size_of::<Tombstone>(), 32);
     }
 }

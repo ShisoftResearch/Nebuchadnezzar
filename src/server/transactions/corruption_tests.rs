@@ -30,6 +30,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -143,6 +144,7 @@ async fn test_varying_size_concurrent_updates() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -244,6 +246,7 @@ async fn test_multi_cell_concurrent_transactions() {
         &ServerOptions {
             chunk_size: 128 * 1024 * 1024,
             db_size: 128 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -348,6 +351,7 @@ async fn test_rapid_commit_sequence() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -436,6 +440,7 @@ async fn test_interleaved_prepare_commit() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -540,6 +545,7 @@ async fn test_maximum_concurrency_stress() {
         &ServerOptions {
             chunk_size: 128 * 1024 * 1024,
             db_size: 128 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -652,6 +658,7 @@ async fn test_wikidata_import_scenario() {
         &ServerOptions {
             chunk_size: 128 * 1024 * 1024, // Multiple chunks like production
             db_size: 512 * 1024 * 1024,    // Larger memory pool
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -779,6 +786,7 @@ async fn test_update_cell_by_stress() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

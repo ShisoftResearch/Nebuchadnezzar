@@ -26,6 +26,7 @@ async fn start_occ_test_server(address: &str, group: &str) -> Arc<NebServer> {
         &ServerOptions {
             chunk_size: crate::ram::segs::SEGMENT_SIZE,
             db_size: crate::ram::segs::SEGMENT_SIZE,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -48,6 +49,7 @@ async fn start_occ_test_cluster(addresses: &[&str], group: &str) -> Vec<Arc<NebS
     let opts = ServerOptions {
         chunk_size: crate::ram::segs::SEGMENT_SIZE,
         db_size: crate::ram::segs::SEGMENT_SIZE,
+        history_retention_ms: 300_000,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
@@ -257,7 +259,7 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
         .chunks()
         .update_cell(&mut external_fail)
         .unwrap();
-    assert!(external_header.version > fail_first.header.version);
+    assert!(external_header.revision_ts > fail_first.header.revision_ts);
 
     let slow_prepare =
         transactions::data_site::install_prepare_delay_for_cell(tid.clone(), slow_id);
@@ -402,7 +404,7 @@ async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_backgroun
         .chunks()
         .update_cell(&mut external_fail)
         .unwrap();
-    assert!(external_header.version > fail_first.header.version);
+    assert!(external_header.revision_ts > fail_first.header.revision_ts);
 
     let slow_prepare =
         transactions::data_site::install_prepare_delay_for_cell(tid.clone(), slow_id);
@@ -537,7 +539,7 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     wait_for_transaction_count(&manager, 0, Duration::from_secs(2)).await;
     let rolled_back = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
     assert_eq!(score_of(&rolled_back), 1);
-    assert!(rolled_back.header.version > first.header.version);
+    assert!(rolled_back.header.revision_ts > first.header.revision_ts);
 
     let retry_tid = txn.begin().await.unwrap().unwrap();
     let retry_first = accepted_cell(txn.read(retry_tid.clone(), cell_id).await.unwrap().unwrap());
@@ -617,7 +619,7 @@ async fn abort_queued_behind_commit_reports_already_cleanup() {
 
     let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
     assert_eq!(persisted.data, committed.data);
-    assert!(persisted.header.version > first.header.version);
+    assert!(persisted.header.revision_ts > first.header.revision_ts);
 
     server.shutdown().await;
 }
@@ -770,10 +772,10 @@ async fn repeatable_full_read_uses_first_snapshot() {
 
     let mut updated = counter_cell(schema.id, cell_id, 9, "counter_full_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
-    assert!(updated_header.version > first.header.version);
+    assert!(updated_header.revision_ts > first.header.revision_ts);
 
     let second = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(second.header.version, first.header.version);
+    assert_eq!(second.header.revision_ts, first.header.revision_ts);
     assert_eq!(score_of(&second), 0);
 
     abort_txn(&txn, tid).await;
@@ -828,15 +830,15 @@ async fn repeatable_selected_and_head_share_full_snapshot() {
     );
     let head = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
 
-    assert_eq!(selected.header.version, head.version);
+    assert_eq!(selected.header.revision_ts, head.revision_ts);
     assert_eq!(selected_score_of(&selected), 0);
 
     let mut updated = counter_cell(schema.id, cell_id, 9, "counter_select_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
-    assert!(updated_header.version > head.version);
+    assert!(updated_header.revision_ts > head.revision_ts);
 
     let full = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(full.header.version, head.version);
+    assert_eq!(full.header.revision_ts, head.revision_ts);
     assert_eq!(score_of(&full), 0);
 
     abort_txn(&txn, tid).await;
@@ -870,10 +872,10 @@ async fn repeatable_selected_empty_fields_return_full_cached_snapshot() {
 
     let mut updated = counter_cell(schema.id, cell_id, 9, "counter_select_all_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
-    assert!(updated_header.version > selected_all.header.version);
+    assert!(updated_header.revision_ts > selected_all.header.revision_ts);
 
     let full = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(full.header.version, selected_all.header.version);
+    assert_eq!(full.header.revision_ts, selected_all.header.revision_ts);
     assert_eq!(full.data, selected_all.data);
 
     abort_txn(&txn, tid).await;
@@ -911,7 +913,7 @@ async fn repeatable_selected_dynamic_fields_fall_back_to_map_lookup() {
             .unwrap(),
     );
 
-    assert_eq!(selected.header.version, initial.header.version);
+    assert_eq!(selected.header.revision_ts, initial.header.revision_ts);
     assert_eq!(selected_value(&selected, 0), &OwnedValue::U64(7));
     assert_eq!(selected_value(&selected, 1), &OwnedValue::Null);
 
@@ -998,7 +1000,7 @@ async fn repeatable_remove_then_write_replaces_existing_cell() {
 
     let replaced = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
     assert_eq!(score_of(&replaced), 9);
-    assert!(replaced.header.version > first.header.version);
+    assert!(replaced.header.revision_ts > first.header.revision_ts);
 
     server.shutdown().await;
 }
@@ -1040,7 +1042,7 @@ async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
 
     let replaced = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
     assert_eq!(score_of(&replaced), 8);
-    assert!(replaced.header.version > initial.header.version);
+    assert!(replaced.header.revision_ts > initial.header.revision_ts);
 
     server.shutdown().await;
 }
@@ -1188,7 +1190,7 @@ async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
     let second = accepted_cell(txn.read(t2.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(score_of(&first), 0);
     assert_eq!(score_of(&second), 0);
-    assert_eq!(first.header.version, second.header.version);
+    assert_eq!(first.header.revision_ts, second.header.revision_ts);
 
     let t1_update = counter_cell(schema.id, cell_id, 1, "counter_lost_update_t1");
     let t2_update = counter_cell(schema.id, cell_id, 1, "counter_lost_update_t2");
@@ -1212,7 +1214,7 @@ async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
 
     let after_t1 = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
     assert_eq!(score_of(&after_t1), 1);
-    assert!(after_t1.header.version > first.header.version);
+    assert!(after_t1.header.revision_ts > first.header.revision_ts);
 
     assert_eq!(
         txn.prepare(t2.clone()).await.unwrap().unwrap(),
@@ -1261,7 +1263,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
 
     let mut initial = counter_cell(schema.id, cell_id, 0, "counter_shape_gated_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
-    let seeded_version = initial.header.version;
+    let seeded_version = initial.header.revision_ts;
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
@@ -1270,7 +1272,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
     let before_partial = transactions::data_site::full_read_rpc_count();
 
     let head = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(head.version, seeded_version);
+    assert_eq!(head.revision_ts, seeded_version);
 
     let selected = accepted_cell(
         txn.read_selected(tid.clone(), cell_id, vec![hash_str("score")])
@@ -1279,7 +1281,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
             .unwrap(),
     );
     assert_eq!(selected_score_of(&selected), 0);
-    assert_eq!(selected.header.version, head.version);
+    assert_eq!(selected.header.revision_ts, head.revision_ts);
 
     assert_eq!(
         transactions::data_site::full_read_rpc_count(),
@@ -1287,14 +1289,14 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
         "head/read_selected must not issue a full-cell participant read"
     );
 
-    // A concurrent update advances the current version; the pin must keep the txn
+    // A concurrent update advances the current revision_ts; the pin must keep the txn
     // observing its snapshot for the later full read.
     let mut updated = counter_cell(schema.id, cell_id, 9, "counter_shape_gated_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
-    assert!(updated_header.version > head.version);
+    assert!(updated_header.revision_ts > head.revision_ts);
 
     // Step 2: the full read fetches the whole cell exactly once, served from the
-    // pinned version so it is consistent with the earlier partial reads.
+    // pinned revision_ts so it is consistent with the earlier partial reads.
     let before_full = transactions::data_site::full_read_rpc_count();
     let full = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(
@@ -1302,7 +1304,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
         before_full + 1,
         "the full read must fetch the whole cell exactly once"
     );
-    assert_eq!(full.header.version, head.version);
+    assert_eq!(full.header.revision_ts, head.revision_ts);
     assert_eq!(score_of(&full), 0);
 
     // Repeated reads of every shape are consistent and transfer nothing further
@@ -1316,10 +1318,10 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
             .unwrap()
             .unwrap(),
     );
-    assert_eq!(head_again.version, head.version);
-    assert_eq!(full_again.header.version, head.version);
+    assert_eq!(head_again.revision_ts, head.revision_ts);
+    assert_eq!(full_again.header.revision_ts, head.revision_ts);
     assert_eq!(score_of(&full_again), 0);
-    assert_eq!(selected_again.header.version, head.version);
+    assert_eq!(selected_again.header.revision_ts, head.revision_ts);
     assert_eq!(selected_score_of(&selected_again), 0);
     assert_eq!(
         transactions::data_site::full_read_rpc_count(),
@@ -1344,18 +1346,18 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
 
     let mut read_seed = counter_cell(schema.id, read_id, 0, "counter_certify_read_seed");
     runtime.chunks().write_cell(&mut read_seed).unwrap();
-    let read_version = read_seed.header.version;
+    let read_version = read_seed.header.revision_ts;
     let mut write_seed = counter_cell(schema.id, write_id, 0, "counter_certify_write_seed");
     runtime.chunks().write_cell(&mut write_seed).unwrap();
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
-    // A header-only read must still enter the certified read set as Present(version)
+    // A header-only read must still enter the certified read set as Present(revision_ts)
     // without transferring the whole cell.
     let before_partial = transactions::data_site::full_read_rpc_count();
     let head = accepted_head(txn.head(tid.clone(), read_id).await.unwrap().unwrap());
-    assert_eq!(head.version, read_version);
+    assert_eq!(head.revision_ts, read_version);
     assert_eq!(
         transactions::data_site::full_read_rpc_count(),
         before_partial,
@@ -1365,17 +1367,20 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
     // A write on a different cell makes this a read-write transaction so prepare runs.
     let write_update = counter_cell(schema.id, write_id, 5, "counter_certify_write_update");
     assert_eq!(
-        txn.update(tid.clone(), write_update).await.unwrap().unwrap(),
+        txn.update(tid.clone(), write_update)
+            .await
+            .unwrap()
+            .unwrap(),
         TxnExecResult::Accepted(())
     );
 
-    // A concurrent writer advances the header-read cell past the pinned version.
+    // A concurrent writer advances the header-read cell past the pinned revision_ts.
     let mut conflicting = counter_cell(schema.id, read_id, 7, "counter_certify_conflict");
     let conflicting_header = runtime.chunks().update_cell(&mut conflicting).unwrap();
-    assert!(conflicting_header.version > head.version);
+    assert!(conflicting_header.revision_ts > head.revision_ts);
 
     // Certification must abort the transaction: the header-only read's recorded
-    // version no longer matches the current stored version.
+    // revision_ts no longer matches the current stored revision_ts.
     assert_eq!(
         txn.prepare(tid.clone()).await.unwrap().unwrap(),
         TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
@@ -1401,23 +1406,23 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::new(0, 90133);
 
-    // Seed version A.
+    // Seed revision_ts A.
     let mut version_a = counter_cell(schema.id, cell_id, 100, "counter_overwrite_a");
     runtime.chunks().write_cell(&mut version_a).unwrap();
-    let version_a_version = version_a.header.version;
+    let version_a_version = version_a.header.revision_ts;
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
-    // head pins version A at the participant for this transaction.
+    // head pins revision_ts A at the participant for this transaction.
     let head_a = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(head_a.version, version_a_version);
+    assert_eq!(head_a.revision_ts, version_a_version);
 
-    // Overwrite the cell NON-transactionally: this writes a NEW version B and
-    // only marks version A dead (copy-on-write) rather than mutating it in place.
+    // Overwrite the cell NON-transactionally: this writes a NEW revision_ts B and
+    // only marks revision_ts A dead (copy-on-write) rather than mutating it in place.
     let mut version_b = counter_cell(schema.id, cell_id, 200, "counter_overwrite_b");
     let version_b_header = runtime.chunks().update_cell(&mut version_b).unwrap();
-    assert!(version_b_header.version > head_a.version);
+    assert!(version_b_header.revision_ts > head_a.revision_ts);
 
     // Force a deterministic storage cleaner pass between the overwrite and the
     // pinned reads below. `Cleaner::clean` (src/ram/cleaner/mod.rs) is the real
@@ -1431,7 +1436,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     // chunk holding exactly one segment (Chunk::new divides `size` into
     // `size / SEGMENT_SIZE` segments). The combine-cleaner only ever considers
     // combining when it has >= 2 segment candidates, so in this fixture it can
-    // never find a second segment to combine version A's dead bytes into. The
+    // never find a second segment to combine revision_ts A's dead bytes into. The
     // call below is therefore a genuine, real cleaner pass, but it cannot itself
     // reclaim anything under this particular layout. What actually protects the
     // pinned bytes from reclamation (once there is something to reclaim) is the
@@ -1442,18 +1447,18 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     let _ = crate::ram::cleaner::Cleaner::clean(&runtime.chunks().list[0], true, true);
 
     // In the SAME tid: both a full read and another head must still observe
-    // version A, not version B.
+    // revision_ts A, not revision_ts B.
     let full_a = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(full_a.header.version, head_a.version);
+    assert_eq!(full_a.header.revision_ts, head_a.revision_ts);
     assert_eq!(score_of(&full_a), 100);
 
     let head_a_again = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(head_a_again.version, head_a.version);
+    assert_eq!(head_a_again.revision_ts, head_a.revision_ts);
 
-    // A different, fresh transaction that never pinned sees the current version B.
+    // A different, fresh transaction that never pinned sees the current revision_ts B.
     let tid2 = txn.begin().await.unwrap().unwrap();
     let full_b = accepted_cell(txn.read(tid2.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(full_b.header.version, version_b_header.version);
+    assert_eq!(full_b.header.revision_ts, version_b_header.revision_ts);
     assert_eq!(score_of(&full_b), 200);
 
     abort_txn(&txn, tid).await;
@@ -1471,17 +1476,17 @@ async fn head_pin_survives_concurrent_transactional_remove() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::new(0, 90134);
 
-    // Seed version A.
+    // Seed revision_ts A.
     let mut version_a = counter_cell(schema.id, cell_id, 42, "counter_remove_pin_seed");
     runtime.chunks().write_cell(&mut version_a).unwrap();
-    let version_a_version = version_a.header.version;
+    let version_a_version = version_a.header.revision_ts;
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
-    // head pins version A for tid.
+    // head pins revision_ts A for tid.
     let head_a = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(head_a.version, version_a_version);
+    assert_eq!(head_a.revision_ts, version_a_version);
 
     // A concurrent transaction removes the cell and commits.
     let tid2 = txn.begin().await.unwrap().unwrap();
@@ -1504,15 +1509,15 @@ async fn head_pin_survives_concurrent_transactional_remove() {
         "the cell must be gone from storage after the concurrent remove commits"
     );
 
-    // The ORIGINAL tid still returns version A on a full read: the pinned
-    // version survives the remove.
+    // The ORIGINAL tid still returns revision_ts A on a full read: the pinned
+    // revision_ts survives the remove.
     let full_a = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(full_a.header.version, head_a.version);
+    assert_eq!(full_a.header.revision_ts, head_a.revision_ts);
     assert_eq!(score_of(&full_a), 42);
 
     // ...and on a repeated head, too.
     let head_a_again = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(head_a_again.version, head_a.version);
+    assert_eq!(head_a_again.revision_ts, head_a.revision_ts);
 
     abort_txn(&txn, tid).await;
     server.shutdown().await;

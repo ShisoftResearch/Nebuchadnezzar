@@ -2097,6 +2097,7 @@ async fn create_alignment_test_server(port: u16) -> Arc<NebServer> {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

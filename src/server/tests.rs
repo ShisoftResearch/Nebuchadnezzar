@@ -39,6 +39,7 @@ pub async fn init() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024, // 64 MB - must be >= SEGMENT_SIZE (8 MB)
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -72,6 +73,7 @@ pub async fn explicit_database_binding_scopes_storage_roots() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: Some(backup_root.to_string_lossy().to_string()),
             wal_storage: Some(wal_root.to_string_lossy().to_string()),
@@ -120,6 +122,7 @@ pub async fn resolves_bound_database_runtime_by_name() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -173,6 +176,7 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -251,6 +255,7 @@ pub async fn unload_database_runtime_evicts_non_default_runtime() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -312,6 +317,7 @@ pub async fn delete_database_storage_removes_scoped_paths() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: Some(backup_root.to_string_lossy().to_string()),
             wal_storage: Some(wal_root.to_string_lossy().to_string()),
@@ -372,6 +378,7 @@ pub async fn unload_database_runtime_unchecked_allows_default() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -430,6 +437,7 @@ pub async fn delete_database_storage_unchecked_allows_default() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: Some(backup_root.to_string_lossy().to_string()),
             wal_storage: Some(wal_root.to_string_lossy().to_string()),
@@ -499,6 +507,7 @@ pub async fn smoke_test() {
         &ServerOptions {
             chunk_size: 512 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -582,6 +591,7 @@ pub async fn smoke_test_parallel() {
         &ServerOptions {
             chunk_size: 4 * 1024 * 1024 * 1024,
             db_size: 16 * 1024 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -684,6 +694,7 @@ pub async fn txn() {
         &ServerOptions {
             chunk_size: 512 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -747,6 +758,7 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
         &ServerOptions {
             chunk_size: 128 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -849,6 +861,7 @@ pub async fn schema_wal_recovery_test() {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -965,6 +978,7 @@ pub async fn schema_wal_recovery_test() {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1057,6 +1071,7 @@ pub async fn schema_snapshot_recovery_test() {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1194,6 +1209,7 @@ pub async fn schema_snapshot_recovery_test() {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1307,6 +1323,7 @@ pub async fn schema_persistence_multiple_restarts() {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1378,6 +1395,7 @@ pub async fn schema_persistence_multiple_restarts() {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1433,6 +1451,7 @@ pub async fn memory_status_test() {
         &ServerOptions {
             chunk_size: 32 * 1024 * 1024,
             db_size: 128 * 1024 * 1024, // 128 MB
+            history_retention_ms: 300_000,
             tiered_config: Some(crate::ram::tiered::TieredConfig::with_memory_limit(
                 64 * 1024 * 1024, // 64 MB physical limit
             )),

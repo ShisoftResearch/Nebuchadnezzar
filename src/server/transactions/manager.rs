@@ -3,8 +3,8 @@ use crate::ram::cell::CellHeader;
 use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::types::{Id, OwnedValue};
 use bifrost::conshash::ConsistentHashing;
-use bifrost::rpc::{ClientPool, RPCClient};
 use bifrost::hlc::Hlc;
+use bifrost::rpc::{ClientPool, RPCClient};
 use bifrost::utils::time::get_time;
 use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
@@ -236,14 +236,14 @@ struct DataObject {
     pinned: Option<PinnedReadCache>,
 }
 
-/// Coordinator-side cache for a pinned (size-gated) repeatable-read version.
+/// Coordinator-side cache for a pinned (size-gated) repeatable-read revision_ts.
 /// Keeps only small results — the header and any projections already
 /// fetched — so a large pinned cell is not cloned whole into the
 /// transaction cache. The full cell is materialized lazily on an actual
 /// full read (wiring for that happens outside this representation).
 #[derive(Clone, Debug, Default)]
 struct PinnedReadCache {
-    /// Cached header of the pinned version (small; serves repeated head reads).
+    /// Cached header of the pinned revision_ts (small; serves repeated head reads).
     header: Option<CellHeader>,
     /// Cached projections keyed by the (sorted) field-id list served so far.
     projections: HashMap<Vec<u64>, OwnedCell>,
@@ -254,7 +254,7 @@ struct Transaction {
     affected_objects: AffectedObjs,
     state: TxnState,
     last_activity: i64, // Unix timestamp in milliseconds for detecting stale transactions
-    /// Server ids on which this transaction pinned a read version (via a partial
+    /// Server ids on which this transaction pinned a read revision_ts (via a partial
     /// `head(pin=true)` / `read_selected`). Tracked separately from `data` so it
     /// survives `generate_affected_objs` draining `data`, letting commit/abort
     /// release those pins even on servers the transaction never wrote to.
@@ -701,10 +701,12 @@ impl Service for TransactionManager {
                             .await
                             .map_err(|_| TMError::CannotLocateCellServer)?;
                         let expectation = match self
-                            .observe_version(&server, &tid, id.clone())
+                            .observe_revision(&server, &tid, id.clone())
                             .await?
                         {
-                            TxnExecResult::Accepted(version) => CellExpectation::Present(version),
+                            TxnExecResult::Accepted(revision_ts) => {
+                                CellExpectation::Present(revision_ts)
+                            }
                             TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
                                 return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
                             }
@@ -716,7 +718,7 @@ impl Service for TransactionManager {
                                 return Ok(TxnExecResult::StateError(state));
                             }
                             TxnExecResult::Wait => {
-                                unreachable!("observe_version retries waits before returning")
+                                unreachable!("observe_revision retries waits before returning")
                             }
                         };
                         txn.data.insert(
@@ -772,10 +774,12 @@ impl Service for TransactionManager {
                             .await
                             .map_err(|_| TMError::CannotLocateCellServer)?;
                         let expectation = match self
-                            .observe_version(&server, &tid, id.clone())
+                            .observe_revision(&server, &tid, id.clone())
                             .await?
                         {
-                            TxnExecResult::Accepted(version) => CellExpectation::Present(version),
+                            TxnExecResult::Accepted(revision_ts) => {
+                                CellExpectation::Present(revision_ts)
+                            }
                             TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
                                 return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
                             }
@@ -787,7 +791,7 @@ impl Service for TransactionManager {
                                 return Ok(TxnExecResult::StateError(state));
                             }
                             TxnExecResult::Wait => {
-                                unreachable!("observe_version retries waits before returning")
+                                unreachable!("observe_revision retries waits before returning")
                             }
                         };
                         txn.data.insert(
@@ -865,7 +869,7 @@ impl TransactionManager {
     /// read as missing. Otherwise the whole cell is fetched once via the
     /// participant `read` RPC — this is the single path that materializes the
     /// whole cell — and, if a prior partial read pinned the cell, the
-    /// participant serves that pinned version so the full read is repeatable.
+    /// participant serves that pinned revision_ts so the full read is repeatable.
     async fn full_read<'a>(
         &self,
         tid: &TxnId,
@@ -882,7 +886,7 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
             }
             // A prior partial read pinned the cell but never materialized the
-            // whole cell: fall through to fetch it once from the pinned version.
+            // whole cell: fall through to fetch it once from the pinned revision_ts.
         }
 
         match self.get_data_site_by_id(id).await {
@@ -897,9 +901,9 @@ impl TransactionManager {
     /// Coordinator header read. Read-your-writes and an already-materialized full
     /// cell shadow everything; a buffered remove and repeatable absence read as
     /// missing; an already-pinned header is served from cache. Otherwise a
-    /// `head(pin=true)` participant RPC pins the version and returns only the
-    /// header — the whole cell is never transferred. The observed version is
-    /// recorded as `Present(version)` so the read is certified at prepare.
+    /// `head(pin=true)` participant RPC pins the revision_ts and returns only the
+    /// header — the whole cell is never transferred. The observed revision_ts is
+    /// recorded as `Present(revision_ts)` so the read is certified at prepare.
     async fn head_read<'a>(
         &self,
         tid: &TxnId,
@@ -934,9 +938,9 @@ impl TransactionManager {
     /// full cell shadow everything (the projection is computed locally); a
     /// buffered remove and repeatable absence read as missing; an already-cached
     /// projection for these exact fields is served from cache. Otherwise a
-    /// `read_selected` participant RPC pins the version and returns only the
+    /// `read_selected` participant RPC pins the revision_ts and returns only the
     /// projection — the whole cell is never transferred. The projection's
-    /// version is recorded as `Present(version)` so the read is certified.
+    /// revision_ts is recorded as `Present(revision_ts)` so the read is certified.
     async fn selected_read<'a>(
         &self,
         tid: &TxnId,
@@ -963,7 +967,7 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Accepted(projection.clone()));
             }
             // Pinned but this exact projection is not cached yet: fall through
-            // to fetch it from the pinned version.
+            // to fetch it from the pinned revision_ts.
         }
 
         match self.get_data_site_by_id(id).await {
@@ -1043,7 +1047,7 @@ impl TransactionManager {
                     match payload {
                         TxnExecResult::Accepted(cell) => {
                             // Check if there's a pending update in the transaction cache
-                            // If the cell was updated locally, we must return the cached updated version
+                            // If the cell was updated locally, we must return the cached updated revision_ts
                             // instead of overwriting it with the remote (stale) value
                             if let Some(data_obj) = txn.data.get_mut(id) {
                                 // Entry exists in transaction cache
@@ -1058,22 +1062,22 @@ impl TransactionManager {
                                 }
                                 // Entry exists but not changed - only update if cell is missing
                                 if data_obj.cell.is_none() {
-                                    let version = cell.header.version;
+                                    let revision_ts = cell.header.revision_ts;
                                     data_obj.cell = Some(cell);
-                                    data_obj.expectation = CellExpectation::Present(version);
+                                    data_obj.expectation = CellExpectation::Present(revision_ts);
                                 }
                                 return Ok(TxnExecResult::Accepted(
                                     data_obj.cell.as_ref().unwrap().clone(),
                                 ));
                             } else {
                                 // No entry exists - cache the remote value and return it
-                                let version = cell.header.version;
+                                let revision_ts = cell.header.revision_ts;
                                 let result = TxnExecResult::Accepted(cell.clone());
                                 txn.data.insert(
                                     id.clone(),
                                     DataObject {
                                         server: server_id,
-                                        expectation: CellExpectation::Present(version),
+                                        expectation: CellExpectation::Present(revision_ts),
                                         cell: Some(cell),
                                         new: false,
                                         changed: false,
@@ -1115,9 +1119,9 @@ impl TransactionManager {
         }
     }
 
-    /// Issues a `head(pin=true)` participant RPC, pinning the served version so a
+    /// Issues a `head(pin=true)` participant RPC, pinning the served revision_ts so a
     /// later read in the same transaction repeats it, and caches only the header
-    /// (never the whole cell). Records `Present(version)` for certification, or
+    /// (never the whole cell). Records `Present(revision_ts)` for certification, or
     /// `Absent` on a missing cell (repeatable absence).
     async fn head_from_site<'a>(
         &self,
@@ -1139,7 +1143,7 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Rejected);
             }
 
-            // Partial read: pin=true snapshots the served version for repeatability.
+            // Partial read: pin=true snapshots the served revision_ts for repeatability.
             let head_response = server
                 .head(self_server_id, self.get_clock(), tid.to_owned(), *id, true)
                 .await;
@@ -1148,8 +1152,8 @@ impl TransactionManager {
                     self.merge_clock(dsr.clock);
                     match dsr.payload {
                         TxnExecResult::Accepted(header) => {
-                            let version = header.version;
-                            // The participant pinned the served version and holds
+                            let revision_ts = header.revision_ts;
+                            // The participant pinned the served revision_ts and holds
                             // a segment guard for it. Remember this server so the
                             // pin is released promptly on commit/abort, even if a
                             // buffered write later shadows the read locally.
@@ -1163,7 +1167,7 @@ impl TransactionManager {
                                     });
                                 }
                                 // Cache the header on the existing pinned entry;
-                                // its recorded version is already Present(version).
+                                // its recorded revision_ts is already Present(revision_ts).
                                 let pinned =
                                     data_obj.pinned.get_or_insert_with(PinnedReadCache::default);
                                 if pinned.header.is_none() {
@@ -1172,13 +1176,13 @@ impl TransactionManager {
                                 return Ok(TxnExecResult::Accepted(header));
                             }
                             // Record the header-only read so it is in the certified
-                            // read set as Present(version) — no whole-cell transfer.
+                            // read set as Present(revision_ts) — no whole-cell transfer.
                             txn.data.insert(
                                 id.clone(),
                                 DataObject {
                                     server: server_id,
                                     cell: None,
-                                    expectation: CellExpectation::Present(version),
+                                    expectation: CellExpectation::Present(revision_ts),
                                     changed: false,
                                     new: false,
                                     pinned: Some(PinnedReadCache {
@@ -1221,10 +1225,10 @@ impl TransactionManager {
         }
     }
 
-    /// Issues a `read_selected` participant RPC, pinning the served version so a
+    /// Issues a `read_selected` participant RPC, pinning the served revision_ts so a
     /// later read in the same transaction repeats it, and caches only the
     /// returned projection (never the whole cell) keyed by the exact requested
-    /// field order. Records `Present(version)` for certification, or `Absent` on
+    /// field order. Records `Present(revision_ts)` for certification, or `Absent` on
     /// a missing cell (repeatable absence).
     async fn selected_from_site<'a>(
         &self,
@@ -1264,8 +1268,8 @@ impl TransactionManager {
                     self.merge_clock(dsr.clock);
                     match dsr.payload {
                         TxnExecResult::Accepted(projection) => {
-                            let version = projection.header.version;
-                            // The participant pinned the served version and holds
+                            let revision_ts = projection.header.revision_ts;
+                            // The participant pinned the served revision_ts and holds
                             // a segment guard for it. Remember this server so the
                             // pin is released promptly on commit/abort, even if a
                             // buffered write later shadows the read locally.
@@ -1282,7 +1286,7 @@ impl TransactionManager {
                                     });
                                 }
                                 // Cache the projection on the existing pinned entry;
-                                // its recorded version is already Present(version).
+                                // its recorded revision_ts is already Present(revision_ts).
                                 let pinned =
                                     data_obj.pinned.get_or_insert_with(PinnedReadCache::default);
                                 pinned
@@ -1292,7 +1296,7 @@ impl TransactionManager {
                                 return Ok(TxnExecResult::Accepted(projection));
                             }
                             // Record the projection-only read so it is in the
-                            // certified read set as Present(version).
+                            // certified read set as Present(revision_ts).
                             let mut projections = HashMap::new();
                             projections.insert(fields.to_vec(), projection.clone());
                             txn.data.insert(
@@ -1300,7 +1304,7 @@ impl TransactionManager {
                                 DataObject {
                                     server: server_id,
                                     cell: None,
-                                    expectation: CellExpectation::Present(version),
+                                    expectation: CellExpectation::Present(revision_ts),
                                     changed: false,
                                     new: false,
                                     pinned: Some(PinnedReadCache {
@@ -1364,7 +1368,7 @@ impl TransactionManager {
 
             // Use the transaction's own timestamp for internal blind observations so the
             // read timestamp recorded at the data site cannot advance beyond this tid.
-            // Blind version observation: never pin. Blind update/remove targets
+            // Blind revision_ts observation: never pin. Blind update/remove targets
             // are written, not re-read, so pinning here would waste a segment
             // guard and needlessly materialize a participant transaction.
             let head_response = server
@@ -1392,14 +1396,14 @@ impl TransactionManager {
             }
         }
     }
-    async fn observe_version(
+    async fn observe_revision(
         &self,
         server: &Arc<data_site::AsyncServiceClient>,
         tid: &TxnId,
         id: Id,
     ) -> Result<TxnExecResult<u64, ReadError>, TMError> {
         Ok(match self.observe_head_from_site(server, tid, &id).await? {
-            TxnExecResult::Accepted(header) => TxnExecResult::Accepted(header.version),
+            TxnExecResult::Accepted(header) => TxnExecResult::Accepted(header.revision_ts),
             TxnExecResult::Rejected => TxnExecResult::Rejected,
             TxnExecResult::Error(error) => TxnExecResult::Error(error),
             TxnExecResult::StateError(state) => TxnExecResult::StateError(state),
@@ -1747,7 +1751,10 @@ impl TransactionManager {
         let mut tids_by_server: HashMap<u64, Vec<TxnId>> = HashMap::new();
         for (tid, servers) in pending {
             for server_id in servers {
-                tids_by_server.entry(server_id).or_default().push(tid.clone());
+                tids_by_server
+                    .entry(server_id)
+                    .or_default()
+                    .push(tid.clone());
             }
         }
         for (server_id, tids) in tids_by_server {
@@ -1962,7 +1969,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn data_object_pinned_representation_defers_full_cell() {
         let obj = DataObject {
@@ -2024,6 +2030,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: crate::ram::segs::SEGMENT_SIZE,
                 db_size: crate::ram::segs::SEGMENT_SIZE,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2309,7 +2316,7 @@ mod tests {
             .expect("blind update should cache the target cell");
         assert_eq!(
             data_obj.expectation,
-            CellExpectation::Present(original.header.version)
+            CellExpectation::Present(original.header.revision_ts)
         );
         assert!(data_obj.changed);
 
@@ -2353,7 +2360,7 @@ mod tests {
             .expect("blind remove should cache the target cell");
         assert_eq!(
             data_obj.expectation,
-            CellExpectation::Present(original.header.version)
+            CellExpectation::Present(original.header.revision_ts)
         );
         assert!(data_obj.changed);
 

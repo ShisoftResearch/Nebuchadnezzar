@@ -96,7 +96,7 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
 #[derive(Debug, Clone)]
 struct StashedTombstone {
     hash: u64,
-    version: u64,
+    revision_ts: u64,
     chunk_id: usize,
 }
 
@@ -517,7 +517,7 @@ fn scan_segment_from_data(
     seg_id: u64,
     segment_base: usize,
     data: &[u8],
-    version_map: &WordMap,
+    revision_map: &WordMap,
 ) -> io::Result<RecoveryScanResult> {
     use byteorder::{LittleEndian, ReadBytesExt};
     use std::io::Cursor;
@@ -658,16 +658,17 @@ fn scan_segment_from_data(
                 &mut first_missing_schema_id,
             )?;
             let hash = cell_header.hash;
-            let new_version = cell_header.version;
+            let new_revision_ts = cell_header.revision_ts;
 
-            // Use version_map to check existing version (concurrent-safe)
-            let mut version_guard = version_map.lock_or_insert(hash as usize, new_version as usize);
-            let existing_version = *version_guard as u64;
+            // Use revision_map to check the existing revision (concurrent-safe).
+            let mut revision_guard =
+                revision_map.lock_or_insert(hash as usize, new_revision_ts as usize);
+            let existing_revision_ts = *revision_guard as u64;
 
-            if new_version >= existing_version {
-                // Our version is newer or equal, update cell_index and version_map
-                *version_guard = new_version as usize;
-                drop(version_guard);
+            if new_revision_ts >= existing_revision_ts {
+                // Our revision is newer or equal, update cell_index and revision_map.
+                *revision_guard = new_revision_ts as usize;
+                drop(revision_guard);
 
                 let mut cell_guard = chunk
                     .cell_index
@@ -698,7 +699,7 @@ fn scan_segment_from_data(
                     }
                 }
             } else {
-                // Existing version is newer, this entry is dead
+                // Existing revision is newer, this entry is dead.
                 dead_space += entry_header.content_length as u64;
             }
         } else if entry_header.entry_type == EntryType::TOMBSTONE {
@@ -707,15 +708,15 @@ fn scan_segment_from_data(
             let hash = tombstone.hash;
             tombstone_count += 1;
 
-            // Use lock_or_insert to handle case where no version exists yet
-            let mut version_guard =
-                version_map.lock_or_insert(hash as usize, tombstone.version as usize);
-            let existing_version = *version_guard as u64;
+            // Use lock_or_insert to handle case where no revision exists yet
+            let mut revision_guard =
+                revision_map.lock_or_insert(hash as usize, tombstone.revision_ts as usize);
+            let existing_revision_ts = *revision_guard as u64;
 
-            if tombstone.version >= existing_version {
-                // Update version_map BEFORE releasing lock (prevents race)
-                *version_guard = tombstone.version as usize;
-                drop(version_guard);
+            if tombstone.revision_ts >= existing_revision_ts {
+                // Update revision_map BEFORE releasing lock (prevents race)
+                *revision_guard = tombstone.revision_ts as usize;
+                drop(revision_guard);
 
                 // Tombstone is newer, delete cell from index
                 if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
@@ -741,10 +742,10 @@ fn scan_segment_from_data(
                     }
                 }
             } else {
-                drop(version_guard);
+                drop(revision_guard);
                 stashed_tombstones.push(StashedTombstone {
                     hash,
-                    version: tombstone.version,
+                    revision_ts: tombstone.revision_ts,
                     chunk_id: chunk.id,
                 });
             }
@@ -796,7 +797,7 @@ fn scan_segment_from_data(
     })
 }
 
-/// Merge stashed tombstones from all threads, keeping latest version per hash
+/// Merge stashed tombstones from all threads, keeping latest revision per hash
 fn merge_stashed_tombstones(all_stashed: Vec<Vec<StashedTombstone>>) -> Vec<StashedTombstone> {
     let mut merged: HashMap<u64, StashedTombstone> = HashMap::new();
 
@@ -805,7 +806,7 @@ fn merge_stashed_tombstones(all_stashed: Vec<Vec<StashedTombstone>>) -> Vec<Stas
             merged
                 .entry(tombstone.hash)
                 .and_modify(|existing| {
-                    if tombstone.version > existing.version {
+                    if tombstone.revision_ts > existing.revision_ts {
                         *existing = tombstone.clone();
                     }
                 })
@@ -835,7 +836,7 @@ fn apply_stashed_tombstones(stashed: &[StashedTombstone], chunks: &[Chunk]) {
             let cell_header =
                 cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
 
-            if tombstone.version >= cell_header.version {
+            if tombstone.revision_ts >= cell_header.revision_ts {
                 *guard = 0; // Delete cell
                 if let Some(seg) = chunk.locate_segment(existing_addr) {
                     let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
@@ -845,8 +846,8 @@ fn apply_stashed_tombstones(stashed: &[StashedTombstone], chunks: &[Chunk]) {
                 }
                 applied_count += 1;
                 debug!(
-                "Applied stashed tombstone: deleted cell hash={} version={} with tombstone version={}",
-                tombstone.hash, cell_header.version, tombstone.version
+                "Applied stashed tombstone: deleted cell hash={} revision={} with tombstone revision={}",
+                tombstone.hash, cell_header.revision_ts, tombstone.revision_ts
             );
             }
         }
@@ -932,8 +933,8 @@ pub fn recover_chunks(
         recovery_parallelism(config)
     );
 
-    // Create per-chunk version maps sized from the actual recovery footprint.
-    let version_maps: Vec<WordMap> = files_by_chunk
+    // Create per-chunk revision maps sized from the actual recovery footprint.
+    let revision_maps: Vec<WordMap> = files_by_chunk
         .iter()
         .map(|chunk_files| WordMap::with_capacity(estimate_recovery_word_map_capacity(chunk_files)))
         .collect();
@@ -968,7 +969,7 @@ pub fn recover_chunks(
         files_by_chunk.into_par_iter().enumerate().try_for_each(
             |(chunk_id, chunk_files)| -> io::Result<()> {
                 let chunk = &chunks[chunk_id];
-                let version_map = &version_maps[chunk_id];
+                let revision_map = &revision_maps[chunk_id];
                 let mut local_stashed = Vec::new();
 
                 for file_info in chunk_files {
@@ -991,7 +992,7 @@ pub fn recover_chunks(
                         file_info.seg_id,
                         segment_base,
                         &file_data,
-                        version_map,
+                        revision_map,
                     )?;
                     let segment_class = scan_result.segment_class;
 
@@ -1064,8 +1065,8 @@ pub fn recover_chunks(
         )
     })?;
 
-    // Version maps are dropped here, freeing all temporary version tracking memory
-    drop(version_maps);
+    // Version maps are dropped here, freeing all temporary revision tracking memory
+    drop(revision_maps);
     info!("Version maps freed, recovery memory usage reduced");
 
     // Update allocator next_seq_id for each chunk to continue from max recovered seq_id
@@ -1257,8 +1258,8 @@ mod tests {
         chunk: &Chunk,
         data: &[u8],
     ) -> io::Result<RecoveryScanResult> {
-        let version_map = WordMap::with_capacity(128);
-        scan_segment_from_data(chunk, 1, chunk.allocator.addr_by_id(1), data, &version_map)
+        let revision_map = WordMap::with_capacity(128);
+        scan_segment_from_data(chunk, 1, chunk.allocator.addr_by_id(1), data, &revision_map)
     }
 
     // Purpose: Validate parsing of segment filenames `{chunk}-{seg}-{seq}.{nlog|nbackup}`
@@ -2048,9 +2049,9 @@ mod tests {
         }
     }
 
-    // Purpose: Verify version handling across recovery. After recovering an
-    // initial write, write a newer version, archive, and finally recover again;
-    // latest version must be returned.
+    // Purpose: Verify revision handling across recovery. After recovering an
+    // initial write, write a newer revision, archive, and finally recover again;
+    // latest revision must be returned.
     #[test]
     fn test_recovery_with_updates() {
         let _ = env_logger::try_init();
@@ -2093,7 +2094,7 @@ mod tests {
         println!("Phase 1 chunks dropped");
 
         println!("=== Phase 2: Recover and update ===");
-        // Phase 2: Update the cell (higher version)
+        // Phase 2: Update the cell (higher revision)
         {
             let schemas = setup_test_schema();
             println!("Creating chunks with recovery enabled...");
@@ -2138,13 +2139,13 @@ mod tests {
                 list_files_recursively(backup_dir.path())
             );
 
-            // Update with new data (version will be higher)
+            // Update with new data (revision will be higher)
             println!("Updating cell...");
             let updated_data: Vec<u8> = vec![0xFF; DATA_SIZE];
             let mut updated_cell = OwnedCell {
                 header: CellHeader {
-                    version: 2,
-                    timestamp: 200,
+                    revision_ts: 2,
+                    flags: 0,
                     schema: 0,
                     partition: 0,
                     hash: cell_id.lower,
@@ -2204,7 +2205,7 @@ mod tests {
                 .map(|e| e.path().display().to_string())
                 .collect::<Vec<_>>()
         );
-        // Phase 3: Recover and verify we get the latest version
+        // Phase 3: Recover and verify we get the latest revision
         {
             let schemas = setup_test_schema();
             println!("Creating chunks with recovery for verification...");
@@ -2237,8 +2238,8 @@ mod tests {
         }
     }
 
-    // Purpose: Ensure multiple versions land in different segments with distinct
-    // header versions and that recovery restores the latest version/data.
+    // Purpose: Ensure multiple revisions land in different segments with distinct
+    // header revisions and that recovery restores the latest revision/data.
     #[test]
     fn test_recovery_with_multi_segment_versions() {
         let _ = env_logger::try_init();
@@ -2247,8 +2248,8 @@ mod tests {
         let (_raft_dir, raft_path) = temp_raft_dir();
 
         // Helpers scoped to this test
-        fn collect_versions_for_hash(chunk: &Chunk, hash: u64) -> Vec<(u64, u64)> {
-            let mut versions = Vec::new();
+        fn collect_revisions_for_hash(chunk: &Chunk, hash: u64) -> Vec<(u64, u64)> {
+            let mut revisions = Vec::new();
             for seg in chunk.segments() {
                 let mut cursor = seg.addr;
                 let bound = seg.append_header.load(Ordering::Relaxed);
@@ -2259,13 +2260,13 @@ mod tests {
                         let content_addr = Entry::content_pos(cursor);
                         let header = cell_header_from_entry_content_addr(content_addr);
                         if header.hash == hash {
-                            versions.push((seg.id, header.version));
+                            revisions.push((seg.id, header.revision_ts));
                         }
                     }
                     cursor += entry_size;
                 }
             }
-            versions
+            revisions
         }
 
         fn list_all_files(dir: &Path) -> Vec<String> {
@@ -2310,7 +2311,7 @@ mod tests {
 
         let cell_id = Id::new(0, 7);
         let payload_size = 128 * 1024; // 128KB payload to rotate segments with moderate writes
-        let latest_version: u64;
+        let latest_revision_ts: u64;
         let latest_marker: i32;
 
         {
@@ -2328,7 +2329,7 @@ mod tests {
             );
 
             let chunk = &chunks.list[0];
-            let mut current_version = 1u64;
+            let mut current_revision_ts = 1u64;
             let mut filler_counter: i32 = 10_000;
 
             // Version 1
@@ -2336,9 +2337,9 @@ mod tests {
                 header: CellHeader::new(0, &cell_id),
                 data: data_map_value!(id: 101i32, data: vec![0x11u8; payload_size]),
             };
-            v1_cell.header.version = current_version;
+            v1_cell.header.revision_ts = current_revision_ts;
             let v1_header = chunks.write_cell(&mut v1_cell).unwrap();
-            current_version = v1_header.version;
+            current_revision_ts = v1_header.revision_ts;
 
             // Version 2 in a new segment
             force_new_segment(&chunks, chunk, &mut filler_counter, payload_size);
@@ -2346,9 +2347,9 @@ mod tests {
                 header: CellHeader::new(0, &cell_id),
                 data: data_map_value!(id: 202i32, data: vec![0x22u8; payload_size]),
             };
-            v2_cell.header.version = current_version;
+            v2_cell.header.revision_ts = current_revision_ts;
             let v2_header = chunks.update_cell(&mut v2_cell).unwrap();
-            current_version = v2_header.version;
+            current_revision_ts = v2_header.revision_ts;
 
             // Version 3 in yet another segment
             force_new_segment(&chunks, chunk, &mut filler_counter, payload_size);
@@ -2356,25 +2357,29 @@ mod tests {
                 header: CellHeader::new(0, &cell_id),
                 data: data_map_value!(id: 303i32, data: vec![0x33u8; payload_size]),
             };
-            v3_cell.header.version = current_version;
+            v3_cell.header.revision_ts = current_revision_ts;
             let v3_header = chunks.update_cell(&mut v3_cell).unwrap();
             latest_marker = 303;
 
-            let versions = collect_versions_for_hash(chunk, cell_id.lower);
-            println!("Written versions: {:?}", versions);
-            assert_eq!(versions.len(), 3, "expected three stored versions");
-            let version_set: HashSet<u64> = versions.iter().map(|(_, v)| *v).collect();
+            let revisions = collect_revisions_for_hash(chunk, cell_id.lower);
+            println!("Written revisions: {:?}", revisions);
+            assert_eq!(revisions.len(), 3, "expected three stored revisions");
+            let revision_set: HashSet<u64> = revisions.iter().map(|(_, v)| *v).collect();
             assert_eq!(
-                version_set,
-                HashSet::from_iter([v1_header.version, v2_header.version, v3_header.version]),
-                "stored versions should match written versions"
+                revision_set,
+                HashSet::from_iter([
+                    v1_header.revision_ts,
+                    v2_header.revision_ts,
+                    v3_header.revision_ts
+                ]),
+                "stored revisions should match written revisions"
             );
-            latest_version = *version_set.iter().max().unwrap();
-            let seg_set: HashSet<u64> = versions.iter().map(|(seg, _)| *seg).collect();
+            latest_revision_ts = *revision_set.iter().max().unwrap();
+            let seg_set: HashSet<u64> = revisions.iter().map(|(seg, _)| *seg).collect();
             assert_eq!(
                 seg_set.len(),
                 3,
-                "each version should reside in a different segment"
+                "each revision should reside in a different segment"
             );
 
             let mut archived_segments = Vec::new();
@@ -2416,11 +2421,11 @@ mod tests {
             );
 
             let recovered = chunks.read_cell(&cell_id).unwrap().to_owned();
-            let recovered_versions = collect_versions_for_hash(&chunks.list[0], cell_id.lower);
-            println!("Recovered versions: {:?}", recovered_versions);
+            let recovered_revisions = collect_revisions_for_hash(&chunks.list[0], cell_id.lower);
+            println!("Recovered revisions: {:?}", recovered_revisions);
             assert_eq!(
-                recovered.header.version, latest_version,
-                "recovered cell should have the latest version"
+                recovered.header.revision_ts, latest_revision_ts,
+                "recovered cell should have the latest revision"
             );
             assert_eq!(
                 *recovered.data["id"].i32().unwrap(),
@@ -2929,7 +2934,7 @@ mod tests {
     }
 
     // Purpose: Test that updates across multiple recovery cycles preserve
-    // the latest version of each cell
+    // the latest revision of each cell
     #[test]
     fn test_recovery_cycles_with_updates() {
         let _ = env_logger::try_init();
@@ -2939,7 +2944,7 @@ mod tests {
 
         let cell_id = Id::new(0, 42);
 
-        // Cycle 1: Write initial version
+        // Cycle 1: Write initial revision
         {
             let schemas = setup_test_schema();
             let chunks = Chunks::new_with_recovery(
@@ -2979,12 +2984,12 @@ mod tests {
                 Some(raft_path.clone()),
             );
 
-            // Update to version 2
+            // Update to revision 2
             let updated_data: Vec<u8> = vec![0xAA; DATA_SIZE];
             let mut updated_cell = OwnedCell {
                 header: CellHeader {
-                    version: 2,
-                    timestamp: 200,
+                    revision_ts: 2,
+                    flags: 0,
                     schema: 0,
                     partition: 0,
                     hash: cell_id.lower,
@@ -3015,12 +3020,12 @@ mod tests {
                 Some(raft_path.clone()),
             );
 
-            // Update to version 3
+            // Update to revision 3
             let updated_data: Vec<u8> = vec![0xFF; DATA_SIZE];
             let mut updated_cell = OwnedCell {
                 header: CellHeader {
-                    version: 3,
-                    timestamp: 300,
+                    revision_ts: 3,
+                    flags: 0,
                     schema: 0,
                     partition: 0,
                     hash: cell_id.lower,
@@ -3036,7 +3041,7 @@ mod tests {
             }
         }
 
-        // Cycle 4: Verify latest version survived
+        // Cycle 4: Verify latest revision survived
         {
             let schemas = setup_test_schema();
             let chunks = Chunks::new_with_recovery(
@@ -3054,9 +3059,9 @@ mod tests {
             let cell = chunks.read_cell(&cell_id).unwrap();
             let cell_owned = cell.to_owned();
 
-            // Should have latest update with id=999 (version may be auto-incremented)
+            // Should have latest update with id=999 (revision may be auto-incremented)
             assert!(
-                cell_owned.header.version >= 3,
+                cell_owned.header.revision_ts >= 3,
                 "Version should be at least 3"
             );
             let id_val = cell_owned.data["id"].i32().unwrap();

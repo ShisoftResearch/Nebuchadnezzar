@@ -740,7 +740,7 @@ async fn blind_remove_once(fixture: &OccFixture, id: Id) -> AttemptOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProjectionObservation {
-    version: u64,
+    revision_ts: u64,
     score: Option<u64>,
 }
 
@@ -751,7 +751,7 @@ fn projected_observations_match(observations: &[ProjectionObservation]) -> bool 
 
     let mut expected_score = None;
     for observation in observations {
-        if observation.version != first.version {
+        if observation.revision_ts != first.revision_ts {
             return false;
         }
         if let Some(score) = observation.score {
@@ -796,14 +796,14 @@ fn full_score(cell: &OwnedCell, id: Id) -> Result<u64, AttemptOutcome> {
     }
 }
 
-async fn transactional_head_version(
+async fn transactional_head_revision(
     fixture: &OccFixture,
     tid: TxnId,
     id: Id,
 ) -> Result<ProjectionObservation, AttemptOutcome> {
     match fixture.txn.head(tid.clone(), id).await {
         Ok(Ok(TxnExecResult::Accepted(header))) => Ok(ProjectionObservation {
-            version: header.version,
+            revision_ts: header.revision_ts,
             score: None,
         }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
@@ -830,7 +830,7 @@ async fn transactional_head_version(
     }
 }
 
-async fn transactional_selected_version(
+async fn transactional_selected_revision(
     fixture: &OccFixture,
     tid: TxnId,
     id: Id,
@@ -841,7 +841,7 @@ async fn transactional_selected_version(
         .await
     {
         Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(ProjectionObservation {
-            version: cell.header.version,
+            revision_ts: cell.header.revision_ts,
             score: Some(selected_score(&cell, id)?),
         }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
@@ -868,14 +868,14 @@ async fn transactional_selected_version(
     }
 }
 
-async fn transactional_full_version(
+async fn transactional_full_revision(
     fixture: &OccFixture,
     tid: TxnId,
     id: Id,
 ) -> Result<ProjectionObservation, AttemptOutcome> {
     match fixture.txn.read(tid.clone(), id).await {
         Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(ProjectionObservation {
-            version: cell.header.version,
+            revision_ts: cell.header.revision_ts,
             score: Some(full_score(&cell, id)?),
         }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
@@ -910,17 +910,17 @@ async fn projected_observations(
 ) -> Result<Vec<ProjectionObservation>, AttemptOutcome> {
     match mode {
         ProjectionMode::Head => Ok(vec![
-            transactional_head_version(fixture, tid.clone(), id).await?,
-            transactional_head_version(fixture, tid.clone(), id).await?,
+            transactional_head_revision(fixture, tid.clone(), id).await?,
+            transactional_head_revision(fixture, tid.clone(), id).await?,
         ]),
         ProjectionMode::Selected => Ok(vec![
-            transactional_selected_version(fixture, tid.clone(), id).await?,
-            transactional_selected_version(fixture, tid.clone(), id).await?,
+            transactional_selected_revision(fixture, tid.clone(), id).await?,
+            transactional_selected_revision(fixture, tid.clone(), id).await?,
         ]),
         ProjectionMode::Mixed => Ok(vec![
-            transactional_head_version(fixture, tid.clone(), id).await?,
-            transactional_selected_version(fixture, tid.clone(), id).await?,
-            transactional_full_version(fixture, tid.clone(), id).await?,
+            transactional_head_revision(fixture, tid.clone(), id).await?,
+            transactional_selected_revision(fixture, tid.clone(), id).await?,
+            transactional_full_revision(fixture, tid.clone(), id).await?,
         ]),
     }
 }
@@ -1353,15 +1353,15 @@ mod tests {
     fn projected_observations_reject_score_mismatches() {
         assert!(!projected_observations_match(&[
             ProjectionObservation {
-                version: 7,
+                revision_ts: 7,
                 score: None,
             },
             ProjectionObservation {
-                version: 7,
+                revision_ts: 7,
                 score: Some(3),
             },
             ProjectionObservation {
-                version: 7,
+                revision_ts: 7,
                 score: Some(4),
             },
         ]));

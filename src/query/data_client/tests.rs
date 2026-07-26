@@ -216,6 +216,7 @@ async fn scan_all() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -445,6 +446,7 @@ async fn range_query_scan() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -528,6 +530,7 @@ async fn create_test_server(port: u16) -> Arc<NebServer> {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3539,6 +3542,7 @@ async fn hashed_query_test() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3753,6 +3757,7 @@ async fn hashed_query_supports_array_values() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -3918,6 +3923,7 @@ async fn ranged_query_supports_array_values() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4006,6 +4012,7 @@ async fn hashed_query_rejects_map_values() {
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
             db_size: 512 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4084,6 +4091,7 @@ async fn bm25_search_returns_ranked_results() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4192,6 +4200,7 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4300,6 +4309,7 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4408,6 +4418,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4512,6 +4523,7 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4611,6 +4623,7 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4749,6 +4762,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -4878,6 +4892,7 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -5008,6 +5023,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -5148,6 +5164,7 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 64 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

@@ -481,6 +481,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -503,6 +504,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -756,6 +758,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -856,6 +859,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

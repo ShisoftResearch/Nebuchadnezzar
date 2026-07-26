@@ -755,7 +755,7 @@ where
                         &IndexType::Fulltext => {
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
-                                cell.header().version,
+                                cell.header().revision_ts,
                                 schema.id,
                                 *field_id,
                                 owned_value.clone(),
@@ -804,7 +804,7 @@ where
                         &IndexType::Fulltext => {
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
-                                cell.header().version,
+                                cell.header().revision_ts,
                                 schema.id,
                                 *field_id,
                                 owned_value.clone(),

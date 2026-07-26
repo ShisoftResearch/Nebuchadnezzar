@@ -8,6 +8,7 @@ use crate::ram::chunk::Chunks;
 use crate::ram::schema::*;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
+use bifrost::hlc::HlcSource;
 use bifrost_hasher::hash_str;
 use env_logger;
 use std;
@@ -15,6 +16,35 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 pub const CHUNK_SIZE: usize = 1 * 8 * 1024 * 1024;
+
+#[test]
+fn writes_allocate_monotonic_revision_timestamps() {
+    let id = Id::new(11, 22);
+    let schema = Schema::new("revision-test", None, simple_fields(), false, true);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(schema.clone());
+    let revision_clock = Arc::new(HlcSource::new(0));
+    let chunks = Chunks::new_with_recovery_and_clock(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        revision_clock,
+        300_000,
+    );
+
+    let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::U64(1));
+    let first = chunks.write_cell(&mut cell).unwrap();
+    cell.data = OwnedValue::U64(2);
+    let second = chunks.update_cell(&mut cell).unwrap();
+
+    assert!(second.revision_ts > first.revision_ts);
+}
 
 #[test]
 pub fn round_robin_segment() {
@@ -1429,7 +1459,7 @@ fn create_test_cell(schema_id: u32, id: &Id, name: &str, score: u64) -> OwnedCel
 // ============================================================================
 
 #[test]
-pub fn test_compare_version_and_update_cell_success() {
+pub fn test_compare_revision_and_update_cell_success() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
     let id = Id::new(1, 1);
@@ -1437,18 +1467,18 @@ pub fn test_compare_version_and_update_cell_success() {
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
-    let initial_version = header.version;
+    let initial_version = header.revision_ts;
 
     // Verify initial state (drop the guard before attempting update)
     {
         let stored_cell = chunks.read_cell(&id).unwrap();
-        assert_eq!(stored_cell.header.version, initial_version);
+        assert_eq!(stored_cell.header.revision_ts, initial_version);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "Alice");
     }
 
     // Update with matching version - should succeed
     let mut updated_cell = create_test_cell(schema.id, &id, "Bob", 85);
-    let result = chunks.compare_version_and_update_cell(&id, initial_version, &mut updated_cell);
+    let result = chunks.compare_revision_and_update_cell(&id, initial_version, &mut updated_cell);
     assert!(
         result.is_ok(),
         "Update should succeed with matching version"
@@ -1458,11 +1488,11 @@ pub fn test_compare_version_and_update_cell_success() {
     let stored_cell = chunks.read_cell(&id).unwrap();
     assert_eq!(stored_cell.data["name"].string().unwrap(), "Bob");
     assert_eq!(stored_cell.data["score"].u64().unwrap(), &85);
-    assert_eq!(stored_cell.header.version, initial_version + 1);
+    assert!(stored_cell.header.revision_ts > initial_version);
 }
 
 #[test]
-pub fn test_compare_version_and_update_cell_version_mismatch() {
+pub fn test_compare_revision_and_update_cell_version_mismatch() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
     let id = Id::new(1, 1);
@@ -1470,24 +1500,24 @@ pub fn test_compare_version_and_update_cell_version_mismatch() {
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
-    let initial_version = header.version;
+    let initial_version = header.revision_ts;
 
     // Try to update with FUTURE version (higher than current) - should fail
     let mut updated_cell = create_test_cell(schema.id, &id, "Bob", 85);
     let result =
-        chunks.compare_version_and_update_cell(&id, initial_version + 1, &mut updated_cell);
+        chunks.compare_revision_and_update_cell(&id, initial_version + 1, &mut updated_cell);
     assert!(result.is_err(), "Update should fail with future version");
-    assert_eq!(result.unwrap_err(), WriteError::CellVersionMismatch);
+    assert_eq!(result.unwrap_err(), WriteError::CellRevisionMismatch);
 
     // Verify the cell was NOT updated (atomicity)
     let stored_cell = chunks.read_cell(&id).unwrap();
     assert_eq!(stored_cell.data["name"].string().unwrap(), "Alice");
     assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
-    assert_eq!(stored_cell.header.version, initial_version);
+    assert_eq!(stored_cell.header.revision_ts, initial_version);
 }
 
 #[test]
-pub fn test_compare_version_and_update_cell_stale_version() {
+pub fn test_compare_revision_and_update_cell_stale_version() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
     let id = Id::new(1, 1);
@@ -1495,29 +1525,29 @@ pub fn test_compare_version_and_update_cell_stale_version() {
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
-    let initial_version = header.version;
+    let initial_version = header.revision_ts;
 
     // Perform a successful update to increment version
     let mut updated_cell = create_test_cell(schema.id, &id, "Bob", 80);
     chunks
-        .compare_version_and_update_cell(&id, initial_version, &mut updated_cell)
+        .compare_revision_and_update_cell(&id, initial_version, &mut updated_cell)
         .unwrap();
 
     // Now try to update with STALE version (the old initial_version)
     let mut stale_cell = create_test_cell(schema.id, &id, "Charlie", 90);
-    let result = chunks.compare_version_and_update_cell(&id, initial_version, &mut stale_cell);
+    let result = chunks.compare_revision_and_update_cell(&id, initial_version, &mut stale_cell);
     assert!(result.is_err(), "Update should fail with stale version");
-    assert_eq!(result.unwrap_err(), WriteError::CellVersionMismatch);
+    assert_eq!(result.unwrap_err(), WriteError::CellRevisionMismatch);
 
     // Verify the cell still has Bob's data (stale update was rejected)
     let stored_cell = chunks.read_cell(&id).unwrap();
     assert_eq!(stored_cell.data["name"].string().unwrap(), "Bob");
     assert_eq!(stored_cell.data["score"].u64().unwrap(), &80);
-    assert_eq!(stored_cell.header.version, initial_version + 1);
+    assert!(stored_cell.header.revision_ts > initial_version);
 }
 
 #[test]
-pub fn test_compare_version_and_set_field_success() {
+pub fn test_compare_revision_and_set_field_success() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
     let id = Id::new(1, 1);
@@ -1525,12 +1555,16 @@ pub fn test_compare_version_and_set_field_success() {
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
-    let initial_version = header.version;
+    let initial_version = header.revision_ts;
 
     // Update field with matching version - should succeed
     let score_hash = hash_str("score");
-    let result =
-        chunks.compare_version_and_set_field(&id, initial_version, score_hash, OwnedValue::U64(95));
+    let result = chunks.compare_revision_and_set_field(
+        &id,
+        initial_version,
+        score_hash,
+        OwnedValue::U64(95),
+    );
     assert!(
         result.is_ok(),
         "Field update should succeed with matching version"
@@ -1548,7 +1582,7 @@ pub fn test_compare_version_and_set_field_success() {
         "Alice",
         "Name should remain unchanged"
     );
-    assert_eq!(stored_cell.header.version, initial_version + 1);
+    assert!(stored_cell.header.revision_ts > initial_version);
 }
 
 // ============================================================================
@@ -1556,7 +1590,7 @@ pub fn test_compare_version_and_set_field_success() {
 // ============================================================================
 
 #[test]
-pub fn test_compare_version_sequential_updates() {
+pub fn test_compare_revision_sequential_updates() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
     let id = Id::new(1, 1);
@@ -1564,22 +1598,22 @@ pub fn test_compare_version_sequential_updates() {
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "v1", 10);
     let header = chunks.write_cell(&mut cell).unwrap();
-    let mut current_version = header.version;
+    let mut current_version = header.revision_ts;
 
     // Perform multiple sequential updates, each tracking the new version
     for i in 2..=5 {
         let mut updated_cell = create_test_cell(schema.id, &id, &format!("v{}", i), i * 10);
         let result =
-            chunks.compare_version_and_update_cell(&id, current_version, &mut updated_cell);
+            chunks.compare_revision_and_update_cell(&id, current_version, &mut updated_cell);
         assert!(result.is_ok(), "Update {} should succeed", i);
-        current_version = result.unwrap().version;
+        current_version = result.unwrap().revision_ts;
     }
 
     // Verify final state
     let stored_cell = chunks.read_cell(&id).unwrap();
     assert_eq!(stored_cell.data["name"].string().unwrap(), "v5");
     assert_eq!(stored_cell.data["score"].u64().unwrap(), &50);
-    assert_eq!(stored_cell.header.version, current_version);
+    assert_eq!(stored_cell.header.revision_ts, current_version);
 }
 
 // ============================================================================
@@ -1587,7 +1621,7 @@ pub fn test_compare_version_sequential_updates() {
 // ============================================================================
 
 #[test]
-pub fn test_compare_version_optimistic_retry_pattern() {
+pub fn test_compare_revision_optimistic_retry_pattern() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
     let id = Id::new(1, 1);
@@ -1605,7 +1639,10 @@ pub fn test_compare_version_optimistic_retry_pattern() {
         // Step 1: Read current state
         let (current_score, current_version) = {
             let stored = chunks.read_cell(&id).unwrap();
-            (*stored.data["score"].u64().unwrap(), stored.header.version)
+            (
+                *stored.data["score"].u64().unwrap(),
+                stored.header.revision_ts,
+            )
         };
 
         // Step 2: Compute new value (increment score by 10)
@@ -1613,9 +1650,9 @@ pub fn test_compare_version_optimistic_retry_pattern() {
         let mut updated_cell = create_test_cell(schema.id, &id, "Player", new_score);
 
         // Step 3: Attempt compare-and-swap
-        match chunks.compare_version_and_update_cell(&id, current_version, &mut updated_cell) {
+        match chunks.compare_revision_and_update_cell(&id, current_version, &mut updated_cell) {
             Ok(_) => break, // Success!
-            Err(WriteError::CellVersionMismatch) => {
+            Err(WriteError::CellRevisionMismatch) => {
                 retries += 1;
                 if retries >= max_retries {
                     panic!("Too many retries");
@@ -1634,7 +1671,7 @@ pub fn test_compare_version_optimistic_retry_pattern() {
 }
 
 #[test]
-pub fn test_compare_version_and_set_field_version_mismatch() {
+pub fn test_compare_revision_and_set_field_version_mismatch() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
     let id = Id::new(1, 1);
@@ -1642,11 +1679,11 @@ pub fn test_compare_version_and_set_field_version_mismatch() {
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
     let header = chunks.write_cell(&mut cell).unwrap();
-    let initial_version = header.version;
+    let initial_version = header.revision_ts;
 
     // Try to update field with wrong version - should fail
     let score_hash = hash_str("score");
-    let result = chunks.compare_version_and_set_field(
+    let result = chunks.compare_revision_and_set_field(
         &id,
         initial_version + 1,
         score_hash,
@@ -1656,13 +1693,13 @@ pub fn test_compare_version_and_set_field_version_mismatch() {
         result.is_err(),
         "Field update should fail with mismatched version"
     );
-    assert_eq!(result.unwrap_err(), WriteError::CellVersionMismatch);
+    assert_eq!(result.unwrap_err(), WriteError::CellRevisionMismatch);
 
     // Verify the field was NOT updated (atomicity)
     let stored_cell = chunks.read_cell(&id).unwrap();
     assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
     assert_eq!(stored_cell.data["name"].string().unwrap(), "Alice");
-    assert_eq!(stored_cell.header.version, initial_version);
+    assert_eq!(stored_cell.header.revision_ts, initial_version);
 }
 
 // ============================================================================
@@ -1670,7 +1707,7 @@ pub fn test_compare_version_and_set_field_version_mismatch() {
 // ============================================================================
 
 #[test]
-pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
+pub fn test_compare_revision_and_update_cell_concurrent_atomicity() {
     let _ = env_logger::try_init();
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -1683,7 +1720,7 @@ pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Initial", 0);
     let header = chunks.write_cell(&mut cell).unwrap();
-    let initial_version = header.version;
+    let initial_version = header.revision_ts;
 
     let num_threads = 5;
     let barrier = Arc::new(Barrier::new(num_threads));
@@ -1693,7 +1730,7 @@ pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
 
     // Spawn threads that all try to update with the same version simultaneously.
     // Using a barrier ensures true concurrency (all threads start at the same time).
-    // Only ONE should succeed; others fail with CellVersionMismatch.
+    // Only ONE should succeed; others fail with CellRevisionMismatch.
     let mut handles = vec![];
     for i in 0..num_threads {
         let chunks_clone = chunks.clone();
@@ -1708,7 +1745,7 @@ pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
 
             let mut updated_cell =
                 create_test_cell(schema.id, &id, &format!("Thread{}", i), i as u64);
-            match chunks_clone.compare_version_and_update_cell(
+            match chunks_clone.compare_revision_and_update_cell(
                 &id,
                 initial_version,
                 &mut updated_cell,
@@ -1717,7 +1754,7 @@ pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
                     success_clone.fetch_add(1, Ordering::SeqCst);
                     winner_clone.store(i as u64, Ordering::SeqCst);
                 }
-                Err(WriteError::CellVersionMismatch) => {
+                Err(WriteError::CellRevisionMismatch) => {
                     failure_clone.fetch_add(1, Ordering::SeqCst);
                 }
                 Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1750,11 +1787,11 @@ pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
         stored_cell.data["name"].string().unwrap(),
         format!("Thread{}", winner)
     );
-    assert_eq!(stored_cell.header.version, initial_version + 1);
+    assert!(stored_cell.header.revision_ts > initial_version);
 }
 
 #[test]
-pub fn test_compare_version_and_set_field_concurrent_atomicity() {
+pub fn test_compare_revision_and_set_field_concurrent_atomicity() {
     let _ = env_logger::try_init();
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -1767,7 +1804,7 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Initial", 0);
     let header = chunks.write_cell(&mut cell).unwrap();
-    let initial_version = header.version;
+    let initial_version = header.revision_ts;
 
     let num_threads = 5;
     let barrier = Arc::new(Barrier::new(num_threads));
@@ -1777,7 +1814,7 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
     let score_hash = hash_str("score");
 
     // Spawn threads that all try to set the same field simultaneously.
-    // Only ONE should succeed; others fail with CellVersionMismatch.
+    // Only ONE should succeed; others fail with CellRevisionMismatch.
     let mut handles = vec![];
     for i in 0..num_threads {
         let chunks_clone = chunks.clone();
@@ -1789,7 +1826,7 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
         let handle = thread::spawn(move || {
             barrier_clone.wait();
 
-            match chunks_clone.compare_version_and_set_field(
+            match chunks_clone.compare_revision_and_set_field(
                 &id,
                 initial_version,
                 score_hash,
@@ -1799,7 +1836,7 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
                     success_clone.fetch_add(1, Ordering::SeqCst);
                     winning_clone.store(i as u64, Ordering::SeqCst);
                 }
-                Err(WriteError::CellVersionMismatch) => {
+                Err(WriteError::CellRevisionMismatch) => {
                     failure_clone.fetch_add(1, Ordering::SeqCst);
                 }
                 Err(e) => panic!("Unexpected error: {:?}", e),
@@ -1833,7 +1870,7 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
         "Initial",
         "Name should remain unchanged"
     );
-    assert_eq!(stored_cell.header.version, initial_version + 1);
+    assert!(stored_cell.header.revision_ts > initial_version);
 }
 
 // ============================================================================
@@ -1841,13 +1878,13 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
 // ============================================================================
 
 #[test]
-pub fn test_compare_version_and_update_cell_nonexistent_cell() {
+pub fn test_compare_revision_and_update_cell_nonexistent_cell() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
     let id = Id::new(1, 999); // Non-existent cell
 
     let mut cell = create_test_cell(schema.id, &id, "Test", 70);
-    let result = chunks.compare_version_and_update_cell(&id, 1, &mut cell);
+    let result = chunks.compare_revision_and_update_cell(&id, 1, &mut cell);
 
     assert!(result.is_err(), "Update should fail for non-existent cell");
     match result.unwrap_err() {
@@ -1857,13 +1894,13 @@ pub fn test_compare_version_and_update_cell_nonexistent_cell() {
 }
 
 #[test]
-pub fn test_compare_version_and_set_field_nonexistent_cell() {
+pub fn test_compare_revision_and_set_field_nonexistent_cell() {
     let _ = env_logger::try_init();
     let (chunks, _schema) = setup_test_chunks();
     let id = Id::new(1, 999); // Non-existent cell
 
     let score_hash = hash_str("score");
-    let result = chunks.compare_version_and_set_field(&id, 1, score_hash, OwnedValue::U64(100));
+    let result = chunks.compare_revision_and_set_field(&id, 1, score_hash, OwnedValue::U64(100));
 
     assert!(
         result.is_err(),

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use super::TxnId;
 
 /// Undo log entry stored in the log file
-/// Format: [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][version: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
+/// Format: [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
 ///
 /// The `txn_id` is now a serialized `bifrost::hlc::Hlc` (16-byte fixed HLC),
 /// not the former variable-length vector clock; its serialized byte shape
@@ -26,9 +26,9 @@ use super::TxnId;
 /// error rather than being silently skipped or misparsed. Undo logs from
 /// before the migration must be discarded, not recovered.
 ///
-/// All operations store version for verification during recovery:
-/// - Write: version = new cell version (to verify cell unchanged before deletion)
-/// - Update/Remove: version = old cell version (to verify we're restoring the right version)
+/// All operations store revision_ts for verification during recovery:
+/// - Write: revision_ts = new cell revision_ts (to verify cell unchanged before deletion)
+/// - Update/Remove: revision_ts = old cell revision_ts (to verify we're restoring the right revision_ts)
 ///
 /// Note: seg_id is NOT stored because it's address-derived and changes across recoveries.
 /// Only seq_id is stable across recoveries and sufficient for segment lookup.
@@ -37,10 +37,10 @@ pub struct UndoLogEntry {
     pub txn_id: TxnId,
     pub cell_id: Id,
     pub op_type: UndoOpType,
-    /// Cell version for verification during recovery
-    /// - Write: version of newly created cell
-    /// - Update/Remove: version of old cell before modification
-    pub version: u64,
+    /// Cell revision_ts for verification during recovery
+    /// - Write: revision_ts of newly created cell
+    /// - Update/Remove: revision_ts of old cell before modification
+    pub revision_ts: u64,
     /// For Update/Remove: chunk_id where old cell is located (0 for Write)
     pub chunk_id: u64,
     /// For Update/Remove: seq_id of segment where old cell is located (0 for Write)
@@ -53,9 +53,9 @@ pub struct UndoLogEntry {
 /// Type of operation that needs to be undone
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UndoOpType {
-    Write = 1,  // New cell created - store version, DELETE on rollback if version matches
-    Update = 2, // Cell updated - store old segment location, RESTORE old version on rollback
-    Remove = 3, // Cell removed - store old segment location, RESTORE old version on rollback
+    Write = 1, // New cell created - store revision_ts, DELETE on rollback if revision_ts matches
+    Update = 2, // Cell updated - store old segment location, RESTORE old revision_ts on rollback
+    Remove = 3, // Cell removed - store old segment location, RESTORE old revision_ts on rollback
 }
 
 impl UndoOpType {
@@ -102,7 +102,7 @@ impl UndoLogEntry {
         txn_id: TxnId,
         cell_id: Id,
         op_type: UndoOpType,
-        version: u64,
+        revision_ts: u64,
         chunk_id: u64,
         seq_id: u64,
         cell_offset: u64,
@@ -111,7 +111,7 @@ impl UndoLogEntry {
             txn_id,
             cell_id,
             op_type,
-            version,
+            revision_ts,
             chunk_id,
             seq_id,
             cell_offset,
@@ -119,19 +119,19 @@ impl UndoLogEntry {
     }
 
     /// Helper to create a Write entry (for new cells)
-    /// Only needs version since there's no old segment to restore from
-    pub fn new_write(txn_id: TxnId, cell_id: Id, version: u64) -> Self {
-        Self::new(txn_id, cell_id, UndoOpType::Write, version, 0, 0, 0)
+    /// Only needs revision_ts since there's no old segment to restore from
+    pub fn new_write(txn_id: TxnId, cell_id: Id, revision_ts: u64) -> Self {
+        Self::new(txn_id, cell_id, UndoOpType::Write, revision_ts, 0, 0, 0)
     }
 
-    /// Helper to create an Update/Remove entry (with old cell version, segment seq_id, and offset)
-    /// Stores both the old version for verification and exact segment location for fast restoration
+    /// Helper to create an Update/Remove entry (with old cell revision_ts, segment seq_id, and offset)
+    /// Stores both the old revision_ts for verification and exact segment location for fast restoration
     /// Note: only seq_id is stored, not seg_id, because seg_id changes across recoveries
     pub fn new_restore(
         txn_id: TxnId,
         cell_id: Id,
         op_type: UndoOpType,
-        old_version: u64,
+        old_revision_ts: u64,
         chunk_id: u64,
         seq_id: u64,
         cell_offset: u64,
@@ -144,7 +144,7 @@ impl UndoLogEntry {
             txn_id,
             cell_id,
             op_type,
-            old_version,
+            old_revision_ts,
             chunk_id,
             seq_id,
             cell_offset,
@@ -165,7 +165,7 @@ impl UndoLogEntry {
         bytes.extend_from_slice(&self.cell_id.higher.to_le_bytes());
         bytes.extend_from_slice(&self.cell_id.lower.to_le_bytes());
         bytes.push(self.op_type as u8);
-        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self.revision_ts.to_le_bytes());
         bytes.extend_from_slice(&self.chunk_id.to_le_bytes());
         bytes.extend_from_slice(&self.seq_id.to_le_bytes());
         bytes.extend_from_slice(&self.cell_offset.to_le_bytes());
@@ -191,7 +191,7 @@ impl UndoLogEntry {
         }
 
         let txn_id_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        // Removed seg_id field: +1 for op_type, +8 for version, +8 for chunk_id, +8 for seq_id, +8 for cell_offset = 33 + 16 (cell_id) = 49
+        // Removed seg_id field: +1 for op_type, +8 for revision_ts, +8 for chunk_id, +8 for seq_id, +8 for cell_offset = 33 + 16 (cell_id) = 49
         if bytes.len() < 5 + txn_id_len + 49 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -229,7 +229,7 @@ impl UndoLogEntry {
         let op_type = UndoOpType::from_u8(bytes[offset])?;
         offset += 1;
 
-        let version = u64::from_le_bytes([
+        let revision_ts = u64::from_le_bytes([
             bytes[offset],
             bytes[offset + 1],
             bytes[offset + 2],
@@ -289,7 +289,7 @@ impl UndoLogEntry {
                     lower: cell_id_lower,
                 },
                 op_type,
-                version,
+                revision_ts,
                 chunk_id,
                 seq_id,
                 cell_offset,
@@ -482,7 +482,7 @@ impl UndoLogger {
             for entry in entries {
                 match entry.op_type {
                     UndoOpType::Write => {
-                        // Delete new cell if it still has the logged version
+                        // Delete new cell if it still has the logged revision_ts
                         if let Err(e) = self.rollback_write(entry, chunks) {
                             error!(
                                 "Failed to rollback write for cell {:?}: {:?}",
@@ -519,11 +519,11 @@ impl UndoLogger {
         Ok(())
     }
 
-    /// Rollback a Write operation by deleting the new cell if version matches
+    /// Rollback a Write operation by deleting the new cell if revision_ts matches
     fn rollback_write(&self, entry: &UndoLogEntry, chunks: &Arc<Chunks>) -> io::Result<()> {
         debug!(
-            "Rolling back Write: cell_id={:?}, version={}",
-            entry.cell_id, entry.version
+            "Rolling back Write: cell_id={:?}, revision_ts={}",
+            entry.cell_id, entry.revision_ts
         );
 
         // Locate the chunk for this cell
@@ -551,13 +551,13 @@ impl UndoLogger {
             // Read just the header without needing the schema
             // This is safe because the header is always at a fixed offset
             let header = cell_header_from_entry_content_addr(content_addr);
-            let current_version = header.version;
+            let current_revision_ts = header.revision_ts;
 
-            // Only delete if version matches (cell hasn't been modified since transaction)
-            if current_version == entry.version {
+            // Only delete if revision_ts matches (cell hasn't been modified since transaction)
+            if current_revision_ts == entry.revision_ts {
                 debug!(
-                    "Deleting new cell {:?} with version {}",
-                    entry.cell_id, entry.version
+                    "Deleting new cell {:?} with revision_ts {}",
+                    entry.cell_id, entry.revision_ts
                 );
 
                 // Use remove_cell which handles tombstone creation
@@ -566,8 +566,8 @@ impl UndoLogger {
                 }
             } else {
                 debug!(
-                    "Cell {:?} version mismatch (current={}, logged={}), skipping delete",
-                    entry.cell_id, current_version, entry.version
+                    "Cell {:?} revision_ts mismatch (current={}, logged={}), skipping delete",
+                    entry.cell_id, current_revision_ts, entry.revision_ts
                 );
             }
         } else {
@@ -583,10 +583,10 @@ impl UndoLogger {
     /// Rollback an Update or Remove operation by restoring the old cell from segment memory
     fn rollback_restore(&self, entry: &UndoLogEntry, chunks: &Arc<Chunks>) -> io::Result<()> {
         debug!(
-            "Rolling back {:?}: cell_id={:?}, version={}, from chunk={}, seq={}, offset={}",
+            "Rolling back {:?}: cell_id={:?}, revision_ts={}, from chunk={}, seq={}, offset={}",
             entry.op_type,
             entry.cell_id,
-            entry.version,
+            entry.revision_ts,
             entry.chunk_id,
             entry.seq_id,
             entry.cell_offset
@@ -596,7 +596,7 @@ impl UndoLogger {
         let chunk = &chunks.list[entry.chunk_id as usize];
 
         // For Remove operations, verify the cell is actually gone before restoring
-        // For Update operations, we'll verify version matches in read_cell_from_address
+        // For Update operations, we'll verify revision_ts matches in read_cell_from_address
         if entry.op_type == UndoOpType::Remove {
             // Check if cell exists in the index by trying to read it
             if let Ok(cell_ref) = chunks.read_cell(&entry.cell_id) {
@@ -637,19 +637,24 @@ impl UndoLogger {
 
         // Directly read the old cell from the specified offset (no scanning needed!)
         let cell_addr = segment.addr + entry.cell_offset as usize;
-        // For Remove operations, skip hash/version verification (cell is gone)
-        // For Update operations, verify version matches
+        // For Remove operations, skip hash/revision_ts verification (cell is gone)
+        // For Update operations, verify revision_ts matches
         let verify = entry.op_type != UndoOpType::Remove;
-        let old_cell =
-            self.read_cell_from_address(cell_addr, chunk, &entry.cell_id, entry.version, verify)?;
+        let old_cell = self.read_cell_from_address(
+            cell_addr,
+            chunk,
+            &entry.cell_id,
+            entry.revision_ts,
+            verify,
+        )?;
 
-        // Restore the old cell's DATA with a NEW version number
-        // The upsert will automatically assign a new, higher version
+        // Restore the old cell's DATA with a NEW revision_ts number
+        // The upsert will automatically assign a new, higher revision_ts
         match entry.op_type {
             UndoOpType::Remove => {
-                // Cell was removed by the transaction - restore it with its old data but new version
+                // Cell was removed by the transaction - restore it with its old data but new revision_ts
                 debug!(
-                    "Restoring removed cell {:?} (old data with new version)",
+                    "Restoring removed cell {:?} (old data with new revision_ts)",
                     entry.cell_id
                 );
                 if let Err(e) = chunks.upsert_cell(&mut old_cell.clone()) {
@@ -657,10 +662,10 @@ impl UndoLogger {
                 }
             }
             UndoOpType::Update => {
-                // Cell was updated by the transaction - restore old data with new version
+                // Cell was updated by the transaction - restore old data with new revision_ts
                 // Use upsert_cell to handle both cases (cell exists or was deleted by another txn)
                 debug!(
-                    "Restoring old data for cell {:?} (old data with new version)",
+                    "Restoring old data for cell {:?} (old data with new revision_ts)",
                     entry.cell_id
                 );
                 if let Err(e) = chunks.upsert_cell(&mut old_cell.clone()) {
@@ -679,14 +684,14 @@ impl UndoLogger {
     /// * `cell_addr` - Memory address of the entry (not content address)
     /// * `chunk` - The chunk containing the cell
     /// * `cell_id` - Expected cell ID (for verification)
-    /// * `expected_version` - Expected cell version (for verification if verify=true)
-    /// * `verify` - If true, verify hash and version match; if false, skip verification
+    /// * `expected_revision_ts` - Expected cell revision_ts (for verification if verify=true)
+    /// * `verify` - If true, verify hash and revision_ts match; if false, skip verification
     fn read_cell_from_address(
         &self,
         cell_addr: usize,
         chunk: &crate::ram::chunk::Chunk,
         cell_id: &Id,
-        expected_version: u64,
+        expected_revision_ts: u64,
         verify: bool,
     ) -> io::Result<OwnedCell> {
         // Read cell header from the entry content address
@@ -713,20 +718,20 @@ impl UndoLogger {
                 ));
             }
 
-            if cell_header.version != expected_version {
+            if cell_header.revision_ts != expected_revision_ts {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "Cell version mismatch at offset: expected {}, found {}",
-                        expected_version, cell_header.version
+                        "Cell revision_ts mismatch at offset: expected {}, found {}",
+                        expected_revision_ts, cell_header.revision_ts
                     ),
                 ));
             }
         }
 
         debug!(
-            "Reading cell from offset: hash={}, version={}, schema={}, verify={}",
-            cell_header.hash, cell_header.version, cell_header.schema, verify
+            "Reading cell from offset: hash={}, revision_ts={}, schema={}, verify={}",
+            cell_header.hash, cell_header.revision_ts, cell_header.schema, verify
         );
 
         // Get schema to deserialize data
@@ -894,8 +899,7 @@ impl UndoLogger {
                     break;
                 }
 
-                let txn_id: TxnId =
-                    decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])?;
+                let txn_id: TxnId = decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])?;
 
                 match entry_type {
                     ENTRY_TYPE_UNDO => {
@@ -939,9 +943,9 @@ impl UndoLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::transactions::test_hlc;
     use crate::ram::cell::ReadError;
     use crate::ram::types::{OwnedMap, OwnedValue};
+    use crate::server::transactions::test_hlc;
     use crate::server::transactions::{EndResult, TMPrepareResult, TxnExecResult};
     use dovahkiin::data_map_value;
     use dovahkiin::types::Map;
@@ -975,7 +979,7 @@ mod tests {
         assert_eq!(size, bytes.len());
         assert_eq!(recovered.cell_id, entry.cell_id);
         assert_eq!(recovered.op_type, entry.op_type);
-        assert_eq!(recovered.version, entry.version);
+        assert_eq!(recovered.revision_ts, entry.revision_ts);
         assert_eq!(recovered.chunk_id, entry.chunk_id);
         assert_eq!(recovered.seq_id, entry.seq_id);
     }
@@ -1099,7 +1103,7 @@ mod tests {
         let entries = txn_index.get(&txn1).cloned().unwrap_or_default();
         assert_eq!(entries.len(), 1, "Should have 1 undo entry before commit");
         assert_eq!(entries[0].op_type, UndoOpType::Write);
-        assert_eq!(entries[0].version, 1);
+        assert_eq!(entries[0].revision_ts, 1);
 
         // Commit the transaction
         undo_log.write_commit_marker(&txn1).unwrap();
@@ -1244,18 +1248,18 @@ mod tests {
         // Verify entry details
         assert_eq!(entries[0].cell_id, cell_id1);
         assert_eq!(entries[0].op_type, UndoOpType::Write);
-        assert_eq!(entries[0].version, 1);
+        assert_eq!(entries[0].revision_ts, 1);
 
         assert_eq!(entries[1].cell_id, cell_id2);
         assert_eq!(entries[1].op_type, UndoOpType::Update);
-        assert_eq!(entries[1].version, 3);
+        assert_eq!(entries[1].revision_ts, 3);
         assert_eq!(entries[1].chunk_id, 0);
         // Removed seg_id assertion
         assert_eq!(entries[1].seq_id, 500);
 
         assert_eq!(entries[2].cell_id, cell_id3);
         assert_eq!(entries[2].op_type, UndoOpType::Remove);
-        assert_eq!(entries[2].version, 7);
+        assert_eq!(entries[2].revision_ts, 7);
         assert_eq!(entries[2].chunk_id, 1);
         // Removed seg_id assertion
         assert_eq!(entries[2].seq_id, 750);
@@ -1326,7 +1330,7 @@ mod tests {
         // Hand-assemble one undo entry, framed exactly like
         // UndoLogEntry::to_bytes() frames a new one:
         // [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id.higher: u64]
-        // [cell_id.lower: u64][op_type: u8][version: u64][chunk_id: u64]
+        // [cell_id.lower: u64][op_type: u8][revision_ts: u64][chunk_id: u64]
         // [seq_id: u64][cell_offset: u64]
         let mut bytes = Vec::new();
         bytes.push(ENTRY_TYPE_UNDO);
@@ -1335,7 +1339,7 @@ mod tests {
         bytes.extend_from_slice(&1u64.to_le_bytes()); // cell_id.higher
         bytes.extend_from_slice(&2u64.to_le_bytes()); // cell_id.lower
         bytes.push(UndoOpType::Write as u8);
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // version
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // revision_ts
         bytes.extend_from_slice(&0u64.to_le_bytes()); // chunk_id
         bytes.extend_from_slice(&0u64.to_le_bytes()); // seq_id
         bytes.extend_from_slice(&0u64.to_le_bytes()); // cell_offset
@@ -1736,7 +1740,7 @@ mod tests {
     }
 
     /// Test end-to-end: Version verification for different operation types
-    /// Verifies that all operations correctly store and retrieve version information
+    /// Verifies that all operations correctly store and retrieve revision_ts information
     #[test]
     fn test_e2e_version_verification() {
         let temp_dir = TempDir::new().unwrap();
@@ -1745,7 +1749,7 @@ mod tests {
         let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
         let txn = TxnId::default();
 
-        // Write operation: version is the new cell's version
+        // Write operation: revision_ts is the new cell's revision_ts
         let write_entry = UndoLogEntry::new_write(
             txn.clone(),
             Id {
@@ -1756,7 +1760,7 @@ mod tests {
         );
         undo_log.write_undo_entry(write_entry).unwrap();
 
-        // Update operation: version is the old cell's version
+        // Update operation: revision_ts is the old cell's revision_ts
         // Removed seg_id parameter
         let update_entry = UndoLogEntry::new_restore(
             txn.clone(),
@@ -1765,14 +1769,14 @@ mod tests {
                 lower: 2,
             },
             UndoOpType::Update,
-            20,   // old version
+            20,   // old revision_ts
             0,    // chunk_id
             1000, // seq_id
             50,   // cell_offset
         );
         undo_log.write_undo_entry(update_entry).unwrap();
 
-        // Remove operation: version is the old cell's version
+        // Remove operation: revision_ts is the old cell's revision_ts
         // Removed seg_id parameter
         let remove_entry = UndoLogEntry::new_restore(
             txn.clone(),
@@ -1781,7 +1785,7 @@ mod tests {
                 lower: 3,
             },
             UndoOpType::Remove,
-            30,   // old version
+            30,   // old revision_ts
             1,    // chunk_id
             2000, // seq_id
             100,  // cell_offset
@@ -1796,21 +1800,21 @@ mod tests {
 
         // Verify Write entry
         assert_eq!(entries[0].op_type, UndoOpType::Write);
-        assert_eq!(entries[0].version, 10);
+        assert_eq!(entries[0].revision_ts, 10);
         assert_eq!(entries[0].chunk_id, 0);
         // Removed seg_id assertions
         assert_eq!(entries[0].seq_id, 0);
 
         // Verify Update entry
         assert_eq!(entries[1].op_type, UndoOpType::Update);
-        assert_eq!(entries[1].version, 20);
+        assert_eq!(entries[1].revision_ts, 20);
         assert_eq!(entries[1].chunk_id, 0);
         // Removed seg_id assertion
         assert_eq!(entries[1].seq_id, 1000);
 
         // Verify Remove entry
         assert_eq!(entries[2].op_type, UndoOpType::Remove);
-        assert_eq!(entries[2].version, 30);
+        assert_eq!(entries[2].revision_ts, 30);
         assert_eq!(entries[2].chunk_id, 1);
         // Removed seg_id assertion
         assert_eq!(entries[2].seq_id, 2000);
@@ -1883,7 +1887,7 @@ mod tests {
             // Log the write as incomplete transaction
             let undo_log = UndoLogger::new(log_dir.to_str().unwrap().to_string()).unwrap();
             let txn_id = test_hlc(1, 1);
-            let entry = UndoLogEntry::new_write(txn_id, cell_id, cell.header.version);
+            let entry = UndoLogEntry::new_write(txn_id, cell_id, cell.header.revision_ts);
             undo_log.write_undo_entry(entry).unwrap();
             // No commit marker - simulate crash
         }
@@ -1927,8 +1931,8 @@ mod tests {
     // renumbering across recovery cycles. The E2E tests use actual transaction clients and
     // provide better coverage of the real-world rollback scenarios.
 
-    /// Test: Rollback restores old data with new version
-    /// Verifies that rollback restores the old cell data but with a new, incremented version
+    /// Test: Rollback restores old data with new revision_ts
+    /// Verifies that rollback restores the old cell data but with a new, incremented revision_ts
     #[test]
     fn test_rollback_with_new_version() {
         let _ = env_logger::builder()
@@ -1958,7 +1962,7 @@ mod tests {
         let undo_log = UndoLogger::new(log_dir.to_str().unwrap().to_string()).unwrap();
 
         println!("=== Step 1: Create initial cell ===");
-        // Create a cell with initial version
+        // Create a cell with initial revision_ts
         let cell_id = Id {
             higher: 1,
             lower: 100,
@@ -1969,8 +1973,8 @@ mod tests {
             data_map_value!(id: 1i32, value: "v1".to_string()),
         );
         chunks.write_cell(&mut cell).unwrap();
-        let initial_version = cell.header.version;
-        println!("Created cell with version {}", initial_version);
+        let initial_revision_ts = cell.header.revision_ts;
+        println!("Created cell with revision_ts {}", initial_revision_ts);
 
         // Get cell location for undo log
         let chunk = chunks.locate_chunk_by_partition(cell_id.higher);
@@ -1993,7 +1997,7 @@ mod tests {
             txn_id.clone(),
             cell_id,
             UndoOpType::Update,
-            initial_version, // old version before transaction
+            initial_revision_ts, // old revision_ts before transaction
             chunk.id as u64,
             seq_id,
             cell_offset,
@@ -2011,11 +2015,11 @@ mod tests {
             .unwrap();
         println!("Rollback complete!");
 
-        // Verify cell has been rolled back - the old data restored with a new version
+        // Verify cell has been rolled back - the old data restored with a new revision_ts
         let after_rollback = chunks.read_cell(&cell_id).unwrap();
         assert!(
-            after_rollback.header.version >= initial_version,
-            "Rollback should use a new version (>= initial version)"
+            after_rollback.header.revision_ts >= initial_revision_ts,
+            "Rollback should use a new revision_ts (>= initial revision_ts)"
         );
         assert_eq!(
             after_rollback.data["value"].string().unwrap(),
@@ -2057,6 +2061,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
                 db_size: SEGMENT_SIZE * 4,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2140,6 +2145,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
                 db_size: SEGMENT_SIZE * 4,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2209,6 +2215,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
                 db_size: SEGMENT_SIZE * 4,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2317,6 +2324,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
                 db_size: SEGMENT_SIZE * 4,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2380,6 +2388,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
                 db_size: SEGMENT_SIZE * 4,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2472,6 +2481,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
                 db_size: SEGMENT_SIZE * 4,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2528,6 +2538,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
                 db_size: SEGMENT_SIZE * 4,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
@@ -2606,6 +2617,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
                 db_size: SEGMENT_SIZE * 4,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),

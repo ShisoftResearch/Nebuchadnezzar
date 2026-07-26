@@ -22,11 +22,11 @@ use super::{
 };
 
 // Schema for segmented posting lists
-// Each posting entry includes: (doc_id, version, term_freq, doc_length)
-// The version allows filtering stale entries and garbage collection
+// Each posting entry includes: (doc_id, revision_ts, term_freq, doc_length)
+// The revision timestamp allows filtering stale entries and garbage collection.
 const INVERTED_SEGMENT_SCHEMA: &str = "INVERTED_SEGMENT_V2";
 const SEGMENT_DOC_IDS_FIELD: &str = "doc_ids";
-const SEGMENT_VERSIONS_FIELD: &str = "versions"; // Cell version for each entry
+const SEGMENT_REVISIONS_FIELD: &str = "versions";
 const SEGMENT_TERM_FREQS_FIELD: &str = "term_freqs";
 const SEGMENT_DOC_LENGTHS_FIELD: &str = "doc_lengths";
 const SEGMENT_NEXT_FIELD: &str = "_next";
@@ -34,7 +34,7 @@ const SEGMENT_NEXT_FIELD: &str = "_next";
 lazy_static! {
     pub static ref INVERTED_SEGMENT_SCHEMA_ID: u32 = hash_str(INVERTED_SEGMENT_SCHEMA) as u32;
     static ref SEGMENT_DOC_IDS_FIELD_ID: u64 = hash_str(SEGMENT_DOC_IDS_FIELD);
-    static ref SEGMENT_VERSIONS_FIELD_ID: u64 = hash_str(SEGMENT_VERSIONS_FIELD);
+    static ref SEGMENT_REVISIONS_FIELD_ID: u64 = hash_str(SEGMENT_REVISIONS_FIELD);
     static ref SEGMENT_TERM_FREQS_FIELD_ID: u64 = hash_str(SEGMENT_TERM_FREQS_FIELD);
     static ref SEGMENT_DOC_LENGTHS_FIELD_ID: u64 = hash_str(SEGMENT_DOC_LENGTHS_FIELD);
     static ref SEGMENT_NEXT_FIELD_ID: u64 = hash_str(SEGMENT_NEXT_FIELD);
@@ -48,7 +48,7 @@ pub fn inverted_segment_schema() -> Schema {
         Field::new_schema(vec![
             Field::new_unindexed(SEGMENT_NEXT_FIELD, dovahkiin::types::Type::Id),
             Field::new_unindexed_array(SEGMENT_DOC_IDS_FIELD, dovahkiin::types::Type::Id),
-            Field::new_unindexed_array(SEGMENT_VERSIONS_FIELD, dovahkiin::types::Type::U64),
+            Field::new_unindexed_array(SEGMENT_REVISIONS_FIELD, dovahkiin::types::Type::U64),
             Field::new_unindexed_array(SEGMENT_TERM_FREQS_FIELD, dovahkiin::types::Type::U32),
             Field::new_unindexed_array(SEGMENT_DOC_LENGTHS_FIELD, dovahkiin::types::Type::U32),
         ]),
@@ -195,14 +195,14 @@ impl SegmentedPostingList {
     }
 
     /// Append a posting to the segmented list in a specific Chunk
-    /// The version is stored with the entry for filtering stale data and GC
+    /// The revision timestamp is stored with the entry for filtering stale data and GC
     /// partition: used to generate segment IDs that route to the correct chunk after recovery
     fn append(
         &self,
         chunk: &Chunk,
         partition: u64,
         doc_id: Id,
-        version: u64,
+        revision_ts: u64,
         tf: u32,
         doc_len: u32,
     ) -> Result<(), IndexError> {
@@ -211,14 +211,14 @@ impl SegmentedPostingList {
 
         // Try to read existing head segment from this Chunk
         let mut head_guard = chunk.lock_or_insert_cell(head_hash);
-        let (mut segment, head_version) = if !head_guard.is_unassigned() {
+        let (mut segment, head_revision_ts) = if !head_guard.is_unassigned() {
             let owned_cell = head_guard
                 .read_cell_owned()
                 .map_err(|e| IndexError::Other(format!("Failed to read head segment: {:?}", e)))?;
-            let version = owned_cell.header().version;
+            let revision_ts = owned_cell.header().revision_ts;
             let seg = PostingSegment::from_cell(&owned_cell)
                 .ok_or_else(|| IndexError::Other("Failed to parse head segment".to_string()))?;
-            (seg, version)
+            (seg, revision_ts)
         } else {
             (PostingSegment::new(), 0)
         };
@@ -228,24 +228,23 @@ impl SegmentedPostingList {
             // Generate unique ID for overflow segment using random nonce
             let overflow_id = self.random_segment_id(partition);
 
-            // Move current head content (with its chain) to NEW overflow cell (version starts at 0)
+            // Move current head content (with its chain) to a new overflow cell.
             let mut overflow_cell = segment.to_cell(&overflow_id);
             chunk.upsert_cell(&mut overflow_cell).map_err(|e| {
                 IndexError::Other(format!("Failed to write overflow segment: {:?}", e))
             })?;
 
-            // Update head with new posting, pointing to overflow (preserve version for increment)
+            // Update the head with a new posting, pointing to the overflow segment.
             let mut new_head = PostingSegment::new();
-            new_head.add(doc_id, version, tf, doc_len);
+            new_head.add(doc_id, revision_ts, tf, doc_len);
             new_head.next = Some(overflow_id);
-            let mut head_cell = new_head.to_cell_with_version(&head_id, head_version);
+            let mut head_cell = new_head.to_cell_with_revision(&head_id, head_revision_ts);
             head_guard.upsert_cell(&mut head_cell).map_err(|e| {
                 IndexError::Other(format!("Failed to update head segment: {:?}", e))
             })?;
         } else {
-            // Append to existing head (preserve version for increment)
-            segment.add(doc_id, version, tf, doc_len);
-            let mut cell = segment.to_cell_with_version(&head_id, head_version);
+            segment.add(doc_id, revision_ts, tf, doc_len);
+            let mut cell = segment.to_cell_with_revision(&head_id, head_revision_ts);
             head_guard
                 .upsert_cell(&mut cell)
                 .map_err(|e| IndexError::Other(format!("Failed to update segment: {:?}", e)))?;
@@ -275,7 +274,7 @@ impl SegmentedPostingList {
     }
 
     /// Iterate through all postings in this Chunk's posting list for this term
-    /// Returns: (doc_id, version, term_freq, doc_length)
+    /// Returns: (doc_id, revision_ts, term_freq, doc_length)
     /// chunk_index: used to identify posting lists stored in this chunk
     fn iterate(
         &self,
@@ -308,12 +307,12 @@ impl SegmentedPostingList {
 }
 
 /// Posting segment stored in a cell
-/// Each entry contains: (doc_id, version, term_freq, doc_length)
-/// The version is used to filter stale entries and enable garbage collection
+/// Each entry contains: (doc_id, revision_ts, term_freq, doc_length)
+/// The revision timestamp is used to filter stale entries and enable garbage collection.
 struct PostingSegment {
     next: Option<Id>,
     doc_ids: Vec<Id>,
-    versions: Vec<u64>, // Cell version when entry was created
+    revision_timestamps: Vec<u64>,
     term_freqs: Vec<u32>,
     doc_lengths: Vec<u32>,
 }
@@ -323,7 +322,7 @@ impl PostingSegment {
         Self {
             next: None,
             doc_ids: Vec::new(),
-            versions: Vec::new(),
+            revision_timestamps: Vec::new(),
             term_freqs: Vec::new(),
             doc_lengths: Vec::new(),
         }
@@ -333,9 +332,9 @@ impl PostingSegment {
         self.doc_ids.len() >= SegmentedPostingList::MAX_SEGMENT_SIZE
     }
 
-    fn add(&mut self, doc_id: Id, version: u64, tf: u32, doc_len: u32) {
+    fn add(&mut self, doc_id: Id, revision_ts: u64, tf: u32, doc_len: u32) {
         self.doc_ids.push(doc_id);
-        self.versions.push(version);
+        self.revision_timestamps.push(revision_ts);
         self.term_freqs.push(tf);
         self.doc_lengths.push(doc_len);
     }
@@ -357,9 +356,10 @@ impl PostingSegment {
         if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = &data[*SEGMENT_DOC_IDS_FIELD_ID] {
             segment.doc_ids = ids.clone();
         }
-        if let OwnedValue::PrimArray(OwnedPrimArray::U64(vers)) = &data[*SEGMENT_VERSIONS_FIELD_ID]
+        if let OwnedValue::PrimArray(OwnedPrimArray::U64(revisions)) =
+            &data[*SEGMENT_REVISIONS_FIELD_ID]
         {
-            segment.versions = vers.clone();
+            segment.revision_timestamps = revisions.clone();
         }
         if let OwnedValue::PrimArray(OwnedPrimArray::U32(tfs)) = &data[*SEGMENT_TERM_FREQS_FIELD_ID]
         {
@@ -371,9 +371,9 @@ impl PostingSegment {
             segment.doc_lengths = lengths.clone();
         }
 
-        // Handle old schema without versions (backwards compatibility)
-        if segment.versions.is_empty() && !segment.doc_ids.is_empty() {
-            segment.versions = vec![0; segment.doc_ids.len()];
+        // Handle old schema records that predate posting revision metadata.
+        if segment.revision_timestamps.is_empty() && !segment.doc_ids.is_empty() {
+            segment.revision_timestamps = vec![0; segment.doc_ids.len()];
         }
 
         Some(segment)
@@ -393,8 +393,8 @@ impl PostingSegment {
             OwnedValue::PrimArray(OwnedPrimArray::Id(self.doc_ids.clone())),
         );
         data.insert_key_id(
-            *SEGMENT_VERSIONS_FIELD_ID,
-            OwnedValue::PrimArray(OwnedPrimArray::U64(self.versions.clone())),
+            *SEGMENT_REVISIONS_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::U64(self.revision_timestamps.clone())),
         );
         data.insert_key_id(
             *SEGMENT_TERM_FREQS_FIELD_ID,
@@ -405,12 +405,11 @@ impl PostingSegment {
             OwnedValue::PrimArray(OwnedPrimArray::U32(self.doc_lengths.clone())),
         );
 
-        // Create cell with version 0 - storage layer will increment to 1 on write
         OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data))
     }
 
-    /// Convert to cell for updating an existing cell (preserves version for proper incrementing)
-    fn to_cell_with_version(&self, id: &Id, current_version: u64) -> OwnedCell {
+    /// Convert to a cell while preserving its current revision as the write predecessor.
+    fn to_cell_with_revision(&self, id: &Id, current_revision_ts: u64) -> OwnedCell {
         let mut data = OwnedMap::new();
 
         if let Some(next_id) = self.next {
@@ -424,8 +423,8 @@ impl PostingSegment {
             OwnedValue::PrimArray(OwnedPrimArray::Id(self.doc_ids.clone())),
         );
         data.insert_key_id(
-            *SEGMENT_VERSIONS_FIELD_ID,
-            OwnedValue::PrimArray(OwnedPrimArray::U64(self.versions.clone())),
+            *SEGMENT_REVISIONS_FIELD_ID,
+            OwnedValue::PrimArray(OwnedPrimArray::U64(self.revision_timestamps.clone())),
         );
         data.insert_key_id(
             *SEGMENT_TERM_FREQS_FIELD_ID,
@@ -436,22 +435,22 @@ impl PostingSegment {
             OwnedValue::PrimArray(OwnedPrimArray::U32(self.doc_lengths.clone())),
         );
 
-        // Preserve current version so storage layer increments correctly
+        // Preserve the predecessor so the storage layer allocates a newer revision.
         let mut cell =
             OwnedCell::new_with_id(*INVERTED_SEGMENT_SCHEMA_ID, id, OwnedValue::Map(data));
-        cell.header.version = current_version;
+        cell.header.revision_ts = current_revision_ts;
         cell
     }
 
-    /// Iterate all entries: (doc_id, version, term_freq, doc_length)
+    /// Iterate all entries: (doc_id, revision_ts, term_freq, doc_length)
     fn iter(&self) -> impl Iterator<Item = (Id, u64, u32, u32)> + '_ {
         self.doc_ids
             .iter()
             .cloned()
-            .zip(self.versions.iter().cloned())
+            .zip(self.revision_timestamps.iter().cloned())
             .zip(self.term_freqs.iter().cloned())
             .zip(self.doc_lengths.iter().cloned())
-            .map(|(((doc_id, version), tf), len)| (doc_id, version, tf, len))
+            .map(|(((doc_id, revision_ts), tf), len)| (doc_id, revision_ts, tf, len))
     }
 }
 
@@ -566,7 +565,7 @@ impl InvertedIndexer {
         let chunk = &self.chunks.list[chunk_index];
 
         // Update posting lists in this Chunk (write directly, no caching)
-        // Each entry includes the cell version for filtering stale entries
+        // Each entry includes the cell revision for filtering stale entries.
         // Use chunk_index as the partition for posting list IDs (for proper recovery)
         for token in &meta.tokens {
             let seg_list =
@@ -575,7 +574,7 @@ impl InvertedIndexer {
                 chunk,
                 chunk_index as u64,
                 meta.cell_id,
-                meta.version,
+                meta.revision_ts,
                 token.term_freq,
                 meta.doc_length,
             )?;
@@ -739,7 +738,7 @@ impl InvertedIndexer {
         // Iterate all Chunks and collect postings from each
         for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
             if let Ok(postings) = seg_list.iterate(chunk, chunk_index as u64) {
-                for (doc_id, _version, tf, doc_len) in postings {
+                for (doc_id, _revision_ts, tf, doc_len) in postings {
                     all_postings.push((doc_id, tf, doc_len));
                 }
             }
@@ -748,8 +747,8 @@ impl InvertedIndexer {
         all_postings
     }
 
-    /// Get postings with version information (for GC or verified search)
-    pub fn get_term_postings_with_version(
+    /// Get postings with revision information (for GC or verified search).
+    pub fn get_term_postings_with_revision(
         &self,
         schema_id: u32,
         field_id: u64,
@@ -1018,8 +1017,8 @@ impl InvertedIndexer {
 
     /// Garbage collect stale posting entries
     ///
-    /// Scans posting lists and removes entries where the stored version doesn't match
-    /// the current cell version (indicating the document was updated or removed).
+    /// Scans posting lists and removes entries whose stored revision does not match
+    /// the current cell revision (indicating the document was updated or removed).
     ///
     /// Parameters:
     /// - `schema_id`: Schema to GC (or all if None)
@@ -1078,25 +1077,23 @@ impl InvertedIndexer {
             // Read the current posting list
             match head_guard.read_cell_owned() {
                 Ok(cell) => {
-                    let cell_version = cell.header().version;
+                    let cell_revision_ts = cell.header().revision_ts;
                     if let Some(segment) = PostingSegment::from_cell(&cell) {
                         let mut new_segment = PostingSegment::new();
                         new_segment.next = segment.next;
 
                         let mut chunk_removed = 0usize;
 
-                        // Filter entries: keep only those with matching version
-                        for (doc_id, version, tf, doc_len) in segment.iter() {
+                        // Keep only postings matching the current document revision.
+                        for (doc_id, revision_ts, tf, doc_len) in segment.iter() {
                             total_scanned += 1;
 
-                            // Check if this entry's version matches current cell version
+                            // Check whether this posting matches the current cell revision.
                             match chunk.head_cell(doc_id.lower) {
                                 Ok(doc_header) => {
-                                    if doc_header.version == version {
-                                        // Version matches, keep this entry
-                                        new_segment.add(doc_id, version, tf, doc_len);
+                                    if doc_header.revision_ts == revision_ts {
+                                        new_segment.add(doc_id, revision_ts, tf, doc_len);
                                     } else {
-                                        // Version mismatch, remove (don't add to new segment)
                                         chunk_removed += 1;
                                     }
                                 }
@@ -1111,9 +1108,8 @@ impl InvertedIndexer {
 
                         // Write back the cleaned segment if anything was removed from this chunk
                         if chunk_removed > 0 {
-                            // Preserve cell version for proper incrementing
                             let mut new_cell =
-                                new_segment.to_cell_with_version(&head_id, cell_version);
+                                new_segment.to_cell_with_revision(&head_id, cell_revision_ts);
                             head_guard.update_cell(&mut new_cell).map_err(|e| {
                                 IndexError::Other(format!("Failed to write GC'd segment: {:?}", e))
                             })?;
@@ -1192,20 +1188,20 @@ mod tests {
         doc_id: Id,
         text: &str,
     ) -> FullTextIndexMeta {
-        create_test_meta_with_version(schema_id, field_id, doc_id, text, 1)
+        create_test_meta_with_revision(schema_id, field_id, doc_id, text, 1)
     }
 
-    // Helper to create test document metadata with specific version
-    fn create_test_meta_with_version(
+    // Helper to create test document metadata with a specific revision.
+    fn create_test_meta_with_revision(
         schema_id: u32,
         field_id: u64,
         doc_id: Id,
         text: &str,
-        version: u64,
+        revision_ts: u64,
     ) -> FullTextIndexMeta {
         crate::index::full_text::build_index_meta(
             doc_id,
-            version,
+            revision_ts,
             schema_id,
             field_id,
             OwnedValue::String(text.to_string()),
@@ -1305,6 +1301,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1429,6 +1426,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1595,6 +1593,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1796,6 +1795,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1949,6 +1949,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2059,6 +2060,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2169,6 +2171,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2255,6 +2258,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 32 * 1024 * 1024, // Multiple chunks to test per-chunk behavior
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2334,6 +2338,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024, // 64MB
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -2544,6 +2549,7 @@ mod tests {
                 &crate::server::ServerOptions {
                     chunk_size: 64 * 1024 * 1024,
                     db_size: 64 * 1024 * 1024,
+                    history_retention_ms: 300_000,
                     tiered_config: None,
                     backup_storage: None,
                     wal_storage: None,
@@ -2765,6 +2771,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024, // 64MB
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -2996,8 +3003,12 @@ mod tests {
         info!("Attempting to read stats cell before archiving...");
         match server1.chunks().read_cell(&stats_id) {
             Ok(cell) => {
-                info!("SUCCESS: Stats cell readable before archiving! partition={}, hash={}, version={}", 
-                      cell.header().partition, cell.header().hash, cell.header().version);
+                info!(
+                    "SUCCESS: Stats cell readable before archiving! partition={}, hash={}, revision_ts={}",
+                    cell.header().partition,
+                    cell.header().hash,
+                    cell.header().revision_ts
+                );
             }
             Err(e) => {
                 error!("PROBLEM: Stats cell NOT readable before archiving: {:?}", e);
@@ -3086,6 +3097,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024, // 64MB
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3260,6 +3272,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3372,6 +3385,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
@@ -3497,6 +3511,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -3658,6 +3673,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

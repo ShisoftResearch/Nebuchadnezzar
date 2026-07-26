@@ -28,7 +28,7 @@ pub fn cell_rw() {
     let write_plan = cell.plan_write(chunk).unwrap();
     let pending_entry = write_plan.allocate(chunk, true).unwrap();
     let write_result = chunk
-        .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.version)
+        .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.revision_ts)
         .unwrap();
     let cell_1_ptr = write_result.addr;
     {
@@ -50,7 +50,7 @@ pub fn cell_rw() {
     let write_plan = cell.plan_write(chunk).unwrap();
     let pending_entry = write_plan.allocate(chunk, true).unwrap();
     let write_result = chunk
-        .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.version)
+        .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.revision_ts)
         .unwrap();
     let cell_2_ptr = write_result.addr;
     {

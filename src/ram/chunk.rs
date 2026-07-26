@@ -16,6 +16,7 @@ use crate::{
 };
 
 use super::schema::Schema;
+use bifrost::hlc::HlcSource;
 use dovahkiin::types::OwnedValue;
 use lightning::aarc::Arc as AArc;
 use lightning::map::{Map, WordMap, WordMutexGuard};
@@ -169,6 +170,8 @@ pub struct Chunk {
     pub allocator: SegmentAllocator,
     pub index_builder: Option<Arc<IndexBuilder>>,
     pub statistics: ChunkStatistics,
+    pub revision_clock: Arc<HlcSource>,
+    pub history_retention_ms: u64,
     /// Shared tiered memory manager for eviction/promotion
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
 }
@@ -274,28 +277,6 @@ impl Chunk {
         }
     }
 
-    fn new(
-        id: usize,
-        size: usize,
-        meta: Arc<ServerMeta>,
-        index_builder: Option<Arc<IndexBuilder>>,
-        backup_storage: Option<String>,
-        wal_storage: Option<String>,
-        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
-    ) -> Chunk {
-        // Call new_with_base with base_addr=0 to use old allocation behavior
-        Self::new_with_base(
-            id,
-            0,
-            size,
-            meta,
-            index_builder,
-            backup_storage,
-            wal_storage,
-            tiered_manager,
-        )
-    }
-
     fn new_with_base(
         id: usize,
         base_addr: usize,
@@ -305,6 +286,8 @@ impl Chunk {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        revision_clock: Arc<HlcSource>,
+        history_retention_ms: u64,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -360,6 +343,8 @@ impl Chunk {
             blob_head_seg_id: AtomicU64::new(HEAD_SEG_ID_EMPTY),
             gc_lock: Mutex::new(()),
             statistics: ChunkStatistics::new(),
+            revision_clock,
+            history_retention_ms,
             tiered_manager,
         };
         chunk.put_segment(bootstrap_segment);
@@ -618,21 +603,21 @@ impl Chunk {
         header_from_chunk_raw(*CellGuard::for_read(hash, self)?).map(|pair| pair.0)
     }
 
-    // Cheap capture of the current cell's raw address and version: an index
+    // Cheap capture of the current cell's raw address and revision: an index
     // lookup plus a header decode, with no value materialization. Used by
     // repeatable-read pinning, where parsing the payload just to learn where it
     // lives would defeat the point of pinning.
-    pub(crate) fn cell_location_and_version(&self, hash: u64) -> Result<(usize, u64), ReadError> {
+    pub(crate) fn cell_location_and_revision(&self, hash: u64) -> Result<(usize, u64), ReadError> {
         let location = *CellGuard::for_read(hash, self)?;
         let (header, _) = header_from_chunk_raw(location)?;
-        Ok((location, header.version))
+        Ok((location, header.revision_ts))
     }
 
     // By-address header read: decodes the header stored at a caller-pinned raw
     // `location` instead of resolving through the cell index. Used by
     // repeatable-read pinning, where the caller already holds a segment guard
     // that keeps the bytes at `location` alive even after the cell index has
-    // moved on to a newer version.
+    // moved on to a newer revision.
     pub(crate) fn head_at(&self, location: usize) -> Result<CellHeader, ReadError> {
         header_from_chunk_raw(location).map(|pair| pair.0)
     }
@@ -688,9 +673,21 @@ impl Chunk {
         cell: &OwnedCell,
         write_plan: &WritePlan,
         pending_entry: &PendingEntry,
-        old_version: u64,
+        revision_ts: u64,
     ) -> Result<WriteToChunkResult, WriteError> {
-        cell.write_to_chunk_with(write_plan, pending_entry, old_version)
+        cell.write_to_chunk_with(write_plan, pending_entry, revision_ts)
+    }
+
+    fn next_revision_ts(&self, previous: u64) -> Result<u64, WriteError> {
+        let next = self
+            .revision_clock
+            .try_now()
+            .map_err(|_| WriteError::RevisionClockExhausted)?
+            .ts;
+        if next <= previous {
+            return Err(WriteError::RevisionClockExhausted);
+        }
+        Ok(next)
     }
 
     fn ensure_indices(&self, new_cell: &OwnedCell, old_cell: Option<&SharedCell>, schema: &Schema) {
@@ -719,10 +716,11 @@ impl Chunk {
 
     fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
+        let revision_ts = self.next_revision_ts(0)?;
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
         let write_result =
-            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
         let cell_loc = write_result.addr;
         #[cfg(debug_assertions)]
         {
@@ -749,8 +747,7 @@ impl Chunk {
             }
             None => return Err(WriteError::CellAlreadyExisted),
         }
-        cell.header.version = write_result.new_version;
-        cell.header.timestamp = write_result.new_timestamp;
+        cell.header.revision_ts = write_result.revision_ts;
         Ok(cell.header)
     }
 
@@ -760,10 +757,11 @@ impl Chunk {
         let pending_entry = write_plan.allocate(self, true)?;
         if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
             let cell_location = cell_guard.get_ptr();
-            let cell_version =
-                cell_version_from_chunk_raw(cell_location).map_err(|e| WriteError::ReadError(e))?;
+            let previous_revision_ts = cell_revision_ts_from_chunk_raw(cell_location)
+                .map_err(|e| WriteError::ReadError(e))?;
+            let revision_ts = self.next_revision_ts(previous_revision_ts)?;
             let write_result =
-                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell_version)?;
+                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
             let new_cell_loc = write_result.addr;
             #[cfg(debug_assertions)]
             {
@@ -781,12 +779,12 @@ impl Chunk {
             self.mark_dead_entry_with_cell(cell_location, cell);
             self.refresh_statistics_for_schema(schema.id);
             drop(write_plan);
-            cell.header.version = write_result.new_version;
-            cell.header.timestamp = write_result.new_timestamp;
+            cell.header.revision_ts = write_result.revision_ts;
         } else {
             // Optimistic update will remove the new inserted one
+            let revision_ts = self.next_revision_ts(cell.header.revision_ts)?;
             let write_result =
-                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
             let new_cell_loc = write_result.addr;
             self.mark_dead_entry_with_cell(new_cell_loc, cell);
             return Err(WriteError::CellDoesNotExisted);
@@ -802,10 +800,11 @@ impl Chunk {
             if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = cell_guard.get_ptr();
-                let cell_version = cell_version_from_chunk_raw(cell_location)
+                let previous_revision_ts = cell_revision_ts_from_chunk_raw(cell_location)
                     .map_err(|e| WriteError::ReadError(e))?;
+                let revision_ts = self.next_revision_ts(previous_revision_ts)?;
                 let write_result =
-                    self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell_version)?;
+                    self.write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
                 let new_cell_loc = write_result.addr;
                 #[cfg(debug_assertions)]
                 {
@@ -830,8 +829,7 @@ impl Chunk {
                 self.mark_dead_entry_with_cell(cell_location, cell);
                 self.refresh_statistics_for_schema(write_plan.schema.id);
                 drop(write_plan);
-                cell.header.version = write_result.new_version;
-                cell.header.timestamp = write_result.new_timestamp;
+                cell.header.revision_ts = write_result.revision_ts;
             } else {
                 let reservation = self.cell_index.try_insert_locked(hash as usize);
                 if let Some(mut guard) = reservation {
@@ -841,7 +839,7 @@ impl Chunk {
                         cell,
                         &write_plan,
                         &pending_entry,
-                        cell.header.version,
+                        self.next_revision_ts(0)?,
                     )?;
                     let new_cell_loc = write_result.addr;
                     #[cfg(debug_assertions)]
@@ -856,8 +854,7 @@ impl Chunk {
                     self.ensure_indices(cell, None, &*write_plan.schema);
                     self.refresh_statistics_for_schema(write_plan.schema.id);
                     drop(write_plan);
-                    cell.header.version = write_result.new_version;
-                    cell.header.timestamp = write_result.new_timestamp;
+                    cell.header.revision_ts = write_result.revision_ts;
                 } else {
                     trace!("Cell {} was not exists, but found exists, will try", hash);
                     continue;
@@ -894,11 +891,12 @@ impl Chunk {
                     if let Some(mut new_cell) = new_cell {
                         let write_plan = new_cell.plan_write(self)?;
                         let pending_entry = write_plan.allocate(self, false)?;
+                        let revision_ts = self.next_revision_ts(cell.header.revision_ts)?;
                         let write_result = self.write_cell_to_chunk(
                             &new_cell,
                             &write_plan,
                             &pending_entry,
-                            cell.header.version,
+                            revision_ts,
                         )?;
                         let new_cell_loc = write_result.addr;
 
@@ -919,8 +917,7 @@ impl Chunk {
 
                         self.refresh_statistics_for_schema(write_plan.schema.id);
                         drop(write_plan);
-                        new_cell.header.version = write_result.new_version;
-                        new_cell.header.timestamp = write_result.new_timestamp;
+                        new_cell.header.revision_ts = write_result.revision_ts;
                         return Ok(new_cell);
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
@@ -1089,7 +1086,7 @@ impl Chunk {
         Tombstone::put(
             pending_entry.addr,
             cell_seg.seq_id,
-            cell_header.version,
+            self.next_revision_ts(cell_header.revision_ts)?,
             cell_header.partition,
             cell_header.hash,
         );
@@ -1369,28 +1366,28 @@ impl Chunk {
         CellGuard::for_write(hash, has_read, self).ok_or(ReadError::CellDoesNotExisted)
     }
 
-    pub fn compare_version_and_update_cell(
+    pub fn compare_revision_and_update_cell(
         &self,
         hash: u64,
-        version: u64,
+        revision_ts: u64,
         cell: &mut OwnedCell,
     ) -> Result<CellHeader, WriteError> {
         let mut guard = self
             .lock_cell_for_write(hash, true)
             .map_err(WriteError::ReadError)?;
-        let cell_version = guard.cell_version().map_err(WriteError::ReadError)?;
-        if cell_version == version {
-            cell.header.version = version; // update version to the latest version
+        let cell_revision_ts = guard.cell_revision_ts().map_err(WriteError::ReadError)?;
+        if cell_revision_ts == revision_ts {
+            cell.header.revision_ts = revision_ts;
             guard.update_cell(cell)?;
             return Ok(cell.header);
         }
-        return Err(WriteError::CellVersionMismatch);
+        return Err(WriteError::CellRevisionMismatch);
     }
 
-    pub fn compare_version_and_set_field(
+    pub fn compare_revision_and_set_field(
         &self,
         hash: u64,
-        version: u64,
+        revision_ts: u64,
         field: u64,
         value: OwnedValue,
     ) -> Result<CellHeader, WriteError> {
@@ -1398,12 +1395,12 @@ impl Chunk {
             .lock_cell_for_write(hash, true)
             .map_err(WriteError::ReadError)?;
         let mut cell = guard.read_cell_owned().map_err(WriteError::ReadError)?;
-        if cell.header.version == version {
+        if cell.header.revision_ts == revision_ts {
             cell.data[field] = value;
             guard.update_cell(&mut cell)?;
             return Ok(cell.header);
         }
-        return Err(WriteError::CellVersionMismatch);
+        return Err(WriteError::CellRevisionMismatch);
     }
 }
 
@@ -1429,6 +1426,8 @@ pub struct Chunks {
     pub list: Vec<Chunk>,
     pub statistics: TTLCache<Arc<SchemaStatistics>>,
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+    pub revision_clock: Arc<HlcSource>,
+    pub history_retention_ms: u64,
 }
 
 impl Chunks {
@@ -1441,7 +1440,7 @@ impl Chunks {
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     ) -> Arc<Chunks> {
-        Self::new_with_recovery(
+        Self::new_with_recovery_and_clock(
             count,
             size,
             meta,
@@ -1451,6 +1450,8 @@ impl Chunks {
             tiered_manager,
             false,
             None,
+            Arc::new(HlcSource::new(0)),
+            300_000,
         )
     }
 
@@ -1464,6 +1465,35 @@ impl Chunks {
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         enable_recovery: bool,
         raft_storage: Option<String>,
+    ) -> Arc<Chunks> {
+        Self::new_with_recovery_and_clock(
+            count,
+            size,
+            meta,
+            index_builder,
+            backup_storage,
+            wal_storage,
+            tiered_manager,
+            enable_recovery,
+            raft_storage,
+            Arc::new(HlcSource::new(0)),
+            300_000,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_recovery_and_clock(
+        count: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        enable_recovery: bool,
+        raft_storage: Option<String>,
+        revision_clock: Arc<HlcSource>,
+        history_retention_ms: u64,
     ) -> Arc<Chunks> {
         use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
         use std::ptr;
@@ -1545,6 +1575,8 @@ impl Chunks {
                 backup_storage,
                 wal_storage,
                 tiered_manager.clone(),
+                revision_clock.clone(),
+                history_retention_ms,
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
@@ -1552,6 +1584,8 @@ impl Chunks {
             list: chunks,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
             tiered_manager,
+            revision_clock,
+            history_retention_ms,
         });
 
         if let Some(ref manager) = chunks_arc.tiered_manager {
@@ -1589,6 +1623,18 @@ impl Chunks {
         }
 
         chunks_arc
+    }
+
+    pub fn next_revision_ts(&self, previous: u64) -> Result<u64, WriteError> {
+        let next = self
+            .revision_clock
+            .try_now()
+            .map_err(|_| WriteError::RevisionClockExhausted)?
+            .ts;
+        if next <= previous {
+            return Err(WriteError::RevisionClockExhausted);
+        }
+        Ok(next)
     }
 
     /// Sync all buffered WAL data to disk across all chunks
@@ -1719,11 +1765,11 @@ impl Chunks {
         let chunk = self.locate_chunk_by_partition(key.higher);
         return chunk.head_at(location);
     }
-    // Cheap capture of the current cell's raw address and version (index lookup
-    // + header decode, no value materialization). See `Chunk::cell_location_and_version`.
-    pub fn cell_location_and_version(&self, key: &Id) -> Result<(usize, u64), ReadError> {
+    // Cheap capture of the current cell's raw address and revision (index lookup
+    // + header decode, no value materialization). See `Chunk::cell_location_and_revision`.
+    pub fn cell_location_and_revision(&self, key: &Id) -> Result<(usize, u64), ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.cell_location_and_version(hash);
+        return chunk.cell_location_and_revision(hash);
     }
     pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
@@ -1816,25 +1862,25 @@ impl Chunks {
         return chunk.lock_cell_for_write(hash, has_read);
     }
 
-    pub fn compare_version_and_update_cell(
+    pub fn compare_revision_and_update_cell(
         &self,
         key: &Id,
-        version: u64,
+        revision_ts: u64,
         cell: &mut OwnedCell,
     ) -> Result<CellHeader, WriteError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.compare_version_and_update_cell(hash, version, cell);
+        return chunk.compare_revision_and_update_cell(hash, revision_ts, cell);
     }
 
-    pub fn compare_version_and_set_field(
+    pub fn compare_revision_and_set_field(
         &self,
         key: &Id,
-        version: u64,
+        revision_ts: u64,
         field: u64,
         value: OwnedValue,
     ) -> Result<CellHeader, WriteError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.compare_version_and_set_field(hash, version, field, value);
+        return chunk.compare_revision_and_set_field(hash, revision_ts, field, value);
     }
 }
 
@@ -1843,13 +1889,13 @@ pub struct CellGuard<'a> {
     guard: Option<WordMutexGuard<'a>>,
     chunk: &'a Chunk,
     hash: u64,
-    version: u64,
+    revision_ts: u64,
 }
 
 impl<'a> CellGuard<'a> {
     pub fn from_guard(hash: u64, guard: WordMutexGuard<'a>, chunk: &'a Chunk) -> Option<Self> {
         let mut segment = None;
-        let mut version = 0;
+        let mut revision_ts = 0;
         if *guard != 0 {
             #[cfg(feature = "tiered_memory")]
             {
@@ -1890,7 +1936,7 @@ impl<'a> CellGuard<'a> {
                     return None;
                 }
             }
-            version = cell_version_from_chunk_raw(*guard).unwrap();
+            revision_ts = cell_revision_ts_from_chunk_raw(*guard).unwrap();
         }
 
         Some(Self {
@@ -1898,7 +1944,7 @@ impl<'a> CellGuard<'a> {
             chunk,
             hash,
             segment,
-            version,
+            revision_ts,
         })
     }
 
@@ -1924,9 +1970,9 @@ impl<'a> CellGuard<'a> {
         }
     }
 
-    fn update_version(&mut self, version: u64) {
-        if self.version < version {
-            self.version = version;
+    fn update_revision_ts(&mut self, revision_ts: u64) {
+        if self.revision_ts < revision_ts {
+            self.revision_ts = revision_ts;
         }
     }
 
@@ -1935,17 +1981,17 @@ impl<'a> CellGuard<'a> {
             return Err(ReadError::CellDoesNotExisted);
         }
         let (header, _) = header_from_chunk_raw(self.get_ptr())?;
-        self.update_version(header.version);
+        self.update_revision_ts(header.revision_ts);
         Ok(header)
     }
 
-    pub fn cell_version(&mut self) -> Result<u64, ReadError> {
+    pub fn cell_revision_ts(&mut self) -> Result<u64, ReadError> {
         if self.is_unassigned() {
             return Err(ReadError::CellDoesNotExisted);
         }
-        let version = cell_version_from_chunk_raw(self.get_ptr())?;
-        self.update_version(version);
-        Ok(version)
+        let revision_ts = cell_revision_ts_from_chunk_raw(self.get_ptr())?;
+        self.update_revision_ts(revision_ts);
+        Ok(revision_ts)
     }
 
     pub fn read_cell_owned(&mut self) -> Result<OwnedCell, ReadError> {
@@ -1953,7 +1999,7 @@ impl<'a> CellGuard<'a> {
             return Err(ReadError::CellDoesNotExisted);
         }
         let (data, _) = SharedCellData::from_chunk_raw(self.hash, self.get_ptr(), self.chunk)?;
-        self.update_version(data.header.version);
+        self.update_revision_ts(data.header.revision_ts);
         Ok(data.to_owned())
     }
 
@@ -1962,7 +2008,7 @@ impl<'a> CellGuard<'a> {
             return Err(ReadError::CellDoesNotExisted);
         }
         let (data, _) = SharedCellData::from_chunk_raw(self.hash, self.get_ptr(), self.chunk)?;
-        self.update_version(data.header.version);
+        self.update_revision_ts(data.header.revision_ts);
         Ok(data)
     }
 
@@ -1972,20 +2018,18 @@ impl<'a> CellGuard<'a> {
 
     pub fn update_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let old_cell_loc = self.get_ptr();
-        if cell.header.version < self.version {
-            cell.header.version = self.version;
+        if cell.header.revision_ts < self.revision_ts {
+            cell.header.revision_ts = self.revision_ts;
         }
         if self.is_unassigned() {
             return Err(WriteError::CellDoesNotExisted);
         }
         let write_plan = cell.plan_write(self.chunk)?;
         let pending_entry = write_plan.allocate(self.chunk, false)?;
-        let write_result = self.chunk.write_cell_to_chunk(
-            cell,
-            &write_plan,
-            &pending_entry,
-            cell.header.version,
-        )?;
+        let revision_ts = self.chunk.next_revision_ts(cell.header.revision_ts)?;
+        let write_result =
+            self.chunk
+                .write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
         let old_indices = self.old_index_res(schema)?;
@@ -1996,8 +2040,7 @@ impl<'a> CellGuard<'a> {
         self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
         self.chunk.refresh_statistics_for_schema(schema.id);
         drop(write_plan);
-        cell.header.version = write_result.new_version;
-        cell.header.timestamp = write_result.new_timestamp;
+        cell.header.revision_ts = write_result.revision_ts;
         Ok(cell.header)
     }
 
@@ -2006,17 +2049,15 @@ impl<'a> CellGuard<'a> {
     /// an empty slot (insert case) or an existing cell (update case).
     pub fn upsert_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let old_cell_loc = self.get_ptr();
-        if cell.header.version < self.version {
-            cell.header.version = self.version;
+        if cell.header.revision_ts < self.revision_ts {
+            cell.header.revision_ts = self.revision_ts;
         }
         let write_plan = cell.plan_write(self.chunk)?;
         let pending_entry = write_plan.allocate(self.chunk, false)?;
-        let write_result = self.chunk.write_cell_to_chunk(
-            cell,
-            &write_plan,
-            &pending_entry,
-            cell.header.version,
-        )?;
+        let revision_ts = self.chunk.next_revision_ts(cell.header.revision_ts)?;
+        let write_result =
+            self.chunk
+                .write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
         let schema_id = schema.id;
@@ -2036,8 +2077,7 @@ impl<'a> CellGuard<'a> {
         }
 
         drop(write_plan);
-        cell.header.version = write_result.new_version;
-        cell.header.timestamp = write_result.new_timestamp;
+        cell.header.revision_ts = write_result.revision_ts;
 
         self.chunk.refresh_statistics_for_schema(schema_id);
         Ok(cell.header)
@@ -2126,7 +2166,9 @@ mod tests {
     }
 
     fn payload_cell(schema_id: u32, id: &Id, payload_len: usize) -> OwnedCell {
-        let data: Vec<u8> = std::iter::repeat(id.lower as u8).take(payload_len).collect();
+        let data: Vec<u8> = std::iter::repeat(id.lower as u8)
+            .take(payload_len)
+            .collect();
         OwnedCell {
             header: CellHeader::new(schema_id, id),
             data: data_map_value!(id: id.lower as i32, data: data),
@@ -2161,16 +2203,16 @@ mod tests {
         // Sanity check: by-id reads now observe the new version.
         let full_after = chunks.read_cell(&id).unwrap().to_owned();
         assert_ne!(full_after.data, full_before.data);
-        assert!(full_after.header.version > full_before.header.version);
+        assert!(full_after.header.revision_ts > full_before.header.revision_ts);
 
         // Reading BY ADDRESS still returns the OLD version (copy-on-write).
         let pinned = chunks.read_cell_at(&id, addr).unwrap();
         assert_eq!(pinned.data, full_before.data);
-        assert_eq!(pinned.header.version, full_before.header.version);
+        assert_eq!(pinned.header.revision_ts, full_before.header.revision_ts);
 
         // head_at agrees with the pinned header.
         let h = chunks.head_at(&id, addr).unwrap();
-        assert_eq!(h.version, full_before.header.version);
+        assert_eq!(h.revision_ts, full_before.header.revision_ts);
 
         // read_selected_at returns the pinned projection, not the new one.
         let selected_pinned = chunks

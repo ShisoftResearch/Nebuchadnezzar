@@ -26,6 +26,7 @@ pub async fn workspace_wr() {
         &ServerOptions {
             chunk_size: SEGMENT_SIZE,
             db_size: SEGMENT_SIZE,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -171,6 +172,7 @@ pub async fn data_site_wr() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -274,6 +276,7 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -357,6 +360,7 @@ pub async fn multi_transaction() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -481,6 +485,7 @@ pub async fn smoke_rw() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

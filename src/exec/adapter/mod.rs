@@ -19,9 +19,8 @@ pub fn owned_with_header(header: CellHeader, mut value: OwnedValue) -> OwnedValu
         OwnedValue::Map(m) => {
             let mut header_map = OwnedMap::new();
             header_map.insert("id", OwnedValue::Id(header.id()));
-            header_map.insert("ts", OwnedValue::U32(header.timestamp));
+            header_map.insert("ts", OwnedValue::U64(header.revision_ts));
             header_map.insert("sch", OwnedValue::U32(header.schema));
-            header_map.insert("ver", OwnedValue::U64(header.version));
             m.insert_value("__header", OwnedValue::Map(header_map));
         }
         _ => {}
@@ -39,9 +38,8 @@ pub fn shared_with_header<'a>(
             SharedValue::Map(m) => {
                 let mut header_map = SharedMap::new();
                 header_map.insert("id", SharedValue::Id(id_ptr.as_ref().unwrap()));
-                header_map.insert("ts", SharedValue::U32(&header.timestamp));
+                header_map.insert("ts", SharedValue::U64(&header.revision_ts));
                 header_map.insert("sch", SharedValue::U32(&header.schema));
-                header_map.insert("ver", SharedValue::U64(&header.version));
                 m.insert("__header", SharedValue::Map(header_map));
             }
             _ => {}

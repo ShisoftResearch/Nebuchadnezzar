@@ -273,6 +273,7 @@ fn benchmark_server_options() -> ServerOptions {
     ServerOptions {
         chunk_size: BENCHMARK_CHUNK_SIZE,
         db_size: BENCHMARK_DB_SIZE,
+        history_retention_ms: 300_000,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,

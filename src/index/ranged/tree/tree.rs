@@ -291,7 +291,11 @@ impl RangedTree {
     /// split. Returns the new tree and how many keys moved, or None if nothing
     /// moves. The new tree shares this tree's deletion set: the key ranges are
     /// disjoint, so a tombstone only affects the one tree that holds its key.
-    pub fn split_off(&self, pivot: &EntryKey, client: &Arc<AsyncClient>) -> Option<(RangedTree, usize)> {
+    pub fn split_off(
+        &self,
+        pivot: &EntryKey,
+        client: &Arc<AsyncClient>,
+    ) -> Option<(RangedTree, usize)> {
         let so = super::btree::split_off::split_off_spine(&self.tree, pivot)?;
         let mut new_tree = DiskTree::from_root(
             so.new_root,
@@ -662,6 +666,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -763,6 +768,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
                 db_size: 64 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,

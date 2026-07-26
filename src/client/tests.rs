@@ -22,6 +22,7 @@ pub async fn database_catalog() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -89,6 +90,7 @@ pub async fn general() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -216,7 +218,7 @@ pub async fn general() {
 
                         let header = txn.head(cell.id()).await?.unwrap();
                         assert_eq!(header.id(), cell.id());
-                        assert!(header.version > 1);
+                        assert!(header.revision_ts > 1);
 
                         Ok(())
                     }
@@ -242,6 +244,7 @@ pub async fn multi_cell_update() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -413,6 +416,7 @@ fn schema_validation_server_options() -> ServerOptions {
     ServerOptions {
         chunk_size: 16 * 1024 * 1024,
         db_size: 16 * 1024 * 1024,
+        history_retention_ms: 300_000,
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
@@ -771,6 +775,7 @@ pub async fn write_skew() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -873,6 +878,7 @@ pub async fn server_isolation() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -904,6 +910,7 @@ pub async fn server_isolation() {
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

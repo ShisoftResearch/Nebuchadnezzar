@@ -36,8 +36,8 @@ service! {
     rpc upsert_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc upsert_all_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
     rpc remove_cell(key: Id) -> Result<(), WriteError>;
-    rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
-    rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
+    rpc compare_revision_and_update_cell(key: Id, revision_ts: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
+    rpc compare_revision_and_set_field(key: Id, revision_ts: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
     rpc post_schema_add(schema_id: u32) -> Result<(), String>;
     rpc post_schema_delete(schema: u32) -> Result<(), String>;
@@ -218,10 +218,10 @@ impl Service for NebRPCService {
         }
         .boxed()
     }
-    fn compare_version_and_update_cell(
+    fn compare_revision_and_update_cell(
         &self,
         key: Id,
-        version: u64,
+        revision_ts: u64,
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
@@ -229,7 +229,7 @@ impl Service for NebRPCService {
                 .with_indices_ensured(|| {
                     self.database_runtime
                         .chunks()
-                        .compare_version_and_update_cell(&key, version, &mut cell)
+                        .compare_revision_and_update_cell(&key, revision_ts, &mut cell)
                 })
                 .await;
             match result {
@@ -239,7 +239,7 @@ impl Service for NebRPCService {
                     self.with_indices_ensured(|| {
                         self.database_runtime
                             .chunks()
-                            .compare_version_and_update_cell(&key, version, &mut cell)
+                            .compare_revision_and_update_cell(&key, revision_ts, &mut cell)
                     })
                     .await
                 }
@@ -248,10 +248,10 @@ impl Service for NebRPCService {
         }
         .boxed()
     }
-    fn compare_version_and_set_field(
+    fn compare_revision_and_set_field(
         &self,
         key: Id,
-        version: u64,
+        revision_ts: u64,
         field: u64,
         value: OwnedValue,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
@@ -261,7 +261,7 @@ impl Service for NebRPCService {
                 .with_indices_ensured(|| {
                     self.database_runtime
                         .chunks()
-                        .compare_version_and_set_field(&key, version, field, first_value)
+                        .compare_revision_and_set_field(&key, revision_ts, field, first_value)
                 })
                 .await;
             match result {
@@ -271,7 +271,7 @@ impl Service for NebRPCService {
                     self.with_indices_ensured(|| {
                         self.database_runtime
                             .chunks()
-                            .compare_version_and_set_field(&key, version, field, value)
+                            .compare_revision_and_set_field(&key, revision_ts, field, value)
                     })
                     .await
                 }

@@ -38,9 +38,8 @@ pub struct CombinedCleaner;
 struct DummyEntry {
     size: usize,
     addr: usize,
-    cell_ver: u64,
+    revision_ts: u64,
     cell_hash: Option<u64>,
-    timestamp: u32,
 }
 
 struct DummySegment {
@@ -179,17 +178,16 @@ impl CombinedCleaner {
             let dummy_entry = DummyEntry {
                 size: entry_size,
                 addr: entry_addr,
-                timestamp: cell_header.map(|h| h.timestamp).unwrap_or(0),
                 cell_hash: cell_header.map(|h| h.hash),
-                cell_ver: cell_header.map(|h| h.version).unwrap_or(0),
+                revision_ts: cell_header.map(|h| h.revision_ts).unwrap_or(0),
             };
 
             if let Some(hash) = dummy_entry.cell_hash {
-                // Cell with hash: keep only the latest version
+                // Cell with hash: keep only the latest revision.
                 deduped_cells
                     .entry(hash)
                     .and_modify(|existing| {
-                        if dummy_entry.cell_ver > existing.cell_ver {
+                        if dummy_entry.revision_ts > existing.revision_ts {
                             *existing = dummy_entry.clone();
                         }
                     })
@@ -200,14 +198,14 @@ impl CombinedCleaner {
             }
         }
 
-        // Step 2: Combine deduplicated cells and tombstones, then sort by timestamp
+        // Step 2: Combine deduplicated cells and tombstones, then sort by revision.
         let mut all_entries: Vec<_> = deduped_cells
             .into_values()
             .chain(tombstones.into_iter())
             .collect();
 
-        // Sort by timestamp and then by size within timestamp buckets
-        all_entries.sort_by_key(|entry| (entry.timestamp, entry.size));
+        // Sort by revision and then by size within revision buckets.
+        all_entries.sort_by_key(|entry| (entry.revision_ts, entry.size));
 
         // Reverse to get hottest/largest first
         all_entries.reverse();
@@ -285,7 +283,7 @@ impl CombinedCleaner {
                                 seg_cursor,
                                 entry_addr,
                                 cell_hash,
-                                entry.cell_ver,
+                                entry.revision_ts,
                                 entry.size,
                             ));
                         }
@@ -349,41 +347,41 @@ impl CombinedCleaner {
                     COMBINE_UPDATE_POOL.install(|| {
                         sorted_cells
                             .into_par_iter()
-                            .for_each(|(new, old, hash, ver, entry_size)| {
+                            .for_each(|(new, old, hash, revision_ts, entry_size)| {
                                 trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                                 let index = chunk.cell_index.lock(hash as usize);
                                 if let Some(mut actual_addr) = index {
                                     if *actual_addr == old {
                                         *actual_addr = new;
                                         trace!(
-                                            "Cell addr for hash {} set from {} to {} for combine, ver {}",
+                                            "Cell addr for hash {} set from {} to {} for combine, revision {}",
                                             hash,
                                             old,
                                             new,
-                                            ver
+                                            revision_ts
                                         );
                                     } else {
                                         #[cfg(debug_assertions)]
                                         {
-                                            let current_version =
-                                                cell::cell_version_from_chunk_raw(*actual_addr)
+                                            let current_revision_ts =
+                                                cell::cell_revision_ts_from_chunk_raw(*actual_addr)
                                                     .unwrap();
                                             assert!(
-                                        current_version >= ver,
-                                        "Cell {} with address {} changed to {} but version running backwards {} -> {}",
+                                        current_revision_ts >= revision_ts,
+                                        "Cell {} with address {} changed to {} but revision running backwards {} -> {}",
                                         hash,
                                         old,
                                         *actual_addr,
-                                        ver,
-                                        current_version
+                                        revision_ts,
+                                        current_revision_ts
                                     );
                                         }
                                         trace!(
-                                            "cell {} with address {}, have been changed to {} on combine, ver {}",
+                                            "cell {} with address {}, have been changed to {} on combine, revision {}",
                                             hash,
                                             old,
                                             *actual_addr,
-                                            ver
+                                            revision_ts
                                         );
                                         // SAFETY FIX: Use mark_dead_entry_with_size instead of mark_dead_entry_with_seg
                                         // because the entry may contain garbage if the cell was updated during combine.

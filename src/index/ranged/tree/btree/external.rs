@@ -82,7 +82,7 @@ where
 
     pub fn from_cell(cell: &OwnedCell) -> Result<Box<IncubatingExtNode<KS, PS>>, ReconstructError> {
         let cell_id = cell.id();
-        let _cell_version = cell.header.version;
+        let _cell_revision_ts = cell.header.revision_ts;
         if cell.header.schema != *PAGE_SCHEMA_ID {
             return Err(invalid_page_format(
                 cell,

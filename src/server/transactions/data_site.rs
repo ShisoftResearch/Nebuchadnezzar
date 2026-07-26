@@ -188,17 +188,17 @@ pub struct CellMeta {
     lock_acquired_at: Option<i64>, // timestamp when lock was acquired (milliseconds since epoch)
 }
 
-/// A single pinned read: the location of a specific version of a cell within
-/// its segment, together with the version number that was pinned.
+/// A single pinned read: the location of a specific revision_ts of a cell within
+/// its segment, together with the revision_ts number that was pinned.
 #[derive(Clone, Copy, Debug)]
 struct PinnedRead {
     location: usize,
-    version: u64,
+    revision_ts: u64,
 }
 
 /// Per-transaction record of pinned reads for large cells. When a transaction
 /// reads a LARGE cell under repeatable-read semantics, the participant pins
-/// that specific version (holding a segment reference guard) and remembers
+/// that specific revision_ts (holding a segment reference guard) and remembers
 /// its location here, instead of the coordinator cloning the whole cell.
 ///
 /// The guard is `Option` so a pin can be recorded (e.g. in tests) without
@@ -244,14 +244,14 @@ struct Transaction {
 #[derive(Debug)]
 struct CellHistory {
     cell: Option<OwnedCellRef>,
-    current_version: u64,
+    current_revision_ts: u64,
 }
 
 impl CellHistory {
-    pub fn new(cell: Option<OwnedCellRef>, current_ver: u64) -> CellHistory {
+    pub fn new(cell: Option<OwnedCellRef>, current_revision_ts: u64) -> CellHistory {
         CellHistory {
             cell,
-            current_version: current_ver,
+            current_revision_ts: current_revision_ts,
         }
     }
 }
@@ -261,9 +261,9 @@ impl Transaction {
         self.certified.get(id)
     }
 
-    fn certified_present_version(&self, id: &Id) -> Option<u64> {
+    fn certified_present_revision_ts(&self, id: &Id) -> Option<u64> {
         match self.certified_op(id).map(|op| &op.expectation) {
-            Some(CellExpectation::Present(version)) => Some(*version),
+            Some(CellExpectation::Present(revision_ts)) => Some(*revision_ts),
             _ => None,
         }
     }
@@ -483,8 +483,8 @@ impl DataManager {
 
     fn prepare_expectation_matches(&self, op: &PrepareOp) -> bool {
         match (&op.expectation, self.chunks().head_cell(&op.id)) {
-            (CellExpectation::Present(expected_version), Ok(head)) => {
-                head.version == *expected_version
+            (CellExpectation::Present(expected_revision_ts), Ok(head)) => {
+                head.revision_ts == *expected_revision_ts
             }
             (CellExpectation::Absent, Err(ReadError::CellDoesNotExisted)) => true,
             _ => false,
@@ -526,17 +526,17 @@ impl DataManager {
         for (id, history) in history.iter() {
             debug!("ROLLING BACK {:?} - {:?}", id, history);
             let cell = &history.cell;
-            let current_ver = history.current_version;
+            let current_revision_ts = history.current_revision_ts;
             let error = if cell.is_none() {
                 // the cell was created, need to remove
                 self.chunks()
-                    .remove_cell_by(id, |cell| cell.header.version == current_ver)
+                    .remove_cell_by(id, |cell| cell.header.revision_ts == current_revision_ts)
                     .err()
-            } else if current_ver > 0 {
+            } else if current_revision_ts > 0 {
                 // the cell was updated, need to update back
                 self.chunks()
                     .update_cell_by(id, |cell_to_update| {
-                        if cell_to_update.header.version == current_ver {
+                        if cell_to_update.header.revision_ts == current_revision_ts {
                             cell.as_ref().map(|r| r.clone_referred())
                         } else {
                             None
@@ -680,7 +680,7 @@ impl DataManager {
 
     /// Returns the pinned location for `id` IF this transaction already holds a
     /// pin for it, creating nothing. Used by the full-read path, which must
-    /// repeat an already-pinned version (from a prior partial read) but must
+    /// repeat an already-pinned revision_ts (from a prior partial read) but must
     /// never create a pin of its own.
     ///
     /// Must be called AFTER `prepare_read` has succeeded. The transaction lock
@@ -693,18 +693,18 @@ impl DataManager {
 
     /// Shape-gated repeatable-read pinning. Called by the partial-read paths
     /// (`head` with `pin == true`, `read_selected`), which always pin so a later
-    /// read in the same transaction repeats the same version.
+    /// read in the same transaction repeats the same revision_ts.
     ///
     /// Must be called AFTER `prepare_read` has succeeded (so the cell-meta lock
     /// is already released). Returns `Some(location)` when the read should be
-    /// served from a specific stored version (a raw segment address), or `None`
+    /// served from a specific stored revision_ts (a raw segment address), or `None`
     /// when the caller should fall back to a normal current read.
     ///
     /// Behavior:
     /// - If this transaction already pinned the cell, returns that pinned
-    ///   location so the read repeats the original version even if the current
+    ///   location so the read repeats the original revision_ts even if the current
     ///   cell has since advanced.
-    /// - Otherwise it captures the current version's address, acquires a segment
+    /// - Otherwise it captures the current revision_ts's address, acquires a segment
     ///   reference guard to keep it alive, records the pin on a
     ///   (created-if-needed) participant transaction, and returns that address.
     ///   There is no size gate: partial reads pin regardless of cell size.
@@ -717,17 +717,17 @@ impl DataManager {
             return Some(location);
         }
 
-        // Capture the current version's address and version cheaply: an index
+        // Capture the current revision_ts's address and revision_ts cheaply: an index
         // lookup plus a header decode. Materializing the cell value here (e.g.
         // via `read_cell`) would parse the whole payload just to learn where it
         // lives, defeating the point of pinning partial reads. The index guard
         // is released inside the call, before we take the transaction lock.
-        let (addr, version) = self.chunks().cell_location_and_version(id).ok()?;
+        let (addr, revision_ts) = self.chunks().cell_location_and_revision(id).ok()?;
         let chunk = self.chunks().locate_chunk_by_partition(id.higher);
         let chunk_idx = chunk.id;
         let (segment_id, _seq_id) = chunk.get_cell_segment_info(addr);
 
-        // Keep the pinned version's segment alive for the transaction's lifetime.
+        // Keep the pinned revision_ts's segment alive for the transaction's lifetime.
         // If it cannot be acquired (segment freed/evicted), fall back gracefully.
         let guard = self.acquire_segment_guard(chunk_idx, segment_id)?;
 
@@ -738,8 +738,14 @@ impl DataManager {
         if let Some(existing) = txn.pinned_reads.get(id).copied() {
             return Some(existing.location);
         }
-        txn.pinned_reads
-            .insert(*id, PinnedRead { location: addr, version }, Some(guard));
+        txn.pinned_reads.insert(
+            *id,
+            PinnedRead {
+                location: addr,
+                revision_ts,
+            },
+            Some(guard),
+        );
         Some(addr)
     }
 
@@ -946,7 +952,7 @@ impl DataManager {
                                     let undo_entry = super::undo_log::UndoLogEntry::new_write(
                                         tid.clone(),
                                         cell_id,
-                                        header.version,
+                                        header.revision_ts,
                                     );
                                     if let Err(error) = undo_log.write_undo_entry(undo_entry) {
                                         error!(
@@ -956,7 +962,7 @@ impl DataManager {
                                     }
                                 }
                                 txn.history
-                                    .insert(cell_id, CellHistory::new(None, header.version));
+                                    .insert(cell_id, CellHistory::new(None, header.revision_ts));
                                 meta.write = effective_ts.clone();
                             }
                             Err(error) => {
@@ -966,8 +972,8 @@ impl DataManager {
                         };
                     }
                     CommitOp::Remove(ref cell_id) => {
-                        let expected_version = txn
-                            .certified_present_version(cell_id)
+                        let expected_revision_ts = txn
+                            .certified_present_revision_ts(cell_id)
                             .expect("commit payload validation requires present certification");
                         let meta_index = guarded_cell_ids
                             .binary_search(cell_id)
@@ -993,8 +999,8 @@ impl DataManager {
                                     break;
                                 }
                             };
-                            if shared_cell.header.version != expected_version {
-                                write_error = Some((*cell_id, WriteError::CellVersionMismatch));
+                            if shared_cell.header.revision_ts != expected_revision_ts {
+                                write_error = Some((*cell_id, WriteError::CellRevisionMismatch));
                                 break;
                             }
                             let addr = shared_cell.cell_guard().get_ptr();
@@ -1022,7 +1028,7 @@ impl DataManager {
                                 tid.clone(),
                                 *cell_id,
                                 super::undo_log::UndoOpType::Remove,
-                                expected_version,
+                                expected_revision_ts,
                                 chunk_idx as u64,
                                 seq_id,
                                 cell_offset,
@@ -1032,10 +1038,9 @@ impl DataManager {
                             }
                         }
 
-                        match self
-                            .chunks()
-                            .remove_cell_by(cell_id, |cell| cell.header.version == expected_version)
-                        {
+                        match self.chunks().remove_cell_by(cell_id, |cell| {
+                            cell.header.revision_ts == expected_revision_ts
+                        }) {
                             Ok(()) => {
                                 txn.history
                                     .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
@@ -1050,8 +1055,8 @@ impl DataManager {
                     }
                     CommitOp::Update(mut cell) => {
                         let cell_id = cell.id();
-                        let expected_version = txn
-                            .certified_present_version(&cell_id)
+                        let expected_revision_ts = txn
+                            .certified_present_revision_ts(&cell_id)
                             .expect("commit payload validation requires present certification");
                         let meta_index = guarded_cell_ids
                             .binary_search(&cell_id)
@@ -1077,8 +1082,8 @@ impl DataManager {
                                     break;
                                 }
                             };
-                            if shared_cell.header.version != expected_version {
-                                write_error = Some((cell_id, WriteError::CellVersionMismatch));
+                            if shared_cell.header.revision_ts != expected_revision_ts {
+                                write_error = Some((cell_id, WriteError::CellRevisionMismatch));
                                 break;
                             }
                             shared_cell.cell_guard().get_ptr()
@@ -1104,7 +1109,7 @@ impl DataManager {
                                 tid.clone(),
                                 cell_id,
                                 super::undo_log::UndoOpType::Update,
-                                expected_version,
+                                expected_revision_ts,
                                 chunk_idx as u64,
                                 seq_id,
                                 cell_offset,
@@ -1115,9 +1120,9 @@ impl DataManager {
                         }
                         let mut old_cell_ref = None;
                         match self.chunks().update_cell_by(&cell_id, |cell_to_update| {
-                            if cell_to_update.header.version == expected_version {
+                            if cell_to_update.header.revision_ts == expected_revision_ts {
                                 old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
-                                cell.header.version = expected_version;
+                                cell.header.revision_ts = expected_revision_ts;
                                 Some(cell)
                             } else {
                                 None
@@ -1127,7 +1132,7 @@ impl DataManager {
                                 debug_assert!(old_cell_ref.is_some());
                                 txn.history.insert(
                                     cell_id,
-                                    CellHistory::new(old_cell_ref, updated_cell.header.version),
+                                    CellHistory::new(old_cell_ref, updated_cell.header.revision_ts),
                                 );
                                 meta.write = effective_ts.clone();
                                 txn.segment_guards.push(guard);
@@ -1224,9 +1229,9 @@ impl DataManager {
                     certified.intent == PrepareIntent::Write
                         && matches!(certified.expectation, CellExpectation::Present(_))
                 }
-                CommitOp::Read(_, version) => {
+                CommitOp::Read(_, revision_ts) => {
                     certified.intent == PrepareIntent::Read
-                        && certified.expectation == CellExpectation::Present(*version)
+                        && certified.expectation == CellExpectation::Present(*revision_ts)
                 }
                 CommitOp::None => false,
             };
@@ -1264,11 +1269,11 @@ impl DataManager {
                 },
                 CommitOp::Update(cell) => {
                     let cell_id = cell.id();
-                    let expected_version = txn
-                        .certified_present_version(&cell_id)
+                    let expected_revision_ts = txn
+                        .certified_present_revision_ts(&cell_id)
                         .expect("commit payload validation requires present certification");
-                    let current_version = match self.chunks().read_cell(&cell_id) {
-                        Ok(shared_cell) => shared_cell.header.version,
+                    let current_revision_ts = match self.chunks().read_cell(&cell_id) {
+                        Ok(shared_cell) => shared_cell.header.revision_ts,
                         Err(read_error) => {
                             return Err(Self::map_commit_write_error(
                                 txn,
@@ -1277,20 +1282,20 @@ impl DataManager {
                             ));
                         }
                     };
-                    if current_version != expected_version {
+                    if current_revision_ts != expected_revision_ts {
                         return Err(Self::map_commit_write_error(
                             txn,
                             cell_id,
-                            WriteError::CellVersionMismatch,
+                            WriteError::CellRevisionMismatch,
                         ));
                     }
                 }
                 CommitOp::Remove(cell_id) => {
-                    let expected_version = txn
-                        .certified_present_version(cell_id)
+                    let expected_revision_ts = txn
+                        .certified_present_revision_ts(cell_id)
                         .expect("commit payload validation requires present certification");
-                    let current_version = match self.chunks().read_cell(cell_id) {
-                        Ok(shared_cell) => shared_cell.header.version,
+                    let current_revision_ts = match self.chunks().read_cell(cell_id) {
+                        Ok(shared_cell) => shared_cell.header.revision_ts,
                         Err(read_error) => {
                             return Err(Self::map_commit_write_error(
                                 txn,
@@ -1299,17 +1304,17 @@ impl DataManager {
                             ));
                         }
                     };
-                    if current_version != expected_version {
+                    if current_revision_ts != expected_revision_ts {
                         return Err(Self::map_commit_write_error(
                             txn,
                             *cell_id,
-                            WriteError::CellVersionMismatch,
+                            WriteError::CellRevisionMismatch,
                         ));
                     }
                 }
-                CommitOp::Read(cell_id, version) => {
-                    let current_version = match self.chunks().read_cell(cell_id) {
-                        Ok(shared_cell) => shared_cell.header.version,
+                CommitOp::Read(cell_id, revision_ts) => {
+                    let current_revision_ts = match self.chunks().read_cell(cell_id) {
+                        Ok(shared_cell) => shared_cell.header.revision_ts,
                         Err(read_error) => {
                             return Err(Self::map_commit_write_error(
                                 txn,
@@ -1318,11 +1323,11 @@ impl DataManager {
                             ));
                         }
                     };
-                    if current_version != *version {
+                    if current_revision_ts != *revision_ts {
                         return Err(Self::map_commit_write_error(
                             txn,
                             *cell_id,
-                            WriteError::CellVersionMismatch,
+                            WriteError::CellRevisionMismatch,
                         ));
                     }
                 }
@@ -1336,12 +1341,12 @@ impl DataManager {
     }
 
     fn map_commit_write_error(txn: &Transaction, id: Id, error: WriteError) -> DMCommitResult {
-        let expected_present = txn.certified_present_version(&id).is_some();
+        let expected_present = txn.certified_present_revision_ts(&id).is_some();
         let expected_absent_write = txn.certified_expects_absent_write(&id);
         let is_cell_changed = match &error {
             WriteError::DeletionPredictionFailed
             | WriteError::UserCanceledUpdate
-            | WriteError::CellVersionMismatch => true,
+            | WriteError::CellRevisionMismatch => true,
             WriteError::CellDoesNotExisted
             | WriteError::ReadError(ReadError::CellDoesNotExisted) => expected_present,
             WriteError::CellAlreadyExisted => expected_absent_write,
@@ -1367,12 +1372,12 @@ impl DataManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::transactions::test_hlc;
     use crate::ram::cell::OwnedCell;
     use crate::ram::schema::Schema;
     use crate::ram::segs::SEGMENT_SIZE;
     use crate::ram::tests::default_fields;
     use crate::ram::types::{Id, OwnedMap, OwnedValue};
+    use crate::server::transactions::test_hlc;
     use crate::server::{NebServer, ServerOptions, Service as NebService};
     use bifrost::rpc::DEFAULT_CLIENT_POOL;
     use dovahkiin::types::Map as OwnedMapTrait;
@@ -1387,11 +1392,11 @@ mod tests {
             Id::new(0, 42),
             PinnedRead {
                 location: 0x1000,
-                version: 7,
+                revision_ts: 7,
             },
             None,
         );
-        assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.version), Some(7));
+        assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.revision_ts), Some(7));
         assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.location), Some(0x1000));
         assert!(set.get(&Id::new(0, 99)).is_none());
         assert!(!set.is_empty());
@@ -1479,6 +1484,7 @@ mod tests {
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE,
                 db_size: SEGMENT_SIZE,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -1544,7 +1550,7 @@ mod tests {
 
     // A cell whose stored length is well above the default 4096-byte read-pin
     // threshold. The multi-KiB `name` payload makes the participant pin the read
-    // version; `score` is a small, distinct marker used to tell versions apart.
+    // revision_ts; `score` is a small, distinct marker used to tell versions apart.
     fn large_cell(schema_id: u32, id: Id, score: u64, marker: &str) -> OwnedCell {
         let mut data = OwnedMap::new();
         data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
@@ -1554,16 +1560,16 @@ mod tests {
         OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
     }
 
-    fn seed_cell_version(
+    fn seed_cell_revision(
         runtime: &Arc<crate::server::DatabaseRuntime>,
         schema_id: u32,
         id: Id,
         score: u64,
-        version_steps: usize,
+        revision_steps: usize,
     ) -> u64 {
         let mut cell = counter_cell(schema_id, id, score, "prepare-seed-0");
         let mut header = runtime.chunks().write_cell(&mut cell).unwrap();
-        for step in 0..version_steps {
+        for step in 0..revision_steps {
             let next_score = score + step as u64 + 1;
             let mut updated = counter_cell(
                 schema_id,
@@ -1573,7 +1579,7 @@ mod tests {
             );
             header = runtime.chunks().update_cell(&mut updated).unwrap();
         }
-        header.version
+        header.revision_ts
     }
 
     fn prepare_local_txn(manager: &Arc<DataManager>, tid: &TxnId, affected_cells: Vec<Id>) {
@@ -1652,7 +1658,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::new(0, 99001);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 3, 0);
+        let revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 3, 0);
         let tid = test_hlc(1, 11);
 
         let result = client
@@ -1662,7 +1668,7 @@ mod tests {
                 tid.clone(),
                 vec![PrepareOp {
                     id: cell_id,
-                    expectation: CellExpectation::Present(version + 1),
+                    expectation: CellExpectation::Present(revision_ts + 1),
                     intent: PrepareIntent::Write,
                 }],
             )
@@ -1685,16 +1691,20 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99021);
 
-        // Seed version A. Size no longer matters: a partial read (head with
-        // pin=true) pins the read version regardless of cell size, so a small
+        // Seed revision_ts A. Size no longer matters: a partial read (head with
+        // pin=true) pins the read revision_ts regardless of cell size, so a small
         // (normal) cell pins just as a large one would (shape-gated, not size).
         let score_a: u64 = 100;
         let mut cell_a = counter_cell(schema.id, cell_id, score_a, "A");
-        let version_a = runtime.chunks().write_cell(&mut cell_a).unwrap().version;
+        let version_a = runtime
+            .chunks()
+            .write_cell(&mut cell_a)
+            .unwrap()
+            .revision_ts;
 
         let tid = test_hlc(1, 41);
 
-        // A partial read (head with pin=true) pins version A for this transaction.
+        // A partial read (head with pin=true) pins revision_ts A for this transaction.
         let head_a =
             <DataManager as Service>::head(&manager, 41, tid.clone(), tid.clone(), cell_id, true)
                 .await
@@ -1703,15 +1713,19 @@ mod tests {
             TxnExecResult::Accepted(header) => header,
             other => panic!("expected head to be accepted, got {:?}", other),
         };
-        assert_eq!(header_a.version, version_a);
+        assert_eq!(header_a.revision_ts, version_a);
 
-        // Externally advance the cell to version B.
+        // Externally advance the cell to revision_ts B.
         let score_b: u64 = 200;
         let mut cell_b = counter_cell(schema.id, cell_id, score_b, "B");
-        let version_b = runtime.chunks().update_cell(&mut cell_b).unwrap().version;
+        let version_b = runtime
+            .chunks()
+            .update_cell(&mut cell_b)
+            .unwrap()
+            .revision_ts;
         assert_ne!(version_a, version_b);
 
-        // The pinning transaction must still observe version A on a full read.
+        // The pinning transaction must still observe revision_ts A on a full read.
         let read_pinned =
             <DataManager as Service>::read(&manager, 41, tid.clone(), tid.clone(), cell_id)
                 .await
@@ -1723,14 +1737,14 @@ mod tests {
         assert_eq!(
             *pinned_cell.data["score"].u64().unwrap(),
             score_a,
-            "pinned read must serve version A's data, not version B's"
+            "pinned read must serve revision_ts A's data, not revision_ts B's"
         );
         assert_eq!(
-            pinned_cell.header.version, version_a,
-            "pinned read must serve version A, not version B"
+            pinned_cell.header.revision_ts, version_a,
+            "pinned read must serve revision_ts A, not revision_ts B"
         );
 
-        // And a subsequent head from the same transaction is still version A.
+        // And a subsequent head from the same transaction is still revision_ts A.
         let head_again =
             <DataManager as Service>::head(&manager, 41, tid.clone(), tid.clone(), cell_id, true)
                 .await
@@ -1739,14 +1753,19 @@ mod tests {
             TxnExecResult::Accepted(header) => header,
             other => panic!("expected head to be accepted, got {:?}", other),
         };
-        assert_eq!(header_again.version, version_a);
+        assert_eq!(header_again.revision_ts, version_a);
 
-        // A different transaction, never having pinned, sees the current version B.
+        // A different transaction, never having pinned, sees the current revision_ts B.
         let other_tid = test_hlc(1, 42);
-        let read_current =
-            <DataManager as Service>::read(&manager, 42, other_tid.clone(), other_tid.clone(), cell_id)
-                .await
-                .payload;
+        let read_current = <DataManager as Service>::read(
+            &manager,
+            42,
+            other_tid.clone(),
+            other_tid.clone(),
+            cell_id,
+        )
+        .await
+        .payload;
         let current_cell = match read_current {
             TxnExecResult::Accepted(cell) => cell,
             other => panic!("expected read to be accepted, got {:?}", other),
@@ -1754,9 +1773,9 @@ mod tests {
         assert_eq!(
             *current_cell.data["score"].u64().unwrap(),
             score_b,
-            "a non-pinning transaction must see the current version B"
+            "a non-pinning transaction must see the current revision_ts B"
         );
-        assert_eq!(current_cell.header.version, version_b);
+        assert_eq!(current_cell.header.revision_ts, version_b);
 
         server.shutdown().await;
     }
@@ -1772,10 +1791,10 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99023);
 
-        // Seed a version, then pin it with a partial read (head with pin=true),
+        // Seed a revision_ts, then pin it with a partial read (head with pin=true),
         // which creates a participant transaction holding a segment guard.
         let mut cell = counter_cell(schema.id, cell_id, 500, "A");
-        let version = runtime.chunks().write_cell(&mut cell).unwrap().version;
+        let revision_ts = runtime.chunks().write_cell(&mut cell).unwrap().revision_ts;
 
         let tid = test_hlc(1, 44);
         let head =
@@ -1783,8 +1802,8 @@ mod tests {
                 .await
                 .payload;
         assert!(
-            matches!(head, TxnExecResult::Accepted(ref h) if h.version == version),
-            "partial read must observe the seeded version"
+            matches!(head, TxnExecResult::Accepted(ref h) if h.revision_ts == revision_ts),
+            "partial read must observe the seeded revision_ts"
         );
 
         // The pin created a participant transaction with a non-empty pin set.
@@ -1840,36 +1859,44 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99022);
 
-        // Seed version A.
+        // Seed revision_ts A.
         let score_a: u64 = 300;
         let mut cell_a = counter_cell(schema.id, cell_id, score_a, "A");
-        let version_a = runtime.chunks().write_cell(&mut cell_a).unwrap().version;
+        let version_a = runtime
+            .chunks()
+            .write_cell(&mut cell_a)
+            .unwrap()
+            .revision_ts;
 
         let tid = test_hlc(1, 43);
 
-        // A blind head (pin=false, the version-observation path) must NOT pin and
+        // A blind head (pin=false, the revision_ts-observation path) must NOT pin and
         // must NOT create a participant transaction.
         let head_a =
             <DataManager as Service>::head(&manager, 43, tid.clone(), tid.clone(), cell_id, false)
                 .await
                 .payload;
         assert!(
-            matches!(head_a, TxnExecResult::Accepted(ref h) if h.version == version_a),
-            "blind head must observe the current version"
+            matches!(head_a, TxnExecResult::Accepted(ref h) if h.revision_ts == version_a),
+            "blind head must observe the current revision_ts"
         );
         assert!(
             manager.find_transaction(&tid).is_none(),
             "head(pin=false) must not create a participant transaction"
         );
 
-        // Externally advance the cell to version B.
+        // Externally advance the cell to revision_ts B.
         let score_b: u64 = 400;
         let mut cell_b = counter_cell(schema.id, cell_id, score_b, "B");
-        let version_b = runtime.chunks().update_cell(&mut cell_b).unwrap().version;
+        let version_b = runtime
+            .chunks()
+            .update_cell(&mut cell_b)
+            .unwrap()
+            .revision_ts;
         assert_ne!(version_a, version_b);
 
         // With no prior partial-read pin, a full read in the same transaction sees
-        // the current version B (a blind head created no snapshot, and full reads
+        // the current revision_ts B (a blind head created no snapshot, and full reads
         // never create a pin themselves).
         let read_current =
             <DataManager as Service>::read(&manager, 43, tid.clone(), tid.clone(), cell_id)
@@ -1882,9 +1909,9 @@ mod tests {
         assert_eq!(
             *current_cell.data["score"].u64().unwrap(),
             score_b,
-            "head(pin=false) must not snapshot; the later full read sees version B"
+            "head(pin=false) must not snapshot; the later full read sees revision_ts B"
         );
-        assert_eq!(current_cell.header.version, version_b);
+        assert_eq!(current_cell.header.revision_ts, version_b);
         assert!(
             manager.find_transaction(&tid).is_none(),
             "a full read with no prior partial pin must not create a participant transaction"
@@ -1903,7 +1930,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::new(0, 99002);
-        seed_cell_version(&runtime, schema.id, cell_id, 4, 0);
+        seed_cell_revision(&runtime, schema.id, cell_id, 4, 0);
         let tid = test_hlc(1, 12);
 
         let result = client
@@ -1974,11 +2001,11 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99004);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 5, 0);
+        let revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 5, 0);
         let tid = test_hlc(1, 14);
         let op = PrepareOp {
             id: cell_id,
-            expectation: CellExpectation::Present(version),
+            expectation: CellExpectation::Present(revision_ts),
             intent: PrepareIntent::Write,
         };
 
@@ -2031,8 +2058,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_a = Id::new(0, 99006);
         let cell_b = Id::new(0, 99007);
-        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 7, 0);
-        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 8, 0);
+        let version_a = seed_cell_revision(&runtime, schema.id, cell_a, 7, 0);
+        let version_b = seed_cell_revision(&runtime, schema.id, cell_b, 8, 0);
         let tid = test_hlc(1, 15);
         let coordinator_id = 15;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
@@ -2114,13 +2141,13 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99008);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 9, 0);
+        let revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 9, 0);
         let tid = test_hlc(1, 16);
         let original_coordinator = 16;
         let requester = TxnPriority::new(tid.clone(), original_coordinator);
         let op = PrepareOp {
             id: cell_id,
-            expectation: CellExpectation::Present(version),
+            expectation: CellExpectation::Present(revision_ts),
             intent: PrepareIntent::Write,
         };
 
@@ -2184,8 +2211,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_a = Id::new(0, 99009);
         let cell_b = Id::new(0, 99010);
-        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 10, 0);
-        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 11, 0);
+        let version_a = seed_cell_revision(&runtime, schema.id, cell_a, 10, 0);
+        let version_b = seed_cell_revision(&runtime, schema.id, cell_b, 11, 0);
         let tid = test_hlc(1, 17);
         let coordinator_id = 17;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
@@ -2272,14 +2299,14 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99011);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 12, 0);
+        let revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 12, 0);
         let tid = test_hlc(1, 18);
         let coordinator_id = 18;
         let requester = TxnPriority::new(tid.clone(), coordinator_id);
         let foreign_owner = TxnPriority::new(test_hlc(1, 1), 1);
         let op = PrepareOp {
             id: cell_id,
-            expectation: CellExpectation::Present(version),
+            expectation: CellExpectation::Present(revision_ts),
             intent: PrepareIntent::Write,
         };
 
@@ -2356,12 +2383,12 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
         let cell_id = Id::new(0, 99005);
-        let version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
+        let revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 6, 0);
         let older_tid = test_hlc(1, 11);
         let younger_tid = test_hlc(1, 22);
         let op = PrepareOp {
             id: cell_id,
-            expectation: CellExpectation::Present(version),
+            expectation: CellExpectation::Present(revision_ts),
             intent: PrepareIntent::Write,
         };
 
@@ -2422,7 +2449,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99011);
-        seed_cell_version(&runtime, schema.id, cell_id, 7, 0);
+        seed_cell_revision(&runtime, schema.id, cell_id, 7, 0);
         let tid = test_hlc(1, 31);
 
         let response =
@@ -2445,9 +2472,7 @@ mod tests {
         let group = "txn_data_site_cleanup";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
-        let tids = (0..64)
-            .map(|_| manager.hlc.now())
-            .collect::<Vec<_>>();
+        let tids = (0..64).map(|_| manager.hlc.now()).collect::<Vec<_>>();
 
         for tid in &tids {
             let txn = manager.get_or_create_transaction(tid);
@@ -2618,9 +2643,9 @@ mod tests {
         let read_id = Id::new(0, 8202);
         let read_only_id = Id::new(0, 8203);
         let unprepared = Id::new(0, 8204);
-        let write_version = seed_cell_version(&runtime, schema.id, write_id, 7, 0);
-        let read_version = seed_cell_version(&runtime, schema.id, read_id, 9, 0);
-        let read_only_version = seed_cell_version(&runtime, schema.id, read_only_id, 11, 0);
+        let write_version = seed_cell_revision(&runtime, schema.id, write_id, 7, 0);
+        let read_version = seed_cell_revision(&runtime, schema.id, read_id, 9, 0);
+        let read_only_version = seed_cell_revision(&runtime, schema.id, read_only_id, 11, 0);
 
         let read_only_tid = manager.hlc.now();
         let read_only_prepare = prepare_ops_local(
@@ -2661,8 +2686,8 @@ mod tests {
             .to_owned();
         assert_eq!(read_only_after.data, read_only_before.data);
         assert_eq!(
-            read_only_after.header.version,
-            read_only_before.header.version
+            read_only_after.header.revision_ts,
+            read_only_before.header.revision_ts
         );
 
         let empty_tid = manager.hlc.now();
@@ -2708,13 +2733,13 @@ mod tests {
         let empty_after_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
         assert_eq!(empty_after_write.data, empty_before_write.data);
         assert_eq!(
-            empty_after_write.header.version,
-            empty_before_write.header.version
+            empty_after_write.header.revision_ts,
+            empty_before_write.header.revision_ts
         );
         assert_eq!(empty_after_read.data, empty_before_read.data);
         assert_eq!(
-            empty_after_read.header.version,
-            empty_before_read.header.version
+            empty_after_read.header.revision_ts,
+            empty_before_read.header.revision_ts
         );
         assert!(manager
             .txns
@@ -2768,13 +2793,13 @@ mod tests {
         let partial_after_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
         assert_eq!(partial_after_write.data, partial_before_write.data);
         assert_eq!(
-            partial_after_write.header.version,
-            partial_before_write.header.version
+            partial_after_write.header.revision_ts,
+            partial_before_write.header.revision_ts
         );
         assert_eq!(partial_after_read.data, partial_before_read.data);
         assert_eq!(
-            partial_after_read.header.version,
-            partial_before_read.header.version
+            partial_after_read.header.revision_ts,
+            partial_before_read.header.revision_ts
         );
         assert!(manager
             .txns
@@ -2837,7 +2862,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8204);
         let initial_score = 13;
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_revision_ts =
+            seed_cell_revision(&runtime, schema.id, cell_id, initial_score, 0);
         let tid = manager.hlc.now();
         let expected_owner = TxnPriority::new(tid.clone(), 0);
 
@@ -2850,7 +2876,7 @@ mod tests {
                 cell_id,
                 PrepareOp {
                     id: cell_id,
-                    expectation: CellExpectation::Present(initial_version),
+                    expectation: CellExpectation::Present(initial_revision_ts),
                     intent: PrepareIntent::Write,
                 },
             );
@@ -2874,7 +2900,7 @@ mod tests {
 
         let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*persisted.data["score"].u64().unwrap(), initial_score);
-        assert_eq!(persisted.header.version, initial_version);
+        assert_eq!(persisted.header.revision_ts, initial_revision_ts);
 
         let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
         let txn = txn_lock.lock();
@@ -2916,14 +2942,15 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8205);
         let initial_score = 21;
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_revision_ts =
+            seed_cell_revision(&runtime, schema.id, cell_id, initial_score, 0);
         let t1 = test_hlc(1, 21);
         let t2 = test_hlc(1, 22);
         let t1_owner = TxnPriority::new(t1.clone(), 21);
         let t2_owner = TxnPriority::new(t2.clone(), 22);
         let prepare_op = PrepareOp {
             id: cell_id,
-            expectation: CellExpectation::Present(initial_version),
+            expectation: CellExpectation::Present(initial_revision_ts),
             intent: PrepareIntent::Write,
         };
 
@@ -2981,7 +3008,7 @@ mod tests {
 
         let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*persisted.data["score"].u64().unwrap(), initial_score);
-        assert_eq!(persisted.header.version, initial_version);
+        assert_eq!(persisted.header.revision_ts, initial_revision_ts);
 
         let t1_txn_lock = manager.txns.get(&t1).expect("t1 should remain tracked");
         let t1_txn = t1_txn_lock.lock();
@@ -3027,12 +3054,13 @@ mod tests {
         let cell_id = Id::new(0, 8206);
         let initial_score = 41;
         let committed_score = 55;
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_revision_ts =
+            seed_cell_revision(&runtime, schema.id, cell_id, initial_score, 0);
         let tid = test_hlc(1, 23);
         let owner = TxnPriority::new(tid.clone(), 23);
         let prepare_op = PrepareOp {
             id: cell_id,
-            expectation: CellExpectation::Present(initial_version),
+            expectation: CellExpectation::Present(initial_revision_ts),
             intent: PrepareIntent::Write,
         };
 
@@ -3063,9 +3091,9 @@ mod tests {
         assert_eq!(commit, DMCommitResult::Success);
 
         let committed = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
-        let committed_version = committed.header.version;
+        let committed_version = committed.header.revision_ts;
         assert_eq!(*committed.data["score"].u64().unwrap(), committed_score);
-        assert!(committed_version > initial_version);
+        assert!(committed_version > initial_revision_ts);
 
         {
             let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
@@ -3083,7 +3111,7 @@ mod tests {
 
         let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*persisted.data["score"].u64().unwrap(), committed_score);
-        assert_eq!(persisted.header.version, committed_version);
+        assert_eq!(persisted.header.revision_ts, committed_version);
 
         let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
         let txn = txn_lock.lock();
@@ -3119,14 +3147,15 @@ mod tests {
         let cell_id = Id::new(0, 8207);
         let initial_score = 61;
         let committed_score = 77;
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_revision_ts =
+            seed_cell_revision(&runtime, schema.id, cell_id, initial_score, 0);
         let t1 = test_hlc(1, 24);
         let t2 = test_hlc(1, 25);
         let t1_owner = TxnPriority::new(t1.clone(), 24);
         let t2_owner = TxnPriority::new(t2.clone(), 25);
         let t1_prepare = PrepareOp {
             id: cell_id,
-            expectation: CellExpectation::Present(initial_version),
+            expectation: CellExpectation::Present(initial_revision_ts),
             intent: PrepareIntent::Write,
         };
 
@@ -3157,9 +3186,9 @@ mod tests {
         assert_eq!(commit_t1, DMCommitResult::Success);
 
         let committed = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
-        let committed_version = committed.header.version;
+        let committed_version = committed.header.revision_ts;
         assert_eq!(*committed.data["score"].u64().unwrap(), committed_score);
-        assert!(committed_version > initial_version);
+        assert!(committed_version > initial_revision_ts);
 
         {
             let txn_lock = manager.txns.get(&t1).expect("t1 should remain tracked");
@@ -3201,7 +3230,7 @@ mod tests {
 
         let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*persisted.data["score"].u64().unwrap(), committed_score);
-        assert_eq!(persisted.header.version, committed_version);
+        assert_eq!(persisted.header.revision_ts, committed_version);
 
         let t1_txn_lock = manager.txns.get(&t1).expect("t1 should remain tracked");
         let t1_txn = t1_txn_lock.lock();
@@ -3245,19 +3274,19 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8210);
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 0, 0);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 0, 0);
         let t1 = test_hlc(1, 11);
         let t2 = test_hlc(1, 22);
         let prepare_op = PrepareOp {
             id: cell_id,
-            expectation: CellExpectation::Present(initial_version),
+            expectation: CellExpectation::Present(initial_revision_ts),
             intent: PrepareIntent::Write,
         };
 
         // (Dropped the `t1.relation(&t2) == Concurrent` precondition: HLC is a
         // total order with no `Concurrent` relation. The behaviour under test —
         // a stale-versioned update from a peer being rejected after another peer
-        // commits a new version — does not depend on the two tids' relative age.)
+        // commits a new revision_ts — does not depend on the two tids' relative age.)
 
         let prepare_t1 = prepare_ops_local(&manager, 11, &t1, vec![prepare_op.clone()]).await;
         assert_eq!(prepare_t1, DMPrepareResult::Success);
@@ -3285,7 +3314,7 @@ mod tests {
 
         let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*persisted.data["score"].u64().unwrap(), 1);
-        assert!(persisted.header.version > initial_version);
+        assert!(persisted.header.revision_ts > initial_revision_ts);
 
         server.shutdown().await;
     }
@@ -3300,7 +3329,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8211);
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 1, 0);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
         let tid = test_hlc(1, 31);
 
         let prepare = prepare_ops_local(
@@ -3309,7 +3338,7 @@ mod tests {
             &tid,
             vec![PrepareOp {
                 id: cell_id,
-                expectation: CellExpectation::Present(initial_version),
+                expectation: CellExpectation::Present(initial_revision_ts),
                 intent: PrepareIntent::Write,
             }],
         )
@@ -3318,7 +3347,7 @@ mod tests {
 
         let mut external = counter_cell(schema.id, cell_id, 7, "counter_commit_external");
         let external_header = runtime.chunks().update_cell(&mut external).unwrap();
-        assert!(external_header.version > initial_version);
+        assert!(external_header.revision_ts > initial_revision_ts);
 
         let commit = commit_ops_local(
             &manager,
@@ -3335,7 +3364,7 @@ mod tests {
 
         let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*persisted.data["score"].u64().unwrap(), 7);
-        assert_eq!(persisted.header.version, external_header.version);
+        assert_eq!(persisted.header.revision_ts, external_header.revision_ts);
 
         let txn = manager.txns.get(&tid).expect("txn should remain tracked");
         let txn = txn.lock();
@@ -3357,7 +3386,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8212);
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 2, 0);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 2, 0);
         let tid = test_hlc(1, 32);
 
         let prepare = prepare_ops_local(
@@ -3366,7 +3395,7 @@ mod tests {
             &tid,
             vec![PrepareOp {
                 id: cell_id,
-                expectation: CellExpectation::Present(initial_version),
+                expectation: CellExpectation::Present(initial_revision_ts),
                 intent: PrepareIntent::Write,
             }],
         )
@@ -3375,14 +3404,14 @@ mod tests {
 
         let mut external = counter_cell(schema.id, cell_id, 8, "counter_remove_external");
         let external_header = runtime.chunks().update_cell(&mut external).unwrap();
-        assert!(external_header.version > initial_version);
+        assert!(external_header.revision_ts > initial_revision_ts);
 
         let commit = commit_ops_local(&manager, &tid, vec![CommitOp::Remove(cell_id)]).await;
         assert_eq!(commit, DMCommitResult::CellChanged(cell_id));
 
         let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*persisted.data["score"].u64().unwrap(), 8);
-        assert_eq!(persisted.header.version, external_header.version);
+        assert_eq!(persisted.header.revision_ts, external_header.revision_ts);
 
         let txn = manager.txns.get(&tid).expect("txn should remain tracked");
         let txn = txn.lock();
@@ -3404,7 +3433,7 @@ mod tests {
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8216);
-        let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 6, 0);
         let tid = test_hlc(1, 35);
 
         let prepare = prepare_ops_local(
@@ -3413,7 +3442,7 @@ mod tests {
             &tid,
             vec![PrepareOp {
                 id: cell_id,
-                expectation: CellExpectation::Present(initial_version),
+                expectation: CellExpectation::Present(initial_revision_ts),
                 intent: PrepareIntent::Write,
             }],
         )
@@ -3498,7 +3527,7 @@ mod tests {
 
         let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
         assert_eq!(*persisted.data["score"].u64().unwrap(), 5);
-        assert_eq!(persisted.header.version, external_header.version);
+        assert_eq!(persisted.header.revision_ts, external_header.revision_ts);
 
         let txn = manager.txns.get(&tid).expect("txn should remain tracked");
         let txn = txn.lock();
@@ -3521,8 +3550,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_a = Id::new(0, 8214);
         let cell_b = Id::new(0, 8215);
-        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 3, 0);
-        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 4, 0);
+        let version_a = seed_cell_revision(&runtime, schema.id, cell_a, 3, 0);
+        let version_b = seed_cell_revision(&runtime, schema.id, cell_b, 4, 0);
         let tid = test_hlc(1, 34);
 
         let prepare = prepare_ops_local(
@@ -3562,9 +3591,9 @@ mod tests {
         let after_a = runtime.chunks().read_cell(&cell_a).unwrap().to_owned();
         let after_b = runtime.chunks().read_cell(&cell_b).unwrap().to_owned();
         assert_eq!(after_a.data, before_a.data);
-        assert_eq!(after_a.header.version, before_a.header.version);
+        assert_eq!(after_a.header.revision_ts, before_a.header.revision_ts);
         assert_eq!(after_b.data, before_b.data);
-        assert_eq!(after_b.header.version, before_b.header.version);
+        assert_eq!(after_b.header.revision_ts, before_b.header.revision_ts);
 
         let txn = manager.txns.get(&tid).expect("txn should remain tracked");
         let txn = txn.lock();
@@ -3587,8 +3616,8 @@ mod tests {
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_a = Id::new(0, 8217);
         let cell_b = Id::new(0, 8218);
-        let version_a = seed_cell_version(&runtime, schema.id, cell_a, 15, 0);
-        let version_b = seed_cell_version(&runtime, schema.id, cell_b, 25, 0);
+        let version_a = seed_cell_revision(&runtime, schema.id, cell_a, 15, 0);
+        let version_b = seed_cell_revision(&runtime, schema.id, cell_b, 25, 0);
         let tid = test_hlc(1, 36);
 
         let prepare = prepare_ops_local(
@@ -3616,7 +3645,7 @@ mod tests {
 
         let mut external_b = counter_cell(schema.id, cell_b, 26, "counter_prevalidate_external_b");
         let external_b_header = runtime.chunks().update_cell(&mut external_b).unwrap();
-        assert!(external_b_header.version > version_b);
+        assert!(external_b_header.revision_ts > version_b);
 
         let commit = commit_ops_local(
             &manager,
@@ -3643,10 +3672,10 @@ mod tests {
         let after_a = runtime.chunks().read_cell(&cell_a).unwrap().to_owned();
         let after_b = runtime.chunks().read_cell(&cell_b).unwrap().to_owned();
         assert_eq!(after_a.data, before_a.data);
-        assert_eq!(after_a.header.version, before_a.header.version);
+        assert_eq!(after_a.header.revision_ts, before_a.header.revision_ts);
         assert_eq!(after_b.data, external_b.data);
-        assert_eq!(after_b.header.version, external_b_header.version);
-        assert_ne!(after_b.header.version, before_b.header.version);
+        assert_eq!(after_b.header.revision_ts, external_b_header.revision_ts);
+        assert_ne!(after_b.header.revision_ts, before_b.header.revision_ts);
 
         let txn = manager.txns.get(&tid).expect("txn should remain tracked");
         let txn = txn.lock();
@@ -3759,8 +3788,8 @@ impl Service for DataManager {
         FULL_READ_RPC_COUNT.fetch_add(1, Relaxed);
         // A full read never creates a pin. It only serves from an existing pin
         // when a prior partial read (head/read_selected) in this transaction
-        // already snapshotted the cell, so both reads repeat the same version.
-        // Pinned serves deliberately skip `prepare_read`: the version was
+        // already snapshotted the cell, so both reads repeat the same revision_ts.
+        // Pinned serves deliberately skip `prepare_read`: the revision_ts was
         // admitted for this transaction when the pin was created, so re-running
         // the ReadTooLate check or waiting on a committing owner could only
         // spuriously reject or delay a read whose (immutable) outcome cannot
@@ -3809,7 +3838,7 @@ impl Service for DataManager {
             };
         }
         match self.chunks().read_selected(&id, &fields[..], true) {
-            // Need header for version check
+            // Need header for revision_ts check
             Ok(values) => self.response_with(TxnExecResult::Accepted(values.to_owned())),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
@@ -3822,8 +3851,8 @@ impl Service for DataManager {
         id: Id,
         pin: bool,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
-        // A partial read (pin=true) snapshots the read version so the same
-        // transaction repeats it. The blind version-observation path (pin=false,
+        // A partial read (pin=true) snapshots the read revision_ts so the same
+        // transaction repeats it. The blind revision_ts-observation path (pin=false,
         // e.g. `observe_head_from_site`) must NOT pin or create a transaction; it
         // serves the current header as the original (pre-pinning) code did.
         if pin {
@@ -4066,11 +4095,7 @@ impl Service for DataManager {
         let _phase_guard = phase_guard;
         self.response_with(self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells))
     }
-    fn abort(
-        &self,
-        clock: Hlc,
-        tid: TxnId,
-    ) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
+    fn abort(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let _phase_guard =
@@ -4143,11 +4168,7 @@ impl Service for DataManager {
 
         self.response_with(AbortResult::Success(rollback_failures))
     }
-    fn end(
-        &self,
-        clock: Hlc,
-        tid: TxnId,
-    ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+    fn end(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);

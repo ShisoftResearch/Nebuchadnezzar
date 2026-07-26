@@ -70,6 +70,7 @@ async fn test_cell_location_alignment_after_write() {
         &ServerOptions {
             chunk_size: SEGMENT_SIZE,
             db_size: SEGMENT_SIZE,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -145,6 +146,7 @@ async fn test_cell_location_alignment_after_update() {
         &ServerOptions {
             chunk_size: SEGMENT_SIZE * 4,
             db_size: SEGMENT_SIZE * 4,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -243,6 +245,7 @@ async fn test_varying_size_alignment() {
         &ServerOptions {
             chunk_size: SEGMENT_SIZE * 8,
             db_size: SEGMENT_SIZE * 8,
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
@@ -429,6 +432,7 @@ async fn test_alignment_after_multiple_segments() {
         &ServerOptions {
             chunk_size: SEGMENT_SIZE * 4,
             db_size: SEGMENT_SIZE * 4, // Multiple segments
+            history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,

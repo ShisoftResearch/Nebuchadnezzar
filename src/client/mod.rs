@@ -383,7 +383,8 @@ impl AsyncClient {
                 Ok::<_, RPCError>((indices, results))
             })
             .collect::<FuturesUnordered<_>>();
-        let mut out: Vec<Option<Result<CellHeader, WriteError>>> = (0..total).map(|_| None).collect();
+        let mut out: Vec<Option<Result<CellHeader, WriteError>>> =
+            (0..total).map(|_| None).collect();
         while let Some(res) = batches.next().await {
             let (indices, results) = res?;
             for (idx, r) in indices.into_iter().zip(results) {
@@ -418,44 +419,44 @@ impl AsyncClient {
         }
         Ok(sum)
     }
-    pub async fn compare_version_and_update_cell(
+    pub async fn compare_revision_and_update_cell(
         &self,
         id: Id,
-        version: u64,
+        revision_ts: u64,
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         match client
-            .compare_version_and_update_cell(id, version, cell.clone())
+            .compare_revision_and_update_cell(id, revision_ts, cell.clone())
             .await?
         {
             Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
                 self.refresh_owner_schema_cache_for_retry(&client, schema_id)
                     .await?;
                 client
-                    .compare_version_and_update_cell(id, version, cell)
+                    .compare_revision_and_update_cell(id, revision_ts, cell)
                     .await
             }
             other => Ok(other),
         }
     }
-    pub async fn compare_version_and_set_field(
+    pub async fn compare_revision_and_set_field(
         &self,
         id: Id,
-        version: u64,
+        revision_ts: u64,
         field: u64,
         value: OwnedValue,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         match client
-            .compare_version_and_set_field(id, version, field, value.clone())
+            .compare_revision_and_set_field(id, revision_ts, field, value.clone())
             .await?
         {
             Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
                 self.refresh_owner_schema_cache_for_retry(&client, schema_id)
                     .await?;
                 client
-                    .compare_version_and_set_field(id, version, field, value)
+                    .compare_revision_and_set_field(id, revision_ts, field, value)
                     .await
             }
             other => Ok(other),

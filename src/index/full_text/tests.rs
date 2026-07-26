@@ -48,6 +48,7 @@ mod tests {
             &crate::server::ServerOptions {
                 chunk_size: 128 * 1024 * 1024,
                 db_size: 128 * 1024 * 1024,
+                history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
@@ -102,7 +103,7 @@ mod tests {
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
                     cell_id: doc_id,
-                    version: 1,
+                    revision_ts: 1,
                     schema_id,
                     field_id,
                     doc_length: 5,
@@ -164,7 +165,7 @@ mod tests {
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
                     cell_id: doc_id,
-                    version: 1,
+                    revision_ts: 1,
                     schema_id,
                     field_id,
                     doc_length: 5,
@@ -201,7 +202,7 @@ mod tests {
     }
 
     /// Test: Version preservation in posting entries
-    /// Verifies that cell versions are correctly stored with each posting entry
+    /// Verifies that cell revisions are correctly stored with each posting entry.
     #[tokio::test]
     async fn test_cas_version_preservation() {
         let _ = env_logger::try_init();
@@ -213,13 +214,13 @@ mod tests {
         let field_id = hash_str("content");
         let term_hash = hash_str("versioned");
 
-        // Add documents with different versions
-        let versions = vec![1u64, 5u64, 10u64, 15u64, 20u64];
-        for (i, &version) in versions.iter().enumerate() {
+        // Add documents with different revisions.
+        let revisions = vec![1u64, 5u64, 10u64, 15u64, 20u64];
+        for (i, &revision_ts) in revisions.iter().enumerate() {
             let doc_id = Id::new(i as u64, i as u64);
             let meta = FullTextIndexMeta {
                 cell_id: doc_id,
-                version,
+                revision_ts,
                 schema_id,
                 field_id,
                 doc_length: 5,
@@ -232,17 +233,13 @@ mod tests {
             indexer.add_document(&meta).unwrap();
         }
 
-        // Verify versions are stored correctly
-        let postings = indexer.get_term_postings_with_version(schema_id, field_id, term_hash);
+        // Verify revisions are stored correctly.
+        let postings = indexer.get_term_postings_with_revision(schema_id, field_id, term_hash);
         assert_eq!(postings.len(), 5, "Should have 5 postings");
 
-        // Check that versions match
-        let stored_versions: HashSet<u64> = postings.iter().map(|(_, v, _, _)| *v).collect();
-        let expected_versions: HashSet<u64> = versions.into_iter().collect();
-        assert_eq!(
-            stored_versions, expected_versions,
-            "Stored versions should match input versions"
-        );
+        let stored_revisions: HashSet<u64> = postings.iter().map(|(_, ts, _, _)| *ts).collect();
+        let expected_revisions: HashSet<u64> = revisions.into_iter().collect();
+        assert_eq!(stored_revisions, expected_revisions);
     }
 
     /// Test: Concurrent stats updates
@@ -273,7 +270,7 @@ mod tests {
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
                     cell_id: doc_id,
-                    version: 1,
+                    revision_ts: 1,
                     schema_id,
                     field_id,
                     doc_length: 10,
@@ -313,8 +310,7 @@ mod tests {
         );
     }
 
-    /// Test: Update existing document (tests version increment)
-    /// Verifies that updating a document creates a new posting with new version
+    /// Test updating an existing document with a new revision.
     #[tokio::test]
     async fn test_cas_document_update_version_increment() {
         let _ = env_logger::try_init();
@@ -327,10 +323,10 @@ mod tests {
         let doc_id = Id::new(1, 1);
         let term_hash = hash_str("updated");
 
-        // Add document with version 1
+        // Add document with revision 1.
         let meta_v1 = FullTextIndexMeta {
             cell_id: doc_id,
-            version: 1,
+            revision_ts: 1,
             schema_id,
             field_id,
             doc_length: 5,
@@ -342,10 +338,10 @@ mod tests {
         indexer.add_document(&meta_v1).unwrap();
         indexer.update_stats_for_add(&meta_v1);
 
-        // Update document with version 2
+        // Update document with revision 2.
         let meta_v2 = FullTextIndexMeta {
             cell_id: doc_id,
-            version: 2,
+            revision_ts: 2,
             schema_id,
             field_id,
             doc_length: 8,
@@ -357,19 +353,18 @@ mod tests {
         indexer.add_document(&meta_v2).unwrap();
         indexer.update_stats_for_add(&meta_v2);
 
-        // Verify both versions are in posting list (append-only)
-        let postings = indexer.get_term_postings_with_version(schema_id, field_id, term_hash);
+        // Verify both revisions are in the append-only posting list.
+        let postings = indexer.get_term_postings_with_revision(schema_id, field_id, term_hash);
         assert_eq!(
             postings.len(),
             2,
             "Should have 2 entries (append-only for same doc)"
         );
 
-        // Verify versions
-        let versions: Vec<u64> = postings.iter().map(|(_, v, _, _)| *v).collect();
+        let revisions: Vec<u64> = postings.iter().map(|(_, ts, _, _)| *ts).collect();
         assert!(
-            versions.contains(&1) && versions.contains(&2),
-            "Should have both version 1 and version 2"
+            revisions.contains(&1) && revisions.contains(&2),
+            "Should have both revisions"
         );
 
         // Verify stats reflect update (not double-counting)
@@ -405,7 +400,7 @@ mod tests {
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
                     cell_id: doc_id,
-                    version: 1,
+                    revision_ts: 1,
                     schema_id,
                     field_id,
                     doc_length: 5,
@@ -436,7 +431,7 @@ mod tests {
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
                     cell_id: doc_id,
-                    version: 1,
+                    revision_ts: 1,
                     schema_id,
                     field_id,
                     doc_length: 5,
@@ -459,7 +454,7 @@ mod tests {
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
                     cell_id: doc_id,
-                    version: 1,
+                    revision_ts: 1,
                     schema_id,
                     field_id,
                     doc_length: 5,
@@ -516,7 +511,7 @@ mod tests {
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
                     cell_id: doc_id,
-                    version: 1,
+                    revision_ts: 1,
                     schema_id,
                     field_id,
                     doc_length: 3,
@@ -572,7 +567,7 @@ mod tests {
         // Add document
         let meta1 = FullTextIndexMeta {
             cell_id: doc_id,
-            version: 1,
+            revision_ts: 1,
             schema_id,
             field_id,
             doc_length: 10,
@@ -591,7 +586,7 @@ mod tests {
         // Update same document with different length
         let meta2 = FullTextIndexMeta {
             cell_id: doc_id,
-            version: 2,
+            revision_ts: 2,
             schema_id,
             field_id,
             doc_length: 15,
