@@ -3,6 +3,7 @@ use crate::ram::chunk::Chunk;
 use crate::ram::chunk::PendingEntry;
 use crate::ram::compression;
 use crate::ram::entry::*;
+use crate::ram::history::RevisionNode;
 use crate::ram::io::align_address;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
@@ -18,6 +19,7 @@ use std::io::Seek;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
 use std::ptr;
+use std::sync::Arc;
 
 use super::io::writer::WriteInstructions;
 use super::schema::SchemaRef;
@@ -26,6 +28,47 @@ pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
 pub const MAX_BLOB_CELL_SIZE: u32 = 2 * 1024 * 1024;
 
 pub type OwnedCellRef = ARef<OwnedCell>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallVisibility {
+    Pending,
+    Committed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevisionWrite {
+    pub revision_ts: u64,
+    pub visibility: InstallVisibility,
+}
+
+impl RevisionWrite {
+    pub fn pending(revision_ts: u64) -> Self {
+        Self {
+            revision_ts,
+            visibility: InstallVisibility::Pending,
+        }
+    }
+
+    pub fn committed(revision_ts: u64) -> Self {
+        Self {
+            revision_ts,
+            visibility: InstallVisibility::Committed,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct InstalledRevision {
+    pub id: Id,
+    pub node: Arc<RevisionNode>,
+}
+
+#[derive(Debug)]
+pub enum SnapshotRead<T> {
+    Present(T),
+    Absent(Option<u64>),
+    Wait,
+}
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Default)]
@@ -63,6 +106,7 @@ pub enum WriteError {
 pub enum ReadError {
     SchemaDoesNotExisted(u32),
     CellDoesNotExisted,
+    SnapshotTooOld,
     NetworkingError,
     CellTypeIsNotMapForSelect,
     CellIdIsUnitId,

@@ -3,10 +3,12 @@ use crate::query::statistics::{
 };
 use crate::ram::entry::{Entry, EntryContent, EntryType, ENTRY_HEAD_SIZE};
 use crate::ram::file_manager::SegmentFileManager;
-use crate::ram::history::HistoryIndex;
+use crate::ram::history::{HistoryIndex, RevisionNode, RevisionState, SnapshotRevision};
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::segment_list::SegmentList;
-use crate::ram::segs::{Segment, SegmentAllocator, SegmentClass, SEGMENT_SIZE, SEGMENT_SIZE_U32};
+use crate::ram::segs::{
+    Segment, SegmentAllocator, SegmentClass, SegmentReferenceGuard, SEGMENT_SIZE, SEGMENT_SIZE_U32,
+};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
 use crate::ram::types::Id;
 use crate::server::ServerMeta;
@@ -664,12 +666,26 @@ impl Chunk {
 
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
         let loc = CellGuard::for_read(hash, self)?;
-        let head_ptr = *loc + offset;
+        self.read_partial_raw_at(*loc, offset, len)
+    }
+
+    fn read_partial_raw_at(
+        &self,
+        location: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, ReadError> {
+        let head_ptr = location
+            .checked_add(offset)
+            .ok_or(ReadError::CellDoesNotExisted)?;
+        let end_ptr = head_ptr
+            .checked_add(len)
+            .ok_or(ReadError::CellDoesNotExisted)?;
         let mut data = Vec::with_capacity(len);
-        for ptr in head_ptr..(head_ptr + len) {
+        for ptr in head_ptr..end_ptr {
             data.push(unsafe { *(ptr as *const u8) });
         }
-        Ok(data.to_vec())
+        Ok(data)
     }
 
     pub fn write_cell_to_chunk<'a>(
@@ -718,244 +734,471 @@ impl Chunk {
         }
     }
 
-    fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
-        let revision_ts = self.next_revision_ts(0)?;
+    fn entry_size_at(&self, location: usize) -> u32 {
+        let (entry, _) = Entry::decode_from(location, |_, _| {});
+        entry
+            .content_length
+            .checked_add(ENTRY_HEAD_SIZE as u32)
+            .expect("entry size exceeds u32")
+    }
+
+    fn ensure_present_predecessor(
+        &self,
+        id: Id,
+        header: &CellHeader,
+        location: usize,
+    ) -> Result<Arc<RevisionNode>, WriteError> {
+        if let Some(current) = self.history.current(&id) {
+            let (state, current_location) = current.load();
+            if current.revision_ts != header.revision_ts
+                || current_location != location
+                || !matches!(
+                    state,
+                    RevisionState::PendingPresent
+                        | RevisionState::CommittedPresent
+                        | RevisionState::Aborted
+                )
+            {
+                return Err(WriteError::CellRevisionMismatch);
+            }
+            return Ok(current);
+        }
+
+        let predecessor = Arc::new(RevisionNode::new(
+            header.revision_ts,
+            RevisionState::CommittedPresent,
+            location,
+            self.entry_size_at(location),
+        ));
+        self.history
+            .install(id, predecessor.clone(), None)
+            .map_err(|_| WriteError::CellRevisionMismatch)?;
+        Ok(predecessor)
+    }
+
+    fn revision_state(visibility: InstallVisibility, deleted: bool) -> RevisionState {
+        match (visibility, deleted) {
+            (InstallVisibility::Pending, false) => RevisionState::PendingPresent,
+            (InstallVisibility::Pending, true) => RevisionState::PendingDeleted,
+            (InstallVisibility::Committed, false) => RevisionState::CommittedPresent,
+            (InstallVisibility::Committed, true) => RevisionState::CommittedDeleted,
+        }
+    }
+
+    fn install_written_revision(
+        &self,
+        id: Id,
+        node: Arc<RevisionNode>,
+        expected_predecessor: Option<&Arc<RevisionNode>>,
+        orphan_segment: &Segment,
+    ) -> Result<
+        (
+            Arc<crate::ram::history::RevisionChain>,
+            Option<Arc<RevisionNode>>,
+        ),
+        WriteError,
+    > {
+        match self.history.install(id, node.clone(), expected_predecessor) {
+            Ok(installed) => Ok(installed),
+            Err(()) => {
+                self.mark_dead_entry_with_size(node.load().1, node.entry_size, orphan_segment);
+                Err(WriteError::CellRevisionMismatch)
+            }
+        }
+    }
+
+    fn write_cell_at_revision(
+        &self,
+        cell: &mut OwnedCell,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        let id = cell.id();
+        let hash = id.lower;
+        let raw_guard = self
+            .cell_index
+            .try_insert_locked(hash as usize)
+            .ok_or(WriteError::CellAlreadyExisted)?;
+        let mut guard = CellGuard::from_guard(hash, raw_guard, self)
+            .expect("empty cell reservation cannot require promotion");
+        self.write_cell_with_guard_at_revision(&mut guard, cell, write)
+    }
+
+    fn write_cell_with_guard_at_revision(
+        &self,
+        guard: &mut CellGuard<'_>,
+        cell: &mut OwnedCell,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        if !guard.is_unassigned() {
+            return Err(WriteError::CellAlreadyExisted);
+        }
+        let id = cell.id();
+        if id.lower != guard.hash {
+            return Err(WriteError::CellRevisionMismatch);
+        }
+        let hash = id.lower;
+        let predecessor = self.history.current(&id);
+        if predecessor
+            .as_ref()
+            .is_some_and(|current| current.revision_ts >= write.revision_ts)
+        {
+            return Err(WriteError::CellRevisionMismatch);
+        }
+        if predecessor
+            .as_ref()
+            .is_some_and(|current| current.load().0 != RevisionState::CommittedDeleted)
+        {
+            return Err(WriteError::CellAlreadyExisted);
+        }
+
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
+        let entry_size = write_plan.total_size();
+        let orphan_segment = pending_entry.seg.clone();
         let write_result =
-            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
-        let cell_loc = write_result.addr;
+            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, write.revision_ts)?;
+        drop(pending_entry);
+        let node = Arc::new(RevisionNode::new(
+            write.revision_ts,
+            Self::revision_state(write.visibility, false),
+            write_result.addr,
+            entry_size,
+        ));
+        let (chain, installed_predecessor) =
+            self.install_written_revision(id, node.clone(), predecessor.as_ref(), &orphan_segment)?;
+
         #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                self.validate_cell_location(
-                    cell_loc,
-                    &format!("write_cell(hash={})", cell.header.hash)
-                ),
-                "Attempting to store invalid cell location 0x{:x} in cell index for hash {}",
-                cell_loc,
-                cell.header.hash
-            );
+        self.assert_address_aligned_for_write(write_result.addr, "write_cell_at_revision", hash);
+        guard.set_ptr(write_result.addr);
+        self.ensure_indices(cell, None, &write_plan.schema);
+        self.refresh_statistics_for_schema(write_plan.schema.id);
+        if let Some(predecessor) = installed_predecessor {
+            self.history.retire(&chain, &predecessor);
+        }
+        cell.header.revision_ts = write.revision_ts;
+        Ok(InstalledRevision { id, node })
+    }
+
+    fn update_cell_at_revision(
+        &self,
+        cell: &mut OwnedCell,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        let id = cell.id();
+        let hash = id.lower;
+        let mut guard =
+            CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
+        self.update_cell_with_guard_at_revision(&mut guard, cell, write)
+    }
+
+    fn update_cell_with_guard_at_revision(
+        &self,
+        guard: &mut CellGuard<'_>,
+        cell: &mut OwnedCell,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        if guard.is_unassigned() || cell.header.hash != guard.hash {
+            return Err(WriteError::CellDoesNotExisted);
+        }
+        let id = cell.id();
+        let old_location = guard.get_ptr();
+        let old_header = guard.head_cell().map_err(WriteError::ReadError)?;
+        let predecessor = self.ensure_present_predecessor(id, &old_header, old_location)?;
+        if write.revision_ts <= predecessor.revision_ts {
+            return Err(WriteError::CellRevisionMismatch);
         }
 
-        match self.cell_index.try_insert_locked(cell.header.hash as usize) {
-            Some(mut guard) => {
-                #[cfg(debug_assertions)]
-                self.assert_address_aligned_for_write(cell_loc, "write_cell", cell.header.hash);
+        let write_plan = cell.plan_write(self)?;
+        let old_indices = guard.old_index_res(&write_plan.schema)?;
+        let pending_entry = write_plan.allocate(self, true)?;
+        let entry_size = write_plan.total_size();
+        let orphan_segment = pending_entry.seg.clone();
+        let write_result =
+            self.write_cell_to_chunk(cell, &write_plan, &pending_entry, write.revision_ts)?;
+        drop(pending_entry);
+        let node = Arc::new(RevisionNode::new(
+            write.revision_ts,
+            Self::revision_state(write.visibility, false),
+            write_result.addr,
+            entry_size,
+        ));
+        let (chain, _) =
+            self.install_written_revision(id, node.clone(), Some(&predecessor), &orphan_segment)?;
 
-                *guard = cell_loc;
-                drop(guard);
-                self.ensure_indices(cell, None, &*write_plan.schema);
-                self.refresh_statistics_for_schema(write_plan.schema.id);
+        guard.set_ptr(write_result.addr);
+        self.ensure_indices_with_res(cell, old_indices, &write_plan.schema);
+        self.refresh_statistics_for_schema(write_plan.schema.id);
+        self.history.retire(&chain, &predecessor);
+        cell.header.revision_ts = write.revision_ts;
+        Ok(InstalledRevision { id, node })
+    }
+
+    fn remove_cell_at_revision(
+        &self,
+        id: &Id,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        let hash = id.lower;
+        let guard = CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
+        self.remove_cell_with_guard_at_revision(guard, id, write)
+    }
+
+    fn remove_cell_with_guard_at_revision(
+        &self,
+        mut guard: CellGuard<'_>,
+        id: &Id,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        if guard.is_unassigned() || guard.hash != id.lower {
+            return Err(WriteError::CellDoesNotExisted);
+        }
+        let hash = id.lower;
+        let old_location = guard.get_ptr();
+        let old_header = guard.head_cell().map_err(WriteError::ReadError)?;
+        let predecessor = self.ensure_present_predecessor(*id, &old_header, old_location)?;
+        if write.revision_ts <= predecessor.revision_ts {
+            return Err(WriteError::CellRevisionMismatch);
+        }
+
+        let (old_cell, schema) = SharedCellData::from_chunk_raw(hash, old_location, self)
+            .map_err(WriteError::ReadError)?;
+        if let Some(indexer) = &self.index_builder {
+            let shared = SharedCell::compose(old_cell, guard);
+            indexer.remove_indices(&shared, &schema);
+            guard = shared.into_cell_guard();
+        }
+        let old_segment = self.locate_segment_ensured(old_location, id);
+        let pending_entry = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true)?;
+        let tombstone_segment = pending_entry.seg.clone();
+        Tombstone::put(
+            pending_entry.addr,
+            old_segment.seq_id,
+            write.revision_ts,
+            id.higher,
+            id.lower,
+        );
+        tombstone_segment.tombstones.fetch_add(1, Ordering::Relaxed);
+        tombstone_segment.note_dead_bytes_change();
+        let tombstone_location = pending_entry.addr;
+        drop(pending_entry);
+        let node = Arc::new(RevisionNode::new(
+            write.revision_ts,
+            Self::revision_state(write.visibility, true),
+            tombstone_location,
+            TOMBSTONE_ENTRY_SIZE as u32,
+        ));
+        let (chain, _) = self.install_written_revision(
+            *id,
+            node.clone(),
+            Some(&predecessor),
+            &tombstone_segment,
+        )?;
+
+        guard.remove_index_entry();
+        self.refresh_statistics_for_schema(schema.id);
+        self.history.retire(&chain, &predecessor);
+        Ok(InstalledRevision { id: *id, node })
+    }
+
+    fn read_snapshot_at<T, F>(
+        &self,
+        id: &Id,
+        snapshot_ts: u64,
+        materialize: F,
+    ) -> Result<SnapshotRead<T>, ReadError>
+    where
+        F: Fn(usize) -> Result<T, ReadError>,
+    {
+        match CellGuard::for_read(id.lower, self) {
+            Ok(mut guard) => {
+                let location = guard.get_ptr();
+                let header = guard.head_cell()?;
+                if header.revision_ts < snapshot_ts {
+                    if let Some(current) = self.history.current(id) {
+                        let (state, node_location) = current.load();
+                        if current.revision_ts == header.revision_ts
+                            && state == RevisionState::CommittedPresent
+                            && node_location == location
+                        {
+                            return materialize(location).map(SnapshotRead::Present);
+                        }
+                    }
+                }
             }
-            None => return Err(WriteError::CellAlreadyExisted),
+            Err(ReadError::CellDoesNotExisted) => {}
+            Err(error) => return Err(error),
         }
-        cell.header.revision_ts = write_result.revision_ts;
+
+        let backoff = Backoff::new();
+        loop {
+            match self.history.resolve(id, snapshot_ts) {
+                SnapshotRevision::Present(node) => {
+                    let expected = node.load();
+                    if expected.0 != RevisionState::CommittedPresent {
+                        backoff.spin();
+                        continue;
+                    }
+                    let Some(segment) = self.locate_segment(expected.1) else {
+                        backoff.spin();
+                        continue;
+                    };
+                    let Some(_lease) = SegmentReferenceGuard::try_new(segment) else {
+                        backoff.spin();
+                        continue;
+                    };
+                    if node.load() != expected {
+                        backoff.spin();
+                        continue;
+                    }
+                    return materialize(expected.1).map(SnapshotRead::Present);
+                }
+                SnapshotRevision::Deleted(node) => {
+                    return Ok(SnapshotRead::Absent(Some(node.revision_ts)));
+                }
+                SnapshotRevision::NeverExisted => return Ok(SnapshotRead::Absent(None)),
+                SnapshotRevision::Wait => return Ok(SnapshotRead::Wait),
+                SnapshotRevision::TooOld => return Err(ReadError::SnapshotTooOld),
+            }
+        }
+    }
+
+    fn read_cell_snapshot(
+        &self,
+        id: &Id,
+        snapshot_ts: u64,
+    ) -> Result<SnapshotRead<OwnedCell>, ReadError> {
+        self.read_snapshot_at(id, snapshot_ts, |location| {
+            self.read_cell_at(id.lower, location)
+        })
+    }
+
+    fn read_selected_snapshot(
+        &self,
+        id: &Id,
+        snapshot_ts: u64,
+        fields: &[u64],
+    ) -> Result<SnapshotRead<OwnedCell>, ReadError> {
+        self.read_snapshot_at(id, snapshot_ts, |location| {
+            self.read_selected_at(location, fields, true)
+        })
+    }
+
+    fn head_snapshot(
+        &self,
+        id: &Id,
+        snapshot_ts: u64,
+    ) -> Result<SnapshotRead<CellHeader>, ReadError> {
+        self.read_snapshot_at(id, snapshot_ts, |location| self.head_at(location))
+    }
+
+    fn read_partial_raw_snapshot(
+        &self,
+        id: &Id,
+        snapshot_ts: u64,
+        offset: usize,
+        len: usize,
+    ) -> Result<SnapshotRead<Vec<u8>>, ReadError> {
+        self.read_snapshot_at(id, snapshot_ts, |location| {
+            self.read_partial_raw_at(location, offset, len)
+        })
+    }
+
+    fn promote_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
+        if self
+            .history
+            .current(&installed.id)
+            .is_some_and(|current| Arc::ptr_eq(&current, &installed.node))
+            && installed.node.promote()
+        {
+            Ok(())
+        } else {
+            Err(WriteError::CellRevisionMismatch)
+        }
+    }
+
+    fn abort_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
+        if self
+            .history
+            .current(&installed.id)
+            .is_some_and(|current| Arc::ptr_eq(&current, &installed.node))
+            && installed.node.abort()
+        {
+            Ok(())
+        } else {
+            Err(WriteError::CellRevisionMismatch)
+        }
+    }
+
+    fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+        let revision_ts = self.next_revision_ts(0)?;
+        self.write_cell_at_revision(cell, RevisionWrite::committed(revision_ts))?;
         Ok(cell.header)
     }
 
     fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let hash = cell.header.hash;
-        let write_plan = cell.plan_write(self)?;
-        let pending_entry = write_plan.allocate(self, true)?;
-        if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
-            let cell_location = cell_guard.get_ptr();
-            let previous_revision_ts = cell_revision_ts_from_chunk_raw(cell_location)
-                .map_err(|e| WriteError::ReadError(e))?;
-            let revision_ts = self.next_revision_ts(previous_revision_ts)?;
-            let write_result =
-                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
-            let new_cell_loc = write_result.addr;
-            #[cfg(debug_assertions)]
-            {
-                if cell_location != 0 {
-                    self.assert_address_aligned_for_read(cell_location, "update_cell(old)", hash);
-                }
-                self.assert_address_aligned_for_write(new_cell_loc, "update_cell", hash);
-            }
-
-            let schema = &*write_plan.schema;
-            let old_indices = cell_guard.old_index_res(schema)?;
-            cell_guard.set_ptr(new_cell_loc);
-            drop(cell_guard);
-            self.ensure_indices_with_res(cell, old_indices, schema);
-            self.mark_dead_entry_with_cell(cell_location, cell);
-            self.refresh_statistics_for_schema(schema.id);
-            drop(write_plan);
-            cell.header.revision_ts = write_result.revision_ts;
-        } else {
-            // Optimistic update will remove the new inserted one
-            let revision_ts = self.next_revision_ts(cell.header.revision_ts)?;
-            let write_result =
-                self.write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
-            let new_cell_loc = write_result.addr;
-            self.mark_dead_entry_with_cell(new_cell_loc, cell);
-            return Err(WriteError::CellDoesNotExisted);
-        }
+        let current = self
+            .history
+            .current(&cell.id())
+            .map(|node| node.revision_ts)
+            .unwrap_or(cell.header.revision_ts);
+        let revision_ts = self.next_revision_ts(current)?;
+        self.update_cell_at_revision(cell, RevisionWrite::committed(revision_ts))?;
         Ok(cell.header)
     }
 
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
-        let write_plan = cell.plan_write(self)?;
-        let pending_entry = write_plan.allocate(self, true)?;
-        loop {
-            if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
-                trace!("Cell {} exists, will update for upsert", hash);
-                let cell_location = cell_guard.get_ptr();
-                let previous_revision_ts = cell_revision_ts_from_chunk_raw(cell_location)
-                    .map_err(|e| WriteError::ReadError(e))?;
-                let revision_ts = self.next_revision_ts(previous_revision_ts)?;
-                let write_result =
-                    self.write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
-                let new_cell_loc = write_result.addr;
-                #[cfg(debug_assertions)]
-                {
-                    if cell_location != 0 {
-                        self.assert_address_aligned_for_read(
-                            cell_location,
-                            "upsert_cell(update/old)",
-                            hash,
-                        );
-                    }
-                    self.assert_address_aligned_for_write(
-                        new_cell_loc,
-                        "upsert_cell(update)",
-                        hash,
-                    );
-                }
-
-                let old_indices = cell_guard.old_index_res(&*write_plan.schema)?;
-                cell_guard.set_ptr(new_cell_loc);
-                drop(cell_guard);
-                self.ensure_indices_with_res(cell, old_indices, &*write_plan.schema);
-                self.mark_dead_entry_with_cell(cell_location, cell);
-                self.refresh_statistics_for_schema(write_plan.schema.id);
-                drop(write_plan);
-                cell.header.revision_ts = write_result.revision_ts;
-            } else {
-                let reservation = self.cell_index.try_insert_locked(hash as usize);
-                if let Some(mut guard) = reservation {
-                    // New cell
-                    trace!("Cell {} does not exists, will insert for upsert", hash);
-                    let write_result = self.write_cell_to_chunk(
-                        cell,
-                        &write_plan,
-                        &pending_entry,
-                        self.next_revision_ts(0)?,
-                    )?;
-                    let new_cell_loc = write_result.addr;
-                    #[cfg(debug_assertions)]
-                    self.assert_address_aligned_for_write(
-                        new_cell_loc,
-                        "upsert_cell(insert)",
-                        hash,
-                    );
-
-                    *guard = new_cell_loc;
-                    drop(guard);
-                    self.ensure_indices(cell, None, &*write_plan.schema);
-                    self.refresh_statistics_for_schema(write_plan.schema.id);
-                    drop(write_plan);
-                    cell.header.revision_ts = write_result.revision_ts;
-                } else {
-                    trace!("Cell {} was not exists, but found exists, will try", hash);
-                    continue;
-                }
-            }
-            return Ok(cell.header);
+        let mut guard = self.lock_or_insert_cell(hash);
+        let previous_revision_ts = if guard.is_unassigned() {
+            self.history
+                .current(&cell.id())
+                .map(|node| node.revision_ts)
+                .unwrap_or(0)
+        } else {
+            guard.cell_revision_ts().map_err(WriteError::ReadError)?
+        };
+        let revision_ts = self.next_revision_ts(previous_revision_ts)?;
+        let write = RevisionWrite::committed(revision_ts);
+        if guard.is_unassigned() {
+            self.write_cell_with_guard_at_revision(&mut guard, cell, write)?;
+        } else {
+            self.update_cell_with_guard_at_revision(&mut guard, cell, write)?;
         }
+        Ok(cell.header)
     }
 
     fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<OwnedCell, WriteError>
     where
         U: FnOnce(&SharedCellData) -> Option<OwnedCell>,
     {
-        if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
-            let old_loc = cell_guard.get_ptr();
-            match SharedCellData::from_chunk_raw(hash, *cell_guard, self) {
-                Ok((cell, schema)) => {
-                    let old_indices = self
-                        .index_builder
-                        .as_ref()
-                        .map(|_| probe_cell_indices(&cell, &*schema));
-
-                    // Get old entry size BEFORE releasing lock to avoid race condition
-                    // where old_loc could be corrupted after we update cell_index
-                    let old_entry_size = if old_loc != 0 {
-                        match Entry::decode_from(old_loc, |_, _| {}) {
-                            (entry, _) => Some(entry.content_length),
-                        }
-                    } else {
-                        None
-                    };
-
-                    let new_cell = update(&cell);
-                    if let Some(mut new_cell) = new_cell {
-                        let write_plan = new_cell.plan_write(self)?;
-                        let pending_entry = write_plan.allocate(self, false)?;
-                        let revision_ts = self.next_revision_ts(cell.header.revision_ts)?;
-                        let write_result = self.write_cell_to_chunk(
-                            &new_cell,
-                            &write_plan,
-                            &pending_entry,
-                            revision_ts,
-                        )?;
-                        let new_cell_loc = write_result.addr;
-
-                        #[cfg(debug_assertions)]
-                        self.assert_address_aligned_for_write(new_cell_loc, "update_cell_by", hash);
-
-                        **cell_guard.word_mutex_guard() = new_cell_loc;
-                        if let Some(indexer) = &self.index_builder {
-                            indexer.ensure_indices(&new_cell, &*schema, old_indices);
-                        }
-
-                        // Mark old entry as dead using size we captured earlier
-                        // This avoids decoding old_loc after lock is released (race condition)
-                        if let Some(size) = old_entry_size {
-                            let seg = self.locate_segment_ensured(old_loc, &new_cell.id());
-                            self.mark_dead_entry_with_size(old_loc, size, &seg);
-                        }
-
-                        self.refresh_statistics_for_schema(write_plan.schema.id);
-                        drop(write_plan);
-                        new_cell.header.revision_ts = write_result.revision_ts;
-                        return Ok(new_cell);
-                    } else {
-                        return Err(WriteError::UserCanceledUpdate);
-                    }
-                }
-                Err(e) => return Err(WriteError::ReadError(e)),
-            }
-        } else {
-            return Err(WriteError::CellDoesNotExisted);
+        let mut guard =
+            CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
+        let (current, _) = SharedCellData::from_chunk_raw(hash, guard.get_ptr(), self)
+            .map_err(WriteError::ReadError)?;
+        let current_revision_ts = current.header.revision_ts;
+        let mut new_cell = update(&current).ok_or(WriteError::UserCanceledUpdate)?;
+        if new_cell.id() != current.id() {
+            return Err(WriteError::CellRevisionMismatch);
         }
+        let revision_ts = self.next_revision_ts(current_revision_ts)?;
+        self.update_cell_with_guard_at_revision(
+            &mut guard,
+            &mut new_cell,
+            RevisionWrite::committed(revision_ts),
+        )?;
+        Ok(new_cell)
     }
 
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
-        // Use location_for_read to ensure promotion happens if segment is cold
-        let guard = match CellGuard::for_read(hash, self) {
-            Ok(guard) => guard,
-            Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
-            Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
-            Err(e) => return Err(WriteError::ReadError(e)),
-        };
-        let cell_location = guard.get_ptr();
-
-        if let Some(indexer) = &self.index_builder {
-            match SharedCell::from_chunk_raw(hash, guard, self) {
-                Ok((cell, schema)) => {
-                    indexer.remove_indices(&cell, &*schema);
-                    cell.into_cell_guard().remove_cell();
-                }
-                Err(e) => return Err(WriteError::ReadError(e)),
-            }
-        } else {
-            guard.remove_cell();
-        }
-        self.put_tombstone_by_cell_loc(cell_location)?;
+        let mut guard =
+            CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
+        let header = guard.head_cell().map_err(WriteError::ReadError)?;
+        let revision_ts = self.next_revision_ts(header.revision_ts)?;
+        self.remove_cell_with_guard_at_revision(
+            guard,
+            &header.id(),
+            RevisionWrite::committed(revision_ts),
+        )?;
         Ok(())
     }
 
@@ -963,27 +1206,20 @@ impl Chunk {
     where
         P: Fn(&SharedCell) -> bool,
     {
-        // Use location_for_read to ensure promotion happens if segment is cold
-        let guard = match CellGuard::for_read(hash, self) {
-            Ok(guard) => guard,
-            Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
-            Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
-            Err(e) => return Err(WriteError::ReadError(e)),
-        };
-        let cell_location = *guard;
-
-        match SharedCell::from_chunk_raw(hash, guard, self) {
-            Ok((cell, schema)) => {
-                if predict(&cell) {
-                    self.remove_indices(&cell, &schema);
-                    cell.into_cell_guard().remove_cell();
-                    self.put_tombstone_by_cell_loc(cell_location)?;
-                    return Ok(());
-                }
-                Err(WriteError::CellDoesNotExisted)
-            }
-            Err(e) => Err(WriteError::ReadError(e)),
+        let guard = CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
+        let (cell, _) =
+            SharedCell::from_chunk_raw(hash, guard, self).map_err(WriteError::ReadError)?;
+        if !predict(&cell) {
+            return Err(WriteError::CellDoesNotExisted);
         }
+        let header = cell.header;
+        let revision_ts = self.next_revision_ts(header.revision_ts)?;
+        self.remove_cell_with_guard_at_revision(
+            cell.into_cell_guard(),
+            &header.id(),
+            RevisionWrite::committed(revision_ts),
+        )?;
+        Ok(())
     }
 
     #[inline(always)]
@@ -1070,54 +1306,6 @@ impl Chunk {
             );
         }
         return res;
-    }
-
-    #[inline]
-    fn put_tombstone(
-        &self,
-        cell_header: &CellHeader,
-        cell_seg: &AArc<Segment>,
-    ) -> Result<(), WriteError> {
-        let pending_entry = (|| loop {
-            if let Ok(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true) {
-                return pending_entry;
-            }
-            warn!(
-                "Chunk {} is too full to put a tombstone. Will retry.",
-                self.id
-            )
-        })();
-        Tombstone::put(
-            pending_entry.addr,
-            cell_seg.seq_id,
-            self.next_revision_ts(cell_header.revision_ts)?,
-            cell_header.partition,
-            cell_header.hash,
-        );
-        pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
-        pending_entry.seg.note_dead_bytes_change();
-        Ok(())
-    }
-
-    pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
-        debug!(
-            "Put tombstone for chunk {} for cell {}",
-            self.id, cell_location
-        );
-        let header = header_from_chunk_raw(cell_location)
-            .map_err(|e| WriteError::ReadError(e))?
-            .0;
-
-        // Get entry size while we know the memory is still valid
-        let entry_size = {
-            let (entry, _) = Entry::decode_from(cell_location, |_, _| {});
-            entry.content_length
-        };
-
-        let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(&header, &cell_seg)?;
-        self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
-        Ok(())
     }
 
     fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> AArc<Segment> {
@@ -1741,6 +1929,14 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
+    pub fn read_cell_snapshot(
+        &self,
+        key: &Id,
+        snapshot_ts: u64,
+    ) -> Result<SnapshotRead<OwnedCell>, ReadError> {
+        let chunk = self.locate_chunk_by_partition(key.higher);
+        chunk.read_cell_snapshot(key, snapshot_ts)
+    }
     // By-address full-cell read: materializes the cell exactly as stored at
     // `location`, regardless of where the cell index currently points. Used by
     // repeatable-read pinning to re-read a specific version whose address and
@@ -1757,6 +1953,15 @@ impl Chunks {
     ) -> Result<SharedCell<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields, need_header);
+    }
+    pub fn read_selected_snapshot(
+        &self,
+        key: &Id,
+        snapshot_ts: u64,
+        fields: &[u64],
+    ) -> Result<SnapshotRead<OwnedCell>, ReadError> {
+        let chunk = self.locate_chunk_by_partition(key.higher);
+        chunk.read_selected_snapshot(key, snapshot_ts, fields)
     }
     // By-address projected read: same field-projection logic as `read_selected`,
     // pinned to `location` instead of the cell index.
@@ -1778,9 +1983,27 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_partial_raw(hash, offset, len);
     }
+    pub fn read_partial_raw_snapshot(
+        &self,
+        key: &Id,
+        snapshot_ts: u64,
+        offset: usize,
+        len: usize,
+    ) -> Result<SnapshotRead<Vec<u8>>, ReadError> {
+        let chunk = self.locate_chunk_by_partition(key.higher);
+        chunk.read_partial_raw_snapshot(key, snapshot_ts, offset, len)
+    }
     pub fn head_cell(&self, key: &Id) -> Result<CellHeader, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.head_cell(hash);
+    }
+    pub fn head_snapshot(
+        &self,
+        key: &Id,
+        snapshot_ts: u64,
+    ) -> Result<SnapshotRead<CellHeader>, ReadError> {
+        let chunk = self.locate_chunk_by_partition(key.higher);
+        chunk.head_snapshot(key, snapshot_ts)
     }
     // By-address header read: same as `head_cell` but pinned to `location`
     // instead of resolving through the cell index.
@@ -1802,9 +2025,25 @@ impl Chunks {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.write_cell(cell);
     }
+    pub fn write_cell_at_revision(
+        &self,
+        cell: &mut OwnedCell,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        let chunk = self.locate_chunk_by_partition(cell.header.partition);
+        chunk.write_cell_at_revision(cell, write)
+    }
     pub fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.update_cell(cell);
+    }
+    pub fn update_cell_at_revision(
+        &self,
+        cell: &mut OwnedCell,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        let chunk = self.locate_chunk_by_partition(cell.header.partition);
+        chunk.update_cell_at_revision(cell, write)
     }
     pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<OwnedCell, WriteError>
     where
@@ -1821,6 +2060,14 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell(hash);
     }
+    pub fn remove_cell_at_revision(
+        &self,
+        key: &Id,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        let chunk = self.locate_chunk_by_partition(key.higher);
+        chunk.remove_cell_at_revision(key, write)
+    }
     pub fn remove_cell_by<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
     where
         P: Fn(&SharedCell) -> bool,
@@ -1831,6 +2078,22 @@ impl Chunks {
     pub fn address_of(&self, key: &Id) -> usize {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return *chunk.location_for_read(hash).unwrap();
+    }
+
+    pub fn history_location(&self, key: &Id, revision_ts: u64) -> Option<usize> {
+        self.locate_chunk_by_partition(key.higher)
+            .history
+            .location(key, revision_ts)
+    }
+
+    pub fn promote_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
+        self.locate_chunk_by_partition(installed.id.higher)
+            .promote_revision(installed)
+    }
+
+    pub fn abort_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
+        self.locate_chunk_by_partition(installed.id.higher)
+            .abort_revision(installed)
     }
 
     pub fn count(&self) -> usize {
@@ -2040,30 +2303,16 @@ impl<'a> CellGuard<'a> {
     }
 
     pub fn update_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let old_cell_loc = self.get_ptr();
-        if cell.header.revision_ts < self.revision_ts {
-            cell.header.revision_ts = self.revision_ts;
-        }
         if self.is_unassigned() {
             return Err(WriteError::CellDoesNotExisted);
         }
-        let write_plan = cell.plan_write(self.chunk)?;
-        let pending_entry = write_plan.allocate(self.chunk, false)?;
-        let revision_ts = self.chunk.next_revision_ts(cell.header.revision_ts)?;
-        let write_result =
-            self.chunk
-                .write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
-        let new_cell_loc = write_result.addr;
-        let schema = &*write_plan.schema;
-        let old_indices = self.old_index_res(schema)?;
-        let guard = self.guard.as_mut().unwrap();
-        **guard = new_cell_loc;
-        self.chunk
-            .ensure_indices_with_res(cell, old_indices, schema);
-        self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
-        self.chunk.refresh_statistics_for_schema(schema.id);
-        drop(write_plan);
-        cell.header.revision_ts = write_result.revision_ts;
+        let current_revision_ts = self.cell_revision_ts().map_err(WriteError::ReadError)?;
+        let revision_ts = self.chunk.next_revision_ts(current_revision_ts)?;
+        self.chunk.update_cell_with_guard_at_revision(
+            self,
+            cell,
+            RevisionWrite::committed(revision_ts),
+        )?;
         Ok(cell.header)
     }
 
@@ -2071,38 +2320,24 @@ impl<'a> CellGuard<'a> {
     /// This is useful when you have a guard from `try_insert_locked` which may point to
     /// an empty slot (insert case) or an existing cell (update case).
     pub fn upsert_cell(&mut self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let old_cell_loc = self.get_ptr();
-        if cell.header.revision_ts < self.revision_ts {
-            cell.header.revision_ts = self.revision_ts;
-        }
-        let write_plan = cell.plan_write(self.chunk)?;
-        let pending_entry = write_plan.allocate(self.chunk, false)?;
-        let revision_ts = self.chunk.next_revision_ts(cell.header.revision_ts)?;
-        let write_result =
+        let current_revision_ts = if self.is_unassigned() {
             self.chunk
-                .write_cell_to_chunk(cell, &write_plan, &pending_entry, revision_ts)?;
-        let new_cell_loc = write_result.addr;
-        let schema = &*write_plan.schema;
-        let schema_id = schema.id;
-        if old_cell_loc != 0 {
-            // Update case - cell already exists
-            let old_indices = self.old_index_res(&*schema)?;
-            let guard = self.guard.as_mut().unwrap();
-            **guard = new_cell_loc;
-            self.chunk
-                .ensure_indices_with_res(cell, old_indices, &*schema);
-            self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
+                .history
+                .current(&cell.id())
+                .map(|node| node.revision_ts)
+                .unwrap_or(0)
         } else {
-            // Insert case - new cell
-            let guard = self.guard.as_mut().unwrap();
-            **guard = new_cell_loc;
-            self.chunk.ensure_indices(cell, None, &*schema);
+            self.cell_revision_ts().map_err(WriteError::ReadError)?
+        };
+        let revision_ts = self.chunk.next_revision_ts(current_revision_ts)?;
+        let write = RevisionWrite::committed(revision_ts);
+        if self.is_unassigned() {
+            self.chunk
+                .write_cell_with_guard_at_revision(self, cell, write)?;
+        } else {
+            self.chunk
+                .update_cell_with_guard_at_revision(self, cell, write)?;
         }
-
-        drop(write_plan);
-        cell.header.revision_ts = write_result.revision_ts;
-
-        self.chunk.refresh_statistics_for_schema(schema_id);
         Ok(cell.header)
     }
 
@@ -2114,7 +2349,7 @@ impl<'a> CellGuard<'a> {
         **self.guard.as_ref().unwrap() as usize
     }
 
-    pub fn remove_cell(mut self) {
+    fn remove_index_entry(mut self) {
         self.decrement_segment_references();
         self.segment = None;
         self.guard.take().unwrap().remove();

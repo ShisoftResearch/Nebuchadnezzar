@@ -53,6 +53,16 @@ impl RevisionState {
     fn is_prunable(self) -> bool {
         matches!(self, Self::Aborted | Self::Expired)
     }
+
+    #[inline]
+    pub fn is_present(self) -> bool {
+        matches!(self, Self::PendingPresent | Self::CommittedPresent)
+    }
+
+    #[inline]
+    pub fn is_deleted(self) -> bool {
+        matches!(self, Self::PendingDeleted | Self::CommittedDeleted)
+    }
 }
 
 #[derive(Debug)]
@@ -103,6 +113,38 @@ impl RevisionNode {
                 Ok(_) => return true,
                 Err(actual) => raw = actual,
             }
+        }
+    }
+
+    pub fn promote(&self) -> bool {
+        match self.load().0 {
+            RevisionState::PendingPresent => self.compare_exchange_state(
+                RevisionState::PendingPresent,
+                RevisionState::CommittedPresent,
+            ),
+            RevisionState::PendingDeleted => self.compare_exchange_state(
+                RevisionState::PendingDeleted,
+                RevisionState::CommittedDeleted,
+            ),
+            RevisionState::CommittedPresent
+            | RevisionState::CommittedDeleted
+            | RevisionState::Aborted
+            | RevisionState::Expired => false,
+        }
+    }
+
+    pub fn abort(&self) -> bool {
+        match self.load().0 {
+            RevisionState::PendingPresent => {
+                self.compare_exchange_state(RevisionState::PendingPresent, RevisionState::Aborted)
+            }
+            RevisionState::PendingDeleted => {
+                self.compare_exchange_state(RevisionState::PendingDeleted, RevisionState::Aborted)
+            }
+            RevisionState::CommittedPresent
+            | RevisionState::CommittedDeleted
+            | RevisionState::Aborted
+            | RevisionState::Expired => false,
         }
     }
 
@@ -200,11 +242,20 @@ impl RevisionChain {
         }
     }
 
-    fn current(&self) -> Option<Arc<RevisionNode>> {
+    pub(crate) fn current(&self) -> Option<Arc<RevisionNode>> {
         self.revisions
             .peek_front()
             .and_then(|revision_ref| revision_ref.deref())
             .flatten()
+    }
+
+    fn find(&self, revision_ts: u64) -> Option<Arc<RevisionNode>> {
+        self.revisions.iter_front().find_map(|revision_ref| {
+            revision_ref
+                .deref()
+                .flatten()
+                .filter(|node| node.revision_ts == revision_ts)
+        })
     }
 
     fn is_current(&self, node: &Arc<RevisionNode>) -> bool {
@@ -450,6 +501,42 @@ impl HistoryIndex {
         }
     }
 
+    pub(crate) fn current(&self, id: &Id) -> Option<Arc<RevisionNode>> {
+        self.chain(id).and_then(|chain| chain.current())
+    }
+
+    pub(crate) fn install(
+        &self,
+        id: Id,
+        node: Arc<RevisionNode>,
+        expected_predecessor: Option<&Arc<RevisionNode>>,
+    ) -> Result<(Arc<RevisionChain>, Option<Arc<RevisionNode>>), ()> {
+        let chain = self.get_or_create_chain(id);
+        let predecessor = chain.current();
+        let predecessor_matches = match (expected_predecessor, predecessor.as_ref()) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !predecessor_matches {
+            return Err(());
+        }
+        if predecessor
+            .as_ref()
+            .is_some_and(|current| current.revision_ts >= node.revision_ts)
+        {
+            return Err(());
+        }
+        chain.push_front(node);
+        Ok((chain, predecessor))
+    }
+
+    pub(crate) fn location(&self, id: &Id, revision_ts: u64) -> Option<usize> {
+        self.chain(id)
+            .and_then(|chain| chain.find(revision_ts))
+            .map(|node| node.load().1)
+    }
+
     pub fn set_recovery_floor(&self, revision_ts: u64) {
         self.recovery_floor.fetch_max(revision_ts, Ordering::AcqRel);
     }
@@ -551,7 +638,7 @@ impl HistoryIndex {
     }
 
     #[cfg(test)]
-    fn expire_due_for_test(&self, now_ms: u64) {
+    pub(crate) fn expire_due_for_test(&self, now_ms: u64) {
         let _ = self.expire_due(now_ms);
     }
 
@@ -977,6 +1064,23 @@ mod tests {
                 entry_size: 64,
             }
         );
+    }
+
+    #[test]
+    fn predecessor_mismatch_does_not_publish_a_partial_head() {
+        let history = HistoryIndex::new(300_000);
+        let id = Id::new(7, 9);
+        let first = node(100, RevisionState::CommittedPresent, 0x1000);
+        history.install(id, first.clone(), None).unwrap();
+        let wrong_predecessor = node(100, RevisionState::CommittedPresent, 0x1800);
+        let second = node(200, RevisionState::CommittedPresent, 0x2000);
+
+        assert!(history
+            .install(id, second, Some(&wrong_predecessor))
+            .is_err());
+        let current = history.current(&id).expect("first remains current");
+        assert!(Arc::ptr_eq(&current, &first));
+        assert_eq!(history.location(&id, 200), None);
     }
 
     #[test]

@@ -1122,15 +1122,22 @@ pub struct SegmentReferenceGuard {
 }
 
 impl SegmentReferenceGuard {
-    /// Create a new guard and increment the segment's reference count
-    pub fn new(segment: lightning::aarc::Arc<Segment>) -> Self {
-        segment.incr_references();
+    /// Try to create a shared guard without competing with cleaner exclusivity.
+    pub fn try_new(segment: lightning::aarc::Arc<Segment>) -> Option<Self> {
+        if !segment.incr_references() {
+            return None;
+        }
         debug!(
             "SegmentReferenceGuard acquired for segment {} (ref count: {})",
             segment.id,
             segment.references.load(Ordering::Relaxed)
         );
-        Self { segment }
+        Some(Self { segment })
+    }
+
+    /// Create a new guard and increment the segment's reference count.
+    pub fn new(segment: lightning::aarc::Arc<Segment>) -> Self {
+        Self::try_new(segment).expect("segment is exclusively referenced")
     }
 
     /// Get the segment ID
@@ -1496,6 +1503,23 @@ pub unsafe fn madvise_free(addr: usize, size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_segment_lease_rejects_cleaner_exclusivity() {
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let file_manager = Arc::new(SegmentFileManager::new(None, None));
+        let segment = lightning::aarc::Arc::new(
+            allocator
+                .alloc_seg(&file_manager)
+                .expect("failed to allocate segment"),
+        );
+        let exclusive =
+            SegmentExclusiveRefGuard::new(&segment).expect("segment should begin unreferenced");
+
+        assert!(SegmentReferenceGuard::try_new(segment.clone()).is_none());
+        drop(exclusive);
+        assert!(SegmentReferenceGuard::try_new(segment).is_some());
+    }
 
     #[test]
     fn test_punch_hole_alignment() {
