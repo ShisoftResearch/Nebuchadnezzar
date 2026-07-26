@@ -26,6 +26,7 @@ use lightning::map::{Map, WordMap, WordMutexGuard};
 use lightning::spin_hint::Backoff;
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -33,6 +34,11 @@ use std::sync::Arc;
 
 pub type CellReadGuard<'a> = WordMutexGuard<'a>;
 pub type CellWriteGuard<'a> = WordMutexGuard<'a>;
+
+#[cfg(test)]
+type SnapshotReadLeaseHook = Arc<dyn Fn(Id, usize, bool) + Send + Sync>;
+#[cfg(test)]
+type CellGuardRetryHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 // Global chunk allocation state for unified address space
 static GLOBAL_CHUNK_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -182,6 +188,10 @@ pub struct Chunk {
     fail_next_allocation: AtomicUsize,
     #[cfg(test)]
     secondary_index_removal_attempts: AtomicUsize,
+    #[cfg(test)]
+    snapshot_read_lease_hook: Mutex<Option<SnapshotReadLeaseHook>>,
+    #[cfg(test)]
+    cell_guard_retry_hook: Mutex<Option<CellGuardRetryHook>>,
 }
 
 impl Chunk {
@@ -360,6 +370,10 @@ impl Chunk {
             fail_next_allocation: AtomicUsize::new(0),
             #[cfg(test)]
             secondary_index_removal_attempts: AtomicUsize::new(0),
+            #[cfg(test)]
+            snapshot_read_lease_hook: Mutex::new(None),
+            #[cfg(test)]
+            cell_guard_retry_hook: Mutex::new(None),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -543,6 +557,19 @@ impl Chunk {
                 Some(blob_head_id)
             },
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_read_lease_hook_for_test(
+        &self,
+        hook: Option<SnapshotReadLeaseHook>,
+    ) {
+        *self.snapshot_read_lease_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cell_guard_retry_hook_for_test(&self, hook: Option<CellGuardRetryHook>) {
+        *self.cell_guard_retry_hook.lock() = hook;
     }
 
     pub(crate) fn reset_write_heads_after_recovery(&self) -> io::Result<()> {
@@ -1088,7 +1115,12 @@ impl Chunk {
                         backoff.spin();
                         continue;
                     };
-                    let Some(_lease) = SegmentReferenceGuard::try_new(segment) else {
+                    let lease = SegmentReferenceGuard::try_new(segment);
+                    #[cfg(test)]
+                    if let Some(hook) = self.snapshot_read_lease_hook.lock().clone() {
+                        hook(*id, expected.1, lease.is_some());
+                    }
+                    let Some(_lease) = lease else {
                         backoff.spin();
                         continue;
                     };
@@ -1432,6 +1464,79 @@ impl Chunk {
         } else {
             CurrentAddressRelocation::NoLongerCurrent
         }
+    }
+
+    pub(crate) fn compare_exchange_current_only_address(
+        &self,
+        id: Id,
+        revision_ts: u64,
+        old_location: usize,
+        new_location: usize,
+        source_segment_ids: &HashSet<u64>,
+    ) -> CurrentAddressRelocation {
+        let index = self.cell_index.lock(id.lower as usize);
+        let Some(mut current_location) = index else {
+            return CurrentAddressRelocation::Inconsistent;
+        };
+
+        if *current_location == old_location {
+            let Ok((source_header, _)) = header_from_chunk_raw(old_location) else {
+                return CurrentAddressRelocation::Inconsistent;
+            };
+            let Ok((destination_header, _)) = header_from_chunk_raw(new_location) else {
+                return CurrentAddressRelocation::Inconsistent;
+            };
+            if Id::from_header(&source_header) != id
+                || source_header.revision_ts != revision_ts
+                || Id::from_header(&destination_header) != id
+                || destination_header.revision_ts != revision_ts
+            {
+                return CurrentAddressRelocation::Inconsistent;
+            }
+            *current_location = new_location;
+            return CurrentAddressRelocation::Moved;
+        }
+
+        if *current_location == 0 {
+            return CurrentAddressRelocation::Inconsistent;
+        }
+        let Some(current_segment) = self
+            .segments()
+            .into_iter()
+            .find(|segment| segment.contains_address(*current_location))
+        else {
+            return CurrentAddressRelocation::Inconsistent;
+        };
+        if source_segment_ids.contains(&current_segment.id) {
+            return CurrentAddressRelocation::Inconsistent;
+        }
+        let Some(header_end) = current_location
+            .checked_add(ENTRY_HEAD_SIZE)
+            .and_then(|entry_content| entry_content.checked_add(CELL_HEADER_SIZE))
+        else {
+            return CurrentAddressRelocation::Inconsistent;
+        };
+        if header_end > current_segment.append_header.load(Ordering::Acquire) {
+            return CurrentAddressRelocation::Inconsistent;
+        }
+        let Ok((current_header, _)) = header_from_chunk_raw(*current_location) else {
+            return CurrentAddressRelocation::Inconsistent;
+        };
+        if current_header.hash != id.lower {
+            return CurrentAddressRelocation::Inconsistent;
+        }
+        let current_id = Id::from_header(&current_header);
+        if *current_location == new_location {
+            return if current_id == id && current_header.revision_ts == revision_ts {
+                CurrentAddressRelocation::Moved
+            } else {
+                CurrentAddressRelocation::Inconsistent
+            };
+        }
+        if current_id == id && current_header.revision_ts < revision_ts {
+            return CurrentAddressRelocation::Inconsistent;
+        }
+        CurrentAddressRelocation::NoLongerCurrent
     }
 
     // Decodes entry to get size and marks it dead
@@ -2359,6 +2464,10 @@ impl<'a> CellGuard<'a> {
             let guard = chunk.location_for_write(hash, has_read)?;
             if let Some(guard) = CellGuard::from_guard(hash, guard, chunk) {
                 return Some(guard);
+            }
+            #[cfg(test)]
+            if let Some(hook) = chunk.cell_guard_retry_hook.lock().clone() {
+                hook(hash);
             }
             backoff.spin();
         }

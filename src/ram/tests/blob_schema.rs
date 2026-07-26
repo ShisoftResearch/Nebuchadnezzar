@@ -385,6 +385,9 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
     // This test measures cleaner class selection after its deleted fillers are
     // reclaimable, not retention-window behavior. Expire their superseded
     // present revisions explicitly under MVCC before inspecting candidates.
+    // Join the background expiration worker first so it cannot temporarily
+    // hold a queued record across this deterministic test-only drain.
+    chunk.history.shutdown();
     chunk.history.expire_due_for_test(u64::MAX);
     chunk.drain_history_dead();
 
@@ -475,6 +478,9 @@ fn blob_schema_combine_preserves_blob_segment_class() {
     // This test is about preserving the destination segment class. Make the
     // deleted filler revisions reclaimable explicitly instead of weakening
     // the production history-retention policy.
+    // Join the background expiration worker first so it cannot temporarily
+    // hold a queued record across this deterministic test-only drain.
+    chunk.history.shutdown();
     chunk.history.expire_due_for_test(u64::MAX);
     chunk.drain_history_dead();
 

@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 use libc;
 
+#[cfg(test)]
+type BeforeRelocateHook<'a> = dyn Fn(Id, u64, usize, usize) + Sync + 'a;
+#[cfg(test)]
+type AfterHistoryRelocateHook<'a> = dyn Fn(Id, u64, usize, usize) + Sync + 'a;
+
 // Rayon threads default to a small stack; combining can touch large frames when
 // copying entries. Give the pools a larger stack to avoid overflow under heavy loads.
 const COMBINE_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024; // 8MB
@@ -63,6 +68,7 @@ struct Relocation {
     key: RevisionKey,
     kind: RevisionKind,
     entry_size: usize,
+    history_live: bool,
 }
 
 struct DummySegment {
@@ -260,7 +266,9 @@ impl CombinedCleaner {
         chunk: &Chunk,
         pending_segments: Vec<DummySegment>,
         cleaned_total_live_space: &AtomicUsize,
-        before_relocate: &(dyn Fn(Id, u64, usize, usize) + Sync),
+        source_segment_ids: &HashSet<u64>,
+        #[cfg(test)] before_relocate: &BeforeRelocateHook<'_>,
+        #[cfg(test)] after_history_relocate: &AfterHistoryRelocateHook<'_>,
     ) -> (Vec<usize>, bool) {
         let safe_to_reclaim = AtomicBool::new(true);
         // Use global thread pool for segment allocation
@@ -298,6 +306,7 @@ impl CombinedCleaner {
                             key: entry.key,
                             kind: entry.kind,
                             entry_size: entry.size,
+                            history_live: entry.history_live,
                         });
                         seg_cursor += entry.size;
                     }
@@ -367,19 +376,46 @@ impl CombinedCleaner {
                         sorted_relocations
                             .into_par_iter()
                             .for_each(|relocation| {
+                                #[cfg(test)]
                                 before_relocate(
                                     relocation.key.id,
                                     relocation.key.revision_ts,
                                     relocation.old,
                                     relocation.new,
                                 );
-                                match chunk.history.relocate(
+                                let history_result = chunk.history.relocate(
                                     relocation.key.id,
                                     relocation.key.revision_ts,
                                     relocation.old,
                                     relocation.new,
-                                ) {
+                                );
+                                #[cfg(test)]
+                                after_history_relocate(
+                                    relocation.key.id,
+                                    relocation.key.revision_ts,
+                                    relocation.old,
+                                    relocation.new,
+                                );
+                                match history_result {
                                     RelocateResult::LostRace => {
+                                        if relocation.kind == RevisionKind::Cell
+                                            && !relocation.history_live
+                                        {
+                                            match chunk.compare_exchange_current_only_address(
+                                                relocation.key.id,
+                                                relocation.key.revision_ts,
+                                                relocation.old,
+                                                relocation.new,
+                                                source_segment_ids,
+                                            ) {
+                                                CurrentAddressRelocation::Moved => return,
+                                                CurrentAddressRelocation::NoLongerCurrent => {}
+                                                CurrentAddressRelocation::Inconsistent => {
+                                                    safe_to_reclaim
+                                                        .store(false, Ordering::Release);
+                                                }
+                                            }
+                                        }
                                         chunk.mark_dead_entry_with_size(
                                             relocation.new,
                                             relocation.entry_size as u32,
@@ -464,7 +500,19 @@ impl CombinedCleaner {
         chunk: &Chunk,
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
     ) -> (usize, usize) {
-        Self::combine_segments_with_hook(chunk, selected_segments, &|_, _, _, _| {})
+        #[cfg(test)]
+        {
+            return Self::combine_segments_with_hook(
+                chunk,
+                selected_segments,
+                &|_, _, _, _| {},
+                &|_, _, _, _| {},
+            );
+        }
+        #[cfg(not(test))]
+        {
+            Self::combine_segments_with_hook(chunk, selected_segments)
+        }
     }
 
     #[cfg(test)]
@@ -476,13 +524,38 @@ impl CombinedCleaner {
     where
         F: Fn(Id, u64, usize, usize) + Sync,
     {
-        Self::combine_segments_with_hook(chunk, selected_segments, &before_relocate)
+        Self::combine_segments_with_hook(
+            chunk,
+            selected_segments,
+            &before_relocate,
+            &|_, _, _, _| {},
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn combine_segments_with_relocation_hooks<F, G>(
+        chunk: &Chunk,
+        selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
+        before_relocate: F,
+        after_history_relocate: G,
+    ) -> (usize, usize)
+    where
+        F: Fn(Id, u64, usize, usize) + Sync,
+        G: Fn(Id, u64, usize, usize) + Sync,
+    {
+        Self::combine_segments_with_hook(
+            chunk,
+            selected_segments,
+            &before_relocate,
+            &after_history_relocate,
+        )
     }
 
     fn combine_segments_with_hook(
         chunk: &Chunk,
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
-        before_relocate: &(dyn Fn(Id, u64, usize, usize) + Sync),
+        #[cfg(test)] before_relocate: &BeforeRelocateHook<'_>,
+        #[cfg(test)] after_history_relocate: &AfterHistoryRelocateHook<'_>,
     ) -> (usize, usize) {
         let segments = Self::select_candidate_segments(chunk, selected_segments);
         if segments.is_empty() {
@@ -533,7 +606,11 @@ impl CombinedCleaner {
                 chunk,
                 pending_segments,
                 &cleaned_total_live_space,
+                &segment_ids_to_combine,
+                #[cfg(test)]
                 before_relocate,
+                #[cfg(test)]
+                after_history_relocate,
             );
             if !safe_to_reclaim {
                 error!(
