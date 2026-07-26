@@ -251,11 +251,11 @@ pub struct SegmentCandidate {
 
 impl SegmentCandidate {
     pub fn new(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
-        if !segment.incr_references() {
+        if !segment.obtain_exclusive_references() {
             return None;
         }
         if !segment.lock_hot() {
-            segment.decr_references();
+            segment.release_exclusive_references();
             return None;
         }
         Some(Self {
@@ -266,8 +266,8 @@ impl SegmentCandidate {
 
 impl Drop for SegmentCandidate {
     fn drop(&mut self) {
-        self.segment.decr_references();
         self.segment.set_hot();
+        self.segment.release_exclusive_references();
     }
 }
 

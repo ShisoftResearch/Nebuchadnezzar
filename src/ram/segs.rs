@@ -1505,7 +1505,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallible_segment_lease_rejects_cleaner_exclusivity() {
+    fn shared_reference_fails_while_exclusive_guard_is_held() {
         let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
         let file_manager = Arc::new(SegmentFileManager::new(None, None));
         let segment = lightning::aarc::Arc::new(

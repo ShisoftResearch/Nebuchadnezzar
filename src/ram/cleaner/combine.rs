@@ -1,14 +1,16 @@
 use crate::ram::cell;
-use crate::ram::chunk::Chunk;
+use crate::ram::chunk::{Chunk, CurrentAddressRelocation};
 use crate::ram::cleaner::SegmentCandidate;
-use crate::ram::entry::EntryContent;
+use crate::ram::entry::EntryType;
+use crate::ram::history::RelocateResult;
 use crate::ram::segs::{Segment, SegmentClass, SEGMENT_SIZE};
+use crate::ram::tombstone::Tombstone;
+use crate::ram::types::{FromHeader, Id};
 use itertools::Itertools;
-use lightning::map::Map;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 use libc;
 
@@ -34,12 +36,33 @@ lazy_static! {
 
 pub struct CombinedCleaner;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RevisionKey {
+    id: Id,
+    revision_ts: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RevisionKind {
+    Cell,
+    Tombstone,
+}
+
 #[derive(Clone)]
 struct DummyEntry {
     size: usize,
     addr: usize,
-    revision_ts: u64,
-    cell_hash: Option<u64>,
+    key: RevisionKey,
+    kind: RevisionKind,
+    history_live: bool,
+}
+
+struct Relocation {
+    new: usize,
+    old: usize,
+    key: RevisionKey,
+    kind: RevisionKind,
+    entry_size: usize,
 }
 
 struct DummySegment {
@@ -78,11 +101,6 @@ impl CombinedCleaner {
                 if chunk.is_active_head(seg.id) {
                     return None;
                 }
-                // Check references first to avoid locking if busy (fast path)
-                if !seg.no_references() {
-                    return None;
-                }
-
                 SegmentCandidate::new(&seg)
             })
             .collect_vec();
@@ -140,72 +158,70 @@ impl CombinedCleaner {
             chunk.get_head_seg_id()
         );
 
-        // Get all entries in segments to combine and order them by data temperature and size
-        // Step 1: Collect and deduplicate using HashMap (faster than sort+chunk_by)
+        // Retained logical revisions, not the lower cell hash, are the cleaner's
+        // liveness and deduplication identity.
         use std::collections::HashMap;
-        let mut deduped_cells: HashMap<u64, DummyEntry> = HashMap::new();
-        let mut tombstones: Vec<DummyEntry> = Vec::new();
+        let mut revisions: HashMap<RevisionKey, DummyEntry> = HashMap::new();
 
-        for entry in segments
-            .iter()
-            .flat_map(|seg| chunk.live_entries(seg).map(|entry| (entry, seg.id)))
-            .filter(|(entry, _seg_id)| {
-                // live entries have done a lot of filtering work already
-                // but we still need to remove those tombstones that pointed to segments we are about to combine
-                if let EntryContent::Tombstone(ref tombstone) = entry.content {
-                    // Exclude tombstones pointing to segments being combined
-                    // Look up the segment by seq_id to get its segment_id
-                    let tombstone_seg_id = chunk
-                        .segs
-                        .get_by_seq_id(tombstone.segment_seq_id)
-                        .map(|seg| seg.id);
-                    let is_pointing_to_combined_seg = tombstone_seg_id
-                        .map_or(false, |seg_id| segment_ids_to_combine.contains(&seg_id));
-                    return !is_pointing_to_combined_seg // Tombstone is not pointing to a segment we are about to combine
-                        && !chunk.cell_index.contains_key(&(tombstone.hash as usize));
-                    // Tombstone is not pointing to a cell that is already in the chunk;
+        for entry in segments.iter().flat_map(|segment| segment.entry_iter()) {
+            let key_and_kind = match entry.entry_header.entry_type {
+                EntryType::CELL => {
+                    let header = cell::cell_header_from_entry_content_addr(entry.body_pos);
+                    (
+                        RevisionKey {
+                            id: Id::from_header(&header),
+                            revision_ts: header.revision_ts,
+                        },
+                        RevisionKind::Cell,
+                    )
                 }
-                return true;
-            })
-            .map(|(entry, _seg_id)| entry)
-        {
-            let entry_size = entry.meta.entry_size;
-            let entry_addr = entry.meta.entry_pos;
-            let cell_header = match entry.content {
-                EntryContent::Cell(header) => Some(header),
-                _ => None,
+                EntryType::TOMBSTONE => {
+                    let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                    (
+                        RevisionKey {
+                            id: Id::new(tombstone.partition, tombstone.hash),
+                            revision_ts: tombstone.revision_ts,
+                        },
+                        RevisionKind::Tombstone,
+                    )
+                }
+                EntryType::UNDECIDED => continue,
             };
-            let dummy_entry = DummyEntry {
-                size: entry_size,
-                addr: entry_addr,
-                cell_hash: cell_header.map(|h| h.hash),
-                revision_ts: cell_header.map(|h| h.revision_ts).unwrap_or(0),
-            };
-
-            if let Some(hash) = dummy_entry.cell_hash {
-                // Cell with hash: keep only the latest revision.
-                deduped_cells
-                    .entry(hash)
-                    .and_modify(|existing| {
-                        if dummy_entry.revision_ts > existing.revision_ts {
-                            *existing = dummy_entry.clone();
-                        }
-                    })
-                    .or_insert(dummy_entry);
-            } else {
-                // Tombstone or entry without hash: keep all
-                tombstones.push(dummy_entry);
+            let (key, kind) = key_and_kind;
+            let history_live = chunk
+                .history
+                .is_live_at(key.id, key.revision_ts, entry.entry_pos);
+            let current_index_target = kind == RevisionKind::Cell
+                && chunk.cell_index.get_from_mutex(&(key.id.lower as usize))
+                    == Some(entry.entry_pos);
+            if !history_live && !current_index_target {
+                continue;
             }
+
+            let candidate = DummyEntry {
+                size: entry.entry_size,
+                addr: entry.entry_pos,
+                key,
+                kind,
+                history_live,
+            };
+            revisions
+                .entry(key)
+                .and_modify(|existing| {
+                    // A physical duplicate can survive a crash or a prior lost
+                    // cleaner publication. Prefer the address selected by the
+                    // history node over a current-index-only fallback.
+                    if candidate.history_live && !existing.history_live {
+                        *existing = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
         }
 
-        // Step 2: Combine deduplicated cells and tombstones, then sort by revision.
-        let mut all_entries: Vec<_> = deduped_cells
-            .into_values()
-            .chain(tombstones.into_iter())
-            .collect();
+        let mut all_entries: Vec<_> = revisions.into_values().collect();
 
         // Sort by revision and then by size within revision buckets.
-        all_entries.sort_by_key(|entry| (entry.revision_ts, entry.size));
+        all_entries.sort_by_key(|entry| (entry.key.revision_ts, entry.size));
 
         // Reverse to get hottest/largest first
         all_entries.reverse();
@@ -244,9 +260,11 @@ impl CombinedCleaner {
         chunk: &Chunk,
         pending_segments: Vec<DummySegment>,
         cleaned_total_live_space: &AtomicUsize,
-    ) -> Vec<usize> {
+        before_relocate: &(dyn Fn(Id, u64, usize, usize) + Sync),
+    ) -> (Vec<usize>, bool) {
+        let safe_to_reclaim = AtomicBool::new(true);
         // Use global thread pool for segment allocation
-        COMBINE_ALLOC_POOL.install(|| {
+        let segments = COMBINE_ALLOC_POOL.install(|| {
             pending_segments
                 .par_iter()
                 .map(|dummy_seg| {
@@ -255,7 +273,7 @@ impl CombinedCleaner {
                         .alloc_seg_with_class(&chunk.file_manager, dummy_seg.segment_class)
                         .expect("No space left during combine");
                     let new_seg_id = new_seg.id;
-                    let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
+                    let mut relocations = Vec::with_capacity(dummy_seg.entries.len());
                     let mut seg_cursor = new_seg.addr;
                     trace!(
                         "Combining segment to new one with id {} with {} cells",
@@ -271,22 +289,16 @@ impl CombinedCleaner {
                                 entry.size,
                             );
                         }
-                        if let Some(cell_hash) = entry.cell_hash {
-                            trace!(
-                                "Marked cell relocation hash {}, addr {} to segment {}",
-                                cell_hash,
-                                entry_addr,
-                                new_seg_id
-                            );
-                            // Include entry.size so we can mark dead space without decoding if cell was updated
-                            cell_mapping.push((
-                                seg_cursor,
-                                entry_addr,
-                                cell_hash,
-                                entry.revision_ts,
-                                entry.size,
-                            ));
+                        if entry.kind == RevisionKind::Tombstone {
+                            new_seg.tombstones.fetch_add(1, Ordering::Relaxed);
                         }
+                        relocations.push(Relocation {
+                            new: seg_cursor,
+                            old: entry_addr,
+                            key: entry.key,
+                            kind: entry.kind,
+                            entry_size: entry.size,
+                        });
                         seg_cursor += entry.size;
                     }
                     // Use Release ordering to ensure the append_header update is visible
@@ -299,10 +311,14 @@ impl CombinedCleaner {
                         new_seg.shrink(used_size);
                     }
                     cleaned_total_live_space.fetch_add(new_seg.used_spaces() as usize, Relaxed);
-                    return (new_seg, cell_mapping);
+                    return (new_seg, relocations);
                 })
-                .map(|(segment, cells)| {
-                    trace!("Putting new segment {}, cells {}", segment.id, cells.len());
+                .map(|(segment, relocations)| {
+                    trace!(
+                        "Putting new segment {}, revisions {}",
+                        segment.id,
+                        relocations.len()
+                    );
                     let archive_result = segment.archive();
                     match archive_result {
                         Ok(true) => {
@@ -338,71 +354,102 @@ impl CombinedCleaner {
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();
-                    // Sort cells by hash to ensure consistent lock ordering across parallel threads
-                    // This prevents deadlocks when multiple threads acquire locks in different orders
-                    let mut sorted_cells = cells;
-                    sorted_cells.sort_by_key(|(_, _, hash, _, _)| *hash);
+                    let mut sorted_relocations = relocations;
+                    sorted_relocations.sort_by_key(|relocation| {
+                        (
+                            relocation.key.id.lower,
+                            relocation.key.id.higher,
+                            relocation.key.revision_ts,
+                        )
+                    });
 
-                    // Use global thread pool for cell index updates
                     COMBINE_UPDATE_POOL.install(|| {
-                        sorted_cells
+                        sorted_relocations
                             .into_par_iter()
-                            .for_each(|(new, old, hash, revision_ts, entry_size)| {
-                                trace!("Reset cell {} ptr from {} to {}", hash, old, new);
-                                let index = chunk.cell_index.lock(hash as usize);
-                                if let Some(mut actual_addr) = index {
-                                    if *actual_addr == old {
-                                        *actual_addr = new;
-                                        trace!(
-                                            "Cell addr for hash {} set from {} to {} for combine, revision {}",
-                                            hash,
-                                            old,
-                                            new,
-                                            revision_ts
-                                        );
-                                    } else {
-                                        #[cfg(debug_assertions)]
-                                        {
-                                            let current_revision_ts =
-                                                cell::cell_revision_ts_from_chunk_raw(*actual_addr)
-                                                    .unwrap();
-                                            assert!(
-                                        current_revision_ts >= revision_ts,
-                                        "Cell {} with address {} changed to {} but revision running backwards {} -> {}",
-                                        hash,
-                                        old,
-                                        *actual_addr,
-                                        revision_ts,
-                                        current_revision_ts
-                                    );
-                                        }
-                                        trace!(
-                                            "cell {} with address {}, have been changed to {} on combine, revision {}",
-                                            hash,
-                                            old,
-                                            *actual_addr,
-                                            revision_ts
-                                        );
-                                        // SAFETY FIX: Use mark_dead_entry_with_size instead of mark_dead_entry_with_seg
-                                        // because the entry may contain garbage if the cell was updated during combine.
+                            .for_each(|relocation| {
+                                before_relocate(
+                                    relocation.key.id,
+                                    relocation.key.revision_ts,
+                                    relocation.old,
+                                    relocation.new,
+                                );
+                                match chunk.history.relocate(
+                                    relocation.key.id,
+                                    relocation.key.revision_ts,
+                                    relocation.old,
+                                    relocation.new,
+                                ) {
+                                    RelocateResult::LostRace => {
                                         chunk.mark_dead_entry_with_size(
-                                            new,
-                                            entry_size as u32,
+                                            relocation.new,
+                                            relocation.entry_size as u32,
                                             &new_seg,
                                         );
                                     }
-                                } else {
-                                    trace!("cell {} address {} have been removed on combine", hash, old);
-                                    // Cell was deleted - the copy in new segment is wasted space
-                                    // Use mark_dead_entry_with_size to avoid decoding potentially corrupt data
-                                    chunk.mark_dead_entry_with_size(new, entry_size as u32, &new_seg);
+                                    RelocateResult::HistoricalMoved
+                                    | RelocateResult::CurrentPresentMoved => {
+                                        // Decode supplied the physical kind before
+                                        // publication. This is required for Aborted,
+                                        // whose state tag intentionally does not retain
+                                        // present-vs-deleted kind.
+                                        if relocation.kind == RevisionKind::Cell
+                                            && chunk.compare_exchange_current_address(
+                                                relocation.key.id,
+                                                relocation.key.revision_ts,
+                                                relocation.old,
+                                                relocation.new,
+                                            ) == CurrentAddressRelocation::Inconsistent
+                                        {
+                                            // The history word moved first, so a mirror
+                                            // failure must either be proven historical
+                                            // under the cell-index guard or rolled back
+                                            // before the exclusive source can be freed.
+                                            // The source remains registered on this error
+                                            // path. A successful reverse CAS makes this
+                                            // destination copy unreachable and therefore
+                                            // dead exactly once.
+                                            match chunk.history.relocate(
+                                                relocation.key.id,
+                                                relocation.key.revision_ts,
+                                                relocation.new,
+                                                relocation.old,
+                                            ) {
+                                                RelocateResult::HistoricalMoved
+                                                | RelocateResult::CurrentPresentMoved => {
+                                                    chunk.mark_dead_entry_with_size(
+                                                        relocation.new,
+                                                        relocation.entry_size as u32,
+                                                        &new_seg,
+                                                    );
+                                                }
+                                                RelocateResult::LostRace => {
+                                                    error!(
+                                                        "Cleaner could not roll revision {:?} timestamp {} back from {} to {} after mirror publication failed",
+                                                        relocation.key.id,
+                                                        relocation.key.revision_ts,
+                                                        relocation.new,
+                                                        relocation.old
+                                                    );
+                                                }
+                                            }
+                                            error!(
+                                                "Cleaner moved current history node {:?} revision {} from {} to {} but could not reconcile its cell-index mirror",
+                                                relocation.key.id,
+                                                relocation.key.revision_ts,
+                                                relocation.old,
+                                                relocation.new
+                                            );
+                                            safe_to_reclaim.store(false, Ordering::Release);
+                                        }
+                                    }
                                 }
                             });
                     });
                     new_seg_id
                 })
                 .collect::<Vec<_>>()
-        })
+        });
+        (segments, safe_to_reclaim.load(Ordering::Acquire))
     }
 
     fn cleanup_segments(chunk: &Chunk, segments: &[SegmentCandidate]) {
@@ -416,6 +463,26 @@ impl CombinedCleaner {
     pub fn combine_segments(
         chunk: &Chunk,
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
+    ) -> (usize, usize) {
+        Self::combine_segments_with_hook(chunk, selected_segments, &|_, _, _, _| {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn combine_segments_with_relocation_hook<F>(
+        chunk: &Chunk,
+        selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
+        before_relocate: F,
+    ) -> (usize, usize)
+    where
+        F: Fn(Id, u64, usize, usize) + Sync,
+    {
+        Self::combine_segments_with_hook(chunk, selected_segments, &before_relocate)
+    }
+
+    fn combine_segments_with_hook(
+        chunk: &Chunk,
+        selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
+        before_relocate: &(dyn Fn(Id, u64, usize, usize) + Sync),
     ) -> (usize, usize) {
         let segments = Self::select_candidate_segments(chunk, selected_segments);
         if segments.is_empty() {
@@ -462,8 +529,19 @@ impl CombinedCleaner {
             );
 
             // Use global thread pool for segment allocation
-            let new_segs =
-                Self::execute_combine_phases(chunk, pending_segments, &cleaned_total_live_space);
+            let (new_segs, safe_to_reclaim) = Self::execute_combine_phases(
+                chunk,
+                pending_segments,
+                &cleaned_total_live_space,
+                before_relocate,
+            );
+            if !safe_to_reclaim {
+                error!(
+                    "Cleaner retained source segments {:?} because current history and cell-index publication could not be reconciled",
+                    segment_ids_to_combine
+                );
+                return (0, 0);
+            }
 
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
             debug!(

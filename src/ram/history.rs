@@ -116,6 +116,31 @@ impl RevisionNode {
         }
     }
 
+    fn relocate(&self, old_location: usize, new_location: usize) -> bool {
+        assert_eq!(
+            new_location & STATE_MASK,
+            0,
+            "revision entry addresses must be 8-byte aligned"
+        );
+        let mut raw = self.state_and_location.load(Ordering::Acquire);
+        loop {
+            let state = RevisionState::from_tag(raw & STATE_MASK);
+            if state == RevisionState::Expired || raw & LOCATION_MASK != old_location {
+                return false;
+            }
+            let relocated = new_location | state as usize;
+            match self.state_and_location.compare_exchange_weak(
+                raw,
+                relocated,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => raw = actual,
+            }
+        }
+    }
+
     pub fn promote(&self) -> bool {
         match self.load().0 {
             RevisionState::PendingPresent => self.compare_exchange_state(
@@ -390,6 +415,13 @@ pub struct DeadRevision {
     pub entry_size: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelocateResult {
+    HistoricalMoved,
+    CurrentPresentMoved,
+    LostRace,
+}
+
 pub struct HistoryIndex {
     chains: PtrHashMap<Id, Arc<RevisionChain>>,
     chain_creation: Mutex<()>,
@@ -535,6 +567,43 @@ impl HistoryIndex {
         self.chain(id)
             .and_then(|chain| chain.find(revision_ts))
             .map(|node| node.load().1)
+    }
+
+    pub(crate) fn is_live_at(&self, id: Id, revision_ts: u64, location: usize) -> bool {
+        self.chain(&id)
+            .and_then(|chain| chain.find(revision_ts))
+            .is_some_and(|node| {
+                let (state, actual_location) = node.load();
+                state != RevisionState::Expired && actual_location == location
+            })
+    }
+
+    pub(crate) fn relocate(
+        &self,
+        id: Id,
+        revision_ts: u64,
+        old_location: usize,
+        new_location: usize,
+    ) -> RelocateResult {
+        let Some(chain) = self.chain(&id) else {
+            return RelocateResult::LostRace;
+        };
+        let Some(node) = chain.find(revision_ts) else {
+            return RelocateResult::LostRace;
+        };
+        if !node.relocate(old_location, new_location) {
+            return RelocateResult::LostRace;
+        }
+
+        // State alone cannot recover the physical kind of an Aborted node.
+        // The cleaner decodes the entry it copied and only publishes a
+        // cell-index mirror for physical cells. This result reports logical
+        // head position, not a fresh inference from the state tag.
+        if chain.is_current(&node) {
+            RelocateResult::CurrentPresentMoved
+        } else {
+            RelocateResult::HistoricalMoved
+        }
     }
 
     pub fn set_recovery_floor(&self, revision_ts: u64) {

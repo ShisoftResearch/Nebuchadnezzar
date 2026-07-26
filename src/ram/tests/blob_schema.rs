@@ -382,6 +382,12 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
         chunks.remove_cell(id).unwrap();
     }
 
+    // This test measures cleaner class selection after its deleted fillers are
+    // reclaimable, not retention-window behavior. Expire their superseded
+    // present revisions explicitly under MVCC before inspecting candidates.
+    chunk.history.expire_due_for_test(u64::MAX);
+    chunk.drain_history_dead();
+
     let candidate_segments = chunk.segs_for_combine_cleaner();
     let candidate_ids: BTreeSet<_> = candidate_segments.iter().map(|(seg, _)| seg.id).collect();
 
@@ -465,6 +471,12 @@ fn blob_schema_combine_preserves_blob_segment_class() {
         source_segments.len(),
         "setup should keep one live blob cell per source segment"
     );
+
+    // This test is about preserving the destination segment class. Make the
+    // deleted filler revisions reclaimable explicitly instead of weakening
+    // the production history-retention policy.
+    chunk.history.expire_due_for_test(u64::MAX);
+    chunk.drain_history_dead();
 
     let selected_segments: Vec<_> = chunk
         .segments()

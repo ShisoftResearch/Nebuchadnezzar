@@ -1390,6 +1390,50 @@ impl Chunk {
         }
     }
 
+    pub(crate) fn compare_exchange_current_address(
+        &self,
+        id: Id,
+        revision_ts: u64,
+        old_location: usize,
+        new_location: usize,
+    ) -> CurrentAddressRelocation {
+        let index = self.cell_index.lock(id.lower as usize);
+        if let Some(mut current_location) = index {
+            if *current_location == old_location {
+                let Ok((header, _)) = header_from_chunk_raw(old_location) else {
+                    return CurrentAddressRelocation::Inconsistent;
+                };
+                if Id::from_header(&header) != id || header.revision_ts != revision_ts {
+                    return CurrentAddressRelocation::Inconsistent;
+                }
+                *current_location = new_location;
+                return CurrentAddressRelocation::Moved;
+            }
+
+            // Keep the lower-hash guard through the history check. A writer
+            // that won before cleaner publication has already installed a
+            // successor; a writer that starts after the history-location CAS
+            // cannot validate the stale mirror until this guard is released.
+            if self.history.current(&id).is_some_and(|current| {
+                current.revision_ts == revision_ts && current.load().1 == new_location
+            }) {
+                return CurrentAddressRelocation::Inconsistent;
+            }
+            return CurrentAddressRelocation::NoLongerCurrent;
+        }
+
+        // A concurrent delete removes the mirror only after publishing its
+        // tombstone successor. Prove that transition while the absent-key
+        // guard is held before allowing source reclamation.
+        if self.history.current(&id).is_some_and(|current| {
+            current.revision_ts == revision_ts && current.load().1 == new_location
+        }) {
+            CurrentAddressRelocation::Inconsistent
+        } else {
+            CurrentAddressRelocation::NoLongerCurrent
+        }
+    }
+
     // Decodes entry to get size and marks it dead
     // WARNING: Will panic if memory at addr is corrupted!
     // Prefer mark_dead_entry_with_size when size is known
@@ -1486,7 +1530,6 @@ impl Chunk {
                 *utilization < 1.0
                     && (full || *utilization < DEAD_RATE_FOR_COMBINE_CLEANER)
                     && !self.is_active_head(seg.id)
-                    && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
                     && !seg.cleaned_without_progress()
             })
@@ -1653,6 +1696,13 @@ impl Chunk {
         }
         return Err(WriteError::CellRevisionMismatch);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CurrentAddressRelocation {
+    Moved,
+    NoLongerCurrent,
+    Inconsistent,
 }
 
 pub struct PendingEntry {
