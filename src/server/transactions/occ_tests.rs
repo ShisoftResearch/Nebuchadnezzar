@@ -783,6 +783,204 @@ async fn repeatable_full_read_uses_first_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn transaction_reads_revision_older_than_current_head() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5385";
+    let group = "txn_occ_fixed_snapshot_after_current_advance";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90136);
+
+    let mut initial = counter_cell(schema.id, cell_id, 1, "fixed-snapshot-initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    let mut current = counter_cell(schema.id, cell_id, 2, "fixed-snapshot-current");
+    let current_header = runtime.chunks().update_cell(&mut current).unwrap();
+    assert!(current_header.revision_ts >= tid.ts);
+
+    let snapshot = accepted_cell(txn.read(tid, cell_id).await.unwrap().unwrap());
+    assert!(
+        snapshot.header.revision_ts < tid.ts,
+        "transaction read must resolve its fixed begin snapshot, got revision {} at boundary {}",
+        snapshot.header.revision_ts,
+        tid.ts
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleted_snapshot_carries_exact_tombstone_revision() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5386";
+    let group = "txn_occ_deleted_snapshot_expectation";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90137);
+
+    let mut initial = counter_cell(schema.id, cell_id, 1, "deleted-snapshot-initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+    runtime.chunks().remove_cell(&cell_id).unwrap();
+    let delete_revision_ts = match runtime
+        .chunks()
+        .read_cell_snapshot(&cell_id, u64::MAX)
+        .unwrap()
+    {
+        crate::ram::cell::SnapshotRead::Absent(Some(revision_ts)) => revision_ts,
+        other => panic!("expected current tombstone, got {:?}", other),
+    };
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    let mut recreated = counter_cell(schema.id, cell_id, 2, "deleted-snapshot-recreated");
+    runtime.chunks().write_cell(&mut recreated).unwrap();
+    assert!(recreated.header.revision_ts >= tid.ts);
+
+    assert_missing(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(
+        runtime
+            .txn_manager()
+            .unwrap()
+            .coordinator_expectation_for_test(&tid, &cell_id)
+            .await,
+        Some(CellExpectation::Absent(Some(delete_revision_ts)))
+    );
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn never_existed_snapshot_carries_no_tombstone_revision() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5392";
+    let group = "txn_occ_never_existed_snapshot_expectation";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let cell_id = Id::new(0, 90141);
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    assert_missing(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    assert_eq!(
+        runtime
+            .txn_manager()
+            .unwrap()
+            .coordinator_expectation_for_test(&tid, &cell_id)
+            .await,
+        Some(CellExpectation::Absent(None))
+    );
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_point_read_shapes_resolve_one_fixed_snapshot_revision() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5387";
+    let group = "txn_occ_mixed_shapes_fixed_snapshot";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90138);
+
+    let mut initial = counter_cell(schema.id, cell_id, 10, "mixed-shapes-initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+
+    let mut current = counter_cell(schema.id, cell_id, 20, "mixed-shapes-current");
+    runtime.chunks().update_cell(&mut current).unwrap();
+
+    let selected = accepted_cell(
+        txn.read_selected(tid.clone(), cell_id, vec![hash_str("score")])
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    let head = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
+    let full = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+
+    assert!(full.header.revision_ts < tid.ts);
+    assert_eq!(selected.header.revision_ts, full.header.revision_ts);
+    assert_eq!(head.revision_ts, full.header.revision_ts);
+    assert_eq!(selected_score_of(&selected), 10);
+    assert_eq!(score_of(&full), 10);
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_snapshot_too_old_is_not_downgraded_to_current_data() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5388";
+    let group = "txn_occ_snapshot_too_old";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90139);
+
+    let mut initial = counter_cell(schema.id, cell_id, 1, "snapshot-too-old-initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    let floor = runtime.chunks().establish_recovery_floor().unwrap();
+    assert!(floor > tid.ts);
+
+    assert!(matches!(
+        txn.read(tid.clone(), cell_id).await.unwrap().unwrap(),
+        TxnExecResult::Error(ReadError::SnapshotTooOld)
+    ));
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn buffered_update_overlays_the_fixed_point_snapshot() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5389";
+    let group = "txn_occ_snapshot_read_your_update";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90140);
+
+    let mut initial = counter_cell(schema.id, cell_id, 1, "snapshot-overlay-initial");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    let mut buffered = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
+    buffered.data["score"] = OwnedValue::U64(99);
+
+    assert_eq!(
+        txn.update(tid.clone(), buffered).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        score_of(&accepted_cell(
+            txn.read(tid.clone(), cell_id).await.unwrap().unwrap()
+        )),
+        99
+    );
+
+    abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repeatable_missing_read_caches_absence() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5331";
@@ -1289,14 +1487,14 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
         "head/read_selected must not issue a full-cell participant read"
     );
 
-    // A concurrent update advances the current revision_ts; the pin must keep the txn
-    // observing its snapshot for the later full read.
+    // A concurrent update advances the current revision_ts; the fixed snapshot
+    // must keep the later full read on the transaction's original revision.
     let mut updated = counter_cell(schema.id, cell_id, 9, "counter_shape_gated_updated");
     let updated_header = runtime.chunks().update_cell(&mut updated).unwrap();
     assert!(updated_header.revision_ts > head.revision_ts);
 
     // Step 2: the full read fetches the whole cell exactly once, served from the
-    // pinned revision_ts so it is consistent with the earlier partial reads.
+    // snapshot revision so it is consistent with the earlier partial reads.
     let before_full = transactions::data_site::full_read_rpc_count();
     let full = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(
@@ -1334,7 +1532,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
+async fn head_read_certifies_snapshot_version_and_aborts_on_conflict() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5381";
     let group = "txn_occ_shape_gated_certify";
@@ -1374,7 +1572,7 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
         TxnExecResult::Accepted(())
     );
 
-    // A concurrent writer advances the header-read cell past the pinned revision_ts.
+    // A concurrent writer advances the header-read cell past the observed revision_ts.
     let mut conflicting = counter_cell(schema.id, read_id, 7, "counter_certify_conflict");
     let conflicting_header = runtime.chunks().update_cell(&mut conflicting).unwrap();
     assert!(conflicting_header.revision_ts > head.revision_ts);
@@ -1397,7 +1595,7 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn head_pin_survives_concurrent_non_transactional_overwrite() {
+async fn snapshot_read_survives_concurrent_non_transactional_overwrite() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5382";
     let group = "txn_occ_pin_survives_overwrite";
@@ -1414,7 +1612,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
-    // head pins revision_ts A at the participant for this transaction.
+    // head resolves revision_ts A at the transaction's fixed snapshot.
     let head_a = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(head_a.revision_ts, version_a_version);
 
@@ -1425,7 +1623,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     assert!(version_b_header.revision_ts > head_a.revision_ts);
 
     // Force a deterministic storage cleaner pass between the overwrite and the
-    // pinned reads below. `Cleaner::clean` (src/ram/cleaner/mod.rs) is the real
+    // snapshot reads below. `Cleaner::clean` (src/ram/cleaner/mod.rs) is the real
     // GC entry point reachable off `chunks()` (it is used the same way in
     // src/ram/tiered/tests.rs and src/ram/tests/chunk.rs); calling it with
     // full=true, wait=true makes any reclamation work run synchronously instead
@@ -1439,10 +1637,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     // never find a second segment to combine revision_ts A's dead bytes into. The
     // call below is therefore a genuine, real cleaner pass, but it cannot itself
     // reclaim anything under this particular layout. What actually protects the
-    // pinned bytes from reclamation (once there is something to reclaim) is the
-    // `SegmentReferenceGuard` held by the pinning transaction's participant
-    // entry (see `PinnedReadSet` / `ensure_read_pin` in data_site.rs); the
-    // assertions below rely on that guard together with copy-on-write
+    // assertions below rely on the retained MVCC history and copy-on-write
     // immutability of already-written cell bytes.
     let _ = crate::ram::cleaner::Cleaner::clean(&runtime.chunks().list[0], true, true);
 
@@ -1455,7 +1650,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     let head_a_again = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(head_a_again.revision_ts, head_a.revision_ts);
 
-    // A different, fresh transaction that never pinned sees the current revision_ts B.
+    // A different, fresh transaction sees the current revision_ts B.
     let tid2 = txn.begin().await.unwrap().unwrap();
     let full_b = accepted_cell(txn.read(tid2.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(full_b.header.revision_ts, version_b_header.revision_ts);
@@ -1467,7 +1662,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn head_pin_survives_concurrent_transactional_remove() {
+async fn snapshot_read_survives_concurrent_transactional_remove() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5383";
     let group = "txn_occ_pin_survives_remove";
@@ -1509,8 +1704,8 @@ async fn head_pin_survives_concurrent_transactional_remove() {
         "the cell must be gone from storage after the concurrent remove commits"
     );
 
-    // The ORIGINAL tid still returns revision_ts A on a full read: the pinned
-    // revision_ts survives the remove.
+    // The ORIGINAL tid still returns revision_ts A on a full read: the snapshot
+    // revision remains visible across the remove.
     let full_a = accepted_cell(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(full_a.header.revision_ts, head_a.revision_ts);
     assert_eq!(score_of(&full_a), 42);
@@ -1524,7 +1719,7 @@ async fn head_pin_survives_concurrent_transactional_remove() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn head_pin_caches_absence_across_concurrent_transactional_insert() {
+async fn snapshot_read_caches_absence_across_concurrent_transactional_insert() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5384";
     let group = "txn_occ_pin_absence_insert";
@@ -1537,7 +1732,7 @@ async fn head_pin_caches_absence_across_concurrent_transactional_insert() {
     let tid = txn.begin().await.unwrap().unwrap();
 
     // The cell is absent. head observes CellDoesNotExisted and the coordinator
-    // caches the absence (CellExpectation::Absent) for tid.
+    // caches the logical absence expectation for tid.
     assert_missing_head(txn.head(tid.clone(), missing_id).await.unwrap().unwrap());
 
     // Concurrently, a different transaction inserts the cell transactionally

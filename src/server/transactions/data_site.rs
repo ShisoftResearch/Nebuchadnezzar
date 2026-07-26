@@ -5,7 +5,7 @@ use crate::ram::types::Id;
 use crate::server::DatabaseRuntime;
 use crate::{
     index::builder::IndexBuilder,
-    ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
+    ram::cell::{CellHeader, OwnedCell, ReadError, SnapshotRead, WriteError},
 };
 use bifrost::hlc::Hlc;
 use bifrost::utils::time::get_time;
@@ -16,7 +16,7 @@ use lightning::linked_list::LinkedList;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -188,45 +188,6 @@ pub struct CellMeta {
     lock_acquired_at: Option<i64>, // timestamp when lock was acquired (milliseconds since epoch)
 }
 
-/// A single pinned read: the location of a specific revision_ts of a cell within
-/// its segment, together with the revision_ts number that was pinned.
-#[derive(Clone, Copy, Debug)]
-struct PinnedRead {
-    location: usize,
-    revision_ts: u64,
-}
-
-/// Per-transaction record of pinned reads for large cells. When a transaction
-/// reads a LARGE cell under repeatable-read semantics, the participant pins
-/// that specific revision_ts (holding a segment reference guard) and remembers
-/// its location here, instead of the coordinator cloning the whole cell.
-///
-/// The guard is `Option` so a pin can be recorded (e.g. in tests) without
-/// necessarily holding a live segment reference.
-#[derive(Default)]
-struct PinnedReadSet {
-    entries: HashMap<Id, (PinnedRead, Option<SegmentReferenceGuard>)>,
-}
-
-impl PinnedReadSet {
-    fn insert(&mut self, id: Id, pin: PinnedRead, guard: Option<SegmentReferenceGuard>) {
-        self.entries.insert(id, (pin, guard));
-    }
-
-    fn get(&self, id: &Id) -> Option<&PinnedRead> {
-        self.entries.get(id).map(|(pin, _)| pin)
-    }
-
-    /// Empties the set, dropping any held segment guards.
-    fn drain(&mut self) {
-        self.entries.clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
 struct Transaction {
     state: TxnState,
     affected_cells: Vec<Id>,
@@ -236,9 +197,7 @@ struct Transaction {
     history: CommitHistory,
     /// RAII guards that hold segment references during this transaction
     /// Automatically released when guards are dropped (no leak risk)
-    segment_guards: Vec<SegmentReferenceGuard>,
-    /// Pinned versions of LARGE cells read under repeatable-read semantics.
-    pinned_reads: PinnedReadSet,
+    rollback_guards: Vec<SegmentReferenceGuard>,
 }
 
 #[derive(Debug)]
@@ -273,7 +232,7 @@ impl Transaction {
             self.certified_op(id),
             Some(PrepareOp {
                 intent: PrepareIntent::Write,
-                expectation: CellExpectation::Absent,
+                expectation: CellExpectation::Absent(_),
                 ..
             })
         )
@@ -294,14 +253,10 @@ pub struct DataManager {
 }
 
 service! {
-    rpc read(server_id: u64, clock: Hlc, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
-    rpc read_selected(server_id: u64, clock: Hlc, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
-    rpc read_partial_raw(server_id: u64, clock: Hlc, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>;
-    rpc head(server_id: u64, clock: Hlc, tid: TxnId, id: Id, pin: bool) -> DataSiteResponse<TxnExecResult<CellHeader, ReadError>>;
-    // Release any read pins held for a transaction (partial reads pin versions).
-    // Best-effort and idempotent: called by the coordinator on commit/abort so a
-    // transaction that merely pinned reads on a server does not linger there.
-    rpc release_read_pins(tids: Vec<TxnId>) -> DataSiteResponse<()>;
+    rpc read(server_id: u64, clock: Hlc, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<ObservedPoint<OwnedCell>, ReadError>>;
+    rpc read_selected(server_id: u64, clock: Hlc, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<ObservedPoint<OwnedCell>, ReadError>>;
+    rpc read_partial_raw(server_id: u64, clock: Hlc, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<ObservedPoint<Vec<u8>>, ReadError>>;
+    rpc head(server_id: u64, clock: Hlc, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<ObservedPoint<CellHeader>, ReadError>>;
     // two phase commit
     rpc prepare(coordinator_id: u64, clock: Hlc, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
     rpc commit(clock: Hlc, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
@@ -395,8 +350,7 @@ impl DataManager {
                 coordinator_id: None,
                 last_activity: get_time(),
                 history: BTreeMap::new(),
-                segment_guards: Vec::with_capacity(4), // Pre-allocate for common case
-                pinned_reads: PinnedReadSet::default(),
+                rollback_guards: Vec::with_capacity(4), // Pre-allocate for common case
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -486,7 +440,7 @@ impl DataManager {
             (CellExpectation::Present(expected_revision_ts), Ok(head)) => {
                 head.revision_ts == *expected_revision_ts
             }
-            (CellExpectation::Absent, Err(ReadError::CellDoesNotExisted)) => true,
+            (CellExpectation::Absent(_), Err(ReadError::CellDoesNotExisted)) => true,
             _ => false,
         }
     }
@@ -642,28 +596,7 @@ impl DataManager {
         self.update_clock(*clock);
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
-        let committing = meta.owner.is_some();
-
-        // Use the more recent timestamp between the transaction ID and the incoming clock
-        // This allows transactions to proceed even if their original timestamp is stale
-        // due to clock updates from concurrent transactions
-        let effective_ts = clock.max(tid);
-        let read_too_late = &meta.write > effective_ts;
-
-        // Check timestamp constraints first
-        if read_too_late {
-            // Write timestamp is newer - not realizable even if still committing
-            // The timestamp constraint won't change after waiting
-            warn!(
-                "ReadTooLate: Transaction {:?} (effective ts: {:?}) trying to read cell {:?} but write timestamp {:?} is newer. Transaction timestamp is older than cell's write timestamp.",
-                tid, effective_ts, id, meta.write
-            );
-            return Err(self.response_with(TxnExecResult::Rejected));
-        }
-
-        if committing {
-            // Timestamp is OK but another transaction is still committing
-            // Return Wait so caller can retry with backoff
+        if meta.owner.is_some() {
             debug!(
                 "-> READ {:?} WAITING for {:?} to finish commit on cell {:?}",
                 tid, &meta.owner, id
@@ -671,82 +604,37 @@ impl DataManager {
             return Err(self.response_with(TxnExecResult::Wait));
         }
 
-        // Cell is available, update read timestamp using the effective timestamp
-        if &meta.read < effective_ts {
-            meta.read = effective_ts.clone()
+        if meta.read < *tid {
+            meta.read = *tid;
         }
-        return Ok(());
+        Ok(())
     }
 
-    /// Returns the pinned location for `id` IF this transaction already holds a
-    /// pin for it, creating nothing. Used by the full-read path, which must
-    /// repeat an already-pinned revision_ts (from a prior partial read) but must
-    /// never create a pin of its own.
-    ///
-    /// Must be called AFTER `prepare_read` has succeeded. The transaction lock
-    /// is taken briefly and released before returning.
-    fn existing_read_pin(&self, tid: &TxnId, id: &Id) -> Option<usize> {
-        let txn_lock = self.find_transaction(tid)?;
-        let location = txn_lock.lock().pinned_reads.get(id).map(|pin| pin.location);
-        location
-    }
-
-    /// Shape-gated repeatable-read pinning. Called by the partial-read paths
-    /// (`head` with `pin == true`, `read_selected`), which always pin so a later
-    /// read in the same transaction repeats the same revision_ts.
-    ///
-    /// Must be called AFTER `prepare_read` has succeeded (so the cell-meta lock
-    /// is already released). Returns `Some(location)` when the read should be
-    /// served from a specific stored revision_ts (a raw segment address), or `None`
-    /// when the caller should fall back to a normal current read.
-    ///
-    /// Behavior:
-    /// - If this transaction already pinned the cell, returns that pinned
-    ///   location so the read repeats the original revision_ts even if the current
-    ///   cell has since advanced.
-    /// - Otherwise it captures the current revision_ts's address, acquires a segment
-    ///   reference guard to keep it alive, records the pin on a
-    ///   (created-if-needed) participant transaction, and returns that address.
-    ///   There is no size gate: partial reads pin regardless of cell size.
-    /// - If the cell does not exist or the guard cannot be acquired, returns
-    ///   `None` (no pin) so the caller falls back to a normal current read.
-    fn ensure_read_pin(&self, tid: &TxnId, id: &Id) -> Option<usize> {
-        // Serve an already-pinned cell from its pin (repeatability). The
-        // transaction lock is taken briefly and released before returning.
-        if let Some(location) = self.existing_read_pin(tid, id) {
-            return Some(location);
+    fn observed_snapshot<T, F>(
+        snapshot: Result<SnapshotRead<T>, ReadError>,
+        revision_ts: F,
+    ) -> TxnExecResult<ObservedPoint<T>, ReadError>
+    where
+        T: Send + Clone,
+        F: FnOnce(&T) -> u64,
+    {
+        match snapshot {
+            Ok(SnapshotRead::Present(value)) => {
+                let expectation = CellExpectation::Present(revision_ts(&value));
+                TxnExecResult::Accepted(ObservedPoint {
+                    value: Some(value),
+                    expectation,
+                })
+            }
+            Ok(SnapshotRead::Absent(delete_revision_ts)) => {
+                TxnExecResult::Accepted(ObservedPoint {
+                    value: None,
+                    expectation: CellExpectation::Absent(delete_revision_ts),
+                })
+            }
+            Ok(SnapshotRead::Wait) => TxnExecResult::Wait,
+            Err(error) => TxnExecResult::Error(error),
         }
-
-        // Capture the current revision_ts's address and revision_ts cheaply: an index
-        // lookup plus a header decode. Materializing the cell value here (e.g.
-        // via `read_cell`) would parse the whole payload just to learn where it
-        // lives, defeating the point of pinning partial reads. The index guard
-        // is released inside the call, before we take the transaction lock.
-        let (addr, revision_ts) = self.chunks().cell_location_and_revision(id).ok()?;
-        let chunk = self.chunks().locate_chunk_by_partition(id.higher);
-        let chunk_idx = chunk.id;
-        let (segment_id, _seq_id) = chunk.get_cell_segment_info(addr);
-
-        // Keep the pinned revision_ts's segment alive for the transaction's lifetime.
-        // If it cannot be acquired (segment freed/evicted), fall back gracefully.
-        let guard = self.acquire_segment_guard(chunk_idx, segment_id)?;
-
-        let txn_lock = self.get_or_create_transaction(tid);
-        let mut txn = txn_lock.lock();
-        // A concurrent read for the same transaction may have pinned first; keep
-        // the earliest pin so all reads remain mutually repeatable.
-        if let Some(existing) = txn.pinned_reads.get(id).copied() {
-            return Some(existing.location);
-        }
-        txn.pinned_reads.insert(
-            *id,
-            PinnedRead {
-                location: addr,
-                revision_ts,
-            },
-            Some(guard),
-        );
-        Some(addr)
     }
 
     /// Attempt to release locks for a transaction
@@ -1045,7 +933,7 @@ impl DataManager {
                                 txn.history
                                     .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
                                 meta.write = effective_ts.clone();
-                                txn.segment_guards.push(guard);
+                                txn.rollback_guards.push(guard);
                             }
                             Err(error) => {
                                 write_error = Some((*cell_id, error));
@@ -1135,7 +1023,7 @@ impl DataManager {
                                     CellHistory::new(old_cell_ref, updated_cell.header.revision_ts),
                                 );
                                 meta.write = effective_ts.clone();
-                                txn.segment_guards.push(guard);
+                                txn.rollback_guards.push(guard);
                             }
                             Err(error) => {
                                 write_error = Some((cell_id, error));
@@ -1154,7 +1042,7 @@ impl DataManager {
         }
 
         txn.state = TxnState::Committed;
-        for guard in &txn.segment_guards {
+        for guard in &txn.rollback_guards {
             let chunk_idx = guard.chunk_id();
             let seg_id = guard.segment_id();
             let chunk = &self.chunks().list[chunk_idx];
@@ -1223,7 +1111,7 @@ impl DataManager {
             let valid = match op {
                 CommitOp::Write(_) => {
                     certified.intent == PrepareIntent::Write
-                        && certified.expectation == CellExpectation::Absent
+                        && matches!(certified.expectation, CellExpectation::Absent(_))
                 }
                 CommitOp::Update(_) | CommitOp::Remove(_) => {
                     certified.intent == PrepareIntent::Write
@@ -1386,25 +1274,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn pinned_read_set_records_and_returns_entry() {
-        let mut set = PinnedReadSet::default();
-        set.insert(
-            Id::new(0, 42),
-            PinnedRead {
-                location: 0x1000,
-                revision_ts: 7,
-            },
-            None,
-        );
-        assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.revision_ts), Some(7));
-        assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.location), Some(0x1000));
-        assert!(set.get(&Id::new(0, 99)).is_none());
-        assert!(!set.is_empty());
-        set.drain();
-        assert!(set.is_empty());
-    }
-
-    #[test]
     fn scoped_data_manager_service_ids_differ_between_databases() {
         let group = "group_a";
         assert_ne!(
@@ -1548,18 +1417,6 @@ mod tests {
         OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
     }
 
-    // A cell whose stored length is well above the default 4096-byte read-pin
-    // threshold. The multi-KiB `name` payload makes the participant pin the read
-    // revision_ts; `score` is a small, distinct marker used to tell versions apart.
-    fn large_cell(schema_id: u32, id: Id, score: u64, marker: &str) -> OwnedCell {
-        let mut data = OwnedMap::new();
-        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
-        data.insert(&String::from("score"), OwnedValue::U64(score));
-        let payload = format!("{}-{}", marker, "x".repeat(8192));
-        data.insert(&String::from("name"), OwnedValue::String(payload));
-        OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
-    }
-
     fn seed_cell_revision(
         runtime: &Arc<crate::server::DatabaseRuntime>,
         schema_id: u32,
@@ -1595,7 +1452,7 @@ mod tests {
                     id,
                     PrepareOp {
                         id,
-                        expectation: CellExpectation::Absent,
+                        expectation: CellExpectation::Absent(None),
                         intent: PrepareIntent::Write,
                     },
                 )
@@ -1681,241 +1538,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn partial_read_pins_and_is_repeatable_across_an_update() {
+    async fn first_snapshot_read_waits_for_owner_before_timestamp_rejection() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5361";
-        let group = "txn_data_site_pinned_partial_read";
+        let address = "127.0.0.1:5390";
+        let group = "txn_data_site_snapshot_owner_wait";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99021);
+        let cell_id = Id::new(0, 99024);
 
-        // Seed revision_ts A. Size no longer matters: a partial read (head with
-        // pin=true) pins the read revision_ts regardless of cell size, so a small
-        // (normal) cell pins just as a large one would (shape-gated, not size).
-        let score_a: u64 = 100;
-        let mut cell_a = counter_cell(schema.id, cell_id, score_a, "A");
-        let version_a = runtime
-            .chunks()
-            .write_cell(&mut cell_a)
-            .unwrap()
-            .revision_ts;
+        let mut cell = counter_cell(schema.id, cell_id, 1, "owner-wait-seed");
+        runtime.chunks().write_cell(&mut cell).unwrap();
 
-        let tid = test_hlc(1, 41);
+        let reader_tid = test_hlc(cell.header.revision_ts + 1, 51);
+        let writer_tid = test_hlc(reader_tid.ts + 1, 52);
+        let meta = manager.cell_meta_mutex(&cell_id);
+        {
+            let mut meta = meta.lock();
+            meta.write = writer_tid;
+            meta.owner = Some(TxnPriority::new(writer_tid, 52));
+            meta.lock_acquired_at = Some(get_time());
+        }
 
-        // A partial read (head with pin=true) pins revision_ts A for this transaction.
-        let head_a =
-            <DataManager as Service>::head(&manager, 41, tid.clone(), tid.clone(), cell_id, true)
+        let response =
+            <DataManager as Service>::read(&manager, 51, reader_tid, reader_tid, cell_id)
                 .await
                 .payload;
-        let header_a = match head_a {
-            TxnExecResult::Accepted(header) => header,
-            other => panic!("expected head to be accepted, got {:?}", other),
-        };
-        assert_eq!(header_a.revision_ts, version_a);
-
-        // Externally advance the cell to revision_ts B.
-        let score_b: u64 = 200;
-        let mut cell_b = counter_cell(schema.id, cell_id, score_b, "B");
-        let version_b = runtime
-            .chunks()
-            .update_cell(&mut cell_b)
-            .unwrap()
-            .revision_ts;
-        assert_ne!(version_a, version_b);
-
-        // The pinning transaction must still observe revision_ts A on a full read.
-        let read_pinned =
-            <DataManager as Service>::read(&manager, 41, tid.clone(), tid.clone(), cell_id)
-                .await
-                .payload;
-        let pinned_cell = match read_pinned {
-            TxnExecResult::Accepted(cell) => cell,
-            other => panic!("expected read to be accepted, got {:?}", other),
-        };
-        assert_eq!(
-            *pinned_cell.data["score"].u64().unwrap(),
-            score_a,
-            "pinned read must serve revision_ts A's data, not revision_ts B's"
-        );
-        assert_eq!(
-            pinned_cell.header.revision_ts, version_a,
-            "pinned read must serve revision_ts A, not revision_ts B"
-        );
-
-        // And a subsequent head from the same transaction is still revision_ts A.
-        let head_again =
-            <DataManager as Service>::head(&manager, 41, tid.clone(), tid.clone(), cell_id, true)
-                .await
-                .payload;
-        let header_again = match head_again {
-            TxnExecResult::Accepted(header) => header,
-            other => panic!("expected head to be accepted, got {:?}", other),
-        };
-        assert_eq!(header_again.revision_ts, version_a);
-
-        // A different transaction, never having pinned, sees the current revision_ts B.
-        let other_tid = test_hlc(1, 42);
-        let read_current = <DataManager as Service>::read(
-            &manager,
-            42,
-            other_tid.clone(),
-            other_tid.clone(),
-            cell_id,
-        )
-        .await
-        .payload;
-        let current_cell = match read_current {
-            TxnExecResult::Accepted(cell) => cell,
-            other => panic!("expected read to be accepted, got {:?}", other),
-        };
-        assert_eq!(
-            *current_cell.data["score"].u64().unwrap(),
-            score_b,
-            "a non-pinning transaction must see the current revision_ts B"
-        );
-        assert_eq!(current_cell.header.revision_ts, version_b);
+        assert!(matches!(response, TxnExecResult::Wait));
 
         server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn release_read_pins_drains_pins_and_wipes_pin_only_transaction() {
-        let _ = env_logger::try_init();
-        let address = "127.0.0.1:5359";
-        let group = "txn_data_site_release_read_pins";
-        let server = start_transaction_test_server(address, group).await;
-        let runtime = server.current_database();
-        let schema = install_prepare_test_schema(&runtime);
-        let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99023);
-
-        // Seed a revision_ts, then pin it with a partial read (head with pin=true),
-        // which creates a participant transaction holding a segment guard.
-        let mut cell = counter_cell(schema.id, cell_id, 500, "A");
-        let revision_ts = runtime.chunks().write_cell(&mut cell).unwrap().revision_ts;
-
-        let tid = test_hlc(1, 44);
-        let head =
-            <DataManager as Service>::head(&manager, 44, tid.clone(), tid.clone(), cell_id, true)
-                .await
-                .payload;
-        assert!(
-            matches!(head, TxnExecResult::Accepted(ref h) if h.revision_ts == revision_ts),
-            "partial read must observe the seeded revision_ts"
-        );
-
-        // The pin created a participant transaction with a non-empty pin set.
-        // Clone the Arc so we can still inspect the pin set after a wipe removes
-        // the map entry.
-        let txn = manager
-            .find_transaction(&tid)
-            .expect("partial read must create a participant transaction");
-        assert!(
-            !txn.lock().pinned_reads.is_empty(),
-            "partial read must record a pinned read"
-        );
-
-        // Releasing the read pins drains the pin set and, because the transaction
-        // is pin-only (Started, no certified/affected state), wipes it entirely.
-        let released = <DataManager as Service>::release_read_pins(&manager, vec![tid.clone()])
-            .await
-            .payload;
-        assert_eq!(released, ());
-        assert!(
-            txn.lock().pinned_reads.is_empty(),
-            "release_read_pins must drain the pinned reads"
-        );
-        assert!(
-            manager.find_transaction(&tid).is_none(),
-            "release_read_pins must wipe a pin-only participant transaction"
-        );
-        assert!(
-            !manager.txns_sorted.lock().contains(&tid),
-            "release_read_pins must drop the txns_sorted entry too"
-        );
-
-        // Releasing an unknown transaction is idempotent and still succeeds.
-        let unknown_tid = test_hlc(9, 45);
-        let released_unknown =
-            <DataManager as Service>::release_read_pins(&manager, vec![unknown_tid.clone()])
-                .await
-                .payload;
-        assert_eq!(released_unknown, ());
-        assert!(manager.find_transaction(&unknown_tid).is_none());
-
-        server.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn head_without_pin_does_not_snapshot_the_read() {
+    async fn point_read_shapes_share_snapshot_without_participant_state() {
         let _ = env_logger::try_init();
         let address = "127.0.0.1:5362";
-        let group = "txn_data_site_head_no_pin";
+        let group = "txn_data_site_snapshot_shapes";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 99022);
 
-        // Seed revision_ts A.
-        let score_a: u64 = 300;
-        let mut cell_a = counter_cell(schema.id, cell_id, score_a, "A");
-        let version_a = runtime
-            .chunks()
-            .write_cell(&mut cell_a)
-            .unwrap()
-            .revision_ts;
+        let mut first = counter_cell(schema.id, cell_id, 300, "A");
+        let first_revision_ts = runtime.chunks().write_cell(&mut first).unwrap().revision_ts;
+        let tid = manager.hlc.now();
+        let mut second = counter_cell(schema.id, cell_id, 400, "B");
+        runtime.chunks().update_cell(&mut second).unwrap();
 
-        let tid = test_hlc(1, 43);
-
-        // A blind head (pin=false, the revision_ts-observation path) must NOT pin and
-        // must NOT create a participant transaction.
-        let head_a =
-            <DataManager as Service>::head(&manager, 43, tid.clone(), tid.clone(), cell_id, false)
+        let head = <DataManager as Service>::head(&manager, 43, tid, tid, cell_id)
+            .await
+            .payload
+            .unwrap();
+        let selected = <DataManager as Service>::read_selected(
+            &manager,
+            43,
+            tid,
+            tid,
+            cell_id,
+            vec![hash_str("score")],
+        )
+        .await
+        .payload
+        .unwrap();
+        let full = <DataManager as Service>::read(&manager, 43, tid, tid, cell_id)
+            .await
+            .payload
+            .unwrap();
+        let partial =
+            <DataManager as Service>::read_partial_raw(&manager, 43, tid, tid, cell_id, 0, 8)
                 .await
-                .payload;
-        assert!(
-            matches!(head_a, TxnExecResult::Accepted(ref h) if h.revision_ts == version_a),
-            "blind head must observe the current revision_ts"
-        );
-        assert!(
-            manager.find_transaction(&tid).is_none(),
-            "head(pin=false) must not create a participant transaction"
-        );
+                .payload
+                .unwrap();
 
-        // Externally advance the cell to revision_ts B.
-        let score_b: u64 = 400;
-        let mut cell_b = counter_cell(schema.id, cell_id, score_b, "B");
-        let version_b = runtime
-            .chunks()
-            .update_cell(&mut cell_b)
-            .unwrap()
-            .revision_ts;
-        assert_ne!(version_a, version_b);
-
-        // With no prior partial-read pin, a full read in the same transaction sees
-        // the current revision_ts B (a blind head created no snapshot, and full reads
-        // never create a pin themselves).
-        let read_current =
-            <DataManager as Service>::read(&manager, 43, tid.clone(), tid.clone(), cell_id)
-                .await
-                .payload;
-        let current_cell = match read_current {
-            TxnExecResult::Accepted(cell) => cell,
-            other => panic!("expected read to be accepted, got {:?}", other),
-        };
-        assert_eq!(
-            *current_cell.data["score"].u64().unwrap(),
-            score_b,
-            "head(pin=false) must not snapshot; the later full read sees revision_ts B"
-        );
-        assert_eq!(current_cell.header.revision_ts, version_b);
-        assert!(
-            manager.find_transaction(&tid).is_none(),
-            "a full read with no prior partial pin must not create a participant transaction"
-        );
+        let expectation = CellExpectation::Present(first_revision_ts);
+        assert_eq!(head.expectation, expectation);
+        assert_eq!(selected.expectation, expectation);
+        assert_eq!(full.expectation, expectation);
+        assert_eq!(partial.expectation, expectation);
+        assert_eq!(head.value.unwrap().revision_ts, first_revision_ts);
+        assert_eq!(full.value.unwrap().header.revision_ts, first_revision_ts);
+        assert!(partial.value.is_some());
+        assert!(manager.find_transaction(&tid).is_none());
 
         server.shutdown().await;
     }
@@ -1940,7 +1645,7 @@ mod tests {
                 tid.clone(),
                 vec![PrepareOp {
                     id: cell_id,
-                    expectation: CellExpectation::Absent,
+                    expectation: CellExpectation::Absent(None),
                     intent: PrepareIntent::Write,
                 }],
             )
@@ -2458,6 +2163,49 @@ mod tests {
                 .payload;
 
         assert!(matches!(response, TxnExecResult::Accepted(_)));
+        assert!(manager.find_transaction(&tid).is_none());
+        assert_eq!(manager.txns.len(), 0);
+        assert!(manager.txns_sorted.lock().is_empty());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_read_only_point_shape_is_participant_stateless() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5391";
+        let group = "txn_data_site_all_point_shapes_stateless";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99025);
+        seed_cell_revision(&runtime, schema.id, cell_id, 7, 0);
+        let tid = manager.hlc.now();
+
+        let head = <DataManager as Service>::head(&manager, 31, tid, tid, cell_id)
+            .await
+            .payload;
+        assert!(matches!(head, TxnExecResult::Accepted(_)));
+
+        let selected = <DataManager as Service>::read_selected(
+            &manager,
+            31,
+            tid,
+            tid,
+            cell_id,
+            vec![hash_str("score")],
+        )
+        .await
+        .payload;
+        assert!(matches!(selected, TxnExecResult::Accepted(_)));
+
+        let partial =
+            <DataManager as Service>::read_partial_raw(&manager, 31, tid, tid, cell_id, 0, 8)
+                .await
+                .payload;
+        assert!(matches!(partial, TxnExecResult::Accepted(_)));
+
         assert!(manager.find_transaction(&tid).is_none());
         assert_eq!(manager.txns.len(), 0);
         assert!(manager.txns_sorted.lock().is_empty());
@@ -3502,7 +3250,7 @@ mod tests {
             &tid,
             vec![PrepareOp {
                 id: cell_id,
-                expectation: CellExpectation::Absent,
+                expectation: CellExpectation::Absent(None),
                 intent: PrepareIntent::Write,
             }],
         )
@@ -3782,33 +3530,15 @@ impl Service for DataManager {
         clock: Hlc,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
-        // Instrumentation: this is the whole-cell transfer path. Coordinator
-        // tests assert header/projection-only reads never reach here.
+    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<ObservedPoint<OwnedCell>, ReadError>>> {
         FULL_READ_RPC_COUNT.fetch_add(1, Relaxed);
-        // A full read never creates a pin. It only serves from an existing pin
-        // when a prior partial read (head/read_selected) in this transaction
-        // already snapshotted the cell, so both reads repeat the same revision_ts.
-        // Pinned serves deliberately skip `prepare_read`: the revision_ts was
-        // admitted for this transaction when the pin was created, so re-running
-        // the ReadTooLate check or waiting on a committing owner could only
-        // spuriously reject or delay a read whose (immutable) outcome cannot
-        // change. The clock merge `prepare_read` would have done happens here;
-        // the fall-through path merges inside `prepare_read` (never twice).
-        if let Some(location) = self.existing_read_pin(&tid, &id) {
-            self.update_clock(clock);
-            return match self.chunks().read_cell_at(&id, location) {
-                Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
-                Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-            };
-        }
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        match self.chunks().read_cell(&id) {
-            Ok(cell) => self.response_with(TxnExecResult::Accepted(cell.to_owned())),
-            Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-        }
+        self.response_with(Self::observed_snapshot(
+            self.chunks().read_cell_snapshot(&id, tid.ts),
+            |cell| cell.header.revision_ts,
+        ))
     }
     fn read_selected(
         &self,
@@ -3817,31 +3547,14 @@ impl Service for DataManager {
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
-        // Serve an already-pinned cell from its immutable snapshot without
-        // `prepare_read` (see `read` for why re-checking could only spuriously
-        // reject or delay it; the clock merge happens exactly once per path).
-        if let Some(location) = self.existing_read_pin(&tid, &id) {
-            self.update_clock(clock);
-            return match self.chunks().read_selected_at(&id, location, &fields[..]) {
-                Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
-                Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-            };
-        }
+    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<ObservedPoint<OwnedCell>, ReadError>>> {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        if let Some(location) = self.ensure_read_pin(&tid, &id) {
-            return match self.chunks().read_selected_at(&id, location, &fields[..]) {
-                Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
-                Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-            };
-        }
-        match self.chunks().read_selected(&id, &fields[..], true) {
-            // Need header for revision_ts check
-            Ok(values) => self.response_with(TxnExecResult::Accepted(values.to_owned())),
-            Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-        }
+        self.response_with(Self::observed_snapshot(
+            self.chunks().read_selected_snapshot(&id, tid.ts, &fields),
+            |cell| cell.header.revision_ts,
+        ))
     }
     fn head(
         &self,
@@ -3849,76 +3562,15 @@ impl Service for DataManager {
         clock: Hlc,
         tid: TxnId,
         id: Id,
-        pin: bool,
-    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
-        // A partial read (pin=true) snapshots the read revision_ts so the same
-        // transaction repeats it. The blind revision_ts-observation path (pin=false,
-        // e.g. `observe_head_from_site`) must NOT pin or create a transaction; it
-        // serves the current header as the original (pre-pinning) code did.
-        if pin {
-            // Serve an already-pinned cell from its immutable snapshot without
-            // `prepare_read` (see `read` for why re-checking could only
-            // spuriously reject or delay it; the clock merge happens exactly
-            // once per path).
-            if let Some(location) = self.existing_read_pin(&tid, &id) {
-                self.update_clock(clock);
-                return match self.chunks().head_at(&id, location) {
-                    Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
-                    Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-                };
-            }
-        }
+    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<ObservedPoint<CellHeader>, ReadError>>> {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        if pin {
-            if let Some(location) = self.ensure_read_pin(&tid, &id) {
-                return match self.chunks().head_at(&id, location) {
-                    Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
-                    Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-                };
-            }
-        }
-        match self.chunks().head_cell(&id) {
-            Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
-            Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-        }
+        self.response_with(Self::observed_snapshot(
+            self.chunks().head_snapshot(&id, tid.ts),
+            |header| header.revision_ts,
+        ))
     }
-    /// Releases any read pins held for the given transactions, dropping their
-    /// segment guards.
-    ///
-    /// Called by the coordinator's periodic release flusher with a batch of
-    /// completed transactions that pinned reads on this server without writing
-    /// to it (write servers drop their pins in `end`). Best-effort and
-    /// idempotent per transaction:
-    /// - If the transaction is absent (stale cleanup already reclaimed it, or it
-    ///   was ended after a write), this is a no-op and still succeeds.
-    /// - If present, its pinned reads are drained. When the transaction is
-    ///   pin-only (state `Started`, with no certified/affected state), it was
-    ///   created solely to hold pins, so it is wiped out entirely — leaving no
-    ///   lingering `Transaction` or `txns_sorted` entry.
-    ///
-    /// Never fails, so a best-effort coordinator release cannot break commit or
-    /// abort. It does not touch cell locks, history, or two-phase-commit state.
-    fn release_read_pins(&self, tids: Vec<TxnId>) -> BoxFuture<'_, DataSiteResponse<()>> {
-        for tid in tids {
-            if let Some(txn_lock) = self.find_transaction(&tid) {
-                let pin_only = {
-                    let mut txn = txn_lock.lock();
-                    // Dropping the guards here releases the pinned segment references.
-                    txn.pinned_reads.drain();
-                    txn.state == TxnState::Started
-                        && txn.certified.is_empty()
-                        && txn.affected_cells.is_empty()
-                };
-                if pin_only {
-                    self.wipe_out_transaction(&tid);
-                }
-            }
-        }
-        self.response_with(())
-    }
-    // TODO: Link this function in transaction manager
     fn read_partial_raw(
         &self,
         _server_id: u64,
@@ -3927,14 +3579,33 @@ impl Service for DataManager {
         id: Id,
         offset: usize,
         len: usize,
-    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>> {
+    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<ObservedPoint<Vec<u8>>, ReadError>>> {
         if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
-        match self.chunks().read_partial_raw(&id, offset, len) {
-            Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
-            Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
-        }
+        let payload = match self
+            .chunks()
+            .read_partial_raw_snapshot(&id, tid.ts, offset, len)
+        {
+            Ok(SnapshotRead::Present(value)) => match self.chunks().head_snapshot(&id, tid.ts) {
+                Ok(SnapshotRead::Present(header)) => TxnExecResult::Accepted(ObservedPoint {
+                    value: Some(value),
+                    expectation: CellExpectation::Present(header.revision_ts),
+                }),
+                Ok(SnapshotRead::Wait) => TxnExecResult::Wait,
+                Err(error) => TxnExecResult::Error(error),
+                Ok(SnapshotRead::Absent(_)) => TxnExecResult::Error(ReadError::NotMatch),
+            },
+            Ok(SnapshotRead::Absent(delete_revision_ts)) => {
+                TxnExecResult::Accepted(ObservedPoint {
+                    value: None,
+                    expectation: CellExpectation::Absent(delete_revision_ts),
+                })
+            }
+            Ok(SnapshotRead::Wait) => TxnExecResult::Wait,
+            Err(error) => TxnExecResult::Error(error),
+        };
+        self.response_with(payload)
     }
     fn prepare(
         &self,
@@ -4114,7 +3785,7 @@ impl Service for DataManager {
         }
 
         if txn.history.is_empty() {
-            let guards_to_drop = std::mem::take(&mut txn.segment_guards);
+            let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
             txn.last_activity = get_time();
             txn.state = TxnState::Aborted;
             drop(txn);
@@ -4144,7 +3815,7 @@ impl Service for DataManager {
 
         // Keep segment references and metadata guards alive throughout rollback so the owner
         // cannot be reclaimed between validation and the storage mutations.
-        let guards_to_drop = std::mem::take(&mut txn.segment_guards);
+        let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
 
         let rollback_failures = {
             debug!(
@@ -4269,7 +3940,7 @@ impl Service for DataManager {
             let guards_to_drop = {
                 if let Some(txn_lock) = self.find_transaction(&tid) {
                     let mut txn = txn_lock.lock();
-                    std::mem::take(&mut txn.segment_guards)
+                    std::mem::take(&mut txn.rollback_guards)
                 } else {
                     Vec::new()
                 }

@@ -98,15 +98,24 @@ unsafe impl Send for Transaction {}
 unsafe impl Sync for Transaction {}
 
 impl Transaction {
-    pub async fn read(&self, id: Id) -> Result<Option<OwnedCell>, TxnError> {
-        match self.client.read(self.tid.to_owned(), id).await {
-            Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(Some(cell)),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
+    fn map_point_read<T: Send + Clone>(
+        result: TxnExecResult<T, ReadError>,
+        id: Id,
+    ) -> Result<Option<T>, TxnError> {
+        match result {
+            TxnExecResult::Accepted(value) => Ok(Some(value)),
+            TxnExecResult::Rejected => Err(TxnError::NotRealizable(
                 NotRealizableReason::ReadTooLate(id),
             )),
-            Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
-            Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
-            Ok(Ok(_)) => Err(TxnError::InternalError),
+            TxnExecResult::Error(ReadError::CellDoesNotExisted) => Ok(None),
+            TxnExecResult::Error(error) => Err(TxnError::ReadError(error)),
+            _ => Err(TxnError::InternalError),
+        }
+    }
+
+    pub async fn read(&self, id: Id) -> Result<Option<OwnedCell>, TxnError> {
+        match self.client.read(self.tid.to_owned(), id).await {
+            Ok(Ok(result)) => Self::map_point_read(result, id),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e)),
         }
@@ -121,13 +130,7 @@ impl Transaction {
             .read_selected(self.tid.to_owned(), id, fields.clone())
             .await
         {
-            Ok(Ok(TxnExecResult::Accepted(fields))) => Ok(Some(fields)),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
-                NotRealizableReason::ReadTooLate(id),
-            )),
-            Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
-            Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
-            Ok(Ok(_)) => Err(TxnError::InternalError),
+            Ok(Ok(result)) => Self::map_point_read(result, id),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e)),
         }
@@ -172,13 +175,7 @@ impl Transaction {
     }
     pub async fn head(&self, id: Id) -> Result<Option<CellHeader>, TxnError> {
         match self.client.head(self.tid.to_owned(), id).await {
-            Ok(Ok(TxnExecResult::Accepted(head))) => Ok(Some(head)),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
-                NotRealizableReason::ReadTooLate(id),
-            )),
-            Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
-            Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
-            Ok(Ok(_)) => Err(TxnError::InternalError),
+            Ok(Ok(result)) => Self::map_point_read(result, id),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e)),
         }
@@ -255,5 +252,23 @@ impl Transaction {
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn point_read_mapping_preserves_snapshot_too_old() {
+        let result = Transaction::map_point_read::<OwnedCell>(
+            TxnExecResult::Error(ReadError::SnapshotTooOld),
+            Id::new(0, 1),
+        );
+
+        assert!(matches!(
+            result,
+            Err(TxnError::ReadError(ReadError::SnapshotTooOld))
+        ));
     }
 }

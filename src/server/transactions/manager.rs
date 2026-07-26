@@ -11,7 +11,7 @@ use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
 use lightning::map::{Map as LFMapT, PtrHashMap as LFMap};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
@@ -229,23 +229,12 @@ struct DataObject {
     expectation: CellExpectation,
     changed: bool,
     new: bool,
-    /// Coordinator-side pinned-read cache for size-gated repeatable-read.
-    /// `None` selects the current (small-cell / clone) representation.
-    /// `Some(..)` marks a deferred large-cell read whose full `cell` is not
-    /// yet materialized (`cell: None` until an actual full read happens).
-    pinned: Option<PinnedReadCache>,
+    point_cache: PointReadCache,
 }
 
-/// Coordinator-side cache for a pinned (size-gated) repeatable-read revision_ts.
-/// Keeps only small results — the header and any projections already
-/// fetched — so a large pinned cell is not cloned whole into the
-/// transaction cache. The full cell is materialized lazily on an actual
-/// full read (wiring for that happens outside this representation).
 #[derive(Clone, Debug, Default)]
-struct PinnedReadCache {
-    /// Cached header of the pinned revision_ts (small; serves repeated head reads).
+struct PointReadCache {
     header: Option<CellHeader>,
-    /// Cached projections keyed by the (sorted) field-id list served so far.
     projections: HashMap<Vec<u64>, OwnedCell>,
 }
 
@@ -254,11 +243,6 @@ struct Transaction {
     affected_objects: AffectedObjs,
     state: TxnState,
     last_activity: i64, // Unix timestamp in milliseconds for detecting stale transactions
-    /// Server ids on which this transaction pinned a read revision_ts (via a partial
-    /// `head(pin=true)` / `read_selected`). Tracked separately from `data` so it
-    /// survives `generate_affected_objs` draining `data`, letting commit/abort
-    /// release those pins even on servers the transaction never wrote to.
-    pinned_servers: HashSet<u64>,
 }
 
 service! {
@@ -287,18 +271,7 @@ pub struct TransactionManager {
     data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
     wait_config: WaitConfig,
     shutdown: Arc<AtomicBool>, // Signal to stop background cleanup task
-    // Completed transactions whose read pins await release, queued here so the
-    // commit/abort paths pay only a lock+push; a periodic background flusher
-    // sends the batched release RPCs. A per-commit `tokio::spawn` was measured
-    // at 15-40us of worker-unpark overhead at low concurrency in this codebase,
-    // which a queue push avoids entirely.
-    pending_pin_releases: parking_lot::Mutex<Vec<(TxnId, HashSet<u64>)>>,
 }
-
-/// How often the background flusher sends queued read-pin releases. Pins are
-/// memory retention, not locks, so a small bounded delay is harmless; the
-/// participant's stale cleanup remains the backstop for lost releases.
-const PIN_RELEASE_FLUSH_INTERVAL_MS: u64 = 50;
 
 impl TransactionManager {
     pub fn new(deps: Arc<TransactionManagerDeps>) -> Arc<TransactionManager> {
@@ -325,22 +298,6 @@ impl TransactionManager {
             data_sites: LFMap::with_capacity(8),
             wait_config,
             shutdown: shutdown.clone(),
-            pending_pin_releases: parking_lot::Mutex::new(Vec::new()),
-        });
-
-        // Periodically flush queued read-pin releases in batches, so completing
-        // transactions never spawn tasks or await release RPCs themselves.
-        let flusher = manager.clone();
-        let flusher_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            loop {
-                if flusher_shutdown.load(Ordering::Relaxed) {
-                    debug!("TransactionManager pin-release flusher shutting down");
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(PIN_RELEASE_FLUSH_INTERVAL_MS)).await;
-                flusher.flush_pin_releases().await;
-            }
         });
 
         // Spawn background cleanup task
@@ -370,6 +327,22 @@ impl TransactionManager {
     /// Returns the current number of living transactions tracked by this TransactionManager
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn coordinator_expectation_for_test(
+        &self,
+        tid: &TxnId,
+        id: &Id,
+    ) -> Option<CellExpectation> {
+        let txn = self.get_transaction(tid).ok()?;
+        let expectation = txn
+            .lock()
+            .await
+            .data
+            .get(id)
+            .map(|data_obj| data_obj.expectation.clone());
+        expectation
     }
 
     /// Helper function for exponential backoff wait with timeout
@@ -529,16 +502,6 @@ impl Service for TransactionManager {
                 }
                 Err(error) => Err(error),
             };
-            // Fire-and-forget release of read pins on servers this transaction
-            // only read (pinned but not written). Write servers already dropped
-            // their pins in `end`, so they are excluded. Queued so it never adds
-            // latency to the commit path; the periodic flusher batches the RPCs.
-            // Write-only transactions (no pins) skip this entirely.
-            if !txn.pinned_servers.is_empty() {
-                let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
-                pinned_servers.retain(|server_id| !txn.affected_objects.contains_key(server_id));
-                self.queue_pin_release(tid.clone(), pinned_servers);
-            }
             self.cleanup_transaction_guarded(&tid, &mut txn);
             result
         }
@@ -586,17 +549,6 @@ impl Service for TransactionManager {
                 Err(error) => Err(error),
             };
             if Self::abort_cleanup_complete(&result) {
-                // Fire-and-forget release of read pins on servers this transaction
-                // only read (pinned but not written; write servers already dropped
-                // their pins in the abort/end above). Queued so it never adds
-                // latency to the abort path; the periodic flusher batches the RPCs.
-                // Write-only transactions (no pins) skip this entirely.
-                if !txn.pinned_servers.is_empty() {
-                    let mut pinned_servers = std::mem::take(&mut txn.pinned_servers);
-                    pinned_servers
-                        .retain(|server_id| !txn.affected_objects.contains_key(server_id));
-                    self.queue_pin_release(tid.clone(), pinned_servers);
-                }
                 self.cleanup_transaction_guarded(&tid, &mut txn);
             }
             result
@@ -615,7 +567,6 @@ impl Service for TransactionManager {
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
                     last_activity: now,
-                    pinned_servers: HashSet::new(),
                 })),
             )
             .is_some()
@@ -648,10 +599,10 @@ impl Service for TransactionManager {
                             DataObject {
                                 server: server_id,
                                 cell: Some(cell),
-                                expectation: CellExpectation::Absent,
+                                expectation: CellExpectation::Absent(None),
                                 new: true,
                                 changed: true,
-                                pinned: None,
+                                point_cache: PointReadCache::default(),
                             },
                         );
                         Ok(TxnExecResult::Accepted(()))
@@ -661,7 +612,7 @@ impl Service for TransactionManager {
                             return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
                         }
                         data_obj.cell = Some(cell);
-                        data_obj.new = matches!(data_obj.expectation, CellExpectation::Absent)
+                        data_obj.new = matches!(data_obj.expectation, CellExpectation::Absent(_))
                             && !data_obj.changed;
                         data_obj.changed = true;
                         Ok(TxnExecResult::Accepted(()))
@@ -689,7 +640,7 @@ impl Service for TransactionManager {
                     if txn.data.contains_key(&id) {
                         let data_obj = txn.data.get_mut(&id).unwrap();
                         if data_obj.cell.is_none()
-                            && matches!(data_obj.expectation, CellExpectation::Absent)
+                            && matches!(data_obj.expectation, CellExpectation::Absent(_))
                         {
                             return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
                         }
@@ -729,7 +680,7 @@ impl Service for TransactionManager {
                                 expectation,
                                 new: false,
                                 changed: true,
-                                pinned: None,
+                                point_cache: PointReadCache::default(),
                             },
                         );
                     }
@@ -802,7 +753,7 @@ impl Service for TransactionManager {
                                 expectation,
                                 new: false,
                                 changed: true,
-                                pinned: None,
+                                point_cache: PointReadCache::default(),
                             },
                         );
                     }
@@ -868,8 +819,8 @@ impl TransactionManager {
     /// cell shadow everything; a buffered remove and repeatable absence both
     /// read as missing. Otherwise the whole cell is fetched once via the
     /// participant `read` RPC — this is the single path that materializes the
-    /// whole cell — and, if a prior partial read pinned the cell, the
-    /// participant serves that pinned revision_ts so the full read is repeatable.
+    /// whole cell. A prior partial observation keeps only its logical
+    /// expectation, so a later full shape resolves the same fixed snapshot.
     async fn full_read<'a>(
         &self,
         tid: &TxnId,
@@ -882,11 +833,9 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Accepted(cell.clone()));
             }
             // A buffered remove within this transaction, or repeatable absence.
-            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent(_)) {
                 return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
             }
-            // A prior partial read pinned the cell but never materialized the
-            // whole cell: fall through to fetch it once from the pinned revision_ts.
         }
 
         match self.get_data_site_by_id(id).await {
@@ -900,10 +849,8 @@ impl TransactionManager {
 
     /// Coordinator header read. Read-your-writes and an already-materialized full
     /// cell shadow everything; a buffered remove and repeatable absence read as
-    /// missing; an already-pinned header is served from cache. Otherwise a
-    /// `head(pin=true)` participant RPC pins the revision_ts and returns only the
-    /// header — the whole cell is never transferred. The observed revision_ts is
-    /// recorded as `Present(revision_ts)` so the read is certified at prepare.
+    /// missing; an already-owned header is served from cache. Otherwise the
+    /// participant resolves the fixed snapshot and returns only the header.
     async fn head_read<'a>(
         &self,
         tid: &TxnId,
@@ -915,14 +862,12 @@ impl TransactionManager {
             if let Some(cell) = &data_obj.cell {
                 return Ok(TxnExecResult::Accepted(cell.header.clone()));
             }
-            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent(_)) {
                 return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
             }
-            if let Some(header) = data_obj.pinned.as_ref().and_then(|p| p.header.as_ref()) {
+            if let Some(header) = data_obj.point_cache.header.as_ref() {
                 return Ok(TxnExecResult::Accepted(header.clone()));
             }
-            // Pinned (e.g. only a projection was fetched so far) but the header
-            // is not cached yet: fall through to fetch the header from the pin.
         }
 
         match self.get_data_site_by_id(id).await {
@@ -938,9 +883,7 @@ impl TransactionManager {
     /// full cell shadow everything (the projection is computed locally); a
     /// buffered remove and repeatable absence read as missing; an already-cached
     /// projection for these exact fields is served from cache. Otherwise a
-    /// `read_selected` participant RPC pins the revision_ts and returns only the
-    /// projection — the whole cell is never transferred. The projection's
-    /// revision_ts is recorded as `Present(revision_ts)` so the read is certified.
+    /// participant resolves the fixed snapshot and returns only the projection.
     async fn selected_read<'a>(
         &self,
         tid: &TxnId,
@@ -956,18 +899,12 @@ impl TransactionManager {
                     Err(error) => TxnExecResult::Error(error),
                 });
             }
-            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent) {
+            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent(_)) {
                 return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
             }
-            if let Some(projection) = data_obj
-                .pinned
-                .as_ref()
-                .and_then(|p| p.projections.get(fields))
-            {
+            if let Some(projection) = data_obj.point_cache.projections.get(fields) {
                 return Ok(TxnExecResult::Accepted(projection.clone()));
             }
-            // Pinned but this exact projection is not cached yet: fall through
-            // to fetch it from the pinned revision_ts.
         }
 
         match self.get_data_site_by_id(id).await {
@@ -1016,6 +953,27 @@ impl TransactionManager {
         })
     }
 
+    fn visible_point<T>(value: Option<T>) -> TxnExecResult<T, ReadError>
+    where
+        T: Send + Clone,
+    {
+        match value {
+            Some(value) => TxnExecResult::Accepted(value),
+            None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
+        }
+    }
+
+    fn observation_agrees(
+        recorded: &CellExpectation,
+        observed: &CellExpectation,
+    ) -> Result<(), ReadError> {
+        if recorded == observed {
+            Ok(())
+        } else {
+            Err(ReadError::NotMatch)
+        }
+    }
+
     async fn read_from_site<'a>(
         &self,
         server_id: u64,
@@ -1043,72 +1001,53 @@ impl TransactionManager {
             match read_response {
                 Ok(dsr) => {
                     self.merge_clock(dsr.clock);
-                    let payload = dsr.payload;
-                    match payload {
-                        TxnExecResult::Accepted(cell) => {
-                            // Check if there's a pending update in the transaction cache
-                            // If the cell was updated locally, we must return the cached updated revision_ts
-                            // instead of overwriting it with the remote (stale) value
+                    match dsr.payload {
+                        TxnExecResult::Accepted(observed) => {
                             if let Some(data_obj) = txn.data.get_mut(id) {
-                                // Entry exists in transaction cache
                                 if data_obj.changed {
-                                    // There's a pending update - return the cached updated cell instead
-                                    // This ensures update-then-read visibility within the same transaction
                                     if let Some(ref cached_cell) = data_obj.cell {
                                         return Ok(TxnExecResult::Accepted(cached_cell.clone()));
                                     }
-                                    // Changed but cell is None (removed) - return error
                                     return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
                                 }
-                                // Entry exists but not changed - only update if cell is missing
-                                if data_obj.cell.is_none() {
-                                    let revision_ts = cell.header.revision_ts;
-                                    data_obj.cell = Some(cell);
-                                    data_obj.expectation = CellExpectation::Present(revision_ts);
+                                if let Err(error) = Self::observation_agrees(
+                                    &data_obj.expectation,
+                                    &observed.expectation,
+                                ) {
+                                    return Ok(TxnExecResult::Error(error));
                                 }
-                                return Ok(TxnExecResult::Accepted(
-                                    data_obj.cell.as_ref().unwrap().clone(),
-                                ));
+                                if data_obj.cell.is_none() {
+                                    data_obj.cell = observed.value;
+                                }
+                                return Ok(Self::visible_point(data_obj.cell.clone()));
                             } else {
-                                // No entry exists - cache the remote value and return it
-                                let revision_ts = cell.header.revision_ts;
-                                let result = TxnExecResult::Accepted(cell.clone());
+                                let result = Self::visible_point(observed.value.clone());
                                 txn.data.insert(
-                                    id.clone(),
+                                    *id,
                                     DataObject {
                                         server: server_id,
-                                        expectation: CellExpectation::Present(revision_ts),
-                                        cell: Some(cell),
+                                        expectation: observed.expectation,
+                                        cell: observed.value,
                                         new: false,
                                         changed: false,
-                                        pinned: None,
+                                        point_cache: PointReadCache::default(),
                                     },
                                 );
                                 return Ok(result);
                             }
                         }
-                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
-                            let result = TxnExecResult::Error(ReadError::CellDoesNotExisted);
-                            txn.data.insert(
-                                id.clone(),
-                                DataObject {
-                                    server: server_id,
-                                    cell: None,
-                                    expectation: CellExpectation::Absent,
-                                    changed: false,
-                                    new: false,
-                                    pinned: None,
-                                },
-                            );
-                            return Ok(result);
-                        }
                         TxnExecResult::Wait => {
-                            // Backoff and retry
                             Self::backoff_wait(attempt, &self.wait_config).await?;
                             attempt += 1;
                             continue;
                         }
-                        other => return Ok(other),
+                        TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
+                        TxnExecResult::Error(error) => {
+                            return Ok(TxnExecResult::Error(error));
+                        }
+                        TxnExecResult::StateError(state) => {
+                            return Ok(TxnExecResult::StateError(state));
+                        }
                     }
                 }
                 Err(e) => {
@@ -1119,10 +1058,7 @@ impl TransactionManager {
         }
     }
 
-    /// Issues a `head(pin=true)` participant RPC, pinning the served revision_ts so a
-    /// later read in the same transaction repeats it, and caches only the header
-    /// (never the whole cell). Records `Present(revision_ts)` for certification, or
-    /// `Absent` on a missing cell (repeatable absence).
+    /// Resolves the participant snapshot header and caches the owned result.
     async fn head_from_site<'a>(
         &self,
         server_id: u64,
@@ -1143,78 +1079,61 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Rejected);
             }
 
-            // Partial read: pin=true snapshots the served revision_ts for repeatability.
             let head_response = server
-                .head(self_server_id, self.get_clock(), tid.to_owned(), *id, true)
+                .head(self_server_id, self.get_clock(), tid.to_owned(), *id)
                 .await;
             match head_response {
                 Ok(dsr) => {
                     self.merge_clock(dsr.clock);
                     match dsr.payload {
-                        TxnExecResult::Accepted(header) => {
-                            let revision_ts = header.revision_ts;
-                            // The participant pinned the served revision_ts and holds
-                            // a segment guard for it. Remember this server so the
-                            // pin is released promptly on commit/abort, even if a
-                            // buffered write later shadows the read locally.
-                            txn.pinned_servers.insert(server_id);
+                        TxnExecResult::Accepted(observed) => {
                             if let Some(data_obj) = txn.data.get_mut(id) {
-                                // Read-your-writes: a buffered write/remove shadows the pin.
                                 if data_obj.changed {
                                     return Ok(match &data_obj.cell {
                                         Some(cell) => TxnExecResult::Accepted(cell.header.clone()),
                                         None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
                                     });
                                 }
-                                // Cache the header on the existing pinned entry;
-                                // its recorded revision_ts is already Present(revision_ts).
-                                let pinned =
-                                    data_obj.pinned.get_or_insert_with(PinnedReadCache::default);
-                                if pinned.header.is_none() {
-                                    pinned.header = Some(header.clone());
+                                if let Err(error) = Self::observation_agrees(
+                                    &data_obj.expectation,
+                                    &observed.expectation,
+                                ) {
+                                    return Ok(TxnExecResult::Error(error));
                                 }
-                                return Ok(TxnExecResult::Accepted(header));
+                                if data_obj.point_cache.header.is_none() {
+                                    data_obj.point_cache.header = observed.value.clone();
+                                }
+                                return Ok(Self::visible_point(observed.value));
                             }
-                            // Record the header-only read so it is in the certified
-                            // read set as Present(revision_ts) — no whole-cell transfer.
+                            let result = Self::visible_point(observed.value.clone());
                             txn.data.insert(
-                                id.clone(),
+                                *id,
                                 DataObject {
                                     server: server_id,
                                     cell: None,
-                                    expectation: CellExpectation::Present(revision_ts),
+                                    expectation: observed.expectation,
                                     changed: false,
                                     new: false,
-                                    pinned: Some(PinnedReadCache {
-                                        header: Some(header.clone()),
+                                    point_cache: PointReadCache {
+                                        header: observed.value,
                                         projections: HashMap::new(),
-                                    }),
+                                    },
                                 },
                             );
-                            return Ok(TxnExecResult::Accepted(header));
-                        }
-                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
-                            if !txn.data.contains_key(id) {
-                                txn.data.insert(
-                                    id.clone(),
-                                    DataObject {
-                                        server: server_id,
-                                        cell: None,
-                                        expectation: CellExpectation::Absent,
-                                        changed: false,
-                                        new: false,
-                                        pinned: None,
-                                    },
-                                );
-                            }
-                            return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+                            return Ok(result);
                         }
                         TxnExecResult::Wait => {
                             Self::backoff_wait(attempt, &self.wait_config).await?;
                             attempt += 1;
                             continue;
                         }
-                        other => return Ok(other),
+                        TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
+                        TxnExecResult::Error(error) => {
+                            return Ok(TxnExecResult::Error(error));
+                        }
+                        TxnExecResult::StateError(state) => {
+                            return Ok(TxnExecResult::StateError(state));
+                        }
                     }
                 }
                 Err(e) => {
@@ -1225,11 +1144,8 @@ impl TransactionManager {
         }
     }
 
-    /// Issues a `read_selected` participant RPC, pinning the served revision_ts so a
-    /// later read in the same transaction repeats it, and caches only the
-    /// returned projection (never the whole cell) keyed by the exact requested
-    /// field order. Records `Present(revision_ts)` for certification, or `Absent` on
-    /// a missing cell (repeatable absence).
+    /// Resolves a projected participant snapshot and caches the owned result by
+    /// exact requested field order.
     async fn selected_from_site<'a>(
         &self,
         server_id: u64,
@@ -1267,15 +1183,8 @@ impl TransactionManager {
                 Ok(dsr) => {
                     self.merge_clock(dsr.clock);
                     match dsr.payload {
-                        TxnExecResult::Accepted(projection) => {
-                            let revision_ts = projection.header.revision_ts;
-                            // The participant pinned the served revision_ts and holds
-                            // a segment guard for it. Remember this server so the
-                            // pin is released promptly on commit/abort, even if a
-                            // buffered write later shadows the read locally.
-                            txn.pinned_servers.insert(server_id);
+                        TxnExecResult::Accepted(observed) => {
                             if let Some(data_obj) = txn.data.get_mut(id) {
-                                // Read-your-writes: a buffered write/remove shadows the pin.
                                 if data_obj.changed {
                                     return Ok(match &data_obj.cell {
                                         Some(cell) => match self.select_from_cell(cell, fields) {
@@ -1285,58 +1194,54 @@ impl TransactionManager {
                                         None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
                                     });
                                 }
-                                // Cache the projection on the existing pinned entry;
-                                // its recorded revision_ts is already Present(revision_ts).
-                                let pinned =
-                                    data_obj.pinned.get_or_insert_with(PinnedReadCache::default);
-                                pinned
-                                    .projections
-                                    .entry(fields.to_vec())
-                                    .or_insert_with(|| projection.clone());
-                                return Ok(TxnExecResult::Accepted(projection));
+                                if let Err(error) = Self::observation_agrees(
+                                    &data_obj.expectation,
+                                    &observed.expectation,
+                                ) {
+                                    return Ok(TxnExecResult::Error(error));
+                                }
+                                if let Some(projection) = observed.value.as_ref() {
+                                    data_obj
+                                        .point_cache
+                                        .projections
+                                        .entry(fields.to_vec())
+                                        .or_insert_with(|| projection.clone());
+                                }
+                                return Ok(Self::visible_point(observed.value));
                             }
-                            // Record the projection-only read so it is in the
-                            // certified read set as Present(revision_ts).
                             let mut projections = HashMap::new();
-                            projections.insert(fields.to_vec(), projection.clone());
+                            if let Some(projection) = observed.value.as_ref() {
+                                projections.insert(fields.to_vec(), projection.clone());
+                            }
+                            let result = Self::visible_point(observed.value);
                             txn.data.insert(
-                                id.clone(),
+                                *id,
                                 DataObject {
                                     server: server_id,
                                     cell: None,
-                                    expectation: CellExpectation::Present(revision_ts),
+                                    expectation: observed.expectation,
                                     changed: false,
                                     new: false,
-                                    pinned: Some(PinnedReadCache {
+                                    point_cache: PointReadCache {
                                         header: None,
                                         projections,
-                                    }),
+                                    },
                                 },
                             );
-                            return Ok(TxnExecResult::Accepted(projection));
-                        }
-                        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
-                            if !txn.data.contains_key(id) {
-                                txn.data.insert(
-                                    id.clone(),
-                                    DataObject {
-                                        server: server_id,
-                                        cell: None,
-                                        expectation: CellExpectation::Absent,
-                                        changed: false,
-                                        new: false,
-                                        pinned: None,
-                                    },
-                                );
-                            }
-                            return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+                            return Ok(result);
                         }
                         TxnExecResult::Wait => {
                             Self::backoff_wait(attempt, &self.wait_config).await?;
                             attempt += 1;
                             continue;
                         }
-                        other => return Ok(other),
+                        TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
+                        TxnExecResult::Error(error) => {
+                            return Ok(TxnExecResult::Error(error));
+                        }
+                        TxnExecResult::StateError(state) => {
+                            return Ok(TxnExecResult::StateError(state));
+                        }
                     }
                 }
                 Err(e) => {
@@ -1352,7 +1257,7 @@ impl TransactionManager {
         server: &Arc<data_site::AsyncServiceClient>,
         tid: &TxnId,
         id: &Id,
-    ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+    ) -> Result<TxnExecResult<ObservedPoint<CellHeader>, ReadError>, TMError> {
         #[cfg(feature = "occ_phase_profile")]
         let _phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ReadSiteRpc);
         let start_time = std::time::Instant::now();
@@ -1366,21 +1271,14 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Rejected);
             }
 
-            // Use the transaction's own timestamp for internal blind observations so the
-            // read timestamp recorded at the data site cannot advance beyond this tid.
-            // Blind revision_ts observation: never pin. Blind update/remove targets
-            // are written, not re-read, so pinning here would waste a segment
-            // guard and needlessly materialize a participant transaction.
             let head_response = server
-                .head(self_server_id, tid.clone(), tid.to_owned(), *id, false)
+                .head(self_server_id, self.get_clock(), *tid, *id)
                 .await;
             match head_response {
                 Ok(dsr) => {
                     self.merge_clock(dsr.clock);
-                    let payload = &dsr.payload;
-                    match &payload {
-                        &TxnExecResult::Wait => {
-                            // Backoff and retry
+                    match &dsr.payload {
+                        TxnExecResult::Wait => {
                             Self::backoff_wait(attempt, &self.wait_config).await?;
                             attempt += 1;
                             continue;
@@ -1403,7 +1301,16 @@ impl TransactionManager {
         id: Id,
     ) -> Result<TxnExecResult<u64, ReadError>, TMError> {
         Ok(match self.observe_head_from_site(server, tid, &id).await? {
-            TxnExecResult::Accepted(header) => TxnExecResult::Accepted(header.revision_ts),
+            TxnExecResult::Accepted(observed) => match observed.value {
+                Some(header) => {
+                    debug_assert_eq!(
+                        observed.expectation,
+                        CellExpectation::Present(header.revision_ts)
+                    );
+                    TxnExecResult::Accepted(header.revision_ts)
+                }
+                None => TxnExecResult::Error(ReadError::CellDoesNotExisted),
+            },
             TxnExecResult::Rejected => TxnExecResult::Rejected,
             TxnExecResult::Error(error) => TxnExecResult::Error(error),
             TxnExecResult::StateError(state) => TxnExecResult::StateError(state),
@@ -1721,58 +1628,6 @@ impl TransactionManager {
         }
         Ok(EndResult::Success)
     }
-    /// Best-effort, idempotent release of read pins on every server this
-    /// transaction pinned a read on. Runs on commit/abort for both read-only and
-    /// read-write transactions: a server the transaction only *read* (pinned) is
-    /// never `sites_end`ed, so its pin (and the pin-only participant transaction)
-    /// would otherwise linger until slow stale cleanup. Individual failures are
-    /// logged at debug and ignored — the participant's stale cleanup remains the
-    /// backstop, and a release must never fail commit/abort.
-    /// Queue a completed transaction's read pins for release by the periodic
-    /// flusher. Costs one lock+push on the commit/abort path; a lost release is
-    /// reclaimed by the participant's stale cleanup.
-    fn queue_pin_release(&self, tid: TxnId, pinned_servers: HashSet<u64>) {
-        if pinned_servers.is_empty() {
-            return;
-        }
-        self.pending_pin_releases.lock().push((tid, pinned_servers));
-    }
-    /// Drain the queued releases and send one batched RPC per participant.
-    /// Best-effort: individual failures are logged and dropped; the
-    /// participant's stale cleanup remains the backstop.
-    async fn flush_pin_releases(&self) {
-        let pending: Vec<(TxnId, HashSet<u64>)> = {
-            let mut queue = self.pending_pin_releases.lock();
-            if queue.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *queue)
-        };
-        let mut tids_by_server: HashMap<u64, Vec<TxnId>> = HashMap::new();
-        for (tid, servers) in pending {
-            for server_id in servers {
-                tids_by_server
-                    .entry(server_id)
-                    .or_default()
-                    .push(tid.clone());
-            }
-        }
-        for (server_id, tids) in tids_by_server {
-            match self.get_data_site(server_id).await {
-                Ok(data_site) => match data_site.release_read_pins(tids).await {
-                    Ok(response) => self.merge_clock(response.clock),
-                    Err(error) => debug!(
-                        "batched release_read_pins RPC to server {} failed: {:?}",
-                        server_id, error
-                    ),
-                },
-                Err(error) => debug!(
-                    "cannot locate server {} to release read pins: {:?}",
-                    server_id, error
-                ),
-            }
-        }
-    }
     fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
         if txn.state == state {
             return Ok(());
@@ -1811,7 +1666,6 @@ impl TransactionManager {
     fn cleanup_transaction_guarded(&self, tid: &TxnId, txn: &mut Transaction) {
         txn.data.clear();
         txn.affected_objects.clear();
-        txn.pinned_servers.clear();
         txn.state = TxnState::Cleanup;
         txn.last_activity = get_time();
         let _ = self.transactions.remove(tid);
@@ -1970,22 +1824,18 @@ mod tests {
     }
 
     #[test]
-    fn data_object_pinned_representation_defers_full_cell() {
+    fn data_object_point_cache_owns_only_logical_observations() {
         let obj = DataObject {
             server: 1,
             cell: None,
-            expectation: CellExpectation::Absent,
+            expectation: CellExpectation::Absent(None),
             changed: false,
             new: false,
-            pinned: Some(PinnedReadCache {
-                header: None,
-                projections: HashMap::new(),
-            }),
+            point_cache: PointReadCache::default(),
         };
-        assert!(obj.pinned.is_some());
         assert!(obj.cell.is_none());
-        assert!(obj.pinned.as_ref().unwrap().header.is_none());
-        assert!(obj.pinned.as_ref().unwrap().projections.is_empty());
+        assert!(obj.point_cache.header.is_none());
+        assert!(obj.point_cache.projections.is_empty());
     }
 
     #[cfg(feature = "occ_phase_profile")]
@@ -2103,7 +1953,7 @@ mod tests {
                 expectation: CellExpectation::Present(3),
                 changed: true,
                 new: false,
-                pinned: None,
+                point_cache: PointReadCache::default(),
             },
         );
 
@@ -2195,7 +2045,7 @@ mod tests {
                         expectation: CellExpectation::Present(3),
                         changed: false,
                         new: false,
-                        pinned: None,
+                        point_cache: PointReadCache::default(),
                     },
                 ),
                 (
@@ -2206,14 +2056,13 @@ mod tests {
                         expectation: CellExpectation::Present(4),
                         changed: true,
                         new: false,
-                        pinned: None,
+                        point_cache: PointReadCache::default(),
                     },
                 ),
             ]),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
             last_activity: get_time(),
-            pinned_servers: HashSet::new(),
         });
 
         let mut txn = txn_mutex.lock().await;
@@ -2252,13 +2101,12 @@ mod tests {
                     expectation: CellExpectation::Present(8),
                     changed: false,
                     new: false,
-                    pinned: None,
+                    point_cache: PointReadCache::default(),
                 },
             )]),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
             last_activity: get_time(),
-            pinned_servers: HashSet::new(),
         });
 
         let mut txn = txn_mutex.lock().await;

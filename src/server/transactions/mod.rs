@@ -23,7 +23,13 @@ pub type TxnId = bifrost::hlc::Hlc;
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum CellExpectation {
     Present(u64),
-    Absent,
+    Absent(Option<u64>),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ObservedPoint<T> {
+    pub value: Option<T>,
+    pub expectation: CellExpectation,
 }
 
 #[derive(Debug, Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
