@@ -151,6 +151,13 @@ pub struct RevisionChain {
     truncated_before_ts: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpirationReadiness {
+    Ready,
+    Blocked,
+    AlreadyRemoved,
+}
+
 impl RevisionChain {
     pub fn new() -> Self {
         Self {
@@ -240,8 +247,9 @@ impl RevisionChain {
         }
     }
 
-    fn publish_truncation_before_expiring(&self, expiring: &Arc<RevisionNode>) -> bool {
+    fn prepare_expiration(&self, expiring: &Arc<RevisionNode>) -> ExpirationReadiness {
         let mut found_expiring = false;
+        let mut blocked_by_older = false;
         for revision_ref in self.revisions.iter_back() {
             let Some(node) = revision_ref.deref().flatten() else {
                 continue;
@@ -255,13 +263,21 @@ impl RevisionChain {
                 continue;
             }
             if !found_expiring {
-                return false;
+                blocked_by_older = true;
+                continue;
+            }
+            if blocked_by_older {
+                return ExpirationReadiness::Blocked;
             }
             self.truncated_before_ts
                 .fetch_max(node.revision_ts, Ordering::AcqRel);
-            return true;
+            return ExpirationReadiness::Ready;
         }
-        false
+        if found_expiring {
+            ExpirationReadiness::Blocked
+        } else {
+            ExpirationReadiness::AlreadyRemoved
+        }
     }
 
     #[cfg(test)]
@@ -387,8 +403,11 @@ impl HistoryIndex {
     }
 
     pub fn get_or_create_chain(&self, id: Id) -> Arc<RevisionChain> {
-        self.chains
-            .get_or_insert(id, || Arc::new(RevisionChain::new()))
+        let candidate = Arc::new(RevisionChain::new());
+        match self.chains.try_insert(id, candidate.clone()) {
+            None => candidate,
+            Some(existing) => existing,
+        }
     }
 
     pub fn resolve(&self, id: &Id, snapshot_ts: u64) -> SnapshotRevision {
@@ -462,22 +481,23 @@ impl HistoryIndex {
         if expiration.chain.is_current(&expiration.node) {
             return false;
         }
-        // Publish the TooOld boundary before making a suffix node invisible.
-        // `expire` retries every competing tagged-word CAS and only returns
-        // without changing the word when it is already Expired, for which this
-        // monotonic boundary publication is still conservative and correct.
-        if !expiration
-            .chain
-            .publish_truncation_before_expiring(&expiration.node)
-        {
+        // Ready publishes the TooOld boundary before making a suffix node
+        // invisible. AlreadyRemoved means an earlier suffix prune published
+        // that monotonic boundary before removing this scheduled node.
+        let readiness = expiration.chain.prepare_expiration(&expiration.node);
+        if matches!(readiness, ExpirationReadiness::Blocked) {
             return false;
         }
+        // The retrying tagged-word CAS preserves a concurrently updated aligned
+        // location and makes dead accounting single-winner.
         let dead = expiration.node.expire();
         after_expire();
         if let Some(dead) = dead {
             self.dead.push_front(Some(dead));
         }
-        expiration.chain.prune_retired_suffix();
+        if matches!(readiness, ExpirationReadiness::Ready) {
+            expiration.chain.prune_retired_suffix();
+        }
         true
     }
 
@@ -544,7 +564,7 @@ mod tests {
     use crate::ram::segs::SEGMENT_SIZE;
     use crate::ram::types::Id;
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -668,6 +688,37 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_first_creation_returns_the_single_published_chain() {
+        const THREADS: usize = 64;
+
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let id = Id::new(3, 4);
+        let start = Arc::new(Barrier::new(THREADS));
+        let callers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let history = history.clone();
+                let id = id.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    history.get_or_create_chain(id)
+                })
+            })
+            .collect();
+        let returned: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("chain creator panicked"))
+            .collect();
+        let published = history.chain(&id).expect("published chain");
+
+        assert!(
+            returned.iter().all(|chain| Arc::ptr_eq(chain, &published)),
+            "every first creator must receive the map's single published chain"
+        );
+    }
+
+    #[test]
     fn current_node_is_never_scheduled_for_retirement() {
         let history = HistoryIndex::new(0);
         let chain = Arc::new(RevisionChain::new());
@@ -767,6 +818,41 @@ mod tests {
         assert_eq!(history.pop_dead().expect("oldest dead").location, 0x1000);
         assert_eq!(history.pop_dead().expect("middle dead").location, 0x2000);
         assert!(history.pop_dead().is_none());
+    }
+
+    #[test]
+    fn pruned_aborted_record_completes_without_requeueing() {
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        let oldest = node(200, RevisionState::CommittedPresent, 0x2000);
+        let aborted = node(300, RevisionState::Aborted, 0x3000);
+        chain.push_front(oldest.clone());
+        chain.push_front(aborted.clone());
+        chain.push_front(node(400, RevisionState::CommittedPresent, 0x4000));
+
+        // FIFO expiration processes 200 first, whose suffix prune also removes 300.
+        assert!(history.retire(&chain, &oldest));
+        assert!(history.retire(&chain, &aborted));
+        let first_park_ms = history.expire_due(u64::MAX);
+
+        assert_eq!(oldest.load(), (RevisionState::Expired, 0x2000));
+        assert_eq!(aborted.load(), (RevisionState::Expired, 0x3000));
+        assert_eq!(first_park_ms, WORKER_MAX_PARK_MS);
+        assert!(matches!(chain.resolve(350), SnapshotRevision::TooOld));
+        assert_eq!(chain.resolve(401).revision_ts(), Some(400));
+
+        let mut dead_locations = vec![
+            history.pop_dead().expect("oldest dead").location,
+            history.pop_dead().expect("aborted dead").location,
+        ];
+        dead_locations.sort_unstable();
+        assert_eq!(dead_locations, vec![0x2000, 0x3000]);
+        assert!(history.pop_dead().is_none());
+
+        assert_eq!(history.expire_due(u64::MAX), WORKER_MAX_PARK_MS);
+        assert!(history.pop_dead().is_none());
+        assert!(history.expirations.pop_back().is_none());
     }
 
     #[test]
