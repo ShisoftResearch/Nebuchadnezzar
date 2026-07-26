@@ -3,7 +3,7 @@ use crate::ram::chunk::Chunks;
 use crate::ram::entry::Entry;
 use crate::ram::io::reader;
 use crate::ram::types::Id;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, remove_file, File, OpenOptions};
@@ -471,6 +471,7 @@ impl UndoLogger {
         info!("Rolling back {} incomplete transactions", txn_index.len());
 
         let mut rollback_stats = (0usize, 0usize, 0usize); // (writes, updates, removes)
+        let mut rollback_failures = Vec::new();
 
         for (txn_id, entries) in txn_index.iter() {
             debug!(
@@ -488,6 +489,10 @@ impl UndoLogger {
                                 "Failed to rollback write for cell {:?}: {:?}",
                                 entry.cell_id, e
                             );
+                            rollback_failures.push(format!(
+                                "transaction {txn_id:?} {:?} compensation for cell {:?} failed: {e}",
+                                entry.op_type, entry.cell_id
+                            ));
                         } else {
                             rollback_stats.0 += 1;
                         }
@@ -499,6 +504,10 @@ impl UndoLogger {
                                 "Failed to rollback restore for cell {:?}: {:?}",
                                 entry.cell_id, e
                             );
+                            rollback_failures.push(format!(
+                                "transaction {txn_id:?} {:?} compensation for cell {:?} failed: {e}",
+                                entry.op_type, entry.cell_id
+                            ));
                         } else {
                             if entry.op_type == UndoOpType::Update {
                                 rollback_stats.1 += 1;
@@ -516,7 +525,18 @@ impl UndoLogger {
             rollback_stats.0, rollback_stats.1, rollback_stats.2
         );
 
-        Ok(())
+        if rollback_failures.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "{} rollback compensation(s) failed: {}",
+                    rollback_failures.len(),
+                    rollback_failures.join("; ")
+                ),
+            ))
+        }
     }
 
     /// Rollback a Write operation by deleting the new cell if revision_ts matches
@@ -561,9 +581,15 @@ impl UndoLogger {
                 );
 
                 // Use remove_cell which handles tombstone creation
-                if let Err(e) = chunks.remove_cell(&entry.cell_id) {
-                    warn!("Failed to remove cell during rollback: {:?}", e);
-                }
+                chunks.remove_cell(&entry.cell_id).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "remove compensation for cell {:?} at revision {} failed: {:?}",
+                            entry.cell_id, entry.revision_ts, error
+                        ),
+                    )
+                })?;
             } else {
                 debug!(
                     "Cell {:?} revision_ts mismatch (current={}, logged={}), skipping delete",
@@ -657,9 +683,19 @@ impl UndoLogger {
                     "Restoring removed cell {:?} (old data with new revision_ts)",
                     entry.cell_id
                 );
-                if let Err(e) = chunks.upsert_cell(&mut old_cell.clone()) {
-                    error!("Failed to restore removed cell: {:?}", e);
-                }
+                chunks.upsert_cell(&mut old_cell.clone()).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "restore removed cell {:?} from chunk {} segment {} offset {} failed: {:?}",
+                            entry.cell_id,
+                            entry.chunk_id,
+                            entry.seq_id,
+                            entry.cell_offset,
+                            error
+                        ),
+                    )
+                })?;
             }
             UndoOpType::Update => {
                 // Cell was updated by the transaction - restore old data with new revision_ts
@@ -668,9 +704,19 @@ impl UndoLogger {
                     "Restoring old data for cell {:?} (old data with new revision_ts)",
                     entry.cell_id
                 );
-                if let Err(e) = chunks.upsert_cell(&mut old_cell.clone()) {
-                    error!("Failed to restore updated cell: {:?}", e);
-                }
+                chunks.upsert_cell(&mut old_cell.clone()).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "restore updated cell {:?} from chunk {} segment {} offset {} failed: {:?}",
+                            entry.cell_id,
+                            entry.chunk_id,
+                            entry.seq_id,
+                            entry.cell_offset,
+                            error
+                        ),
+                    )
+                })?;
             }
             _ => unreachable!(),
         }
@@ -884,7 +930,14 @@ impl UndoLogger {
             let mut offset = 0;
             while offset < buffer.len() {
                 if buffer.len() < offset + 5 {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "cannot decode undo log {} at byte offset {}: incomplete entry header",
+                            path.display(),
+                            offset
+                        ),
+                    ));
                 }
 
                 let entry_type = buffer[offset];
@@ -896,28 +949,64 @@ impl UndoLogger {
                 ]) as usize;
 
                 if buffer.len() < offset + 5 + txn_id_len {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "cannot decode undo log {} at byte offset {}: incomplete transaction id",
+                            path.display(),
+                            offset
+                        ),
+                    ));
                 }
 
-                let txn_id: TxnId = decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])?;
+                let txn_id: TxnId = decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])
+                    .map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!(
+                                "cannot decode undo log {} at byte offset {}: {}",
+                                path.display(),
+                                offset,
+                                error
+                            ),
+                        )
+                    })?;
 
                 match entry_type {
                     ENTRY_TYPE_UNDO => {
-                        if let Ok((entry, size)) = UndoLogEntry::from_bytes(&buffer[offset..]) {
-                            txn_index
-                                .entry(txn_id.clone())
-                                .or_insert_with(Vec::new)
-                                .push(entry);
-                            offset += size;
-                        } else {
-                            break;
-                        }
+                        let (entry, size) =
+                            UndoLogEntry::from_bytes(&buffer[offset..]).map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!(
+                                        "cannot decode undo log {} at byte offset {}: {}",
+                                        path.display(),
+                                        offset,
+                                        error
+                                    ),
+                                )
+                            })?;
+                        txn_index
+                            .entry(txn_id.clone())
+                            .or_insert_with(Vec::new)
+                            .push(entry);
+                        offset += size;
                     }
                     ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
                         txn_index.remove(&txn_id);
                         offset += 5 + txn_id_len;
                     }
-                    _ => break,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "cannot decode undo log {} at byte offset {}: invalid entry type {}",
+                                path.display(),
+                                offset,
+                                entry_type
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -1894,7 +1983,7 @@ mod tests {
 
         // Phase 2: Recovery with rollback
         {
-            let chunks = Chunks::new_with_recovery(
+            let (chunks, recovery) = Chunks::recover_with_clock(
                 1,
                 32 * 1024 * 1024,
                 meta.clone(),
@@ -1902,8 +1991,24 @@ mod tests {
                 Some(backup_dir.to_str().unwrap().to_string()),
                 Some(wal_dir.to_str().unwrap().to_string()),
                 None,
-                true,
                 Some(raft_path.clone()),
+                Arc::new(bifrost::hlc::HlcSource::new(0)),
+                300_000,
+            )
+            .unwrap();
+            chunks
+                .revision_clock()
+                .try_observe(bifrost::hlc::Hlc {
+                    ts: recovery.max_revision_ts,
+                    node: chunks.revision_clock().node(),
+                })
+                .unwrap();
+            assert!(
+                chunks
+                    .list
+                    .iter()
+                    .all(|chunk| chunk.history.recovery_floor() == 0),
+                "undo must run before the recovery floor is established"
             );
 
             let undo_log = UndoLogger::new(log_dir.to_str().unwrap().to_string()).unwrap();
@@ -1911,6 +2016,11 @@ mod tests {
             undo_log
                 .rollback_incomplete_transactions(txn_index, &chunks)
                 .unwrap();
+            let floor = chunks.establish_recovery_floor().unwrap();
+            assert!(chunks
+                .list
+                .iter()
+                .all(|chunk| chunk.history.recovery_floor() == floor));
 
             // Cell should be deleted after rollback
             assert!(
@@ -1918,6 +2028,155 @@ mod tests {
                 "Cell should be deleted after rollback"
             );
         }
+    }
+
+    #[test]
+    fn rollback_write_failure_is_returned_after_other_records_are_attempted() {
+        use crate::ram::schema::{Field, Schema};
+        use dovahkiin::types::Type;
+
+        let temp_dir = TempDir::new().unwrap();
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed("value", Type::String),
+        ]);
+        let schema = Schema::new("rollback_write_failure", None, fields, false, false);
+        let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            32 * 1024 * 1024,
+            Arc::new(crate::server::ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let failed_id = Id::new(1, 501);
+        let successful_id = Id::new(1, 502);
+        let mut failed_cell = OwnedCell::new_with_id(
+            schema.id,
+            &failed_id,
+            data_map_value!(id: 1i32, value: "failed".to_string()),
+        );
+        let mut successful_cell = OwnedCell::new_with_id(
+            schema.id,
+            &successful_id,
+            data_map_value!(id: 2i32, value: "successful".to_string()),
+        );
+        chunks.write_cell(&mut failed_cell).unwrap();
+        chunks.write_cell(&mut successful_cell).unwrap();
+
+        let txn_id = test_hlc(10, 1);
+        let txn_index = HashMap::from([(
+            txn_id,
+            vec![
+                UndoLogEntry::new_write(txn_id, failed_id, failed_cell.header.revision_ts),
+                UndoLogEntry::new_write(txn_id, successful_id, successful_cell.header.revision_ts),
+            ],
+        )]);
+        chunks.fail_next_allocation_for_test(&failed_id);
+        let undo_log =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+
+        let error = undo_log
+            .rollback_incomplete_transactions(txn_index, &chunks)
+            .expect_err("a failed compensation must reach the recovery caller");
+
+        assert!(
+            error.to_string().contains("Write")
+                && error.to_string().contains(&format!("{failed_id:?}")),
+            "rollback failure should retain operation and cell context: {error}"
+        );
+        assert!(
+            chunks.read_cell(&failed_id).is_ok(),
+            "the failed compensation must leave its cell present"
+        );
+        assert!(
+            chunks.read_cell(&successful_id).is_err(),
+            "independent rollback records must still be attempted"
+        );
+    }
+
+    #[test]
+    fn rollback_restore_failure_is_returned_to_the_caller() {
+        use crate::ram::schema::{Field, Schema};
+        use dovahkiin::types::Type;
+
+        let temp_dir = TempDir::new().unwrap();
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed("value", Type::String),
+        ]);
+        let schema = Schema::new("rollback_restore_failure", None, fields, false, false);
+        let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            2,
+            32 * 1024 * 1024,
+            Arc::new(crate::server::ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let cell_id = Id::new(1, 601);
+        let mut cell = OwnedCell::new_with_id(
+            schema.id,
+            &cell_id,
+            data_map_value!(id: 1i32, value: "restore".to_string()),
+        );
+        chunks.write_cell(&mut cell).unwrap();
+        let chunk = chunks.locate_chunk_by_partition(cell_id.higher);
+        let old_addr = chunks.address_of(&cell_id);
+        let (_, seq_id) = chunk.get_cell_segment_info(old_addr);
+        let segment_base = chunk
+            .segments()
+            .into_iter()
+            .find(|segment| segment.contains_address(old_addr))
+            .unwrap()
+            .addr;
+        let entry = UndoLogEntry::new_restore(
+            test_hlc(11, 1),
+            cell_id,
+            UndoOpType::Remove,
+            cell.header.revision_ts,
+            chunk.id as u64,
+            seq_id,
+            (old_addr - segment_base) as u64,
+        );
+        chunks.remove_cell(&cell_id).unwrap();
+        chunks.fail_next_allocation_for_test(&cell_id);
+        let unrelated_id = Id::new(2, 602);
+        let mut unrelated_cell = OwnedCell::new_with_id(
+            schema.id,
+            &unrelated_id,
+            data_map_value!(id: 2i32, value: "unrelated".to_string()),
+        );
+        chunks
+            .write_cell(&mut unrelated_cell)
+            .expect("a different chunk must not consume the injected failure");
+        let undo_log =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+
+        let error = undo_log
+            .rollback_restore(&entry, &chunks)
+            .expect_err("a failed restore compensation must reach the recovery caller");
+
+        assert!(
+            error.to_string().contains("restore"),
+            "restore failure should retain compensation context: {error}"
+        );
+        assert!(chunks.read_cell(&cell_id).is_err());
+        let follow_up_id = Id::new(1, 603);
+        let mut follow_up_cell = OwnedCell::new_with_id(
+            schema.id,
+            &follow_up_id,
+            data_map_value!(id: 3i32, value: "one-shot".to_string()),
+        );
+        chunks
+            .write_cell(&mut follow_up_cell)
+            .expect("the injected failure must be one-shot");
     }
 
     // NOTE: The following simulated rollback tests for Update and Remove operations have been

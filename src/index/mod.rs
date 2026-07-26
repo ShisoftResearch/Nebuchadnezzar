@@ -83,7 +83,7 @@ impl IndexerClients {
         }
     }
 
-    /// Initialize the inverted indexer with chunks (called once after chunks creation)
+    /// Attach the inverted indexer to chunks without starting background work.
     pub fn initialize_inverted_indexer(&self, chunks: &Arc<Chunks>) {
         let inverted_indexer = Arc::new(InvertedIndexer::new(
             self.server_id,
@@ -91,10 +91,16 @@ impl IndexerClients {
             self.neb_client.clone(),
             Duration::from_secs(30), // Flush every 30 seconds
         ));
-        inverted_indexer.start_background_flush();
 
         // OnceLock ensures this can only be set once
         let _ = self.fulltext_indexer.set(inverted_indexer);
+    }
+
+    /// Start inverted-index background work after storage is ready for traffic.
+    pub fn start_inverted_indexer_background_flush(&self) {
+        if let Some(indexer) = self.fulltext_indexer.get() {
+            indexer.start_background_flush();
+        }
     }
 
     /// Get the inverted indexer if initialized

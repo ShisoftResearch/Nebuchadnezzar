@@ -89,7 +89,7 @@ pub fn chunk_and_segment_from_addr(fault_addr: usize) -> Option<(usize, usize)> 
     Some((chunk_id, segment_id))
 }
 
-/// Set the global Chunks pointer (called by Chunks::new_with_recovery)
+/// Set the global Chunks pointer when a chunk collection is constructed.
 pub fn set_global_chunks(chunks: &Arc<Chunks>) {
     let ptr = Arc::as_ptr(chunks) as usize;
     GLOBAL_CHUNKS_PTR.store(ptr, Ordering::Release);
@@ -402,10 +402,6 @@ impl Chunk {
     }
 
     pub fn try_acquire(&self, size: u32, full_gc: bool) -> Result<PendingEntry, WriteError> {
-        #[cfg(test)]
-        if self.fail_next_allocation.swap(0, Ordering::AcqRel) != 0 {
-            return Err(WriteError::CannotAllocateSpace);
-        }
         self.try_acquire_in_class(size, full_gc, SegmentClass::Regular)
     }
 
@@ -415,6 +411,10 @@ impl Chunk {
         full_gc: bool,
         segment_class: SegmentClass,
     ) -> Result<PendingEntry, WriteError> {
+        #[cfg(test)]
+        if self.fail_next_allocation.swap(0, Ordering::AcqRel) != 0 {
+            return Err(WriteError::CannotAllocateSpace);
+        }
         let mut tried_gc = false;
         let backoff = Backoff::new();
         let head_slot = self.head_slot(segment_class);
@@ -1883,6 +1883,11 @@ pub struct Chunks {
     pub history_retention_ms: u64,
 }
 
+enum ChunkConstruction {
+    Empty,
+    Recover { raft_storage: Option<String> },
+}
+
 impl Chunks {
     pub fn new(
         count: usize,
@@ -1893,7 +1898,7 @@ impl Chunks {
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     ) -> Arc<Chunks> {
-        Self::new_with_recovery_and_clock(
+        Self::new_with_clock(
             count,
             size,
             meta,
@@ -1901,41 +1906,69 @@ impl Chunks {
             backup_storage,
             wal_storage,
             tiered_manager,
-            false,
-            None,
-            Arc::new(HlcSource::new(0)),
-            300_000,
-        )
-    }
-
-    pub fn new_with_recovery(
-        count: usize,
-        size: usize,
-        meta: Arc<ServerMeta>,
-        index_builder: Option<Arc<IndexBuilder>>,
-        backup_storage: Option<String>,
-        wal_storage: Option<String>,
-        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
-        enable_recovery: bool,
-        raft_storage: Option<String>,
-    ) -> Arc<Chunks> {
-        Self::new_with_recovery_and_clock(
-            count,
-            size,
-            meta,
-            index_builder,
-            backup_storage,
-            wal_storage,
-            tiered_manager,
-            enable_recovery,
-            raft_storage,
             Arc::new(HlcSource::new(0)),
             300_000,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_recovery_and_clock(
+    pub(crate) fn new_with_clock(
+        count: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        revision_clock: Arc<HlcSource>,
+        history_retention_ms: u64,
+    ) -> Arc<Chunks> {
+        Self::try_construct_with_clock(
+            count,
+            size,
+            meta,
+            index_builder,
+            backup_storage,
+            wal_storage,
+            tiered_manager,
+            revision_clock,
+            history_retention_ms,
+            ChunkConstruction::Empty,
+        )
+        .expect("chunk construction failed")
+        .0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn recover_with_clock(
+        count: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>,
+        tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        raft_storage: Option<String>,
+        revision_clock: Arc<HlcSource>,
+        history_retention_ms: u64,
+    ) -> io::Result<(Arc<Chunks>, crate::ram::recovery::RecoverySummary)> {
+        Self::try_construct_with_clock(
+            count,
+            size,
+            meta,
+            index_builder,
+            backup_storage,
+            wal_storage,
+            tiered_manager,
+            revision_clock,
+            history_retention_ms,
+            ChunkConstruction::Recover { raft_storage },
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_recovery_for_test(
         count: usize,
         size: usize,
         meta: Arc<ServerMeta>,
@@ -1945,10 +1978,21 @@ impl Chunks {
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         enable_recovery: bool,
         raft_storage: Option<String>,
-        revision_clock: Arc<HlcSource>,
-        history_retention_ms: u64,
     ) -> Arc<Chunks> {
-        let (chunks, recovery) = Self::try_new_with_recovery_and_clock(
+        if !enable_recovery {
+            return Self::new_with_clock(
+                count,
+                size,
+                meta,
+                index_builder,
+                backup_storage,
+                wal_storage,
+                tiered_manager,
+                Arc::new(HlcSource::new(0)),
+                300_000,
+            );
+        }
+        let (chunks, recovery) = Self::recover_with_clock(
             count,
             size,
             meta,
@@ -1956,31 +2000,26 @@ impl Chunks {
             backup_storage,
             wal_storage,
             tiered_manager,
-            enable_recovery,
             raft_storage,
-            revision_clock,
-            history_retention_ms,
+            Arc::new(HlcSource::new(0)),
+            300_000,
         )
-        .expect("segment recovery failed");
-
-        if enable_recovery {
-            chunks
-                .revision_clock()
-                .try_observe(bifrost::hlc::Hlc {
-                    ts: recovery.max_revision_ts,
-                    node: chunks.revision_clock().node(),
-                })
-                .expect("recovered revision clock exhausted");
-            chunks
-                .establish_recovery_floor()
-                .expect("recovery snapshot floor clock exhausted");
-        }
-
+        .expect("test segment recovery failed");
+        chunks
+            .revision_clock()
+            .try_observe(bifrost::hlc::Hlc {
+                ts: recovery.max_revision_ts,
+                node: chunks.revision_clock().node(),
+            })
+            .expect("test recovered revision clock exhausted");
+        chunks
+            .establish_recovery_floor()
+            .expect("test recovery snapshot floor clock exhausted");
         chunks
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new_with_recovery_and_clock(
+    fn try_construct_with_clock(
         count: usize,
         size: usize,
         meta: Arc<ServerMeta>,
@@ -1988,10 +2027,9 @@ impl Chunks {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
-        enable_recovery: bool,
-        raft_storage: Option<String>,
         revision_clock: Arc<HlcSource>,
         history_retention_ms: u64,
+        construction: ChunkConstruction,
     ) -> io::Result<(Arc<Chunks>, crate::ram::recovery::RecoverySummary)> {
         use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
         use std::ptr;
@@ -2093,26 +2131,27 @@ impl Chunks {
         // Store global pointer for signal handler access
         set_global_chunks(&chunks_arc);
 
-        let recovery = if enable_recovery {
-            info!("Recovery enabled, attempting to recover from storage");
+        let recovery = match construction {
+            ChunkConstruction::Empty => crate::ram::recovery::RecoverySummary::default(),
+            ChunkConstruction::Recover { raft_storage } => {
+                info!("Recovery enabled, attempting to recover from storage");
 
-            let config = crate::ram::recovery::RecoveryConfig {
-                num_chunks: count,
-                chunk_size,
-                max_threads: Some(64), // Cap recovery parallelism to reduce contention storms
-            };
+                let config = crate::ram::recovery::RecoveryConfig {
+                    num_chunks: count,
+                    chunk_size,
+                    max_threads: Some(64), // Cap recovery parallelism to reduce contention storms
+                };
 
-            let recovery = crate::ram::recovery::recover_chunks(
-                &config,
-                &backup_storage,
-                &wal_storage,
-                &raft_storage,
-                &chunks_arc.list,
-            )?;
-            info!("Recovery completed successfully");
-            recovery
-        } else {
-            crate::ram::recovery::RecoverySummary::default()
+                let recovery = crate::ram::recovery::recover_chunks(
+                    &config,
+                    &backup_storage,
+                    &wal_storage,
+                    &raft_storage,
+                    &chunks_arc.list,
+                )?;
+                info!("Recovery completed successfully");
+                recovery
+            }
         };
 
         Ok((chunks_arc, recovery))

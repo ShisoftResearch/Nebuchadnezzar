@@ -401,6 +401,11 @@ impl IndexBuilder {
         self.clients.initialize_inverted_indexer(chunks);
     }
 
+    /// Activate inverted-index background work after storage startup completes.
+    pub fn start_inverted_indexer_background_flush(&self) {
+        self.clients.start_inverted_indexer_background_flush();
+    }
+
     pub async fn graceful_shutdown(&self) -> Result<(), IndexError> {
         if let Some(indexer) = self.clients.fulltext_indexer() {
             indexer.graceful_shutdown().await?;
@@ -572,6 +577,13 @@ impl IndexBuilder {
                 .await
         }
         .boxed()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_index_task_for_test(
+        task: impl Future<Output = Result<(), IndexError>> + Send + 'static,
+    ) {
+        new_index_task(task);
     }
 
     // Scope index tasks spawned by a single request so callers can wait only on

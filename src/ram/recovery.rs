@@ -1495,7 +1495,7 @@ mod tests {
         );
         let schemas = LocalSchemasCache::new_local("");
         schemas.debug_only_new_schema(schema);
-        let (chunks, summary) = Chunks::try_new_with_recovery_and_clock(
+        let (chunks, summary) = Chunks::recover_with_clock(
             1,
             TEST_SEGMENT_SIZE * 4,
             Arc::new(ServerMeta { schemas }),
@@ -1503,7 +1503,6 @@ mod tests {
             Some(backup_dir.path().to_str().unwrap().to_string()),
             Some(wal_dir.path().to_str().unwrap().to_string()),
             None,
-            true,
             Some(raft_path),
             Arc::new(bifrost::hlc::HlcSource::new(0)),
             300_000,
@@ -1530,7 +1529,7 @@ mod tests {
         let (_raft_dir, raft_path) = temp_raft_dir();
         write_backup_segment(&backup_dir, 0, 0, 1, &segment);
 
-        let result = Chunks::try_new_with_recovery_and_clock(
+        let result = Chunks::recover_with_clock(
             1,
             TEST_SEGMENT_SIZE * 4,
             Arc::new(ServerMeta {
@@ -1540,7 +1539,6 @@ mod tests {
             Some(backup_dir.path().to_str().unwrap().to_string()),
             Some(wal_dir.path().to_str().unwrap().to_string()),
             None,
-            true,
             Some(raft_path),
             Arc::new(bifrost::hlc::HlcSource::new(0)),
             300_000,
@@ -1574,7 +1572,7 @@ mod tests {
         let schemas = LocalSchemasCache::new_local("");
         schemas.debug_only_new_schema(schema);
 
-        let (chunks, summary) = Chunks::try_new_with_recovery_and_clock(
+        let (chunks, summary) = Chunks::recover_with_clock(
             1,
             TEST_SEGMENT_SIZE * 4,
             Arc::new(ServerMeta { schemas }),
@@ -1582,7 +1580,6 @@ mod tests {
             Some(backup_dir.path().to_str().unwrap().to_string()),
             Some(wal_dir.path().to_str().unwrap().to_string()),
             None,
-            true,
             Some(raft_path),
             Arc::new(bifrost::hlc::HlcSource::new(0)),
             300_000,
@@ -1792,7 +1789,7 @@ mod tests {
         let schemas = LocalSchemasCache::new_local("");
         schemas.debug_only_new_schema(schema);
 
-        let (chunks, summary) = Chunks::try_new_with_recovery_and_clock(
+        let (chunks, summary) = Chunks::recover_with_clock(
             2,
             TEST_SEGMENT_SIZE * 4,
             Arc::new(ServerMeta { schemas }),
@@ -1800,7 +1797,6 @@ mod tests {
             Some(backup_dir.path().to_str().unwrap().to_string()),
             Some(wal_dir.path().to_str().unwrap().to_string()),
             None,
-            true,
             Some(raft_path),
             Arc::new(bifrost::hlc::HlcSource::new(0)),
             300_000,
@@ -2048,7 +2044,7 @@ mod tests {
 
         write_backup_segment(&backup_dir, 0, 0, 1, &empty_segment_bytes());
 
-        let chunks = Chunks::new_with_recovery(
+        let chunks = Chunks::new_with_recovery_for_test(
             1,
             TEST_SEGMENT_SIZE * 4,
             Arc::new(ServerMeta {
@@ -2086,7 +2082,7 @@ mod tests {
 
         write_backup_segment(&backup_dir, 0, 0, 1, &tombstone_only_segment_bytes());
 
-        let chunks = Chunks::new_with_recovery(
+        let chunks = Chunks::new_with_recovery_for_test(
             1,
             TEST_SEGMENT_SIZE * 4,
             Arc::new(ServerMeta {
@@ -2131,7 +2127,7 @@ mod tests {
         {
             let schemas = LocalSchemasCache::new_local("");
             schemas.debug_only_new_schema(regular_schema.clone());
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -2158,7 +2154,7 @@ mod tests {
 
         {
             let schemas = LocalSchemasCache::new_local("");
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -2199,7 +2195,7 @@ mod tests {
             schemas.debug_only_new_schema(regular_schema.clone());
             schemas.debug_only_new_schema(blob_schema.clone());
             let manager = tiered_manager_for_test(8 * SEGMENT_SIZE);
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -2235,7 +2231,7 @@ mod tests {
             schemas.debug_only_new_schema(regular_schema.clone());
             schemas.debug_only_new_schema(blob_schema.clone());
             let manager = tiered_manager_for_test(8 * SEGMENT_SIZE);
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -2320,7 +2316,7 @@ mod tests {
             let schemas = LocalSchemasCache::new_local("");
             schemas.debug_only_new_schema(blob_schema.clone());
             let manager = tiered_manager_for_test(8 * SEGMENT_SIZE);
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -2379,7 +2375,7 @@ mod tests {
             let schemas = LocalSchemasCache::new_local("");
             schemas.debug_only_new_schema(blob_schema.clone());
             let manager = tiered_manager_for_test(8 * SEGMENT_SIZE);
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -2523,7 +2519,7 @@ mod tests {
 
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -2559,7 +2555,7 @@ mod tests {
 
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -2607,7 +2603,7 @@ mod tests {
         let cell_ids: Vec<Id> = (0..10).map(|i| Id::new(0, i)).collect();
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -2639,7 +2635,7 @@ mod tests {
         // Phase 2: Create new chunks instance with recovery enabled
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -2677,7 +2673,7 @@ mod tests {
         // Phase 1: Write initial data
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -2733,7 +2729,7 @@ mod tests {
                 list_files_recursively(wal_dir.path()),
                 list_files_recursively(backup_dir.path())
             );
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -2821,7 +2817,7 @@ mod tests {
         {
             let schemas = setup_test_schema();
             println!("Creating chunks with recovery for verification...");
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -2928,7 +2924,7 @@ mod tests {
 
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4, // allow multiple segments for this chunk
                 Arc::new(ServerMeta { schemas }),
@@ -3020,7 +3016,7 @@ mod tests {
         // Simulate crash and recover
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 4,
                 Arc::new(ServerMeta { schemas }),
@@ -3065,7 +3061,7 @@ mod tests {
         // Phase 1: Write cells
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3095,7 +3091,7 @@ mod tests {
         // Phase 2: Delete some cells
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3125,7 +3121,7 @@ mod tests {
         // Phase 3: Recover and verify deletions
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3163,7 +3159,7 @@ mod tests {
         // Phase 1: Write some data and capture seq_id
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3195,7 +3191,7 @@ mod tests {
         // Phase 2: Recover and verify seq_id continues from where it left off
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3232,7 +3228,7 @@ mod tests {
 
         // Try to recover when no files exist
         let schemas = setup_test_schema();
-        let chunks = Chunks::new_with_recovery(
+        let chunks = Chunks::new_with_recovery_for_test(
             1,
             TEST_SEGMENT_SIZE * 2,
             Arc::new(ServerMeta { schemas }),
@@ -3261,7 +3257,7 @@ mod tests {
         let actual_append_offset: usize;
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3294,7 +3290,7 @@ mod tests {
         // Phase 2: Recover and verify append_header is correctly restored
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3350,7 +3346,7 @@ mod tests {
         // Phase 1: Create backup for a segment
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3372,7 +3368,7 @@ mod tests {
         // Phase 2: Recover - should handle file discovery and deduplication gracefully
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3418,7 +3414,7 @@ mod tests {
         // Cycle 1: Write initial batch of cells
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3449,7 +3445,7 @@ mod tests {
         // Cycle 2: Recover and add more cells
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3486,7 +3482,7 @@ mod tests {
         // Cycle 3: Recover and add more cells
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3523,7 +3519,7 @@ mod tests {
         // Cycle 4: Final recovery and verification
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3559,7 +3555,7 @@ mod tests {
         // Cycle 1: Write initial revision
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3584,7 +3580,7 @@ mod tests {
         // Cycle 2: Recover and update
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3620,7 +3616,7 @@ mod tests {
         // Cycle 3: Recover and update again
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3656,7 +3652,7 @@ mod tests {
         // Cycle 4: Verify latest revision survived
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3698,7 +3694,7 @@ mod tests {
         // Cycle 1: Write all cells
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3727,7 +3723,7 @@ mod tests {
         // Cycle 2: Recover and delete some cells
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3758,7 +3754,7 @@ mod tests {
         // Cycle 3: Verify deletions survived recovery
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta { schemas }),
@@ -3798,7 +3794,7 @@ mod tests {
         // Phase 1: Create multiple chunks with data
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 3,                     // 3 chunks
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3831,7 +3827,7 @@ mod tests {
         // Phase 2: Recover all chunks
         {
             let schemas = setup_test_schema();
-            let chunks = Chunks::new_with_recovery(
+            let chunks = Chunks::new_with_recovery_for_test(
                 3,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
@@ -3877,7 +3873,7 @@ mod tests {
         ));
 
         {
-            let db1_chunks = Chunks::new_with_recovery(
+            let db1_chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta {
@@ -3890,7 +3886,7 @@ mod tests {
                 false,
                 Some(raft_path.clone()),
             );
-            let db2_chunks = Chunks::new_with_recovery(
+            let db2_chunks = Chunks::new_with_recovery_for_test(
                 1,
                 TEST_SEGMENT_SIZE * 8,
                 Arc::new(ServerMeta {
@@ -3925,7 +3921,7 @@ mod tests {
             }),
         ));
 
-        let recovered_db1 = Chunks::new_with_recovery(
+        let recovered_db1 = Chunks::new_with_recovery_for_test(
             1,
             TEST_SEGMENT_SIZE * 8,
             Arc::new(ServerMeta {
@@ -3938,7 +3934,7 @@ mod tests {
             true,
             Some(raft_path.clone()),
         );
-        let recovered_db2 = Chunks::new_with_recovery(
+        let recovered_db2 = Chunks::new_with_recovery_for_test(
             1,
             TEST_SEGMENT_SIZE * 8,
             Arc::new(ServerMeta {

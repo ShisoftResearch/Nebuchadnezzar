@@ -555,8 +555,14 @@ mod startup_discovery_tests {
         discover_known_databases_from_raft_storage, discover_known_databases_from_storage_roots,
         initialize_recovered_storage, shared_meta_plane_id,
     };
+    use crate::index::builder::{IndexBuilder, IndexError};
     use crate::ram::chunk::Chunks;
     use crate::ram::recovery::RecoverySummary;
+    use crate::server::transactions::undo_log::UndoLogger;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     #[test]
     fn discovers_only_databases_with_recoverable_raft_state() {
@@ -673,17 +679,38 @@ mod startup_discovery_tests {
         assert_ne!(plane_id.raw(), 1);
     }
 
-    #[test]
-    fn storage_recovery_observes_clock_before_undo_and_sets_floor_after() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_recovery_orders_and_awaits_scoped_index_work_before_the_floor() {
+        let _ = IndexBuilder::await_indices().await;
         let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
         let recovered_max = chunks.revision_clock().try_now().unwrap().ts + 100;
+        let indexer_initialized = Arc::new(AtomicBool::new(false));
+        let local_index_completed = Arc::new(AtomicBool::new(false));
+        let global_index_completed = Arc::new(AtomicBool::new(false));
+        let release_global = Arc::new(tokio::sync::Notify::new());
+        let global_completed = global_index_completed.clone();
+        let global_release = release_global.clone();
+        IndexBuilder::spawn_index_task_for_test(async move {
+            global_release.notified().await;
+            global_completed.store(true, Ordering::Release);
+            Ok(())
+        });
 
         let (compensation_ts, floor) = initialize_recovered_storage(
             &chunks,
             RecoverySummary {
                 max_revision_ts: recovered_max,
             },
+            true,
+            {
+                let indexer_initialized = indexer_initialized.clone();
+                move || indexer_initialized.store(true, Ordering::Release)
+            },
             || {
+                assert!(
+                    indexer_initialized.load(Ordering::Acquire),
+                    "internal index initialization must precede undo"
+                );
                 assert!(
                     chunks
                         .list
@@ -693,11 +720,24 @@ mod startup_discovery_tests {
                 );
                 let compensation_ts = chunks.revision_clock().try_now().unwrap().ts;
                 assert!(compensation_ts > recovered_max);
+                let local_completed = local_index_completed.clone();
+                IndexBuilder::spawn_index_task_for_test(async move {
+                    tokio::task::yield_now().await;
+                    local_completed.store(true, Ordering::Release);
+                    Ok(())
+                });
                 Ok(compensation_ts)
             },
+            || {},
         )
+        .await
         .unwrap();
 
+        assert!(local_index_completed.load(Ordering::Acquire));
+        assert!(
+            !global_index_completed.load(Ordering::Acquire),
+            "the recovery barrier must not drain unrelated global index work"
+        );
         assert!(floor > compensation_ts);
         assert!(
             chunks
@@ -706,29 +746,201 @@ mod startup_discovery_tests {
                 .all(|chunk| chunk.history.recovery_floor() == floor),
             "every chunk must receive the same post-undo recovery floor"
         );
+
+        release_global.notify_one();
+        let global_results = IndexBuilder::await_indices().await;
+        assert_eq!(global_results.len(), 1);
+        assert!(global_index_completed.load(Ordering::Acquire));
     }
 
-    #[test]
-    fn storage_recovery_refuses_an_exhausted_recovered_clock_before_undo() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_undo_keeps_all_floors_zero_and_prevents_continuation() {
+        let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
+        let continued = AtomicBool::new(false);
+
+        let result: Result<(), super::ServerError> = async {
+            initialize_recovered_storage(
+                &chunks,
+                RecoverySummary::default(),
+                false,
+                || {},
+                || {
+                    Err::<(), _>(super::ServerError::CannotRecoverStorage(
+                        "undo compensation marker".to_string(),
+                    ))
+                },
+                || {},
+            )
+            .await?;
+            continued.store(true, Ordering::Release);
+            Ok(())
+        }
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(super::ServerError::CannotRecoverStorage(_))
+        ));
+        assert!(!continued.load(Ordering::Acquire));
+        assert!(chunks
+            .list
+            .iter()
+            .all(|chunk| chunk.history.recovery_floor() == 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_undo_record_fails_startup_before_the_floor() {
+        let temp = tempfile::TempDir::new().expect("tempdir should be created");
+        let undo_log = UndoLogger::new(temp.path().to_string_lossy().into_owned())
+            .expect("undo log should be created");
+        std::fs::write(temp.path().join("undo-0.nlog"), [1_u8, 2, 3])
+            .expect("malformed undo record should be written");
+        let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
+
+        let result = initialize_recovered_storage(
+            &chunks,
+            RecoverySummary::default(),
+            false,
+            || {},
+            || {
+                undo_log
+                    .recover()
+                    .map_err(|error| super::ServerError::CannotRecoverStorage(error.to_string()))
+            },
+            || {},
+        )
+        .await;
+
+        let error = result.expect_err("malformed undo recovery must fail startup");
+        let message = error.to_string();
+        assert!(message.contains("undo-0.nlog"), "{message}");
+        assert!(message.contains("offset 0"), "{message}");
+        assert!(chunks
+            .list
+            .iter()
+            .all(|chunk| chunk.history.recovery_floor() == 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_activates_background_work_only_after_a_successful_floor() {
+        let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
+        let indexer_attached = AtomicBool::new(false);
+        let background_activated = AtomicBool::new(false);
+
+        let (_, floor) = initialize_recovered_storage(
+            &chunks,
+            RecoverySummary::default(),
+            false,
+            || indexer_attached.store(true, Ordering::Release),
+            || {
+                assert!(indexer_attached.load(Ordering::Acquire));
+                assert!(chunks
+                    .list
+                    .iter()
+                    .all(|chunk| chunk.history.recovery_floor() == 0));
+                Ok(())
+            },
+            || {
+                assert!(chunks
+                    .list
+                    .iter()
+                    .all(|chunk| chunk.history.recovery_floor() != 0));
+                background_activated.store(true, Ordering::Release);
+            },
+        )
+        .await
+        .expect("successful recovery should activate background work");
+
+        assert!(background_activated.load(Ordering::Acquire));
+        assert!(chunks
+            .list
+            .iter()
+            .all(|chunk| chunk.history.recovery_floor() == floor));
+
+        let failed_chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
+        let failed_background_activated = AtomicBool::new(false);
+        let result = initialize_recovered_storage(
+            &failed_chunks,
+            RecoverySummary::default(),
+            false,
+            || {},
+            || {
+                Err::<(), _>(super::ServerError::CannotRecoverStorage(
+                    "undo failure marker".to_string(),
+                ))
+            },
+            || failed_background_activated.store(true, Ordering::Release),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!failed_background_activated.load(Ordering::Acquire));
+        assert!(failed_chunks
+            .list
+            .iter()
+            .all(|chunk| chunk.history.recovery_floor() == 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_scoped_index_work_keeps_all_floors_zero() {
+        let _ = IndexBuilder::await_indices().await;
+        let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
+
+        let result = initialize_recovered_storage(
+            &chunks,
+            RecoverySummary::default(),
+            true,
+            || {},
+            || {
+                IndexBuilder::spawn_index_task_for_test(async {
+                    Err(IndexError::Other("index result marker".to_string()))
+                });
+                IndexBuilder::spawn_index_task_for_test(async {
+                    panic!("index join marker");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                });
+                Ok(())
+            },
+            || {},
+        )
+        .await;
+
+        let error = result.expect_err("every scoped index failure must fail startup");
+        let message = error.to_string();
+        assert!(message.contains("index result marker"), "{message}");
+        assert!(message.contains("index join marker"), "{message}");
+        assert!(chunks
+            .list
+            .iter()
+            .all(|chunk| chunk.history.recovery_floor() == 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_recovery_refuses_an_exhausted_recovered_clock_before_undo() {
         let chunks = Chunks::new_dummy(1, crate::ram::segs::SEGMENT_SIZE);
-        let undo_ran = std::sync::atomic::AtomicBool::new(false);
+        let undo_ran = AtomicBool::new(false);
 
         let result = initialize_recovered_storage(
             &chunks,
             RecoverySummary {
                 max_revision_ts: u64::MAX,
             },
+            false,
+            || {},
             || {
-                undo_ran.store(true, std::sync::atomic::Ordering::Release);
+                undo_ran.store(true, Ordering::Release);
                 Ok(())
             },
-        );
+            || {},
+        )
+        .await;
 
         assert!(matches!(
             result,
             Err(super::ServerError::CannotRecoverStorage(_))
         ));
-        assert!(!undo_ran.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!undo_ran.load(Ordering::Acquire));
         assert_eq!(chunks.list[0].history.recovery_floor(), 0);
     }
 }
@@ -804,13 +1016,19 @@ fn recovery_clock_exhausted() -> ServerError {
     ServerError::CannotRecoverStorage("recovered revision clock is exhausted".to_string())
 }
 
-fn initialize_recovered_storage<T, F>(
+async fn initialize_recovered_storage<T, I, F, A>(
     chunks: &Arc<Chunks>,
     recovery: crate::ram::recovery::RecoverySummary,
+    capture_index_tasks: bool,
+    initialize_indexer: I,
     recover_undo: F,
+    activate_background_workers: A,
 ) -> Result<(T, u64), ServerError>
 where
+    T: Send,
+    I: FnOnce(),
     F: FnOnce() -> Result<T, ServerError>,
+    A: FnOnce(),
 {
     chunks
         .revision_clock()
@@ -820,10 +1038,39 @@ where
         })
         .map_err(|_| recovery_clock_exhausted())?;
 
-    let undo = recover_undo()?;
+    initialize_indexer();
+    let (undo_result, index_results) = if capture_index_tasks {
+        IndexBuilder::with_request_index_scope(recover_undo).await
+    } else {
+        (recover_undo(), Vec::new())
+    };
+    let mut failures = Vec::new();
+    let undo = match undo_result {
+        Ok(undo) => Some(undo),
+        Err(error) => {
+            failures.push(format!("undo recovery failed: {error}"));
+            None
+        }
+    };
+    for (task_index, result) in index_results.into_iter().enumerate() {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(format!(
+                "recovery index task {task_index} failed: {error:?}"
+            )),
+            Err(error) => failures.push(format!(
+                "recovery index task {task_index} join failed: {error:?}"
+            )),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(ServerError::CannotRecoverStorage(failures.join("; ")));
+    }
+    let undo = undo.expect("successful recovery barrier must retain the undo result");
     let recovery_floor = chunks
         .establish_recovery_floor()
         .map_err(|_| recovery_clock_exhausted())?;
+    activate_background_workers();
     info!("MVCC recovery snapshot floor: {}", recovery_floor);
     Ok((undo, recovery_floor))
 }
@@ -1312,37 +1559,74 @@ impl NebServer {
             None
         };
 
-        let (chunks, recovery) = Chunks::try_new_with_recovery_and_clock(
-            effective_opts.db_size / effective_opts.chunk_size,
-            effective_opts.chunk_size,
-            meta_rc.clone(),
-            index_builder.clone(),
-            effective_opts.backup_storage.clone(),
-            effective_opts.wal_storage.clone(),
-            tiered_manager,
-            effective_opts.enable_recovery,
-            effective_opts.raft_storage.clone(),
-            hlc.clone(),
-            effective_opts.history_retention_ms,
-        )
-        .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+        let chunk_count = effective_opts.db_size / effective_opts.chunk_size;
+        let (chunks, recovery) = if effective_opts.enable_recovery {
+            Chunks::recover_with_clock(
+                chunk_count,
+                effective_opts.chunk_size,
+                meta_rc.clone(),
+                index_builder.clone(),
+                effective_opts.backup_storage.clone(),
+                effective_opts.wal_storage.clone(),
+                tiered_manager,
+                effective_opts.raft_storage.clone(),
+                hlc.clone(),
+                effective_opts.history_retention_ms,
+            )
+            .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?
+        } else {
+            (
+                Chunks::new_with_clock(
+                    chunk_count,
+                    effective_opts.chunk_size,
+                    meta_rc.clone(),
+                    index_builder.clone(),
+                    effective_opts.backup_storage.clone(),
+                    effective_opts.wal_storage.clone(),
+                    tiered_manager,
+                    hlc.clone(),
+                    effective_opts.history_retention_ms,
+                ),
+                crate::ram::recovery::RecoverySummary::default(),
+            )
+        };
 
         let undo_log = if effective_opts.enable_recovery {
-            initialize_recovered_storage(&chunks, recovery, || {
-                let Some(undo_log_path) = effective_opts.undo_log_storage.as_ref() else {
-                    return Ok(None);
-                };
-                let log = transactions::undo_log::UndoLogger::new(undo_log_path.clone())
-                    .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
-                let txn_index = log
-                    .recover()
-                    .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
-                log.rollback_incomplete_transactions(txn_index, &chunks)
-                    .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
-                Ok(Some(log))
-            })?
+            initialize_recovered_storage(
+                &chunks,
+                recovery,
+                index_builder.is_some(),
+                || {
+                    if let Some(ref index_builder) = index_builder {
+                        index_builder.initialize_inverted_indexer(&chunks);
+                    }
+                },
+                || {
+                    let Some(undo_log_path) = effective_opts.undo_log_storage.as_ref() else {
+                        return Ok(None);
+                    };
+                    let log = transactions::undo_log::UndoLogger::new(undo_log_path.clone())
+                        .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+                    let txn_index = log
+                        .recover()
+                        .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+                    log.rollback_incomplete_transactions(txn_index, &chunks)
+                        .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+                    Ok(Some(log))
+                },
+                || {
+                    if let Some(ref index_builder) = index_builder {
+                        index_builder.start_inverted_indexer_background_flush();
+                    }
+                },
+            )
+            .await?
             .0
         } else if let Some(ref undo_log_path) = effective_opts.undo_log_storage {
+            if let Some(ref index_builder) = index_builder {
+                index_builder.initialize_inverted_indexer(&chunks);
+                index_builder.start_inverted_indexer_background_flush();
+            }
             match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
                 Ok(log) => Some(log),
                 Err(error) => {
@@ -1351,12 +1635,12 @@ impl NebServer {
                 }
             }
         } else {
+            if let Some(ref index_builder) = index_builder {
+                index_builder.initialize_inverted_indexer(&chunks);
+                index_builder.start_inverted_indexer_background_flush();
+            }
             None
         };
-
-        if let Some(ref index_builder) = index_builder {
-            index_builder.initialize_inverted_indexer(&chunks);
-        }
 
         let cleaner = if effective_opts.enable_recovery {
             debug!(

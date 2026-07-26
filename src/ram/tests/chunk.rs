@@ -24,15 +24,13 @@ fn writes_allocate_monotonic_revision_timestamps() {
     let schemas = LocalSchemasCache::new_local("");
     schemas.debug_only_new_schema(schema.clone());
     let revision_clock = Arc::new(HlcSource::new(0));
-    let chunks = Chunks::new_with_recovery_and_clock(
+    let chunks = Chunks::new_with_clock(
         1,
         CHUNK_SIZE,
         Arc::new(ServerMeta { schemas }),
         None,
         None,
         None,
-        None,
-        false,
         None,
         revision_clock,
         300_000,
