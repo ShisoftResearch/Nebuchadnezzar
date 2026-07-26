@@ -208,7 +208,7 @@ impl RevisionChain {
         }
     }
 
-    pub fn push_front(&self, node: Arc<RevisionNode>) {
+    fn push_front(&self, node: Arc<RevisionNode>) {
         self.revisions.push_front(Some(node));
     }
 
@@ -463,7 +463,7 @@ impl HistoryIndex {
         self.chains.get(id)
     }
 
-    pub fn get_or_create_chain(&self, id: Id) -> Arc<RevisionChain> {
+    fn get_or_create_chain(&self, id: Id) -> Arc<RevisionChain> {
         self.get_or_create_chain_with(id, || Arc::new(RevisionChain::new()))
     }
 

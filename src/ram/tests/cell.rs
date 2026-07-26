@@ -6,6 +6,8 @@ use crate::ram::types;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
 use bifrost_hasher::hash_str;
+use dovahkiin::types::Type;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::*;
@@ -37,6 +39,25 @@ fn test_cell(id: Id, value: u64) -> OwnedCell {
             name: format!("value-{value}")
         },
     )
+}
+
+fn physical_accounting(chunks: &Chunks) -> Vec<(u64, usize, u32, u32)> {
+    chunks.list[0]
+        .segs
+        .iter_values()
+        .map(|segment| {
+            (
+                segment.id,
+                segment.append_header.load(Ordering::Acquire),
+                segment.dead_space.load(Ordering::Acquire),
+                segment.tombstones.load(Ordering::Acquire),
+            )
+        })
+        .collect()
+}
+
+fn assert_zero_write_rejected(result: Result<InstalledRevision, WriteError>) {
+    assert!(matches!(result, Err(WriteError::CellRevisionMismatch)));
 }
 
 #[test]
@@ -129,6 +150,238 @@ fn every_snapshot_read_shape_selects_the_same_old_revision() {
         panic!("partial snapshot should select revision 100");
     };
     assert_eq!(raw_revision, 100u64.to_le_bytes());
+}
+
+#[test]
+fn partial_snapshot_ranges_are_bounded_to_current_entry() {
+    let chunks = test_chunks();
+    let id = Id::new(1, 105);
+    let mut cell = test_cell(id, 10);
+    let installed = chunks
+        .write_cell_at_revision(&mut cell, RevisionWrite::committed(100))
+        .unwrap();
+    let entry_size = installed.node.entry_size as usize;
+
+    assert!(matches!(
+        chunks
+            .read_partial_raw_snapshot(&id, 200, entry_size - 1, 1)
+            .unwrap(),
+        SnapshotRead::Present(bytes) if bytes.len() == 1
+    ));
+    assert!(matches!(
+        chunks.read_partial_raw_snapshot(&id, 200, entry_size, 1),
+        Err(ReadError::CellDoesNotExisted)
+    ));
+    assert!(matches!(
+        chunks.read_partial_raw_snapshot(&id, 200, usize::MAX, 1),
+        Err(ReadError::CellDoesNotExisted)
+    ));
+}
+
+#[test]
+fn partial_snapshot_ranges_are_bounded_to_historical_entry() {
+    let chunks = test_chunks();
+    let id = Id::new(1, 106);
+    let mut first = test_cell(id, 10);
+    let historical = chunks
+        .write_cell_at_revision(&mut first, RevisionWrite::committed(100))
+        .unwrap();
+    let historical_entry_size = historical.node.entry_size as usize;
+    let mut second = test_cell(id, 20);
+    chunks
+        .update_cell_at_revision(&mut second, RevisionWrite::committed(200))
+        .unwrap();
+
+    assert!(matches!(
+        chunks
+            .read_partial_raw_snapshot(&id, 150, historical_entry_size - 1, 1)
+            .unwrap(),
+        SnapshotRead::Present(bytes) if bytes.len() == 1
+    ));
+    assert!(matches!(
+        chunks.read_partial_raw_snapshot(&id, 150, historical_entry_size, 1),
+        Err(ReadError::CellDoesNotExisted)
+    ));
+    assert!(matches!(
+        chunks.read_partial_raw_snapshot(&id, 150, usize::MAX, 1),
+        Err(ReadError::CellDoesNotExisted)
+    ));
+}
+
+#[test]
+fn failed_delete_preserves_current_cell_and_secondary_indices() {
+    let fields = Field::new_schema(vec![
+        Field::new_indexed("id", Type::I64, vec![IndexType::Hashed, IndexType::Null]),
+        Field::new_unindexed("name", Type::String),
+        Field::new_indexed("score", Type::U64, vec![IndexType::Ranged]),
+    ]);
+    let schema = Schema::new_with_id(1, "delete-atomicity", None, fields, false, true);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(schema);
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    );
+    let id = Id::new(1, 107);
+    let mut cell = test_cell(id, 10);
+    chunks
+        .write_cell_at_revision(&mut cell, RevisionWrite::committed(100))
+        .unwrap();
+    let original_address = chunks.address_of(&id);
+    let original_accounting = physical_accounting(&chunks);
+    chunks.fail_next_allocation_for_test(&id);
+
+    assert!(matches!(
+        chunks.remove_cell_at_revision(&id, RevisionWrite::committed(200)),
+        Err(WriteError::CannotAllocateSpace)
+    ));
+    assert_eq!(chunks.address_of(&id), original_address);
+    let stored = chunks.read_cell(&id).unwrap();
+    assert_eq!(stored.id(), id);
+    assert_eq!(stored.data["score"].u64(), Some(&10));
+    assert_eq!(
+        chunks.secondary_index_removal_attempts_for_test(&id),
+        0,
+        "a failed delete must not schedule removal of any secondary index"
+    );
+    assert_eq!(physical_accounting(&chunks), original_accounting);
+    assert!(chunks.list[0]
+        .history
+        .current(&id)
+        .is_some_and(|node| node.revision_ts == 100));
+}
+
+#[test]
+fn zero_assigned_insert_is_side_effect_free() {
+    for write in [RevisionWrite::committed(0), RevisionWrite::pending(0)] {
+        let chunks = test_chunks();
+        let id = Id::new(1, 108);
+        let mut cell = test_cell(id, 10);
+        let before = physical_accounting(&chunks);
+
+        assert_zero_write_rejected(chunks.write_cell_at_revision(&mut cell, write));
+
+        assert_eq!(chunks.list[0].cell_count(), 0);
+        assert!(chunks.list[0].history.current(&id).is_none());
+        assert_eq!(physical_accounting(&chunks), before);
+        assert_eq!(cell.header.revision_ts, 0);
+    }
+}
+
+#[test]
+fn zero_assigned_update_is_side_effect_free() {
+    for write in [RevisionWrite::committed(0), RevisionWrite::pending(0)] {
+        let chunks = test_chunks();
+        let id = Id::new(1, 109);
+        let colliding_id = Id::new(2, id.lower);
+        let mut first = test_cell(id, 10);
+        chunks
+            .write_cell_at_revision(&mut first, RevisionWrite::committed(100))
+            .unwrap();
+        let original_address = chunks.address_of(&id);
+        let original_accounting = physical_accounting(&chunks);
+        let original_node = chunks.list[0].history.current(&id).unwrap();
+        let mut update = test_cell(colliding_id, 20);
+
+        assert_zero_write_rejected(chunks.update_cell_at_revision(&mut update, write));
+
+        assert_eq!(chunks.address_of(&id), original_address);
+        assert!(chunks.list[0].history.current(&colliding_id).is_none());
+        assert!(chunks.list[0]
+            .history
+            .current(&id)
+            .is_some_and(|node| Arc::ptr_eq(&node, &original_node)));
+        assert_eq!(physical_accounting(&chunks), original_accounting);
+        assert_eq!(update.header.revision_ts, 0);
+    }
+}
+
+#[test]
+fn zero_assigned_delete_is_side_effect_free() {
+    for write in [RevisionWrite::committed(0), RevisionWrite::pending(0)] {
+        let chunks = test_chunks();
+        let id = Id::new(1, 110);
+        let colliding_id = Id::new(2, id.lower);
+        let mut cell = test_cell(id, 10);
+        chunks
+            .write_cell_at_revision(&mut cell, RevisionWrite::committed(100))
+            .unwrap();
+        let original_address = chunks.address_of(&id);
+        let original_accounting = physical_accounting(&chunks);
+        let original_node = chunks.list[0].history.current(&id).unwrap();
+
+        assert_zero_write_rejected(chunks.remove_cell_at_revision(&colliding_id, write));
+
+        assert_eq!(chunks.address_of(&id), original_address);
+        assert!(chunks.list[0].history.current(&colliding_id).is_none());
+        assert!(chunks.list[0]
+            .history
+            .current(&id)
+            .is_some_and(|node| Arc::ptr_eq(&node, &original_node)));
+        assert_eq!(physical_accounting(&chunks), original_accounting);
+    }
+}
+
+#[test]
+fn assigned_update_rejects_full_id_collision_without_side_effects() {
+    let chunks = test_chunks();
+    let original_id = Id::new(1, 111);
+    let colliding_id = Id::new(2, original_id.lower);
+    let mut original = test_cell(original_id, 10);
+    let installed = chunks
+        .write_cell_at_revision(&mut original, RevisionWrite::committed(100))
+        .unwrap();
+    let original_address = chunks.address_of(&original_id);
+    let original_accounting = physical_accounting(&chunks);
+    let mut colliding = test_cell(colliding_id, 20);
+
+    assert!(matches!(
+        chunks.update_cell_at_revision(&mut colliding, RevisionWrite::committed(200)),
+        Err(WriteError::CellDoesNotExisted)
+    ));
+    assert_eq!(chunks.address_of(&original_id), original_address);
+    assert!(chunks.list[0].history.current(&colliding_id).is_none());
+    assert!(chunks.list[0]
+        .history
+        .current(&original_id)
+        .is_some_and(|node| Arc::ptr_eq(&node, &installed.node)));
+    assert_eq!(physical_accounting(&chunks), original_accounting);
+    let stored = chunks.read_cell(&original_id).unwrap();
+    assert_eq!(stored.id(), original_id);
+    assert_eq!(stored.data["score"].u64(), Some(&10));
+}
+
+#[test]
+fn assigned_delete_rejects_full_id_collision_without_side_effects() {
+    let chunks = test_chunks();
+    let original_id = Id::new(1, 112);
+    let colliding_id = Id::new(2, original_id.lower);
+    let mut original = test_cell(original_id, 10);
+    let installed = chunks
+        .write_cell_at_revision(&mut original, RevisionWrite::committed(100))
+        .unwrap();
+    let original_address = chunks.address_of(&original_id);
+    let original_accounting = physical_accounting(&chunks);
+
+    assert!(matches!(
+        chunks.remove_cell_at_revision(&colliding_id, RevisionWrite::committed(200)),
+        Err(WriteError::CellDoesNotExisted)
+    ));
+    assert_eq!(chunks.address_of(&original_id), original_address);
+    assert!(chunks.list[0].history.current(&colliding_id).is_none());
+    assert!(chunks.list[0]
+        .history
+        .current(&original_id)
+        .is_some_and(|node| Arc::ptr_eq(&node, &installed.node)));
+    assert_eq!(physical_accounting(&chunks), original_accounting);
+    let stored = chunks.read_cell(&original_id).unwrap();
+    assert_eq!(stored.id(), original_id);
+    assert_eq!(stored.data["score"].u64(), Some(&10));
 }
 
 #[test]

@@ -10,7 +10,7 @@ use crate::ram::segs::{
     Segment, SegmentAllocator, SegmentClass, SegmentReferenceGuard, SEGMENT_SIZE, SEGMENT_SIZE_U32,
 };
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
-use crate::ram::types::Id;
+use crate::ram::types::{FromHeader, Id};
 use crate::server::ServerMeta;
 use crate::{index::builder::IndexBuilder, ram::cell::*};
 use crate::{
@@ -178,6 +178,10 @@ pub struct Chunk {
     pub history: Arc<HistoryIndex>,
     /// Shared tiered memory manager for eviction/promotion
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+    #[cfg(test)]
+    fail_next_allocation: AtomicUsize,
+    #[cfg(test)]
+    secondary_index_removal_attempts: AtomicUsize,
 }
 
 impl Chunk {
@@ -352,6 +356,10 @@ impl Chunk {
             history_retention_ms,
             history,
             tiered_manager,
+            #[cfg(test)]
+            fail_next_allocation: AtomicUsize::new(0),
+            #[cfg(test)]
+            secondary_index_removal_attempts: AtomicUsize::new(0),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -380,6 +388,10 @@ impl Chunk {
     }
 
     pub fn try_acquire(&self, size: u32, full_gc: bool) -> Result<PendingEntry, WriteError> {
+        #[cfg(test)]
+        if self.fail_next_allocation.swap(0, Ordering::AcqRel) != 0 {
+            return Err(WriteError::CannotAllocateSpace);
+        }
         self.try_acquire_in_class(size, full_gc, SegmentClass::Regular)
     }
 
@@ -666,20 +678,28 @@ impl Chunk {
 
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
         let loc = CellGuard::for_read(hash, self)?;
-        self.read_partial_raw_at(*loc, offset, len)
+        let entry_size = self.entry_size_at(*loc);
+        self.read_partial_raw_at(*loc, entry_size, offset, len)
     }
 
     fn read_partial_raw_at(
         &self,
         location: usize,
+        entry_size: u32,
         offset: usize,
         len: usize,
     ) -> Result<Vec<u8>, ReadError> {
+        let end_offset = offset
+            .checked_add(len)
+            .ok_or(ReadError::CellDoesNotExisted)?;
+        if end_offset > entry_size as usize {
+            return Err(ReadError::CellDoesNotExisted);
+        }
         let head_ptr = location
             .checked_add(offset)
             .ok_or(ReadError::CellDoesNotExisted)?;
-        let end_ptr = head_ptr
-            .checked_add(len)
+        let end_ptr = location
+            .checked_add(end_offset)
             .ok_or(ReadError::CellDoesNotExisted)?;
         let mut data = Vec::with_capacity(len);
         for ptr in head_ptr..end_ptr {
@@ -785,6 +805,14 @@ impl Chunk {
         }
     }
 
+    fn validate_assigned_revision(write: RevisionWrite) -> Result<(), WriteError> {
+        if write.revision_ts == 0 {
+            Err(WriteError::CellRevisionMismatch)
+        } else {
+            Ok(())
+        }
+    }
+
     fn install_written_revision(
         &self,
         id: Id,
@@ -812,6 +840,7 @@ impl Chunk {
         cell: &mut OwnedCell,
         write: RevisionWrite,
     ) -> Result<InstalledRevision, WriteError> {
+        Self::validate_assigned_revision(write)?;
         let id = cell.id();
         let hash = id.lower;
         let raw_guard = self
@@ -884,6 +913,7 @@ impl Chunk {
         cell: &mut OwnedCell,
         write: RevisionWrite,
     ) -> Result<InstalledRevision, WriteError> {
+        Self::validate_assigned_revision(write)?;
         let id = cell.id();
         let hash = id.lower;
         let mut guard =
@@ -903,6 +933,9 @@ impl Chunk {
         let id = cell.id();
         let old_location = guard.get_ptr();
         let old_header = guard.head_cell().map_err(WriteError::ReadError)?;
+        if Id::from_header(&old_header) != id {
+            return Err(WriteError::CellDoesNotExisted);
+        }
         let predecessor = self.ensure_present_predecessor(id, &old_header, old_location)?;
         if write.revision_ts <= predecessor.revision_ts {
             return Err(WriteError::CellRevisionMismatch);
@@ -938,6 +971,7 @@ impl Chunk {
         id: &Id,
         write: RevisionWrite,
     ) -> Result<InstalledRevision, WriteError> {
+        Self::validate_assigned_revision(write)?;
         let hash = id.lower;
         let guard = CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
         self.remove_cell_with_guard_at_revision(guard, id, write)
@@ -955,6 +989,9 @@ impl Chunk {
         let hash = id.lower;
         let old_location = guard.get_ptr();
         let old_header = guard.head_cell().map_err(WriteError::ReadError)?;
+        if Id::from_header(&old_header) != *id {
+            return Err(WriteError::CellDoesNotExisted);
+        }
         let predecessor = self.ensure_present_predecessor(*id, &old_header, old_location)?;
         if write.revision_ts <= predecessor.revision_ts {
             return Err(WriteError::CellRevisionMismatch);
@@ -962,11 +999,6 @@ impl Chunk {
 
         let (old_cell, schema) = SharedCellData::from_chunk_raw(hash, old_location, self)
             .map_err(WriteError::ReadError)?;
-        if let Some(indexer) = &self.index_builder {
-            let shared = SharedCell::compose(old_cell, guard);
-            indexer.remove_indices(&shared, &schema);
-            guard = shared.into_cell_guard();
-        }
         let old_segment = self.locate_segment_ensured(old_location, id);
         let pending_entry = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true)?;
         let tombstone_segment = pending_entry.seg.clone();
@@ -994,6 +1026,19 @@ impl Chunk {
             &tombstone_segment,
         )?;
 
+        // History publication is the last fallible step. From here through the
+        // current-index transition and secondary-index scheduling, deletion
+        // cannot return an error.
+        #[cfg(test)]
+        if !schema.index_fields.is_empty() || schema.is_scannable {
+            self.secondary_index_removal_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(indexer) = &self.index_builder {
+            let shared = SharedCell::compose(old_cell, guard);
+            indexer.remove_indices(&shared, &schema);
+            guard = shared.into_cell_guard();
+        }
         guard.remove_index_entry();
         self.refresh_statistics_for_schema(schema.id);
         self.history.retire(&chain, &predecessor);
@@ -1007,7 +1052,7 @@ impl Chunk {
         materialize: F,
     ) -> Result<SnapshotRead<T>, ReadError>
     where
-        F: Fn(usize) -> Result<T, ReadError>,
+        F: Fn(usize, u32) -> Result<T, ReadError>,
     {
         match CellGuard::for_read(id.lower, self) {
             Ok(mut guard) => {
@@ -1020,7 +1065,8 @@ impl Chunk {
                             && state == RevisionState::CommittedPresent
                             && node_location == location
                         {
-                            return materialize(location).map(SnapshotRead::Present);
+                            return materialize(location, current.entry_size)
+                                .map(SnapshotRead::Present);
                         }
                     }
                 }
@@ -1050,7 +1096,7 @@ impl Chunk {
                         backoff.spin();
                         continue;
                     }
-                    return materialize(expected.1).map(SnapshotRead::Present);
+                    return materialize(expected.1, node.entry_size).map(SnapshotRead::Present);
                 }
                 SnapshotRevision::Deleted(node) => {
                     return Ok(SnapshotRead::Absent(Some(node.revision_ts)));
@@ -1067,7 +1113,7 @@ impl Chunk {
         id: &Id,
         snapshot_ts: u64,
     ) -> Result<SnapshotRead<OwnedCell>, ReadError> {
-        self.read_snapshot_at(id, snapshot_ts, |location| {
+        self.read_snapshot_at(id, snapshot_ts, |location, _| {
             self.read_cell_at(id.lower, location)
         })
     }
@@ -1078,7 +1124,7 @@ impl Chunk {
         snapshot_ts: u64,
         fields: &[u64],
     ) -> Result<SnapshotRead<OwnedCell>, ReadError> {
-        self.read_snapshot_at(id, snapshot_ts, |location| {
+        self.read_snapshot_at(id, snapshot_ts, |location, _| {
             self.read_selected_at(location, fields, true)
         })
     }
@@ -1088,7 +1134,7 @@ impl Chunk {
         id: &Id,
         snapshot_ts: u64,
     ) -> Result<SnapshotRead<CellHeader>, ReadError> {
-        self.read_snapshot_at(id, snapshot_ts, |location| self.head_at(location))
+        self.read_snapshot_at(id, snapshot_ts, |location, _| self.head_at(location))
     }
 
     fn read_partial_raw_snapshot(
@@ -1098,8 +1144,8 @@ impl Chunk {
         offset: usize,
         len: usize,
     ) -> Result<SnapshotRead<Vec<u8>>, ReadError> {
-        self.read_snapshot_at(id, snapshot_ts, |location| {
-            self.read_partial_raw_at(location, offset, len)
+        self.read_snapshot_at(id, snapshot_ts, |location, entry_size| {
+            self.read_partial_raw_at(location, entry_size, offset, len)
         })
     }
 
@@ -2067,6 +2113,18 @@ impl Chunks {
     ) -> Result<InstalledRevision, WriteError> {
         let chunk = self.locate_chunk_by_partition(key.higher);
         chunk.remove_cell_at_revision(key, write)
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_next_allocation_for_test(&self, key: &Id) {
+        self.locate_chunk_by_partition(key.higher)
+            .fail_next_allocation
+            .store(1, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(crate) fn secondary_index_removal_attempts_for_test(&self, key: &Id) -> usize {
+        self.locate_chunk_by_partition(key.higher)
+            .secondary_index_removal_attempts
+            .load(Ordering::Acquire)
     }
     pub fn remove_cell_by<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
     where
