@@ -203,6 +203,7 @@ pub enum TMError {
     TransactionIdExisted,
     CannotLocateCellServer,
     RPCErrorFromCellServer,
+    ClockExhausted,
     AssertionError,
     InvalidTransactionState(TxnState),
     Other,

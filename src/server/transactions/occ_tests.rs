@@ -21,6 +21,21 @@ async fn scoped_txn_client_for_database(
         .unwrap()
 }
 
+async fn scoped_data_site_client_for_database(
+    address: &str,
+    group_name: &str,
+    database_name: &str,
+) -> Arc<transactions::data_site::AsyncServiceClient> {
+    let client = bifrost::rpc::DEFAULT_CLIENT_POOL
+        .get(&address.to_string())
+        .await
+        .unwrap();
+    transactions::data_site::AsyncServiceClient::new_with_service_id(
+        transactions::data_site::generate_scoped_service_id(group_name, database_name),
+        &client,
+    )
+}
+
 async fn start_occ_test_server(address: &str, group: &str) -> Arc<NebServer> {
     NebServer::new_from_opts(
         &ServerOptions {
@@ -203,6 +218,370 @@ async fn wait_for_transaction_count(
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_read_validation_prevents_point_write_skew() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5393";
+    let group = "txn_occ_full_read_write_skew";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let first_id = Id::new(0, 90142);
+    let second_id = Id::new(0, 90143);
+
+    let mut first_seed = counter_cell(schema.id, first_id, 1, "write-skew-first");
+    runtime.chunks().write_cell(&mut first_seed).unwrap();
+    let mut second_seed = counter_cell(schema.id, second_id, 1, "write-skew-second");
+    runtime.chunks().write_cell(&mut second_seed).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let left = txn.begin().await.unwrap().unwrap();
+    let right = txn.begin().await.unwrap().unwrap();
+
+    for tid in [left, right] {
+        assert_eq!(
+            score_of(&accepted_cell(
+                txn.read(tid, first_id).await.unwrap().unwrap()
+            )),
+            1
+        );
+        assert_eq!(
+            score_of(&accepted_cell(
+                txn.read(tid, second_id).await.unwrap().unwrap()
+            )),
+            1
+        );
+    }
+
+    assert_eq!(
+        txn.update(
+            left,
+            counter_cell(schema.id, first_id, 0, "write-skew-left"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.update(
+            right,
+            counter_cell(schema.id, second_id, 0, "write-skew-right"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    let (left_result, right_result) = tokio::join!(txn.prepare(left), txn.prepare(right));
+    let left_result = left_result.unwrap().unwrap();
+    let right_result = right_result.unwrap().unwrap();
+    let successful = usize::from(left_result == TMPrepareResult::Success)
+        + usize::from(right_result == TMPrepareResult::Success);
+    assert_eq!(
+        successful, 1,
+        "exactly one write-skewing transaction may prepare: left={left_result:?}, right={right_result:?}"
+    );
+
+    if left_result == TMPrepareResult::Success {
+        let _ = txn.abort(left).await;
+    }
+    if right_result == TMPrepareResult::Success {
+        let _ = txn.abort(right).await;
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn all_participants_install_the_same_commit_timestamp() {
+    let _ = env_logger::try_init();
+    let addresses = ["127.0.0.1:5394", "127.0.0.1:5395"];
+    let group = "txn_occ_shared_distributed_commit_hlc";
+    let servers = start_occ_test_cluster(&addresses, group).await;
+    let schema = install_occ_schema_on_servers(&servers);
+    let ((first_id, first_server_id), (second_id, second_server_id)) =
+        ids_on_distinct_servers(&servers[0]);
+    let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
+        .iter()
+        .map(|server| (server.server_id, server.clone()))
+        .collect();
+
+    let mut first_seed = counter_cell(schema.id, first_id, 1, "shared-hlc-first");
+    servers_by_id[&first_server_id]
+        .current_database()
+        .chunks()
+        .write_cell(&mut first_seed)
+        .unwrap();
+    let mut second_seed = counter_cell(schema.id, second_id, 2, "shared-hlc-second");
+    servers_by_id[&second_server_id]
+        .current_database()
+        .chunks()
+        .write_cell(&mut second_seed)
+        .unwrap();
+
+    let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    let first = accepted_cell(txn.read(tid, first_id).await.unwrap().unwrap());
+    let second = accepted_cell(txn.read(tid, second_id).await.unwrap().unwrap());
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(
+                schema.id,
+                first_id,
+                score_of(&first) + 10,
+                "shared-hlc-first-new"
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(
+                schema.id,
+                second_id,
+                score_of(&second) + 10,
+                "shared-hlc-second-new",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(txn.commit(tid).await.unwrap().unwrap(), EndResult::Success);
+
+    let first_revision = servers_by_id[&first_server_id]
+        .current_database()
+        .chunks()
+        .head_cell(&first_id)
+        .unwrap()
+        .revision_ts;
+    let second_revision = servers_by_id[&second_server_id]
+        .current_database()
+        .chunks()
+        .head_cell(&second_id)
+        .unwrap()
+        .revision_ts;
+    assert_eq!(
+        first_revision, second_revision,
+        "every participant must install the coordinator's one shared commit HLC"
+    );
+
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn participant_delay_after_peer_install_never_exposes_partial_commit() {
+    let _ = env_logger::try_init();
+    let addresses = ["127.0.0.1:5401", "127.0.0.1:5402"];
+    let group = "txn_occ_distributed_pending_visibility";
+    let servers = start_occ_test_cluster(&addresses, group).await;
+    let schema = install_occ_schema_on_servers(&servers);
+    let ((first_id, first_server_id), (second_id, second_server_id)) =
+        ids_on_distinct_servers(&servers[0]);
+    let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
+        .iter()
+        .map(|server| (server.server_id, server.clone()))
+        .collect();
+
+    let mut first_seed = counter_cell(schema.id, first_id, 1, "partial-first-old");
+    servers_by_id[&first_server_id]
+        .current_database()
+        .chunks()
+        .write_cell(&mut first_seed)
+        .unwrap();
+    let mut second_seed = counter_cell(schema.id, second_id, 2, "partial-second-old");
+    servers_by_id[&second_server_id]
+        .current_database()
+        .chunks()
+        .write_cell(&mut second_seed)
+        .unwrap();
+
+    let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
+    let observer = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        score_of(&accepted_cell(
+            txn.read(observer, first_id).await.unwrap().unwrap()
+        )),
+        1
+    );
+    assert_eq!(
+        score_of(&accepted_cell(
+            txn.read(observer, second_id).await.unwrap().unwrap()
+        )),
+        2
+    );
+
+    let writer = txn.begin().await.unwrap().unwrap();
+    let first = accepted_cell(txn.read(writer, first_id).await.unwrap().unwrap());
+    let second = accepted_cell(txn.read(writer, second_id).await.unwrap().unwrap());
+    assert_eq!(
+        txn.update(
+            writer,
+            counter_cell(
+                schema.id,
+                first_id,
+                score_of(&first) + 10,
+                "partial-first-new"
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.update(
+            writer,
+            counter_cell(
+                schema.id,
+                second_id,
+                score_of(&second) + 10,
+                "partial-second-new",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    let delayed_commit = transactions::data_site::install_commit_delay_for_cell(writer, second_id);
+    let prepare_client = txn.clone();
+    let prepare_task =
+        tokio::spawn(async move { prepare_client.prepare(writer).await.unwrap().unwrap() });
+    delayed_commit.wait_until_entered().await;
+
+    let first_runtime = servers_by_id[&first_server_id].current_database();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                first_runtime
+                    .chunks()
+                    .read_cell_snapshot(&first_id, u64::MAX)
+                    .unwrap(),
+                crate::ram::cell::SnapshotRead::Wait
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first participant should install pending before delayed peer");
+
+    assert_eq!(
+        score_of(&accepted_cell(
+            txn.read(observer, first_id).await.unwrap().unwrap()
+        )),
+        1,
+        "an already-selected old revision remains readable"
+    );
+    assert_eq!(
+        score_of(&accepted_cell(
+            txn.read(observer, second_id).await.unwrap().unwrap()
+        )),
+        2,
+        "an already-selected old revision remains readable on the delayed peer"
+    );
+
+    for (id, server_id) in [(first_id, first_server_id), (second_id, second_server_id)] {
+        let server_index = servers
+            .iter()
+            .position(|server| server.server_id == server_id)
+            .unwrap();
+        let data_site =
+            scoped_data_site_client_for_database(addresses[server_index], group, group).await;
+        let reader_tid = servers_by_id[&server_id].hlc.now();
+        assert!(matches!(
+            data_site
+                .read(server_id, reader_tid, reader_tid, id)
+                .await
+                .unwrap()
+                .payload,
+            TxnExecResult::Wait
+        ));
+    }
+
+    delayed_commit.release();
+    assert_eq!(prepare_task.await.unwrap(), TMPrepareResult::Success);
+    assert_eq!(
+        txn.commit(writer).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+    abort_txn(&txn, observer).await;
+
+    let first_current = first_runtime
+        .chunks()
+        .read_cell(&first_id)
+        .unwrap()
+        .to_owned();
+    let second_current = servers_by_id[&second_server_id]
+        .current_database()
+        .chunks()
+        .read_cell(&second_id)
+        .unwrap()
+        .to_owned();
+    assert_eq!(score_of(&first_current), 11);
+    assert_eq!(score_of(&second_current), 12);
+    assert_eq!(
+        first_current.header.revision_ts,
+        second_current.header.revision_ts
+    );
+
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn equal_commit_timestamp_is_invisible_to_snapshot() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5396";
+    let group = "txn_occ_equal_commit_boundary";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90144);
+
+    let mut old = counter_cell(schema.id, cell_id, 1, "equal-boundary-old");
+    runtime
+        .chunks()
+        .write_cell_at_revision(&mut old, crate::ram::cell::RevisionWrite::committed(100))
+        .unwrap();
+    let mut current = counter_cell(schema.id, cell_id, 2, "equal-boundary-current");
+    runtime
+        .chunks()
+        .update_cell_at_revision(
+            &mut current,
+            crate::ram::cell::RevisionWrite::committed(200),
+        )
+        .unwrap();
+
+    let snapshot = runtime.chunks().read_cell_snapshot(&cell_id, 200).unwrap();
+    match snapshot {
+        crate::ram::cell::SnapshotRead::Present(cell) => {
+            assert_eq!(score_of(&cell), 1);
+            assert_eq!(cell.header.revision_ts, 100);
+        }
+        other => panic!("expected the old revision at an equal boundary, got {other:?}"),
+    }
+
+    server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1591,6 +1970,56 @@ async fn head_read_certifies_snapshot_version_and_aborts_on_conflict() {
     assert_eq!(score_of(&after_write), 0);
 
     abort_txn(&txn, tid).await;
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn selected_read_certifies_snapshot_version_and_aborts_on_conflict() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5400";
+    let group = "txn_occ_selected_read_certificate";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let read_id = Id::new(0, 90145);
+    let write_id = Id::new(0, 90146);
+
+    let mut read_seed = counter_cell(schema.id, read_id, 3, "selected-cert-read");
+    runtime.chunks().write_cell(&mut read_seed).unwrap();
+    let mut write_seed = counter_cell(schema.id, write_id, 4, "selected-cert-write");
+    runtime.chunks().write_cell(&mut write_seed).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    let selected = accepted_cell(
+        txn.read_selected(tid, read_id, vec![hash_str("score")])
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(selected_score_of(&selected), 3);
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, write_id, 9, "selected-cert-write-new"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    let mut external = counter_cell(schema.id, read_id, 7, "selected-cert-external");
+    runtime.chunks().update_cell(&mut external).unwrap();
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
+    );
+    assert_eq!(
+        score_of(&runtime.chunks().read_cell(&write_id).unwrap().to_owned()),
+        4
+    );
+
     server.shutdown().await;
 }
 

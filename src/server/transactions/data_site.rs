@@ -1,7 +1,8 @@
 use super::*;
-use crate::ram::cell::OwnedCellRef;
+use crate::ram::cell::{InstalledRevision, OwnedCellRef, RevisionWrite};
+use crate::ram::history::RevisionState;
 use crate::ram::segs::SegmentReferenceGuard;
-use crate::ram::types::Id;
+use crate::ram::types::{FromHeader, Id};
 use crate::server::DatabaseRuntime;
 use crate::{
     index::builder::IndexBuilder,
@@ -133,6 +134,71 @@ pub(crate) fn install_prepare_delay_for_cell(tid: TxnId, id: Id) -> PrepareDelay
 }
 
 #[cfg(test)]
+pub(crate) struct CommitDelayHandle {
+    key: (TxnId, Id),
+    state: Arc<PrepareDelayState>,
+}
+
+#[cfg(test)]
+impl CommitDelayHandle {
+    pub(crate) async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    pub(crate) fn release(&self) {
+        if !self
+            .state
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.state.released_notify.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CommitDelayHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = commit_delay_hooks().lock();
+        if hooks
+            .get(&self.key)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            hooks.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+static COMMIT_DELAY_HOOKS: OnceLock<Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDelayState>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn commit_delay_hooks() -> &'static Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDelayState>>> {
+    COMMIT_DELAY_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_commit_delay_for_cell(tid: TxnId, id: Id) -> CommitDelayHandle {
+    let key = (tid, id);
+    let state = Arc::new(PrepareDelayState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    commit_delay_hooks()
+        .lock()
+        .insert(key.clone(), state.clone());
+    CommitDelayHandle { key, state }
+}
+
+#[cfg(test)]
 pub(crate) struct AbortCannotEndHandle {
     key: (TxnId, Id),
 }
@@ -193,6 +259,8 @@ struct Transaction {
     affected_cells: Vec<Id>,
     certified: BTreeMap<Id, PrepareOp>,
     coordinator_id: Option<u64>,
+    installed: BTreeMap<Id, InstalledRevision>,
+    commit_hlc: Option<Hlc>,
     last_activity: i64,
     history: CommitHistory,
     /// RAII guards that hold segment references during this transaction
@@ -259,7 +327,7 @@ service! {
     rpc head(server_id: u64, clock: Hlc, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<ObservedPoint<CellHeader>, ReadError>>;
     // two phase commit
     rpc prepare(coordinator_id: u64, clock: Hlc, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
-    rpc commit(clock: Hlc, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
+    rpc commit(commit_hlc: Hlc, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
 
     // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
     // for committed transaction, abort need to recover the data according to it's cells history
@@ -348,6 +416,8 @@ impl DataManager {
                 affected_cells: Vec::with_capacity(8), // Pre-allocate for common case
                 certified: BTreeMap::new(),
                 coordinator_id: None,
+                installed: BTreeMap::new(),
+                commit_hlc: None,
                 last_activity: get_time(),
                 history: BTreeMap::new(),
                 rollback_guards: Vec::with_capacity(4), // Pre-allocate for common case
@@ -422,6 +492,20 @@ impl DataManager {
         notified.await;
     }
 
+    #[cfg(test)]
+    fn take_matching_commit_delay(
+        tid: &TxnId,
+        cells: &[CommitOp],
+    ) -> Option<Arc<PrepareDelayState>> {
+        let mut hooks = commit_delay_hooks().lock();
+        let delayed_key = cells
+            .iter()
+            .filter_map(|op| Self::commit_op_cell_id(op).ok())
+            .map(|id| (*tid, id))
+            .find(|key| hooks.contains_key(key))?;
+        hooks.remove(&delayed_key)
+    }
+
     fn canonical_prepare_ops(ops: Vec<PrepareOp>) -> Result<Vec<PrepareOp>, DMPrepareResult> {
         let mut by_id = BTreeMap::new();
         for op in ops {
@@ -435,14 +519,19 @@ impl DataManager {
         Ok(by_id.into_values().collect())
     }
 
-    fn prepare_expectation_matches(&self, op: &PrepareOp) -> bool {
-        match (&op.expectation, self.chunks().head_cell(&op.id)) {
-            (CellExpectation::Present(expected_revision_ts), Ok(head)) => {
-                head.revision_ts == *expected_revision_ts
+    fn current_expectation(&self, id: &Id) -> Result<CellExpectation, ReadError> {
+        match self.chunks().head_snapshot(id, u64::MAX)? {
+            SnapshotRead::Present(header) => Ok(CellExpectation::Present(header.revision_ts)),
+            SnapshotRead::Absent(tombstone_revision_ts) => {
+                Ok(CellExpectation::Absent(tombstone_revision_ts))
             }
-            (CellExpectation::Absent(_), Err(ReadError::CellDoesNotExisted)) => true,
-            _ => false,
+            SnapshotRead::Wait => Err(ReadError::NotMatch),
         }
+    }
+
+    fn prepare_expectation_matches(&self, op: &PrepareOp) -> bool {
+        self.current_expectation(&op.id)
+            .is_ok_and(|current| current == op.expectation)
     }
 
     #[inline]
@@ -646,74 +735,18 @@ impl DataManager {
         expected_owner: Option<&TxnPriority>,
         affected_cell_ids: &[Id],
     ) -> (usize, Vec<LockReleaseFailure>) {
-        let mut released_count = 0;
+        let affected_cell_ids: Vec<_> = affected_cell_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let mut failures = Vec::new();
         let current_time = get_time();
-
-        for cell_id in affected_cell_ids {
+        let mut cell_mutexes = Vec::with_capacity(affected_cell_ids.len());
+        for cell_id in &affected_cell_ids {
             if let Some(cell_mutex) = self.cells.get(cell_id) {
-                let mut meta = cell_mutex.lock();
-
-                match (expected_owner, &meta.owner) {
-                    (Some(expected_owner), Some(owner)) if owner == expected_owner => {
-                        // Release the lock
-                        let lock_age = meta
-                            .lock_acquired_at
-                            .map(|acquired| current_time - acquired)
-                            .unwrap_or(0);
-
-                        meta.owner = None;
-                        meta.lock_acquired_at = None;
-                        released_count += 1;
-
-                        debug!(
-                            "Released lock on cell {:?} owned by {:?} (held for {}ms)",
-                            cell_id, expected_owner, lock_age
-                        );
-                    }
-                    (Some(expected_owner), Some(owner)) => {
-                        let reason = format!(
-                            "Cell lock owned by different transaction: expected {:?}, found {:?}",
-                            expected_owner, owner
-                        );
-                        warn!(
-                            "Cannot release lock on cell {:?} for {:?}: {}",
-                            cell_id, expected_owner, reason
-                        );
-                        failures.push(LockReleaseFailure {
-                            cell_id: *cell_id,
-                            reason,
-                        });
-                    }
-                    (Some(expected_owner), None) => {
-                        debug!(
-                            "Lock on cell {:?} not held by {:?} (already released or never acquired)",
-                            cell_id, expected_owner
-                        );
-                        released_count += 1;
-                    }
-                    (None, Some(owner)) => {
-                        let reason = format!(
-                            "Missing coordinator id for release; cell still owned by {:?}",
-                            owner
-                        );
-                        warn!(
-                            "Cannot release lock on cell {:?} without expected owner: {}",
-                            cell_id, reason
-                        );
-                        failures.push(LockReleaseFailure {
-                            cell_id: *cell_id,
-                            reason,
-                        });
-                    }
-                    (None, None) => {
-                        debug!(
-                            "Lock on cell {:?} already released before coordinator was known",
-                            cell_id
-                        );
-                        released_count += 1;
-                    }
-                }
+                cell_mutexes.push(cell_mutex);
             } else {
                 let reason = "Cell metadata not found (may have been cleaned up)".to_string();
                 warn!(
@@ -726,8 +759,55 @@ impl DataManager {
                 });
             }
         }
+        if !failures.is_empty() {
+            return (0, failures);
+        }
 
-        (released_count, failures)
+        let mut cell_guards: Vec<_> = cell_mutexes.iter().map(|cell| cell.lock()).collect();
+        for (cell_id, meta) in affected_cell_ids.iter().zip(cell_guards.iter()) {
+            match (expected_owner, &meta.owner) {
+                (Some(expected), Some(actual)) if expected == actual => {}
+                (Some(_), None) | (None, None) => {}
+                (Some(expected), Some(actual)) => {
+                    failures.push(LockReleaseFailure {
+                        cell_id: *cell_id,
+                        reason: format!(
+                            "Cell lock owned by different transaction: expected {:?}, found {:?}",
+                            expected, actual
+                        ),
+                    });
+                }
+                (None, Some(actual)) => {
+                    failures.push(LockReleaseFailure {
+                        cell_id: *cell_id,
+                        reason: format!(
+                            "Missing coordinator id for release; cell still owned by {:?}",
+                            actual
+                        ),
+                    });
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return (0, failures);
+        }
+
+        for (cell_id, meta) in affected_cell_ids.iter().zip(cell_guards.iter_mut()) {
+            if meta.owner.is_some() {
+                let lock_age = meta
+                    .lock_acquired_at
+                    .map(|acquired| current_time - acquired)
+                    .unwrap_or(0);
+                debug!(
+                    "Released lock on cell {:?} owned by {:?} (held for {}ms)",
+                    cell_id, expected_owner, lock_age
+                );
+            }
+            meta.owner = None;
+            meta.lock_acquired_at = None;
+        }
+
+        (affected_cell_ids.len(), failures)
     }
 
     fn warn_on_index_wait_results<I>(&self, tid: &TxnId, results: I)
@@ -759,7 +839,7 @@ impl DataManager {
         &self,
         txn_lock: &TxnMutex,
         tid: &TxnId,
-        effective_ts: &TxnId,
+        commit_hlc: Hlc,
         cells: Vec<CommitOp>,
     ) -> DMCommitResult {
         let mut txn = txn_lock.lock();
@@ -772,6 +852,13 @@ impl DataManager {
                 return DMCommitResult::CheckFailed(CheckError::AlreadyAborted);
             }
             TxnState::Committed => {
+                if txn.commit_hlc == Some(commit_hlc)
+                    && Self::validate_commit_subset(&txn, &cells).is_ok()
+                    && Self::validate_commit_payload(&txn, &cells).is_ok()
+                    && self.installed_revisions_agree(&txn)
+                {
+                    return DMCommitResult::Success;
+                }
                 return DMCommitResult::CheckFailed(CheckError::AlreadyCommitted);
             }
             TxnState::Cleanup => {
@@ -785,6 +872,15 @@ impl DataManager {
         }
         if let Err(result) = Self::validate_commit_payload(&txn, &cells) {
             return result;
+        }
+        if let Err(result) = Self::validate_commit_hlc(&txn, tid, commit_hlc) {
+            return result;
+        }
+        if txn
+            .commit_hlc
+            .is_some_and(|installed_hlc| installed_hlc != commit_hlc)
+        {
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
 
         let Some(coordinator_id) = txn.coordinator_id else {
@@ -810,37 +906,33 @@ impl DataManager {
             return result;
         }
 
+        txn.commit_hlc = Some(commit_hlc);
         crate::ram::chunk::set_transaction_context(true);
         let mut write_error: Option<(Id, WriteError)> = None;
         {
             for cell_op in cells {
+                let cell_id = Self::commit_op_cell_id(&cell_op)
+                    .expect("commit payload validation rejects non-mutation ops");
+                if txn.installed.contains_key(&cell_id) {
+                    continue;
+                }
+
+                let meta_index = guarded_cell_ids
+                    .binary_search(&cell_id)
+                    .expect("prepared cell metadata must exist");
+                let meta = &mut cell_guards[meta_index];
                 match cell_op {
-                    CommitOp::Read(_, _) => continue,
-                    CommitOp::None => unreachable!("commit payload validation rejects None ops"),
                     CommitOp::Write(mut cell) => {
-                        let cell_id = cell.id();
-                        let meta_index = guarded_cell_ids
-                            .binary_search(&cell_id)
-                            .expect("prepared cell metadata must exist");
-                        let meta = &mut cell_guards[meta_index];
-                        let should_skip = effective_ts < &meta.write;
-                        let write_ts = meta.write.clone();
-
-                        if should_skip {
-                            debug!(
-                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
-                                cell_id, effective_ts, write_ts
-                            );
-                            continue;
-                        }
-
-                        match self.chunks().write_cell(&mut cell) {
-                            Ok(header) => {
+                        match self.chunks().write_cell_at_revision(
+                            &mut cell,
+                            RevisionWrite::pending(commit_hlc.ts),
+                        ) {
+                            Ok(installed) => {
                                 if let Some(undo_log) = self.undo_log() {
                                     let undo_entry = super::undo_log::UndoLogEntry::new_write(
                                         tid.clone(),
                                         cell_id,
-                                        header.revision_ts,
+                                        commit_hlc.ts,
                                     );
                                     if let Err(error) = undo_log.write_undo_entry(undo_entry) {
                                         error!(
@@ -850,8 +942,9 @@ impl DataManager {
                                     }
                                 }
                                 txn.history
-                                    .insert(cell_id, CellHistory::new(None, header.revision_ts));
-                                meta.write = effective_ts.clone();
+                                    .insert(cell_id, CellHistory::new(None, commit_hlc.ts));
+                                txn.installed.insert(cell_id, installed);
+                                meta.write = commit_hlc;
                             }
                             Err(error) => {
                                 write_error = Some((cell_id, error));
@@ -863,20 +956,6 @@ impl DataManager {
                         let expected_revision_ts = txn
                             .certified_present_revision_ts(cell_id)
                             .expect("commit payload validation requires present certification");
-                        let meta_index = guarded_cell_ids
-                            .binary_search(cell_id)
-                            .expect("prepared cell metadata must exist");
-                        let meta = &mut cell_guards[meta_index];
-                        let should_skip = effective_ts < &meta.write;
-                        let write_ts = meta.write.clone();
-
-                        if should_skip {
-                            debug!(
-                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
-                                cell_id, effective_ts, write_ts
-                            );
-                            continue;
-                        }
 
                         let (cell_addr, old_cell_ref) = {
                             let shared_cell = match self.chunks().read_cell(cell_id) {
@@ -926,13 +1005,15 @@ impl DataManager {
                             }
                         }
 
-                        match self.chunks().remove_cell_by(cell_id, |cell| {
-                            cell.header.revision_ts == expected_revision_ts
-                        }) {
-                            Ok(()) => {
+                        match self
+                            .chunks()
+                            .remove_cell_at_revision(cell_id, RevisionWrite::pending(commit_hlc.ts))
+                        {
+                            Ok(installed) => {
                                 txn.history
                                     .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
-                                meta.write = effective_ts.clone();
+                                txn.installed.insert(*cell_id, installed);
+                                meta.write = commit_hlc;
                                 txn.rollback_guards.push(guard);
                             }
                             Err(error) => {
@@ -946,22 +1027,8 @@ impl DataManager {
                         let expected_revision_ts = txn
                             .certified_present_revision_ts(&cell_id)
                             .expect("commit payload validation requires present certification");
-                        let meta_index = guarded_cell_ids
-                            .binary_search(&cell_id)
-                            .expect("prepared cell metadata must exist");
-                        let meta = &mut cell_guards[meta_index];
-                        let should_skip = effective_ts < &meta.write;
-                        let write_ts = meta.write.clone();
 
-                        if should_skip {
-                            debug!(
-                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
-                                cell_id, effective_ts, write_ts
-                            );
-                            continue;
-                        }
-
-                        let cell_addr = {
+                        let (cell_addr, old_cell_ref) = {
                             let shared_cell = match self.chunks().read_cell(&cell_id) {
                                 Ok(cell) => cell,
                                 Err(read_error) => {
@@ -974,7 +1041,10 @@ impl DataManager {
                                 write_error = Some((cell_id, WriteError::CellRevisionMismatch));
                                 break;
                             }
-                            shared_cell.cell_guard().get_ptr()
+                            (
+                                shared_cell.cell_guard().get_ptr(),
+                                shared_cell.to_owned().into_ref(),
+                            )
                         };
                         let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
@@ -1006,23 +1076,17 @@ impl DataManager {
                                 error!("Failed to write undo log entry: {:?}", error);
                             }
                         }
-                        let mut old_cell_ref = None;
-                        match self.chunks().update_cell_by(&cell_id, |cell_to_update| {
-                            if cell_to_update.header.revision_ts == expected_revision_ts {
-                                old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
-                                cell.header.revision_ts = expected_revision_ts;
-                                Some(cell)
-                            } else {
-                                None
-                            }
-                        }) {
-                            Ok(updated_cell) => {
-                                debug_assert!(old_cell_ref.is_some());
+                        match self.chunks().update_cell_at_revision(
+                            &mut cell,
+                            RevisionWrite::pending(commit_hlc.ts),
+                        ) {
+                            Ok(installed) => {
                                 txn.history.insert(
                                     cell_id,
-                                    CellHistory::new(old_cell_ref, updated_cell.header.revision_ts),
+                                    CellHistory::new(Some(old_cell_ref), commit_hlc.ts),
                                 );
-                                meta.write = effective_ts.clone();
+                                txn.installed.insert(cell_id, installed);
+                                meta.write = commit_hlc;
                                 txn.rollback_guards.push(guard);
                             }
                             Err(error) => {
@@ -1030,6 +1094,9 @@ impl DataManager {
                                 break;
                             }
                         }
+                    }
+                    CommitOp::Read(_, _) | CommitOp::None => {
+                        unreachable!("commit payload validation rejects non-mutation ops")
                     }
                 }
             }
@@ -1039,6 +1106,9 @@ impl DataManager {
 
         if let Some((id, error)) = write_error {
             return Self::map_commit_write_error(&txn, id, error);
+        }
+        if !self.installed_revisions_agree(&txn) {
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
 
         txn.state = TxnState::Committed;
@@ -1062,6 +1132,69 @@ impl DataManager {
         }
 
         DMCommitResult::Success
+    }
+
+    fn validate_commit_hlc(
+        txn: &Transaction,
+        tid: &TxnId,
+        commit_hlc: Hlc,
+    ) -> Result<(), DMCommitResult> {
+        if commit_hlc.ts <= tid.ts
+            || txn.certified.values().any(|op| {
+                let certified_revision = match op.expectation {
+                    CellExpectation::Present(revision_ts)
+                    | CellExpectation::Absent(Some(revision_ts)) => Some(revision_ts),
+                    CellExpectation::Absent(None) => None,
+                };
+                certified_revision.is_some_and(|revision_ts| commit_hlc.ts <= revision_ts)
+            })
+        {
+            Err(DMCommitResult::CheckFailed(CheckError::CannotEnd))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn installed_revision_agrees(&self, installed: &InstalledRevision, commit_hlc: Hlc) -> bool {
+        if installed.node.revision_ts != commit_hlc.ts {
+            return false;
+        }
+        let (state, location) = installed.node.load();
+        if self.chunks().history_location(&installed.id, commit_hlc.ts) != Some(location) {
+            return false;
+        }
+        match state {
+            RevisionState::PendingPresent | RevisionState::CommittedPresent => {
+                self.chunks().head_cell(&installed.id).is_ok_and(|header| {
+                    Id::from_header(&header) == installed.id && header.revision_ts == commit_hlc.ts
+                })
+            }
+            RevisionState::PendingDeleted | RevisionState::CommittedDeleted => matches!(
+                self.chunks().head_cell(&installed.id),
+                Err(ReadError::CellDoesNotExisted)
+            ),
+            RevisionState::Aborted | RevisionState::Expired => false,
+        }
+    }
+
+    fn installed_revisions_agree(&self, txn: &Transaction) -> bool {
+        let write_ids: Vec<_> = txn
+            .certified
+            .iter()
+            .filter(|(_, op)| op.intent == PrepareIntent::Write)
+            .map(|(id, _)| *id)
+            .collect();
+        if write_ids.is_empty() {
+            return txn.installed.is_empty();
+        }
+        let Some(commit_hlc) = txn.commit_hlc else {
+            return false;
+        };
+        write_ids.into_iter().all(|id| {
+            txn.installed
+                .get(&id)
+                .is_some_and(|installed| self.installed_revision_agrees(installed, commit_hlc))
+        })
     }
 
     fn validate_commit_subset(txn: &Transaction, cells: &[CommitOp]) -> Result<(), DMCommitResult> {
@@ -1117,11 +1250,7 @@ impl DataManager {
                     certified.intent == PrepareIntent::Write
                         && matches!(certified.expectation, CellExpectation::Present(_))
                 }
-                CommitOp::Read(_, revision_ts) => {
-                    certified.intent == PrepareIntent::Read
-                        && certified.expectation == CellExpectation::Present(*revision_ts)
-                }
-                CommitOp::None => false,
+                CommitOp::Read(_, _) | CommitOp::None => false,
             };
 
             if !valid {
@@ -1138,90 +1267,15 @@ impl DataManager {
         cells: &[CommitOp],
     ) -> Result<(), DMCommitResult> {
         for op in cells {
-            match op {
-                CommitOp::Write(cell) => match self.chunks().read_cell(&cell.id()) {
-                    Ok(_) => {
-                        return Err(Self::map_commit_write_error(
-                            txn,
-                            cell.id(),
-                            WriteError::CellAlreadyExisted,
-                        ));
-                    }
-                    Err(ReadError::CellDoesNotExisted) => {}
-                    Err(read_error) => {
-                        return Err(DMCommitResult::WriteError(
-                            cell.id(),
-                            WriteError::ReadError(read_error),
-                        ));
-                    }
-                },
-                CommitOp::Update(cell) => {
-                    let cell_id = cell.id();
-                    let expected_revision_ts = txn
-                        .certified_present_revision_ts(&cell_id)
-                        .expect("commit payload validation requires present certification");
-                    let current_revision_ts = match self.chunks().read_cell(&cell_id) {
-                        Ok(shared_cell) => shared_cell.header.revision_ts,
-                        Err(read_error) => {
-                            return Err(Self::map_commit_write_error(
-                                txn,
-                                cell_id,
-                                WriteError::ReadError(read_error),
-                            ));
-                        }
-                    };
-                    if current_revision_ts != expected_revision_ts {
-                        return Err(Self::map_commit_write_error(
-                            txn,
-                            cell_id,
-                            WriteError::CellRevisionMismatch,
-                        ));
-                    }
-                }
-                CommitOp::Remove(cell_id) => {
-                    let expected_revision_ts = txn
-                        .certified_present_revision_ts(cell_id)
-                        .expect("commit payload validation requires present certification");
-                    let current_revision_ts = match self.chunks().read_cell(cell_id) {
-                        Ok(shared_cell) => shared_cell.header.revision_ts,
-                        Err(read_error) => {
-                            return Err(Self::map_commit_write_error(
-                                txn,
-                                *cell_id,
-                                WriteError::ReadError(read_error),
-                            ));
-                        }
-                    };
-                    if current_revision_ts != expected_revision_ts {
-                        return Err(Self::map_commit_write_error(
-                            txn,
-                            *cell_id,
-                            WriteError::CellRevisionMismatch,
-                        ));
-                    }
-                }
-                CommitOp::Read(cell_id, revision_ts) => {
-                    let current_revision_ts = match self.chunks().read_cell(cell_id) {
-                        Ok(shared_cell) => shared_cell.header.revision_ts,
-                        Err(read_error) => {
-                            return Err(Self::map_commit_write_error(
-                                txn,
-                                *cell_id,
-                                WriteError::ReadError(read_error),
-                            ));
-                        }
-                    };
-                    if current_revision_ts != *revision_ts {
-                        return Err(Self::map_commit_write_error(
-                            txn,
-                            *cell_id,
-                            WriteError::CellRevisionMismatch,
-                        ));
-                    }
-                }
-                CommitOp::None => {
-                    return Err(DMCommitResult::CheckFailed(CheckError::CannotEnd));
-                }
+            let cell_id = Self::commit_op_cell_id(op).map_err(DMCommitResult::CheckFailed)?;
+            if txn.installed.contains_key(&cell_id) {
+                continue;
+            }
+            let certified = txn
+                .certified_op(&cell_id)
+                .ok_or(DMCommitResult::CheckFailed(CheckError::CannotEnd))?;
+            if self.current_expectation(&cell_id).ok().as_ref() != Some(&certified.expectation) {
+                return Err(DMCommitResult::CellChanged(cell_id));
             }
         }
 
@@ -1489,7 +1543,7 @@ mod tests {
         tid: &TxnId,
         ops: Vec<CommitOp>,
     ) -> DMCommitResult {
-        <DataManager as Service>::commit(manager, tid.clone(), tid.clone(), ops)
+        <DataManager as Service>::commit(manager, manager.hlc.now(), tid.clone(), ops)
             .await
             .payload
     }
@@ -2363,9 +2417,10 @@ mod tests {
             let tid = manager.hlc.now();
             prepare_local_txn(&manager, &tid, vec![affected_id]);
 
-            let result = <DataManager as Service>::commit(&manager, tid.clone(), tid.clone(), ops)
-                .await
-                .payload;
+            let result =
+                <DataManager as Service>::commit(&manager, manager.hlc.now(), tid.clone(), ops)
+                    .await
+                    .payload;
             assert_eq!(result, DMCommitResult::CheckFailed(CheckError::CannotEnd));
 
             let txn_lock = manager.txns.get(&tid).expect("txn should remain tracked");
@@ -2416,7 +2471,7 @@ mod tests {
             .to_owned();
         let read_only_result = <DataManager as Service>::commit(
             &manager,
-            read_only_tid.clone(),
+            manager.hlc.now(),
             read_only_tid.clone(),
             vec![],
         )
@@ -2463,7 +2518,7 @@ mod tests {
         let empty_before_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
         let empty_result = <DataManager as Service>::commit(
             &manager,
-            empty_tid.clone(),
+            manager.hlc.now(),
             empty_tid.clone(),
             vec![],
         )
@@ -2523,7 +2578,7 @@ mod tests {
         let partial_before_read = runtime.chunks().read_cell(&read_id).unwrap().to_owned();
         let partial_result = <DataManager as Service>::commit(
             &manager,
-            partial_tid.clone(),
+            manager.hlc.now(),
             partial_tid.clone(),
             vec![CommitOp::Read(read_id, read_version)],
         )
@@ -2562,7 +2617,7 @@ mod tests {
         prepare_local_txn(&manager, &extra_tid, vec![write_id, read_id]);
         let extra_result = <DataManager as Service>::commit(
             &manager,
-            extra_tid.clone(),
+            manager.hlc.now(),
             extra_tid.clone(),
             vec![CommitOp::Remove(unprepared)],
         )
@@ -2581,7 +2636,7 @@ mod tests {
         prepare_local_txn(&manager, &duplicate_tid, vec![write_id, read_id]);
         let duplicate_result = <DataManager as Service>::commit(
             &manager,
-            duplicate_tid.clone(),
+            manager.hlc.now(),
             duplicate_tid.clone(),
             vec![CommitOp::Remove(write_id), CommitOp::Remove(write_id)],
         )
@@ -2632,7 +2687,7 @@ mod tests {
 
         let result = <DataManager as Service>::commit(
             &manager,
-            tid.clone(),
+            manager.hlc.now(),
             tid.clone(),
             vec![CommitOp::Update(counter_cell(
                 schema.id,
@@ -2740,7 +2795,7 @@ mod tests {
 
         let commit = <DataManager as Service>::commit(
             &manager,
-            t1.clone(),
+            manager.hlc.now(),
             t1.clone(),
             vec![CommitOp::Update(counter_cell(
                 schema.id,
@@ -2825,7 +2880,7 @@ mod tests {
 
         let commit = <DataManager as Service>::commit(
             &manager,
-            tid.clone(),
+            manager.hlc.now(),
             tid.clone(),
             vec![CommitOp::Update(counter_cell(
                 schema.id,
@@ -2898,9 +2953,8 @@ mod tests {
         let initial_revision_ts =
             seed_cell_revision(&runtime, schema.id, cell_id, initial_score, 0);
         let t1 = test_hlc(1, 24);
-        let t2 = test_hlc(1, 25);
         let t1_owner = TxnPriority::new(t1.clone(), 24);
-        let t2_owner = TxnPriority::new(t2.clone(), 25);
+        let t2_owner = TxnPriority::new(test_hlc(1, 25), 25);
         let t1_prepare = PrepareOp {
             id: cell_id,
             expectation: CellExpectation::Present(initial_revision_ts),
@@ -2920,7 +2974,7 @@ mod tests {
 
         let commit_t1 = <DataManager as Service>::commit(
             &manager,
-            t1.clone(),
+            manager.hlc.now(),
             t1.clone(),
             vec![CommitOp::Update(counter_cell(
                 schema.id,
@@ -2948,23 +3002,11 @@ mod tests {
         {
             let meta = manager.cell_meta_mutex(&cell_id);
             let mut meta = meta.lock();
-            meta.lock_acquired_at = Some(get_time() - LOCK_TIMEOUT_MS - 1);
+            // Simulate stale-owner replacement directly. A real prepare must not
+            // observe or certify t1's pending revision before end promotes it.
+            meta.owner = Some(t2_owner.clone());
+            meta.lock_acquired_at = Some(get_time());
         }
-
-        let prepare_t2 = <DataManager as Service>::prepare(
-            &manager,
-            25,
-            t2.clone(),
-            t2.clone(),
-            vec![PrepareOp {
-                id: cell_id,
-                expectation: CellExpectation::Present(committed_version),
-                intent: PrepareIntent::Write,
-            }],
-        )
-        .await
-        .payload;
-        assert_eq!(prepare_t2, DMPrepareResult::Success);
         assert_eq!(
             manager.cell_meta_mutex(&cell_id).lock().owner,
             Some(t2_owner.clone())
@@ -2988,21 +3030,19 @@ mod tests {
 
         assert_ne!(
             manager.cell_meta_mutex(&cell_id).lock().owner,
-            Some(t1_owner)
+            Some(t1_owner.clone())
         );
         assert_eq!(
             manager.cell_meta_mutex(&cell_id).lock().owner,
             Some(t2_owner.clone())
         );
 
-        let abort_t2 = <DataManager as Service>::abort(&manager, t2.clone(), t2.clone())
-            .await
-            .payload;
-        assert_eq!(abort_t2, AbortResult::Success(None));
-        let end_t2 = <DataManager as Service>::end(&manager, t2.clone(), t2.clone())
-            .await
-            .payload;
-        assert_eq!(end_t2, EndResult::Success);
+        {
+            let meta = manager.cell_meta_mutex(&cell_id);
+            let mut meta = meta.lock();
+            meta.owner = Some(t1_owner);
+            meta.lock_acquired_at = Some(get_time());
+        }
 
         let end_t1 = <DataManager as Service>::end(&manager, t1.clone(), t1.clone())
             .await
@@ -3517,6 +3557,233 @@ mod tests {
 
         server.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepare_certifies_exact_tombstone_never_absence_and_full_id() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5397";
+        let group = "txn_data_site_exact_absence";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let deleted_id = Id::new(0, 99030);
+        let never_id = Id::new(0, 99031);
+        let colliding_id = Id::new(1, deleted_id.lower);
+
+        let deleted_revision = seed_cell_revision(&runtime, schema.id, deleted_id, 1, 0);
+        runtime.chunks().remove_cell(&deleted_id).unwrap();
+        let tombstone_revision = match manager.current_expectation(&deleted_id).unwrap() {
+            CellExpectation::Absent(Some(revision_ts)) => revision_ts,
+            other => panic!("expected exact tombstone, got {other:?}"),
+        };
+        assert!(tombstone_revision > deleted_revision);
+
+        let wrong_tid = manager.hlc.now();
+        let wrong = prepare_ops_local(
+            &manager,
+            41,
+            &wrong_tid,
+            vec![PrepareOp {
+                id: deleted_id,
+                expectation: CellExpectation::Absent(Some(tombstone_revision - 1)),
+                intent: PrepareIntent::Read,
+            }],
+        )
+        .await;
+        assert_eq!(wrong, DMPrepareResult::NotRealizable);
+        assert!(manager.cell_meta_mutex(&deleted_id).lock().owner.is_none());
+
+        let exact_tid = manager.hlc.now();
+        let exact = prepare_ops_local(
+            &manager,
+            42,
+            &exact_tid,
+            vec![
+                PrepareOp {
+                    id: deleted_id,
+                    expectation: CellExpectation::Absent(Some(tombstone_revision)),
+                    intent: PrepareIntent::Read,
+                },
+                PrepareOp {
+                    id: never_id,
+                    expectation: CellExpectation::Absent(None),
+                    intent: PrepareIntent::Write,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(exact, DMPrepareResult::Success);
+        abort_and_end_local(&manager, &exact_tid).await;
+
+        let collision_tid = manager.hlc.now();
+        let collision = prepare_ops_local(
+            &manager,
+            43,
+            &collision_tid,
+            vec![PrepareOp {
+                id: colliding_id,
+                expectation: CellExpectation::Present(tombstone_revision),
+                intent: PrepareIntent::Read,
+            }],
+        )
+        .await;
+        assert_eq!(collision, DMPrepareResult::NotRealizable);
+        assert!(manager
+            .cell_meta_mutex(&colliding_id)
+            .lock()
+            .owner
+            .is_none());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_point_observation_is_a_prepare_certificate() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5398";
+        let group = "txn_data_site_partial_certificate";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let read_id = Id::new(0, 99032);
+        let write_id = Id::new(0, 99033);
+        let read_revision = seed_cell_revision(&runtime, schema.id, read_id, 1, 0);
+        let write_revision = seed_cell_revision(&runtime, schema.id, write_id, 2, 0);
+        let tid = manager.hlc.now();
+
+        let observed =
+            <DataManager as Service>::read_partial_raw(&manager, 44, tid, tid, read_id, 0, 8)
+                .await
+                .payload
+                .unwrap();
+        assert_eq!(
+            observed.expectation,
+            CellExpectation::Present(read_revision)
+        );
+
+        let mut external = counter_cell(schema.id, read_id, 7, "partial-cert-external");
+        runtime.chunks().update_cell(&mut external).unwrap();
+
+        let prepare = prepare_ops_local(
+            &manager,
+            44,
+            &tid,
+            vec![
+                PrepareOp {
+                    id: read_id,
+                    expectation: observed.expectation,
+                    intent: PrepareIntent::Read,
+                },
+                PrepareOp {
+                    id: write_id,
+                    expectation: CellExpectation::Present(write_revision),
+                    intent: PrepareIntent::Write,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(prepare, DMPrepareResult::NotRealizable);
+        assert!(manager.cell_meta_mutex(&read_id).lock().owner.is_none());
+        assert!(manager.cell_meta_mutex(&write_id).lock().owner.is_none());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_installs_pending_retries_same_hlc_and_end_promotes() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5399";
+        let group = "txn_data_site_pending_commit";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99034);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        let op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_revision),
+            intent: PrepareIntent::Write,
+        };
+        assert_eq!(
+            prepare_ops_local(&manager, 45, &tid, vec![op]).await,
+            DMPrepareResult::Success
+        );
+
+        let commit_hlc = manager.hlc.now();
+        let commit_op = CommitOp::Update(counter_cell(schema.id, cell_id, 9, "pending-commit-new"));
+        let first =
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![commit_op.clone()])
+                .await
+                .payload;
+        assert_eq!(first, DMCommitResult::Success);
+
+        let txn = manager.txns.get(&tid).unwrap();
+        {
+            let txn = txn.lock();
+            assert_eq!(txn.commit_hlc, Some(commit_hlc));
+            assert_eq!(txn.installed.len(), 1);
+            assert_eq!(
+                txn.installed[&cell_id].node.load().0,
+                RevisionState::PendingPresent
+            );
+        }
+        assert!(matches!(
+            runtime
+                .chunks()
+                .read_cell_snapshot(&cell_id, u64::MAX)
+                .unwrap(),
+            SnapshotRead::Wait
+        ));
+        let reader_tid = manager.hlc.now();
+        assert!(matches!(
+            <DataManager as Service>::read(&manager, 46, reader_tid, reader_tid, cell_id,)
+                .await
+                .payload,
+            TxnExecResult::Wait
+        ));
+
+        let retry =
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![commit_op.clone()])
+                .await
+                .payload;
+        assert_eq!(retry, DMCommitResult::Success);
+        let conflicting =
+            <DataManager as Service>::commit(&manager, manager.hlc.now(), tid, vec![commit_op])
+                .await
+                .payload;
+        assert_eq!(
+            conflicting,
+            DMCommitResult::CheckFailed(CheckError::AlreadyCommitted)
+        );
+
+        let end = <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+            .await
+            .payload;
+        assert_eq!(end, EndResult::Success);
+        let current = runtime
+            .chunks()
+            .read_cell_snapshot(&cell_id, u64::MAX)
+            .unwrap();
+        match current {
+            SnapshotRead::Present(cell) => {
+                assert_eq!(cell.header.revision_ts, commit_hlc.ts);
+                assert_eq!(*cell.data["score"].u64().unwrap(), 9);
+            }
+            other => panic!("expected promoted commit, got {other:?}"),
+        }
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::NotExisted)
+        );
+
+        server.shutdown().await;
+    }
 }
 
 impl Service for DataManager {
@@ -3692,20 +3959,26 @@ impl Service for DataManager {
                     cell_guards.push(meta);
                 }
 
+                let lock_time = get_time();
+                for meta in &mut cell_guards {
+                    meta.owner = Some(requester.clone());
+                    meta.lock_acquired_at = Some(lock_time);
+                }
+
                 for op in &prepared_ops {
                     if !self.prepare_expectation_matches(op) {
                         debug!(
                             "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
                             requester, op.id, op
                         );
+                        for meta in &mut cell_guards {
+                            if meta.owner.as_ref() == Some(&requester) {
+                                meta.owner = None;
+                                meta.lock_acquired_at = None;
+                            }
+                        }
                         break 'result DMPrepareResult::NotRealizable;
                     }
-                }
-
-                let lock_time = get_time();
-                for meta in &mut cell_guards {
-                    meta.owner = Some(requester.clone());
-                    meta.lock_acquired_at = Some(lock_time);
                 }
 
                 txn.certified = prepared_ops_by_id;
@@ -3723,16 +3996,29 @@ impl Service for DataManager {
     }
     fn commit(
         &self,
-        clock: Hlc,
+        commit_hlc: Hlc,
         tid: TxnId,
         cells: Vec<CommitOp>,
     ) -> BoxFuture<'_, DataSiteResponse<DMCommitResult>> {
         #[cfg(feature = "occ_phase_profile")]
         let phase_guard =
             super::phase_profile::guard(super::phase_profile::Phase::ParticipantCommit);
-        self.update_clock(clock);
+        self.update_clock(commit_hlc);
 
-        let effective_ts = clock.max(tid);
+        #[cfg(test)]
+        if let Some(state) = Self::take_matching_commit_delay(&tid, &cells) {
+            return async move {
+                #[cfg(feature = "occ_phase_profile")]
+                let _phase_guard = phase_guard;
+                Self::await_prepare_delay(&state).await;
+                let payload = match self.find_transaction(&tid) {
+                    Some(txn_lock) => self.apply_commit_ops(&txn_lock, &tid, commit_hlc, cells),
+                    None => DMCommitResult::CheckFailed(CheckError::NotExisted),
+                };
+                DataSiteResponse::new(self.hlc.now(), payload)
+            }
+            .boxed();
+        }
 
         let Some(txn_lock) = self.find_transaction(&tid) else {
             return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted));
@@ -3743,8 +4029,7 @@ impl Service for DataManager {
             let scoped_commit = IndexBuilder::with_request_index_scope({
                 let txn_lock = txn_lock.clone();
                 let tid = tid.clone();
-                let effective_ts = effective_ts.clone();
-                move || self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells)
+                move || self.apply_commit_ops(&txn_lock, &tid, commit_hlc, cells)
             });
             return async move {
                 #[cfg(feature = "occ_phase_profile")]
@@ -3764,7 +4049,7 @@ impl Service for DataManager {
 
         #[cfg(feature = "occ_phase_profile")]
         let _phase_guard = phase_guard;
-        self.response_with(self.apply_commit_ops(&txn_lock, &tid, &effective_ts, cells))
+        self.response_with(self.apply_commit_ops(&txn_lock, &tid, commit_hlc, cells))
     }
     fn abort(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
@@ -3854,6 +4139,29 @@ impl Service for DataManager {
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
                 return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
             }
+            if txn.state == TxnState::Committed {
+                if !self.installed_revisions_agree(&txn) {
+                    return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                }
+                for installed in txn.installed.values() {
+                    match installed.node.load().0 {
+                        RevisionState::PendingPresent | RevisionState::PendingDeleted => {
+                            if self.chunks().promote_revision(installed).is_err() {
+                                return self
+                                    .response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                            }
+                        }
+                        RevisionState::CommittedPresent | RevisionState::CommittedDeleted => {}
+                        RevisionState::Aborted | RevisionState::Expired => {
+                            return self
+                                .response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                        }
+                    }
+                }
+                if !self.installed_revisions_agree(&txn) {
+                    return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                }
+            }
             debug!(
                 "AFFECTED: {}, {:?}, {:?}",
                 txn.affected_cells.len(),
@@ -3936,35 +4244,33 @@ impl Service for DataManager {
         async move {
             #[cfg(feature = "occ_phase_profile")]
             let _phase_guard = phase_guard;
-            // Release all segment references before wiping out transaction
-            let guards_to_drop = {
-                if let Some(txn_lock) = self.find_transaction(&tid) {
-                    let mut txn = txn_lock.lock();
-                    std::mem::take(&mut txn.rollback_guards)
-                } else {
-                    Vec::new()
-                }
-            };
-            drop(guards_to_drop); // Drop guards, releasing all segment references
-
-            // Write commit/abort marker to undo log based on transaction state
-            if let Some(undo_log) = self.undo_log() {
-                let log_result = match txn_state {
-                    TxnState::Committed => undo_log.write_commit_marker(&tid),
-                    TxnState::Aborted => undo_log.write_abort_marker(&tid),
-                    _ => Ok(()), // No marker needed for other states
-                };
-                if let Err(e) = log_result {
-                    error!("Failed to write transaction completion marker: {:?}", e);
-                }
-            }
-
-            self.wipe_out_transaction(&tid);
-            self.cleanup_signal.store(true, Relaxed);
-
             // Return appropriate result based on lock release outcome
             match lock_release_result {
                 Some(Ok(())) => {
+                    // Release all segment references before wiping out transaction.
+                    let guards_to_drop = {
+                        if let Some(txn_lock) = self.find_transaction(&tid) {
+                            let mut txn = txn_lock.lock();
+                            std::mem::take(&mut txn.rollback_guards)
+                        } else {
+                            Vec::new()
+                        }
+                    };
+                    drop(guards_to_drop);
+
+                    if let Some(undo_log) = self.undo_log() {
+                        let log_result = match txn_state {
+                            TxnState::Committed => undo_log.write_commit_marker(&tid),
+                            TxnState::Aborted => undo_log.write_abort_marker(&tid),
+                            _ => Ok(()),
+                        };
+                        if let Err(e) = log_result {
+                            error!("Failed to write transaction completion marker: {:?}", e);
+                        }
+                    }
+
+                    self.wipe_out_transaction(&tid);
+                    self.cleanup_signal.store(true, Relaxed);
                     debug!("ENDED: {:?} with all locks released", tid);
                     self.response_with(EndResult::Success).await
                 }

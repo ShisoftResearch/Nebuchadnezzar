@@ -1433,6 +1433,7 @@ impl TransactionManager {
     async fn sites_commit(
         &self,
         tid: &TxnId,
+        commit_hlc: Hlc,
         changed_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
     ) -> Result<DMCommitResult, TMError> {
@@ -1448,11 +1449,7 @@ impl TransactionManager {
                             .then(|| Self::commit_op_for_changed_data_obj(*cell_id, data_obj))
                     })
                     .collect();
-                async move {
-                    data_site
-                        .commit(self.get_clock(), tid.to_owned(), ops)
-                        .await
-                }
+                async move { data_site.commit(commit_hlc, tid.to_owned(), ops).await }
             })
             .collect();
         let commit_results: Vec<_> = commit_futures.collect().await;
@@ -1759,15 +1756,27 @@ impl TransactionManager {
                     self.sites_prepare(&tid, affect_objs, &data_sites).await?
                 };
                 if sites_prepare_result == DMPrepareResult::Success {
-                    let sites_commit_result = {
-                        #[cfg(feature = "occ_phase_profile")]
-                        let _phase_guard =
-                            super::phase_profile::guard(super::phase_profile::Phase::CommitBarrier);
-                        self.sites_commit(&tid, affect_objs, &data_sites).await?
-                    };
-                    match sites_commit_result {
-                        DMCommitResult::Success => TMPrepareResult::Success,
-                        _ => TMPrepareResult::DMCommitError(sites_commit_result),
+                    if affect_objs.is_empty() {
+                        TMPrepareResult::Success
+                    } else {
+                        let commit_hlc = self
+                            .deps
+                            .hlc
+                            .try_now()
+                            .map_err(|_| TMError::ClockExhausted)?;
+                        debug_assert!(commit_hlc.ts > tid.ts);
+                        let sites_commit_result = {
+                            #[cfg(feature = "occ_phase_profile")]
+                            let _phase_guard = super::phase_profile::guard(
+                                super::phase_profile::Phase::CommitBarrier,
+                            );
+                            self.sites_commit(&tid, commit_hlc, affect_objs, &data_sites)
+                                .await?
+                        };
+                        match sites_commit_result {
+                            DMCommitResult::Success => TMPrepareResult::Success,
+                            _ => TMPrepareResult::DMCommitError(sites_commit_result),
+                        }
                     }
                 } else {
                     TMPrepareResult::DMPrepareError(sites_prepare_result)
