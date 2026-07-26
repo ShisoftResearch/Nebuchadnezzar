@@ -266,12 +266,20 @@ impl RevisionChain {
                 blocked_by_older = true;
                 continue;
             }
-            if blocked_by_older {
-                return ExpirationReadiness::Blocked;
+            match state {
+                RevisionState::CommittedPresent | RevisionState::CommittedDeleted => {
+                    if blocked_by_older {
+                        return ExpirationReadiness::Blocked;
+                    }
+                    self.truncated_before_ts
+                        .fetch_max(node.revision_ts, Ordering::AcqRel);
+                    return ExpirationReadiness::Ready;
+                }
+                RevisionState::PendingPresent
+                | RevisionState::PendingDeleted
+                | RevisionState::Aborted
+                | RevisionState::Expired => {}
             }
-            self.truncated_before_ts
-                .fetch_max(node.revision_ts, Ordering::AcqRel);
-            return ExpirationReadiness::Ready;
         }
         if found_expiring {
             ExpirationReadiness::Blocked
@@ -333,6 +341,7 @@ pub struct DeadRevision {
 
 pub struct HistoryIndex {
     chains: PtrHashMap<Id, Arc<RevisionChain>>,
+    chain_creation: Mutex<()>,
     expirations: LinkedRingBufferList<Option<ExpirationRecord>, 64>,
     dead: LinkedRingBufferList<Option<DeadRevision>, 64>,
     retention_ms: u64,
@@ -353,6 +362,7 @@ impl HistoryIndex {
     fn new_named(chunk_id: Option<usize>, retention_ms: u64) -> Arc<Self> {
         let history = Arc::new(Self {
             chains: PtrHashMap::with_capacity(HISTORY_MAP_INITIAL_CAPACITY),
+            chain_creation: Mutex::new(()),
             expirations: LinkedRingBufferList::new(),
             dead: LinkedRingBufferList::new(),
             retention_ms,
@@ -403,11 +413,29 @@ impl HistoryIndex {
     }
 
     pub fn get_or_create_chain(&self, id: Id) -> Arc<RevisionChain> {
-        let candidate = Arc::new(RevisionChain::new());
-        match self.chains.try_insert(id, candidate.clone()) {
-            None => candidate,
-            Some(existing) => existing,
+        self.get_or_create_chain_with(id, || Arc::new(RevisionChain::new()))
+    }
+
+    fn get_or_create_chain_with<F>(&self, id: Id, create: F) -> Arc<RevisionChain>
+    where
+        F: FnOnce() -> Arc<RevisionChain>,
+    {
+        if let Some(chain) = self.chains.get(&id) {
+            return chain;
         }
+
+        let _creation = self.chain_creation.lock();
+        if let Some(chain) = self.chains.get(&id) {
+            return chain;
+        }
+
+        let chain = create();
+        let replaced = self.chains.insert(id, chain.clone());
+        debug_assert!(
+            replaced.is_none(),
+            "chain creation lock must serialize every history insertion"
+        );
+        chain
     }
 
     pub fn resolve(&self, id: &Id, snapshot_ts: u64) -> SnapshotRevision {
@@ -695,14 +723,19 @@ mod tests {
         history.shutdown();
         let id = Id::new(3, 4);
         let start = Arc::new(Barrier::new(THREADS));
+        let constructions = Arc::new(AtomicUsize::new(0));
         let callers: Vec<_> = (0..THREADS)
             .map(|_| {
                 let history = history.clone();
                 let id = id.clone();
                 let start = start.clone();
+                let constructions = constructions.clone();
                 thread::spawn(move || {
                     start.wait();
-                    history.get_or_create_chain(id)
+                    history.get_or_create_chain_with(id, || {
+                        constructions.fetch_add(1, Ordering::SeqCst);
+                        Arc::new(RevisionChain::new())
+                    })
                 })
             })
             .collect();
@@ -715,6 +748,11 @@ mod tests {
         assert!(
             returned.iter().all(|chain| Arc::ptr_eq(chain, &published)),
             "every first creator must receive the map's single published chain"
+        );
+        assert_eq!(
+            constructions.load(Ordering::SeqCst),
+            1,
+            "the serialized miss path must construct exactly one candidate"
         );
     }
 
@@ -817,6 +855,60 @@ mod tests {
         assert!(matches!(chain.resolve(250), SnapshotRevision::TooOld));
         assert_eq!(history.pop_dead().expect("oldest dead").location, 0x1000);
         assert_eq!(history.pop_dead().expect("middle dead").location, 0x2000);
+        assert!(history.pop_dead().is_none());
+    }
+
+    #[test]
+    fn pending_boundary_that_aborts_keeps_retired_commit_visible() {
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(200, RevisionState::CommittedPresent, 0x2000);
+        let pending = node(300, RevisionState::PendingPresent, 0x3000);
+        chain.push_front(retired.clone());
+        chain.push_front(pending.clone());
+
+        assert!(history.retire(&chain, &retired));
+        assert_eq!(history.expire_due(u64::MAX), 1);
+
+        assert_eq!(retired.load(), (RevisionState::CommittedPresent, 0x2000));
+        assert_eq!(chain.truncated_before_ts.load(Ordering::Acquire), 0);
+        assert!(history.pop_dead().is_none());
+
+        assert!(
+            pending.compare_exchange_state(RevisionState::PendingPresent, RevisionState::Aborted,)
+        );
+        assert_eq!(chain.resolve(401).revision_ts(), Some(200));
+    }
+
+    #[test]
+    fn pending_boundary_that_commits_allows_retired_commit_to_expire() {
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(200, RevisionState::CommittedPresent, 0x2000);
+        let pending = node(300, RevisionState::PendingPresent, 0x3000);
+        chain.push_front(retired.clone());
+        chain.push_front(pending.clone());
+
+        assert!(history.retire(&chain, &retired));
+        assert_eq!(history.expire_due(u64::MAX), 1);
+        assert!(pending.compare_exchange_state(
+            RevisionState::PendingPresent,
+            RevisionState::CommittedPresent,
+        ));
+
+        assert_eq!(history.expire_due(u64::MAX), WORKER_MAX_PARK_MS);
+        assert_eq!(retired.load(), (RevisionState::Expired, 0x2000));
+        assert!(matches!(chain.resolve(300), SnapshotRevision::TooOld));
+        assert_eq!(chain.resolve(301).revision_ts(), Some(300));
+        assert_eq!(
+            history.pop_dead(),
+            Some(DeadRevision {
+                location: 0x2000,
+                entry_size: 64,
+            })
+        );
         assert!(history.pop_dead().is_none());
     }
 
