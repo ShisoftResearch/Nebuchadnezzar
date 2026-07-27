@@ -2,7 +2,7 @@ use super::*;
 use crate::ram::cell::{InstalledRevision, OwnedCellRef, RevisionWrite};
 use crate::ram::history::RevisionState;
 use crate::ram::segs::SegmentReferenceGuard;
-use crate::ram::types::{FromHeader, Id};
+use crate::ram::types::{FromHeader, Id, OwnedMap, OwnedPrimArray, OwnedValue};
 use crate::server::DatabaseRuntime;
 use crate::{
     index::builder::IndexBuilder,
@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 #[cfg(test)]
-use std::sync::OnceLock;
+use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -349,6 +349,44 @@ pub struct DataManager {
     hlc: Arc<bifrost::hlc::HlcSource>,
 }
 
+#[cfg(test)]
+type TestDataManagerKey = (u64, String, String);
+
+#[cfg(test)]
+static TEST_DATA_MANAGERS: OnceLock<Mutex<BTreeMap<TestDataManagerKey, Weak<DataManager>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn test_data_managers() -> &'static Mutex<BTreeMap<TestDataManagerKey, Weak<DataManager>>> {
+    TEST_DATA_MANAGERS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn register_data_manager_for_test(manager: &Arc<DataManager>) {
+    let key = (
+        manager.hlc.node(),
+        manager.database_runtime.group_name().to_string(),
+        manager.database_runtime.database_name().to_string(),
+    );
+    test_data_managers()
+        .lock()
+        .insert(key, Arc::downgrade(manager));
+}
+
+#[cfg(test)]
+pub(crate) fn participant_owner_for_test(
+    server_id: u64,
+    group_name: &str,
+    database_name: &str,
+    id: &Id,
+) -> Option<TxnPriority> {
+    let key = (server_id, group_name.to_string(), database_name.to_string());
+    let manager = test_data_managers().lock().get(&key)?.upgrade()?;
+    let cell_meta = manager.cells.get(id)?;
+    let owner = cell_meta.lock().owner.clone();
+    owner
+}
+
 service! {
     rpc read(server_id: u64, clock: Hlc, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<ObservedPoint<OwnedCell>, ReadError>>;
     rpc read_selected(server_id: u64, clock: Hlc, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<ObservedPoint<OwnedCell>, ReadError>>;
@@ -385,6 +423,9 @@ impl DataManager {
             cleanup_signal: cleanup_signal.clone(),
             hlc,
         });
+        #[cfg(test)]
+        register_data_manager_for_test(&manager);
+
         let manager_clone = manager.clone();
         tokio::spawn(async move {
             loop {
@@ -781,13 +822,159 @@ impl DataManager {
         }
     }
 
+    fn exact_slice_eq<T>(left: &[T], right: &[T], elements_equal: impl Fn(&T, &T) -> bool) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| elements_equal(left, right))
+    }
+
+    fn exact_owned_map_eq(left: &OwnedMap, right: &OwnedMap) -> bool {
+        left.fields == right.fields
+            && left.map.len() == right.map.len()
+            && left.map.iter().all(|(key, left_value)| {
+                right
+                    .map
+                    .get(key)
+                    .is_some_and(|right_value| Self::exact_owned_value_eq(left_value, right_value))
+            })
+    }
+
+    fn exact_owned_primitive_array_eq(left: &OwnedPrimArray, right: &OwnedPrimArray) -> bool {
+        match left {
+            OwnedPrimArray::Bool(left) => {
+                matches!(right, OwnedPrimArray::Bool(right) if left == right)
+            }
+            OwnedPrimArray::Char(left) => {
+                matches!(right, OwnedPrimArray::Char(right) if left == right)
+            }
+            OwnedPrimArray::I8(left) => {
+                matches!(right, OwnedPrimArray::I8(right) if left == right)
+            }
+            OwnedPrimArray::I16(left) => {
+                matches!(right, OwnedPrimArray::I16(right) if left == right)
+            }
+            OwnedPrimArray::I32(left) => {
+                matches!(right, OwnedPrimArray::I32(right) if left == right)
+            }
+            OwnedPrimArray::I64(left) => {
+                matches!(right, OwnedPrimArray::I64(right) if left == right)
+            }
+            OwnedPrimArray::U8(left) => {
+                matches!(right, OwnedPrimArray::U8(right) if left == right)
+            }
+            OwnedPrimArray::U16(left) => {
+                matches!(right, OwnedPrimArray::U16(right) if left == right)
+            }
+            OwnedPrimArray::U32(left) => {
+                matches!(right, OwnedPrimArray::U32(right) if left == right)
+            }
+            OwnedPrimArray::U64(left) => {
+                matches!(right, OwnedPrimArray::U64(right) if left == right)
+            }
+            OwnedPrimArray::F32(left) => matches!(right, OwnedPrimArray::F32(right)
+                if Self::exact_slice_eq(left, right, |left, right| left.to_bits() == right.to_bits())),
+            OwnedPrimArray::F64(left) => matches!(right, OwnedPrimArray::F64(right)
+                if Self::exact_slice_eq(left, right, |left, right| left.to_bits() == right.to_bits())),
+            OwnedPrimArray::Pos2d32(left) => matches!(right, OwnedPrimArray::Pos2d32(right)
+            if Self::exact_slice_eq(left, right, |left, right| {
+                left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()
+            })),
+            OwnedPrimArray::Pos2d64(left) => matches!(right, OwnedPrimArray::Pos2d64(right)
+            if Self::exact_slice_eq(left, right, |left, right| {
+                left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()
+            })),
+            OwnedPrimArray::Pos3d32(left) => matches!(right, OwnedPrimArray::Pos3d32(right)
+            if Self::exact_slice_eq(left, right, |left, right| {
+                left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()
+                    && left.z.to_bits() == right.z.to_bits()
+            })),
+            OwnedPrimArray::Pos3d64(left) => matches!(right, OwnedPrimArray::Pos3d64(right)
+            if Self::exact_slice_eq(left, right, |left, right| {
+                left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()
+                    && left.z.to_bits() == right.z.to_bits()
+            })),
+            OwnedPrimArray::Id(left) => {
+                matches!(right, OwnedPrimArray::Id(right) if left == right)
+            }
+            OwnedPrimArray::String(left) => {
+                matches!(right, OwnedPrimArray::String(right) if left == right)
+            }
+            OwnedPrimArray::Bytes(left) => {
+                matches!(right, OwnedPrimArray::Bytes(right) if left.iter().map(|value| &value.data).eq(right.iter().map(|value| &value.data)))
+            }
+            OwnedPrimArray::SmallBytes(left) => {
+                matches!(right, OwnedPrimArray::SmallBytes(right) if left.iter().map(|value| &value.data).eq(right.iter().map(|value| &value.data)))
+            }
+        }
+    }
+
+    fn exact_owned_value_eq(left: &OwnedValue, right: &OwnedValue) -> bool {
+        match left {
+            OwnedValue::Bool(left) => matches!(right, OwnedValue::Bool(right) if left == right),
+            OwnedValue::Char(left) => matches!(right, OwnedValue::Char(right) if left == right),
+            OwnedValue::I8(left) => matches!(right, OwnedValue::I8(right) if left == right),
+            OwnedValue::I16(left) => matches!(right, OwnedValue::I16(right) if left == right),
+            OwnedValue::I32(left) => matches!(right, OwnedValue::I32(right) if left == right),
+            OwnedValue::I64(left) => matches!(right, OwnedValue::I64(right) if left == right),
+            OwnedValue::U8(left) => matches!(right, OwnedValue::U8(right) if left == right),
+            OwnedValue::U16(left) => matches!(right, OwnedValue::U16(right) if left == right),
+            OwnedValue::U32(left) => matches!(right, OwnedValue::U32(right) if left == right),
+            OwnedValue::U64(left) => matches!(right, OwnedValue::U64(right) if left == right),
+            OwnedValue::F32(left) => {
+                matches!(right, OwnedValue::F32(right) if left.to_bits() == right.to_bits())
+            }
+            OwnedValue::F64(left) => {
+                matches!(right, OwnedValue::F64(right) if left.to_bits() == right.to_bits())
+            }
+            OwnedValue::Pos2d32(left) => matches!(right, OwnedValue::Pos2d32(right)
+                if left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()),
+            OwnedValue::Pos2d64(left) => matches!(right, OwnedValue::Pos2d64(right)
+                if left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()),
+            OwnedValue::Pos3d32(left) => matches!(right, OwnedValue::Pos3d32(right)
+                if left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()
+                    && left.z.to_bits() == right.z.to_bits()),
+            OwnedValue::Pos3d64(left) => matches!(right, OwnedValue::Pos3d64(right)
+                if left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()
+                    && left.z.to_bits() == right.z.to_bits()),
+            OwnedValue::Id(left) => matches!(right, OwnedValue::Id(right) if left == right),
+            OwnedValue::String(left) => {
+                matches!(right, OwnedValue::String(right) if left == right)
+            }
+            OwnedValue::Bytes(left) => {
+                matches!(right, OwnedValue::Bytes(right) if left.data == right.data)
+            }
+            OwnedValue::SmallBytes(left) => {
+                matches!(right, OwnedValue::SmallBytes(right) if left.data == right.data)
+            }
+            OwnedValue::Map(left) => {
+                matches!(right, OwnedValue::Map(right) if Self::exact_owned_map_eq(left, right))
+            }
+            OwnedValue::Array(left) => matches!(right, OwnedValue::Array(right)
+                if Self::exact_slice_eq(left, right, Self::exact_owned_value_eq)),
+            OwnedValue::PrimArray(left) => matches!(right, OwnedValue::PrimArray(right)
+                if Self::exact_owned_primitive_array_eq(left, right)),
+            OwnedValue::Null => matches!(right, OwnedValue::Null),
+            OwnedValue::NA => matches!(right, OwnedValue::NA),
+        }
+    }
+
     fn commit_cells_equal(left: &OwnedCell, right: &OwnedCell) -> bool {
         left.header.revision_ts == right.header.revision_ts
             && left.header.flags == right.header.flags
             && left.header.schema == right.header.schema
             && left.header.partition == right.header.partition
             && left.header.hash == right.header.hash
-            && left.data == right.data
+            && Self::exact_owned_value_eq(&left.data, &right.data)
     }
 
     fn commit_ops_equal(left: &CommitOp, right: &CommitOp) -> bool {
@@ -1320,7 +1507,7 @@ mod tests {
     use crate::ram::schema::Schema;
     use crate::ram::segs::SEGMENT_SIZE;
     use crate::ram::tests::default_fields;
-    use crate::ram::types::{Id, OwnedMap, OwnedValue};
+    use crate::ram::types::{Id, OwnedMap, OwnedPrimArray, OwnedValue, Pos3d32};
     use crate::server::transactions::test_hlc;
     use crate::server::{NebServer, ServerOptions, Service as NebService};
     use bifrost::rpc::DEFAULT_CLIENT_POOL;
@@ -1406,6 +1593,109 @@ mod tests {
             &expected,
             &changed_payload
         ));
+    }
+
+    fn commit_identity_for_values(left: OwnedValue, right: OwnedValue) -> bool {
+        let id = Id::new(7, 12);
+        let left = DataManager::canonical_commit_ops(vec![CommitOp::Update(
+            OwnedCell::new_with_id(990, &id, left),
+        )])
+        .unwrap();
+        let right = DataManager::canonical_commit_ops(vec![CommitOp::Update(
+            OwnedCell::new_with_id(990, &id, right),
+        )])
+        .unwrap();
+        DataManager::commit_requests_equal(&left, &right)
+    }
+
+    #[test]
+    fn commit_identity_accepts_same_nan_bits_and_rejects_changed_payload_bits() {
+        let nan_bits = 0x7ff8_0000_0000_0042;
+        let same_left = OwnedValue::F64(f64::from_bits(nan_bits));
+        let same_right = OwnedValue::F64(f64::from_bits(nan_bits));
+        assert!(
+            commit_identity_for_values(same_left, same_right),
+            "the same NaN payload bits are the same request"
+        );
+
+        assert!(
+            !commit_identity_for_values(
+                OwnedValue::F64(f64::from_bits(nan_bits)),
+                OwnedValue::F64(f64::from_bits(nan_bits + 1)),
+            ),
+            "different NaN payload bits are different requests"
+        );
+    }
+
+    #[test]
+    fn commit_identity_distinguishes_signed_zero() {
+        assert!(!commit_identity_for_values(
+            OwnedValue::F32(0.0),
+            OwnedValue::F32(-0.0),
+        ));
+    }
+
+    #[test]
+    fn commit_identity_compares_complete_ordered_map_fields() {
+        let mut left = OwnedMap::new();
+        left.insert("score", OwnedValue::U64(9));
+        left.insert("name", OwnedValue::String("cell".to_string()));
+        let mut right = left.clone();
+        right.fields = vec!["renamed".to_string()];
+
+        assert!(!commit_identity_for_values(
+            OwnedValue::Map(left.clone()),
+            OwnedValue::Map(right),
+        ));
+
+        let mut reverse_inserted = OwnedMap::new();
+        reverse_inserted.insert("name", OwnedValue::String("cell".to_string()));
+        reverse_inserted.insert("score", OwnedValue::U64(9));
+        reverse_inserted.fields = left.fields.clone();
+        assert!(
+            commit_identity_for_values(OwnedValue::Map(left), OwnedValue::Map(reverse_inserted)),
+            "map entry iteration order is not request identity"
+        );
+    }
+
+    #[test]
+    fn commit_identity_applies_bit_exact_comparison_recursively() {
+        let nan_bits = 0x7fc0_0042;
+        let nested = OwnedValue::Array(vec![OwnedValue::Map(OwnedMap {
+            map: [(
+                17,
+                OwnedValue::PrimArray(OwnedPrimArray::Pos3d32(vec![Pos3d32 {
+                    x: f32::from_bits(nan_bits),
+                    y: 0.0,
+                    z: -0.0,
+                }])),
+            )]
+            .into_iter()
+            .collect(),
+            fields: vec!["position".to_string()],
+        })]);
+        assert!(
+            commit_identity_for_values(nested.clone(), nested.clone()),
+            "bit-identical nested NaNs must compare equal"
+        );
+
+        let changed = OwnedValue::Array(vec![OwnedValue::Map(OwnedMap {
+            map: [(
+                17,
+                OwnedValue::PrimArray(OwnedPrimArray::Pos3d32(vec![Pos3d32 {
+                    x: f32::from_bits(nan_bits),
+                    y: -0.0,
+                    z: -0.0,
+                }])),
+            )]
+            .into_iter()
+            .collect(),
+            fields: vec!["position".to_string()],
+        })]);
+        assert!(
+            !commit_identity_for_values(nested, changed),
+            "nested primitive-array element order and float bits are request identity"
+        );
     }
 
     #[cfg(feature = "occ_phase_profile")]
@@ -3829,6 +4119,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn commit_retry_same_hlc_accepts_identical_nan_payload_bits() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5410";
+        let group = "txn_data_site_commit_retry_identical_nan";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99041);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                51,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+
+        let nan_bits = 0x7ff8_0000_0000_0042;
+        let mut cell = counter_cell(schema.id, cell_id, 9, "exact-nan-payload");
+        let OwnedValue::Map(data) = &mut cell.data else {
+            unreachable!()
+        };
+        data.insert("measurement", OwnedValue::F64(f64::from_bits(nan_bits)));
+        let commit_op = CommitOp::Update(cell);
+        let commit_hlc = manager.hlc.now();
+        assert_eq!(
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![commit_op.clone()],)
+                .await
+                .payload,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![commit_op])
+                .await
+                .payload,
+            DMCommitResult::Success,
+            "an exact same-HLC NaN retry must be idempotently accepted"
+        );
+
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn commit_retry_same_hlc_requires_exact_operation_and_cell_without_mutation() {
         let _ = env_logger::try_init();
         let address = "127.0.0.1:5403";
@@ -3856,12 +4204,12 @@ mod tests {
         );
 
         let commit_hlc = manager.hlc.now();
-        let original = CommitOp::Update(counter_cell(
-            schema.id,
-            cell_id,
-            9,
-            "exact-payload-original",
-        ));
+        let mut original_cell = counter_cell(schema.id, cell_id, 9, "exact-payload-original");
+        let OwnedValue::Map(original_data) = &mut original_cell.data else {
+            unreachable!()
+        };
+        original_data.insert("signed_zero", OwnedValue::F64(0.0));
+        let original = CommitOp::Update(original_cell);
         assert_eq!(
             <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![original.clone()],)
                 .await
@@ -3871,6 +4219,22 @@ mod tests {
 
         let txn_lock = manager.txns.get(&tid).expect("transaction should exist");
         let installed_before = txn_lock.lock().installed[&cell_id].node.load();
+        let mut changed_signed_zero = original.clone();
+        let CommitOp::Update(changed_cell) = &mut changed_signed_zero else {
+            unreachable!()
+        };
+        let OwnedValue::Map(changed_data) = &mut changed_cell.data else {
+            unreachable!()
+        };
+        changed_data
+            .map
+            .insert(hash_str("signed_zero"), OwnedValue::F64(-0.0));
+        assert_eq!(
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![changed_signed_zero],)
+                .await
+                .payload,
+            DMCommitResult::CheckFailed(CheckError::AlreadyCommitted)
+        );
         let changed = CommitOp::Update(counter_cell(
             schema.id,
             cell_id,

@@ -185,3 +185,84 @@ Post-review cleanup verification was run against the exact final Rust sources:
 - `commit_stage_failure_preserves_installed_peer_barrier` passed 1/1;
 - `cargo check --lib`, touched-file `rustfmt --check`, and
   `git diff --check` passed.
+
+## Review Fixes Round 2
+
+### Findings and invariants
+
+- Same-HLC commit retry identity no longer delegates payload comparison to
+  Dovahkiin's semantic `PartialEq`. The participant now compares every
+  `OwnedValue` and `OwnedPrimArray` variant recursively, using `to_bits()` for
+  every floating scalar, position component, and primitive-array float.
+- Exact map identity includes the complete ordered `fields` vector and all map
+  entries. Entry iteration order is ignored, while nested arrays and primitive
+  arrays retain element order.
+- Operation discriminants, full `Id` values, complete cell headers, and
+  canonical operation ordering remain part of request identity. No serializer
+  is used for comparison.
+- A mismatched retry still returns `AlreadyCommitted` before any installed
+  state or revision can change. Identical NaN payload bits are accepted;
+  different NaN payloads and positive-zero/negative-zero differences are
+  rejected.
+- `commit_stage_failure_preserves_installed_peer_barrier` now proves that
+  participant A retains the exact `TxnPriority` owner, including both the
+  transaction HLC and coordinator server ID. The manager registry and owner
+  accessor used by this assertion are entirely `cfg(test)`; the non-test
+  `cargo check --lib` build confirms no production observability was added.
+- Task 9 compensation and Task 10 stale-owner resolution remain intentionally
+  deferred.
+
+### TDD evidence
+
+Focused RED checks failed on the intended gaps before implementation:
+
+- the four pure identity regressions ran 4 tests with 0 passed and 4 failed
+  (694 filtered): identical NaN bits compared unequal, different signed zeros
+  compared equal, a fields-only map change compared equal, and the same defects
+  recurred recursively in nested arrays/maps/primitive arrays;
+- `commit_retry_same_hlc_accepts_identical_nan_payload_bits` ran 1 test with 0
+  passed and 1 failed (697 filtered), returning `AlreadyCommitted` instead of
+  `Success`;
+- `commit_retry_same_hlc_requires_exact_operation_and_cell_without_mutation`
+  ran 1 test with 0 passed and 1 failed (697 filtered), accepting a signed-zero
+  mismatch instead of returning `AlreadyCommitted`;
+- `commit_stage_failure_preserves_installed_peer_barrier` failed to compile
+  with E0425 after the exact-owner assertion was added because the test-only
+  participant owner inspector did not yet exist.
+
+Focused GREEN checks after the two scoped implementations:
+
+- the pure identity group passed 4/4 (694 filtered), including map
+  insertion-order independence;
+- identical-NaN and signed-zero retry integration tests each passed 1/1 (697
+  filtered);
+- the distributed installed-peer owner assertion passed 1/1 (697 filtered).
+
+### Serial verification
+
+- `timeout 900s cargo test --lib server::transactions::data_site -- --test-threads=1`:
+  47 passed, 0 failed, 651 filtered, 449.92s.
+- `timeout 900s cargo test --lib server::transactions::occ_tests -- --test-threads=1`:
+  34 passed, 0 failed, 664 filtered, 403.32s.
+- `timeout 600s cargo test --lib server::transactions::manager -- --test-threads=1`:
+  15 passed, 0 failed, 683 filtered, 110.15s.
+- `timeout 300s cargo test --lib server::transactions::tests -- --test-threads=1`:
+  5 passed, 0 failed, 693 filtered, 5.04s.
+- `timeout 600s cargo check --lib`: passed.
+- `rustfmt --edition 2021 --check
+  src/server/transactions/data_site.rs
+  src/server/transactions/occ_tests.rs`: passed.
+- `git diff --check`: passed.
+
+The full-worktree `cargo fmt --all -- --check` gate still reports the
+pre-existing formatting debt described in Round 1: trailing whitespace in the
+sibling `bifrost/src/membership/server.rs` worktree and formatting differences
+in existing B-tree files. Neither touched Task 8 Rust file appears in that
+output.
+
+### Files
+
+- `.superpowers/sdd/task-8-fix2-brief.md`
+- `.superpowers/sdd/task-8-report.md`
+- `src/server/transactions/data_site.rs`
+- `src/server/transactions/occ_tests.rs`

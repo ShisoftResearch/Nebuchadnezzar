@@ -729,6 +729,16 @@ async fn commit_stage_failure_preserves_installed_peer_barrier() {
         1,
         "coordinator state must remain for later explicit resolution"
     );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            first_server_id,
+            group,
+            group,
+            &first_id,
+        ),
+        Some(TxnPriority::new(tid, servers[0].server_id)),
+        "participant A must retain the exact transaction/coordinator owner"
+    );
     assert!(matches!(
         first_runtime
             .chunks()
