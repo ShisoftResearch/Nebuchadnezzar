@@ -18,10 +18,11 @@ use lightning::map::PtrHashMap as LFMap;
 #[cfg(test)]
 use parking_lot::Condvar;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 #[cfg(test)]
-use std::sync::{OnceLock, Weak};
+use std::sync::OnceLock;
+use std::sync::Weak;
 use std::time::Duration;
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -50,10 +51,38 @@ pub(crate) fn full_read_rpc_count() -> usize {
     FULL_READ_RPC_COUNT.load(Relaxed)
 }
 
-// Test age used to prove that elapsed wall-clock time never authorizes owner
-// takeover. Stale-owner resolution is an explicit later protocol phase.
-#[cfg(test)]
-const LOCK_TIMEOUT_MS: i64 = 30_000;
+const DEFAULT_LOCK_TIMEOUT_MS: i64 = 30_000;
+const VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS: i64 = 300_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParticipantCompletionEvidence {
+    outcome: TxnState,
+    expires_at_ms: Option<i64>,
+}
+
+impl ParticipantCompletionEvidence {
+    fn completed_at(outcome: TxnState, completed_at_ms: i64) -> Self {
+        Self {
+            outcome,
+            expires_at_ms: Some(
+                completed_at_ms.saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS),
+            ),
+        }
+    }
+
+    fn durable(outcome: TxnState, expires_at_ms: Option<i64>) -> Self {
+        Self {
+            outcome,
+            expires_at_ms,
+        }
+    }
+
+    fn outcome_at(&self, now_ms: i64) -> Option<TxnState> {
+        self.expires_at_ms
+            .is_none_or(|expires_at_ms| now_ms < expires_at_ms)
+            .then_some(self.outcome)
+    }
+}
 
 #[cfg(test)]
 struct PrepareDelayState {
@@ -127,6 +156,69 @@ pub(crate) fn install_prepare_delay_for_cell(tid: TxnId, id: Id) -> PrepareDelay
         .lock()
         .insert(key.clone(), state.clone());
     PrepareDelayHandle { key, state }
+}
+
+#[cfg(test)]
+pub(crate) struct MetaAcquireDelayHandle {
+    key: (TxnId, Id),
+    state: Arc<PrepareDelayState>,
+}
+
+#[cfg(test)]
+impl MetaAcquireDelayHandle {
+    pub(crate) async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    pub(crate) fn release(&self) {
+        if !self
+            .state
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.state.released_notify.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetaAcquireDelayHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = meta_acquire_delay_hooks().lock();
+        if hooks
+            .get(&self.key)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            hooks.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+static META_ACQUIRE_DELAY_HOOKS: OnceLock<Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDelayState>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn meta_acquire_delay_hooks() -> &'static Mutex<BTreeMap<(TxnId, Id), Arc<PrepareDelayState>>> {
+    META_ACQUIRE_DELAY_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_meta_acquire_delay_for_cell(tid: TxnId, id: Id) -> MetaAcquireDelayHandle {
+    let key = (tid, id);
+    let state = Arc::new(PrepareDelayState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    meta_acquire_delay_hooks().lock().insert(key, state.clone());
+    MetaAcquireDelayHandle { key, state }
 }
 
 #[cfg(test)]
@@ -289,6 +381,85 @@ fn pause_before_storage_mutation(tid: &TxnId, id: &Id) {
 }
 
 #[cfg(test)]
+struct TxnRegistryPublishDelayHandle {
+    tid: TxnId,
+    state: Arc<BeforeStorageMutationState>,
+}
+
+#[cfg(test)]
+impl TxnRegistryPublishDelayHandle {
+    async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    fn release(&self) {
+        let mut released = self.state.released.lock();
+        if !*released {
+            *released = true;
+            self.state.released_condvar.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TxnRegistryPublishDelayHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = txn_registry_publish_delay_hooks().lock();
+        if hooks
+            .get(&self.tid)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            hooks.remove(&self.tid);
+        }
+    }
+}
+
+#[cfg(test)]
+static TXN_REGISTRY_PUBLISH_DELAY_HOOKS: OnceLock<
+    Mutex<BTreeMap<TxnId, Arc<BeforeStorageMutationState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn txn_registry_publish_delay_hooks(
+) -> &'static Mutex<BTreeMap<TxnId, Arc<BeforeStorageMutationState>>> {
+    TXN_REGISTRY_PUBLISH_DELAY_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn install_txn_registry_publish_delay(tid: TxnId) -> TxnRegistryPublishDelayHandle {
+    let state = Arc::new(BeforeStorageMutationState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: Mutex::new(false),
+        released_condvar: Condvar::new(),
+    });
+    txn_registry_publish_delay_hooks()
+        .lock()
+        .insert(tid, state.clone());
+    TxnRegistryPublishDelayHandle { tid, state }
+}
+
+#[cfg(test)]
+fn pause_after_txn_registry_publish(tid: &TxnId) {
+    let Some(state) = txn_registry_publish_delay_hooks().lock().remove(tid) else {
+        return;
+    };
+    state
+        .entered
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state.entered_notify.notify_waiters();
+    let mut released = state.released.lock();
+    while !*released {
+        state.released_condvar.wait(&mut released);
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct AbortCannotEndHandle {
     key: (TxnId, Id),
 }
@@ -431,16 +602,25 @@ impl Transaction {
 }
 
 pub struct DataManager {
+    self_ref: Weak<DataManager>,
     cells: LFMap<Id, Arc<Mutex<CellMeta>>>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: LinkedList<Id>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
+    txn_registry_lock: Mutex<()>,
+    cell_cleanup_lock: Mutex<()>,
+    resolving_owners: Mutex<BTreeSet<(TxnId, u64)>>,
+    participant_completions: Mutex<HashMap<TxnId, ParticipantCompletionEvidence>>,
+    participant_completion_cache_ready: bool,
+    #[cfg(test)]
+    resolution_attempts: Mutex<BTreeMap<(TxnId, u64), u64>>,
     database_runtime: Arc<DatabaseRuntime>,
     cleanup_signal: Arc<AtomicBool>,
     /// Per-server Hybrid Logical Clock source (node = server_id), shared with
     /// the coordinator-side `TransactionManager`. Stamps every participant
     /// response clock and observes the coordinator's incoming clock.
     hlc: Arc<bifrost::hlc::HlcSource>,
+    lock_timeout_ms: i64,
     #[cfg(test)]
     fail_next_undo_availability: AtomicBool,
 }
@@ -498,6 +678,11 @@ service! {
 
     // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
     rpc end(clock: Hlc, tid: TxnId) -> DataSiteResponse<EndResult>;
+    // Retirement is off the user-visible completion path. The prepare step
+    // retains idempotence evidence until the coordinator durably acknowledges
+    // it; finalize starts the participant-side expiry clock.
+    rpc retire(clock: Hlc, tid: TxnId, resolution: TxnResolution, expires_at_ms: i64) -> DataSiteResponse<EndResult>;
+    rpc finalize_retirement(clock: Hlc, tid: TxnId, resolution: TxnResolution, expires_at_ms: i64) -> DataSiteResponse<EndResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -509,15 +694,67 @@ impl DataManager {
         database_runtime: Arc<DatabaseRuntime>,
         hlc: Arc<bifrost::hlc::HlcSource>,
     ) -> Arc<Self> {
+        Self::new_inner(database_runtime, hlc, DEFAULT_LOCK_TIMEOUT_MS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_lock_timeout(
+        database_runtime: Arc<DatabaseRuntime>,
+        hlc: Arc<bifrost::hlc::HlcSource>,
+        lock_timeout_ms: i64,
+    ) -> Arc<Self> {
+        Self::new_inner(database_runtime, hlc, lock_timeout_ms)
+    }
+
+    fn new_inner(
+        database_runtime: Arc<DatabaseRuntime>,
+        hlc: Arc<bifrost::hlc::HlcSource>,
+        lock_timeout_ms: i64,
+    ) -> Arc<Self> {
+        assert!(lock_timeout_ms > 0, "lock timeout must be positive");
         let cleanup_signal = Arc::new(AtomicBool::new(false));
-        let manager = Arc::new(Self {
+        let (participant_completions, participant_completion_cache_ready) =
+            match database_runtime.undo_log() {
+                Some(undo_log) => match undo_log.participant_completion_cache_at(get_time()) {
+                    Ok(completions) => (
+                        completions
+                            .into_iter()
+                            .map(|(tid, (outcome, expires_at_ms))| {
+                                (
+                                    tid,
+                                    ParticipantCompletionEvidence::durable(outcome, expires_at_ms),
+                                )
+                            })
+                            .collect(),
+                        true,
+                    ),
+                    Err(error) => {
+                        error!(
+                            "Failed to rebuild participant completion cache at startup: {:?}",
+                            error
+                        );
+                        (HashMap::new(), false)
+                    }
+                },
+                None => (HashMap::new(), true),
+            };
+        let manager = Arc::new_cyclic(|self_ref| Self {
+            self_ref: self_ref.clone(),
             cells: LFMap::with_capacity(256),
             txns: LFMap::with_capacity(128),
             cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
+            txn_registry_lock: Mutex::new(()),
+            cell_cleanup_lock: Mutex::new(()),
+            resolving_owners: Mutex::new(BTreeSet::new()),
+            participant_completions: Mutex::new(participant_completions),
+            participant_completion_cache_ready,
+            #[cfg(test)]
+            resolution_attempts: Mutex::new(BTreeMap::new()),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
             hlc,
+            lock_timeout_ms,
             #[cfg(test)]
             fail_next_undo_availability: AtomicBool::new(false),
         });
@@ -527,6 +764,7 @@ impl DataManager {
         let manager_clone = manager.clone();
         tokio::spawn(async move {
             loop {
+                manager_clone.prune_participant_completions_at(get_time());
                 if cleanup_signal.load(Relaxed) {
                     manager_clone.cell_meta_cleanup().await;
                     cleanup_signal.store(false, Relaxed);
@@ -557,15 +795,99 @@ impl DataManager {
     fn update_clock(&self, clock: Hlc) {
         self.hlc.observe(clock);
     }
+
+    fn prune_participant_completions_at(&self, now_ms: i64) {
+        self.participant_completions
+            .lock()
+            .retain(|_, completion| completion.outcome_at(now_ms).is_some());
+    }
+
+    fn cached_participant_completion_at(&self, tid: &TxnId, now_ms: i64) -> Option<TxnState> {
+        let mut completions = self.participant_completions.lock();
+        match completions.get(tid).copied() {
+            Some(completion) => match completion.outcome_at(now_ms) {
+                Some(outcome) => Some(outcome),
+                None => {
+                    completions.remove(tid);
+                    None
+                }
+            },
+            None => None,
+        }
+    }
+
+    fn record_volatile_completion_at(&self, tid: TxnId, outcome: TxnState, now_ms: i64) {
+        let mut completions = self.participant_completions.lock();
+        if completions
+            .get(&tid)
+            .is_some_and(|completion| completion.outcome_at(now_ms).is_none())
+        {
+            completions.remove(&tid);
+        }
+        completions
+            .entry(tid)
+            .or_insert_with(|| ParticipantCompletionEvidence::completed_at(outcome, now_ms));
+    }
+
+    fn record_durable_completion(&self, tid: TxnId, outcome: TxnState, expires_at_ms: Option<i64>) {
+        self.participant_completions.lock().insert(
+            tid,
+            ParticipantCompletionEvidence::durable(outcome, expires_at_ms),
+        );
+    }
+
+    fn participant_completion_evidence(
+        &self,
+        tid: &TxnId,
+        now_ms: i64,
+    ) -> std::io::Result<Option<TxnState>> {
+        if !self.participant_completion_cache_ready {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "participant completion cache was not rebuilt",
+            ));
+        }
+        Ok(self.cached_participant_completion_at(tid, now_ms))
+    }
+
+    fn end_result_from_completion_evidence(&self, tid: &TxnId) -> EndResult {
+        match self.participant_completion_evidence(tid, get_time()) {
+            Ok(Some(TxnState::Committed | TxnState::Aborted)) => EndResult::Success,
+            Ok(_) => EndResult::CheckFailed(CheckError::NotExisted),
+            Err(error) => {
+                error!(
+                    "Failed to read participant completion for transaction {:?}: {:?}",
+                    tid, error
+                );
+                EndResult::CheckFailed(CheckError::CannotEnd)
+            }
+        }
+    }
+
+    fn abort_result_from_completion_evidence(&self, tid: &TxnId) -> AbortResult {
+        match self.participant_completion_evidence(tid, get_time()) {
+            Ok(Some(TxnState::Aborted)) => AbortResult::CheckFailed(CheckError::AlreadyAborted),
+            Ok(Some(TxnState::Committed)) => AbortResult::CheckFailed(CheckError::AlreadyCommitted),
+            Ok(_) => AbortResult::CheckFailed(CheckError::NotExisted),
+            Err(error) => {
+                error!(
+                    "Failed to read participant completion for transaction {:?}: {:?}",
+                    tid, error
+                );
+                AbortResult::CheckFailed(CheckError::CannotEnd)
+            }
+        }
+    }
     #[inline]
     fn get_or_create_transaction(&self, tid: &TxnId) -> TxnMutex {
-        // Fast path: transaction already exists
-        if let Some(txn) = self.txns.get(tid) {
-            return txn;
-        }
+        self.get_or_create_transaction_with_status(tid).0
+    }
 
-        // Slow path: create new transaction
-        self.create_transaction(tid)
+    fn get_or_create_transaction_with_status(&self, tid: &TxnId) -> (TxnMutex, bool) {
+        if let Some(txn) = self.txns.get(tid) {
+            return (txn, false);
+        }
+        self.create_transaction_with_status(tid)
     }
     #[inline]
     fn find_transaction(&self, tid: &TxnId) -> Option<TxnMutex> {
@@ -573,10 +895,11 @@ impl DataManager {
     }
 
     #[cold]
-    fn create_transaction(&self, tid: &TxnId) -> TxnMutex {
+    fn create_transaction_with_status(&self, tid: &TxnId) -> (TxnMutex, bool) {
+        let _registry_guard = self.txn_registry_lock.lock();
         loop {
             if let Some(txn) = self.txns.get(tid) {
-                return txn;
+                return (txn, false);
             }
 
             let txn = Arc::new(Mutex::new(Transaction {
@@ -594,28 +917,45 @@ impl DataManager {
                 history: BTreeMap::new(),
             }));
 
-            if self.txns.insert(tid.clone(), txn.clone()).is_none() {
-                self.txns_sorted.lock().insert(tid.clone());
-                return txn;
+            // Publish the conservative cleanup watermark first, then expose
+            // the transaction map entry. Registry removal uses the same
+            // mutex, so no completed transaction can leave a ghost TID and
+            // readers can never observe a map entry without sorted
+            // membership.
+            self.txns_sorted.lock().insert(*tid);
+            match self.txns.try_insert(*tid, txn.clone()) {
+                None => {
+                    #[cfg(test)]
+                    pause_after_txn_registry_publish(tid);
+                    return (txn, true);
+                }
+                Some(existing) => return (existing, false),
             }
         }
     }
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
-        // Check if entry exists to avoid duplicate list insertions
-        let is_new = self.cells.get(id).is_none();
-        let arc = self.cells.get_or_insert(*id, || {
-            Arc::new(Mutex::new(CellMeta {
-                read: TxnId::default(),
-                write: TxnId::default(),
-                owner: None,
-                lock_acquired_at: None,
-            }))
-        });
-        // Only push to list if this was a new insertion
-        if is_new {
-            self.cell_list.push_back(*id);
+        if let Some(meta) = self.cells.get(id) {
+            return meta;
         }
-        arc
+        let new_meta = Arc::new(Mutex::new(CellMeta {
+            read: TxnId::default(),
+            write: TxnId::default(),
+            owner: None,
+            lock_acquired_at: None,
+        }));
+        match self.cells.try_insert(*id, new_meta.clone()) {
+            None => {
+                self.cell_list.push_back(*id);
+                new_meta
+            }
+            Some(existing) => existing,
+        }
+    }
+
+    fn cell_meta_is_current(&self, id: &Id, candidate: &CellMetaMutex) -> bool {
+        self.cells
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(&current, candidate))
     }
     fn response_with<T: Send>(&self, data: T) -> BoxFuture<'_, DataSiteResponse<T>>
     where
@@ -624,12 +964,252 @@ impl DataManager {
         future::ready(DataSiteResponse::new(self.hlc.now(), data)).boxed()
     }
 
+    fn owner_is_present(&self, owner: &TxnPriority) -> bool {
+        for cell_id_ref in self.cell_list.iter_front() {
+            let cell_id = cell_id_ref.deref();
+            if self
+                .cells
+                .get(&cell_id)
+                .is_some_and(|cell| cell.lock().owner.as_ref() == Some(owner))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn transaction_owner_is_present(&self, tid: &TxnId) -> bool {
+        for cell_id_ref in self.cell_list.iter_front() {
+            let cell_id = cell_id_ref.deref();
+            if self.cells.get(&cell_id).is_some_and(|cell| {
+                cell.lock()
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.tid == *tid)
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn resolution_outcome(resolution: TxnResolution) -> Option<TxnState> {
+        match resolution {
+            TxnResolution::Commit(_) => Some(TxnState::Committed),
+            TxnResolution::Abort => Some(TxnState::Aborted),
+            TxnResolution::InProgress | TxnResolution::Unknown => None,
+        }
+    }
+
+    fn queue_stale_owner_resolution(&self, owner: TxnPriority) {
+        let key = (owner.tid, owner.coordinator_id);
+        if !self.resolving_owners.lock().insert(key) {
+            return;
+        }
+
+        let manager = self.self_ref.clone();
+        tokio::spawn(async move {
+            let mut attempt = 0u32;
+            loop {
+                let Some(manager) = manager.upgrade() else {
+                    return;
+                };
+                if manager.resolve_stale_owner_once(&owner).await {
+                    manager.resolving_owners.lock().remove(&key);
+                    return;
+                }
+                drop(manager);
+
+                let backoff_ms = 10u64.saturating_mul(1u64 << attempt.min(6)).min(1_000);
+                attempt = attempt.saturating_add(1);
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn resolution_attempt_count_for_test(&self, owner: &TxnPriority) -> u64 {
+        self.resolution_attempts
+            .lock()
+            .get(&(owner.tid, owner.coordinator_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn queued_resolution_count_for_test(&self) -> usize {
+        self.resolving_owners.lock().len()
+    }
+
+    #[cfg(test)]
+    fn note_resolution_attempt(&self, owner: &TxnPriority) {
+        *self
+            .resolution_attempts
+            .lock()
+            .entry((owner.tid, owner.coordinator_id))
+            .or_default() += 1;
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn note_resolution_attempt(&self, _owner: &TxnPriority) {}
+
+    async fn resolve_stale_owner_once(&self, owner: &TxnPriority) -> bool {
+        self.note_resolution_attempt(owner);
+
+        if !self.owner_is_present(owner) {
+            return true;
+        }
+        let Some(coordinator) = self.database_runtime.txn_manager() else {
+            return false;
+        };
+        let resolution = match coordinator.resolve_at_coordinator(owner).await {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                debug!(
+                    "Could not resolve stale owner {:?} at coordinator {}: {:?}",
+                    owner, owner.coordinator_id, error
+                );
+                return false;
+            }
+        };
+
+        match resolution {
+            TxnResolution::Commit(commit_hlc) => {
+                let exact_install = self.find_transaction(&owner.tid).is_some_and(|txn| {
+                    let txn = txn.lock();
+                    txn.state == TxnState::Committed
+                        && txn.coordinator_id == Some(owner.coordinator_id)
+                        && txn.commit_hlc == Some(commit_hlc)
+                        && self.installed_revisions_agree(&txn)
+                });
+                if !exact_install {
+                    return !self.owner_is_present(owner);
+                }
+
+                let result = <DataManager as Service>::end(self, self.hlc.now(), owner.tid)
+                    .await
+                    .payload;
+                matches!(result, EndResult::Success) || !self.owner_is_present(owner)
+            }
+            TxnResolution::Abort => {
+                let abort = <DataManager as Service>::abort(self, self.hlc.now(), owner.tid)
+                    .await
+                    .payload;
+                if !matches!(
+                    abort,
+                    AbortResult::Success(None)
+                        | AbortResult::CheckFailed(CheckError::AlreadyAborted)
+                ) {
+                    return !self.owner_is_present(owner);
+                }
+
+                let end = <DataManager as Service>::end(self, self.hlc.now(), owner.tid)
+                    .await
+                    .payload;
+                matches!(end, EndResult::Success) || !self.owner_is_present(owner)
+            }
+            TxnResolution::InProgress | TxnResolution::Unknown => false,
+        }
+    }
+
+    fn retire_participant_evidence(
+        &self,
+        tid: &TxnId,
+        resolution: TxnResolution,
+        expires_at_ms: i64,
+        finalized: bool,
+    ) -> EndResult {
+        let Some(outcome) = Self::resolution_outcome(resolution) else {
+            return EndResult::CheckFailed(CheckError::CannotEnd);
+        };
+        let Some(undo_log) = self.undo_log() else {
+            return EndResult::CheckFailed(CheckError::NotExisted);
+        };
+        if self.find_transaction(tid).is_some() || self.transaction_owner_is_present(tid) {
+            return EndResult::CheckFailed(CheckError::CannotEnd);
+        }
+
+        let retirement = match undo_log.participant_retirement(tid) {
+            Ok(retirement) => retirement,
+            Err(error) => {
+                error!(
+                    "Failed to read participant retirement for {:?}: {:?}",
+                    tid, error
+                );
+                return EndResult::CheckFailed(CheckError::CannotEnd);
+            }
+        };
+        if let Some(record) = retirement.as_ref() {
+            if record.outcome != outcome {
+                return EndResult::CheckFailed(CheckError::CannotEnd);
+            }
+            if record.finalized {
+                self.record_durable_completion(*tid, outcome, Some(record.expires_at_ms));
+                return EndResult::Success;
+            }
+            if !finalized {
+                self.record_durable_completion(*tid, outcome, None);
+                return EndResult::Success;
+            }
+        } else {
+            let completion = match undo_log.participant_completion(tid) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    error!(
+                        "Failed to read participant completion for retirement {:?}: {:?}",
+                        tid, error
+                    );
+                    return EndResult::CheckFailed(CheckError::CannotEnd);
+                }
+            };
+            if completion.is_some_and(|completion| completion != outcome)
+                || (!finalized && completion != Some(outcome))
+                || (finalized && undo_log.has_active_undo(tid))
+            {
+                return EndResult::CheckFailed(CheckError::CannotEnd);
+            }
+        }
+
+        let result = if finalized {
+            undo_log.finalize_participant_retirement(tid, outcome, expires_at_ms)
+        } else {
+            undo_log.write_participant_retirement(tid, outcome, expires_at_ms)
+        };
+        match result {
+            Ok(()) => {
+                self.record_durable_completion(*tid, outcome, finalized.then_some(expires_at_ms));
+                EndResult::Success
+            }
+            Err(error) => {
+                error!(
+                    "Failed to persist participant retirement for {:?}: {:?}",
+                    tid, error
+                );
+                EndResult::CheckFailed(CheckError::CannotEnd)
+            }
+        }
+    }
+
     #[cfg(test)]
     fn take_matching_prepare_delay(
         tid: &TxnId,
         prepared_ops: &[PrepareOp],
     ) -> Option<Arc<PrepareDelayState>> {
         let mut hooks = prepare_delay_hooks().lock();
+        let delayed_key = prepared_ops
+            .iter()
+            .map(|op| (tid.clone(), op.id))
+            .find(|key| hooks.contains_key(key))?;
+        hooks.remove(&delayed_key)
+    }
+
+    #[cfg(test)]
+    fn take_matching_meta_acquire_delay(
+        tid: &TxnId,
+        prepared_ops: &[PrepareOp],
+    ) -> Option<Arc<PrepareDelayState>> {
+        let mut hooks = meta_acquire_delay_hooks().lock();
         let delayed_key = prepared_ops
             .iter()
             .map(|op| (tid.clone(), op.id))
@@ -772,11 +1352,21 @@ impl DataManager {
             .collect()
     }
     #[inline]
-    fn wipe_out_transaction(&self, tid: &TxnId) {
+    fn wipe_out_transaction(&self, tid: &TxnId, expected: &TxnMutex) -> bool {
+        let _registry_guard = self.txn_registry_lock.lock();
+        if !self
+            .txns
+            .get(tid)
+            .is_some_and(|current| Arc::ptr_eq(&current, expected))
+        {
+            return false;
+        }
         let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
+        true
     }
     async fn cell_meta_cleanup(&self) {
+        let _cleanup_guard = self.cell_cleanup_lock.lock();
         let oldest_transaction = {
             self.txns_sorted
                 .lock()
@@ -805,33 +1395,18 @@ impl DataManager {
         }
 
         // Second pass: re-check and remove (prevents TOCTOU race)
-        let empty_clock = TxnId::default();
         for (cell_id_ref, cell_meta) in cells_to_evict {
             let cell_id = cell_id_ref.deref();
 
-            // Re-check timestamps while holding lock before removal
-            // This prevents evicting cells that became active after first check
-            let should_evict = {
-                let meta = cell_meta.lock();
-                meta.write < oldest_transaction
-                    && meta.read < oldest_transaction
-                    && meta.owner.is_none() // Don't evict if locked by a transaction
-                    // Skip metas that have never been stamped (both clocks still
-                    // empty). Such a meta belongs to an in-flight prepare that has
-                    // created it via `cell_meta_mutex` but not yet assigned its
-                    // owner (an insert prepare stamps neither `read` nor `write`
-                    // before acquiring the owner). The owner check above cannot see
-                    // that pending acquisition, and the removal below runs after
-                    // this lock is released, so evicting here would race the
-                    // prepare and orphan the lock it is about to take. Read/observe
-                    // paths stamp `read` before prepare, so update/remove metas are
-                    // never empty at this point; the only cost is that a genuinely
-                    // abandoned empty meta is reclaimed on a later pass (once it is
-                    // stamped or re-accessed) rather than now.
-                    && !(meta.read == empty_clock && meta.write == empty_clock)
-            };
-
-            if should_evict {
+            // Keep the candidate locked through identity validation and removal.
+            // A caller that fetched this Arc first either stamps it before this
+            // check, or observes that it became orphaned and retries the lookup.
+            let meta = cell_meta.lock();
+            if self.cell_meta_is_current(&cell_id, &cell_meta)
+                && meta.write < oldest_transaction
+                && meta.read < oldest_transaction
+                && meta.owner.is_none()
+            {
                 self.cells.remove(&cell_id);
                 cell_id_ref.remove();
             }
@@ -847,20 +1422,26 @@ impl DataManager {
         T: 'static + Clone,
     {
         self.update_clock(*clock);
-        let meta_ref = self.cell_meta_mutex(id);
-        let mut meta = meta_ref.lock();
-        if meta.owner.is_some() {
-            debug!(
-                "-> READ {:?} WAITING for {:?} to finish commit on cell {:?}",
-                tid, &meta.owner, id
-            );
-            return Err(self.response_with(TxnExecResult::Wait));
-        }
+        loop {
+            let meta_ref = self.cell_meta_mutex(id);
+            let mut meta = meta_ref.lock();
+            if !self.cell_meta_is_current(id, &meta_ref) {
+                drop(meta);
+                continue;
+            }
+            if meta.owner.is_some() {
+                debug!(
+                    "-> READ {:?} WAITING for {:?} to finish commit on cell {:?}",
+                    tid, &meta.owner, id
+                );
+                return Err(self.response_with(TxnExecResult::Wait));
+            }
 
-        if meta.read < *tid {
-            meta.read = *tid;
+            if meta.read < *tid {
+                meta.read = *tid;
+            }
+            return Ok(());
         }
-        Ok(())
     }
 
     fn observed_snapshot<T, F>(
@@ -2076,6 +2657,60 @@ mod tests {
         assert_eq!(end, EndResult::Success);
     }
 
+    async fn assert_delayed_duplicate_prepare_cannot_resurrect_completion(
+        manager: Arc<DataManager>,
+        runtime: Arc<DatabaseRuntime>,
+        cell_id: Id,
+    ) {
+        let schema = install_prepare_test_schema(&runtime);
+        let revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        let op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(revision),
+            intent: PrepareIntent::Read,
+        };
+        assert_eq!(
+            prepare_ops_local(&manager, 77, &tid, vec![op.clone()]).await,
+            DMPrepareResult::Success
+        );
+
+        let delay = install_prepare_delay_for_cell(tid, cell_id);
+        let duplicate_manager = manager.clone();
+        let duplicate =
+            tokio::spawn(
+                async move { prepare_ops_local(&duplicate_manager, 77, &tid, vec![op]).await },
+            );
+        delay.wait_until_entered().await;
+
+        assert_eq!(
+            <DataManager as Service>::commit(&manager, manager.hlc.now(), tid, vec![])
+                .await
+                .payload,
+            DMCommitResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        delay.release();
+
+        assert_eq!(
+            duplicate.await.unwrap(),
+            DMPrepareResult::StateError(TxnState::Committed)
+        );
+        assert!(manager.find_transaction(&tid).is_none());
+        assert!(
+            manager
+                .cells
+                .get(&cell_id)
+                .is_some_and(|meta| meta.lock().owner.is_none()),
+            "the delayed duplicate must not republish a read-only owner"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_rejects_a_stale_present_version() {
         let _ = env_logger::try_init();
@@ -2715,6 +3350,59 @@ mod tests {
         server.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transaction_registry_publish_is_atomic_with_end_cleanup() {
+        let address = "127.0.0.1:5398";
+        let group = "txn_data_site_registry_publish_cleanup";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = manager.hlc.now();
+        let publish_delay = install_txn_registry_publish_delay(tid);
+
+        let creator_manager = manager.clone();
+        let creator = std::thread::spawn(move || {
+            creator_manager
+                .get_or_create_transaction_with_status(&tid)
+                .1
+        });
+        publish_delay.wait_until_entered().await;
+
+        let published = manager
+            .find_transaction(&tid)
+            .expect("the transaction map entry should be published");
+        published.lock().state = TxnState::Aborted;
+
+        let end_manager = manager.clone();
+        let mut end_task = tokio::spawn(async move {
+            <DataManager as Service>::end(&end_manager, tid, tid)
+                .await
+                .payload
+        });
+        let early_end = tokio::time::timeout(Duration::from_millis(100), &mut end_task).await;
+        let end_was_blocked = early_end.is_err();
+
+        publish_delay.release();
+        let was_created = creator.join().expect("creator should not panic");
+        assert!(was_created);
+        let end_result = match early_end {
+            Ok(result) => result.expect("end task should not panic"),
+            Err(_) => end_task.await.expect("end task should not panic"),
+        };
+
+        assert!(
+            end_was_blocked,
+            "end must not remove a transaction while its map and sorted-index publication is partial"
+        );
+        assert_eq!(end_result, EndResult::Success);
+        assert!(manager.find_transaction(&tid).is_none());
+        assert!(
+            !manager.txns_sorted.lock().contains(&tid),
+            "end must not leave a ghost TID pinning the CellMeta cleanup watermark"
+        );
+
+        server.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn read_only_transaction_creates_no_data_site_transaction() {
         let _ = env_logger::try_init();
@@ -2901,18 +3589,7 @@ mod tests {
         );
 
         for result in [left, right] {
-            assert!(
-                matches!(
-                    result,
-                    EndResult::Success
-                        | EndResult::CheckFailed(CheckError::NotExisted)
-                        | EndResult::CheckFailed(CheckError::CannotEnd)
-                        | EndResult::LockReleaseRetriesExhausted { .. }
-                        | EndResult::SomeLocksNotReleased { .. }
-                ),
-                "unexpected end result in duplicate end race: {:?}",
-                result
-            );
+            assert_eq!(result, EndResult::Success);
         }
 
         assert!(manager.txns.get(&tid).is_none());
@@ -3252,6 +3929,846 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_only_lock_timeout_constructor_uses_a_short_positive_timeout() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5345";
+        let group = "txn_data_site_short_lock_timeout";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+
+        assert_eq!(manager.lock_timeout_ms, 5);
+        assert_eq!(
+            DataManager::new(runtime.clone(), server.hlc.clone()).lock_timeout_ms,
+            30_000,
+            "production stale-owner probing must keep the 30-second timeout"
+        );
+        for invalid_timeout in [0, -1] {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+                    let runtime = runtime.clone();
+                    let hlc = server.hlc.clone();
+                    move || {
+                        DataManager::new_with_lock_timeout(runtime, hlc, invalid_timeout);
+                    }
+                }))
+                .is_err(),
+                "{invalid_timeout}ms must be rejected instead of causing immediate stale probing"
+            );
+        }
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn volatile_completion_retention_uses_the_exact_logical_deadline() {
+        assert_eq!(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS, 300_000);
+        let completed_at_ms = 10_000;
+        let completion =
+            ParticipantCompletionEvidence::completed_at(TxnState::Committed, completed_at_ms);
+        assert_eq!(
+            completion.outcome_at(completed_at_ms + 299_999),
+            Some(TxnState::Committed)
+        );
+        assert_eq!(completion.outcome_at(completed_at_ms + 300_000), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_volatile_tid_is_not_evidence_and_completed_abort_retries_exactly() {
+        let address = "127.0.0.1:5373";
+        let group = "txn_data_site_volatile_completion_evidence";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let unknown_tid = manager.hlc.now();
+
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), unknown_tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::NotExisted)
+        );
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, manager.hlc.now(), unknown_tid)
+                .await
+                .payload,
+            AbortResult::CheckFailed(CheckError::NotExisted)
+        );
+        manager.record_volatile_completion_at(
+            unknown_tid,
+            TxnState::Aborted,
+            get_time() - VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS,
+        );
+        let unrelated_expired_tid = manager.hlc.now();
+        manager.record_volatile_completion_at(
+            unrelated_expired_tid,
+            TxnState::Committed,
+            get_time() - VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS,
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), unknown_tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::NotExisted),
+            "evidence expires at the strict logical deadline"
+        );
+        assert!(
+            manager
+                .participant_completions
+                .lock()
+                .contains_key(&unrelated_expired_tid),
+            "ordinary evidence lookup must expire only its requested TID, not scan the cache"
+        );
+        manager.prune_participant_completions_at(get_time());
+        assert!(
+            !manager
+                .participant_completions
+                .lock()
+                .contains_key(&unrelated_expired_tid),
+            "the bounded background maintenance path removes unrelated expired evidence"
+        );
+
+        let aborted_tid = manager.hlc.now();
+        manager.get_or_create_transaction(&aborted_tid).lock().state = TxnState::Aborted;
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), aborted_tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, manager.hlc.now(), aborted_tid)
+                .await
+                .payload,
+            AbortResult::CheckFailed(CheckError::AlreadyAborted)
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), aborted_tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delayed_duplicate_prepare_cannot_resurrect_volatile_completion() {
+        let address = "127.0.0.1:5374";
+        let group = "txn_data_site_volatile_delayed_prepare";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let manager = data_manager_for_database(&server, address, group).await;
+
+        assert_delayed_duplicate_prepare_cannot_resurrect_completion(
+            manager,
+            runtime,
+            Id::new(0, 90502),
+        )
+        .await;
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delayed_duplicate_prepare_cannot_resurrect_durable_completion() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5375";
+        let group = "txn_data_site_durable_delayed_prepare";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = data_manager_for_database(&server, address, group).await;
+
+        assert_delayed_duplicate_prepare_cannot_resurrect_completion(
+            manager,
+            runtime,
+            Id::new(0, 90503),
+        )
+        .await;
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_owner_resolution_finishes_exact_known_commit() {
+        let _ = env_logger::try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5347";
+        let group = "txn_data_site_stale_commit_resolution";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+        let cell_id = Id::new(0, 8208);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 21, 0);
+        let tid = server.hlc.try_now().unwrap();
+        let owner = TxnPriority::new(tid, server.server_id);
+        let prepare_op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_revision_ts),
+            intent: PrepareIntent::Write,
+        };
+
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &tid, vec![prepare_op.clone()]).await,
+            DMPrepareResult::Success
+        );
+        let commit_hlc = server.hlc.try_now().unwrap();
+        assert_eq!(
+            <DataManager as Service>::commit(
+                &manager,
+                commit_hlc,
+                tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    22,
+                    "stale-commit-resolution",
+                ))],
+            )
+            .await
+            .payload,
+            DMCommitResult::Success
+        );
+        assert!(
+            matches!(
+                runtime.chunks().head_snapshot(&cell_id, u64::MAX).unwrap(),
+                SnapshotRead::Wait
+            ),
+            "the installed revision must remain pending before explicit resolution"
+        );
+        runtime
+            .undo_log()
+            .expect("durable coordinator undo log")
+            .write_coordinator_commit_decision(&tid, commit_hlc, &[server.server_id])
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let contender = server.hlc.try_now().unwrap();
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &contender, vec![prepare_op],).await,
+            DMPrepareResult::NotRealizable
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.cell_meta_mutex(&cell_id).lock().owner.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("known Commit resolution must release the stale owner");
+        assert_ne!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner),
+            "the exact stale owner must be resolved"
+        );
+        match runtime
+            .chunks()
+            .read_cell_snapshot(&cell_id, u64::MAX)
+            .unwrap()
+        {
+            SnapshotRead::Present(cell) => {
+                assert_eq!(*cell.data["score"].u64().unwrap(), 22);
+            }
+            other => panic!("known Commit must promote the pending value, got {other:?}"),
+        }
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_unknown_owner_is_retained_retried_and_deduplicated() {
+        let _ = env_logger::try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5348";
+        let group = "txn_data_site_stale_unknown_resolution";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+        let cell_id = Id::new(0, 8209);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 31, 0);
+        let tid = server.hlc.try_now().unwrap();
+        let owner = TxnPriority::new(tid, server.server_id);
+        let prepare_op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_revision_ts),
+            intent: PrepareIntent::Write,
+        };
+
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &tid, vec![prepare_op.clone()]).await,
+            DMPrepareResult::Success
+        );
+        let commit_hlc = server.hlc.try_now().unwrap();
+        assert_eq!(
+            <DataManager as Service>::commit(
+                &manager,
+                commit_hlc,
+                tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    32,
+                    "stale-unknown-resolution",
+                ))],
+            )
+            .await
+            .payload,
+            DMCommitResult::Success
+        );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..8 {
+            let contender = server.hlc.try_now().unwrap();
+            assert_eq!(
+                prepare_ops_local(
+                    &manager,
+                    server.server_id,
+                    &contender,
+                    vec![prepare_op.clone()],
+                )
+                .await,
+                DMPrepareResult::NotRealizable
+            );
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.resolution_attempt_count_for_test(&owner) >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Unknown resolution must be retried");
+        assert_eq!(
+            manager.queued_resolution_count_for_test(),
+            1,
+            "repeated stale prepares must share one owner resolver"
+        );
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner.clone()),
+            "Unknown must retain the exact owner"
+        );
+        assert!(
+            matches!(
+                runtime.chunks().head_snapshot(&cell_id, u64::MAX).unwrap(),
+                SnapshotRead::Wait
+            ),
+            "Unknown must keep the pending revision hidden"
+        );
+
+        runtime
+            .undo_log()
+            .expect("durable coordinator undo log")
+            .write_coordinator_commit_decision(&tid, commit_hlc, &[server.server_id])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.cell_meta_mutex(&cell_id).lock().owner.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a later exact Commit decision must finish the retry loop");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_in_progress_owner_is_retained_until_coordinator_aborts() {
+        let address = "127.0.0.1:5440";
+        let group = "txn_data_site_stale_in_progress";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+        let coordinator = runtime.txn_manager().expect("transaction manager").clone();
+        let tid =
+            <super::manager::TransactionManager as super::manager::Service>::begin(&coordinator)
+                .await
+                .unwrap();
+        let owner = TxnPriority::new(tid, server.server_id);
+        let cell_id = Id::new(0, 8213);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 71, 0);
+        let prepare_op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_revision_ts),
+            intent: PrepareIntent::Write,
+        };
+
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &tid, vec![prepare_op.clone()]).await,
+            DMPrepareResult::Success
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let contender = server.hlc.try_now().unwrap();
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &contender, vec![prepare_op]).await,
+            DMPrepareResult::NotRealizable
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.resolution_attempt_count_for_test(&owner) >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("InProgress resolution must be retried");
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner.clone()),
+            "InProgress must never clear the owner"
+        );
+
+        assert_eq!(
+            <super::manager::TransactionManager as super::manager::Service>::abort(
+                &coordinator,
+                tid,
+            )
+            .await
+            .unwrap(),
+            AbortResult::Success(None)
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.cell_meta_mutex(&cell_id).lock().owner.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a later explicit Abort decision must release the owner");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolution_rpc_failure_retains_owner_until_a_later_explicit_decision() {
+        let address = "127.0.0.1:5441";
+        let group = "txn_data_site_resolution_rpc_failure";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+        let coordinator = runtime.txn_manager().expect("transaction manager").clone();
+        let tid =
+            <super::manager::TransactionManager as super::manager::Service>::begin(&coordinator)
+                .await
+                .unwrap();
+        let owner = TxnPriority::new(tid, server.server_id);
+        let cell_id = Id::new(0, 8214);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 81, 0);
+
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                server.server_id,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision_ts),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        coordinator.fail_next_resolution_request_for_test();
+        assert!(
+            !manager.resolve_stale_owner_once(&owner).await,
+            "a failed coordinator request must remain retryable"
+        );
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner.clone()),
+            "RPC failure must retain the exact owner"
+        );
+
+        assert_eq!(
+            <super::manager::TransactionManager as super::manager::Service>::abort(
+                &coordinator,
+                tid,
+            )
+            .await
+            .unwrap(),
+            AbortResult::Success(None)
+        );
+        assert!(
+            manager.resolve_stale_owner_once(&owner).await,
+            "the later explicit Abort decision must finish resolution"
+        );
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unavailable_remote_coordinator_is_retried_without_owner_reclamation() {
+        let address = "127.0.0.1:5442";
+        let group = "txn_data_site_unavailable_remote_coordinator";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+        let unavailable_coordinator = server.server_id.wrapping_add(1_000_000);
+        let tid = server.hlc.try_now().unwrap();
+        let owner = TxnPriority::new(tid, unavailable_coordinator);
+        let cell_id = Id::new(0, 8215);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 91, 0);
+        let prepare_op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_revision_ts),
+            intent: PrepareIntent::Write,
+        };
+
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                unavailable_coordinator,
+                &tid,
+                vec![prepare_op.clone()],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let contender = server.hlc.try_now().unwrap();
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &contender, vec![prepare_op]).await,
+            DMPrepareResult::NotRealizable
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.resolution_attempt_count_for_test(&owner) >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an unavailable coordinator must remain on the retry queue");
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner.clone()),
+            "network unavailability must never infer Abort or clear ownership"
+        );
+        assert_eq!(manager.queued_resolution_count_for_test(), 1);
+
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, server.hlc.now(), tid)
+                .await
+                .payload,
+            AbortResult::Success(None)
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, server.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_resolution_timestamp_mismatch_retains_owner_and_pending_value() {
+        let _ = env_logger::try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5349";
+        let group = "txn_data_site_stale_commit_mismatch";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+        let cell_id = Id::new(0, 8210);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 41, 0);
+        let tid = server.hlc.try_now().unwrap();
+        let owner = TxnPriority::new(tid, server.server_id);
+        let prepare_op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(initial_revision_ts),
+            intent: PrepareIntent::Write,
+        };
+
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &tid, vec![prepare_op.clone()]).await,
+            DMPrepareResult::Success
+        );
+        let installed_hlc = server.hlc.try_now().unwrap();
+        assert_eq!(
+            <DataManager as Service>::commit(
+                &manager,
+                installed_hlc,
+                tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    42,
+                    "stale-commit-mismatch",
+                ))],
+            )
+            .await
+            .payload,
+            DMCommitResult::Success
+        );
+        let mismatched_hlc = server.hlc.try_now().unwrap();
+        assert_ne!(installed_hlc, mismatched_hlc);
+        runtime
+            .undo_log()
+            .expect("durable coordinator undo log")
+            .write_coordinator_commit_decision(&tid, mismatched_hlc, &[server.server_id])
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let contender = server.hlc.try_now().unwrap();
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &contender, vec![prepare_op],).await,
+            DMPrepareResult::NotRealizable
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.resolution_attempt_count_for_test(&owner) >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("mismatched Commit resolution must retry");
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner),
+            "a mismatched Commit timestamp must retain ownership"
+        );
+        assert!(
+            matches!(
+                runtime.chunks().head_snapshot(&cell_id, u64::MAX).unwrap(),
+                SnapshotRead::Wait
+            ),
+            "a mismatched Commit timestamp must keep installed output hidden"
+        );
+
+        runtime
+            .undo_log()
+            .expect("durable coordinator undo log")
+            .write_coordinator_commit_decision(&tid, installed_hlc, &[server.server_id])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.cell_meta_mutex(&cell_id).lock().owner.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a later exact Commit decision must finish the retry loop");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_abort_resolution_compensates_then_ends_idempotently() {
+        let _ = env_logger::try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5350";
+        let group = "txn_data_site_stale_abort_resolution";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+        let cell_id = Id::new(0, 8211);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 51, 0);
+        let tid = server.hlc.try_now().unwrap();
+        let owner = TxnPriority::new(tid, server.server_id);
+
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                server.server_id,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision_ts),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::commit(
+                &manager,
+                server.hlc.try_now().unwrap(),
+                tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    52,
+                    "stale-abort-resolution",
+                ))],
+            )
+            .await
+            .payload,
+            DMCommitResult::Success
+        );
+        let undo_log = runtime.undo_log().expect("durable coordinator undo log");
+        undo_log
+            .write_coordinator_abort_decision(&tid, &[server.server_id])
+            .unwrap();
+        undo_log.fail_next_abort_marker_for_test();
+
+        assert!(
+            !manager.resolve_stale_owner_once(&owner).await,
+            "a failed durable end must retain the resolver for retry"
+        );
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner.clone()),
+            "abort compensation alone must not release the owner"
+        );
+        let compensated = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*compensated.data["score"].u64().unwrap(), 51);
+        assert!(compensated.header.revision_ts > initial_revision_ts);
+        let compensation_ts = compensated.header.revision_ts;
+
+        assert!(
+            manager.resolve_stale_owner_once(&owner).await,
+            "AlreadyAborted followed by an idempotent end must finish resolution"
+        );
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+        let retained = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*retained.data["score"].u64().unwrap(), 51);
+        assert_eq!(
+            retained.header.revision_ts, compensation_ts,
+            "retry must not install duplicate compensation"
+        );
+        assert_eq!(
+            undo_log.participant_completion(&tid).unwrap(),
+            Some(TxnState::Aborted),
+            "participant completion evidence must make end restart-idempotent"
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, server.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn participant_retirement_prepare_and_finalize_are_durable_and_idempotent() {
+        let _ = env_logger::try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5351";
+        let group = "txn_data_site_participant_retirement";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 8212);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 61, 0);
+        let tid = server.hlc.try_now().unwrap();
+        let coordinator_expires_at_ms = get_time() - 1;
+        let participant_expires_at_ms = get_time() + 300_000;
+
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                server.server_id,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision_ts),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, server.hlc.now(), tid)
+                .await
+                .payload,
+            AbortResult::Success(None)
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, server.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                <DataManager as Service>::retire(
+                    &manager,
+                    server.hlc.now(),
+                    tid,
+                    TxnResolution::Abort,
+                    coordinator_expires_at_ms,
+                )
+                .await
+                .payload,
+                EndResult::Success
+            );
+        }
+        assert_eq!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .participant_retirement(&tid)
+                .unwrap(),
+            Some(undo_log::ParticipantRetirementRecord {
+                outcome: TxnState::Aborted,
+                expires_at_ms: coordinator_expires_at_ms,
+                finalized: false,
+            })
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                <DataManager as Service>::finalize_retirement(
+                    &manager,
+                    server.hlc.now(),
+                    tid,
+                    TxnResolution::Abort,
+                    participant_expires_at_ms,
+                )
+                .await
+                .payload,
+                EndResult::Success
+            );
+        }
+        assert_eq!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .participant_retirement(&tid)
+                .unwrap(),
+            Some(undo_log::ParticipantRetirementRecord {
+                outcome: TxnState::Aborted,
+                expires_at_ms: participant_expires_at_ms,
+                finalized: true,
+            })
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn prepare_does_not_reclaim_aged_foreign_owner() {
         let _ = env_logger::try_init();
         let address = "127.0.0.1:5346";
@@ -3289,7 +4806,7 @@ mod tests {
         {
             let meta = manager.cell_meta_mutex(&cell_id);
             let mut meta = meta.lock();
-            meta.lock_acquired_at = Some(get_time() - LOCK_TIMEOUT_MS - 1);
+            meta.lock_acquired_at = Some(get_time() - DEFAULT_LOCK_TIMEOUT_MS - 1);
         }
 
         let second = <DataManager as Service>::prepare(
@@ -3963,86 +5480,55 @@ mod tests {
         server.shutdown().await;
     }
 
-    // Regression guard for the `cell_meta_cleanup` orphan race.
-    //
-    // `cell_meta_cleanup`'s second pass checks `owner.is_none()` under the meta
-    // lock but then calls `self.cells.remove` AFTER releasing that lock. An
-    // in-flight INSERT prepare creates its cell meta via `cell_meta_mutex` (empty
-    // read/write clocks, `owner = None`, pushed onto `cell_list`) and only later,
-    // in the same synchronous region, assigns `owner = Some(..)`. Because the
-    // background cleanup task runs on another worker thread (it is signalled on
-    // every transaction `end`, see `cleanup_signal.store(true, ..)`), it could
-    // lock the fresh meta first, evict it, and remove it from `self.cells` before
-    // the prepare acquires the owner — orphaning the acquired lock (the cell map
-    // would then hold no entry, and the next `cell_meta_mutex` would mint a fresh
-    // unowned meta). The orphan is fail-safe rather than a lost update (`write_cell`
-    // rejects a duplicate insert with `CellAlreadyExisted` and the participant
-    // `commit` re-checks `owner`, so the orphaned transaction spuriously aborts
-    // with `CannotEnd`), but it is still an incorrect spurious abort.
-    //
-    // The fix leaves metas whose `read` and `write` clocks are both still empty
-    // (the in-flight-insert window) for a later pass. This test drives the window
-    // deterministically and asserts the owned meta stays map-resident.
     #[tokio::test(flavor = "multi_thread")]
-    async fn cell_meta_cleanup_must_not_orphan_a_lock_being_acquired_by_insert_prepare() {
+    async fn stamped_meta_evicted_after_prepare_prefetch_is_retried_not_orphaned() {
         let _ = env_logger::try_init();
         let address = "127.0.0.1:5372";
         let group = "txn_ds_cleanup_insert_race";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
-
-        // The preparing insert transaction is registered exactly as real prepare
-        // does via `get_or_create_transaction`, so the cleanup watermark `oldest`
-        // is this (non-empty) clock. A freshly created insert meta carries empty
-        // read/write clocks, which sort strictly below `oldest`, so only the
-        // racy `owner.is_none()` check stands between it and eviction.
-        let insert_tid = test_hlc(9, 7);
-        let _txn = manager.get_or_create_transaction(&insert_tid);
-
-        // Model prepare mid-flight: the meta exists (owner not yet acquired).
+        let insert_tid = manager.hlc.now();
         let insert_id = Id::new(0, 90501);
-        let meta_in_prepare = manager.cell_meta_mutex(&insert_id);
-        assert!(
-            manager.cells.get(&insert_id).is_some(),
-            "precondition: the in-flight insert meta is registered in the cell map"
-        );
-        assert!(
-            meta_in_prepare.lock().owner.is_none(),
-            "precondition: prepare has not yet acquired the owner"
-        );
-
-        // The background cleanup pass runs during that window.
-        manager.cell_meta_cleanup().await;
-
-        // Prepare now finishes acquiring the owner on the meta it created.
+        let prefetched = manager.cell_meta_mutex(&insert_id);
         {
-            let mut meta = meta_in_prepare.lock();
-            meta.owner = Some(TxnPriority::new(insert_tid.clone(), 0));
-            meta.lock_acquired_at = Some(get_time());
+            let mut meta = prefetched.lock();
+            meta.read = test_hlc(1, 7);
+            meta.write = test_hlc(1, 7);
         }
+        let pause = install_meta_acquire_delay_for_cell(insert_tid, insert_id);
+        let prepare_manager = manager.clone();
+        let prepare_task = tokio::spawn(async move {
+            prepare_ops_local(
+                &prepare_manager,
+                0,
+                &insert_tid,
+                vec![PrepareOp {
+                    id: insert_id,
+                    expectation: CellExpectation::Absent(None),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await
+        });
+        pause.wait_until_entered().await;
 
-        // Safety property: the cell map must still resolve to the meta prepare
-        // acquired its owner on. If cleanup removed the entry during the window,
-        // a subsequent `cell_meta_mutex` would mint a fresh, unowned meta and the
-        // acquired lock is orphaned.
-        let visible = manager.cells.get(&insert_id);
-        let same_meta = visible
-            .as_ref()
-            .is_some_and(|m| Arc::ptr_eq(m, &meta_in_prepare));
+        manager.cell_meta_cleanup().await;
         assert!(
-            same_meta,
-            "cell_meta_cleanup orphaned the in-flight insert lock: after prepare \
-             acquired its owner, the cell map no longer resolves to that owned meta \
-             (present={}, same_arc={})",
-            visible.is_some(),
-            same_meta
+            manager.cells.get(&insert_id).is_none(),
+            "the stamped prefetched candidate must be evicted during the pause"
         );
+        pause.release();
+        assert_eq!(prepare_task.await.unwrap(), DMPrepareResult::Success);
+
+        let visible = manager.cells.get(&insert_id).expect("retried current meta");
+        assert!(!Arc::ptr_eq(&visible, &prefetched));
         assert_eq!(
-            visible.unwrap().lock().owner,
+            visible.lock().owner,
             Some(TxnPriority::new(insert_tid, 0)),
-            "the meta visible to other transactions must reflect the acquired owner"
+            "prepare must own the replacement map entry, never the orphaned Arc"
         );
 
+        abort_and_end_local(&manager, &insert_tid).await;
         server.shutdown().await;
     }
 
@@ -4267,7 +5753,7 @@ mod tests {
             <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
                 .await
                 .payload,
-            EndResult::CheckFailed(CheckError::NotExisted)
+            EndResult::Success
         );
 
         server.shutdown().await;
@@ -5435,25 +6921,20 @@ mod tests {
         let tid = manager.hlc.now();
         let coordinator_id = 50;
         let owner = TxnPriority::new(tid, coordinator_id);
+        let prepare_ops = vec![
+            PrepareOp {
+                id: first_id,
+                expectation: CellExpectation::Present(first_revision),
+                intent: PrepareIntent::Write,
+            },
+            PrepareOp {
+                id: second_id,
+                expectation: CellExpectation::Present(second_revision),
+                intent: PrepareIntent::Write,
+            },
+        ];
         assert_eq!(
-            prepare_ops_local(
-                &manager,
-                coordinator_id,
-                &tid,
-                vec![
-                    PrepareOp {
-                        id: first_id,
-                        expectation: CellExpectation::Present(first_revision),
-                        intent: PrepareIntent::Write,
-                    },
-                    PrepareOp {
-                        id: second_id,
-                        expectation: CellExpectation::Present(second_revision),
-                        intent: PrepareIntent::Write,
-                    },
-                ],
-            )
-            .await,
+            prepare_ops_local(&manager, coordinator_id, &tid, prepare_ops.clone()).await,
             DMPrepareResult::Success
         );
         assert_eq!(
@@ -5479,6 +6960,12 @@ mod tests {
             DMCommitResult::Success
         );
 
+        let delayed_prepare = install_prepare_delay_for_cell(tid, first_id);
+        let duplicate_manager = manager.clone();
+        let duplicate_prepare = tokio::spawn(async move {
+            prepare_ops_local(&duplicate_manager, coordinator_id, &tid, prepare_ops).await
+        });
+        delayed_prepare.wait_until_entered().await;
         let failure = install_end_promotion_failure(tid, second_id);
         assert_eq!(
             <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
@@ -5490,6 +6977,18 @@ mod tests {
             .txns
             .get(&tid)
             .expect("failed promotion must preserve transaction state");
+        delayed_prepare.release();
+        assert_eq!(
+            duplicate_prepare.await.unwrap(),
+            DMPrepareResult::StateError(TxnState::Committed)
+        );
+        assert!(
+            manager
+                .txns
+                .get(&tid)
+                .is_some_and(|current| Arc::ptr_eq(&current, &txn_lock)),
+            "a duplicate prepare must preserve the exact live retry transaction"
+        );
         assert_eq!(txn_lock.lock().state, TxnState::Committed);
         assert_eq!(
             txn_lock.lock().durable_decision,
@@ -5660,9 +7159,99 @@ impl Service for DataManager {
                 prepared_ops.iter().cloned().map(|op| (op.id, op)).collect();
             let requester = TxnPriority::new(tid.clone(), coordinator_id);
 
-            let result = 'result: {
-                let txn_lock = self.get_or_create_transaction(&tid);
+            // Reject known-complete or non-identical live retries before
+            // minting any CellMeta entries. The checks inside the acquisition
+            // loop remain authoritative: end or another prepare may race this
+            // fail-fast snapshot.
+            match self.participant_completion_evidence(&tid, get_time()) {
+                Ok(Some(state @ (TxnState::Committed | TxnState::Aborted))) => {
+                    return self
+                        .response_with(DMPrepareResult::StateError(state))
+                        .await;
+                }
+                Ok(Some(_)) => {
+                    return self.response_with(DMPrepareResult::NotRealizable).await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    error!(
+                        "Failed to check participant completion before prepare {:?}: {:?}",
+                        tid, error
+                    );
+                    return self.response_with(DMPrepareResult::NotRealizable).await;
+                }
+            }
+            let live_rejection = self.find_transaction(&tid).and_then(|txn_lock| {
+                let txn = txn_lock.lock();
+                self.txns
+                    .get(&tid)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &txn_lock))
+                    .then(|| match txn.state {
+                        TxnState::Started => None,
+                        TxnState::Prepared
+                            if txn.coordinator_id == Some(coordinator_id)
+                                && txn.certified == prepared_ops_by_id =>
+                        {
+                            None
+                        }
+                        state => Some(DMPrepareResult::StateError(state)),
+                    })
+                    .flatten()
+            });
+            if let Some(rejection) = live_rejection {
+                return self.response_with(rejection).await;
+            }
+            let mut prefetched_cell_mutexes = Some(
+                prepared_ops
+                    .iter()
+                    .map(|op| self.cell_meta_mutex(&op.id))
+                    .collect::<Vec<_>>(),
+            );
+            #[cfg(test)]
+            if let Some(state) = Self::take_matching_meta_acquire_delay(&tid, &prepared_ops) {
+                Self::await_prepare_delay(&state).await;
+            }
+
+            let result = 'result: loop {
+                let (txn_lock, created) = self.get_or_create_transaction_with_status(&tid);
                 let mut txn = txn_lock.lock();
+                if !self
+                    .txns
+                    .get(&tid)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &txn_lock))
+                {
+                    drop(txn);
+                    match self.participant_completion_evidence(&tid, get_time()) {
+                        Ok(Some(state @ (TxnState::Committed | TxnState::Aborted))) => {
+                            break 'result DMPrepareResult::StateError(state);
+                        }
+                        Ok(_) => continue 'result,
+                        Err(error) => {
+                            error!(
+                                "Failed to check participant completion before prepare {:?}: {:?}",
+                                tid, error
+                            );
+                            break 'result DMPrepareResult::NotRealizable;
+                        }
+                    }
+                }
+                match self.participant_completion_evidence(&tid, get_time()) {
+                    Ok(Some(state @ (TxnState::Committed | TxnState::Aborted))) => {
+                        if created {
+                            self.wipe_out_transaction(&tid, &txn_lock);
+                        }
+                        break 'result DMPrepareResult::StateError(state);
+                    }
+                    Ok(Some(_)) => break 'result DMPrepareResult::NotRealizable,
+                    Ok(None) => {}
+                    Err(error) => {
+                        error!(
+                            "Failed to check participant completion before prepare {:?}: {:?}",
+                            tid, error
+                        );
+                        break 'result DMPrepareResult::NotRealizable;
+                    }
+                }
                 match txn.state {
                     TxnState::Started => {}
                     TxnState::Prepared => {
@@ -5675,70 +7264,87 @@ impl Service for DataManager {
                     _ => break 'result DMPrepareResult::StateError(txn.state),
                 }
 
-                let mut cell_mutices = Vec::with_capacity(prepared_ops.len());
-                let mut cell_guards = Vec::with_capacity(prepared_ops.len());
+                'acquire: loop {
+                    let mut cell_mutexes = prefetched_cell_mutexes.take().unwrap_or_else(|| {
+                        Vec::with_capacity(prepared_ops.len())
+                    });
+                    let mut cell_guards = Vec::with_capacity(prepared_ops.len());
 
-                for op in &prepared_ops {
-                    cell_mutices.push(self.cell_meta_mutex(&op.id));
-                }
-                for cell_mutex in &cell_mutices {
-                    let meta = cell_mutex.lock();
+                    if cell_mutexes.is_empty() && !prepared_ops.is_empty() {
+                        for op in &prepared_ops {
+                            cell_mutexes.push(self.cell_meta_mutex(&op.id));
+                        }
+                    }
+                    for cell_mutex in &cell_mutexes {
+                        cell_guards.push(cell_mutex.lock());
+                    }
+                    if prepared_ops
+                        .iter()
+                        .zip(&cell_mutexes)
+                        .any(|(op, meta)| !self.cell_meta_is_current(&op.id, meta))
+                    {
+                        drop(cell_guards);
+                        continue 'acquire;
+                    }
 
-                    if let Some(owner) = meta.owner.clone() {
-                        if owner != requester {
-                            let lock_age = meta
-                                .lock_acquired_at
-                                .map(|acquired| get_time() - acquired)
-                                .unwrap_or(0);
+                    for meta in &cell_guards {
+                        if let Some(owner) = meta.owner.clone() {
+                            if owner != requester {
+                                let lock_age = meta
+                                    .lock_acquired_at
+                                    .map(|acquired| get_time() - acquired)
+                                    .unwrap_or(0);
+                                if lock_age > self.lock_timeout_ms {
+                                    self.queue_stale_owner_resolution(owner.clone());
+                                }
 
-                            if requester.compare_age(&owner).is_gt() {
-                                debug!(
-                                    "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
-                                    requester, owner, lock_age
-                                );
-                                break 'result DMPrepareResult::NotRealizable;
-                            } else {
-                                debug!(
-                                    "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?} (lock age: {}ms)",
-                                    requester, owner, lock_age
-                                );
-                                break 'result DMPrepareResult::Wait;
+                                if requester.compare_age(&owner).is_gt() {
+                                    debug!(
+                                        "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
+                                        requester, owner, lock_age
+                                    );
+                                    break 'result DMPrepareResult::NotRealizable;
+                                } else {
+                                    debug!(
+                                        "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?} (lock age: {}ms)",
+                                        requester, owner, lock_age
+                                    );
+                                    break 'result DMPrepareResult::Wait;
+                                }
                             }
                         }
                     }
 
-                    cell_guards.push(meta);
-                }
-
-                let lock_time = get_time();
-                for meta in &mut cell_guards {
-                    meta.owner = Some(requester.clone());
-                    meta.lock_acquired_at = Some(lock_time);
-                }
-
-                for op in &prepared_ops {
-                    if !self.prepare_expectation_matches(op) {
-                        debug!(
-                            "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
-                            requester, op.id, op
-                        );
-                        for meta in &mut cell_guards {
-                            if meta.owner.as_ref() == Some(&requester) {
-                                meta.owner = None;
-                                meta.lock_acquired_at = None;
-                            }
-                        }
-                        break 'result DMPrepareResult::NotRealizable;
+                    let lock_time = get_time();
+                    for meta in &mut cell_guards {
+                        meta.owner = Some(requester.clone());
+                        meta.lock_acquired_at = Some(lock_time);
                     }
-                }
 
-                txn.certified = prepared_ops_by_id;
-                txn.affected_cells = txn.certified.keys().copied().collect();
-                txn.coordinator_id = Some(coordinator_id);
-                txn.state = TxnState::Prepared;
-                txn.last_activity = get_time();
-                debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
-                DMPrepareResult::Success
+                    for op in &prepared_ops {
+                        if !self.prepare_expectation_matches(op) {
+                            debug!(
+                                "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
+                                requester, op.id, op
+                            );
+                            for meta in &mut cell_guards {
+                                if meta.owner.as_ref() == Some(&requester) {
+                                    meta.owner = None;
+                                    meta.lock_acquired_at = None;
+                                }
+                            }
+                            break 'result DMPrepareResult::NotRealizable;
+                        }
+                    }
+
+                    txn.certified = prepared_ops_by_id;
+                    txn.affected_cells = txn.certified.keys().copied().collect();
+                    txn.coordinator_id = Some(coordinator_id);
+                    txn.state = TxnState::Prepared;
+                    txn.last_activity = get_time();
+                    debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
+                    break 'result DMPrepareResult::Success;
+                }
             };
 
             self.response_with(result).await
@@ -5809,9 +7415,19 @@ impl Service for DataManager {
             super::phase_profile::guard(super::phase_profile::Phase::ParticipantAbort);
         self.update_clock(clock);
         let Some(txn_lock) = self.find_transaction(&tid) else {
-            return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted));
+            return self.response_with(self.abort_result_from_completion_evidence(&tid));
         };
         let mut txn = txn_lock.lock();
+        match self.txns.get(&tid) {
+            Some(current) if Arc::ptr_eq(&current, &txn_lock) => {}
+            None => {
+                drop(txn);
+                return self.response_with(self.abort_result_from_completion_evidence(&tid));
+            }
+            Some(_) => {
+                return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
+            }
+        }
         if txn.durable_decision == Some(TxnState::Committed) {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyCommitted));
         }
@@ -5895,23 +7511,17 @@ impl Service for DataManager {
 
         let result = 'end: {
             let Some(txn_lock) = self.find_transaction(&tid) else {
-                let completion = match self.undo_log() {
-                    Some(undo_log) => undo_log.participant_completion(&tid),
-                    None => Ok(None),
-                };
-                return self.response_with(match completion {
-                    Ok(Some(TxnState::Committed | TxnState::Aborted)) => EndResult::Success,
-                    Ok(_) => EndResult::CheckFailed(CheckError::NotExisted),
-                    Err(error) => {
-                        error!(
-                            "Failed to read durable participant completion for transaction {:?}: {:?}",
-                            tid, error
-                        );
-                        EndResult::CheckFailed(CheckError::CannotEnd)
-                    }
-                });
+                return self.response_with(self.end_result_from_completion_evidence(&tid));
             };
             let mut txn = txn_lock.lock();
+            match self.txns.get(&tid) {
+                Some(current) if Arc::ptr_eq(&current, &txn_lock) => {}
+                None => {
+                    drop(txn);
+                    return self.response_with(self.end_result_from_completion_evidence(&tid));
+                }
+                Some(_) => break 'end EndResult::CheckFailed(CheckError::CannotEnd),
+            }
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
                 break 'end EndResult::CheckFailed(CheckError::CannotEnd);
             }
@@ -6039,7 +7649,12 @@ impl Service for DataManager {
                 meta.lock_acquired_at = None;
             }
 
-            self.wipe_out_transaction(&tid);
+            if self.undo_log().is_none() {
+                self.record_volatile_completion_at(tid, txn.state, get_time());
+            } else {
+                self.record_durable_completion(tid, txn.state, None);
+            }
+            self.wipe_out_transaction(&tid, &txn_lock);
             drop(txn);
             self.cleanup_signal.store(true, Relaxed);
             debug!("ENDED: {:?} after atomic owner barrier", tid);
@@ -6051,5 +7666,27 @@ impl Service for DataManager {
             self.response_with(result).await
         }
         .boxed()
+    }
+
+    fn retire(
+        &self,
+        clock: Hlc,
+        tid: TxnId,
+        resolution: TxnResolution,
+        expires_at_ms: i64,
+    ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+        self.update_clock(clock);
+        self.response_with(self.retire_participant_evidence(&tid, resolution, expires_at_ms, false))
+    }
+
+    fn finalize_retirement(
+        &self,
+        clock: Hlc,
+        tid: TxnId,
+        resolution: TxnResolution,
+        expires_at_ms: i64,
+    ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
+        self.update_clock(clock);
+        self.response_with(self.retire_participant_evidence(&tid, resolution, expires_at_ms, true))
     }
 }
