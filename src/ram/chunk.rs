@@ -900,10 +900,12 @@ impl Chunk {
         {
             return Err(WriteError::CellRevisionMismatch);
         }
-        if predecessor
-            .as_ref()
-            .is_some_and(|current| current.load().0 != RevisionState::CommittedDeleted)
-        {
+        if predecessor.as_ref().is_some_and(|current| {
+            !matches!(
+                current.load().0,
+                RevisionState::CommittedDeleted | RevisionState::Aborted
+            )
+        }) {
             return Err(WriteError::CellAlreadyExisted);
         }
 
@@ -1248,6 +1250,47 @@ impl Chunk {
         }
     }
 
+    fn invalidate_recovered_revision(
+        &self,
+        id: &Id,
+        installed_revision_ts: u64,
+    ) -> Result<InstalledRevision, WriteError> {
+        let current = self
+            .history
+            .current(id)
+            .filter(|current| current.revision_ts == installed_revision_ts)
+            .ok_or(WriteError::CellRevisionMismatch)?;
+        let (state, location) = current.load();
+        let mirror_matches = match state {
+            RevisionState::CommittedPresent => CellGuard::for_read(id.lower, self)
+                .ok()
+                .and_then(|mut guard| {
+                    let header = guard.head_cell().ok()?;
+                    Some(
+                        guard.get_ptr() == location
+                            && Id::from_header(&header) == *id
+                            && header.revision_ts == installed_revision_ts,
+                    )
+                })
+                .unwrap_or(false),
+            RevisionState::CommittedDeleted => matches!(
+                CellGuard::for_read(id.lower, self),
+                Err(ReadError::CellDoesNotExisted)
+            ),
+            RevisionState::PendingPresent
+            | RevisionState::PendingDeleted
+            | RevisionState::Aborted
+            | RevisionState::Expired => false,
+        };
+        if !mirror_matches || !current.compare_exchange_state(state, RevisionState::Aborted) {
+            return Err(WriteError::CellRevisionMismatch);
+        }
+        Ok(InstalledRevision {
+            id: *id,
+            node: current,
+        })
+    }
+
     fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let revision_ts = self.next_revision_ts(0)?;
         self.write_cell_at_revision(cell, RevisionWrite::committed(revision_ts))?;
@@ -1284,6 +1327,21 @@ impl Chunk {
             self.update_cell_with_guard_at_revision(&mut guard, cell, write)?;
         }
         Ok(cell.header)
+    }
+
+    fn upsert_cell_at_revision(
+        &self,
+        cell: &mut OwnedCell,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        Self::validate_assigned_revision(write)?;
+        let hash = cell.header.hash;
+        let mut guard = self.lock_or_insert_cell(hash);
+        if guard.is_unassigned() {
+            self.write_cell_with_guard_at_revision(&mut guard, cell, write)
+        } else {
+            self.update_cell_with_guard_at_revision(&mut guard, cell, write)
+        }
     }
 
     fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<OwnedCell, WriteError>
@@ -2393,6 +2451,15 @@ impl Chunks {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.upsert_cell(cell);
     }
+
+    fn upsert_cell_at_revision(
+        &self,
+        cell: &mut OwnedCell,
+        write: RevisionWrite,
+    ) -> Result<InstalledRevision, WriteError> {
+        let chunk = self.locate_chunk_by_partition(cell.header.partition);
+        chunk.upsert_cell_at_revision(cell, write)
+    }
     pub fn remove_cell(&self, key: &Id) -> Result<(), WriteError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell(hash);
@@ -2435,6 +2502,13 @@ impl Chunks {
             .location(key, revision_ts)
     }
 
+    pub(crate) fn current_revision_ts(&self, key: &Id) -> Option<u64> {
+        self.locate_chunk_by_partition(key.higher)
+            .history
+            .current(key)
+            .map(|node| node.revision_ts)
+    }
+
     pub fn promote_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
         self.locate_chunk_by_partition(installed.id.higher)
             .promote_revision(installed)
@@ -2443,6 +2517,59 @@ impl Chunks {
     pub fn abort_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
         self.locate_chunk_by_partition(installed.id.higher)
             .abort_revision(installed)
+    }
+
+    fn install_compensation(
+        &self,
+        installed: &InstalledRevision,
+        prior: Option<OwnedCell>,
+    ) -> Result<InstalledRevision, WriteError> {
+        let compensation_ts = self.next_revision_ts(installed.node.revision_ts)?;
+        match prior {
+            Some(mut cell) => {
+                self.upsert_cell_at_revision(&mut cell, RevisionWrite::committed(compensation_ts))
+            }
+            None => self
+                .remove_cell_at_revision(&installed.id, RevisionWrite::committed(compensation_ts)),
+        }
+    }
+
+    pub fn compensate(
+        &self,
+        installed: &InstalledRevision,
+        prior: Option<OwnedCell>,
+    ) -> Result<InstalledRevision, WriteError> {
+        let chunk = self.locate_chunk_by_partition(installed.id.higher);
+        let current = chunk
+            .history
+            .current(&installed.id)
+            .ok_or(WriteError::CellRevisionMismatch)?;
+        if Arc::ptr_eq(&current, &installed.node) {
+            match installed.node.load().0 {
+                RevisionState::PendingPresent | RevisionState::PendingDeleted => {
+                    chunk.abort_revision(installed)?;
+                }
+                RevisionState::Aborted => {}
+                RevisionState::CommittedPresent
+                | RevisionState::CommittedDeleted
+                | RevisionState::Expired => return Err(WriteError::CellRevisionMismatch),
+            }
+            return self.install_compensation(installed, prior);
+        }
+
+        Err(WriteError::CellRevisionMismatch)
+    }
+
+    pub(crate) fn compensate_recovered(
+        &self,
+        id: &Id,
+        installed_revision_ts: u64,
+        prior: Option<OwnedCell>,
+    ) -> Result<InstalledRevision, WriteError> {
+        let installed = self
+            .locate_chunk_by_partition(id.higher)
+            .invalidate_recovered_revision(id, installed_revision_ts)?;
+        self.install_compensation(&installed, prior)
     }
 
     pub fn count(&self) -> usize {

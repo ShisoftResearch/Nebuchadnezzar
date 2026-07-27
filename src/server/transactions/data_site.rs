@@ -16,6 +16,8 @@ use futures::future::BoxFuture;
 use lightning::linked_list::LinkedList;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
+#[cfg(test)]
+use parking_lot::Condvar;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
@@ -194,6 +196,100 @@ pub(crate) fn install_commit_delay_for_cell(tid: TxnId, id: Id) -> CommitDelayHa
 }
 
 #[cfg(test)]
+struct BeforeStorageMutationState {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    released: Mutex<bool>,
+    released_condvar: Condvar,
+}
+
+#[cfg(test)]
+pub(crate) struct BeforeStorageMutationHandle {
+    key: (TxnId, Id),
+    state: Arc<BeforeStorageMutationState>,
+}
+
+#[cfg(test)]
+impl BeforeStorageMutationHandle {
+    pub(crate) async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    pub(crate) fn release(&self) {
+        let mut released = self.state.released.lock();
+        if !*released {
+            *released = true;
+            self.state.released_condvar.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BeforeStorageMutationHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = before_storage_mutation_hooks().lock();
+        if hooks
+            .get(&self.key)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            hooks.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+static BEFORE_STORAGE_MUTATION_HOOKS: OnceLock<
+    Mutex<BTreeMap<(TxnId, Id), Arc<BeforeStorageMutationState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn before_storage_mutation_hooks(
+) -> &'static Mutex<BTreeMap<(TxnId, Id), Arc<BeforeStorageMutationState>>> {
+    BEFORE_STORAGE_MUTATION_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn install_before_storage_mutation_pause(
+    tid: TxnId,
+    id: Id,
+) -> BeforeStorageMutationHandle {
+    let key = (tid, id);
+    let state = Arc::new(BeforeStorageMutationState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: Mutex::new(false),
+        released_condvar: Condvar::new(),
+    });
+    before_storage_mutation_hooks()
+        .lock()
+        .insert(key.clone(), state.clone());
+    BeforeStorageMutationHandle { key, state }
+}
+
+#[cfg(test)]
+fn pause_before_storage_mutation(tid: &TxnId, id: &Id) {
+    let state = before_storage_mutation_hooks()
+        .lock()
+        .remove(&(tid.clone(), *id));
+    let Some(state) = state else {
+        return;
+    };
+    state
+        .entered
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state.entered_notify.notify_waiters();
+    let mut released = state.released.lock();
+    while !*released {
+        state.released_condvar.wait(&mut released);
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct AbortCannotEndHandle {
     key: (TxnId, Id),
 }
@@ -300,14 +396,14 @@ struct Transaction {
 #[derive(Debug)]
 struct CellHistory {
     cell: Option<OwnedCellRef>,
-    current_revision_ts: u64,
+    compensation_revision_ts: Option<u64>,
 }
 
 impl CellHistory {
-    pub fn new(cell: Option<OwnedCellRef>, current_revision_ts: u64) -> CellHistory {
+    pub fn new(cell: Option<OwnedCellRef>) -> CellHistory {
         CellHistory {
             cell,
-            current_revision_ts: current_revision_ts,
+            compensation_revision_ts: None,
         }
     }
 }
@@ -635,33 +731,36 @@ impl DataManager {
         );
         None
     }
-    fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
+    fn rollback(
+        &self,
+        history: &mut CommitHistory,
+        installed_revisions: &BTreeMap<Id, InstalledRevision>,
+    ) -> Vec<RollbackFailure> {
         let mut failures = Vec::new();
-        for (id, history) in history.iter() {
+        for (id, history) in history.iter_mut() {
             debug!("ROLLING BACK {:?} - {:?}", id, history);
-            let cell = &history.cell;
-            let current_revision_ts = history.current_revision_ts;
-            let error = if cell.is_none() {
-                // the cell was created, need to remove
-                self.chunks()
-                    .remove_cell_by(id, |cell| cell.header.revision_ts == current_revision_ts)
-                    .err()
-            } else if current_revision_ts > 0 {
-                // the cell was updated, need to update back
-                self.chunks()
-                    .update_cell_by(id, |cell_to_update| {
-                        if cell_to_update.header.revision_ts == current_revision_ts {
-                            cell.as_ref().map(|r| r.clone_referred())
-                        } else {
-                            None
-                        }
+            let result = match history.compensation_revision_ts {
+                Some(compensation_revision_ts) => {
+                    if self.chunks().current_revision_ts(id) == Some(compensation_revision_ts) {
+                        Ok(())
+                    } else {
+                        Err(WriteError::CellRevisionMismatch)
+                    }
+                }
+                None => installed_revisions
+                    .get(id)
+                    .ok_or(WriteError::CellRevisionMismatch)
+                    .and_then(|installed| {
+                        self.chunks().compensate(
+                            installed,
+                            history.cell.as_ref().map(|cell| cell.clone_referred()),
+                        )
                     })
-                    .err()
-            } else {
-                // the cell was removed, need to put back
-                let mut cell = cell.as_ref().unwrap().clone_referred();
-                self.chunks().write_cell(&mut cell).err()
+                    .map(|compensation| {
+                        history.compensation_revision_ts = Some(compensation.node.revision_ts);
+                    }),
             };
+            let error = result.err();
             if let Some(error) = error {
                 failures.push(RollbackFailure { id: *id, error });
             }
@@ -1098,6 +1197,7 @@ impl DataManager {
         txn.commit_ops = Some(cells.clone());
         crate::ram::chunk::set_transaction_context(true);
         let mut write_error: Option<(Id, WriteError)> = None;
+        let mut commit_failure: Option<DMCommitResult> = None;
         {
             for cell_op in cells {
                 let cell_id = Self::commit_op_cell_id(&cell_op)
@@ -1112,26 +1212,27 @@ impl DataManager {
                 let meta = &mut cell_guards[meta_index];
                 match cell_op {
                     CommitOp::Write(mut cell) => {
+                        if let Some(undo_log) = self.undo_log() {
+                            let undo_entry = super::undo_log::UndoLogEntry::new_write(
+                                tid.clone(),
+                                cell_id,
+                                commit_hlc.ts,
+                            );
+                            if let Err(error) = undo_log.write_undo_entry(undo_entry) {
+                                error!("Failed to write undo log entry for new cell: {:?}", error);
+                                commit_failure =
+                                    Some(DMCommitResult::CheckFailed(CheckError::CannotEnd));
+                                break;
+                            }
+                            #[cfg(test)]
+                            pause_before_storage_mutation(tid, &cell_id);
+                        }
                         match self.chunks().write_cell_at_revision(
                             &mut cell,
                             RevisionWrite::pending(commit_hlc.ts),
                         ) {
                             Ok(installed) => {
-                                if let Some(undo_log) = self.undo_log() {
-                                    let undo_entry = super::undo_log::UndoLogEntry::new_write(
-                                        tid.clone(),
-                                        cell_id,
-                                        commit_hlc.ts,
-                                    );
-                                    if let Err(error) = undo_log.write_undo_entry(undo_entry) {
-                                        error!(
-                                            "Failed to write undo log entry for new cell: {:?}",
-                                            error
-                                        );
-                                    }
-                                }
-                                txn.history
-                                    .insert(cell_id, CellHistory::new(None, commit_hlc.ts));
+                                txn.history.insert(cell_id, CellHistory::new(None));
                                 txn.installed.insert(cell_id, installed);
                                 meta.write = commit_hlc;
                             }
@@ -1184,6 +1285,7 @@ impl DataManager {
                                 tid.clone(),
                                 *cell_id,
                                 super::undo_log::UndoOpType::Remove,
+                                commit_hlc.ts,
                                 expected_revision_ts,
                                 chunk_idx as u64,
                                 seq_id,
@@ -1191,7 +1293,12 @@ impl DataManager {
                             );
                             if let Err(error) = undo_log.write_undo_entry(undo_entry) {
                                 error!("Failed to write undo log entry: {:?}", error);
+                                commit_failure =
+                                    Some(DMCommitResult::CheckFailed(CheckError::CannotEnd));
+                                break;
                             }
+                            #[cfg(test)]
+                            pause_before_storage_mutation(tid, cell_id);
                         }
 
                         match self
@@ -1200,7 +1307,7 @@ impl DataManager {
                         {
                             Ok(installed) => {
                                 txn.history
-                                    .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
+                                    .insert(*cell_id, CellHistory::new(Some(old_cell_ref)));
                                 txn.installed.insert(*cell_id, installed);
                                 meta.write = commit_hlc;
                                 txn.rollback_guards.push(guard);
@@ -1256,6 +1363,7 @@ impl DataManager {
                                 tid.clone(),
                                 cell_id,
                                 super::undo_log::UndoOpType::Update,
+                                commit_hlc.ts,
                                 expected_revision_ts,
                                 chunk_idx as u64,
                                 seq_id,
@@ -1263,17 +1371,20 @@ impl DataManager {
                             );
                             if let Err(error) = undo_log.write_undo_entry(undo_entry) {
                                 error!("Failed to write undo log entry: {:?}", error);
+                                commit_failure =
+                                    Some(DMCommitResult::CheckFailed(CheckError::CannotEnd));
+                                break;
                             }
+                            #[cfg(test)]
+                            pause_before_storage_mutation(tid, &cell_id);
                         }
                         match self.chunks().update_cell_at_revision(
                             &mut cell,
                             RevisionWrite::pending(commit_hlc.ts),
                         ) {
                             Ok(installed) => {
-                                txn.history.insert(
-                                    cell_id,
-                                    CellHistory::new(Some(old_cell_ref), commit_hlc.ts),
-                                );
+                                txn.history
+                                    .insert(cell_id, CellHistory::new(Some(old_cell_ref)));
                                 txn.installed.insert(cell_id, installed);
                                 meta.write = commit_hlc;
                                 txn.rollback_guards.push(guard);
@@ -1293,6 +1404,9 @@ impl DataManager {
         txn.last_activity = get_time();
         crate::ram::chunk::set_transaction_context(false);
 
+        if let Some(failure) = commit_failure {
+            return failure;
+        }
         if let Some((id, error)) = write_error {
             return Self::map_commit_write_error(&txn, id, error);
         }
@@ -4905,23 +5019,38 @@ impl Service for DataManager {
             return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
         }
 
-        // Keep segment references and metadata guards alive throughout rollback so the owner
-        // cannot be reclaimed between validation and the storage mutations.
-        let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
-
         let rollback_failures = {
             debug!(
                 ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
                 txn.history.len(),
                 tid
             );
-            let failures = self.rollback(&txn.history);
+            let Transaction {
+                history, installed, ..
+            } = &mut *txn;
+            let failures = self.rollback(history, installed);
             if failures.len() == 0 {
                 None
             } else {
                 Some(failures)
             }
         };
+        if let Some(failures) = rollback_failures {
+            for failure in failures {
+                error!(
+                    "Compensation for cell {:?} in transaction {:?} failed: {:?}",
+                    failure.id, tid, failure.error
+                );
+            }
+            txn.last_activity = get_time();
+            return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
+        }
+
+        // Keep the old immutable locations protected until every compensation
+        // is complete. A failed attempt retains both these guards and the cell
+        // owners so a later abort call can resume an already-aborted installed
+        // node without duplicating completed compensation.
+        let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
 
@@ -4929,7 +5058,7 @@ impl Service for DataManager {
         drop(txn);
         drop(guards_to_drop);
 
-        self.response_with(AbortResult::Success(rollback_failures))
+        self.response_with(AbortResult::Success(None))
     }
     fn end(&self, clock: Hlc, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);

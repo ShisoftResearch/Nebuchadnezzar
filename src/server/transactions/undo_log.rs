@@ -9,13 +9,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, remove_file, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::TxnId;
 
 /// Undo log entry stored in the log file
-/// Format: [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
+/// Format: [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][installed_revision_ts: u64][prior_revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
 ///
 /// The `txn_id` is now a serialized `bifrost::hlc::Hlc` (16-byte fixed HLC),
 /// not the former variable-length vector clock; its serialized byte shape
@@ -26,9 +28,9 @@ use super::TxnId;
 /// error rather than being silently skipped or misparsed. Undo logs from
 /// before the migration must be discarded, not recovered.
 ///
-/// All operations store revision_ts for verification during recovery:
-/// - Write: revision_ts = new cell revision_ts (to verify cell unchanged before deletion)
-/// - Update/Remove: revision_ts = old cell revision_ts (to verify we're restoring the right revision_ts)
+/// All operations store the installed revision for exact recovery ownership.
+/// Update and remove also store the prior revision whose immutable bytes are
+/// addressed by the stable chunk/sequence/offset tuple.
 ///
 /// Note: seg_id is NOT stored because it's address-derived and changes across recoveries.
 /// Only seq_id is stable across recoveries and sufficient for segment lookup.
@@ -37,10 +39,11 @@ pub struct UndoLogEntry {
     pub txn_id: TxnId,
     pub cell_id: Id,
     pub op_type: UndoOpType,
-    /// Cell revision_ts for verification during recovery
-    /// - Write: revision_ts of newly created cell
-    /// - Update/Remove: revision_ts of old cell before modification
-    pub revision_ts: u64,
+    /// Revision installed by the incomplete transaction.
+    pub installed_revision_ts: u64,
+    /// Revision whose immutable contents must be restored. Inserts have no
+    /// prior revision.
+    pub prior_revision_ts: Option<u64>,
     /// For Update/Remove: chunk_id where old cell is located (0 for Write)
     pub chunk_id: u64,
     /// For Update/Remove: seq_id of segment where old cell is located (0 for Write)
@@ -53,9 +56,9 @@ pub struct UndoLogEntry {
 /// Type of operation that needs to be undone
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UndoOpType {
-    Write = 1, // New cell created - store revision_ts, DELETE on rollback if revision_ts matches
-    Update = 2, // Cell updated - store old segment location, RESTORE old revision_ts on rollback
-    Remove = 3, // Cell removed - store old segment location, RESTORE old revision_ts on rollback
+    Write = 1,  // Compensate the installed revision with a newer tombstone.
+    Update = 2, // Compensate the installed revision with the prior immutable contents.
+    Remove = 3, // Compensate the installed tombstone with the prior immutable contents.
 }
 
 impl UndoOpType {
@@ -75,6 +78,7 @@ impl UndoOpType {
 const ENTRY_TYPE_UNDO: u8 = 1;
 const ENTRY_TYPE_COMMIT: u8 = 2;
 const ENTRY_TYPE_ABORT: u8 = 3;
+const UNDO_FIXED_PAYLOAD_LEN: usize = 16 + 1 + 8 + 8 + 8 + 8 + 8;
 
 fn collect_undo_log_paths<I>(log_dir_path: &Path, entries: I) -> io::Result<Vec<(u64, PathBuf)>>
 where
@@ -137,7 +141,8 @@ impl UndoLogEntry {
         txn_id: TxnId,
         cell_id: Id,
         op_type: UndoOpType,
-        revision_ts: u64,
+        installed_revision_ts: u64,
+        prior_revision_ts: Option<u64>,
         chunk_id: u64,
         seq_id: u64,
         cell_offset: u64,
@@ -146,7 +151,8 @@ impl UndoLogEntry {
             txn_id,
             cell_id,
             op_type,
-            revision_ts,
+            installed_revision_ts,
+            prior_revision_ts,
             chunk_id,
             seq_id,
             cell_offset,
@@ -155,8 +161,17 @@ impl UndoLogEntry {
 
     /// Helper to create a Write entry (for new cells)
     /// Only needs revision_ts since there's no old segment to restore from
-    pub fn new_write(txn_id: TxnId, cell_id: Id, revision_ts: u64) -> Self {
-        Self::new(txn_id, cell_id, UndoOpType::Write, revision_ts, 0, 0, 0)
+    pub fn new_write(txn_id: TxnId, cell_id: Id, installed_revision_ts: u64) -> Self {
+        Self::new(
+            txn_id,
+            cell_id,
+            UndoOpType::Write,
+            installed_revision_ts,
+            None,
+            0,
+            0,
+            0,
+        )
     }
 
     /// Helper to create an Update/Remove entry (with old cell revision_ts, segment seq_id, and offset)
@@ -166,7 +181,8 @@ impl UndoLogEntry {
         txn_id: TxnId,
         cell_id: Id,
         op_type: UndoOpType,
-        old_revision_ts: u64,
+        installed_revision_ts: u64,
+        prior_revision_ts: u64,
         chunk_id: u64,
         seq_id: u64,
         cell_offset: u64,
@@ -179,7 +195,8 @@ impl UndoLogEntry {
             txn_id,
             cell_id,
             op_type,
-            old_revision_ts,
+            installed_revision_ts,
+            Some(prior_revision_ts),
             chunk_id,
             seq_id,
             cell_offset,
@@ -192,15 +209,15 @@ impl UndoLogEntry {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let txn_id_len = txn_id_bytes.len() as u32;
 
-        // Removed seg_id field (8 bytes)
-        let mut bytes = Vec::with_capacity(1 + 4 + txn_id_bytes.len() + 16 + 1 + 8 + 8 + 8 + 8);
+        let mut bytes = Vec::with_capacity(1 + 4 + txn_id_bytes.len() + UNDO_FIXED_PAYLOAD_LEN);
         bytes.push(ENTRY_TYPE_UNDO);
         bytes.extend_from_slice(&txn_id_len.to_le_bytes());
         bytes.extend_from_slice(&txn_id_bytes);
         bytes.extend_from_slice(&self.cell_id.higher.to_le_bytes());
         bytes.extend_from_slice(&self.cell_id.lower.to_le_bytes());
         bytes.push(self.op_type as u8);
-        bytes.extend_from_slice(&self.revision_ts.to_le_bytes());
+        bytes.extend_from_slice(&self.installed_revision_ts.to_le_bytes());
+        bytes.extend_from_slice(&self.prior_revision_ts.unwrap_or(0).to_le_bytes());
         bytes.extend_from_slice(&self.chunk_id.to_le_bytes());
         bytes.extend_from_slice(&self.seq_id.to_le_bytes());
         bytes.extend_from_slice(&self.cell_offset.to_le_bytes());
@@ -226,8 +243,7 @@ impl UndoLogEntry {
         }
 
         let txn_id_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        // Removed seg_id field: +1 for op_type, +8 for revision_ts, +8 for chunk_id, +8 for seq_id, +8 for cell_offset = 33 + 16 (cell_id) = 49
-        if bytes.len() < 5 + txn_id_len + 49 {
+        if bytes.len() < 5 + txn_id_len + UNDO_FIXED_PAYLOAD_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Not enough bytes for full entry",
@@ -264,7 +280,7 @@ impl UndoLogEntry {
         let op_type = UndoOpType::from_u8(bytes[offset])?;
         offset += 1;
 
-        let revision_ts = u64::from_le_bytes([
+        let installed_revision_ts = u64::from_le_bytes([
             bytes[offset],
             bytes[offset + 1],
             bytes[offset + 2],
@@ -275,6 +291,20 @@ impl UndoLogEntry {
             bytes[offset + 7],
         ]);
         offset += 8;
+
+        let encoded_prior_revision_ts = u64::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]);
+        offset += 8;
+        let prior_revision_ts =
+            (encoded_prior_revision_ts != 0).then_some(encoded_prior_revision_ts);
 
         let chunk_id = u64::from_le_bytes([
             bytes[offset],
@@ -324,7 +354,8 @@ impl UndoLogEntry {
                     lower: cell_id_lower,
                 },
                 op_type,
-                revision_ts,
+                installed_revision_ts,
+                prior_revision_ts,
                 chunk_id,
                 seq_id,
                 cell_offset,
@@ -348,6 +379,8 @@ pub struct UndoLogger {
     active_txns: Mutex<HashSet<TxnId>>,
     /// Maximum log file size before rotation (default 64MB)
     max_log_size: u64,
+    #[cfg(test)]
+    fail_next_undo_write: AtomicBool,
 }
 
 impl UndoLogger {
@@ -362,6 +395,8 @@ impl UndoLogger {
             log_seq: AtomicU64::new(0),
             active_txns: Mutex::new(HashSet::new()),
             max_log_size: 64 * 1024 * 1024, // 64MB
+            #[cfg(test)]
+            fail_next_undo_write: AtomicBool::new(false),
         });
 
         // Open or create initial log file
@@ -398,6 +433,13 @@ impl UndoLogger {
 
     /// Write an undo entry to the log
     pub fn write_undo_entry(&self, entry: UndoLogEntry) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_undo_write.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected undo write failure",
+            ));
+        }
         let bytes = entry.to_bytes()?;
 
         let mut log_file_guard = self.log_file.lock();
@@ -428,6 +470,11 @@ impl UndoLogger {
                 "Log file not initialized",
             ))
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_undo_write_for_test(&self) {
+        self.fail_next_undo_write.store(true, Ordering::SeqCst);
     }
 
     /// Write a commit marker for a transaction
@@ -518,7 +565,6 @@ impl UndoLogger {
             for entry in entries {
                 match entry.op_type {
                     UndoOpType::Write => {
-                        // Delete new cell if it still has the logged revision_ts
                         if let Err(e) = self.rollback_write(entry, chunks) {
                             error!(
                                 "Failed to rollback write for cell {:?}: {:?}",
@@ -533,7 +579,6 @@ impl UndoLogger {
                         }
                     }
                     UndoOpType::Update | UndoOpType::Remove => {
-                        // Restore old cell from segment
                         if let Err(e) = self.rollback_restore(entry, chunks) {
                             error!(
                                 "Failed to rollback restore for cell {:?}: {:?}",
@@ -574,102 +619,72 @@ impl UndoLogger {
         }
     }
 
-    /// Rollback a Write operation by deleting the new cell if revision_ts matches
+    /// Compensate a recovered insert with a newer tombstone when the recovered
+    /// logical head is exactly the revision installed by the incomplete
+    /// transaction.
     fn rollback_write(&self, entry: &UndoLogEntry, chunks: &Arc<Chunks>) -> io::Result<()> {
         debug!(
-            "Rolling back Write: cell_id={:?}, revision_ts={}",
-            entry.cell_id, entry.revision_ts
+            "Compensating recovered Write: cell_id={:?}, installed_revision_ts={}",
+            entry.cell_id, entry.installed_revision_ts
         );
-
-        // Locate the chunk for this cell
-        let chunk = chunks.locate_chunk_by_partition(entry.cell_id.higher);
-
-        // Check if cell exists in cell_index
-        let hash = entry.cell_id.lower;
-        if let Some(guard) = chunk.cell_index.lock(hash as usize) {
-            let entry_addr = *guard; // This is the Entry address, not content address
-            drop(guard); // Release lock early
-
-            // The index may hold a zero value if a tombstone was applied during recovery.
-            // Treat this as "not found" instead of attempting to read from null.
-            if entry_addr == 0 {
-                debug!(
-                    "Cell {:?} not found in index during rollback (stored addr=0)",
-                    entry.cell_id
-                );
-                return Ok(());
-            }
-
-            // Convert entry address to content address
-            let content_addr = Entry::content_pos(entry_addr);
-
-            // Read just the header without needing the schema
-            // This is safe because the header is always at a fixed offset
-            let header = cell_header_from_entry_content_addr(content_addr);
-            let current_revision_ts = header.revision_ts;
-
-            // Only delete if revision_ts matches (cell hasn't been modified since transaction)
-            if current_revision_ts == entry.revision_ts {
-                debug!(
-                    "Deleting new cell {:?} with revision_ts {}",
-                    entry.cell_id, entry.revision_ts
-                );
-
-                // Use remove_cell which handles tombstone creation
-                chunks.remove_cell(&entry.cell_id).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
-                            "remove compensation for cell {:?} at revision {} failed: {:?}",
-                            entry.cell_id, entry.revision_ts, error
-                        ),
-                    )
-                })?;
-            } else {
-                debug!(
-                    "Cell {:?} revision_ts mismatch (current={}, logged={}), skipping delete",
-                    entry.cell_id, current_revision_ts, entry.revision_ts
-                );
-            }
-        } else {
+        if chunks.current_revision_ts(&entry.cell_id) != Some(entry.installed_revision_ts) {
             debug!(
-                "Cell {:?} not found in index during rollback",
-                entry.cell_id
+                "Recovered cell {:?} no longer has installed revision {}; compensation is already complete or the mutation was never durable",
+                entry.cell_id, entry.installed_revision_ts
             );
+            return Ok(());
         }
-
-        Ok(())
+        chunks
+            .compensate_recovered(&entry.cell_id, entry.installed_revision_ts, None)
+            .map(|_| ())
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "insert compensation for cell {:?} at installed revision {} failed: {:?}",
+                        entry.cell_id, entry.installed_revision_ts, error
+                    ),
+                )
+            })
     }
 
-    /// Rollback an Update or Remove operation by restoring the old cell from segment memory
+    /// Compensate a recovered update or remove by restoring the immutable prior
+    /// contents as a newer committed revision.
     fn rollback_restore(&self, entry: &UndoLogEntry, chunks: &Arc<Chunks>) -> io::Result<()> {
+        let prior_revision_ts = entry.prior_revision_ts.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{:?} undo entry for {:?} has no prior revision",
+                    entry.op_type, entry.cell_id
+                ),
+            )
+        })?;
         debug!(
-            "Rolling back {:?}: cell_id={:?}, revision_ts={}, from chunk={}, seq={}, offset={}",
+            "Compensating recovered {:?}: cell_id={:?}, installed_revision_ts={}, prior_revision_ts={}, from chunk={}, seq={}, offset={}",
             entry.op_type,
             entry.cell_id,
-            entry.revision_ts,
+            entry.installed_revision_ts,
+            prior_revision_ts,
             entry.chunk_id,
             entry.seq_id,
             entry.cell_offset
         );
+        if chunks.current_revision_ts(&entry.cell_id) != Some(entry.installed_revision_ts) {
+            debug!(
+                "Recovered cell {:?} no longer has installed revision {}; compensation is already complete or a later revision won",
+                entry.cell_id, entry.installed_revision_ts
+            );
+            return Ok(());
+        }
 
         // Get the chunk and find the segment in memory
-        let chunk = &chunks.list[entry.chunk_id as usize];
-
-        // For Remove operations, verify the cell is actually gone before restoring
-        // For Update operations, we'll verify revision_ts matches in read_cell_from_address
-        if entry.op_type == UndoOpType::Remove {
-            // Check if cell exists in the index by trying to read it
-            if let Ok(cell_ref) = chunks.read_cell(&entry.cell_id) {
-                drop(cell_ref); // Release the read lock immediately
-                debug!(
-                    "Cell {:?} still exists after Remove operation - skipping restore (might have been re-created)",
-                    entry.cell_id
-                );
-                return Ok(());
-            }
-            // Cell doesn't exist (or read error), proceed with restore
-        }
+        let chunk = chunks.list.get(entry.chunk_id as usize).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("undo entry references missing chunk {}", entry.chunk_id),
+            )
+        })?;
 
         // Find the segment by seq_id (segments are already loaded in memory after recovery)
         // Note: seg_id in the undo log is the OLD segment ID from before recovery,
@@ -698,65 +713,28 @@ impl UndoLogger {
 
         // Directly read the old cell from the specified offset (no scanning needed!)
         let cell_addr = segment.addr + entry.cell_offset as usize;
-        // For Remove operations, skip hash/revision_ts verification (cell is gone)
-        // For Update operations, verify revision_ts matches
-        let verify = entry.op_type != UndoOpType::Remove;
-        let old_cell = self.read_cell_from_address(
-            cell_addr,
-            chunk,
-            &entry.cell_id,
-            entry.revision_ts,
-            verify,
-        )?;
-
-        // Restore the old cell's DATA with a NEW revision_ts number
-        // The upsert will automatically assign a new, higher revision_ts
-        match entry.op_type {
-            UndoOpType::Remove => {
-                // Cell was removed by the transaction - restore it with its old data but new revision_ts
-                debug!(
-                    "Restoring removed cell {:?} (old data with new revision_ts)",
-                    entry.cell_id
-                );
-                chunks.upsert_cell(&mut old_cell.clone()).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
-                            "restore removed cell {:?} from chunk {} segment {} offset {} failed: {:?}",
-                            entry.cell_id,
-                            entry.chunk_id,
-                            entry.seq_id,
-                            entry.cell_offset,
-                            error
-                        ),
-                    )
-                })?;
-            }
-            UndoOpType::Update => {
-                // Cell was updated by the transaction - restore old data with new revision_ts
-                // Use upsert_cell to handle both cases (cell exists or was deleted by another txn)
-                debug!(
-                    "Restoring old data for cell {:?} (old data with new revision_ts)",
-                    entry.cell_id
-                );
-                chunks.upsert_cell(&mut old_cell.clone()).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
-                            "restore updated cell {:?} from chunk {} segment {} offset {} failed: {:?}",
-                            entry.cell_id,
-                            entry.chunk_id,
-                            entry.seq_id,
-                            entry.cell_offset,
-                            error
-                        ),
-                    )
-                })?;
-            }
-            _ => unreachable!(),
-        }
-
-        Ok(())
+        let old_cell =
+            self.read_cell_from_address(cell_addr, chunk, &entry.cell_id, prior_revision_ts)?;
+        chunks
+            .compensate_recovered(
+                &entry.cell_id,
+                entry.installed_revision_ts,
+                Some(old_cell),
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "restore compensation for cell {:?} from chunk {} segment {} offset {} failed: {:?}",
+                        entry.cell_id,
+                        entry.chunk_id,
+                        entry.seq_id,
+                        entry.cell_offset,
+                        error
+                    ),
+                )
+            })
     }
 
     /// Read a cell directly from a memory address (using stored offset, no scanning!)
@@ -765,15 +743,13 @@ impl UndoLogger {
     /// * `cell_addr` - Memory address of the entry (not content address)
     /// * `chunk` - The chunk containing the cell
     /// * `cell_id` - Expected cell ID (for verification)
-    /// * `expected_revision_ts` - Expected cell revision_ts (for verification if verify=true)
-    /// * `verify` - If true, verify hash and revision_ts match; if false, skip verification
+    /// * `expected_revision_ts` - Expected immutable prior revision
     fn read_cell_from_address(
         &self,
         cell_addr: usize,
         chunk: &crate::ram::chunk::Chunk,
         cell_id: &Id,
         expected_revision_ts: u64,
-        verify: bool,
     ) -> io::Result<OwnedCell> {
         // Read cell header from the entry content address
         let content_addr = Entry::content_pos(cell_addr);
@@ -787,32 +763,29 @@ impl UndoLogger {
             ));
         }
 
-        // Verify cell identity if requested (skip for Remove operations)
-        if verify {
-            if cell_header.hash != cell_id.lower {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Cell hash mismatch at offset: expected {}, found {}",
-                        cell_id.lower, cell_header.hash
-                    ),
-                ));
-            }
+        if cell_header.hash != cell_id.lower {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Cell hash mismatch at offset: expected {}, found {}",
+                    cell_id.lower, cell_header.hash
+                ),
+            ));
+        }
 
-            if cell_header.revision_ts != expected_revision_ts {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Cell revision_ts mismatch at offset: expected {}, found {}",
-                        expected_revision_ts, cell_header.revision_ts
-                    ),
-                ));
-            }
+        if cell_header.revision_ts != expected_revision_ts {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Cell revision_ts mismatch at offset: expected {}, found {}",
+                    expected_revision_ts, cell_header.revision_ts
+                ),
+            ));
         }
 
         debug!(
-            "Reading cell from offset: hash={}, revision_ts={}, schema={}, verify={}",
-            cell_header.hash, cell_header.revision_ts, cell_header.schema, verify
+            "Reading verified cell from offset: hash={}, revision_ts={}, schema={}",
+            cell_header.hash, cell_header.revision_ts, cell_header.schema
         );
 
         // Get schema to deserialize data
@@ -911,7 +884,7 @@ impl UndoLogger {
             match entry_type {
                 ENTRY_TYPE_UNDO => {
                     // Skip the rest of the undo entry
-                    offset += 5 + txn_id_len + 40; // txn_id + cell_id + chunk_id + seg_id + seq_id
+                    offset += 5 + txn_id_len + UNDO_FIXED_PAYLOAD_LEN;
                 }
                 ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
                     offset += 5 + txn_id_len;
@@ -1076,6 +1049,47 @@ mod tests {
         }
     }
 
+    fn compensation_test_chunks(name: &str) -> (crate::ram::schema::Schema, Arc<Chunks>) {
+        use crate::ram::schema::{Field, Schema};
+        use dovahkiin::types::Type;
+
+        let schema = Schema::new(
+            name,
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::I32),
+                Field::new_unindexed("value", Type::String),
+            ]),
+            false,
+            false,
+        );
+        let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            32 * 1024 * 1024,
+            Arc::new(crate::server::ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        (schema, chunks)
+    }
+
+    fn stable_cell_location(chunks: &Chunks, id: &Id) -> (u64, u64, u64) {
+        let chunk = chunks.locate_chunk_by_partition(id.higher);
+        let address = chunks.address_of(id);
+        let (_, seq_id) = chunk.get_cell_segment_info(address);
+        let segment_base = chunk
+            .segments()
+            .into_iter()
+            .find(|segment| segment.contains_address(address))
+            .unwrap()
+            .addr;
+        (chunk.id as u64, seq_id, (address - segment_base) as u64)
+    }
+
     #[test]
     fn test_undo_entry_serialization() {
         let txn_id = TxnId::default();
@@ -1083,8 +1097,7 @@ mod tests {
             higher: 1,
             lower: 2,
         };
-        // Removed seg_id parameter (was 100)
-        let entry = UndoLogEntry::new(txn_id, cell_id, UndoOpType::Update, 5, 0, 1000, 50);
+        let entry = UndoLogEntry::new(txn_id, cell_id, UndoOpType::Update, 6, Some(5), 0, 1000, 50);
 
         let bytes = entry.to_bytes().unwrap();
         let (recovered, size) = UndoLogEntry::from_bytes(&bytes).unwrap();
@@ -1092,9 +1105,48 @@ mod tests {
         assert_eq!(size, bytes.len());
         assert_eq!(recovered.cell_id, entry.cell_id);
         assert_eq!(recovered.op_type, entry.op_type);
-        assert_eq!(recovered.revision_ts, entry.revision_ts);
+        assert_eq!(recovered.installed_revision_ts, entry.installed_revision_ts);
+        assert_eq!(recovered.prior_revision_ts, entry.prior_revision_ts);
         assert_eq!(recovered.chunk_id, entry.chunk_id);
         assert_eq!(recovered.seq_id, entry.seq_id);
+    }
+
+    #[test]
+    fn undo_decoder_rejects_legacy_single_revision_layout() {
+        let txn_id_bytes = serde_json::to_vec(&test_hlc(10, 1)).unwrap();
+        let mut bytes = Vec::new();
+        bytes.push(ENTRY_TYPE_UNDO);
+        bytes.extend_from_slice(&(txn_id_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&txn_id_bytes);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.push(UndoOpType::Update as u8);
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&64u64.to_le_bytes());
+
+        UndoLogEntry::from_bytes(&bytes)
+            .expect_err("the legacy single-revision undo layout must not be decoded");
+    }
+
+    #[test]
+    fn undo_bytes_record_installed_and_prior_revisions() {
+        let entry = UndoLogEntry::new_restore(
+            test_hlc(10, 1),
+            Id::new(1, 2),
+            UndoOpType::Update,
+            200,
+            100,
+            0,
+            9,
+            64,
+        );
+        let decoded = UndoLogEntry::from_bytes(&entry.to_bytes().unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(decoded.installed_revision_ts, 200);
+        assert_eq!(decoded.prior_revision_ts, Some(100));
     }
 
     #[test]
@@ -1109,8 +1161,16 @@ mod tests {
             higher: 1,
             lower: 2,
         };
-        // Removed seg_id parameter (was 100)
-        let entry = UndoLogEntry::new(txn_id.clone(), cell_id, UndoOpType::Update, 3, 0, 1000, 50);
+        let entry = UndoLogEntry::new(
+            txn_id.clone(),
+            cell_id,
+            UndoOpType::Update,
+            4,
+            Some(3),
+            0,
+            1000,
+            50,
+        );
 
         undo_log.write_undo_entry(entry.clone()).unwrap();
 
@@ -1136,8 +1196,16 @@ mod tests {
             higher: 1,
             lower: 2,
         };
-        // Removed seg_id parameter (was 100)
-        let entry = UndoLogEntry::new(txn_id.clone(), cell_id, UndoOpType::Remove, 2, 0, 1000, 50);
+        let entry = UndoLogEntry::new(
+            txn_id.clone(),
+            cell_id,
+            UndoOpType::Remove,
+            3,
+            Some(2),
+            0,
+            1000,
+            50,
+        );
 
         {
             let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
@@ -1219,13 +1287,13 @@ mod tests {
             lower: 4,
         };
 
-        // Removed seg_id parameters
-        let entry1 = UndoLogEntry::new(txn_id.clone(), cell_id1, UndoOpType::Write, 1, 0, 0, 0);
+        let entry1 = UndoLogEntry::new_write(txn_id.clone(), cell_id1, 1);
         let entry2 = UndoLogEntry::new(
             txn_id.clone(),
             cell_id2,
             UndoOpType::Update,
-            4,
+            5,
+            Some(4),
             0,
             2000,
             100,
@@ -1264,7 +1332,8 @@ mod tests {
         let entries = txn_index.get(&txn1).cloned().unwrap_or_default();
         assert_eq!(entries.len(), 1, "Should have 1 undo entry before commit");
         assert_eq!(entries[0].op_type, UndoOpType::Write);
-        assert_eq!(entries[0].revision_ts, 1);
+        assert_eq!(entries[0].installed_revision_ts, 1);
+        assert_eq!(entries[0].prior_revision_ts, None);
 
         // Commit the transaction
         undo_log.write_commit_marker(&txn1).unwrap();
@@ -1310,9 +1379,8 @@ mod tests {
 
         // Write, Update, and Remove operations
         let entry1 = UndoLogEntry::new_write(txn.clone(), cell_id1, 1);
-        // Removed seg_id parameter (was 100)
         let entry2 =
-            UndoLogEntry::new_restore(txn.clone(), cell_id2, UndoOpType::Update, 5, 0, 1000, 50);
+            UndoLogEntry::new_restore(txn.clone(), cell_id2, UndoOpType::Update, 6, 5, 0, 1000, 50);
 
         undo_log.write_undo_entry(entry1).unwrap();
         undo_log.write_undo_entry(entry2).unwrap();
@@ -1376,6 +1444,7 @@ mod tests {
                 txn_incomplete.clone(),
                 cell_id2,
                 UndoOpType::Update,
+                4,
                 3,
                 0,
                 500,
@@ -1385,6 +1454,7 @@ mod tests {
                 txn_incomplete.clone(),
                 cell_id3,
                 UndoOpType::Remove,
+                8,
                 7,
                 1,
                 750,
@@ -1409,18 +1479,21 @@ mod tests {
         // Verify entry details
         assert_eq!(entries[0].cell_id, cell_id1);
         assert_eq!(entries[0].op_type, UndoOpType::Write);
-        assert_eq!(entries[0].revision_ts, 1);
+        assert_eq!(entries[0].installed_revision_ts, 1);
+        assert_eq!(entries[0].prior_revision_ts, None);
 
         assert_eq!(entries[1].cell_id, cell_id2);
         assert_eq!(entries[1].op_type, UndoOpType::Update);
-        assert_eq!(entries[1].revision_ts, 3);
+        assert_eq!(entries[1].installed_revision_ts, 4);
+        assert_eq!(entries[1].prior_revision_ts, Some(3));
         assert_eq!(entries[1].chunk_id, 0);
         // Removed seg_id assertion
         assert_eq!(entries[1].seq_id, 500);
 
         assert_eq!(entries[2].cell_id, cell_id3);
         assert_eq!(entries[2].op_type, UndoOpType::Remove);
-        assert_eq!(entries[2].revision_ts, 7);
+        assert_eq!(entries[2].installed_revision_ts, 8);
+        assert_eq!(entries[2].prior_revision_ts, Some(7));
         assert_eq!(entries[2].chunk_id, 1);
         // Removed seg_id assertion
         assert_eq!(entries[2].seq_id, 750);
@@ -1491,8 +1564,8 @@ mod tests {
         // Hand-assemble one undo entry, framed exactly like
         // UndoLogEntry::to_bytes() frames a new one:
         // [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id.higher: u64]
-        // [cell_id.lower: u64][op_type: u8][revision_ts: u64][chunk_id: u64]
-        // [seq_id: u64][cell_offset: u64]
+        // [cell_id.lower: u64][op_type: u8][installed_revision_ts: u64]
+        // [prior_revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
         let mut bytes = Vec::new();
         bytes.push(ENTRY_TYPE_UNDO);
         bytes.extend_from_slice(&(old_txn_id_bytes.len() as u32).to_le_bytes());
@@ -1500,7 +1573,8 @@ mod tests {
         bytes.extend_from_slice(&1u64.to_le_bytes()); // cell_id.higher
         bytes.extend_from_slice(&2u64.to_le_bytes()); // cell_id.lower
         bytes.push(UndoOpType::Write as u8);
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // revision_ts
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // installed_revision_ts
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // prior_revision_ts (None)
         bytes.extend_from_slice(&0u64.to_le_bytes()); // chunk_id
         bytes.extend_from_slice(&0u64.to_le_bytes()); // seq_id
         bytes.extend_from_slice(&0u64.to_le_bytes()); // cell_offset
@@ -1900,8 +1974,7 @@ mod tests {
         );
     }
 
-    /// Test end-to-end: Version verification for different operation types
-    /// Verifies that all operations correctly store and retrieve revision_ts information
+    /// Test end-to-end: installed and prior revision persistence by operation.
     #[test]
     fn test_e2e_version_verification() {
         let temp_dir = TempDir::new().unwrap();
@@ -1910,7 +1983,7 @@ mod tests {
         let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
         let txn = TxnId::default();
 
-        // Write operation: revision_ts is the new cell's revision_ts
+        // Write records only the revision installed by the incomplete transaction.
         let write_entry = UndoLogEntry::new_write(
             txn.clone(),
             Id {
@@ -1921,8 +1994,7 @@ mod tests {
         );
         undo_log.write_undo_entry(write_entry).unwrap();
 
-        // Update operation: revision_ts is the old cell's revision_ts
-        // Removed seg_id parameter
+        // Update records both installed and prior revisions.
         let update_entry = UndoLogEntry::new_restore(
             txn.clone(),
             Id {
@@ -1930,15 +2002,15 @@ mod tests {
                 lower: 2,
             },
             UndoOpType::Update,
-            20,   // old revision_ts
+            21,   // installed revision_ts
+            20,   // prior revision_ts
             0,    // chunk_id
             1000, // seq_id
             50,   // cell_offset
         );
         undo_log.write_undo_entry(update_entry).unwrap();
 
-        // Remove operation: revision_ts is the old cell's revision_ts
-        // Removed seg_id parameter
+        // Remove records the installed tombstone and prior present revision.
         let remove_entry = UndoLogEntry::new_restore(
             txn.clone(),
             Id {
@@ -1946,7 +2018,8 @@ mod tests {
                 lower: 3,
             },
             UndoOpType::Remove,
-            30,   // old revision_ts
+            31,   // installed revision_ts
+            30,   // prior revision_ts
             1,    // chunk_id
             2000, // seq_id
             100,  // cell_offset
@@ -1961,21 +2034,24 @@ mod tests {
 
         // Verify Write entry
         assert_eq!(entries[0].op_type, UndoOpType::Write);
-        assert_eq!(entries[0].revision_ts, 10);
+        assert_eq!(entries[0].installed_revision_ts, 10);
+        assert_eq!(entries[0].prior_revision_ts, None);
         assert_eq!(entries[0].chunk_id, 0);
         // Removed seg_id assertions
         assert_eq!(entries[0].seq_id, 0);
 
         // Verify Update entry
         assert_eq!(entries[1].op_type, UndoOpType::Update);
-        assert_eq!(entries[1].revision_ts, 20);
+        assert_eq!(entries[1].installed_revision_ts, 21);
+        assert_eq!(entries[1].prior_revision_ts, Some(20));
         assert_eq!(entries[1].chunk_id, 0);
         // Removed seg_id assertion
         assert_eq!(entries[1].seq_id, 1000);
 
         // Verify Remove entry
         assert_eq!(entries[2].op_type, UndoOpType::Remove);
-        assert_eq!(entries[2].revision_ts, 30);
+        assert_eq!(entries[2].installed_revision_ts, 31);
+        assert_eq!(entries[2].prior_revision_ts, Some(30));
         assert_eq!(entries[2].chunk_id, 1);
         // Removed seg_id assertion
         assert_eq!(entries[2].seq_id, 2000);
@@ -2208,16 +2284,19 @@ mod tests {
             .find(|segment| segment.contains_address(old_addr))
             .unwrap()
             .addr;
+        let prior_revision_ts = cell.header.revision_ts;
+        chunks.remove_cell(&cell_id).unwrap();
+        let installed_revision_ts = chunks.current_revision_ts(&cell_id).unwrap();
         let entry = UndoLogEntry::new_restore(
             test_hlc(11, 1),
             cell_id,
             UndoOpType::Remove,
-            cell.header.revision_ts,
+            installed_revision_ts,
+            prior_revision_ts,
             chunk.id as u64,
             seq_id,
             (old_addr - segment_base) as u64,
         );
-        chunks.remove_cell(&cell_id).unwrap();
         chunks.fail_next_allocation_for_test(&cell_id);
         let unrelated_id = Id::new(2, 602);
         let mut unrelated_cell = OwnedCell::new_with_id(
@@ -2309,7 +2388,7 @@ mod tests {
 
         // Get cell location for undo log
         let chunk = chunks.locate_chunk_by_partition(cell_id.higher);
-        let (_cell_addr, seg_id, seq_id, cell_offset) = {
+        let (_cell_addr, _seg_id, seq_id, cell_offset) = {
             // Scope the guard so it's dropped immediately after we extract the info
             let guard = chunk.location_for_read(cell_id.lower).unwrap();
             let addr = *guard;
@@ -2321,14 +2400,21 @@ mod tests {
             (addr, seg_id, seq_id, offset)
         };
 
-        // Simulate incomplete transaction that updated the cell
+        let mut failed = OwnedCell::new_with_id(
+            0,
+            &cell_id,
+            data_map_value!(id: 1i32, value: "v2".to_string()),
+        );
+        let installed_revision_ts = chunks.update_cell(&mut failed).unwrap().revision_ts;
+
+        // Simulate incomplete transaction that updated the cell.
         let txn_id = test_hlc(1, 1);
-        // Removed seg_id parameter
         let undo_entry = UndoLogEntry::new_restore(
             txn_id.clone(),
             cell_id,
             UndoOpType::Update,
-            initial_revision_ts, // old revision_ts before transaction
+            installed_revision_ts,
+            initial_revision_ts,
             chunk.id as u64,
             seq_id,
             cell_offset,
@@ -2336,8 +2422,6 @@ mod tests {
         undo_log.write_undo_entry(undo_entry).unwrap();
 
         println!("=== Step 2: Perform rollback (restore v1) ===");
-        // Directly perform rollback without doing the transaction update
-        // This tests that rollback correctly restores the old data
         println!("About to recover...");
         let txn_index = undo_log.recover().unwrap();
         println!("About to rollback...");
@@ -2349,13 +2433,152 @@ mod tests {
         // Verify cell has been rolled back - the old data restored with a new revision_ts
         let after_rollback = chunks.read_cell(&cell_id).unwrap();
         assert!(
-            after_rollback.header.revision_ts >= initial_revision_ts,
-            "Rollback should use a new revision_ts (>= initial revision_ts)"
+            after_rollback.header.revision_ts > installed_revision_ts,
+            "Rollback should use a newer compensation revision"
         );
         assert_eq!(
             after_rollback.data["value"].string().unwrap(),
             "v1",
             "Rollback should restore the original data from the undo log"
+        );
+    }
+
+    #[test]
+    fn recovery_compensates_insert_with_newer_tombstone_idempotently() {
+        let temp_dir = TempDir::new().unwrap();
+        let (schema, chunks) = compensation_test_chunks("recovery_insert_compensation");
+        let id = Id::new(0, 701);
+        let mut failed = OwnedCell::new_with_id(
+            schema.id,
+            &id,
+            data_map_value!(id: 1i32, value: "failed".to_string()),
+        );
+        let installed_revision_ts = chunks.write_cell(&mut failed).unwrap().revision_ts;
+        let tid = test_hlc(20, 1);
+        let entry = UndoLogEntry::new_write(tid, id, installed_revision_ts);
+        let undo =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+
+        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry.clone()])]), &chunks)
+            .unwrap();
+        assert!(chunks.read_cell(&id).is_err());
+        let compensation_ts = chunks.current_revision_ts(&id).unwrap();
+        assert!(compensation_ts > installed_revision_ts);
+        assert!(matches!(
+            chunks.read_cell_snapshot(&id, compensation_ts).unwrap(),
+            crate::ram::cell::SnapshotRead::Absent(None)
+        ));
+
+        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry])]), &chunks)
+            .unwrap();
+        assert_eq!(chunks.current_revision_ts(&id), Some(compensation_ts));
+    }
+
+    #[test]
+    fn recovery_compensates_update_with_newer_content_idempotently() {
+        let temp_dir = TempDir::new().unwrap();
+        let (schema, chunks) = compensation_test_chunks("recovery_update_compensation");
+        let id = Id::new(0, 702);
+        let mut original = OwnedCell::new_with_id(
+            schema.id,
+            &id,
+            data_map_value!(id: 1i32, value: "original".to_string()),
+        );
+        let prior_revision_ts = chunks.write_cell(&mut original).unwrap().revision_ts;
+        let (chunk_id, seq_id, cell_offset) = stable_cell_location(&chunks, &id);
+        let mut failed = OwnedCell::new_with_id(
+            schema.id,
+            &id,
+            data_map_value!(id: 1i32, value: "failed".to_string()),
+        );
+        let installed_revision_ts = chunks.update_cell(&mut failed).unwrap().revision_ts;
+        let tid = test_hlc(21, 1);
+        let entry = UndoLogEntry::new_restore(
+            tid,
+            id,
+            UndoOpType::Update,
+            installed_revision_ts,
+            prior_revision_ts,
+            chunk_id,
+            seq_id,
+            cell_offset,
+        );
+        let undo =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+
+        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry.clone()])]), &chunks)
+            .unwrap();
+        let compensated = chunks.read_cell(&id).unwrap().to_owned();
+        assert_eq!(compensated.data, original.data);
+        assert!(compensated.header.revision_ts > installed_revision_ts);
+        let compensation_ts = compensated.header.revision_ts;
+        assert!(matches!(
+            chunks.read_cell_snapshot(&id, compensation_ts).unwrap(),
+            crate::ram::cell::SnapshotRead::Present(ref cell)
+                if cell.header.revision_ts == prior_revision_ts
+                    && cell.data == original.data
+        ));
+
+        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry.clone()])]), &chunks)
+            .unwrap();
+        assert_eq!(
+            chunks.read_cell(&id).unwrap().header.revision_ts,
+            compensation_ts
+        );
+
+        let mut later = OwnedCell::new_with_id(
+            schema.id,
+            &id,
+            data_map_value!(id: 1i32, value: "later".to_string()),
+        );
+        let later_header = chunks.update_cell(&mut later).unwrap();
+        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry])]), &chunks)
+            .unwrap();
+        let retained = chunks.read_cell(&id).unwrap().to_owned();
+        assert_eq!(retained.header.revision_ts, later_header.revision_ts);
+        assert_eq!(retained.data, later.data);
+    }
+
+    #[test]
+    fn recovery_compensates_delete_with_newer_content_idempotently() {
+        let temp_dir = TempDir::new().unwrap();
+        let (schema, chunks) = compensation_test_chunks("recovery_delete_compensation");
+        let id = Id::new(0, 703);
+        let mut original = OwnedCell::new_with_id(
+            schema.id,
+            &id,
+            data_map_value!(id: 1i32, value: "original".to_string()),
+        );
+        let prior_revision_ts = chunks.write_cell(&mut original).unwrap().revision_ts;
+        let (chunk_id, seq_id, cell_offset) = stable_cell_location(&chunks, &id);
+        chunks.remove_cell(&id).unwrap();
+        let installed_revision_ts = chunks.current_revision_ts(&id).unwrap();
+        let tid = test_hlc(22, 1);
+        let entry = UndoLogEntry::new_restore(
+            tid,
+            id,
+            UndoOpType::Remove,
+            installed_revision_ts,
+            prior_revision_ts,
+            chunk_id,
+            seq_id,
+            cell_offset,
+        );
+        let undo =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+
+        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry.clone()])]), &chunks)
+            .unwrap();
+        let compensated = chunks.read_cell(&id).unwrap().to_owned();
+        assert_eq!(compensated.data, original.data);
+        assert!(compensated.header.revision_ts > installed_revision_ts);
+        let compensation_ts = compensated.header.revision_ts;
+
+        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry])]), &chunks)
+            .unwrap();
+        assert_eq!(
+            chunks.read_cell(&id).unwrap().header.revision_ts,
+            compensation_ts
         );
     }
 

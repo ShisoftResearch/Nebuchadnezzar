@@ -9,6 +9,7 @@ use bifrost_hasher::hash_str;
 use dovahkiin::types::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tempfile::TempDir;
 use tokio::time::{timeout, Duration};
 
 async fn scoped_txn_client_for_database(
@@ -37,15 +38,24 @@ async fn scoped_data_site_client_for_database(
 }
 
 async fn start_occ_test_server(address: &str, group: &str) -> Arc<NebServer> {
+    start_occ_test_server_with_options(address, group, None, 1).await
+}
+
+async fn start_occ_test_server_with_options(
+    address: &str,
+    group: &str,
+    undo_log_storage: Option<String>,
+    chunk_count: usize,
+) -> Arc<NebServer> {
     NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: crate::ram::segs::SEGMENT_SIZE,
-            db_size: crate::ram::segs::SEGMENT_SIZE,
+            db_size: crate::ram::segs::SEGMENT_SIZE * chunk_count,
             history_retention_ms: 300_000,
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
+            undo_log_storage,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -801,6 +811,565 @@ async fn equal_commit_timestamp_is_invisible_to_snapshot() {
         other => panic!("expected the old revision at an equal boundary, got {other:?}"),
     }
 
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborted_update_restores_content_with_newer_revision() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5410";
+    let group = "txn_occ_abort_update_compensation";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90150);
+
+    let mut original = counter_cell(schema.id, cell_id, 1, "abort-update-original");
+    let original_header = runtime.chunks().write_cell(&mut original).unwrap();
+    let tid = server.hlc.now();
+    let data_site = scoped_data_site_client_for_database(address, group, group).await;
+    let prepare = data_site
+        .prepare(
+            server.server_id,
+            tid,
+            tid,
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Present(original_header.revision_ts),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepare.payload, DMPrepareResult::Success);
+
+    let commit_hlc = server.hlc.now();
+    let commit = data_site
+        .commit(
+            commit_hlc,
+            tid,
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                2,
+                "abort-update-failed",
+            ))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(commit.payload, DMCommitResult::Success);
+
+    let abort = data_site.abort(server.hlc.now(), tid).await.unwrap();
+    assert_eq!(abort.payload, AbortResult::Success(None));
+
+    let current = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(current.data, original.data);
+    assert!(current.header.revision_ts > commit_hlc.ts);
+    assert!(matches!(
+        runtime
+            .chunks()
+            .read_cell_snapshot(&cell_id, current.header.revision_ts)
+            .unwrap(),
+        crate::ram::cell::SnapshotRead::Present(ref cell)
+            if cell.header.revision_ts == original_header.revision_ts
+                && cell.data == original.data
+    ));
+
+    let end = data_site.end(server.hlc.now(), tid).await.unwrap();
+    assert_eq!(end.payload, EndResult::Success);
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborted_insert_installs_a_newer_tombstone() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5411";
+    let group = "txn_occ_abort_insert_compensation";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90151);
+    let tid = server.hlc.now();
+    let data_site = scoped_data_site_client_for_database(address, group, group).await;
+
+    let prepare = data_site
+        .prepare(
+            server.server_id,
+            tid,
+            tid,
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Absent(None),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepare.payload, DMPrepareResult::Success);
+    let commit_hlc = server.hlc.now();
+    let commit = data_site
+        .commit(
+            commit_hlc,
+            tid,
+            vec![CommitOp::Write(counter_cell(
+                schema.id,
+                cell_id,
+                1,
+                "abort-insert-failed",
+            ))],
+        )
+        .await
+        .unwrap();
+    assert_eq!(commit.payload, DMCommitResult::Success);
+
+    let abort = data_site.abort(server.hlc.now(), tid).await.unwrap();
+    assert_eq!(abort.payload, AbortResult::Success(None));
+    assert!(runtime.chunks().read_cell(&cell_id).is_err());
+    let compensation_ts = runtime
+        .chunks()
+        .current_revision_ts(&cell_id)
+        .expect("aborted insert must leave a current tombstone");
+    assert!(compensation_ts > commit_hlc.ts);
+    assert!(matches!(
+        runtime
+            .chunks()
+            .read_cell_snapshot(&cell_id, compensation_ts)
+            .unwrap(),
+        crate::ram::cell::SnapshotRead::Absent(None)
+    ));
+
+    assert_eq!(
+        data_site.end(server.hlc.now(), tid).await.unwrap().payload,
+        EndResult::Success
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn aborted_delete_restores_content_with_newer_revision() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5412";
+    let group = "txn_occ_abort_delete_compensation";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90152);
+
+    let mut original = counter_cell(schema.id, cell_id, 1, "abort-delete-original");
+    let original_header = runtime.chunks().write_cell(&mut original).unwrap();
+    let tid = server.hlc.now();
+    let data_site = scoped_data_site_client_for_database(address, group, group).await;
+    let prepare = data_site
+        .prepare(
+            server.server_id,
+            tid,
+            tid,
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::Present(original_header.revision_ts),
+                intent: PrepareIntent::Write,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepare.payload, DMPrepareResult::Success);
+    let commit_hlc = server.hlc.now();
+    let commit = data_site
+        .commit(commit_hlc, tid, vec![CommitOp::Remove(cell_id)])
+        .await
+        .unwrap();
+    assert_eq!(commit.payload, DMCommitResult::Success);
+
+    let abort = data_site.abort(server.hlc.now(), tid).await.unwrap();
+    assert_eq!(abort.payload, AbortResult::Success(None));
+    let current = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(current.data, original.data);
+    assert!(current.header.revision_ts > commit_hlc.ts);
+    assert!(matches!(
+        runtime
+            .chunks()
+            .read_cell_snapshot(&cell_id, current.header.revision_ts)
+            .unwrap(),
+        crate::ram::cell::SnapshotRead::Present(ref cell)
+            if cell.header.revision_ts == original_header.revision_ts
+                && cell.data == original.data
+    ));
+
+    assert_eq!(
+        data_site.end(server.hlc.now(), tid).await.unwrap().payload,
+        EndResult::Success
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn abort_rejects_a_later_successful_revision_without_overwriting_it() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5416";
+    let group = "txn_occ_abort_preserves_later_revision";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90157);
+
+    let mut original = counter_cell(schema.id, cell_id, 1, "later-winner-original");
+    let original_header = runtime.chunks().write_cell(&mut original).unwrap();
+    let tid = server.hlc.now();
+    let data_site = scoped_data_site_client_for_database(address, group, group).await;
+    assert_eq!(
+        data_site
+            .prepare(
+                server.server_id,
+                tid,
+                tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(original_header.revision_ts),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await
+            .unwrap()
+            .payload,
+        DMPrepareResult::Success
+    );
+    assert_eq!(
+        data_site
+            .commit(
+                server.hlc.now(),
+                tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    2,
+                    "later-winner-failed",
+                ))],
+            )
+            .await
+            .unwrap()
+            .payload,
+        DMCommitResult::Success
+    );
+
+    let mut later = counter_cell(schema.id, cell_id, 3, "later-winner-success");
+    let later_header = runtime.chunks().update_cell(&mut later).unwrap();
+    assert_eq!(
+        data_site
+            .abort(server.hlc.now(), tid)
+            .await
+            .unwrap()
+            .payload,
+        AbortResult::CheckFailed(CheckError::CannotEnd)
+    );
+    let retained = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(retained.header.revision_ts, later_header.revision_ts);
+    assert_eq!(retained.data, later.data);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undo_is_durable_before_transactional_storage_mutation() {
+    let _ = env_logger::try_init();
+    let temp_dir = TempDir::new().unwrap();
+    let address = "127.0.0.1:5413";
+    let group = "txn_occ_undo_before_mutation";
+    let server = start_occ_test_server_with_options(
+        address,
+        group,
+        Some(temp_dir.path().join("undo").to_string_lossy().into_owned()),
+        1,
+    )
+    .await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90153);
+    let mut original = counter_cell(schema.id, cell_id, 1, "undo-durable-original");
+    let original_header = runtime.chunks().write_cell(&mut original).unwrap();
+    let tid = server.hlc.now();
+    let data_site = scoped_data_site_client_for_database(address, group, group).await;
+    assert_eq!(
+        data_site
+            .prepare(
+                server.server_id,
+                tid,
+                tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(original_header.revision_ts),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await
+            .unwrap()
+            .payload,
+        DMPrepareResult::Success
+    );
+
+    let commit_hlc = server.hlc.now();
+    let pause = transactions::data_site::install_before_storage_mutation_pause(tid, cell_id);
+    let commit_site = data_site.clone();
+    let commit_task = tokio::spawn(async move {
+        commit_site
+            .commit(
+                commit_hlc,
+                tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    2,
+                    "undo-durable-pending",
+                ))],
+            )
+            .await
+            .unwrap()
+            .payload
+    });
+    pause.wait_until_entered().await;
+
+    let before_mutation = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(
+        before_mutation.header.revision_ts,
+        original_header.revision_ts
+    );
+    assert_eq!(before_mutation.data, original.data);
+    let recovered = runtime.undo_log().unwrap().recover().unwrap();
+    let entries = recovered
+        .get(&tid)
+        .expect("the synced undo entry must be recoverable before mutation");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].installed_revision_ts, commit_hlc.ts);
+    assert_eq!(
+        entries[0].prior_revision_ts,
+        Some(original_header.revision_ts)
+    );
+
+    pause.release();
+    assert_eq!(commit_task.await.unwrap(), DMCommitResult::Success);
+    assert_eq!(
+        data_site
+            .abort(server.hlc.now(), tid)
+            .await
+            .unwrap()
+            .payload,
+        AbortResult::Success(None)
+    );
+    assert_eq!(
+        data_site.end(server.hlc.now(), tid).await.unwrap().payload,
+        EndResult::Success
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undo_write_failure_prevents_transactional_storage_mutation() {
+    let _ = env_logger::try_init();
+    let temp_dir = TempDir::new().unwrap();
+    let address = "127.0.0.1:5414";
+    let group = "txn_occ_undo_failure_stops_mutation";
+    let server = start_occ_test_server_with_options(
+        address,
+        group,
+        Some(temp_dir.path().join("undo").to_string_lossy().into_owned()),
+        1,
+    )
+    .await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90154);
+    let mut original = counter_cell(schema.id, cell_id, 1, "undo-failure-original");
+    let original_header = runtime.chunks().write_cell(&mut original).unwrap();
+    let tid = server.hlc.now();
+    let data_site = scoped_data_site_client_for_database(address, group, group).await;
+    assert_eq!(
+        data_site
+            .prepare(
+                server.server_id,
+                tid,
+                tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(original_header.revision_ts),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await
+            .unwrap()
+            .payload,
+        DMPrepareResult::Success
+    );
+
+    runtime.undo_log().unwrap().fail_next_undo_write_for_test();
+    let commit = data_site
+        .commit(
+            server.hlc.now(),
+            tid,
+            vec![CommitOp::Update(counter_cell(
+                schema.id,
+                cell_id,
+                2,
+                "undo-failure-pending",
+            ))],
+        )
+        .await
+        .unwrap()
+        .payload;
+    assert_ne!(commit, DMCommitResult::Success);
+    let after = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(after.header.revision_ts, original_header.revision_ts);
+    assert_eq!(after.data, original.data);
+
+    assert_eq!(
+        data_site
+            .abort(server.hlc.now(), tid)
+            .await
+            .unwrap()
+            .payload,
+        AbortResult::Success(None)
+    );
+    assert_eq!(
+        data_site.end(server.hlc.now(), tid).await.unwrap().payload,
+        EndResult::Success
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_compensation_retry_resumes_aborted_node_without_duplicates() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5415";
+    let group = "txn_occ_partial_compensation_retry";
+    let server = start_occ_test_server_with_options(address, group, None, 2).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let first_id = Id::new(0, 90155);
+    let second_id = Id::new(1, 90156);
+    let mut first_original = counter_cell(
+        schema.id,
+        first_id,
+        1,
+        "partial-compensation-first-original",
+    );
+    let first_header = runtime.chunks().write_cell(&mut first_original).unwrap();
+    let mut second_original = counter_cell(
+        schema.id,
+        second_id,
+        2,
+        "partial-compensation-second-original",
+    );
+    let second_header = runtime.chunks().write_cell(&mut second_original).unwrap();
+    let tid = server.hlc.now();
+    let data_site = scoped_data_site_client_for_database(address, group, group).await;
+    assert_eq!(
+        data_site
+            .prepare(
+                server.server_id,
+                tid,
+                tid,
+                vec![
+                    PrepareOp {
+                        id: first_id,
+                        expectation: CellExpectation::Present(first_header.revision_ts),
+                        intent: PrepareIntent::Write,
+                    },
+                    PrepareOp {
+                        id: second_id,
+                        expectation: CellExpectation::Present(second_header.revision_ts),
+                        intent: PrepareIntent::Write,
+                    },
+                ],
+            )
+            .await
+            .unwrap()
+            .payload,
+        DMPrepareResult::Success
+    );
+    let commit_hlc = server.hlc.now();
+    assert_eq!(
+        data_site
+            .commit(
+                commit_hlc,
+                tid,
+                vec![
+                    CommitOp::Update(counter_cell(
+                        schema.id,
+                        first_id,
+                        11,
+                        "partial-compensation-first-failed",
+                    )),
+                    CommitOp::Update(counter_cell(
+                        schema.id,
+                        second_id,
+                        12,
+                        "partial-compensation-second-failed",
+                    )),
+                ],
+            )
+            .await
+            .unwrap()
+            .payload,
+        DMCommitResult::Success
+    );
+
+    runtime.chunks().fail_next_allocation_for_test(&second_id);
+    assert_eq!(
+        data_site
+            .abort(server.hlc.now(), tid)
+            .await
+            .unwrap()
+            .payload,
+        AbortResult::CheckFailed(CheckError::CannotEnd)
+    );
+    let first_compensation = runtime.chunks().read_cell(&first_id).unwrap().to_owned();
+    assert_eq!(first_compensation.data, first_original.data);
+    assert!(first_compensation.header.revision_ts > commit_hlc.ts);
+    let first_compensation_ts = first_compensation.header.revision_ts;
+    let expected_owner = Some(TxnPriority::new(tid, server.server_id));
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            server.server_id,
+            group,
+            group,
+            &first_id,
+        ),
+        expected_owner
+    );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            server.server_id,
+            group,
+            group,
+            &second_id,
+        ),
+        expected_owner
+    );
+
+    assert_eq!(
+        data_site
+            .abort(server.hlc.now(), tid)
+            .await
+            .unwrap()
+            .payload,
+        AbortResult::Success(None)
+    );
+    assert_eq!(
+        runtime
+            .chunks()
+            .read_cell(&first_id)
+            .unwrap()
+            .header
+            .revision_ts,
+        first_compensation_ts,
+        "retry must not install a duplicate compensation"
+    );
+    let second_compensation = runtime.chunks().read_cell(&second_id).unwrap().to_owned();
+    assert_eq!(second_compensation.data, second_original.data);
+    assert!(second_compensation.header.revision_ts > commit_hlc.ts);
+
+    assert_eq!(
+        data_site.end(server.hlc.now(), tid).await.unwrap().payload,
+        EndResult::Success
+    );
     server.shutdown().await;
 }
 
