@@ -6,8 +6,11 @@ use crate::ram::entry::{EntryContent, EntryType};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::Field;
 use crate::ram::schema::*;
-use crate::ram::segs::{SegmentAllocator, SegmentReferenceGuard, SEGMENT_SIZE};
+use crate::ram::segs::{
+    SegmentAllocator, SegmentExclusiveRefGuard, SegmentReferenceGuard, SEGMENT_SIZE,
+};
 use crate::ram::types::*;
+use crate::server::transactions::undo_log::{UndoLogEntry, UndoLogger, UndoOpType};
 use crate::server::ServerMeta;
 use lightning::map::Map as LightningMap;
 use std::collections::HashSet;
@@ -56,6 +59,55 @@ fn retained_revision_chunks(segment_count: usize) -> (Arc<Chunks>, Schema) {
     (chunks, schema)
 }
 
+fn retained_revision_chunks_with_wal(
+    segment_count: usize,
+    wal_storage: String,
+) -> (Arc<Chunks>, Schema) {
+    let schema = Schema::new(
+        "cleaner_durable_retained_revision_test",
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        MAX_SEGMENT_SIZE * segment_count,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        Some(wal_storage),
+        None,
+    );
+    (chunks, schema)
+}
+
+fn recover_retained_revision_chunks_with_wal(
+    segment_count: usize,
+    wal_storage: String,
+    raft_storage: String,
+    schema: Schema,
+) -> Arc<Chunks> {
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(schema);
+    Chunks::recover_with_clock(
+        1,
+        MAX_SEGMENT_SIZE * segment_count,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        Some(wal_storage),
+        None,
+        Some(raft_storage),
+        Arc::new(bifrost::hlc::HlcSource::new(0)),
+        300_000,
+    )
+    .expect("recover relocated WAL-only chunks")
+    .0
+}
+
 fn revision_cell(schema_id: u32, id: &Id, value: u8) -> OwnedCell {
     OwnedCell {
         header: CellHeader::new(schema_id, id),
@@ -72,6 +124,34 @@ fn force_next_write_to_new_segment(chunk: &crate::ram::chunk::Chunk) {
         .get(&(chunk.get_head_seg_id() as usize))
         .expect("active regular head");
     head.append_header.store(head.bound, Ordering::Release);
+}
+
+fn restore_undo_entry(
+    chunks: &Chunks,
+    txn_id: crate::server::transactions::TxnId,
+    id: Id,
+    op_type: UndoOpType,
+    installed_revision_ts: u64,
+    prior_revision_ts: u64,
+) -> UndoLogEntry {
+    let chunk = chunks.locate_chunk_by_partition(id.higher);
+    let prior_addr = chunks
+        .history_location(&id, prior_revision_ts)
+        .expect("prior immutable revision");
+    let (_, seq_id) = chunk.get_cell_segment_info(prior_addr);
+    let source = chunk
+        .locate_segment(prior_addr)
+        .expect("prior immutable segment");
+    UndoLogEntry::new_restore(
+        txn_id,
+        id,
+        op_type,
+        installed_revision_ts,
+        prior_revision_ts,
+        chunk.id as u64,
+        seq_id,
+        (prior_addr - source.addr) as u64,
+    )
 }
 
 fn install_current_only_cell(
@@ -490,6 +570,364 @@ fn combine_skips_a_source_with_an_active_shared_lease() {
     );
 
     drop(lease);
+}
+
+#[test]
+fn exact_output_sync_fails_retryably_while_cleaner_has_exclusive_source() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let (chunks, schema) =
+        retained_revision_chunks_with_wal(3, wal_dir.path().to_string_lossy().into_owned());
+    let chunk = &chunks.list[0];
+    let id = Id::new(72, 9_103);
+    crate::ram::chunk::set_transaction_context(true);
+    let mut cell = revision_cell(schema.id, &id, 10);
+    let installed = chunks
+        .write_cell_at_revision(&mut cell, RevisionWrite::pending(100))
+        .unwrap();
+    crate::ram::chunk::set_transaction_context(false);
+    let source = chunk
+        .locate_segment(installed.node.load().1)
+        .expect("installed output source");
+    let exclusive =
+        SegmentExclusiveRefGuard::new(&source).expect("cleaner-style exclusive source lease");
+
+    let error = chunks
+        .force_sync_installed_revisions([&installed])
+        .expect_err("exact sync must not race a cleaner-exclusive source");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        installed.node.load().0,
+        crate::ram::history::RevisionState::PendingPresent
+    );
+
+    drop(exclusive);
+    chunks
+        .force_sync_installed_revisions([&installed])
+        .expect("retry after cleaner contention must sync the exact output");
+}
+
+#[test]
+fn exact_output_sync_short_lease_blocks_cleaner_relocation_only_until_sync_finishes() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let (chunks, schema) =
+        retained_revision_chunks_with_wal(5, wal_dir.path().to_string_lossy().into_owned());
+    let chunk = &chunks.list[0];
+    let id = Id::new(72, 9_104);
+    crate::ram::chunk::set_transaction_context(true);
+    let mut cell = revision_cell(schema.id, &id, 10);
+    let installed = chunks
+        .write_cell_at_revision(&mut cell, RevisionWrite::pending(100))
+        .unwrap();
+    crate::ram::chunk::set_transaction_context(false);
+    let source_location = installed.node.load().1;
+    let source = chunk
+        .locate_segment(source_location)
+        .expect("installed output source");
+    force_next_write_to_new_segment(chunk);
+    let filler_id = Id::new(72, 9_105);
+    let mut filler = revision_cell(schema.id, &filler_id, 20);
+    chunks
+        .write_cell_at_revision(&mut filler, RevisionWrite::committed(200))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let selected = chunk.segments();
+    assert_eq!(selected.len(), 2);
+
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = StdMutex::new(release_rx);
+    chunk.set_exact_sync_lease_hook_for_test(Some(Arc::new(move |leased_id, _| {
+        if leased_id == id {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release exact output sync");
+        }
+    })));
+
+    let sync_chunks = chunks.clone();
+    let sync_installed = installed.clone();
+    let sync = thread::spawn(move || sync_chunks.force_sync_installed_revisions([&sync_installed]));
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("exact sync must acquire its short source lease");
+
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+    assert_eq!(
+        combine::CombinedCleaner::combine_segments(chunk, &selected),
+        (0, 0),
+        "cleaner must skip an exact output source while its sync lease is held"
+    );
+    assert!(chunk.contains_seg(source.id));
+
+    release_tx.send(()).unwrap();
+    sync.join().unwrap().unwrap();
+    chunk.set_exact_sync_lease_hook_for_test(None);
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+    assert_eq!(reduced, 1);
+    assert!(
+        !chunk.contains_seg(source.id),
+        "the operation-scoped lease must be released after exact sync"
+    );
+    assert_ne!(chunks.history_location(&id, 100), Some(source_location));
+}
+
+#[test]
+fn wal_only_relocation_persists_destination_before_source_cleanup_and_recovery() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let raft_dir = tempfile::TempDir::new().unwrap();
+    let wal_path = wal_dir.path().to_string_lossy().into_owned();
+    let (chunks, schema) = retained_revision_chunks_with_wal(5, wal_path.clone());
+    let chunk = &chunks.list[0];
+    let id = Id::new(72, 9_106);
+    let mut cell = revision_cell(schema.id, &id, 10);
+    let installed = chunks
+        .write_cell_at_revision(&mut cell, RevisionWrite::committed(100))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let filler_id = Id::new(72, 9_107);
+    let mut filler = revision_cell(schema.id, &filler_id, 20);
+    chunks
+        .write_cell_at_revision(&mut filler, RevisionWrite::committed(90))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    chunks
+        .force_sync_installed_revisions([&installed])
+        .expect("source output WAL sync");
+
+    let selected = chunk.segments();
+    assert_eq!(selected.len(), 2);
+    let source_wals: Vec<_> = selected
+        .iter()
+        .map(|segment| {
+            segment.force_wal_sync().unwrap();
+            chunk
+                .file_manager
+                .wal_path(chunk.id, segment.id, segment.seq_id)
+                .unwrap()
+        })
+        .collect();
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected);
+    assert_eq!(reduced, 1);
+    let destination = chunk
+        .locate_segment(chunks.history_location(&id, 100).unwrap())
+        .expect("relocated destination");
+    let destination_wal = chunk
+        .file_manager
+        .wal_path(chunk.id, destination.id, destination.seq_id)
+        .unwrap();
+    assert!(
+        source_wals
+            .iter()
+            .all(|path| !std::path::Path::new(path).exists()),
+        "source cleanup must delete the superseded WALs"
+    );
+    assert!(
+        std::path::Path::new(&destination_wal).exists(),
+        "cleaner must create a durable WAL for the relocated destination"
+    );
+
+    drop(chunks);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(schema);
+    let (recovered, _) = Chunks::recover_with_clock(
+        1,
+        MAX_SEGMENT_SIZE * 5,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        Some(wal_path),
+        None,
+        Some(raft_dir.path().to_string_lossy().into_owned()),
+        Arc::new(bifrost::hlc::HlcSource::new(0)),
+        300_000,
+    )
+    .unwrap();
+    let restored = recovered.read_cell(&id).unwrap().to_owned();
+    assert_eq!(restored.header.revision_ts, 100);
+    assert_eq!(restored.data["id"].i32(), Some(&10));
+}
+
+#[test]
+fn marked_committed_insert_update_delete_survive_relocation_and_recovery() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let undo_dir = tempfile::TempDir::new().unwrap();
+    let raft_dir = tempfile::TempDir::new().unwrap();
+    let wal_path = wal_dir.path().to_string_lossy().into_owned();
+    let undo_path = undo_dir.path().to_string_lossy().into_owned();
+    let raft_path = raft_dir.path().to_string_lossy().into_owned();
+    let (chunks, schema) = retained_revision_chunks_with_wal(10, wal_path.clone());
+    let undo = UndoLogger::new(undo_path.clone()).unwrap();
+    let chunk = &chunks.list[0];
+    let txn_id = crate::server::transactions::test_hlc(200, 7);
+    let insert_id = Id::new(73, 9_201);
+    let update_id = Id::new(73, 9_202);
+    let delete_id = Id::new(73, 9_203);
+
+    let mut update_prior = revision_cell(schema.id, &update_id, 20);
+    chunks
+        .write_cell_at_revision(&mut update_prior, RevisionWrite::committed(100))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let mut delete_prior = revision_cell(schema.id, &delete_id, 30);
+    chunks
+        .write_cell_at_revision(&mut delete_prior, RevisionWrite::committed(100))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+
+    undo.write_undo_entry(UndoLogEntry::new_write(txn_id, insert_id, 200))
+        .unwrap();
+    undo.write_undo_entry(restore_undo_entry(
+        &chunks,
+        txn_id,
+        update_id,
+        UndoOpType::Update,
+        200,
+        100,
+    ))
+    .unwrap();
+    undo.write_undo_entry(restore_undo_entry(
+        &chunks,
+        txn_id,
+        delete_id,
+        UndoOpType::Remove,
+        200,
+        100,
+    ))
+    .unwrap();
+
+    crate::ram::chunk::set_transaction_context(true);
+    let mut inserted = revision_cell(schema.id, &insert_id, 31);
+    let inserted_revision = chunks
+        .write_cell_at_revision(&mut inserted, RevisionWrite::pending(200))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let mut updated = revision_cell(schema.id, &update_id, 21);
+    let updated_revision = chunks
+        .update_cell_at_revision(&mut updated, RevisionWrite::pending(200))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let deleted_revision = chunks
+        .remove_cell_at_revision(&delete_id, RevisionWrite::pending(200))
+        .unwrap();
+    crate::ram::chunk::set_transaction_context(false);
+    force_next_write_to_new_segment(chunk);
+
+    let installed = [&inserted_revision, &updated_revision, &deleted_revision];
+    chunks
+        .force_sync_installed_revisions(installed)
+        .expect("exact commit outputs must be durable before the marker");
+    undo.write_commit_marker(&txn_id).unwrap();
+    for revision in installed {
+        chunks.promote_revision(revision).unwrap();
+    }
+    let committed_sources = [
+        (insert_id, chunks.history_location(&insert_id, 200).unwrap()),
+        (update_id, chunks.history_location(&update_id, 200).unwrap()),
+        (delete_id, chunks.history_location(&delete_id, 200).unwrap()),
+    ];
+
+    let sources = chunk.segments();
+    assert!(sources.len() >= 5, "setup must span cleaner sources");
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &sources);
+    assert!(reduced > 0, "cleaner must reclaim marked-output sources");
+    for (id, old_location) in committed_sources {
+        assert_relocated_revision(&chunks, &id, 200, old_location);
+    }
+
+    drop(chunks);
+    drop(undo);
+    let recovered = recover_retained_revision_chunks_with_wal(10, wal_path, raft_path, schema);
+    let recovered_undo = UndoLogger::new(undo_path).unwrap();
+    assert!(
+        recovered_undo.recover().unwrap().is_empty(),
+        "the durable commit marker must suppress all three undo records"
+    );
+    let inserted = recovered.read_cell(&insert_id).unwrap().to_owned();
+    assert_eq!(inserted.header.revision_ts, 200);
+    assert_eq!(inserted.data["id"].i32(), Some(&31));
+    let updated = recovered.read_cell(&update_id).unwrap().to_owned();
+    assert_eq!(updated.header.revision_ts, 200);
+    assert_eq!(updated.data["id"].i32(), Some(&21));
+    assert!(recovered.read_cell(&delete_id).is_err());
+    assert_eq!(recovered.current_revision_ts(&delete_id), Some(200));
+}
+
+#[test]
+fn marked_aborted_compensation_survives_relocation_and_recovery() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let undo_dir = tempfile::TempDir::new().unwrap();
+    let raft_dir = tempfile::TempDir::new().unwrap();
+    let wal_path = wal_dir.path().to_string_lossy().into_owned();
+    let undo_path = undo_dir.path().to_string_lossy().into_owned();
+    let raft_path = raft_dir.path().to_string_lossy().into_owned();
+    let (chunks, schema) = retained_revision_chunks_with_wal(8, wal_path.clone());
+    let undo = UndoLogger::new(undo_path.clone()).unwrap();
+    let chunk = &chunks.list[0];
+    let txn_id = crate::server::transactions::test_hlc(200, 8);
+    let id = Id::new(73, 9_204);
+
+    let mut prior = revision_cell(schema.id, &id, 40);
+    chunks
+        .write_cell_at_revision(&mut prior, RevisionWrite::committed(100))
+        .unwrap();
+    let prior = chunks.read_cell(&id).unwrap().to_owned();
+    undo.write_undo_entry(restore_undo_entry(
+        &chunks,
+        txn_id,
+        id,
+        UndoOpType::Update,
+        200,
+        100,
+    ))
+    .unwrap();
+    force_next_write_to_new_segment(chunk);
+
+    crate::ram::chunk::set_transaction_context(true);
+    let mut failed = revision_cell(schema.id, &id, 41);
+    let failed_revision = chunks
+        .update_cell_at_revision(&mut failed, RevisionWrite::pending(200))
+        .unwrap();
+    crate::ram::chunk::set_transaction_context(false);
+    let compensation = chunks.compensate(&failed_revision, Some(prior)).unwrap();
+    chunks
+        .force_sync_installed_revisions([&compensation])
+        .expect("exact compensation output must be durable before the marker");
+    undo.write_abort_marker(&txn_id).unwrap();
+    let compensation_ts = compensation.node.revision_ts;
+    let compensation_source = chunks.history_location(&id, compensation_ts).unwrap();
+
+    force_next_write_to_new_segment(chunk);
+    let filler_id = Id::new(73, 9_205);
+    let mut filler = revision_cell(schema.id, &filler_id, 50);
+    chunks
+        .write_cell_at_revision(&mut filler, RevisionWrite::committed(90))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let sources = chunk.segments();
+    assert!(sources.len() >= 3, "setup must span cleaner sources");
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &sources);
+    assert!(reduced > 0, "cleaner must reclaim the compensation source");
+    assert_relocated_revision(&chunks, &id, compensation_ts, compensation_source);
+
+    drop(chunks);
+    drop(undo);
+    let recovered = recover_retained_revision_chunks_with_wal(8, wal_path, raft_path, schema);
+    let recovered_undo = UndoLogger::new(undo_path).unwrap();
+    assert!(
+        recovered_undo.recover().unwrap().is_empty(),
+        "the durable abort marker must suppress the compensated undo record"
+    );
+    let restored = recovered.read_cell(&id).unwrap().to_owned();
+    assert_eq!(restored.header.revision_ts, compensation_ts);
+    assert_eq!(restored.data["id"].i32(), Some(&40));
 }
 
 #[test]

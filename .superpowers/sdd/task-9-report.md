@@ -231,3 +231,214 @@ All bounded server suites ran strictly serially on the final source:
 
 Task 10 stale-owner resolution, index/range MVCC, and unrelated
 non-transactional isolation behavior remain explicitly deferred.
+
+## Review Fixes Round 2
+
+### Root-Cause Trace
+
+#### Critical 1: durable transactions could run without an output WAL
+
+The transaction durability predicate treated backup/recovery storage as
+durable output storage. `Segment::force_wal_sync` then returned success when a
+segment had no WAL handle. Consequently, a backup + undo configuration could
+install a revision only in memory, persist a transaction marker, and suppress
+the undo record even though no output WAL existed.
+
+The correction separates "some durable storage is configured" from "a writable
+output WAL is configured." Durable transaction startup now requires both WAL
+and undo storage; direct participants check both before mutation. Required
+exact-output synchronization fails if the exact segment has no WAL, including
+when backup storage exists, while genuinely volatile fixtures retain the
+permissive path.
+
+#### Critical 2: cleaner relocation could invalidate an output-durability proof
+
+Exact-output synchronization previously validated an address, retained only
+its `(chunk_id, segment_id)`, and synchronized later without a segment lease.
+The combine cleaner could move that revision and reclaim the source between
+validation and synchronization. In WAL-only mode it copied memory to the
+destination, skipped backup archiving, and could delete the source WAL before
+the destination was durably represented.
+
+Exact sync now acquires fallible, short-lived `SegmentReferenceGuard`s,
+revalidates full identity, chain node, location, registry entry, and segment
+while each lease is held, and retains those guards through `fsync`. Contention
+therefore returns a retryable error. Cleaner relocation writes and strictly
+synchronizes the destination WAL before publication or source reclamation.
+Required WAL sync can reopen an existing configured WAL after rollover closed
+the live writer, but cannot create or silently substitute a missing WAL.
+There are no transaction-lifetime segment pins.
+
+#### Critical 3: a chosen distributed outcome could be forgotten
+
+The coordinator unconditionally removed live state after `sites_end`, even
+when a participant returned `CannotEnd` or its response was lost. It neither
+remembered completed participants nor retained enough durable data to replay
+unresolved participants after coordinator restart. Participant startup also
+presumed abort when it found incomplete undo, and the old commit marker type
+could not distinguish coordinator decision evidence from local participant
+completion.
+
+Commit and abort choices now become irrevocable before the first decision
+write. Distinct durable coordinator Commit and Abort records persist the
+canonical participant set; participant completion retains its separate record
+type. Live retries target only unresolved participants, and a caller retry
+after live coordinator state is gone reconstructs the outcome and participant
+set from durable evidence. Participant startup resolves locally when possible,
+otherwise asks `tid.node`; Commit preserves the installed output and writes a
+participant completion marker, Abort durably compensates before its marker,
+and Unknown/InProgress/RPC failure halts recovery conservatively.
+
+Participant Commit synchronizes its exact output before returning `Success`.
+Participant Abort synchronizes the exact compensation before returning
+success. The resulting durability proof is cached through `end`, avoiding a
+second `fsync`, while failures retain retry state. Reopened undo writers start
+after the maximum existing log sequence so recovery completion markers sort
+after all prior undo records.
+
+### Focused TDD Evidence
+
+Each GREEN line is one focused test run with one test thread. The initial
+behavioral REDs were:
+
+- `recoverable_transaction_configuration_requires_output_wal_storage`: RED
+  accepted backup/recovery + undo without WAL; GREEN 1 passed, 0 failed,
+  0 ignored, 736 filtered, 1.00s.
+- `backup_only_direct_participant_rejects_mutation_without_wal_before_any_change`:
+  RED allowed the participant mutation instead of returning `CannotEnd`;
+  GREEN 1 passed, 0 failed, 0 ignored, 736 filtered, 11.15s. The post-format
+  verification run was also green with 739 filtered in 11.15s.
+- `backup_only_chunks_reject_exact_transaction_output_sync_without_wal`: RED
+  exact sync returned `Ok(())` for a backup-only segment; GREEN 1 passed,
+  0 failed, 0 ignored, 736 filtered, 0.00s.
+- `required_wal_sync_rejects_a_segment_without_a_real_wal` and
+  `required_wal_sync_accepts_an_existing_wal_after_its_live_handle_was_closed`:
+  RED exposed the no-WAL success path and inability to prove a closed live
+  writer's existing WAL; each GREEN run passed its single test, with the
+  closed-handle run finishing in 0.00s.
+- `exact_output_sync_fails_retryably_while_cleaner_has_exclusive_source`: RED
+  synchronization succeeded from an unleased stale location; GREEN 1 passed,
+  0 failed, 0 ignored, 736 filtered, 0.00s.
+- `exact_output_sync_short_lease_blocks_cleaner_relocation_only_until_sync_finishes`:
+  RED relocation could cross validation/sync with no lease; GREEN 1 passed,
+  0 failed, 0 ignored, 736 filtered, 0.00s.
+- `wal_only_relocation_persists_destination_before_source_cleanup_and_recovery`:
+  RED reopening after source cleanup could not recover the relocated output;
+  GREEN 1 passed, 0 failed, 0 ignored, 736 filtered, 0.01s.
+- `marked_committed_insert_update_delete_survive_relocation_and_recovery`: RED
+  the marked insert/update/delete set was not fully reconstructible after
+  WAL-only relocation; GREEN 1 passed, 0 failed, 0 ignored, 736 filtered,
+  0.01s.
+- `marked_aborted_compensation_survives_relocation_and_recovery`: RED the
+  durable abort marker could outlive its relocated compensation; GREEN 1
+  passed, 0 failed, 0 ignored, 736 filtered, 0.01s.
+- `participant_commit_syncs_exact_output_before_success_without_emitting_decision`:
+  RED participant Commit returned success without an exact-output sync;
+  GREEN 1 passed, 0 failed, 0 ignored, 736 filtered, 11.13s.
+- `end_retry_after_durable_commit_completion_is_idempotently_successful`: RED a
+  lost `end` response followed by retry returned `TransactionNotFound`; GREEN
+  1 passed, 0 failed, 0 ignored, 736 filtered, 11.13s.
+- `partial_commit_end_failure_retains_coordinator_state_until_retry_completes`:
+  RED cleaned coordinator state after A completed and B returned `CannotEnd`;
+  GREEN 1 passed, 0 failed, 0 ignored, 736 filtered, 12.26s.
+- `coordinator_decision_marker_failure_keeps_commit_irrevocable_and_retryable`:
+  RED lacked a durable, participant-distinct commit choice and allowed the
+  caller path to lose retryability; GREEN 1 passed, 0 failed, 0 ignored,
+  736 filtered, 11.15s.
+- `coordinator_abort_marker_failure_defers_compensation_until_retry_is_durable`:
+  RED could begin participant abort before the distributed Abort decision was
+  durable; GREEN 1 passed, 0 failed, 0 ignored, 737 filtered, 11.15s.
+- `restarted_unended_participant_resolves_durable_commit_from_remote_coordinator`:
+  RED participant B presumed Abort at startup despite the coordinator's
+  chosen Commit; GREEN 1 passed, 0 failed, 0 ignored, 736 filtered, 28.55s.
+- The local-decision restart regression was RED because incomplete undo was
+  compensated instead of resolved from its durable Commit; GREEN 1 passed,
+  0 failed, 0 ignored, 736 filtered, 8.11s.
+- `coordinator_commit_decision_is_durable_without_suppressing_participant_undo`,
+  `committed_recovery_resolution_preserves_installed_output_instead_of_compensating`,
+  and
+  `unknown_recovery_resolution_is_conservative_and_leaves_pending_bytes_and_undo_intact`
+  respectively exposed conflated decision/completion evidence, presumed-abort
+  compensation despite Commit, and destructive handling of Unknown. Each
+  GREEN run passed 1 test, failed 0, ignored 0, filtered 736, and finished in
+  0.00s.
+- Recovery completion regressions for compensated insert, update, and delete
+  were RED because successful startup compensation emitted no durable
+  participant Abort completion. Their GREEN runs each passed 1 test, failed 0,
+  ignored 0, filtered 737, in 7.10s, 7.12s, and 7.12s respectively.
+
+The formal-review follow-up added four further RED checks:
+
+- The compensation retry sync-count assertion was RED at 4 calls versus the
+  expected 3 because `end` synchronized the already durable abort compensation
+  again. `compensation_sync_failure_retries_the_exact_handle_without_duplicate_output`
+  was GREEN with 1 passed, 0 failed, 0 ignored, 738 filtered, 11.13s test time
+  and 21.21s wall time.
+- `reopened_logger_orders_recovery_completion_after_existing_log_sequences`
+  was RED because a reopened writer reused sequence zero, so the completion
+  marker sorted before an older undo entry. GREEN: 1 passed, 0 failed,
+  0 ignored, 738 filtered, 0.00s test time and 6.20s wall time.
+- A deliberate retention-removal mutation made
+  `trimming_retains_distributed_decisions_and_participant_completion_evidence`
+  RED (`None` instead of the persisted `Some(Commit)` record): 0 passed,
+  1 failed, 0 ignored, 739 filtered, 0.00s test time and 4.70s wall time.
+  Restored retention was GREEN: 1 passed, 0 failed, 0 ignored, 739 filtered,
+  0.00s test time and 4.60s wall time.
+- Forgetting coordinator live state made the caller retry RED with
+  `TransactionNotFound`. Durable participant-set replay made the Commit
+  variant GREEN with 1 passed, 0 failed, 0 ignored, 739 filtered, 11.15s test
+  time and 19.51s wall time. The symmetric Abort replay was GREEN with the same
+  counts and 11.15s test time, 15.81s wall time.
+
+### Serial Verification
+
+All server suites ran strictly serially. Each completed before its configured
+generous bound; no timeout was reached.
+
+- `cargo test --lib server::transactions::undo_log -- --test-threads=1`:
+  38 passed, 0 failed, 0 ignored, 702 filtered; 29.56s test time, 29.72s wall.
+- `cargo test --lib server::transactions::occ_tests -- --test-threads=1`:
+  45 passed, 0 failed, 0 ignored, 695 filtered; 549.36s test time, 549.49s wall.
+- `cargo test --lib ram::recovery -- --test-threads=1`: 37 passed, 0 failed,
+  2 ignored, 701 filtered; 3.40s test time, 3.60s wall.
+- `cargo test --lib ram::cleaner -- --test-threads=1`: 21 passed, 0 failed,
+  0 ignored, 719 filtered; 0.35s test time, 0.50s wall.
+- `cargo test --lib server::transactions::data_site -- --test-threads=1`:
+  53 passed, 0 failed, 0 ignored, 687 filtered; 516.66s test time, 516.82s wall.
+- `cargo test --lib server::transactions::manager -- --test-threads=1`:
+  15 passed, 0 failed, 0 ignored, 725 filtered; 110.15s test time, 110.27s wall.
+- `cargo test --lib server::transactions::tests -- --test-threads=1`: 5
+  passed, 0 failed, 0 ignored, 735 filtered; 5.04s test time, 5.20s wall.
+- `cargo test --lib server::tests::durable_transaction_configuration_requires_undo_storage -- --test-threads=1`:
+  1 passed, 0 failed, 0 ignored, 739 filtered; 1.00s.
+- `cargo test --lib server::tests::recoverable_transaction_configuration_requires_output_wal_storage -- --test-threads=1`:
+  1 passed, 0 failed, 0 ignored, 739 filtered; 1.01s.
+- `cargo test --lib server::tests::durable_undo_initialization_failure_is_fatal -- --test-threads=1`:
+  1 passed, 0 failed, 0 ignored, 739 filtered; 1.01s.
+- `cargo check --lib`: exit 0 in 0.83s with 58 existing warnings and no
+  errors; timeout not reached.
+- `rustfmt --edition 2021 src/ram/chunk.rs src/ram/cleaner/combine.rs src/ram/cleaner/tests.rs src/ram/segs.rs src/server/mod.rs src/server/tests.rs src/server/transactions/data_site.rs src/server/transactions/manager.rs src/server/transactions/mod.rs src/server/transactions/occ_tests.rs src/server/transactions/undo_log.rs`:
+  exit 0 in 0.15s; timeout not reached.
+- `git diff --check`: exit 0 in 0.00s; timeout not reached.
+
+### Files
+
+- `src/ram/chunk.rs`
+- `src/ram/cleaner/combine.rs`
+- `src/ram/cleaner/tests.rs`
+- `src/ram/segs.rs`
+- `src/server/mod.rs`
+- `src/server/tests.rs`
+- `src/server/transactions/data_site.rs`
+- `src/server/transactions/manager.rs`
+- `src/server/transactions/mod.rs`
+- `src/server/transactions/occ_tests.rs`
+- `src/server/transactions/undo_log.rs`
+- `.superpowers/sdd/task-9-report.md`
+
+Coordinator decisions and participant completion evidence are conservatively
+retained by trimming so delayed retries and restart resolution cannot lose
+their safety proof. A bounded, acknowledged retirement/compaction protocol is
+deferred to Task 10; until then these records can grow the undo-log footprint.
+Task 10 stale-owner resolution, index/range MVCC, and unrelated
+non-transactional isolation behavior also remain deferred.

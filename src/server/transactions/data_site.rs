@@ -317,7 +317,7 @@ pub(crate) fn install_abort_cannot_end_for_cell(tid: TxnId, id: Id) -> AbortCann
 }
 
 #[cfg(test)]
-struct EndPromotionFailureHandle {
+pub(crate) struct EndPromotionFailureHandle {
     key: (TxnId, Id),
 }
 
@@ -337,7 +337,7 @@ fn end_promotion_failure_hooks() -> &'static Mutex<BTreeSet<(TxnId, Id)>> {
 }
 
 #[cfg(test)]
-fn install_end_promotion_failure(tid: TxnId, id: Id) -> EndPromotionFailureHandle {
+pub(crate) fn install_end_promotion_failure(tid: TxnId, id: Id) -> EndPromotionFailureHandle {
     let key = (tid, id);
     end_promotion_failure_hooks().lock().insert(key.clone());
     EndPromotionFailureHandle { key }
@@ -386,6 +386,8 @@ struct Transaction {
     installed: BTreeMap<Id, InstalledRevision>,
     commit_hlc: Option<Hlc>,
     commit_ops: Option<Vec<CommitOp>>,
+    installed_output_durable: bool,
+    compensation_output_durable: bool,
     durable_decision: Option<TxnState>,
     last_activity: i64,
     history: CommitHistory,
@@ -589,6 +591,8 @@ impl DataManager {
                 installed: BTreeMap::new(),
                 commit_hlc: None,
                 commit_ops: None,
+                installed_output_durable: false,
+                compensation_output_durable: false,
                 durable_decision: None,
                 last_activity: get_time(),
                 history: BTreeMap::new(),
@@ -1162,15 +1166,17 @@ impl DataManager {
             TxnState::Prepared => {}
         };
 
-        let mut undo_available = self.undo_log().is_some();
+        let undo_available = self.undo_log().is_some();
         #[cfg(test)]
-        if self
-            .fail_next_undo_availability
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        let undo_available = {
+            let failure_injected = self
+                .fail_next_undo_availability
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            undo_available && !failure_injected
+        };
+        if self.chunks().durable_storage_configured()
+            && (!undo_available || !self.chunks().wal_storage_configured())
         {
-            undo_available = false;
-        }
-        if self.chunks().durable_storage_configured() && !undo_available {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
 
@@ -1440,6 +1446,17 @@ impl DataManager {
         if !self.installed_revisions_agree(&txn) {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
+        if let Err(error) = self
+            .chunks()
+            .force_sync_installed_revisions(txn.installed.values())
+        {
+            error!(
+                "Failed to sync exact installed output before participant commit success for transaction {:?}: {:?}",
+                tid, error
+            );
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
+        }
+        txn.installed_output_durable = true;
 
         txn.state = TxnState::Committed;
 
@@ -1929,6 +1946,40 @@ mod tests {
                 raft_storage: None,
                 index_enabled: false,
                 services: vec![NebService::Cell, NebService::Transaction],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn start_backup_without_wal_test_server(
+        address: &str,
+        group: &str,
+        temp_dir: &TempDir,
+    ) -> Arc<crate::server::NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: SEGMENT_SIZE,
+                db_size: SEGMENT_SIZE,
+                history_retention_ms: 300_000,
+                tiered_config: None,
+                backup_storage: Some(
+                    temp_dir
+                        .path()
+                        .join("backup")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                wal_storage: None,
+                undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().into_owned()),
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![NebService::Cell],
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
@@ -4699,22 +4750,14 @@ mod tests {
             .locate_segment(installed_location)
             .unwrap();
         let syncs_before_end = installed_segment.force_wal_sync_count_for_test();
-
-        installed_segment.fail_next_force_wal_sync_for_test();
-        assert_eq!(
-            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
-                .await
-                .payload,
-            EndResult::CheckFailed(CheckError::CannotEnd)
-        );
         assert!(
-            runtime
-                .undo_log()
+            manager
+                .txns
+                .get(&tid)
                 .unwrap()
-                .recover()
-                .unwrap()
-                .contains_key(&tid),
-            "output sync failure must happen before the commit marker"
+                .lock()
+                .installed_output_durable,
+            "participant commit success must already prove exact output durability"
         );
 
         runtime
@@ -4729,20 +4772,34 @@ mod tests {
         );
         assert_eq!(
             installed_segment.force_wal_sync_count_for_test(),
-            syncs_before_end + 2,
-            "exact installed output must be synced before attempting the commit marker"
+            syncs_before_end,
+            "end must reuse the participant commit durability proof instead of double-fsyncing"
         );
         let txn_lock = manager
             .txns
             .get(&tid)
             .expect("marker failure must preserve transaction state");
-        assert_eq!(
-            txn_lock.lock().installed[&cell_id].node.load().0,
-            RevisionState::PendingPresent
-        );
+        {
+            let txn = txn_lock.lock();
+            assert_eq!(txn.state, TxnState::Committed);
+            assert_eq!(txn.durable_decision, None);
+            assert_eq!(
+                txn.installed[&cell_id].node.load().0,
+                RevisionState::PendingPresent
+            );
+        }
         assert_eq!(
             manager.cell_meta_mutex(&cell_id).lock().owner,
             Some(owner.clone())
+        );
+        assert!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .contains_key(&tid),
+            "participant marker failure must retain undo until end succeeds"
         );
 
         assert_eq!(
@@ -4751,6 +4808,177 @@ mod tests {
                 .payload,
             EndResult::Success
         );
+        assert_eq!(
+            installed_segment.force_wal_sync_count_for_test(),
+            syncs_before_end,
+            "retry must continue reusing the participant commit durability proof"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_retry_after_durable_commit_completion_is_idempotently_successful() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5425";
+        let group = "txn_data_site_end_response_loss_retry";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99045);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                55,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    9,
+                    "response-was-lost-after-durable-end",
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success,
+            "a retry must use durable participant outcome evidence after live state is gone"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn participant_commit_syncs_exact_output_before_success_without_emitting_decision() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5426";
+        let group = "txn_data_site_commit_output_durability";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99046);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                56,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        let output_segment = runtime.chunks().list[0]
+            .locate_segment(runtime.chunks().address_of(&cell_id))
+            .unwrap();
+        output_segment.fail_next_force_wal_sync_for_test();
+        let update = CommitOp::Update(counter_cell(
+            schema.id,
+            cell_id,
+            9,
+            "commit-output-must-be-durable",
+        ));
+        let commit_hlc = manager.hlc.now();
+
+        assert_eq!(
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![update.clone()],)
+                .await
+                .payload,
+            DMCommitResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let txn_lock = manager
+            .txns
+            .get(&tid)
+            .expect("output sync failure must retain participant state");
+        assert_eq!(
+            txn_lock.lock().installed[&cell_id].node.load().0,
+            RevisionState::PendingPresent
+        );
+        {
+            let txn = txn_lock.lock();
+            assert_eq!(txn.state, TxnState::Prepared);
+            assert!(!txn.installed_output_durable);
+            assert_eq!(txn.durable_decision, None);
+        }
+        let owner = manager.cells.get(&cell_id).unwrap();
+        assert_eq!(
+            owner.lock().owner,
+            Some(TxnPriority::new(tid, 56)),
+            "retryable sync contention must retain the participant owner"
+        );
+        assert!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .contains_key(&tid),
+            "participant commit durability is not a transaction decision"
+        );
+        assert_eq!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .participant_completion(&tid)
+                .unwrap(),
+            None,
+            "retryable sync contention must not emit a participant marker"
+        );
+
+        assert_eq!(
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![update])
+                .await
+                .payload,
+            DMCommitResult::Success
+        );
+        assert!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .contains_key(&tid),
+            "successful output preparation must not emit a completion marker"
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+
         server.shutdown().await;
     }
 
@@ -4812,6 +5040,75 @@ mod tests {
                 .payload,
             EndResult::Success
         );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backup_only_direct_participant_rejects_mutation_without_wal_before_any_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5424";
+        let group = "txn_data_site_backup_without_wal";
+        let server = start_backup_without_wal_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new(runtime.clone(), server.hlc.clone());
+        let cell_id = Id::new(0, 99044);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                54,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    9,
+                    "backup-only-must-not-install",
+                ))],
+            )
+            .await,
+            DMCommitResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let retained = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(retained.header.revision_ts, initial_revision);
+        assert_eq!(*retained.data["score"].u64().unwrap(), 1);
+        assert!(
+            !runtime
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .contains_key(&tid),
+            "rejection must precede undo output and every durable decision"
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        assert!(!runtime
+            .undo_log()
+            .unwrap()
+            .recover()
+            .unwrap()
+            .contains_key(&tid));
+
         server.shutdown().await;
     }
 
@@ -4897,6 +5194,17 @@ mod tests {
             compensation_ts,
             "retry must sync the retained exact compensation instead of installing another"
         );
+        let compensation_location = manager.txns.get(&tid).unwrap().lock().history[&cell_id]
+            .compensation
+            .as_ref()
+            .unwrap()
+            .node
+            .load()
+            .1;
+        let compensation_segment = runtime.chunks().list[0]
+            .locate_segment(compensation_location)
+            .unwrap();
+        let syncs_after_abort = compensation_segment.force_wal_sync_count_for_test();
         runtime
             .undo_log()
             .unwrap()
@@ -4906,6 +5214,11 @@ mod tests {
                 .await
                 .payload,
             EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        assert_eq!(
+            compensation_segment.force_wal_sync_count_for_test(),
+            syncs_after_abort,
+            "end must reuse the participant abort durability proof instead of double-fsyncing"
         );
         assert!(
             manager.txns.get(&tid).is_some(),
@@ -4930,6 +5243,11 @@ mod tests {
                 .await
                 .payload,
             EndResult::Success
+        );
+        assert_eq!(
+            compensation_segment.force_wal_sync_count_for_test(),
+            syncs_after_abort,
+            "end retry must continue reusing the participant abort durability proof"
         );
         assert!(
             !runtime
@@ -5351,6 +5669,7 @@ impl Service for DataManager {
         if txn.history.is_empty() {
             let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
             txn.last_activity = get_time();
+            txn.compensation_output_durable = true;
             txn.state = TxnState::Aborted;
             drop(txn);
             drop(guards_to_drop);
@@ -5410,6 +5729,7 @@ impl Service for DataManager {
         // node without duplicating completed compensation.
         let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
         txn.last_activity = get_time();
+        txn.compensation_output_durable = true;
         txn.state = TxnState::Aborted;
 
         drop(cell_guards);
@@ -5426,7 +5746,21 @@ impl Service for DataManager {
 
         let result = 'end: {
             let Some(txn_lock) = self.find_transaction(&tid) else {
-                return self.response_with(EndResult::CheckFailed(CheckError::NotExisted));
+                let completion = match self.undo_log() {
+                    Some(undo_log) => undo_log.participant_completion(&tid),
+                    None => Ok(None),
+                };
+                return self.response_with(match completion {
+                    Ok(Some(TxnState::Committed | TxnState::Aborted)) => EndResult::Success,
+                    Ok(_) => EndResult::CheckFailed(CheckError::NotExisted),
+                    Err(error) => {
+                        error!(
+                            "Failed to read durable participant completion for transaction {:?}: {:?}",
+                            tid, error
+                        );
+                        EndResult::CheckFailed(CheckError::CannotEnd)
+                    }
+                });
             };
             let mut txn = txn_lock.lock();
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
@@ -5460,6 +5794,9 @@ impl Service for DataManager {
             }
 
             if txn.state == TxnState::Committed {
+                if !txn.installed.is_empty() && !txn.installed_output_durable {
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                }
                 if !self.installed_revisions_agree(&txn) {
                     break 'end EndResult::CheckFailed(CheckError::CannotEnd);
                 }
@@ -5474,34 +5811,16 @@ impl Service for DataManager {
                 }) {
                     break 'end EndResult::CheckFailed(CheckError::CannotEnd);
                 }
-                if let Err(error) = self
-                    .chunks()
-                    .force_sync_installed_revisions(txn.installed.values())
-                {
-                    error!(
-                        "Failed to sync exact installed output for transaction {:?}: {:?}",
-                        tid, error
-                    );
-                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
-                }
             }
             if txn.state == TxnState::Aborted {
+                if !txn.history.is_empty() && !txn.compensation_output_durable {
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                }
                 if txn
                     .history
                     .values()
                     .any(|history| history.compensation.is_none())
                 {
-                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
-                }
-                if let Err(error) = self.chunks().force_sync_installed_revisions(
-                    txn.history
-                        .values()
-                        .filter_map(|history| history.compensation.as_ref()),
-                ) {
-                    error!(
-                        "Failed to sync exact compensation output for transaction {:?}: {:?}",
-                        tid, error
-                    );
                     break 'end EndResult::CheckFailed(CheckError::CannotEnd);
                 }
             }

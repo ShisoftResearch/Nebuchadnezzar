@@ -319,6 +319,17 @@ impl CombinedCleaner {
                     if used_size < SEGMENT_SIZE {
                         new_seg.shrink(used_size);
                     }
+                    if new_seg.wal_storage_configured() {
+                        new_seg
+                            .write_wal(new_seg.addr, used_size as u32, true)
+                            .and_then(|()| new_seg.force_wal_sync_required())
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "Combine failed to persist destination segment {} WAL before source reclaim: {}",
+                                    new_seg.id, error
+                                )
+                            });
+                    }
                     cleaned_total_live_space.fetch_add(new_seg.used_spaces() as usize, Relaxed);
                     return (new_seg, relocations);
                 })

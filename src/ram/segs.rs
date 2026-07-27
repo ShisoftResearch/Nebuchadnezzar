@@ -14,7 +14,7 @@ use lightning::list::LinkedRingBufferList;
 use lightning::spin_hint::Backoff;
 use parking_lot;
 use std::fs;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::path::Path;
 use std::ptr;
@@ -768,6 +768,18 @@ impl Segment {
     /// Force a WAL sync, ensuring all buffered data is persisted to disk
     /// This is useful for transaction commits and other critical durability points
     pub fn force_wal_sync(&self) -> io::Result<()> {
+        self.force_wal_sync_inner(false)
+    }
+
+    /// Force a WAL sync and reject segments without a real WAL file.
+    ///
+    /// Durable transaction and relocation paths use this strict variant after
+    /// establishing that the exact output bytes were written to this segment.
+    pub fn force_wal_sync_required(&self) -> io::Result<()> {
+        self.force_wal_sync_inner(true)
+    }
+
+    fn force_wal_sync_inner(&self, require_wal: bool) -> io::Result<()> {
         #[cfg(test)]
         {
             self.force_wal_sync_count.fetch_add(1, Ordering::SeqCst);
@@ -788,8 +800,42 @@ impl Segment {
             self.last_sync_time.store(current_time, Ordering::Relaxed);
 
             trace!("Forced WAL sync for segment {}", self.id);
+        } else if require_wal {
+            let wal_path = state
+                .manager
+                .wal_path(self.chunk_id, self.id, self.seq_id)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("segment {} has no configured WAL to sync", self.id),
+                    )
+                })?;
+            let wal = OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .map_err(|error| {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("segment {} WAL file {} does not exist", self.id, wal_path),
+                        )
+                    } else {
+                        error
+                    }
+                })?;
+            wal.sync_all()?;
+            self.bytes_since_sync.store(0, Ordering::Relaxed);
+            self.last_sync_time.store(get_time(), Ordering::Relaxed);
+            trace!(
+                "Forced WAL sync for segment {} through its closed-handle path",
+                self.id
+            );
         }
         Ok(())
+    }
+
+    pub fn wal_storage_configured(&self) -> bool {
+        self.file_state.lock().manager.wal_storage().is_some()
     }
 
     #[cfg(test)]
@@ -1547,6 +1593,43 @@ mod tests {
         assert!(SegmentReferenceGuard::try_new(segment.clone()).is_none());
         drop(exclusive);
         assert!(SegmentReferenceGuard::try_new(segment).is_some());
+    }
+
+    #[test]
+    fn required_wal_sync_rejects_a_segment_without_a_real_wal() {
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let file_manager = Arc::new(SegmentFileManager::new(None, None));
+        let segment = allocator
+            .alloc_seg(&file_manager)
+            .expect("failed to allocate segment");
+
+        let error = segment
+            .force_wal_sync_required()
+            .expect_err("strict durability cannot succeed without a WAL file");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn required_wal_sync_accepts_an_existing_wal_after_its_live_handle_was_closed() {
+        let wal_dir = tempfile::TempDir::new().unwrap();
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let file_manager = Arc::new(SegmentFileManager::new(
+            None,
+            Some(wal_dir.path().to_string_lossy().into_owned()),
+        ));
+        let segment = allocator
+            .alloc_seg(&file_manager)
+            .expect("failed to allocate segment");
+        segment.write_wal(segment.addr, 8, true).unwrap();
+        let wal_path = file_manager
+            .wal_path(segment.chunk_id, segment.id, segment.seq_id)
+            .unwrap();
+        drop(segment.file_state.lock().wal.take());
+        assert!(Path::new(&wal_path).exists());
+
+        segment
+            .force_wal_sync_required()
+            .expect("strict sync must accept and sync the exact existing WAL file");
     }
 
     #[test]

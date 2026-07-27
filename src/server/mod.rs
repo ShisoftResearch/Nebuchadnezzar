@@ -1125,6 +1125,81 @@ where
     Ok((undo, recovery_floor))
 }
 
+async fn resolve_incomplete_transaction_decisions(
+    undo_log: &Arc<transactions::undo_log::UndoLogger>,
+    txn_index: HashMap<transactions::TxnId, Vec<transactions::undo_log::UndoLogEntry>>,
+    local_server_id: u64,
+    group_name: &str,
+    database_name: &str,
+    conshasing: &Arc<ConsistentHashing>,
+    member_pool: &Arc<ClientPool>,
+) -> Result<HashMap<transactions::TxnId, Vec<transactions::undo_log::UndoLogEntry>>, ServerError> {
+    if txn_index.is_empty() {
+        return Ok(txn_index);
+    }
+
+    let mut resolutions = HashMap::with_capacity(txn_index.len());
+    for tid in txn_index.keys() {
+        let local_decision = undo_log
+            .coordinator_decision(tid)
+            .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+        let resolution = if let Some(decision) = local_decision {
+            decision
+        } else if tid.node == local_server_id {
+            transactions::TxnResolution::Unknown
+        } else {
+            let coordinator_id = tid.node;
+            let conshasing = conshasing.clone();
+            match member_pool
+                .get_by_id(coordinator_id, move |_| {
+                    conshasing.to_server_name(coordinator_id)
+                })
+                .await
+            {
+                Ok(client) => {
+                    let coordinator =
+                        transactions::manager::AsyncServiceClient::new_with_service_id(
+                            transactions::manager::generate_scoped_service_id(
+                                group_name,
+                                database_name,
+                            ),
+                            &client,
+                        );
+                    match coordinator.resolve(*tid).await {
+                        Ok(Ok(resolution)) => resolution,
+                        Ok(Err(error)) => {
+                            warn!(
+                                "Coordinator {} could not resolve recovered transaction {:?}: {:?}",
+                                coordinator_id, tid, error
+                            );
+                            transactions::TxnResolution::Unknown
+                        }
+                        Err(error) => {
+                            warn!(
+                                "Could not query coordinator {} for recovered transaction {:?}: {:?}",
+                                coordinator_id, tid, error
+                            );
+                            transactions::TxnResolution::Unknown
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        "Could not connect to coordinator {} for recovered transaction {:?}: {:?}",
+                        coordinator_id, tid, error
+                    );
+                    transactions::TxnResolution::Unknown
+                }
+            }
+        };
+        resolutions.insert(*tid, resolution);
+    }
+
+    undo_log
+        .resolve_recovered_transactions(txn_index, &resolutions)
+        .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerOptions {
     pub chunk_size: usize,
@@ -1538,13 +1613,17 @@ impl NebServer {
         let durable_storage = effective_opts.enable_recovery
             || effective_opts.wal_storage.is_some()
             || effective_opts.backup_storage.is_some();
-        if durable_storage
-            && effective_opts.services.contains(&Service::Transaction)
-            && effective_opts.undo_log_storage.is_none()
-        {
-            return Err(ServerError::CannotInitializeDatabaseServices(
-                "durable transactional storage requires undo log storage".to_string(),
-            ));
+        if durable_storage && effective_opts.services.contains(&Service::Transaction) {
+            if effective_opts.wal_storage.is_none() {
+                return Err(ServerError::CannotInitializeDatabaseServices(
+                    "durable transactional storage requires WAL output storage".to_string(),
+                ));
+            }
+            if effective_opts.undo_log_storage.is_none() {
+                return Err(ServerError::CannotInitializeDatabaseServices(
+                    "durable transactional storage requires undo log storage".to_string(),
+                ));
+            }
         }
 
         let schema_plane_client =
@@ -1652,6 +1731,31 @@ impl NebServer {
             )
         };
 
+        let recovered_undo = if effective_opts.enable_recovery {
+            if let Some(undo_log_path) = effective_opts.undo_log_storage.as_ref() {
+                let log = transactions::undo_log::UndoLogger::new(undo_log_path.clone())
+                    .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+                let txn_index = log
+                    .recover()
+                    .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
+                let txn_index = resolve_incomplete_transaction_decisions(
+                    &log,
+                    txn_index,
+                    rpc_server.server_id,
+                    group_name,
+                    database_name,
+                    conshasing,
+                    member_pool,
+                )
+                .await?;
+                Some((log, txn_index))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let undo_log = if effective_opts.enable_recovery {
             initialize_recovered_storage(
                 &chunks,
@@ -1663,14 +1767,9 @@ impl NebServer {
                     }
                 },
                 || {
-                    let Some(undo_log_path) = effective_opts.undo_log_storage.as_ref() else {
+                    let Some((log, txn_index)) = recovered_undo else {
                         return Ok(None);
                     };
-                    let log = transactions::undo_log::UndoLogger::new(undo_log_path.clone())
-                        .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
-                    let txn_index = log
-                        .recover()
-                        .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
                     log.rollback_incomplete_transactions(txn_index, &chunks)
                         .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
                     Ok(Some(log))

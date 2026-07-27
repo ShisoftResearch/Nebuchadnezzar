@@ -39,6 +39,8 @@ pub type CellWriteGuard<'a> = WordMutexGuard<'a>;
 type SnapshotReadLeaseHook = Arc<dyn Fn(Id, usize, bool) + Send + Sync>;
 #[cfg(test)]
 type CellGuardRetryHook = Arc<dyn Fn(u64) + Send + Sync>;
+#[cfg(test)]
+type ExactSyncLeaseHook = Arc<dyn Fn(Id, usize) + Send + Sync>;
 
 // Global chunk allocation state for unified address space
 static GLOBAL_CHUNK_BASE: AtomicUsize = AtomicUsize::new(0);
@@ -192,6 +194,8 @@ pub struct Chunk {
     snapshot_read_lease_hook: Mutex<Option<SnapshotReadLeaseHook>>,
     #[cfg(test)]
     cell_guard_retry_hook: Mutex<Option<CellGuardRetryHook>>,
+    #[cfg(test)]
+    exact_sync_lease_hook: Mutex<Option<ExactSyncLeaseHook>>,
 }
 
 impl Chunk {
@@ -374,6 +378,8 @@ impl Chunk {
             snapshot_read_lease_hook: Mutex::new(None),
             #[cfg(test)]
             cell_guard_retry_hook: Mutex::new(None),
+            #[cfg(test)]
+            exact_sync_lease_hook: Mutex::new(None),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -570,6 +576,11 @@ impl Chunk {
     #[cfg(test)]
     pub(crate) fn set_cell_guard_retry_hook_for_test(&self, hook: Option<CellGuardRetryHook>) {
         *self.cell_guard_retry_hook.lock() = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_exact_sync_lease_hook_for_test(&self, hook: Option<ExactSyncLeaseHook>) {
+        *self.exact_sync_lease_hook.lock() = hook;
     }
 
     pub(crate) fn reset_write_heads_after_recovery(&self) -> io::Result<()> {
@@ -2237,6 +2248,10 @@ impl Chunks {
             .any(|chunk| chunk.wal_storage.is_some() || chunk.backup_storage.is_some())
     }
 
+    pub(crate) fn wal_storage_configured(&self) -> bool {
+        !self.list.is_empty() && self.list.iter().all(|chunk| chunk.wal_storage.is_some())
+    }
+
     pub fn establish_recovery_floor(&self) -> Result<u64, WriteError> {
         let recovery_floor = self
             .revision_clock
@@ -2254,7 +2269,12 @@ impl Chunks {
         info!("Syncing WAL for all chunks...");
         for chunk in &self.list {
             for segment in chunk.segs.iter_values() {
-                segment.force_wal_sync();
+                if let Err(error) = segment.force_wal_sync() {
+                    error!(
+                        "Failed to sync WAL for chunk {} segment {}: {}",
+                        chunk.id, segment.seq_id, error
+                    );
+                }
             }
         }
         info!("All WAL data synced to disk.");
@@ -2529,7 +2549,8 @@ impl Chunks {
         &self,
         installed_revisions: impl IntoIterator<Item = &'a InstalledRevision>,
     ) -> io::Result<()> {
-        let mut segments = HashSet::new();
+        let mut segment_keys = HashSet::new();
+        let mut guarded_segments = Vec::new();
         for installed in installed_revisions {
             let chunk = self.locate_chunk_by_partition(installed.id.higher);
             let current = chunk.history.current(&installed.id).ok_or_else(|| {
@@ -2550,7 +2571,50 @@ impl Chunks {
                     ),
                 ));
             }
-            let (state, location) = installed.node.load();
+            let expected = installed.node.load();
+            let location = expected.1;
+            let segment = chunk.locate_segment(location).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "installed revision {:?} moved before its segment could be leased",
+                        installed.id
+                    ),
+                )
+            })?;
+            let lease = SegmentReferenceGuard::try_new(segment.clone()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "installed revision {:?} segment is being relocated",
+                        installed.id
+                    ),
+                )
+            })?;
+            let registered = chunk.segs.get(&(segment.id as usize)).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "installed revision {:?} segment was reclaimed while acquiring its lease",
+                        installed.id
+                    ),
+                )
+            })?;
+            if !std::ptr::eq::<Segment>(&*registered, &*segment)
+                || installed.node.load() != expected
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "installed revision {:?} moved while acquiring its segment lease",
+                        installed.id
+                    ),
+                ));
+            }
+            #[cfg(test)]
+            if let Some(hook) = chunk.exact_sync_lease_hook.lock().clone() {
+                hook(installed.id, location);
+            }
             if chunk
                 .history
                 .location(&installed.id, installed.node.revision_ts)
@@ -2564,7 +2628,7 @@ impl Chunks {
                     ),
                 ));
             }
-            match state {
+            match expected.0 {
                 RevisionState::PendingPresent | RevisionState::CommittedPresent => {
                     let header = cell_header_from_entry_content_addr(Entry::content_pos(location));
                     if Id::from_header(&header) != installed.id
@@ -2600,32 +2664,18 @@ impl Chunks {
                     ));
                 }
             }
-            let segment = chunk.locate_segment(location).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "installed revision {:?} has no containing segment",
-                        installed.id
-                    ),
-                )
-            })?;
-            segments.insert((chunk.id, segment.id));
+            if segment_keys.insert((chunk.id, segment.id)) {
+                guarded_segments.push((segment, lease));
+            }
         }
 
-        for (chunk_id, segment_id) in segments {
-            let chunk = self.list.get(chunk_id).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "installed output chunk disappeared",
-                )
-            })?;
-            let segment = chunk.segs.get(&(segment_id as usize)).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "installed output segment disappeared",
-                )
-            })?;
-            segment.force_wal_sync()?;
+        let require_wal = self.durable_storage_configured();
+        for (segment, _lease) in guarded_segments {
+            if require_wal {
+                segment.force_wal_sync_required()?;
+            } else {
+                segment.force_wal_sync()?;
+            }
         }
         Ok(())
     }
@@ -2991,6 +3041,7 @@ mod tests {
     use bifrost_hasher::hash_str;
     use dovahkiin::types::Type;
     use env_logger;
+    use tempfile::TempDir;
 
     const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -3022,6 +3073,40 @@ mod tests {
             header: CellHeader::new(schema_id, id),
             data: data_map_value!(id: id.lower as i32, data: data),
         }
+    }
+
+    #[test]
+    fn backup_only_chunks_reject_exact_transaction_output_sync_without_wal() {
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new("backup_only_exact_sync", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let backup = TempDir::new().unwrap();
+        let chunks = Chunks::new(
+            1,
+            TEST_CHUNK_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup.path().to_string_lossy().into_owned()),
+            None,
+            None,
+        );
+        let id = Id::new(1, 39);
+        let mut cell = payload_cell(schema.id, &id, 16);
+
+        set_transaction_context(true);
+        let installed = chunks
+            .write_cell_at_revision(&mut cell, RevisionWrite::pending(7))
+            .unwrap();
+        set_transaction_context(false);
+
+        let error = chunks
+            .force_sync_installed_revisions([&installed])
+            .expect_err("backup storage without WAL cannot prove exact output durability");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     fn replace_stored_schema_id(chunks: &Chunks, id: &Id, schema_id: u32) {

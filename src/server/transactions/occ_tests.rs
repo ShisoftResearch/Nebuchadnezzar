@@ -8,6 +8,7 @@ use crate::server::{DatabaseRuntime, NebServer, ServerOptions, Service};
 use bifrost_hasher::hash_str;
 use dovahkiin::types::{Map, Value};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::time::{timeout, Duration};
@@ -70,6 +71,34 @@ async fn start_occ_test_server_with_options(
     .unwrap()
 }
 
+async fn start_durable_occ_test_server(
+    address: &str,
+    group: &str,
+    storage: &TempDir,
+) -> Arc<NebServer> {
+    NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: crate::ram::segs::SEGMENT_SIZE,
+            db_size: crate::ram::segs::SEGMENT_SIZE,
+            history_retention_ms: 300_000,
+            tiered_config: None,
+            backup_storage: Some(storage.path().join("backup").to_string_lossy().into_owned()),
+            wal_storage: Some(storage.path().join("wal").to_string_lossy().into_owned()),
+            undo_log_storage: Some(storage.path().join("undo").to_string_lossy().into_owned()),
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &address.to_string(),
+        &group.to_string(),
+        async |_| {},
+    )
+    .await
+    .unwrap()
+}
+
 async fn start_occ_test_cluster(addresses: &[&str], group: &str) -> Vec<Arc<NebServer>> {
     let opts = ServerOptions {
         chunk_size: crate::ram::segs::SEGMENT_SIZE,
@@ -91,6 +120,45 @@ async fn start_occ_test_cluster(addresses: &[&str], group: &str) -> Vec<Arc<NebS
         .collect();
     let mut servers = Vec::with_capacity(addresses.len());
     for address in addresses {
+        servers.push(
+            NebServer::new_cluster_from_opts(&opts, address, &meta_servers, group, async |_| {})
+                .await
+                .unwrap(),
+        );
+    }
+    let _ = ids_on_stably_routed_distinct_servers(&servers).await;
+    servers
+}
+
+fn durable_occ_cluster_options(storage: &Path, enable_recovery: bool) -> ServerOptions {
+    ServerOptions {
+        chunk_size: crate::ram::segs::SEGMENT_SIZE,
+        db_size: crate::ram::segs::SEGMENT_SIZE,
+        history_retention_ms: 300_000,
+        tiered_config: None,
+        backup_storage: Some(storage.join("backup").to_string_lossy().into_owned()),
+        wal_storage: Some(storage.join("wal").to_string_lossy().into_owned()),
+        undo_log_storage: Some(storage.join("undo").to_string_lossy().into_owned()),
+        raft_storage: Some(storage.join("raft").to_string_lossy().into_owned()),
+        index_enabled: false,
+        services: vec![Service::Cell, Service::Transaction],
+        enable_recovery,
+        disable_storage_locks: true,
+    }
+}
+
+async fn start_durable_occ_test_cluster(
+    addresses: &[&str],
+    group: &str,
+    storage: &Path,
+) -> Vec<Arc<NebServer>> {
+    let meta_servers = addresses
+        .iter()
+        .map(|address| address.to_string())
+        .collect();
+    let mut servers = Vec::with_capacity(addresses.len());
+    for (index, address) in addresses.iter().enumerate() {
+        let opts = durable_occ_cluster_options(&storage.join(format!("server-{index}")), false);
         servers.push(
             NebServer::new_cluster_from_opts(&opts, address, &meta_servers, group, async |_| {})
                 .await
@@ -1798,6 +1866,501 @@ async fn abort_queued_behind_commit_reports_already_cleanup() {
     assert!(persisted.header.revision_ts > first.header.revision_ts);
 
     server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_commit_end_failure_retains_coordinator_state_until_retry_completes() {
+    let _ = env_logger::try_init();
+    let addresses = ["127.0.0.1:5421", "127.0.0.1:5422"];
+    let group = "txn_occ_partial_commit_end_retry";
+    let servers = start_occ_test_cluster(&addresses, group).await;
+    let schema = install_occ_schema_on_servers(&servers);
+    let ((success_id, success_server_id), (fail_id, fail_server_id)) =
+        ids_on_distinct_servers(&servers[0]);
+    let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
+        .iter()
+        .map(|server| (server.server_id, server.clone()))
+        .collect();
+
+    let mut success_seed = counter_cell(schema.id, success_id, 1, "partial-commit-success-seed");
+    let success_seed_header = servers_by_id[&success_server_id]
+        .current_database()
+        .chunks()
+        .write_cell(&mut success_seed)
+        .unwrap();
+    let mut fail_seed = counter_cell(schema.id, fail_id, 2, "partial-commit-fail-seed");
+    let fail_seed_header = servers_by_id[&fail_server_id]
+        .current_database()
+        .chunks()
+        .write_cell(&mut fail_seed)
+        .unwrap();
+    observe_distributed_seed_revisions(
+        &servers[0],
+        [
+            success_seed_header.revision_ts,
+            fail_seed_header.revision_ts,
+        ],
+    );
+
+    let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
+    let manager = servers[0].current_database().txn_manager().unwrap().clone();
+    let tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, success_id, 11, "partial-commit-success-update"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, fail_id, 12, "partial-commit-fail-update"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+
+    let failure = transactions::data_site::install_end_promotion_failure(tid, fail_id);
+    assert_eq!(
+        txn.commit(tid).await.unwrap().unwrap(),
+        EndResult::CheckFailed(CheckError::CannotEnd)
+    );
+    assert_eq!(
+        manager.transaction_count(),
+        1,
+        "a chosen commit with one unresolved participant must remain retryable"
+    );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            success_server_id,
+            group,
+            group,
+            &success_id,
+        ),
+        None,
+        "the participant that durably completed may release its owner"
+    );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(fail_server_id, group, group, &fail_id,),
+        Some(TxnPriority::new(tid, servers[0].server_id)),
+        "the unresolved participant must retain its owner"
+    );
+
+    drop(failure);
+    assert_eq!(txn.commit(tid).await.unwrap().unwrap(), EndResult::Success);
+    assert_eq!(manager.transaction_count(), 0);
+    assert_eq!(
+        score_of(
+            &servers_by_id[&success_server_id]
+                .current_database()
+                .chunks()
+                .read_cell(&success_id)
+                .unwrap()
+                .to_owned()
+        ),
+        11
+    );
+    assert_eq!(
+        score_of(
+            &servers_by_id[&fail_server_id]
+                .current_database()
+                .chunks()
+                .read_cell(&fail_id)
+                .unwrap()
+                .to_owned()
+        ),
+        12
+    );
+
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn coordinator_decision_marker_failure_keeps_commit_irrevocable_and_retryable() {
+    let _ = env_logger::try_init();
+    let storage = TempDir::new().unwrap();
+    let address = "127.0.0.1:5430";
+    let group = "txn_occ_coordinator_decision_retry";
+    let server = start_durable_occ_test_server(address, group, &storage).await;
+    let runtime = server.current_database();
+    let manager = runtime.txn_manager().unwrap().clone();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90_170);
+    let mut original = counter_cell(schema.id, cell_id, 1, "decision-retry-original");
+    runtime.chunks().write_cell(&mut original).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, cell_id, 2, "decision-retry-committed"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+
+    runtime
+        .undo_log()
+        .unwrap()
+        .fail_next_coordinator_commit_decision_for_test();
+    assert_eq!(
+        txn.commit(tid).await.unwrap().unwrap(),
+        EndResult::CheckFailed(CheckError::CannotEnd)
+    );
+    assert_eq!(
+        txn.resolve(tid).await.unwrap().unwrap(),
+        TxnResolution::InProgress,
+        "participants must not expose Commit until the global record is durable"
+    );
+    assert_eq!(
+        txn.abort(tid).await.unwrap().unwrap(),
+        AbortResult::CheckFailed(CheckError::AlreadyCommitted),
+        "an attempted coordinator commit record makes the choice irrevocable"
+    );
+    assert_eq!(
+        runtime
+            .undo_log()
+            .unwrap()
+            .coordinator_decision(&tid)
+            .unwrap(),
+        None,
+        "the injected pre-write failure leaves no durable record yet"
+    );
+
+    let end_failure = transactions::data_site::install_end_promotion_failure(tid, cell_id);
+    assert_eq!(
+        txn.commit(tid).await.unwrap().unwrap(),
+        EndResult::CheckFailed(CheckError::CannotEnd)
+    );
+    assert!(matches!(
+        runtime
+            .undo_log()
+            .unwrap()
+            .coordinator_decision(&tid)
+            .unwrap(),
+        Some(TxnResolution::Commit(_))
+    ));
+    assert!(matches!(
+        txn.resolve(tid).await.unwrap().unwrap(),
+        TxnResolution::Commit(_)
+    ));
+    manager.forget_transaction_for_test(&tid);
+    drop(end_failure);
+    assert_eq!(
+        txn.commit(tid).await.unwrap().unwrap(),
+        EndResult::Success,
+        "a caller retry after coordinator restart must replay unresolved participants from the durable decision"
+    );
+    assert_eq!(
+        score_of(&runtime.chunks().read_cell(&cell_id).unwrap().to_owned()),
+        2
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn coordinator_abort_marker_failure_defers_compensation_until_retry_is_durable() {
+    let _ = env_logger::try_init();
+    let storage = TempDir::new().unwrap();
+    let address = "127.0.0.1:5433";
+    let group = "txn_occ_coordinator_abort_decision_retry";
+    let server = start_durable_occ_test_server(address, group, &storage).await;
+    let runtime = server.current_database();
+    let manager = runtime.txn_manager().unwrap().clone();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90_171);
+    let mut original = counter_cell(schema.id, cell_id, 1, "abort-decision-original");
+    runtime.chunks().write_cell(&mut original).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, cell_id, 2, "abort-decision-pending"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+
+    runtime
+        .undo_log()
+        .unwrap()
+        .fail_next_coordinator_abort_decision_for_test();
+    assert_eq!(
+        txn.abort(tid).await.unwrap().unwrap(),
+        AbortResult::CheckFailed(CheckError::CannotEnd)
+    );
+    assert_eq!(
+        txn.resolve(tid).await.unwrap().unwrap(),
+        TxnResolution::InProgress,
+        "participants must not compensate until the global Abort record is durable"
+    );
+    assert_eq!(
+        txn.commit(tid).await.unwrap(),
+        Err(TMError::InvalidTransactionState(TxnState::Aborted)),
+        "the in-memory Abort choice is irrevocable even while its record retries"
+    );
+    assert_eq!(
+        runtime
+            .undo_log()
+            .unwrap()
+            .coordinator_decision(&tid)
+            .unwrap(),
+        None
+    );
+    assert!(
+        runtime
+            .undo_log()
+            .unwrap()
+            .recover()
+            .unwrap()
+            .contains_key(&tid),
+        "failed decision persistence must leave participant undo unresolved"
+    );
+
+    let abort_failure = transactions::data_site::install_abort_cannot_end_for_cell(tid, cell_id);
+    assert_eq!(
+        txn.abort(tid).await.unwrap().unwrap(),
+        AbortResult::CheckFailed(CheckError::CannotEnd)
+    );
+    assert_eq!(
+        runtime
+            .undo_log()
+            .unwrap()
+            .coordinator_decision(&tid)
+            .unwrap(),
+        Some(TxnResolution::Abort)
+    );
+    manager.forget_transaction_for_test(&tid);
+    drop(abort_failure);
+    assert_eq!(
+        txn.abort(tid).await.unwrap().unwrap(),
+        AbortResult::Success(None),
+        "a caller retry after coordinator restart must replay durable Abort participants"
+    );
+    assert_eq!(
+        txn.resolve(tid).await.unwrap().unwrap(),
+        TxnResolution::Abort
+    );
+    assert_eq!(
+        score_of(&runtime.chunks().read_cell(&cell_id).unwrap().to_owned()),
+        1
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_unended_participant_resolves_durable_commit_from_remote_coordinator() {
+    let _ = env_logger::try_init();
+    let storage = TempDir::new().unwrap();
+    let addresses = ["127.0.0.1:5431", "127.0.0.1:5432"];
+    let group = "txn_occ_remote_participant_restart_resolution";
+    let mut servers = start_durable_occ_test_cluster(&addresses, group, storage.path()).await;
+    let schema = install_occ_schema_on_servers(&servers);
+    let coordinator = servers[0].clone();
+    let coordinator_id = coordinator.server_id;
+    let ((first_id, first_server_id), (second_id, second_server_id)) =
+        ids_on_stably_routed_distinct_servers(&servers).await;
+    let ((local_id, local_server_id), (remote_id, remote_server_id)) =
+        if first_server_id == coordinator_id {
+            ((first_id, first_server_id), (second_id, second_server_id))
+        } else {
+            ((second_id, second_server_id), (first_id, first_server_id))
+        };
+    assert_eq!(local_server_id, coordinator_id);
+    assert_ne!(remote_server_id, coordinator_id);
+    let local_server = servers
+        .iter()
+        .find(|server| server.server_id == local_server_id)
+        .unwrap()
+        .clone();
+    let remote_index = servers
+        .iter()
+        .position(|server| server.server_id == remote_server_id)
+        .unwrap();
+    let remote_server = servers[remote_index].clone();
+
+    let mut local_seed = counter_cell(schema.id, local_id, 1, "restart-local-seed");
+    let local_header = local_server
+        .current_database()
+        .chunks()
+        .write_cell(&mut local_seed)
+        .unwrap();
+    let mut remote_seed = counter_cell(schema.id, remote_id, 2, "restart-remote-seed");
+    let remote_header = remote_server
+        .current_database()
+        .chunks()
+        .write_cell(&mut remote_seed)
+        .unwrap();
+    observe_distributed_seed_revisions(
+        &coordinator,
+        [local_header.revision_ts, remote_header.revision_ts],
+    );
+
+    let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, local_id, 11, "restart-local-commit"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, remote_id, 12, "restart-remote-commit"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+
+    remote_server
+        .current_database()
+        .undo_log()
+        .unwrap()
+        .fail_next_commit_marker_for_test();
+    assert_eq!(
+        txn.commit(tid).await.unwrap().unwrap(),
+        EndResult::CheckFailed(CheckError::CannotEnd)
+    );
+    assert!(matches!(
+        coordinator
+            .current_database()
+            .undo_log()
+            .unwrap()
+            .coordinator_decision(&tid)
+            .unwrap(),
+        Some(TxnResolution::Commit(_))
+    ));
+    assert!(
+        remote_server
+            .current_database()
+            .undo_log()
+            .unwrap()
+            .recover()
+            .unwrap()
+            .contains_key(&tid),
+        "the remote participant must still have unresolved undo before restart"
+    );
+
+    let remote_address_index = remote_index;
+    let stopped_remote = servers.remove(remote_index);
+    stopped_remote.shutdown().await;
+    drop(stopped_remote);
+    drop(remote_server);
+
+    let meta_servers = addresses
+        .iter()
+        .map(|address| address.to_string())
+        .collect::<Vec<_>>();
+    let mut restart_opts = durable_occ_cluster_options(
+        &storage
+            .path()
+            .join(format!("server-{remote_address_index}")),
+        true,
+    );
+    // The data/undo roots are the crash image under test. Rejoin the live
+    // metadata cluster with a fresh local Raft runtime so graceful shutdown of
+    // the old process cannot leave a stale root-membership snapshot.
+    restart_opts.raft_storage = Some(
+        storage
+            .path()
+            .join(format!("server-{remote_address_index}/raft-restart"))
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let restarted_remote = NebServer::new_cluster_from_opts(
+        &restart_opts,
+        addresses[remote_address_index],
+        &meta_servers,
+        group,
+        async |_| {},
+    )
+    .await
+    .expect("remote participant startup must resolve Commit from the live coordinator");
+    restarted_remote
+        .current_database()
+        .meta()
+        .schemas
+        .debug_only_new_schema(schema.clone());
+    assert!(
+        !restarted_remote
+            .current_database()
+            .undo_log()
+            .unwrap()
+            .recover()
+            .unwrap()
+            .contains_key(&tid),
+        "startup must durably complete the participant outcome before exposure"
+    );
+
+    assert_eq!(
+        txn.commit(tid).await.unwrap().unwrap(),
+        EndResult::Success,
+        "the coordinator retry must finish only the restarted unresolved participant"
+    );
+    assert_eq!(
+        coordinator
+            .current_database()
+            .txn_manager()
+            .unwrap()
+            .transaction_count(),
+        0
+    );
+    assert_eq!(
+        score_of(
+            &restarted_remote
+                .current_database()
+                .chunks()
+                .read_cell(&remote_id)
+                .unwrap()
+                .to_owned()
+        ),
+        12
+    );
+
+    restarted_remote.shutdown().await;
+    for server in servers {
+        server.shutdown().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

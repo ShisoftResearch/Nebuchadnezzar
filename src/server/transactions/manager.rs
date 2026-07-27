@@ -243,6 +243,9 @@ struct Transaction {
     affected_objects: AffectedObjs,
     state: TxnState,
     commit_dispatch_started: bool,
+    commit_hlc: Option<Hlc>,
+    coordinator_decision_durable: bool,
+    completed_participants: BTreeSet<u64>,
     last_activity: i64, // Unix timestamp in milliseconds for detecting stale transactions
 }
 
@@ -258,6 +261,7 @@ service! {
     rpc prepare(tid: TxnId) -> Result<TMPrepareResult, TMError>;
     rpc commit(tid: TxnId) -> Result<EndResult, TMError>;
     rpc abort(tid: TxnId) -> Result<AbortResult, TMError>;
+    rpc resolve(tid: TxnId) -> Result<TxnResolution, TMError>;
 }
 
 dispatch_rpc_service_functions!(TransactionManager);
@@ -328,6 +332,12 @@ impl TransactionManager {
     /// Returns the current number of living transactions tracked by this TransactionManager
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_transaction_for_test(&self, tid: &TxnId) {
+        let _ = self.transactions.remove(tid);
+        self.txn_ids.lock().remove(tid);
     }
 
     #[cfg(test)]
@@ -485,25 +495,89 @@ impl Service for TransactionManager {
     }
     fn commit(&self, tid: TxnId) -> BoxFuture<'_, Result<EndResult, TMError>> {
         async move {
-            let txn_lock = self.get_transaction(&tid)?;
+            let txn_lock = match self.get_transaction(&tid) {
+                Ok(txn_lock) => txn_lock,
+                Err(TMError::TransactionNotFound) => {
+                    return self
+                        .retry_durable_commit_after_coordinator_restart(&tid)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            };
             let mut txn = txn_lock.lock().await;
-            self.ensure_txn_state(&txn, TxnState::Prepared)?;
-            let affected_objs = &txn.affected_objects;
+            match txn.state {
+                TxnState::Prepared => {
+                    // The commit choice becomes irrevocable before the first
+                    // decision-record attempt. An I/O error can be
+                    // outcome-uncertain, so abort must never be allowed after
+                    // this transition.
+                    txn.state = TxnState::Committed;
+                }
+                TxnState::Committed => {}
+                state => return Err(TMError::InvalidTransactionState(state)),
+            }
+            txn.last_activity = get_time();
+            if !txn.coordinator_decision_durable {
+                if txn.affected_objects.is_empty() {
+                    txn.coordinator_decision_durable = true;
+                } else {
+                    let Some(commit_hlc) = txn.commit_hlc else {
+                        return Ok(EndResult::CheckFailed(CheckError::CannotEnd));
+                    };
+                    if self
+                        .deps
+                        .database_runtime
+                        .chunks()
+                        .durable_storage_configured()
+                        && self.deps.database_runtime.undo_log().is_none()
+                    {
+                        return Ok(EndResult::CheckFailed(CheckError::CannotEnd));
+                    }
+                    if let Some(undo_log) = self.deps.database_runtime.undo_log() {
+                        let participants: Vec<_> = txn.affected_objects.keys().copied().collect();
+                        if let Err(error) = undo_log.write_coordinator_commit_decision(
+                            &tid,
+                            commit_hlc,
+                            &participants,
+                        ) {
+                            error!(
+                                "Failed to persist coordinator commit decision for {:?}: {:?}",
+                                tid, error
+                            );
+                            return Ok(EndResult::CheckFailed(CheckError::CannotEnd));
+                        }
+                    }
+                    txn.coordinator_decision_durable = true;
+                }
+            }
+            let affected_objs: AffectedObjs = txn
+                .affected_objects
+                .iter()
+                .filter(|(server_id, _)| !txn.completed_participants.contains(server_id))
+                .map(|(server_id, objects)| (*server_id, objects.clone()))
+                .collect();
             let result = match {
                 #[cfg(feature = "occ_phase_profile")]
                 let _phase_guard =
                     super::phase_profile::guard(super::phase_profile::Phase::EndParticipantLookup);
-                self.data_sites_for_objs(affected_objs).await
+                self.data_sites_for_objs(&affected_objs).await
             } {
                 Ok(data_sites) => {
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard =
                         super::phase_profile::guard(super::phase_profile::Phase::EndCleanup);
-                    self.sites_end(&tid, affected_objs, &data_sites).await
+                    let (result, completed) =
+                        self.sites_end(&tid, &affected_objs, &data_sites).await;
+                    txn.completed_participants.extend(completed);
+                    result
                 }
                 Err(error) => Err(error),
             };
-            self.cleanup_transaction_guarded(&tid, &mut txn);
+            if matches!(result, Ok(EndResult::Success))
+                && txn.completed_participants.len() == txn.affected_objects.len()
+            {
+                self.cleanup_transaction_guarded(&tid, &mut txn);
+            }
             result
         }
         .boxed()
@@ -511,15 +585,20 @@ impl Service for TransactionManager {
     fn abort(&self, tid: TxnId) -> BoxFuture<'_, Result<AbortResult, TMError>> {
         debug!("TXN ABORT IN MGR {:?}", &tid);
         async move {
-            let txn_lock = self.get_transaction(&tid)?;
+            let txn_lock = match self.get_transaction(&tid) {
+                Ok(txn_lock) => txn_lock,
+                Err(TMError::TransactionNotFound) => {
+                    return self
+                        .retry_durable_abort_after_coordinator_restart(&tid)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            };
             #[cfg(test)]
             if let Some(state) = Self::take_abort_entry_delay(&tid) {
                 Self::await_abort_entry_delay(&state).await;
             }
             let mut txn = txn_lock.lock().await;
-            if txn.state == TxnState::Started && txn.commit_dispatch_started {
-                return Ok(AbortResult::CheckFailed(CheckError::AlreadyCommitted));
-            }
             match txn.state {
                 TxnState::Cleanup => {
                     return Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup));
@@ -535,6 +614,34 @@ impl Service for TransactionManager {
                 TxnState::Aborted => {}
             }
             txn.last_activity = get_time();
+            if !txn.coordinator_decision_durable {
+                if txn.affected_objects.is_empty() {
+                    txn.coordinator_decision_durable = true;
+                } else {
+                    if self
+                        .deps
+                        .database_runtime
+                        .chunks()
+                        .durable_storage_configured()
+                        && self.deps.database_runtime.undo_log().is_none()
+                    {
+                        return Ok(AbortResult::CheckFailed(CheckError::CannotEnd));
+                    }
+                    if let Some(undo_log) = self.deps.database_runtime.undo_log() {
+                        let participants: Vec<_> = txn.affected_objects.keys().copied().collect();
+                        if let Err(error) =
+                            undo_log.write_coordinator_abort_decision(&tid, &participants)
+                        {
+                            error!(
+                                "Failed to persist coordinator abort decision for {:?}: {:?}",
+                                tid, error
+                            );
+                            return Ok(AbortResult::CheckFailed(CheckError::CannotEnd));
+                        }
+                    }
+                    txn.coordinator_decision_durable = true;
+                }
+            }
             let changed_objs = &txn.affected_objects;
             let result = match {
                 #[cfg(feature = "occ_phase_profile")]
@@ -571,6 +678,9 @@ impl Service for TransactionManager {
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
                     commit_dispatch_started: false,
+                    commit_hlc: None,
+                    coordinator_decision_durable: false,
+                    completed_participants: BTreeSet::new(),
                     last_activity: now,
                 })),
             )
@@ -582,6 +692,38 @@ impl Service for TransactionManager {
             self.txn_ids.lock().insert(id.clone());
             future::ready(Ok(id)).boxed()
         }
+    }
+    fn resolve(&self, tid: TxnId) -> BoxFuture<'_, Result<TxnResolution, TMError>> {
+        async move {
+            if let Ok(txn_lock) = self.get_transaction(&tid) {
+                let txn = txn_lock.lock().await;
+                return Ok(match txn.state {
+                    TxnState::Committed if txn.coordinator_decision_durable => txn
+                        .commit_hlc
+                        .map(TxnResolution::Commit)
+                        .unwrap_or(TxnResolution::Unknown),
+                    TxnState::Committed => TxnResolution::InProgress,
+                    TxnState::Aborted if txn.coordinator_decision_durable => TxnResolution::Abort,
+                    TxnState::Aborted => TxnResolution::InProgress,
+                    TxnState::Started | TxnState::Prepared => TxnResolution::InProgress,
+                    TxnState::Cleanup => TxnResolution::Unknown,
+                });
+            }
+            match self.deps.database_runtime.undo_log() {
+                Some(undo_log) => undo_log
+                    .coordinator_decision(&tid)
+                    .map(|decision| decision.unwrap_or(TxnResolution::Unknown))
+                    .map_err(|error| {
+                        error!(
+                            "Failed to resolve durable coordinator decision for {:?}: {:?}",
+                            tid, error
+                        );
+                        TMError::Other
+                    }),
+                None => Ok(TxnResolution::Unknown),
+            }
+        }
+        .boxed()
     }
 
     fn write(
@@ -1604,35 +1746,124 @@ impl TransactionManager {
         tid: &TxnId,
         changed_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
-    ) -> Result<EndResult, TMError> {
+    ) -> (Result<EndResult, TMError>, BTreeSet<u64>) {
         let end_futures: FuturesUnordered<_> = changed_objs
             .iter()
-            .map(|(ref server_id, _)| {
-                let data_site = data_sites.get(*server_id).unwrap();
-                async move { data_site.end(self.get_clock(), tid.clone()).await }
+            .map(|(server_id, _)| {
+                let server_id = *server_id;
+                let data_site = data_sites.get(&server_id).unwrap();
+                async move {
+                    (
+                        server_id,
+                        data_site.end(self.get_clock(), tid.clone()).await,
+                    )
+                }
             })
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
-        for result in end_results {
+        let mut completed = BTreeSet::new();
+        let mut first_failure = None;
+        let mut first_error = None;
+        for (server_id, result) in end_results {
             match result {
                 Ok(result) => {
                     self.merge_clock(result.clock);
                     let payload = result.payload;
                     match payload {
-                        EndResult::Success => {}
-                        _ => {
-                            return Ok(payload);
+                        EndResult::Success => {
+                            completed.insert(server_id);
                         }
+                        _ if first_failure.is_none() => first_failure = Some(payload),
+                        _ => {}
                     }
                 }
                 Err(e) => {
                     debug!("Error on site end {:?}", e);
-                    return Err(TMError::RPCErrorFromCellServer);
+                    if first_error.is_none() {
+                        first_error = Some(TMError::RPCErrorFromCellServer);
+                    }
                 }
             }
         }
-        Ok(EndResult::Success)
+        let result = if let Some(error) = first_error {
+            Err(error)
+        } else if let Some(failure) = first_failure {
+            Ok(failure)
+        } else {
+            Ok(EndResult::Success)
+        };
+        (result, completed)
     }
+
+    fn recorded_participant_targets(participants: &BTreeSet<u64>) -> AffectedObjs {
+        participants
+            .iter()
+            .map(|server_id| (*server_id, BTreeMap::new()))
+            .collect()
+    }
+
+    async fn retry_durable_commit_after_coordinator_restart(
+        &self,
+        tid: &TxnId,
+    ) -> Result<EndResult, TMError> {
+        let Some(undo_log) = self.deps.database_runtime.undo_log() else {
+            return Err(TMError::TransactionNotFound);
+        };
+        let Some(record) = undo_log.coordinator_decision_record(tid).map_err(|error| {
+            error!(
+                "Failed to read durable coordinator decision for {:?}: {:?}",
+                tid, error
+            );
+            TMError::Other
+        })?
+        else {
+            return Err(TMError::TransactionNotFound);
+        };
+        match record.resolution {
+            TxnResolution::Commit(_) => {
+                let affected_objs = Self::recorded_participant_targets(&record.participants);
+                if affected_objs.is_empty() {
+                    return Ok(EndResult::Success);
+                }
+                let data_sites = self.data_sites_for_objs(&affected_objs).await?;
+                self.sites_end(tid, &affected_objs, &data_sites).await.0
+            }
+            TxnResolution::Abort => Err(TMError::InvalidTransactionState(TxnState::Aborted)),
+            TxnResolution::InProgress | TxnResolution::Unknown => Err(TMError::TransactionNotFound),
+        }
+    }
+
+    async fn retry_durable_abort_after_coordinator_restart(
+        &self,
+        tid: &TxnId,
+    ) -> Result<AbortResult, TMError> {
+        let Some(undo_log) = self.deps.database_runtime.undo_log() else {
+            return Err(TMError::TransactionNotFound);
+        };
+        let Some(record) = undo_log.coordinator_decision_record(tid).map_err(|error| {
+            error!(
+                "Failed to read durable coordinator decision for {:?}: {:?}",
+                tid, error
+            );
+            TMError::Other
+        })?
+        else {
+            return Err(TMError::TransactionNotFound);
+        };
+        match record.resolution {
+            TxnResolution::Commit(_) => Ok(AbortResult::CheckFailed(CheckError::AlreadyCommitted)),
+            TxnResolution::Abort => {
+                let affected_objs = Self::recorded_participant_targets(&record.participants);
+                if affected_objs.is_empty() {
+                    return Ok(AbortResult::Success(None));
+                }
+                let data_sites = self.data_sites_for_objs(&affected_objs).await?;
+                self.sites_abort(tid, &affected_objs, &data_sites).await
+            }
+            TxnResolution::InProgress | TxnResolution::Unknown => Err(TMError::TransactionNotFound),
+        }
+    }
+
     fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
         if txn.state == state {
             return Ok(());
@@ -1778,6 +2009,7 @@ impl TransactionManager {
                             .map_err(|_| TMError::ClockExhausted)?;
                         debug_assert!(commit_hlc.ts > tid.ts);
                         txn.commit_dispatch_started = true;
+                        txn.commit_hlc = Some(commit_hlc);
                         let sites_commit_result = {
                             #[cfg(feature = "occ_phase_profile")]
                             let _phase_guard = super::phase_profile::guard(
@@ -2091,6 +2323,9 @@ mod tests {
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
             commit_dispatch_started: false,
+            commit_hlc: None,
+            coordinator_decision_durable: false,
+            completed_participants: BTreeSet::new(),
             last_activity: get_time(),
         });
 
@@ -2136,6 +2371,9 @@ mod tests {
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
             commit_dispatch_started: false,
+            commit_hlc: None,
+            coordinator_decision_durable: false,
+            completed_participants: BTreeSet::new(),
             last_activity: get_time(),
         });
 

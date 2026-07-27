@@ -20,6 +20,14 @@ pub mod undo_log;
 
 pub type TxnId = bifrost::hlc::Hlc;
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
+pub enum TxnResolution {
+    Commit(Hlc),
+    Abort,
+    InProgress,
+    Unknown,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum CellExpectation {
     Present(u64),

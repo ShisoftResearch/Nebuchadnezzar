@@ -3,9 +3,10 @@ use crate::ram::chunk::Chunks;
 use crate::ram::entry::Entry;
 use crate::ram::io::reader;
 use crate::ram::types::{FromHeader, Id};
+use bifrost::hlc::Hlc;
 use log::{debug, error, info};
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{create_dir_all, remove_file, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::TxnId;
+use super::{TxnId, TxnResolution, TxnState};
 
 /// Undo log entry stored in the log file
 /// Format: [entry_type: u8 = 4][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][installed_revision_ts: u64][prior_revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
@@ -81,7 +82,15 @@ impl UndoOpType {
 const ENTRY_TYPE_UNDO: u8 = 4;
 const ENTRY_TYPE_COMMIT: u8 = 2;
 const ENTRY_TYPE_ABORT: u8 = 3;
+const ENTRY_TYPE_COORDINATOR_COMMIT: u8 = 5;
+const ENTRY_TYPE_COORDINATOR_ABORT: u8 = 6;
 const UNDO_FIXED_PAYLOAD_LEN: usize = 16 + 1 + 8 + 8 + 8 + 8 + 8;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct CoordinatorDecisionRecord {
+    pub resolution: TxnResolution,
+    pub participants: BTreeSet<u64>,
+}
 
 fn collect_undo_log_paths<I>(log_dir_path: &Path, entries: I) -> io::Result<Vec<(u64, PathBuf)>>
 where
@@ -136,6 +145,90 @@ fn decode_txn_id(bytes: &[u8]) -> io::Result<TxnId> {
             ),
         )
     })
+}
+
+fn coordinator_commit_record_size(
+    bytes: &[u8],
+    offset: usize,
+    txn_id_len: usize,
+) -> io::Result<(Hlc, BTreeSet<u64>, usize)> {
+    let commit_len_offset = offset
+        .checked_add(5)
+        .and_then(|value| value.checked_add(txn_id_len))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record size overflow"))?;
+    if bytes.len() < commit_len_offset + 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "incomplete coordinator commit timestamp length",
+        ));
+    }
+    let commit_hlc_len = u32::from_le_bytes([
+        bytes[commit_len_offset],
+        bytes[commit_len_offset + 1],
+        bytes[commit_len_offset + 2],
+        bytes[commit_len_offset + 3],
+    ]) as usize;
+    let commit_hlc_offset = commit_len_offset + 4;
+    let commit_hlc_end = commit_hlc_offset
+        .checked_add(commit_hlc_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record size overflow"))?;
+    if bytes.len() < commit_hlc_end {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "incomplete coordinator commit timestamp",
+        ));
+    }
+    let commit_hlc = serde_json::from_slice(&bytes[commit_hlc_offset..commit_hlc_end])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let (participants, record_end) =
+        decode_coordinator_participants(bytes, commit_hlc_end, "commit")?;
+    Ok((commit_hlc, participants, record_end - offset))
+}
+
+fn coordinator_abort_record_size(
+    bytes: &[u8],
+    offset: usize,
+    txn_id_len: usize,
+) -> io::Result<(BTreeSet<u64>, usize)> {
+    let participants_len_offset = offset
+        .checked_add(5)
+        .and_then(|value| value.checked_add(txn_id_len))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record size overflow"))?;
+    let (participants, record_end) =
+        decode_coordinator_participants(bytes, participants_len_offset, "abort")?;
+    Ok((participants, record_end - offset))
+}
+
+fn decode_coordinator_participants(
+    bytes: &[u8],
+    participants_len_offset: usize,
+    decision: &str,
+) -> io::Result<(BTreeSet<u64>, usize)> {
+    if bytes.len() < participants_len_offset + 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("incomplete coordinator {decision} participant length"),
+        ));
+    }
+    let participants_len = u32::from_le_bytes([
+        bytes[participants_len_offset],
+        bytes[participants_len_offset + 1],
+        bytes[participants_len_offset + 2],
+        bytes[participants_len_offset + 3],
+    ]) as usize;
+    let participants_offset = participants_len_offset + 4;
+    let record_end = participants_offset
+        .checked_add(participants_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record size overflow"))?;
+    if bytes.len() < record_end {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("incomplete coordinator {decision} participants"),
+        ));
+    }
+    let participants = serde_json::from_slice(&bytes[participants_offset..record_end])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok((participants, record_end))
 }
 
 impl UndoLogEntry {
@@ -388,18 +481,39 @@ pub struct UndoLogger {
     fail_next_commit_marker: AtomicBool,
     #[cfg(test)]
     fail_next_abort_marker: AtomicBool,
+    #[cfg(test)]
+    fail_next_coordinator_commit_decision: AtomicBool,
+    #[cfg(test)]
+    fail_next_coordinator_abort_decision: AtomicBool,
 }
 
 impl UndoLogger {
     /// Create a new undo log manager
     pub fn new(log_dir: String) -> io::Result<Arc<Self>> {
         create_dir_all(&log_dir)?;
+        let log_dir_path = Path::new(&log_dir);
+        let existing_logs = collect_undo_log_paths(
+            log_dir_path,
+            std::fs::read_dir(log_dir_path)?.map(|entry| entry.map(|entry| entry.path())),
+        )?;
+        let next_log_seq = existing_logs
+            .last()
+            .map(|(seq, _)| {
+                seq.checked_add(1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "undo log sequence number is exhausted",
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(0);
 
         let log = Arc::new(Self {
             log_dir: log_dir.clone(),
             log_file: Mutex::new(None),
             log_file_name: Mutex::new(None),
-            log_seq: AtomicU64::new(0),
+            log_seq: AtomicU64::new(next_log_seq),
             active_txns: Mutex::new(HashSet::new()),
             max_log_size: 64 * 1024 * 1024, // 64MB
             #[cfg(test)]
@@ -408,6 +522,10 @@ impl UndoLogger {
             fail_next_commit_marker: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_abort_marker: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_coordinator_commit_decision: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_coordinator_abort_decision: AtomicBool::new(false),
         });
 
         // Open or create initial log file
@@ -562,6 +680,333 @@ impl UndoLogger {
         }
     }
 
+    /// Persist the distributed coordinator's irrevocable commit decision.
+    ///
+    /// This record is intentionally distinct from a participant commit marker:
+    /// it must remain visible to resolution RPCs without suppressing local
+    /// participant undo until recovery has proved the installed output durable.
+    pub fn write_coordinator_commit_decision(
+        &self,
+        txn_id: &TxnId,
+        commit_hlc: Hlc,
+        participants: &[u64],
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_coordinator_commit_decision
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected coordinator commit decision failure",
+            ));
+        }
+        let txn_id_bytes = serde_json::to_vec(txn_id)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let commit_hlc_bytes = serde_json::to_vec(&commit_hlc)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let participants: BTreeSet<_> = participants.iter().copied().collect();
+        let participants_bytes = serde_json::to_vec(&participants)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let txn_id_len = u32::try_from(txn_id_bytes.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "transaction id too large"))?;
+        let commit_hlc_len = u32::try_from(commit_hlc_bytes.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "commit timestamp too large")
+        })?;
+        let participants_len = u32::try_from(participants_bytes.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "participant list too large")
+        })?;
+
+        let mut bytes = Vec::with_capacity(
+            1 + 4 + txn_id_bytes.len() + 4 + commit_hlc_bytes.len() + 4 + participants_bytes.len(),
+        );
+        bytes.push(ENTRY_TYPE_COORDINATOR_COMMIT);
+        bytes.extend_from_slice(&txn_id_len.to_le_bytes());
+        bytes.extend_from_slice(&txn_id_bytes);
+        bytes.extend_from_slice(&commit_hlc_len.to_le_bytes());
+        bytes.extend_from_slice(&commit_hlc_bytes);
+        bytes.extend_from_slice(&participants_len.to_le_bytes());
+        bytes.extend_from_slice(&participants_bytes);
+
+        let mut log_file_guard = self.log_file.lock();
+        let writer = log_file_guard
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Log file not initialized"))?;
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        writer.get_ref().sync_data()
+    }
+
+    /// Persist the distributed coordinator's irrevocable abort decision.
+    ///
+    /// Like the coordinator commit record, this does not suppress participant
+    /// undo. Recovery must first compensate the participant output and then
+    /// write the ordinary participant abort marker.
+    pub fn write_coordinator_abort_decision(
+        &self,
+        txn_id: &TxnId,
+        participants: &[u64],
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_coordinator_abort_decision
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected coordinator abort decision failure",
+            ));
+        }
+        let txn_id_bytes = serde_json::to_vec(txn_id)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let participants: BTreeSet<_> = participants.iter().copied().collect();
+        let participants_bytes = serde_json::to_vec(&participants)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let txn_id_len = u32::try_from(txn_id_bytes.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "transaction id too large"))?;
+        let participants_len = u32::try_from(participants_bytes.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "participant list too large")
+        })?;
+        let mut bytes =
+            Vec::with_capacity(1 + 4 + txn_id_bytes.len() + 4 + participants_bytes.len());
+        bytes.push(ENTRY_TYPE_COORDINATOR_ABORT);
+        bytes.extend_from_slice(&txn_id_len.to_le_bytes());
+        bytes.extend_from_slice(&txn_id_bytes);
+        bytes.extend_from_slice(&participants_len.to_le_bytes());
+        bytes.extend_from_slice(&participants_bytes);
+
+        let mut log_file_guard = self.log_file.lock();
+        let writer = log_file_guard
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Log file not initialized"))?;
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        writer.get_ref().sync_data()
+    }
+
+    pub fn coordinator_decision(&self, txn_id: &TxnId) -> io::Result<Option<TxnResolution>> {
+        self.coordinator_decision_record(txn_id)
+            .map(|record| record.map(|record| record.resolution))
+    }
+
+    pub(crate) fn coordinator_decision_record(
+        &self,
+        txn_id: &TxnId,
+    ) -> io::Result<Option<CoordinatorDecisionRecord>> {
+        let log_dir_path = Path::new(&self.log_dir);
+        let entries = std::fs::read_dir(log_dir_path)?;
+        let log_files = collect_undo_log_paths(
+            log_dir_path,
+            entries.map(|entry| entry.map(|entry| entry.path())),
+        )?;
+        let mut decision = None;
+
+        for (_seq, path) in log_files {
+            let mut buffer = Vec::new();
+            File::open(&path)?.read_to_end(&mut buffer)?;
+            let mut offset = 0;
+            while offset < buffer.len() {
+                if buffer.len() < offset + 5 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "cannot decode undo log {} at byte offset {}: incomplete entry header",
+                            path.display(),
+                            offset
+                        ),
+                    ));
+                }
+                let entry_type = buffer[offset];
+                let encoded_txn_id_len = u32::from_le_bytes([
+                    buffer[offset + 1],
+                    buffer[offset + 2],
+                    buffer[offset + 3],
+                    buffer[offset + 4],
+                ]) as usize;
+                if buffer.len() < offset + 5 + encoded_txn_id_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "cannot decode undo log {} at byte offset {}: incomplete transaction id",
+                            path.display(),
+                            offset
+                        ),
+                    ));
+                }
+                let encoded_txn_id =
+                    decode_txn_id(&buffer[offset + 5..offset + 5 + encoded_txn_id_len])?;
+                match entry_type {
+                    ENTRY_TYPE_UNDO => {
+                        let (_, size) = UndoLogEntry::from_bytes(&buffer[offset..])?;
+                        offset += size;
+                    }
+                    ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
+                        offset += 5 + encoded_txn_id_len;
+                    }
+                    ENTRY_TYPE_COORDINATOR_COMMIT => {
+                        let (commit_hlc, participants, size) =
+                            coordinator_commit_record_size(&buffer, offset, encoded_txn_id_len)?;
+                        if encoded_txn_id == *txn_id {
+                            decision = Some(CoordinatorDecisionRecord {
+                                resolution: TxnResolution::Commit(commit_hlc),
+                                participants,
+                            });
+                        }
+                        offset += size;
+                    }
+                    ENTRY_TYPE_COORDINATOR_ABORT => {
+                        let (participants, size) =
+                            coordinator_abort_record_size(&buffer, offset, encoded_txn_id_len)?;
+                        if encoded_txn_id == *txn_id {
+                            decision = Some(CoordinatorDecisionRecord {
+                                resolution: TxnResolution::Abort,
+                                participants,
+                            });
+                        }
+                        offset += size;
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "cannot decode undo log {} at byte offset {}: invalid entry type {}",
+                                path.display(),
+                                offset,
+                                entry_type
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(decision)
+    }
+
+    /// Read the durable outcome written by a participant's `end` operation.
+    ///
+    /// Coordinator decision records are deliberately ignored here: they prove
+    /// only the global choice, not that this participant finished promotion and
+    /// lock release.
+    pub fn participant_completion(&self, txn_id: &TxnId) -> io::Result<Option<TxnState>> {
+        let log_dir_path = Path::new(&self.log_dir);
+        let entries = std::fs::read_dir(log_dir_path)?;
+        let log_files = collect_undo_log_paths(
+            log_dir_path,
+            entries.map(|entry| entry.map(|entry| entry.path())),
+        )?;
+        let mut completion = None;
+
+        for (_seq, path) in log_files {
+            let mut buffer = Vec::new();
+            File::open(&path)?.read_to_end(&mut buffer)?;
+            let mut offset = 0;
+            while offset < buffer.len() {
+                if buffer.len() < offset + 5 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "cannot decode undo log {} at byte offset {}: incomplete entry header",
+                            path.display(),
+                            offset
+                        ),
+                    ));
+                }
+                let entry_type = buffer[offset];
+                let encoded_txn_id_len = u32::from_le_bytes([
+                    buffer[offset + 1],
+                    buffer[offset + 2],
+                    buffer[offset + 3],
+                    buffer[offset + 4],
+                ]) as usize;
+                if buffer.len() < offset + 5 + encoded_txn_id_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "cannot decode undo log {} at byte offset {}: incomplete transaction id",
+                            path.display(),
+                            offset
+                        ),
+                    ));
+                }
+                let encoded_txn_id =
+                    decode_txn_id(&buffer[offset + 5..offset + 5 + encoded_txn_id_len])?;
+                match entry_type {
+                    ENTRY_TYPE_UNDO => {
+                        let (_, size) = UndoLogEntry::from_bytes(&buffer[offset..])?;
+                        offset += size;
+                    }
+                    ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
+                        if encoded_txn_id == *txn_id {
+                            completion = Some(if entry_type == ENTRY_TYPE_COMMIT {
+                                TxnState::Committed
+                            } else {
+                                TxnState::Aborted
+                            });
+                        }
+                        offset += 5 + encoded_txn_id_len;
+                    }
+                    ENTRY_TYPE_COORDINATOR_COMMIT => {
+                        let (_, _, size) =
+                            coordinator_commit_record_size(&buffer, offset, encoded_txn_id_len)?;
+                        offset += size;
+                    }
+                    ENTRY_TYPE_COORDINATOR_ABORT => {
+                        let (_, size) =
+                            coordinator_abort_record_size(&buffer, offset, encoded_txn_id_len)?;
+                        offset += size;
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "cannot decode undo log {} at byte offset {}: invalid entry type {}",
+                                path.display(),
+                                offset,
+                                entry_type
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(completion)
+    }
+
+    pub fn resolve_recovered_transactions(
+        &self,
+        mut txn_index: HashMap<TxnId, Vec<UndoLogEntry>>,
+        resolutions: &HashMap<TxnId, TxnResolution>,
+    ) -> io::Result<HashMap<TxnId, Vec<UndoLogEntry>>> {
+        for txn_id in txn_index.keys() {
+            match resolutions
+                .get(txn_id)
+                .copied()
+                .unwrap_or(TxnResolution::Unknown)
+            {
+                TxnResolution::Commit(_) | TxnResolution::Abort => {}
+                TxnResolution::InProgress | TxnResolution::Unknown => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("transaction {txn_id:?} has no final durable coordinator decision"),
+                    ));
+                }
+            }
+        }
+
+        let committed: Vec<_> = txn_index
+            .keys()
+            .filter(|txn_id| matches!(resolutions.get(txn_id), Some(TxnResolution::Commit(_))))
+            .copied()
+            .collect();
+        for txn_id in committed {
+            self.write_commit_marker(&txn_id)?;
+            txn_index.remove(&txn_id);
+        }
+        Ok(txn_index)
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_commit_marker_for_test(&self) {
         self.fail_next_commit_marker.store(true, Ordering::SeqCst);
@@ -570,6 +1015,18 @@ impl UndoLogger {
     #[cfg(test)]
     pub(crate) fn fail_next_abort_marker_for_test(&self) {
         self.fail_next_abort_marker.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_coordinator_commit_decision_for_test(&self) {
+        self.fail_next_coordinator_commit_decision
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_coordinator_abort_decision_for_test(&self) {
+        self.fail_next_coordinator_abort_decision
+            .store(true, Ordering::SeqCst);
     }
 
     /// Perform rollback for all incomplete transactions
@@ -616,6 +1073,7 @@ impl UndoLogger {
                 entries.len()
             );
 
+            let failures_before = rollback_failures.len();
             for entry in entries {
                 match entry.op_type {
                     UndoOpType::Write => {
@@ -650,6 +1108,13 @@ impl UndoLogger {
                             }
                         }
                     }
+                }
+            }
+            if rollback_failures.len() == failures_before {
+                if let Err(error) = self.write_abort_marker(txn_id) {
+                    rollback_failures.push(format!(
+                        "transaction {txn_id:?} participant abort marker failed after durable compensation: {error}"
+                    ));
                 }
             }
         }
@@ -954,7 +1419,20 @@ impl UndoLogger {
                     offset += 5 + txn_id_len + UNDO_FIXED_PAYLOAD_LEN;
                 }
                 ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
-                    offset += 5 + txn_id_len;
+                    // Participant completion evidence is retained until a
+                    // future compaction protocol can atomically prove that
+                    // every earlier undo record is gone.
+                    return Ok(true);
+                }
+                ENTRY_TYPE_COORDINATOR_COMMIT => {
+                    let _ = coordinator_commit_record_size(&buffer, offset, txn_id_len)?;
+                    // A delayed retry or restarting participant may still
+                    // require this final distributed decision.
+                    return Ok(true);
+                }
+                ENTRY_TYPE_COORDINATOR_ABORT => {
+                    let _ = coordinator_abort_record_size(&buffer, offset, txn_id_len)?;
+                    return Ok(true);
                 }
                 _ => break,
             }
@@ -1060,6 +1538,38 @@ impl UndoLogger {
                         txn_index.remove(&txn_id);
                         offset += 5 + txn_id_len;
                     }
+                    ENTRY_TYPE_COORDINATOR_COMMIT => {
+                        let (_, _, size) = coordinator_commit_record_size(
+                            &buffer, offset, txn_id_len,
+                        )
+                        .map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "cannot decode undo log {} at byte offset {}: {}",
+                                    path.display(),
+                                    offset,
+                                    error
+                                ),
+                            )
+                        })?;
+                        offset += size;
+                    }
+                    ENTRY_TYPE_COORDINATOR_ABORT => {
+                        let (_, size) = coordinator_abort_record_size(&buffer, offset, txn_id_len)
+                            .map_err(|error| {
+                                io::Error::new(
+                                    error.kind(),
+                                    format!(
+                                        "cannot decode undo log {} at byte offset {}: {}",
+                                        path.display(),
+                                        offset,
+                                        error
+                                    ),
+                                )
+                            })?;
+                        offset += size;
+                    }
                     _ => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -1099,7 +1609,9 @@ mod tests {
     use crate::ram::cell::ReadError;
     use crate::ram::types::{OwnedMap, OwnedValue};
     use crate::server::transactions::test_hlc;
-    use crate::server::transactions::{EndResult, TMPrepareResult, TxnExecResult};
+    use crate::server::transactions::{
+        AbortResult, CheckError, EndResult, TMPrepareResult, TxnExecResult,
+    };
     use dovahkiin::data_map_value;
     use dovahkiin::types::Map;
     use std::collections::HashMap;
@@ -1239,6 +1751,201 @@ mod tests {
             .0;
         assert_eq!(decoded.installed_revision_ts, 200);
         assert_eq!(decoded.prior_revision_ts, Some(100));
+    }
+
+    #[test]
+    fn coordinator_commit_decision_is_durable_without_suppressing_participant_undo() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let tid = test_hlc(300, 7);
+        let commit_hlc = test_hlc(400, 7);
+        let cell_id = Id::new(1, 2);
+
+        {
+            let undo =
+                UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
+            undo.write_undo_entry(UndoLogEntry::new_write(tid, cell_id, commit_hlc.ts))
+                .unwrap();
+            undo.write_coordinator_commit_decision(&tid, commit_hlc, &[11, 12])
+                .unwrap();
+
+            assert_eq!(
+                undo.coordinator_decision(&tid).unwrap(),
+                Some(super::super::TxnResolution::Commit(commit_hlc))
+            );
+            assert_eq!(
+                undo.coordinator_decision_record(&tid)
+                    .unwrap()
+                    .unwrap()
+                    .participants,
+                BTreeSet::from([11, 12])
+            );
+            assert!(
+                undo.recover().unwrap().contains_key(&tid),
+                "a coordinator decision is not participant completion and must not suppress undo"
+            );
+        }
+
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("reopened undo logger");
+        assert_eq!(
+            reopened.coordinator_decision(&tid).unwrap(),
+            Some(super::super::TxnResolution::Commit(commit_hlc))
+        );
+        assert!(reopened.recover().unwrap().contains_key(&tid));
+    }
+
+    #[test]
+    fn committed_recovery_resolution_preserves_installed_output_instead_of_compensating() {
+        let temp_dir = TempDir::new().unwrap();
+        let (schema, chunks) = compensation_test_chunks("committed_recovery_resolution");
+        let id = Id::new(0, 706);
+        let mut installed = OwnedCell::new_with_id(
+            schema.id,
+            &id,
+            data_map_value!(id: 1i32, value: "chosen-commit".to_string()),
+        );
+        let installed_revision_ts = chunks.write_cell(&mut installed).unwrap().revision_ts;
+        let tid = test_hlc(301, 8);
+        let commit_hlc = bifrost::hlc::Hlc {
+            ts: installed_revision_ts,
+            node: tid.node,
+        };
+        let undo =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+        undo.write_undo_entry(UndoLogEntry::new_write(tid, id, installed_revision_ts))
+            .unwrap();
+
+        let unresolved = undo
+            .resolve_recovered_transactions(
+                undo.recover().unwrap(),
+                &HashMap::from([(tid, super::super::TxnResolution::Commit(commit_hlc))]),
+            )
+            .unwrap();
+        assert!(unresolved.is_empty());
+        undo.rollback_incomplete_transactions(unresolved, &chunks)
+            .unwrap();
+
+        let retained = chunks.read_cell(&id).unwrap().to_owned();
+        assert_eq!(retained.header.revision_ts, installed_revision_ts);
+        assert_eq!(retained.data, installed.data);
+        assert!(
+            !undo.recover().unwrap().contains_key(&tid),
+            "participant commit outcome must become durable before recovery continues"
+        );
+    }
+
+    #[test]
+    fn unknown_recovery_resolution_is_conservative_and_leaves_pending_bytes_and_undo_intact() {
+        let temp_dir = TempDir::new().unwrap();
+        let (schema, chunks) = compensation_test_chunks("unknown_recovery_resolution");
+        let id = Id::new(0, 707);
+        let mut installed = OwnedCell::new_with_id(
+            schema.id,
+            &id,
+            data_map_value!(id: 1i32, value: "unresolved".to_string()),
+        );
+        let installed_revision_ts = chunks.write_cell(&mut installed).unwrap().revision_ts;
+        let tid = test_hlc(302, 9);
+        let undo =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+        undo.write_undo_entry(UndoLogEntry::new_write(tid, id, installed_revision_ts))
+            .unwrap();
+
+        let error = undo
+            .resolve_recovered_transactions(
+                undo.recover().unwrap(),
+                &HashMap::from([(tid, super::super::TxnResolution::Unknown)]),
+            )
+            .expect_err("unknown coordinator state must stop recovery");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        let retained = chunks.read_cell(&id).unwrap().to_owned();
+        assert_eq!(retained.header.revision_ts, installed_revision_ts);
+        assert_eq!(retained.data, installed.data);
+        assert!(
+            undo.recover().unwrap().contains_key(&tid),
+            "unknown resolution must not emit a completion marker or discard undo"
+        );
+    }
+
+    #[test]
+    fn reopened_logger_orders_recovery_completion_after_existing_log_sequences() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_string_lossy().into_owned();
+        let tid = test_hlc(303, 10);
+
+        {
+            let undo = UndoLogger::new(log_dir.clone()).unwrap();
+            undo.rotate_log().unwrap();
+            undo.write_undo_entry(UndoLogEntry::new_write(tid, Id::new(1, 158), 304))
+                .unwrap();
+        }
+
+        {
+            let reopened = UndoLogger::new(log_dir.clone()).unwrap();
+            let pending = reopened.recover().unwrap();
+            assert!(pending.contains_key(&tid));
+            reopened
+                .resolve_recovered_transactions(
+                    pending,
+                    &HashMap::from([(tid, super::super::TxnResolution::Commit(test_hlc(305, 10)))]),
+                )
+                .unwrap();
+        }
+
+        let reopened = UndoLogger::new(log_dir).unwrap();
+        assert!(
+            !reopened.recover().unwrap().contains_key(&tid),
+            "a startup completion marker must sort after every pre-existing undo record"
+        );
+        assert_eq!(
+            reopened.participant_completion(&tid).unwrap(),
+            Some(TxnState::Committed)
+        );
+    }
+
+    #[test]
+    fn trimming_retains_distributed_decisions_and_participant_completion_evidence() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_string_lossy().into_owned();
+        let decision_tid = test_hlc(306, 11);
+        let participant_tid = test_hlc(307, 11);
+        let commit_hlc = test_hlc(308, 11);
+
+        {
+            let undo = UndoLogger::new(log_dir.clone()).unwrap();
+            undo.write_coordinator_commit_decision(&decision_tid, commit_hlc, &[21, 22])
+                .unwrap();
+            undo.write_undo_entry(UndoLogEntry::new_write(
+                participant_tid,
+                Id::new(1, 159),
+                309,
+            ))
+            .unwrap();
+            undo.write_commit_marker(&participant_tid).unwrap();
+            for _ in 0..4 {
+                undo.rotate_log().unwrap();
+            }
+            undo.trim_old_logs().unwrap();
+        }
+
+        let reopened = UndoLogger::new(log_dir).unwrap();
+        assert_eq!(
+            reopened.coordinator_decision_record(&decision_tid).unwrap(),
+            Some(CoordinatorDecisionRecord {
+                resolution: TxnResolution::Commit(commit_hlc),
+                participants: BTreeSet::from([21, 22]),
+            })
+        );
+        assert_eq!(
+            reopened.participant_completion(&participant_tid).unwrap(),
+            Some(TxnState::Committed),
+            "delayed end retries must keep durable participant completion evidence"
+        );
+        assert!(
+            !reopened.recover().unwrap().contains_key(&participant_tid),
+            "retained completion evidence must continue suppressing participant undo"
+        );
     }
 
     #[test]
@@ -2891,6 +3598,13 @@ mod tests {
             TMPrepareResult::Success => {}
             other => panic!("Prepare should succeed, got {:?}", other),
         }
+        let abort_failure =
+            transactions::data_site::install_abort_cannot_end_for_cell(txn_id, cell_id);
+        assert_eq!(
+            txn.abort(txn_id).await.unwrap().unwrap(),
+            AbortResult::CheckFailed(CheckError::CannotEnd)
+        );
+        drop(abort_failure);
 
         // Archive segments before shutdown
         for chunk in &server.chunks().list {
@@ -3070,6 +3784,13 @@ mod tests {
             TMPrepareResult::Success => {}
             other => panic!("Prepare should succeed, got {:?}", other),
         }
+        let abort_failure =
+            transactions::data_site::install_abort_cannot_end_for_cell(txn_id, cell_id);
+        assert_eq!(
+            txn.abort(txn_id).await.unwrap().unwrap(),
+            AbortResult::CheckFailed(CheckError::CannotEnd)
+        );
+        drop(abort_failure);
 
         // Archive segments before shutdown
         for chunk in &server.chunks().list {
@@ -3227,6 +3948,13 @@ mod tests {
             TMPrepareResult::Success => {}
             other => panic!("Prepare should succeed, got {:?}", other),
         }
+        let abort_failure =
+            transactions::data_site::install_abort_cannot_end_for_cell(txn_id, cell_id);
+        assert_eq!(
+            txn.abort(txn_id).await.unwrap().unwrap(),
+            AbortResult::CheckFailed(CheckError::CannotEnd)
+        );
+        drop(abort_failure);
 
         // Archive segments before shutdown
         for chunk in &server.chunks().list {
@@ -3359,10 +4087,34 @@ mod tests {
             txn.prepare(txn_id.clone()).await.unwrap().unwrap(),
             TMPrepareResult::Success
         );
+        server
+            .current_database()
+            .undo_log()
+            .unwrap()
+            .fail_next_commit_marker_for_test();
         assert_eq!(
             txn.commit(txn_id.clone()).await.unwrap().unwrap(),
-            EndResult::Success
+            EndResult::CheckFailed(CheckError::CannotEnd),
+            "crash fixture must stop after the durable coordinator decision but before participant completion"
         );
+        assert_eq!(
+            server
+                .current_database()
+                .txn_manager()
+                .unwrap()
+                .transaction_count(),
+            1,
+            "the unresolved durable commit must remain owned by the coordinator"
+        );
+        assert!(matches!(
+            server
+                .current_database()
+                .undo_log()
+                .unwrap()
+                .coordinator_decision(&txn_id)
+                .unwrap(),
+            Some(TxnResolution::Commit(_))
+        ));
 
         // Archive segments before shutdown
         for chunk in &server.chunks().list {
@@ -3402,7 +4154,8 @@ mod tests {
 
         server2.meta().schemas.debug_only_new_schema(schema.clone());
 
-        // Cell should still exist after recovery (committed transaction)
+        // Startup resolves the incomplete participant from the durable local
+        // coordinator record and must not compensate its installed output.
         let read_cell = server2.chunks().read_cell(&cell_id).unwrap();
         assert_eq!(
             read_cell.data["name"].string().unwrap(),

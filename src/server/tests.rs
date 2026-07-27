@@ -95,6 +95,48 @@ async fn durable_transaction_configuration_requires_undo_storage() {
 }
 
 #[tokio::test]
+async fn recoverable_transaction_configuration_requires_output_wal_storage() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let result = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: crate::ram::segs::SEGMENT_SIZE,
+            db_size: crate::ram::segs::SEGMENT_SIZE,
+            history_retention_ms: 300_000,
+            tiered_config: None,
+            backup_storage: Some(
+                temp_dir
+                    .path()
+                    .join("backup")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            wal_storage: None,
+            undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().into_owned()),
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &String::from("127.0.0.1:5423"),
+        &String::from("recoverable_transactions_require_wal"),
+        async |_| {},
+    )
+    .await;
+
+    match result {
+        Err(ServerError::CannotInitializeDatabaseServices(message)) => {
+            assert!(message.contains("WAL") || message.contains("wal"));
+        }
+        Err(other) => panic!("unexpected startup failure: {other}"),
+        Ok(server) => {
+            server.shutdown().await;
+            panic!("recoverable transactional storage must not start without an output WAL");
+        }
+    }
+}
+
+#[tokio::test]
 async fn durable_undo_initialization_failure_is_fatal() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let invalid_undo_path = temp_dir.path().join("undo-is-a-file");
