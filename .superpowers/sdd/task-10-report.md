@@ -397,3 +397,151 @@ Index/range isolation remains outside the point-cell MVCC contract, and the
 unrelated B-tree/range-service worktree edits remain untouched and excluded.
 The strict point visibility rule, 32-byte cell header, revision-chain layout,
 and logical-ID-only transaction state are unchanged.
+
+## Review Fixes Round 2
+
+### Implementation and focused evidence
+
+1. **Completion persistence and exact retention.** Coordinator completion is
+   now a retryable transition protected by the per-TID replay lock. The live
+   transaction is identity-removed while a nonexpiring cleanup-pending
+   decision is published under the same cache lock. Only after that
+   publication is the completion boundary sampled and the `Completed` record
+   persisted. Success publishes the exact 300,000ms deadline and clears heavy
+   live state; failure restores the exact transaction `Arc`, sorted TID, and
+   prior cache state. Replayed decisions use the same pending-publication,
+   boundary, persistence, and rollback ordering. Expired completion records
+   continue to mask older decisions across reopen and compaction.
+
+   `completion_persistence_failure_keeps_cleanup_pending_until_exact_retry_boundary`
+   was RED when a failed completion write could outlive the cache and expose
+   the older durable decision indefinitely. It is GREEN with explicit
+   cleanup-pending resolution before the successful retry, visibility through
+   boundary +299,999ms, and expiry at boundary +300,000ms. The first integrated
+   audit found that replay still sampled its deadline before publishing the
+   pending state. The deterministic
+   `replayed_completion_retention_starts_after_cleanup_pending_publication`
+   RED observed the real-time deadline instead of the injected post-publication
+   boundary; moving the sample after publication made it GREEN in 11.12s.
+
+2. **Restartable Abort after partial dispatch or cancellation.** A durable
+   entry-type-11 `InProgress` dispatch intent records the exact participant set
+   before prepare RPC dispatch. Any pre-Commit exit latches Abort
+   irrevocably. A single capacity-256 manager worker plus bounded periodic
+   canonical rediscovery retries Abort-decision fsync, participant abort/end,
+   and final completion; no persistent per-transaction retry task is created.
+   Live state tracks the exact dispatched, cleanup-finished, and ended
+   participants. `NotExisted` proves cleanup without creating a retirement
+   obligation.
+
+   The focused cancellation, dropped-guard, partial-install, failed-fsync,
+   abandoned-intent, background-retry, and absent-target regressions all
+   passed. A broad OCC run exposed a real sibling-owner violation:
+   `sites_abort` ended a successfully compensated participant while another
+   participant still failed. End RPCs are now deferred until the entire abort
+   phase succeeds, so all sibling owners retain the shared barrier and retry
+   together. The participant failure hook now explicitly distinguishes
+   one-shot failures from handle-lifetime persistent failures; the recovery
+   and background fixtures use persistent failures and explicitly release
+   them. This is test-only behavior.
+
+   Two other OCC assertions were corrected for the new protocol: a failed
+   final Commit write retains the earlier durable `InProgress` intent, and a
+   concurrent cleanup retry may advance `InProgress` to durable `Abort`.
+   Caller retry can also race the queued worker and observe the established
+   `AlreadyCleanup` result. None of these changes relax owner, decision, or
+   retention assertions.
+
+3. **Bounded central stale-owner resolution.** DataManager now owns one
+   Weak-backed resolver worker and a capacity-256 channel. Per-owner state is
+   embedded in the canonical owner index (`requested`, `queued`, attempt, and
+   retry deadline), with a rotating bounded discovery cursor. Queueing is
+   deduplicated and nonblocking; RPC attempts are globally spaced by 10ms,
+   retry backoff is capped at one second, queue refill is capacity-aware, and
+   owner removal physically removes its scheduling state. Cleanup and undo
+   workers also retain only Weak manager references.
+
+   Focused tests covered 2,048 unresolved owners with one worker and bounded
+   storage, a 512-owner global attempt-rate bound, fair reachability of late
+   work behind 1,025 owners, and worker termination after the last strong
+   DataManager reference is dropped. Exact Commit/Abort, Unknown/InProgress,
+   RPC-failure, missing-membership, and multi-cell owner behavior remained
+   fail-closed.
+
+4. **Tombstone-free retirement discovery.** Volatile and durable retirement
+   scheduling no longer retain completed deque entries. Their canonical
+   incomplete-work sets contain only live work and use rotating cursors;
+   capacity-aware refill advances only for work actually admitted to the
+   bounded sender. Completion physically removes membership, while periodic
+   discovery fairly rediscovers unavailable work. Durable compaction/reopen
+   rebuilds only live canonical members.
+
+   The volatile and durable over-capacity regressions passed with storage at
+   the fixed bound, no completed tombstones, and repeated fair attempts for
+   unavailable TIDs. The first broad data-site run found a timing-only test
+   assumption: the legitimate one-second maintenance pass could prune an
+   unrelated expired TID between lookup and assertion. The identical targeted
+   lookup/removal logic was factored into a local-map helper for the atomic
+   two-TID assertion, while a separate manager assertion still verifies
+   maintenance pruning.
+
+### Focused review and audit
+
+The pre-audit focused set passed 28/28. After the replay-boundary audit fix it
+passed 29/29. The recovered exact aggregate plus the audit-discovered
+partial-abort sibling-owner regression passed 30/30 on final text, strictly
+serial and with one test thread per process. The partial-abort target passed
+alone (18.27s), in the smallest adjacent `partial_` prefix (3/3, 41.63s), and
+as test 30 of the aggregate (18.32s). Deterministic background-completion and
+queued-`AlreadyCleanup` characterizations each passed 1/1.
+
+The fresh integrated read-only audit returned READY with zero Critical and
+zero Important findings. Subsequent narrow delta audits covering replay
+boundary placement, targeted cache lookup, persistent test hooks, sibling
+owner gating, and the final OCC race assertions also returned READY. These
+are implementation-review results, not a claim of formal approval; the
+required full-range rereview still follows this commit.
+
+### Broad-test debugging and final serial verification
+
+All heavy commands ran one process at a time with no overlap. Intermediate
+failures were retained as diagnostic evidence:
+
+- The first undo-log run passed 64 and failed the three write/update/remove
+  crash-recovery cases. The new background Abort worker consumed the old
+  one-shot failure before archive. Handle-lifetime persistent injection kept
+  the intended crash prefix deterministic. The exact cases passed, and the
+  final-text full run passed 67/67 with 771 filtered in 29.75s.
+- Manager passed its earlier 38-test run, then was rerun after the final
+  abort-phase production change. The final-text result was 38 passed,
+  0 failed, 800 filtered in 321.70s.
+- The first data-site run passed 77 and failed the unrelated-expiry timing
+  assertion described above. The final-text result was 78 passed, 0 failed,
+  760 filtered in 807.45s.
+- The first OCC run passed 45 and failed four cases: retained dispatch intent,
+  the valid `InProgress`/`Abort` handoff race, premature sibling end, and the
+  valid `AlreadyCleanup` retry race. After those corrections, a 48/49 run
+  found the same caller/background race at the later partial-abort retry
+  result; all owner-barrier and data assertions had already passed. The final
+  run passed 49/49 with 789 filtered in 589.26s.
+
+The remaining final-text gates passed:
+
+- `cargo test --lib ram::recovery -- --test-threads=1`: 41 passed,
+  0 failed, 2 ignored, 795 filtered in 4.52s.
+- `cargo test --lib server::transactions::tests -- --test-threads=1`:
+  5 passed, 0 failed, 833 filtered in 5.09s.
+- `cargo test --lib server::tests::durable_ -- --test-threads=1`:
+  2 passed, 0 failed, 836 filtered in 2.01s.
+- `cargo test --lib --features occ_phase_profile server::transactions::phase_profile::tests -- --test-threads=1`:
+  5 passed, 0 failed, 840 filtered; the feature command completed in 21.69s.
+- `cargo test --lib ram::cell::tests::revision_header_is_exactly_32_bytes -- --exact --test-threads=1`:
+  1 passed, 0 failed, 837 filtered in 0.00s.
+- `cargo check --lib`: passed in 3.71s with existing repository warnings.
+- Scoped `rustfmt --check` over the four touched Rust files and
+  `git diff --check`: passed. The first scoped rustfmt check found only three
+  line-wrap differences in the latest OCC assertions; scoped rustfmt
+  normalized them before the final checks.
+
+The 11 unrelated B-tree/range-service worktree modifications remained
+untouched and excluded from staging throughout Round 2.

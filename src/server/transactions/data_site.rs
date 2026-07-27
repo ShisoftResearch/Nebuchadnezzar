@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::OnceLock;
 use std::sync::Weak;
 use std::time::Duration;
+use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::Notify;
 
@@ -55,6 +56,34 @@ pub(crate) fn full_read_rpc_count() -> usize {
 const DEFAULT_LOCK_TIMEOUT_MS: i64 = 30_000;
 const VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS: i64 = 300_000;
 const PARTICIPANT_LIFECYCLE_SHARD_COUNT: usize = 64;
+const OWNER_RESOLUTION_QUEUE_CAPACITY: usize = 256;
+const OWNER_RESOLUTION_DISCOVERY_BATCH: usize = 64;
+const OWNER_RESOLUTION_DISCOVERY_INTERVAL_MS: u64 = 10;
+const OWNER_RESOLUTION_MIN_ATTEMPT_INTERVAL_MS: u64 = 10;
+
+type OwnerKey = (TxnId, u64);
+
+#[derive(Default)]
+struct OwnerResolutionWorkerActivity {
+    live: AtomicUsize,
+}
+
+struct OwnerResolutionWorkerGuard {
+    activity: Arc<OwnerResolutionWorkerActivity>,
+}
+
+impl OwnerResolutionWorkerGuard {
+    fn new(activity: Arc<OwnerResolutionWorkerActivity>) -> Self {
+        activity.live.fetch_add(1, Relaxed);
+        Self { activity }
+    }
+}
+
+impl Drop for OwnerResolutionWorkerGuard {
+    fn drop(&mut self) {
+        self.activity.live.fetch_sub(1, Relaxed);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParticipantCompletionEvidence {
@@ -85,9 +114,27 @@ impl ParticipantCompletionEvidence {
 }
 
 #[derive(Default)]
+struct OwnerResolutionState {
+    requested: bool,
+    queued: bool,
+    attempt: u32,
+    retry_at_ms: i64,
+}
+
+struct OwnerEntry {
+    count: usize,
+    resolution: OwnerResolutionState,
+    previous: Option<OwnerKey>,
+    next: Option<OwnerKey>,
+}
+
+#[derive(Default)]
 struct OwnerIndex {
-    by_owner: HashMap<(TxnId, u64), usize>,
+    by_owner: HashMap<OwnerKey, OwnerEntry>,
     by_tid: HashMap<TxnId, usize>,
+    head: Option<OwnerKey>,
+    tail: Option<OwnerKey>,
+    resolution_cursor: Option<OwnerKey>,
 }
 
 impl OwnerIndex {
@@ -95,10 +142,33 @@ impl OwnerIndex {
         if count == 0 {
             return;
         }
-        *self
-            .by_owner
-            .entry((owner.tid, owner.coordinator_id))
-            .or_default() += count;
+        let key = (owner.tid, owner.coordinator_id);
+        if let Some(entry) = self.by_owner.get_mut(&key) {
+            entry.count += count;
+            *self.by_tid.entry(owner.tid).or_default() += count;
+            return;
+        }
+
+        let previous = self.tail;
+        self.by_owner.insert(
+            key,
+            OwnerEntry {
+                count,
+                resolution: OwnerResolutionState::default(),
+                previous,
+                next: None,
+            },
+        );
+        if let Some(previous) = previous {
+            self.by_owner
+                .get_mut(&previous)
+                .expect("owner discovery tail must remain indexed")
+                .next = Some(key);
+        } else {
+            self.head = Some(key);
+        }
+        self.tail = Some(key);
+        self.resolution_cursor.get_or_insert(key);
         *self.by_tid.entry(owner.tid).or_default() += count;
     }
 
@@ -106,12 +176,129 @@ impl OwnerIndex {
         if count == 0 {
             return;
         }
-        Self::subtract_count(
-            &mut self.by_owner,
-            &(owner.tid, owner.coordinator_id),
-            count,
-        );
+        let key = (owner.tid, owner.coordinator_id);
+        let remaining = self
+            .by_owner
+            .get(&key)
+            .expect("owner index transition must remove an existing owner")
+            .count
+            .checked_sub(count)
+            .expect("owner index transition must not underflow");
+        if remaining > 0 {
+            self.by_owner
+                .get_mut(&key)
+                .expect("owner index entry must remain present")
+                .count = remaining;
+        } else {
+            let removed = self
+                .by_owner
+                .remove(&key)
+                .expect("owner index entry must remain present");
+            if let Some(previous) = removed.previous {
+                self.by_owner
+                    .get_mut(&previous)
+                    .expect("owner discovery previous link must remain indexed")
+                    .next = removed.next;
+            } else {
+                self.head = removed.next;
+            }
+            if let Some(next) = removed.next {
+                self.by_owner
+                    .get_mut(&next)
+                    .expect("owner discovery next link must remain indexed")
+                    .previous = removed.previous;
+            } else {
+                self.tail = removed.previous;
+            }
+            if self.resolution_cursor == Some(key) {
+                self.resolution_cursor = removed.next.or(self.head);
+            }
+        }
         Self::subtract_count(&mut self.by_tid, &owner.tid, count);
+    }
+
+    fn contains_owner(&self, owner: &TxnPriority) -> bool {
+        self.by_owner
+            .contains_key(&(owner.tid, owner.coordinator_id))
+    }
+
+    fn request_resolution(&mut self, key: OwnerKey, now_ms: i64) -> bool {
+        let Some(entry) = self.by_owner.get_mut(&key) else {
+            return false;
+        };
+        entry.resolution.requested = true;
+        if entry.resolution.queued || now_ms < entry.resolution.retry_at_ms {
+            return false;
+        }
+        entry.resolution.queued = true;
+        true
+    }
+
+    fn release_queue_slot(&mut self, key: OwnerKey) {
+        if let Some(entry) = self.by_owner.get_mut(&key) {
+            entry.resolution.queued = false;
+        }
+    }
+
+    fn finish_resolution_attempt(&mut self, key: OwnerKey, now_ms: i64) {
+        let Some(entry) = self.by_owner.get_mut(&key) else {
+            return;
+        };
+        let backoff_ms = 10i64
+            .saturating_mul(1i64 << entry.resolution.attempt.min(6))
+            .min(1_000);
+        entry.resolution.attempt = entry.resolution.attempt.saturating_add(1);
+        entry.resolution.retry_at_ms = now_ms.saturating_add(backoff_ms);
+        entry.resolution.queued = false;
+    }
+
+    fn discover_resolution_candidates(
+        &mut self,
+        now_ms: i64,
+        visit_limit: usize,
+        candidate_limit: usize,
+    ) -> Vec<OwnerKey> {
+        if candidate_limit == 0 {
+            return Vec::new();
+        }
+        let visit_count = self.by_owner.len().min(visit_limit);
+        let mut current = self.resolution_cursor.or(self.head);
+        let mut candidates = Vec::with_capacity(visit_count.min(candidate_limit));
+        for _ in 0..visit_count {
+            let Some(key) = current else {
+                break;
+            };
+            let next = self
+                .by_owner
+                .get(&key)
+                .and_then(|entry| entry.next)
+                .or(self.head);
+            let entry = self
+                .by_owner
+                .get_mut(&key)
+                .expect("owner discovery cursor must reference canonical ownership");
+            if entry.resolution.requested
+                && !entry.resolution.queued
+                && now_ms >= entry.resolution.retry_at_ms
+            {
+                entry.resolution.queued = true;
+                candidates.push(key);
+            }
+            current = next;
+            if candidates.len() == candidate_limit {
+                break;
+            }
+        }
+        self.resolution_cursor = current;
+        candidates
+    }
+
+    #[cfg(test)]
+    fn requested_resolution_count(&self) -> usize {
+        self.by_owner
+            .values()
+            .filter(|entry| entry.resolution.requested)
+            .count()
     }
 
     fn subtract_count<K: Eq + Hash + Copy>(counts: &mut HashMap<K, usize>, key: &K, count: usize) {
@@ -600,17 +787,36 @@ impl Drop for AbortCannotEndHandle {
 }
 
 #[cfg(test)]
-static ABORT_CANNOT_END_HOOKS: OnceLock<Mutex<BTreeSet<(TxnId, Id)>>> = OnceLock::new();
+static ABORT_CANNOT_END_HOOKS: OnceLock<Mutex<BTreeMap<(TxnId, Id), bool>>> = OnceLock::new();
 
 #[cfg(test)]
-fn abort_cannot_end_hooks() -> &'static Mutex<BTreeSet<(TxnId, Id)>> {
-    ABORT_CANNOT_END_HOOKS.get_or_init(|| Mutex::new(BTreeSet::new()))
+fn abort_cannot_end_hooks() -> &'static Mutex<BTreeMap<(TxnId, Id), bool>> {
+    ABORT_CANNOT_END_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
 pub(crate) fn install_abort_cannot_end_for_cell(tid: TxnId, id: Id) -> AbortCannotEndHandle {
+    install_abort_cannot_end_for_cell_with_mode(tid, id, false)
+}
+
+#[cfg(test)]
+pub(crate) fn install_persistent_abort_cannot_end_for_cell(
+    tid: TxnId,
+    id: Id,
+) -> AbortCannotEndHandle {
+    install_abort_cannot_end_for_cell_with_mode(tid, id, true)
+}
+
+#[cfg(test)]
+fn install_abort_cannot_end_for_cell_with_mode(
+    tid: TxnId,
+    id: Id,
+    persistent: bool,
+) -> AbortCannotEndHandle {
     let key = (tid, id);
-    abort_cannot_end_hooks().lock().insert(key.clone());
+    abort_cannot_end_hooks()
+        .lock()
+        .insert(key.clone(), persistent);
     AbortCannotEndHandle { key }
 }
 
@@ -730,14 +936,14 @@ impl Transaction {
 }
 
 pub struct DataManager {
-    self_ref: Weak<DataManager>,
     cells: LFMap<Id, Arc<Mutex<CellMeta>>>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: LinkedList<Id>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
     txn_registry_lock: Mutex<()>,
     cell_cleanup_lock: Mutex<()>,
-    resolving_owners: Mutex<BTreeSet<(TxnId, u64)>>,
+    owner_resolution_sender: mpsc::Sender<OwnerKey>,
+    owner_resolution_worker_activity: Arc<OwnerResolutionWorkerActivity>,
     owner_index: Mutex<OwnerIndex>,
     participant_lifecycle_shards: [Mutex<()>; PARTICIPANT_LIFECYCLE_SHARD_COUNT],
     participant_completions: Mutex<HashMap<TxnId, ParticipantCompletionEvidence>>,
@@ -929,6 +1135,9 @@ impl DataManager {
     ) -> Arc<Self> {
         assert!(lock_timeout_ms > 0, "lock timeout must be positive");
         let cleanup_signal = Arc::new(AtomicBool::new(false));
+        let (owner_resolution_sender, owner_resolution_receiver) =
+            mpsc::channel(OWNER_RESOLUTION_QUEUE_CAPACITY);
+        let owner_resolution_worker_activity = Arc::new(OwnerResolutionWorkerActivity::default());
         let (participant_completions, participant_completion_cache_ready) =
             match database_runtime.undo_log() {
                 Some(undo_log) => match undo_log.participant_completion_cache_at(get_time()) {
@@ -954,15 +1163,15 @@ impl DataManager {
                 },
                 None => (HashMap::new(), true),
             };
-        let manager = Arc::new_cyclic(|self_ref| Self {
-            self_ref: self_ref.clone(),
+        let manager = Arc::new(Self {
             cells: LFMap::with_capacity(256),
             txns: LFMap::with_capacity(128),
             cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
             txn_registry_lock: Mutex::new(()),
             cell_cleanup_lock: Mutex::new(()),
-            resolving_owners: Mutex::new(BTreeSet::new()),
+            owner_resolution_sender,
+            owner_resolution_worker_activity: owner_resolution_worker_activity.clone(),
             owner_index: Mutex::new(OwnerIndex::default()),
             participant_lifecycle_shards: std::array::from_fn(|_| Mutex::new(())),
             participant_completions: Mutex::new(participant_completions),
@@ -980,26 +1189,38 @@ impl DataManager {
         });
         #[cfg(test)]
         register_data_manager_for_test(&manager);
+        Self::spawn_owner_resolution_worker(
+            &manager,
+            owner_resolution_receiver,
+            owner_resolution_worker_activity,
+        );
 
-        let manager_clone = manager.clone();
+        let manager_ref = Arc::downgrade(&manager);
         tokio::spawn(async move {
             loop {
-                manager_clone.prune_participant_completions_at(get_time());
+                let Some(manager) = manager_ref.upgrade() else {
+                    break;
+                };
+                manager.prune_participant_completions_at(get_time());
                 if cleanup_signal.load(Relaxed) {
-                    manager_clone.cell_meta_cleanup().await;
+                    manager.cell_meta_cleanup().await;
                     cleanup_signal.store(false, Relaxed);
                 }
+                drop(manager);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
 
         // Spawn undo log trimming task if undo log is enabled
         if manager.undo_log().is_some() {
-            let manager_clone = manager.clone();
+            let manager_ref = Arc::downgrade(&manager);
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(300)).await; // Trim every 5 minutes
-                    if let Some(undo_log) = manager_clone.undo_log() {
+                    let Some(manager) = manager_ref.upgrade() else {
+                        break;
+                    };
+                    if let Some(undo_log) = manager.undo_log() {
                         if let Err(e) = undo_log.trim_old_logs() {
                             error!("Failed to trim undo logs: {:?}", e);
                         } else {
@@ -1012,6 +1233,51 @@ impl DataManager {
 
         return manager;
     }
+
+    fn spawn_owner_resolution_worker(
+        manager: &Arc<Self>,
+        mut receiver: mpsc::Receiver<OwnerKey>,
+        activity: Arc<OwnerResolutionWorkerActivity>,
+    ) {
+        let manager_ref = Arc::downgrade(manager);
+        tokio::spawn(async move {
+            let _worker_guard = OwnerResolutionWorkerGuard::new(activity);
+            let mut discovery = tokio::time::interval(Duration::from_millis(
+                OWNER_RESOLUTION_DISCOVERY_INTERVAL_MS,
+            ));
+            discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    owner_key = receiver.recv() => {
+                        let Some(owner_key) = owner_key else {
+                            break;
+                        };
+                        tokio::time::sleep(Duration::from_millis(
+                            OWNER_RESOLUTION_MIN_ATTEMPT_INTERVAL_MS,
+                        ))
+                        .await;
+                        let Some(manager) = manager_ref.upgrade() else {
+                            break;
+                        };
+                        let owner = TxnPriority::new(owner_key.0, owner_key.1);
+                        manager.resolve_stale_owner_once(&owner).await;
+                        manager
+                            .owner_index
+                            .lock()
+                            .finish_resolution_attempt(owner_key, get_time());
+                        manager.refill_owner_resolution_queue();
+                    }
+                    _ = discovery.tick() => {
+                        let Some(manager) = manager_ref.upgrade() else {
+                            break;
+                        };
+                        manager.refill_owner_resolution_queue();
+                    }
+                }
+            }
+        });
+    }
+
     fn update_clock(&self, clock: Hlc) {
         self.hlc.observe(clock);
     }
@@ -1038,6 +1304,14 @@ impl DataManager {
 
     fn cached_participant_completion_at(&self, tid: &TxnId, now_ms: i64) -> Option<TxnState> {
         let mut completions = self.participant_completions.lock();
+        Self::cached_participant_completion_from(&mut completions, tid, now_ms)
+    }
+
+    fn cached_participant_completion_from(
+        completions: &mut HashMap<TxnId, ParticipantCompletionEvidence>,
+        tid: &TxnId,
+        now_ms: i64,
+    ) -> Option<TxnState> {
         match completions.get(tid).copied() {
             Some(completion) => match completion.outcome_at(now_ms) {
                 Some(outcome) => Some(outcome),
@@ -1207,10 +1481,7 @@ impl DataManager {
     }
 
     fn owner_is_present(&self, owner: &TxnPriority) -> bool {
-        self.owner_index
-            .lock()
-            .by_owner
-            .contains_key(&(owner.tid, owner.coordinator_id))
+        self.owner_index.lock().contains_owner(owner)
     }
 
     fn transaction_owner_is_present(&self, tid: &TxnId) -> bool {
@@ -1227,28 +1498,36 @@ impl DataManager {
 
     fn queue_stale_owner_resolution(&self, owner: TxnPriority) {
         let key = (owner.tid, owner.coordinator_id);
-        if !self.resolving_owners.lock().insert(key) {
+        if !self.owner_index.lock().request_resolution(key, get_time()) {
             return;
         }
+        self.enqueue_owner_resolution_key(key);
+    }
 
-        let manager = self.self_ref.clone();
-        tokio::spawn(async move {
-            let mut attempt = 0u32;
-            loop {
-                let Some(manager) = manager.upgrade() else {
-                    return;
-                };
-                if manager.resolve_stale_owner_once(&owner).await {
-                    manager.resolving_owners.lock().remove(&key);
-                    return;
-                }
-                drop(manager);
+    fn enqueue_owner_resolution_key(&self, key: OwnerKey) {
+        if self.owner_resolution_sender.try_send(key).is_err() {
+            self.owner_index.lock().release_queue_slot(key);
+        }
+    }
 
-                let backoff_ms = 10u64.saturating_mul(1u64 << attempt.min(6)).min(1_000);
-                attempt = attempt.saturating_add(1);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+    fn refill_owner_resolution_queue(&self) {
+        let available_capacity = self
+            .owner_resolution_sender
+            .capacity()
+            .min(OWNER_RESOLUTION_DISCOVERY_BATCH);
+        if available_capacity == 0 {
+            return;
+        }
+        let candidates = self.owner_index.lock().discover_resolution_candidates(
+            get_time(),
+            OWNER_RESOLUTION_DISCOVERY_BATCH,
+            available_capacity,
+        );
+        for key in candidates {
+            if self.owner_resolution_sender.try_send(key).is_err() {
+                self.owner_index.lock().release_queue_slot(key);
             }
-        });
+        }
     }
 
     #[cfg(test)]
@@ -1262,7 +1541,22 @@ impl DataManager {
 
     #[cfg(test)]
     fn queued_resolution_count_for_test(&self) -> usize {
-        self.resolving_owners.lock().len()
+        self.owner_index.lock().requested_resolution_count()
+    }
+
+    #[cfg(test)]
+    fn resolver_scheduled_storage_len_for_test(&self) -> usize {
+        OWNER_RESOLUTION_QUEUE_CAPACITY - self.owner_resolution_sender.capacity()
+    }
+
+    #[cfg(test)]
+    fn resolver_worker_cardinality_for_test(&self) -> usize {
+        self.owner_resolution_worker_activity.live.load(Relaxed)
+    }
+
+    #[cfg(test)]
+    fn total_resolution_attempt_count_for_test(&self) -> u64 {
+        self.resolution_attempts.lock().values().copied().sum()
     }
 
     #[cfg(test)]
@@ -1481,14 +1775,17 @@ impl DataManager {
     #[cfg(test)]
     fn take_matching_abort_cannot_end(tid: &TxnId, affected_cells: &[Id]) -> bool {
         let mut hooks = abort_cannot_end_hooks().lock();
-        let Some(key) = affected_cells
+        let Some((key, persistent)) = affected_cells
             .iter()
             .map(|id| (tid.clone(), *id))
-            .find(|key| hooks.contains(key))
+            .find_map(|key| hooks.get(&key).copied().map(|persistent| (key, persistent)))
         else {
             return false;
         };
-        hooks.remove(&key)
+        if !persistent {
+            hooks.remove(&key);
+        }
+        true
     }
 
     #[cfg(test)]
@@ -4409,14 +4706,10 @@ mod tests {
                 .payload,
             AbortResult::CheckFailed(CheckError::NotExisted)
         );
+        let targeted_expiry = get_time();
         manager.participant_completions.lock().insert(
             unknown_tid,
-            ParticipantCompletionEvidence::durable(TxnState::Aborted, Some(get_time())),
-        );
-        let unrelated_expired_tid = manager.hlc.now();
-        manager.participant_completions.lock().insert(
-            unrelated_expired_tid,
-            ParticipantCompletionEvidence::durable(TxnState::Committed, Some(get_time())),
+            ParticipantCompletionEvidence::durable(TxnState::Aborted, Some(targeted_expiry)),
         );
         assert_eq!(
             <DataManager as Service>::end(&manager, manager.hlc.now(), unknown_tid)
@@ -4425,14 +4718,37 @@ mod tests {
             EndResult::CheckFailed(CheckError::NotExisted),
             "evidence expires at the strict logical deadline"
         );
+
+        let targeted_tid = manager.hlc.now();
+        let unrelated_expired_tid = manager.hlc.now();
+        let mut targeted_cache = HashMap::from([
+            (
+                targeted_tid,
+                ParticipantCompletionEvidence::durable(TxnState::Aborted, Some(targeted_expiry)),
+            ),
+            (
+                unrelated_expired_tid,
+                ParticipantCompletionEvidence::durable(TxnState::Committed, Some(targeted_expiry)),
+            ),
+        ]);
+        assert_eq!(
+            DataManager::cached_participant_completion_from(
+                &mut targeted_cache,
+                &targeted_tid,
+                targeted_expiry,
+            ),
+            None
+        );
         assert!(
-            manager
-                .participant_completions
-                .lock()
-                .contains_key(&unrelated_expired_tid),
+            targeted_cache.contains_key(&unrelated_expired_tid),
             "ordinary evidence lookup must expire only its requested TID, not scan the cache"
         );
-        manager.prune_participant_completions_at(get_time());
+
+        manager.participant_completions.lock().insert(
+            unrelated_expired_tid,
+            ParticipantCompletionEvidence::durable(TxnState::Committed, Some(targeted_expiry)),
+        );
+        manager.prune_participant_completions_at(targeted_expiry);
         assert!(
             !manager
                 .participant_completions
@@ -4498,6 +4814,212 @@ mod tests {
             Id::new(0, 90503),
         )
         .await;
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_owner_resolver_uses_one_worker_and_bounded_scheduling_storage() {
+        let address = "127.0.0.1:5491";
+        let group = "txn_data_site_bounded_owner_resolver";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let manager = DataManager::new_with_lock_timeout(runtime, server.hlc.clone(), 5);
+        let unavailable_coordinator = server.server_id.wrapping_add(1_000_000);
+
+        for sequence in 0..2_048u64 {
+            let owner = TxnPriority::new(
+                test_hlc(90_000 + sequence, unavailable_coordinator),
+                unavailable_coordinator,
+            );
+            manager.owner_index.lock().add(&owner, 1);
+            manager.queue_stale_owner_resolution(owner);
+        }
+
+        assert!(
+            manager.resolver_scheduled_storage_len_for_test() <= 256,
+            "ready/delay scheduling storage must remain at its fixed capacity"
+        );
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while manager.resolver_worker_cardinality_for_test() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the one configured resolver worker must start");
+        assert_eq!(
+            manager.resolver_worker_cardinality_for_test(),
+            1,
+            "all stale owners must share one central resolver worker"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_owner_resolver_globally_bounds_immediate_rpc_attempt_rate() {
+        let address = "127.0.0.1:5492";
+        let group = "txn_data_site_bounded_owner_rpc_rate";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let manager = DataManager::new_with_lock_timeout(runtime, server.hlc.clone(), 5);
+        let unavailable_coordinator = server.server_id.wrapping_add(1_000_001);
+
+        for sequence in 0..512u64 {
+            let owner = TxnPriority::new(
+                test_hlc(100_000 + sequence, unavailable_coordinator),
+                unavailable_coordinator,
+            );
+            manager.owner_index.lock().add(&owner, 1);
+            manager.queue_stale_owner_resolution(owner);
+        }
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            manager.total_resolution_attempt_count_for_test() <= 64,
+            "a stale-owner flood must not issue one immediate RPC per owner"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_owner_resolver_fairly_reaches_late_work_after_decision_appears() {
+        let address = "127.0.0.1:5493";
+        let group = "txn_data_site_fair_owner_resolver";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 5);
+        let first_unknown_owner =
+            TxnPriority::new(test_hlc(110_000, server.server_id), server.server_id);
+
+        for sequence in 0..1_024u64 {
+            let owner = TxnPriority::new(
+                test_hlc(110_000 + sequence, server.server_id),
+                server.server_id,
+            );
+            manager.owner_index.lock().add(&owner, 1);
+            manager.queue_stale_owner_resolution(owner);
+        }
+
+        let coordinator = runtime.txn_manager().expect("transaction manager").clone();
+        let tail_tid =
+            <super::super::manager::TransactionManager as super::super::manager::Service>::begin(
+                &coordinator,
+            )
+            .await
+            .unwrap();
+        let tail_owner = TxnPriority::new(tail_tid, server.server_id);
+        let tail_cell = Id::new(0, 90520);
+        {
+            let txn_lock = manager.get_or_create_transaction(&tail_tid);
+            let mut txn = txn_lock.lock();
+            txn.state = TxnState::Prepared;
+            txn.certified.insert(
+                tail_cell,
+                PrepareOp {
+                    id: tail_cell,
+                    expectation: CellExpectation::Absent(None),
+                    intent: PrepareIntent::Write,
+                },
+            );
+            txn.affected_cells = vec![tail_cell];
+            txn.coordinator_id = Some(server.server_id);
+            txn.last_activity = get_time();
+        }
+        {
+            let meta = manager.cell_meta_mutex(&tail_cell);
+            let mut meta = meta.lock();
+            meta.owner = Some(tail_owner.clone());
+            meta.lock_acquired_at = Some(get_time());
+        }
+        manager.owner_index.lock().add(&tail_owner, 1);
+        manager.queue_stale_owner_resolution(tail_owner.clone());
+
+        let first_attempt = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if manager.resolution_attempt_count_for_test(&tail_owner) > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(
+            first_attempt.is_ok(),
+            "rotating discovery must fairly reach late canonical work; total attempts={}, scheduled={}, pending={}, cursor={:?}",
+            manager.total_resolution_attempt_count_for_test(),
+            manager.resolver_scheduled_storage_len_for_test(),
+            manager.queued_resolution_count_for_test(),
+            manager.owner_index.lock().resolution_cursor,
+        );
+        assert!(
+            manager.owner_is_present(&tail_owner),
+            "InProgress must retain the exact late owner"
+        );
+
+        assert_eq!(
+            <super::super::manager::TransactionManager as super::super::manager::Service>::abort(
+                &coordinator,
+                tail_tid,
+            )
+            .await
+            .unwrap(),
+            AbortResult::Success(None)
+        );
+        let convergence = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if !manager.owner_is_present(&tail_owner) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(
+            convergence.is_ok(),
+            "late work must converge after an explicit decision appears; tail attempts={}, total attempts={}, scheduled={}, pending={}",
+            manager.resolution_attempt_count_for_test(&tail_owner),
+            manager.total_resolution_attempt_count_for_test(),
+            manager.resolver_scheduled_storage_len_for_test(),
+            manager.queued_resolution_count_for_test(),
+        );
+        assert!(
+            manager.owner_is_present(&first_unknown_owner),
+            "Unknown must remain unresolved while other work converges"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_data_manager_terminates_background_workers_without_a_strong_arc_leak() {
+        let address = "127.0.0.1:5494";
+        let group = "txn_data_site_owner_resolver_drop";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let manager = DataManager::new_with_lock_timeout(runtime, server.hlc.clone(), 5);
+        let manager_ref = Arc::downgrade(&manager);
+        let worker_activity = manager.owner_resolution_worker_activity.clone();
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while worker_activity.live.load(Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the central resolver worker must start");
+
+        drop(manager);
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if manager_ref.upgrade().is_none() && worker_activity.live.load(Relaxed) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background workers must not retain DataManager indefinitely");
 
         server.shutdown().await;
     }

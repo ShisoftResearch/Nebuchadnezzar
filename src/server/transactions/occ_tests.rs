@@ -697,7 +697,7 @@ async fn participant_delay_after_peer_install_never_exposes_partial_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn commit_stage_failure_preserves_installed_peer_barrier() {
+async fn commit_stage_failure_compensates_installed_peer_and_resolves_abort() {
     let _ = env_logger::try_init();
     let addresses = ["127.0.0.1:5406", "127.0.0.1:5407"];
     let group = "txn_occ_commit_failure_pending_barrier";
@@ -802,11 +802,7 @@ async fn commit_stage_failure_preserves_installed_peer_barrier() {
         prepare_task.await.unwrap(),
         TMPrepareResult::DMCommitError(DMCommitResult::CellChanged(second_id))
     );
-    assert_eq!(
-        manager.transaction_count(),
-        1,
-        "coordinator state must remain for later explicit resolution"
-    );
+    wait_for_transaction_count(&manager, 0, Duration::from_secs(2)).await;
     assert_eq!(
         transactions::data_site::participant_owner_for_test(
             first_server_id,
@@ -814,32 +810,36 @@ async fn commit_stage_failure_preserves_installed_peer_barrier() {
             group,
             &first_id,
         ),
-        Some(TxnPriority::new(tid, servers[0].server_id)),
-        "participant A must retain the exact transaction/coordinator owner"
+        None,
+        "the already-installed peer must be compensated and released"
     );
-    assert!(matches!(
-        first_runtime
-            .chunks()
-            .read_cell_snapshot(&first_id, u64::MAX)
-            .unwrap(),
-        crate::ram::cell::SnapshotRead::Wait
-    ));
-
-    let first_server_index = servers
-        .iter()
-        .position(|server| server.server_id == first_server_id)
-        .unwrap();
-    let first_site =
-        scoped_data_site_client_for_database(addresses[first_server_index], group, group).await;
-    let reader_tid = servers_by_id[&first_server_id].hlc.now();
-    assert!(matches!(
-        first_site
-            .read(first_server_id, reader_tid, reader_tid, first_id)
-            .await
-            .unwrap()
-            .payload,
-        TxnExecResult::Wait
-    ));
+    assert_eq!(
+        txn.resolve(tid).await.unwrap().unwrap(),
+        TxnResolution::Abort
+    );
+    assert_eq!(
+        score_of(
+            &first_runtime
+                .chunks()
+                .read_cell(&first_id)
+                .unwrap()
+                .to_owned()
+        ),
+        1,
+        "compensation must restore the pre-transaction value"
+    );
+    assert_eq!(
+        score_of(
+            &servers_by_id[&second_server_id]
+                .current_database()
+                .chunks()
+                .read_cell(&second_id)
+                .unwrap()
+                .to_owned()
+        ),
+        99,
+        "the independent conflicting write must remain authoritative"
+    );
 
     for server in servers {
         server.shutdown().await;
@@ -1538,10 +1538,12 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
         0,
         "stale cleanup must skip the partial-failure abort handoff"
     );
-    assert_eq!(
-        txn.resolve(tid).await.unwrap().unwrap(),
-        TxnResolution::InProgress,
-        "dispatch remains explicitly resolvable until abort cleanup completes"
+    assert!(
+        matches!(
+            txn.resolve(tid).await.unwrap().unwrap(),
+            TxnResolution::InProgress | TxnResolution::Abort
+        ),
+        "resolution may advance only from dispatch intent to the explicit Abort choice"
     );
     abort_delay.release();
 
@@ -1928,10 +1930,14 @@ async fn volatile_end_response_loss_waits_for_retirement_before_starting_ttl() {
         ),
         "a delayed duplicate prepare must remain rejected after more than 300s while retirement is unfinalized"
     );
-    assert!(matches!(
-        txn.abort(tid).await.unwrap().unwrap(),
-        AbortResult::Success(None)
-    ));
+    let retry_result = txn.abort(tid).await.unwrap().unwrap();
+    assert!(
+        matches!(
+            retry_result,
+            AbortResult::Success(None) | AbortResult::CheckFailed(CheckError::AlreadyCleanup)
+        ),
+        "abort retry after lost end response returned {retry_result:?}"
+    );
     timeout(Duration::from_secs(2), async {
         loop {
             if transactions::data_site::participant_completion_for_test(
@@ -2211,8 +2217,8 @@ async fn coordinator_decision_marker_failure_keeps_commit_irrevocable_and_retrya
             .unwrap()
             .coordinator_decision(&tid)
             .unwrap(),
-        None,
-        "the injected pre-write failure leaves no durable record yet"
+        Some(TxnResolution::InProgress),
+        "the injected final-decision failure preserves the durable pre-dispatch intent"
     );
 
     let end_failure = transactions::data_site::install_end_promotion_failure(tid, cell_id);
@@ -2282,27 +2288,34 @@ async fn coordinator_abort_marker_failure_defers_compensation_until_retry_is_dur
         .undo_log()
         .unwrap()
         .fail_next_coordinator_abort_decision_for_test();
+    let abort_failure =
+        transactions::data_site::install_persistent_abort_cannot_end_for_cell(tid, cell_id);
     assert_eq!(
         txn.abort(tid).await.unwrap().unwrap(),
         AbortResult::CheckFailed(CheckError::CannotEnd)
     );
-    assert_eq!(
-        txn.resolve(tid).await.unwrap().unwrap(),
-        TxnResolution::InProgress,
-        "participants must not compensate until the global Abort record is durable"
+    assert!(
+        matches!(
+            txn.resolve(tid).await.unwrap().unwrap(),
+            TxnResolution::InProgress | TxnResolution::Abort
+        ),
+        "resolution may advance only from dispatch intent to durable Abort"
     );
     assert_eq!(
         txn.commit(tid).await.unwrap(),
         Err(TMError::InvalidTransactionState(TxnState::Aborted)),
         "the in-memory Abort choice is irrevocable even while its record retries"
     );
-    assert_eq!(
-        runtime
-            .undo_log()
-            .unwrap()
-            .coordinator_decision(&tid)
-            .unwrap(),
-        None
+    assert!(
+        matches!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .coordinator_decision(&tid)
+                .unwrap(),
+            Some(TxnResolution::InProgress | TxnResolution::Abort)
+        ),
+        "the pre-dispatch intent remains fail-closed until background Abort persistence succeeds"
     );
     assert!(
         runtime
@@ -2314,11 +2327,22 @@ async fn coordinator_abort_marker_failure_defers_compensation_until_retry_is_dur
         "failed decision persistence must leave participant undo unresolved"
     );
 
-    let abort_failure = transactions::data_site::install_abort_cannot_end_for_cell(tid, cell_id);
-    assert_eq!(
-        txn.abort(tid).await.unwrap().unwrap(),
-        AbortResult::CheckFailed(CheckError::CannotEnd)
-    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime
+                .undo_log()
+                .unwrap()
+                .coordinator_decision(&tid)
+                .unwrap()
+                == Some(TxnResolution::Abort)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background cleanup must retry the failed Abort decision");
     assert_eq!(
         runtime
             .undo_log()
@@ -2342,6 +2366,256 @@ async fn coordinator_abort_marker_failure_defers_compensation_until_retry_is_dur
         score_of(&runtime.chunks().read_cell(&cell_id).unwrap().to_owned()),
         1
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_abort_retries_decision_and_participant_cleanup_after_caller_disappears() {
+    let _ = env_logger::try_init();
+    let storage = TempDir::new().unwrap();
+    let address = "127.0.0.1:5435";
+    let group = "txn_occ_background_abort_retry";
+    let server = start_durable_occ_test_server(address, group, &storage).await;
+    let runtime = server.current_database();
+    let manager = runtime.txn_manager().unwrap().clone();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90_172);
+    let mut original = counter_cell(schema.id, cell_id, 1, "background-abort-original");
+    runtime.chunks().write_cell(&mut original).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, cell_id, 2, "background-abort-pending"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            server.server_id,
+            group,
+            group,
+            &cell_id,
+        ),
+        Some(TxnPriority::new(tid, server.server_id))
+    );
+
+    runtime
+        .undo_log()
+        .unwrap()
+        .fail_next_coordinator_abort_decision_for_test();
+    let participant_failure =
+        transactions::data_site::install_persistent_abort_cannot_end_for_cell(tid, cell_id);
+    assert_eq!(
+        txn.abort(tid).await.unwrap().unwrap(),
+        AbortResult::CheckFailed(CheckError::CannotEnd),
+        "the caller observes the injected first decision persistence failure"
+    );
+    assert_eq!(
+        txn.resolve(tid).await.unwrap().unwrap(),
+        TxnResolution::InProgress
+    );
+
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if runtime
+                .undo_log()
+                .unwrap()
+                .coordinator_decision(&tid)
+                .unwrap()
+                == Some(TxnResolution::Abort)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background cleanup must retry the transient Abort decision failure");
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            server.server_id,
+            group,
+            group,
+            &cell_id,
+        ),
+        Some(TxnPriority::new(tid, server.server_id)),
+        "the injected first participant cleanup failure must retain ownership"
+    );
+
+    drop(participant_failure);
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let completed = matches!(
+                runtime
+                    .undo_log()
+                    .unwrap()
+                    .coordinator_status(&tid)
+                    .unwrap(),
+                Some(undo_log::CoordinatorStatus::Completed(ref record))
+                    if record.resolution == TxnResolution::Abort
+            );
+            if completed
+                && manager.transaction_count() == 0
+                && transactions::data_site::participant_owner_for_test(
+                    server.server_id,
+                    group,
+                    group,
+                    &cell_id,
+                )
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background cleanup must retry participant abort/end and final completion");
+    assert_eq!(
+        score_of(&runtime.chunks().read_cell(&cell_id).unwrap().to_owned()),
+        1
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_dispatch_intent_is_rediscovered_and_aborted_without_a_live_coordinator() {
+    let _ = env_logger::try_init();
+    let storage = TempDir::new().unwrap();
+    let address = "127.0.0.1:5436";
+    let group = "txn_occ_dispatch_intent_restart_abort";
+    let server = start_durable_occ_test_server(address, group, &storage).await;
+    let runtime = server.current_database();
+    let manager = runtime.txn_manager().unwrap().clone();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90_173);
+    let mut original = counter_cell(schema.id, cell_id, 1, "intent-restart-original");
+    runtime.chunks().write_cell(&mut original).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, cell_id, 2, "intent-restart-pending"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        runtime
+            .undo_log()
+            .unwrap()
+            .coordinator_decision(&tid)
+            .unwrap(),
+        Some(TxnResolution::InProgress),
+        "the exact participant target set must be durable before dispatch"
+    );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            server.server_id,
+            group,
+            group,
+            &cell_id,
+        ),
+        Some(TxnPriority::new(tid, server.server_id))
+    );
+
+    manager.forget_transaction_for_test(&tid);
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let completed = matches!(
+                runtime
+                    .undo_log()
+                    .unwrap()
+                    .coordinator_status(&tid)
+                    .unwrap(),
+                Some(undo_log::CoordinatorStatus::Completed(ref record))
+                    if record.resolution == TxnResolution::Abort
+            );
+            if completed
+                && transactions::data_site::participant_owner_for_test(
+                    server.server_id,
+                    group,
+                    group,
+                    &cell_id,
+                )
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("maintenance must rediscover and complete the abandoned durable dispatch intent");
+    assert_eq!(
+        score_of(&runtime.chunks().read_cell(&cell_id).unwrap().to_owned()),
+        1
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undispatched_intent_target_not_existed_completes_without_retirement_obligation() {
+    let _ = env_logger::try_init();
+    let storage = TempDir::new().unwrap();
+    let address = "127.0.0.1:5437";
+    let group = "txn_occ_undispatched_intent_absence";
+    let server = start_durable_occ_test_server(address, group, &storage).await;
+    let runtime = server.current_database();
+    let tid = server.hlc.now();
+    runtime
+        .undo_log()
+        .unwrap()
+        .write_coordinator_dispatch_intent(&tid, &[server.server_id])
+        .unwrap();
+
+    let completion = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(undo_log::CoordinatorStatus::Completed(record)) = runtime
+                .undo_log()
+                .unwrap()
+                .coordinator_status(&tid)
+                .unwrap()
+            {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a conclusively absent participant must not cause an infinite Abort cleanup loop");
+    assert_eq!(completion.resolution, TxnResolution::Abort);
+    assert!(
+        completion.participants.is_empty(),
+        "NotExisted proves cleanup but creates no participant retirement evidence"
+    );
+    assert!(runtime
+        .undo_log()
+        .unwrap()
+        .coordinator_retirement_candidates(8)
+        .unwrap()
+        .is_empty());
 
     server.shutdown().await;
 }
@@ -2605,8 +2879,8 @@ async fn partial_abort_failure_retains_all_site_owners_until_retry_resolves_ever
         TMPrepareResult::Success
     );
 
-    let _forced_failure =
-        transactions::data_site::install_abort_cannot_end_for_cell(tid.clone(), fail_id);
+    let forced_failure =
+        transactions::data_site::install_persistent_abort_cannot_end_for_cell(tid.clone(), fail_id);
     assert_eq!(
         txn.abort(tid.clone()).await.unwrap().unwrap(),
         AbortResult::CheckFailed(CheckError::CannotEnd)
@@ -2648,10 +2922,15 @@ async fn partial_abort_failure_retains_all_site_owners_until_retry_resolves_ever
     );
     abort_txn(&txn, probe_tid).await;
 
-    assert!(matches!(
-        txn.abort(tid.clone()).await.unwrap().unwrap(),
-        AbortResult::Success(_)
-    ));
+    drop(forced_failure);
+    let retry_result = txn.abort(tid.clone()).await.unwrap().unwrap();
+    assert!(
+        matches!(
+            retry_result,
+            AbortResult::Success(_) | AbortResult::CheckFailed(CheckError::AlreadyCleanup)
+        ),
+        "caller retry may race the queued background completion, got {retry_result:?}"
+    );
     assert_eq!(manager.transaction_count(), 0);
     assert_eq!(
         transactions::data_site::participant_owner_for_test(

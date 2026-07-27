@@ -11,8 +11,9 @@ use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
 use lightning::map::{Map as LFMapT, PtrHashMap as LFMap};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
+use std::ops::Bound::{Excluded, Unbounded};
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
 use futures::future::BoxFuture;
@@ -493,57 +494,87 @@ struct PointReadCache {
 
 const COMPLETED_DECISION_RETENTION_MS: i64 = 300_000;
 const RETIREMENT_DISCOVERY_BATCH: usize = 256;
+const ABORT_CLEANUP_QUEUE_CAPACITY: usize = 256;
+const ABORT_CLEANUP_DISCOVERY_BATCH: usize = 256;
 
 #[derive(Default)]
 struct RetirementDiscoveryState {
-    queue: VecDeque<TxnId>,
-    members: HashSet<TxnId>,
+    members: BTreeSet<TxnId>,
+    cursor: Option<TxnId>,
 }
 
 impl RetirementDiscoveryState {
     fn insert(&mut self, tid: TxnId) {
-        if self.members.insert(tid) {
-            self.queue.push_back(tid);
-        }
+        self.members.insert(tid);
     }
 
     fn remove(&mut self, tid: &TxnId) {
         self.members.remove(tid);
+        if self.members.is_empty() {
+            self.cursor = None;
+        }
     }
 
     fn candidates(&mut self, limit: usize) -> Vec<TxnId> {
+        if self.members.is_empty() || limit == 0 {
+            return Vec::new();
+        }
         let mut candidates = Vec::with_capacity(limit.min(self.members.len()));
-        let mut examined = 0;
-        while examined < limit {
-            let Some(tid) = self.queue.pop_front() else {
-                break;
-            };
-            examined += 1;
-            if self.members.contains(&tid) {
-                candidates.push(tid);
-                self.queue.push_back(tid);
+        if let Some(after) = self.cursor {
+            candidates.extend(
+                self.members
+                    .range((Excluded(after), Unbounded))
+                    .take(limit)
+                    .copied(),
+            );
+            if candidates.len() < limit {
+                candidates.extend(
+                    self.members
+                        .range(..=after)
+                        .take(limit - candidates.len())
+                        .copied(),
+                );
             }
+        } else {
+            candidates.extend(self.members.iter().take(limit).copied());
+        }
+        if let Some(last) = candidates.last() {
+            self.cursor = Some(*last);
         }
         candidates
+    }
+
+    #[cfg(test)]
+    fn storage_len(&self) -> usize {
+        self.members.len()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DecisionRecord {
     resolution: TxnResolution,
-    expires_at_ms: i64,
+    expires_at_ms: Option<i64>,
 }
 
 impl DecisionRecord {
+    fn cleanup_pending(resolution: TxnResolution) -> Self {
+        Self {
+            resolution,
+            expires_at_ms: None,
+        }
+    }
+
     fn completed_at(resolution: TxnResolution, completed_at_ms: i64) -> Self {
         Self {
             resolution,
-            expires_at_ms: completed_at_ms.saturating_add(COMPLETED_DECISION_RETENTION_MS),
+            expires_at_ms: Some(completed_at_ms.saturating_add(COMPLETED_DECISION_RETENTION_MS)),
         }
     }
 
     fn resolution_at(&self, now_ms: i64) -> Option<TxnResolution> {
-        (now_ms < self.expires_at_ms).then_some(self.resolution)
+        self.expires_at_ms
+            .is_none_or(|expires_at_ms| now_ms < expires_at_ms)
+            .then_some(self.resolution)
     }
 }
 
@@ -551,13 +582,23 @@ const PREPARE_DISPATCH_CLOSED: usize = 1usize << (usize::BITS - 1);
 
 struct PrepareDispatchState {
     word: AtomicUsize,
+    abort_requested: AtomicBool,
 }
 
 impl PrepareDispatchState {
     fn new() -> Self {
         Self {
             word: AtomicUsize::new(0),
+            abort_requested: AtomicBool::new(false),
         }
+    }
+
+    fn request_abort(&self) {
+        self.abort_requested.store(true, Ordering::Release);
+    }
+
+    fn abort_requested(&self) -> bool {
+        self.abort_requested.load(Ordering::Acquire)
     }
 
     fn acquire(
@@ -622,18 +663,9 @@ impl PrepareDispatchGuard {
 impl Drop for PrepareDispatchGuard {
     fn drop(&mut self) {
         if self.cleanup_armed {
-            let previous = self.state.word.fetch_add(1, Ordering::AcqRel);
-            debug_assert!(previous > 0 && previous & PREPARE_DISPATCH_CLOSED == 0);
-            let state = self.state.clone();
-            let manager = self.manager.upgrade();
-            let tid = self.tid;
-            if let (Some(manager), Ok(runtime)) = (manager, tokio::runtime::Handle::try_current()) {
-                runtime.spawn(async move {
-                    let _ = manager.abort(tid).await;
-                    state.release();
-                });
-            } else {
-                state.release();
+            self.state.request_abort();
+            if let Some(manager) = self.manager.upgrade() {
+                manager.queue_abort_cleanup(self.tid);
             }
         }
         self.state.release();
@@ -645,9 +677,11 @@ struct Transaction {
     affected_objects: AffectedObjs,
     state: TxnState,
     prepare_dispatch: Arc<PrepareDispatchState>,
+    dispatch_participants: BTreeSet<u64>,
     commit_dispatch_started: bool,
     commit_hlc: Option<Hlc>,
     coordinator_decision_durable: bool,
+    abort_cleanup_finished: BTreeSet<u64>,
     completed_participants: BTreeSet<u64>,
     last_activity: i64, // Unix timestamp in milliseconds for detecting stale transactions
 }
@@ -681,6 +715,9 @@ pub struct TransactionManager {
     retirement_records: parking_lot::Mutex<HashMap<TxnId, undo_log::CoordinatorCompletionRecord>>,
     volatile_retirement_discovery: parking_lot::Mutex<RetirementDiscoveryState>,
     retirement_sender: mpsc::Sender<TxnId>,
+    abort_cleanup_sender: mpsc::Sender<TxnId>,
+    abort_cleanup_scheduled: parking_lot::Mutex<HashSet<TxnId>>,
+    abort_cleanup_cursor: parking_lot::Mutex<Option<TxnId>>,
     replay_locks: parking_lot::Mutex<HashMap<TxnId, Weak<Mutex<()>>>>,
     data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
     wait_config: WaitConfig,
@@ -711,6 +748,8 @@ impl TransactionManager {
     ) -> Arc<TransactionManager> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (retirement_sender, mut retirement_receiver) = mpsc::channel(256);
+        let (abort_cleanup_sender, mut abort_cleanup_receiver) =
+            mpsc::channel(ABORT_CLEANUP_QUEUE_CAPACITY);
         let manager = Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
             deps,
@@ -723,6 +762,9 @@ impl TransactionManager {
                 RetirementDiscoveryState::default(),
             ),
             retirement_sender,
+            abort_cleanup_sender,
+            abort_cleanup_scheduled: parking_lot::Mutex::new(HashSet::new()),
+            abort_cleanup_cursor: parking_lot::Mutex::new(None),
             replay_locks: parking_lot::Mutex::new(HashMap::new()),
             data_sites: LFMap::with_capacity(8),
             wait_config,
@@ -753,6 +795,7 @@ impl TransactionManager {
                 manager_clone.prune_completed_decisions_at(get_time());
                 manager_clone.prune_replay_locks();
                 manager_clone.restart_retirement_jobs();
+                manager_clone.restart_abort_cleanup_jobs();
 
                 // Clean up stale transactions (older than 5 minutes)
                 let cleaned = manager_clone.cleanup_stale_transactions(5 * 60 * 1000);
@@ -786,6 +829,27 @@ impl TransactionManager {
             }
         });
 
+        let abort_cleanup_manager = manager.self_ref.clone();
+        tokio::spawn(async move {
+            while let Some(tid) = abort_cleanup_receiver.recv().await {
+                let Some(manager) = abort_cleanup_manager.upgrade() else {
+                    return;
+                };
+                if manager.shutdown.load(Ordering::Relaxed) {
+                    manager.abort_cleanup_scheduled.lock().remove(&tid);
+                    return;
+                }
+                let result = <TransactionManager as Service>::abort(&manager, tid).await;
+                if let Err(error) = &result {
+                    debug!(
+                        "Background Abort cleanup attempt failed for {:?}: {:?}",
+                        tid, error
+                    );
+                }
+                manager.abort_cleanup_scheduled.lock().remove(&tid);
+            }
+        });
+
         let retirement_discovery_manager = manager.self_ref.clone();
         tokio::spawn(async move {
             loop {
@@ -804,6 +868,7 @@ impl TransactionManager {
         });
 
         manager.restart_retirement_jobs();
+        manager.restart_abort_cleanup_jobs();
 
         manager
     }
@@ -896,6 +961,92 @@ impl TransactionManager {
         }
     }
 
+    fn queue_abort_cleanup(&self, tid: TxnId) {
+        if !self.abort_cleanup_scheduled.lock().insert(tid) {
+            return;
+        }
+        if self.abort_cleanup_sender.try_send(tid).is_err() {
+            self.abort_cleanup_scheduled.lock().remove(&tid);
+        }
+    }
+
+    fn live_abort_cleanup_candidates(&self, limit: usize) -> Vec<TxnId> {
+        let tids = self.txn_ids.lock();
+        if tids.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut cursor = self.abort_cleanup_cursor.lock();
+        let mut candidates = Vec::with_capacity(limit.min(tids.len()));
+        if let Some(after) = *cursor {
+            candidates.extend(
+                tids.range((Excluded(after), Unbounded))
+                    .take(limit)
+                    .copied(),
+            );
+            if candidates.len() < limit {
+                candidates.extend(tids.range(..=after).take(limit - candidates.len()).copied());
+            }
+        } else {
+            candidates.extend(tids.iter().take(limit).copied());
+        }
+        if let Some(last) = candidates.last() {
+            *cursor = Some(*last);
+        }
+        candidates
+    }
+
+    fn restart_abort_cleanup_jobs(&self) {
+        let available_capacity = self
+            .abort_cleanup_sender
+            .capacity()
+            .min(ABORT_CLEANUP_DISCOVERY_BATCH);
+        if available_capacity == 0 {
+            return;
+        }
+        if let Some(undo_log) = self.deps.database_runtime.undo_log() {
+            match undo_log.coordinator_abort_cleanup_candidates(available_capacity) {
+                Ok(candidates) => {
+                    for tid in candidates {
+                        if let Some(txn) = self.transactions.get(&tid) {
+                            let should_abort = txn.try_lock().is_some_and(|txn| {
+                                txn.state == TxnState::Aborted
+                                    || txn.prepare_dispatch.abort_requested()
+                            });
+                            if should_abort {
+                                self.queue_abort_cleanup(tid);
+                            }
+                            continue;
+                        }
+                        self.queue_abort_cleanup(tid);
+                    }
+                }
+                Err(error) => {
+                    error!(
+                        "Failed to rediscover durable coordinator Abort cleanup: {:?}",
+                        error
+                    );
+                }
+            }
+        }
+        let remaining_capacity = self
+            .abort_cleanup_sender
+            .capacity()
+            .min(ABORT_CLEANUP_DISCOVERY_BATCH);
+        for tid in self.live_abort_cleanup_candidates(remaining_capacity) {
+            let Some(txn) = self.transactions.get(&tid) else {
+                self.txn_ids.lock().remove(&tid);
+                continue;
+            };
+            let Some(txn) = txn.try_lock() else {
+                continue;
+            };
+            if txn.state == TxnState::Aborted || txn.prepare_dispatch.abort_requested() {
+                drop(txn);
+                self.queue_abort_cleanup(tid);
+            }
+        }
+    }
+
     fn replay_lock(&self, tid: &TxnId) -> Arc<Mutex<()>> {
         let mut locks = self.replay_locks.lock();
         if let Some(lock) = locks.get(tid).and_then(Weak::upgrade) {
@@ -913,8 +1064,15 @@ impl TransactionManager {
     }
 
     fn restart_retirement_jobs(&self) {
+        let available_capacity = self
+            .retirement_sender
+            .capacity()
+            .min(RETIREMENT_DISCOVERY_BATCH);
+        if available_capacity == 0 {
+            return;
+        }
         if let Some(undo_log) = self.deps.database_runtime.undo_log() {
-            match undo_log.coordinator_retirement_candidates(RETIREMENT_DISCOVERY_BATCH) {
+            match undo_log.coordinator_retirement_candidates(available_capacity) {
                 Ok(candidates) => {
                     for tid in candidates {
                         self.queue_retirement(tid);
@@ -928,10 +1086,14 @@ impl TransactionManager {
                 }
             }
         }
+        let remaining_capacity = self
+            .retirement_sender
+            .capacity()
+            .min(RETIREMENT_DISCOVERY_BATCH);
         let volatile_candidates = self
             .volatile_retirement_discovery
             .lock()
-            .candidates(RETIREMENT_DISCOVERY_BATCH);
+            .candidates(remaining_capacity);
         for tid in volatile_candidates {
             self.queue_retirement(tid);
         }
@@ -1332,7 +1494,10 @@ impl Service for TransactionManager {
                 && txn.completed_participants.len() == txn.affected_objects.len()
             {
                 let resolution = TxnResolution::Commit(txn.commit_hlc.unwrap_or(tid));
-                match self.finish_transaction_guarded(&tid, &mut txn, resolution) {
+                match self
+                    .finish_transaction_guarded(&tid, &txn_lock, &mut txn, resolution)
+                    .await
+                {
                     Ok(completion) => {
                         if !completion.participants.is_empty() {
                             self.queue_retirement(tid);
@@ -1382,9 +1547,10 @@ impl Service for TransactionManager {
                 }
                 TxnState::Aborted => {}
             }
+            txn.prepare_dispatch.request_abort();
             txn.last_activity = get_time();
             if !txn.coordinator_decision_durable {
-                if txn.affected_objects.is_empty() {
+                if txn.dispatch_participants.is_empty() {
                     txn.coordinator_decision_durable = true;
                 } else {
                     if self
@@ -1394,10 +1560,12 @@ impl Service for TransactionManager {
                         .durable_storage_configured()
                         && self.deps.database_runtime.undo_log().is_none()
                     {
+                        self.queue_abort_cleanup(tid);
                         return Ok(AbortResult::CheckFailed(CheckError::CannotEnd));
                     }
                     if let Some(undo_log) = self.deps.database_runtime.undo_log() {
-                        let participants: Vec<_> = txn.affected_objects.keys().copied().collect();
+                        let participants: Vec<_> =
+                            txn.dispatch_participants.iter().copied().collect();
                         if let Err(error) =
                             undo_log.write_coordinator_abort_decision(&tid, &participants)
                         {
@@ -1405,31 +1573,48 @@ impl Service for TransactionManager {
                                 "Failed to persist coordinator abort decision for {:?}: {:?}",
                                 tid, error
                             );
+                            self.queue_abort_cleanup(tid);
                             return Ok(AbortResult::CheckFailed(CheckError::CannotEnd));
                         }
                     }
                     txn.coordinator_decision_durable = true;
                 }
             }
-            let changed_objs = &txn.affected_objects;
-            let mut result = match {
+            let changed_objs: AffectedObjs = txn
+                .dispatch_participants
+                .difference(&txn.abort_cleanup_finished)
+                .filter_map(|server_id| {
+                    txn.affected_objects
+                        .get(server_id)
+                        .cloned()
+                        .map(|objects| (*server_id, objects))
+                })
+                .collect();
+            let (mut result, cleanup_finished, ended_participants) = match {
                 #[cfg(feature = "occ_phase_profile")]
                 let _phase_guard = super::phase_profile::guard(
                     super::phase_profile::Phase::AbortParticipantLookup,
                 );
-                self.data_sites_for_objs(changed_objs).await
+                self.data_sites_for_objs(&changed_objs).await
             } {
                 Ok(data_sites) => {
                     debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard =
                         super::phase_profile::guard(super::phase_profile::Phase::AbortCleanup);
-                    self.sites_abort(&tid, changed_objs, &data_sites).await // with end
+                    self.sites_abort(&tid, &changed_objs, &data_sites).await // with end
                 }
-                Err(error) => Err(error),
+                Err(error) => (Err(error), BTreeSet::new(), BTreeSet::new()),
             };
-            if Self::abort_cleanup_complete(&result) {
-                match self.finish_transaction_guarded(&tid, &mut txn, TxnResolution::Abort) {
+            txn.abort_cleanup_finished.extend(cleanup_finished);
+            txn.completed_participants.extend(ended_participants);
+            if Self::abort_cleanup_complete(&result)
+                && txn.abort_cleanup_finished == txn.dispatch_participants
+            {
+                match self
+                    .finish_transaction_guarded(&tid, &txn_lock, &mut txn, TxnResolution::Abort)
+                    .await
+                {
                     Ok(completion) => {
                         if !completion.participants.is_empty() {
                             self.queue_retirement(tid);
@@ -1440,9 +1625,12 @@ impl Service for TransactionManager {
                             "Failed to persist coordinator abort completion for {:?}: {:?}",
                             tid, error
                         );
+                        self.queue_abort_cleanup(tid);
                         result = Ok(AbortResult::CheckFailed(CheckError::CannotEnd));
                     }
                 }
+            } else {
+                self.queue_abort_cleanup(tid);
             }
             result
         }
@@ -1460,9 +1648,11 @@ impl Service for TransactionManager {
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
                     prepare_dispatch: Arc::new(PrepareDispatchState::new()),
+                    dispatch_participants: BTreeSet::new(),
                     commit_dispatch_started: false,
                     commit_hlc: None,
                     coordinator_decision_durable: false,
+                    abort_cleanup_finished: BTreeSet::new(),
                     completed_participants: BTreeSet::new(),
                     last_activity: now,
                 })),
@@ -2431,7 +2621,7 @@ impl TransactionManager {
         tid: &TxnId,
         changed_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
-    ) -> Result<AbortResult, TMError> {
+    ) -> (Result<AbortResult, TMError>, BTreeSet<u64>, BTreeSet<u64>) {
         let abort_futures: FuturesUnordered<_> = changed_objs
             .iter()
             .map(|(server_id, _)| {
@@ -2448,6 +2638,8 @@ impl TransactionManager {
         let abort_results: Vec<_> = abort_futures.collect().await;
         let mut rollback_failures = Vec::new();
         let mut sites_to_end = BTreeSet::new();
+        let mut cleanup_finished = BTreeSet::new();
+        let mut ended_participants = BTreeSet::new();
         let mut first_failure = None;
         let mut first_error = None;
 
@@ -2457,14 +2649,21 @@ impl TransactionManager {
                     let payload = asr.payload;
                     self.merge_clock(asr.clock);
                     match payload {
-                        AbortResult::Success(failures) => {
-                            sites_to_end.insert(server_id);
-                            if let Some(mut failures) = failures {
+                        AbortResult::Success(Some(mut failures)) => {
+                            if !failures.is_empty() {
                                 rollback_failures.append(&mut failures);
+                            } else {
+                                sites_to_end.insert(server_id);
                             }
+                        }
+                        AbortResult::Success(None) => {
+                            sites_to_end.insert(server_id);
                         }
                         AbortResult::CheckFailed(CheckError::AlreadyAborted) => {
                             sites_to_end.insert(server_id);
+                        }
+                        AbortResult::CheckFailed(CheckError::NotExisted) => {
+                            cleanup_finished.insert(server_id);
                         }
                         failure if first_failure.is_none() => first_failure = Some(failure),
                         _ => {}
@@ -2477,14 +2676,11 @@ impl TransactionManager {
             }
         }
 
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        if let Some(failure) = first_failure {
-            return Ok(failure);
-        }
-        if !rollback_failures.is_empty() {
-            return Ok(AbortResult::Success(Some(rollback_failures)));
+        // Releasing any successful participant before every participant has
+        // compensated would break the shared owner barrier. A retry can safely
+        // observe AlreadyAborted and end all compensated participants together.
+        if first_error.is_some() || first_failure.is_some() || !rollback_failures.is_empty() {
+            sites_to_end.clear();
         }
 
         let end_futures: FuturesUnordered<_> = sites_to_end
@@ -2506,9 +2702,20 @@ impl TransactionManager {
                 Ok(response) => {
                     self.merge_clock(response.clock);
                     let payload = response.payload;
-                    let succeeded = matches!(&payload, EndResult::Success);
                     match payload {
-                        EndResult::Success => {}
+                        EndResult::Success => {
+                            if self.take_dropped_end_response_for_test() {
+                                if first_error.is_none() {
+                                    first_error = Some(TMError::RPCErrorFromCellServer);
+                                }
+                            } else {
+                                cleanup_finished.insert(server_id);
+                                ended_participants.insert(server_id);
+                            }
+                        }
+                        EndResult::CheckFailed(CheckError::NotExisted) => {
+                            cleanup_finished.insert(server_id);
+                        }
                         other => {
                             error!(
                                 "Abort cleanup could not end participant {} for {:?}: {:?}",
@@ -2518,12 +2725,6 @@ impl TransactionManager {
                                 first_error = Some(TMError::AssertionError);
                             }
                         }
-                    }
-                    if succeeded
-                        && self.take_dropped_end_response_for_test()
-                        && first_error.is_none()
-                    {
-                        first_error = Some(TMError::RPCErrorFromCellServer);
                     }
                 }
                 Err(error) => {
@@ -2538,10 +2739,16 @@ impl TransactionManager {
             }
         }
 
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(AbortResult::Success(None))
+        let result = if let Some(error) = first_error {
+            Err(error)
+        } else if let Some(failure) = first_failure {
+            Ok(failure)
+        } else if !rollback_failures.is_empty() {
+            Ok(AbortResult::Success(Some(rollback_failures)))
+        } else {
+            Ok(AbortResult::Success(None))
+        };
+        (result, cleanup_finished, ended_participants)
     }
     async fn sites_end(
         &self,
@@ -2653,6 +2860,7 @@ impl TransactionManager {
                 if matches!(record.resolution, TxnResolution::Commit(_)) =>
             {
                 let affected_objs = Self::recorded_participant_targets(&record.participants);
+                let mut completion_participants = BTreeSet::new();
                 if !affected_objs.is_empty() {
                     let data_sites = self.data_sites_for_objs(&affected_objs).await?;
                     let (result, completed) =
@@ -2662,8 +2870,9 @@ impl TransactionManager {
                     {
                         return result;
                     }
+                    completion_participants = completed;
                 }
-                self.complete_replayed_decision(tid, &record)
+                self.complete_replayed_decision(tid, &record, completion_participants)
                     .map_err(|error| {
                         error!(
                             "Failed to persist replayed commit completion for {:?}: {:?}",
@@ -2687,27 +2896,50 @@ impl TransactionManager {
         &self,
         tid: &TxnId,
         decision: &undo_log::CoordinatorDecisionRecord,
+        participants: BTreeSet<u64>,
     ) -> io::Result<undo_log::CoordinatorCompletionRecord> {
-        let completed = DecisionRecord::completed_at(decision.resolution, get_time());
-        let completion = undo_log::CoordinatorCompletionRecord {
-            resolution: decision.resolution,
-            participants: decision.participants.clone(),
-            expires_at_ms: completed.expires_at_ms,
-            retired_participants: BTreeSet::new(),
-            finalized_participants: BTreeSet::new(),
-        };
         let undo_log =
             self.deps.database_runtime.undo_log().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "undo log not configured")
             })?;
+        if self.transactions.get(tid).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("transaction {tid:?} was restored while replaying completion"),
+            ));
+        }
+        let prior_completed = self
+            .completed_decisions
+            .lock()
+            .insert(*tid, DecisionRecord::cleanup_pending(decision.resolution));
+        note_completion_cleanup_boundary(tid);
+        #[cfg(test)]
+        pause_after_completion_cleanup(tid);
+        let completed =
+            DecisionRecord::completed_at(decision.resolution, completion_boundary_time(tid));
+        let completion = undo_log::CoordinatorCompletionRecord {
+            resolution: decision.resolution,
+            participants,
+            expires_at_ms: completed
+                .expires_at_ms
+                .expect("a completed decision must have an expiry"),
+            retired_participants: BTreeSet::new(),
+            finalized_participants: BTreeSet::new(),
+        };
+        if let Err(error) = undo_log.write_coordinator_completion_record(tid, &completion) {
+            let mut completed_decisions = self.completed_decisions.lock();
+            if let Some(prior_completed) = prior_completed {
+                completed_decisions.insert(*tid, prior_completed);
+            } else {
+                completed_decisions.remove(tid);
+            }
+            return Err(error);
+        }
         self.completed_decisions.lock().insert(*tid, completed);
         if !completion.participants.is_empty() {
             self.retirement_records
                 .lock()
                 .insert(*tid, completion.clone());
-        }
-        undo_log.write_coordinator_completion_record(tid, &completion)?;
-        if !completion.participants.is_empty() {
             self.queue_retirement(*tid);
         }
         Ok(completion)
@@ -2752,18 +2984,40 @@ impl TransactionManager {
                     }
                 }
             }
-            undo_log::CoordinatorStatus::Decided(record)
-                if record.resolution == TxnResolution::Abort =>
+            undo_log::CoordinatorStatus::Decided(mut record)
+                if matches!(
+                    record.resolution,
+                    TxnResolution::InProgress | TxnResolution::Abort
+                ) =>
             {
+                if record.resolution == TxnResolution::InProgress {
+                    let participants: Vec<_> = record.participants.iter().copied().collect();
+                    if let Err(error) =
+                        undo_log.write_coordinator_abort_decision(tid, &participants)
+                    {
+                        error!(
+                            "Failed to turn coordinator dispatch intent into Abort for {:?}: {:?}",
+                            tid, error
+                        );
+                        return Ok(AbortResult::CheckFailed(CheckError::CannotEnd));
+                    }
+                    record.resolution = TxnResolution::Abort;
+                }
                 let affected_objs = Self::recorded_participant_targets(&record.participants);
+                let mut completion_participants = BTreeSet::new();
                 if !affected_objs.is_empty() {
                     let data_sites = self.data_sites_for_objs(&affected_objs).await?;
-                    let result = self.sites_abort(tid, &affected_objs, &data_sites).await;
+                    let (result, cleanup_finished, ended_participants) =
+                        self.sites_abort(tid, &affected_objs, &data_sites).await;
                     if !Self::abort_cleanup_complete(&result) {
                         return result;
                     }
+                    if cleanup_finished.len() != record.participants.len() {
+                        return Ok(AbortResult::CheckFailed(CheckError::CannotEnd));
+                    }
+                    completion_participants = ended_participants;
                 }
-                self.complete_replayed_decision(tid, &record)
+                self.complete_replayed_decision(tid, &record, completion_participants)
                     .map_err(|error| {
                         error!(
                             "Failed to persist replayed abort completion for {:?}: {:?}",
@@ -2778,9 +3032,8 @@ impl TransactionManager {
                     Ok(AbortResult::CheckFailed(CheckError::AlreadyCommitted))
                 }
                 TxnResolution::Abort => unreachable!(),
-                TxnResolution::InProgress | TxnResolution::Unknown => {
-                    Err(TMError::TransactionNotFound)
-                }
+                TxnResolution::InProgress => unreachable!(),
+                TxnResolution::Unknown => Err(TMError::TransactionNotFound),
             },
         }
     }
@@ -2832,29 +3085,106 @@ impl TransactionManager {
         pause_after_completion_cleanup(tid);
     }
 
-    fn finish_transaction_guarded(
+    async fn finish_transaction_guarded(
         &self,
         tid: &TxnId,
+        txn_lock: &TxnMutex,
         txn: &mut Transaction,
         resolution: TxnResolution,
     ) -> io::Result<undo_log::CoordinatorCompletionRecord> {
-        let participants = txn.affected_objects.keys().copied().collect();
-        // Hold the completion index lock across removal of the live entry and
-        // publication of its retained decision. A resolver that misses the
-        // live map then waits here and can never observe an Unknown gap.
-        let mut completed_decisions = self.completed_decisions.lock();
-        self.cleanup_transaction_guarded(tid, txn);
+        let replay_lock = self.replay_lock(tid);
+        let _replay_guard = replay_lock.lock().await;
+        self.finish_transaction_guarded_with_replay_lock(tid, txn_lock, txn, resolution)
+    }
+
+    fn finish_transaction_guarded_with_replay_lock(
+        &self,
+        tid: &TxnId,
+        txn_lock: &TxnMutex,
+        txn: &mut Transaction,
+        resolution: TxnResolution,
+    ) -> io::Result<undo_log::CoordinatorCompletionRecord> {
+        let participants = txn.completed_participants.clone();
+        let pending = DecisionRecord::cleanup_pending(resolution);
+        let prior_completed = {
+            let mut completed_decisions = self.completed_decisions.lock();
+            let current = self.transactions.get(tid).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("transaction {tid:?} is not live during completion"),
+                )
+            })?;
+            if !Arc::ptr_eq(&current, txn_lock) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("transaction {tid:?} was replaced during completion"),
+                ));
+            }
+            let removed = self.transactions.remove(tid).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("transaction {tid:?} disappeared during completion"),
+                )
+            })?;
+            if !Arc::ptr_eq(&removed, txn_lock) {
+                let _ = self.transactions.try_insert(*tid, removed);
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("transaction {tid:?} changed identity during completion"),
+                ));
+            }
+            self.txn_ids.lock().remove(tid);
+            completed_decisions.insert(*tid, pending)
+        };
+        note_completion_cleanup_boundary(tid);
+        #[cfg(test)]
+        pause_after_completion_cleanup(tid);
         let completed = DecisionRecord::completed_at(resolution, completion_boundary_time(tid));
         let completion = undo_log::CoordinatorCompletionRecord {
             resolution,
             participants,
-            expires_at_ms: completed.expires_at_ms,
+            expires_at_ms: completed
+                .expires_at_ms
+                .expect("a completed decision must have an expiry"),
             retired_participants: BTreeSet::new(),
             finalized_participants: BTreeSet::new(),
         };
-        completed_decisions.insert(*tid, completed);
-        drop(completed_decisions);
         let undo_log = self.deps.database_runtime.undo_log();
+        if let Some(undo_log) = undo_log {
+            if let Err(error) = undo_log.write_coordinator_completion_record(tid, &completion) {
+                let mut completed_decisions = self.completed_decisions.lock();
+                match self.transactions.try_insert(*tid, txn_lock.clone()) {
+                    None => {
+                        self.txn_ids.lock().insert(*tid);
+                    }
+                    Some(existing) if Arc::ptr_eq(&existing, txn_lock) => {
+                        self.txn_ids.lock().insert(*tid);
+                    }
+                    Some(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!(
+                                "transaction {tid:?} could not restore its exact completion state"
+                            ),
+                        ));
+                    }
+                }
+                if let Some(prior_completed) = prior_completed {
+                    completed_decisions.insert(*tid, prior_completed);
+                } else {
+                    completed_decisions.remove(tid);
+                }
+                return Err(error);
+            }
+        }
+        {
+            let mut completed_decisions = self.completed_decisions.lock();
+            txn.data.clear();
+            txn.affected_objects.clear();
+            txn.state = TxnState::Cleanup;
+            txn.last_activity = get_time();
+            completed_decisions.insert(*tid, completed);
+        }
         if !completion.participants.is_empty() {
             self.retirement_records
                 .lock()
@@ -2862,9 +3192,6 @@ impl TransactionManager {
             if undo_log.is_none() {
                 self.volatile_retirement_discovery.lock().insert(*tid);
             }
-        }
-        if let Some(undo_log) = undo_log {
-            undo_log.write_coordinator_completion_record(tid, &completion)?;
         }
         Ok(completion)
     }
@@ -2889,6 +3216,7 @@ impl TransactionManager {
         if txn_guard.last_activity >= cutoff
             || txn_guard.state != TxnState::Started
             || txn_guard.commit_dispatch_started
+            || txn_guard.prepare_dispatch.abort_requested()
             || !txn_guard.prepare_dispatch.try_close()
         {
             return false;
@@ -2929,6 +3257,9 @@ impl TransactionManager {
             let mut txn = txn_mutex.lock().await;
             let result = {
                 self.ensure_rw_state(&txn)?;
+                if txn.prepare_dispatch.abort_requested() {
+                    return Err(TMError::InvalidTransactionState(TxnState::Aborted));
+                }
                 if txn.commit_dispatch_started {
                     return Err(TMError::InvalidTransactionState(TxnState::Committed));
                 }
@@ -2946,6 +3277,30 @@ impl TransactionManager {
                     );
                     self.data_sites_for_objs(&txn.affected_objects).await?
                 };
+                if txn.dispatch_participants.is_empty() && !txn.affected_objects.is_empty() {
+                    let participants: Vec<_> = txn.affected_objects.keys().copied().collect();
+                    if self
+                        .deps
+                        .database_runtime
+                        .chunks()
+                        .durable_storage_configured()
+                        && self.deps.database_runtime.undo_log().is_none()
+                    {
+                        return Err(TMError::Other);
+                    }
+                    if let Some(undo_log) = self.deps.database_runtime.undo_log() {
+                        undo_log
+                            .write_coordinator_dispatch_intent(tid, &participants)
+                            .map_err(|error| {
+                                error!(
+                                    "Failed to persist coordinator dispatch intent for {:?}: {:?}",
+                                    tid, error
+                                );
+                                TMError::Other
+                            })?;
+                    }
+                    txn.dispatch_participants.extend(participants);
+                }
                 let sites_prepare_result = {
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard =
@@ -3002,15 +3357,11 @@ impl TransactionManager {
         // For remaining NotRealizable errors, clients should retry with a new transaction.
         let result = self.do_prepare(&tid).await;
         let failed = !matches!(&result, Ok(TMPrepareResult::Success));
-        let preserve_commit_barrier = if failed {
-            match self.get_transaction(&tid) {
-                Ok(txn) => txn.lock().await.commit_dispatch_started,
-                Err(_) => false,
+        if failed {
+            if let Ok(txn) = self.get_transaction(&tid) {
+                txn.lock().await.prepare_dispatch.request_abort();
             }
-        } else {
-            false
-        };
-        if failed && !preserve_commit_barrier {
+            self.queue_abort_cleanup(tid);
             let _ = self.abort(tid.clone()).await;
         }
         result
@@ -3038,6 +3389,38 @@ mod tests {
         assert_ne!(
             generate_scoped_service_id(group, "db_a"),
             generate_scoped_service_id(group, "db_b")
+        );
+    }
+
+    #[test]
+    fn volatile_retirement_discovery_physically_removes_completed_work_and_rotates_live_work() {
+        let mut discovery = RetirementDiscoveryState::default();
+        for offset in 0..(RETIREMENT_DISCOVERY_BATCH * 8) {
+            let tid = test_hlc(20_000 + offset as u64, 70);
+            discovery.insert(tid);
+            discovery.remove(&tid);
+        }
+        let live = BTreeSet::from([
+            test_hlc(40_001, 70),
+            test_hlc(40_002, 70),
+            test_hlc(40_003, 70),
+        ]);
+        for tid in &live {
+            discovery.insert(*tid);
+        }
+
+        assert_eq!(
+            discovery.storage_len(),
+            live.len(),
+            "successful retirement must physically remove all scheduling storage"
+        );
+        let mut observed = BTreeSet::new();
+        for _ in 0..3 {
+            observed.extend(discovery.candidates(1));
+        }
+        assert_eq!(
+            observed, live,
+            "bounded rotation must not starve live work behind completed history"
         );
     }
 
@@ -3112,14 +3495,14 @@ mod tests {
                 expired_tid,
                 DecisionRecord {
                     resolution: TxnResolution::Abort,
-                    expires_at_ms: deadline_ms,
+                    expires_at_ms: Some(deadline_ms),
                 },
             ),
             (
                 live_tid,
                 DecisionRecord {
                     resolution: TxnResolution::Abort,
-                    expires_at_ms: deadline_ms + 1,
+                    expires_at_ms: Some(deadline_ms + 1),
                 },
             ),
         ]);
@@ -3263,7 +3646,7 @@ mod tests {
             expired_tid,
             DecisionRecord {
                 resolution: TxnResolution::Abort,
-                expires_at_ms: get_time().saturating_sub(1),
+                expires_at_ms: Some(get_time().saturating_sub(1)),
             },
         );
 
@@ -3301,7 +3684,8 @@ mod tests {
         let mut txn = txn_lock.lock().await;
 
         let completion = manager
-            .finish_transaction_guarded(&tid, &mut txn, TxnResolution::Abort)
+            .finish_transaction_guarded(&tid, &txn_lock, &mut txn, TxnResolution::Abort)
+            .await
             .unwrap();
         assert_eq!(
             completion.expires_at_ms,
@@ -3346,22 +3730,23 @@ mod tests {
         let mut resolve = tokio::spawn(async move {
             <TransactionManager as super::Service>::resolve(&resolve_manager, tid).await
         });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut resolve)
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut resolve)
                 .await
-                .is_err(),
-            "resolve must synchronize with the live-to-completed publication barrier"
+                .expect("cleanup-pending resolution must remain immediately discoverable")
+                .unwrap()
+                .unwrap(),
+            TxnResolution::Abort
         );
 
         pause.release();
         assert_eq!(abort.await.unwrap().unwrap(), AbortResult::Success(None));
-        assert_eq!(resolve.await.unwrap().unwrap(), TxnResolution::Abort);
 
         server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn completion_persistence_failure_after_cleanup_preserves_replay_source() {
+    async fn completion_persistence_failure_keeps_cleanup_pending_until_exact_retry_boundary() {
         let temp_dir = TempDir::new().unwrap();
         let address = "127.0.0.1:5481";
         let group = "txn_manager_completion_failure_replay";
@@ -3373,19 +3758,38 @@ mod tests {
             .await
             .unwrap();
         undo.write_coordinator_abort_decision(&tid, &[]).unwrap();
+        let failed_cleanup_boundary = 1_000_000;
+        let failed_clock = install_completion_boundary_clock(tid, 0, failed_cleanup_boundary);
         undo.fail_next_coordinator_completion_for_test();
         let txn_lock = manager.get_transaction(&tid).unwrap();
         let mut txn = txn_lock.lock().await;
+        txn.state = TxnState::Aborted;
         txn.coordinator_decision_durable = true;
 
         assert!(manager
-            .finish_transaction_guarded(&tid, &mut txn, TxnResolution::Abort)
+            .finish_transaction_guarded(&tid, &txn_lock, &mut txn, TxnResolution::Abort)
+            .await
             .is_err());
-        assert_eq!(manager.transaction_count(), 0);
         assert_eq!(
-            manager.cached_resolution_at(&tid, get_time()),
-            Some(TxnResolution::Abort),
-            "the post-cleanup cache remains resolvable despite completion fsync failure"
+            manager.transaction_count(),
+            1,
+            "failed completion persistence must restore the exact live coordinator"
+        );
+        assert_eq!(
+            manager.cached_resolution_at(
+                &tid,
+                failed_cleanup_boundary + COMPLETED_DECISION_RETENTION_MS,
+            ),
+            None,
+            "a failed cleanup attempt must not leave any completed-retention entry"
+        );
+        drop(txn);
+        assert_eq!(
+            <TransactionManager as super::Service>::resolve(&manager, tid)
+                .await
+                .unwrap(),
+            TxnResolution::Abort,
+            "the restored live coordinator must remain explicitly resolvable"
         );
         assert!(matches!(
             undo.coordinator_status(&tid).unwrap(),
@@ -3396,8 +3800,15 @@ mod tests {
                 }
             ))
         ));
-        drop(txn);
+        drop(failed_clock);
 
+        let successful_cleanup_boundary =
+            failed_cleanup_boundary + COMPLETED_DECISION_RETENTION_MS + 37;
+        let _successful_clock = install_completion_boundary_clock(
+            tid,
+            failed_cleanup_boundary + COMPLETED_DECISION_RETENTION_MS,
+            successful_cleanup_boundary,
+        );
         assert_eq!(
             <TransactionManager as super::Service>::abort(&manager, tid)
                 .await
@@ -3405,10 +3816,75 @@ mod tests {
             AbortResult::Success(None),
             "retry must replay the older irrevocable decision and reconstruct completion"
         );
-        assert!(matches!(
-            undo.coordinator_status(&tid).unwrap(),
-            Some(undo_log::CoordinatorStatus::Completed(_))
-        ));
+        let completed = match undo.coordinator_status(&tid).unwrap() {
+            Some(undo_log::CoordinatorStatus::Completed(record)) => record,
+            other => panic!("expected a durable completion after retry, got {other:?}"),
+        };
+        assert_eq!(
+            completed.expires_at_ms,
+            successful_cleanup_boundary + COMPLETED_DECISION_RETENTION_MS
+        );
+        assert_eq!(
+            TransactionManager::durable_resolution_at(
+                &undo_log::CoordinatorStatus::Completed(completed.clone()),
+                successful_cleanup_boundary + COMPLETED_DECISION_RETENTION_MS - 1,
+            ),
+            TxnResolution::Abort
+        );
+        assert_eq!(
+            TransactionManager::durable_resolution_at(
+                &undo_log::CoordinatorStatus::Completed(completed),
+                successful_cleanup_boundary + COMPLETED_DECISION_RETENTION_MS,
+            ),
+            TxnResolution::Unknown
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replayed_completion_retention_starts_after_cleanup_pending_publication() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5486";
+        let group = "txn_manager_replayed_completion_boundary";
+        let server = start_durable_manager_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = runtime.txn_manager().unwrap().clone();
+        let undo = runtime.undo_log().unwrap();
+        let tid = test_hlc(700, manager.deps.server_id);
+        let commit_hlc = test_hlc(701, manager.deps.server_id);
+        undo.write_coordinator_commit_decision(&tid, commit_hlc, &[])
+            .unwrap();
+        let before_pending_ms = 1_000_000;
+        let after_pending_ms = before_pending_ms + COMPLETED_DECISION_RETENTION_MS + 23;
+        let _clock = install_completion_boundary_clock(tid, before_pending_ms, after_pending_ms);
+
+        assert_eq!(
+            manager
+                .retry_durable_commit_after_coordinator_restart(&tid)
+                .await,
+            Ok(EndResult::Success)
+        );
+        let completed = match undo.coordinator_status(&tid).unwrap() {
+            Some(undo_log::CoordinatorStatus::Completed(record)) => record,
+            other => panic!("expected replayed durable completion, got {other:?}"),
+        };
+        assert_eq!(
+            completed.expires_at_ms,
+            after_pending_ms + COMPLETED_DECISION_RETENTION_MS,
+            "replay must allocate its exact window only after cleanup-pending publication"
+        );
+        assert_eq!(
+            manager.cached_resolution_at(
+                &tid,
+                after_pending_ms + COMPLETED_DECISION_RETENTION_MS - 1,
+            ),
+            Some(TxnResolution::Commit(commit_hlc))
+        );
+        assert_eq!(
+            manager.cached_resolution_at(&tid, after_pending_ms + COMPLETED_DECISION_RETENTION_MS,),
+            None
+        );
 
         server.shutdown().await;
     }
@@ -3442,7 +3918,7 @@ mod tests {
             }
         })
         .await
-        .expect("Drop must hand off abort cleanup and release its replacement guard");
+        .expect("Drop must enqueue Abort cleanup and release the in-flight count");
         assert_eq!(
             <TransactionManager as super::Service>::resolve(&manager, tid)
                 .await
@@ -4096,9 +4572,11 @@ mod tests {
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
             prepare_dispatch: Arc::new(PrepareDispatchState::new()),
+            dispatch_participants: BTreeSet::new(),
             commit_dispatch_started: false,
             commit_hlc: None,
             coordinator_decision_durable: false,
+            abort_cleanup_finished: BTreeSet::new(),
             completed_participants: BTreeSet::new(),
             last_activity: get_time(),
         });
@@ -4145,9 +4623,11 @@ mod tests {
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
             prepare_dispatch: Arc::new(PrepareDispatchState::new()),
+            dispatch_participants: BTreeSet::new(),
             commit_dispatch_started: false,
             commit_hlc: None,
             coordinator_decision_durable: false,
+            abort_cleanup_finished: BTreeSet::new(),
             completed_participants: BTreeSet::new(),
             last_activity: get_time(),
         });

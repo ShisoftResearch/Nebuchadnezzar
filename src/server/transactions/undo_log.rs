@@ -7,7 +7,7 @@ use log::{debug, error, info};
 use parking_lot::{Mutex, RwLock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -78,6 +78,7 @@ const ENTRY_TYPE_COORDINATOR_ABORT: u8 = 6;
 const ENTRY_TYPE_COORDINATOR_COMPLETION: u8 = 8;
 const ENTRY_TYPE_PARTICIPANT_RETIREMENT: u8 = 9;
 const ENTRY_TYPE_COMPACTION_SNAPSHOT: u8 = 10;
+const ENTRY_TYPE_COORDINATOR_DISPATCH_INTENT: u8 = 11;
 const UNDO_FIXED_PAYLOAD_LEN: usize = 16 + 1 + 8 + 4;
 const MAX_UNDO_PRIOR_CELL_LEN: usize = 16 * 1024 * 1024;
 
@@ -127,8 +128,10 @@ struct CanonicalLogState {
     participant_completion: HashMap<TxnId, TxnState>,
     participant_retirement: HashMap<TxnId, ParticipantRetirementRecord>,
     coordinator_status: HashMap<TxnId, CoordinatorStatus>,
-    incomplete_retirement_queue: VecDeque<TxnId>,
-    incomplete_retirement_members: HashSet<TxnId>,
+    incomplete_retirement_members: BTreeSet<TxnId>,
+    incomplete_retirement_cursor: Option<TxnId>,
+    abort_cleanup_members: BTreeSet<TxnId>,
+    abort_cleanup_cursor: Option<TxnId>,
 }
 
 impl CanonicalLogState {
@@ -165,6 +168,14 @@ impl CanonicalLogState {
             self.coordinator_status.get(&txn_id),
             Some(CoordinatorStatus::Completed(_))
         ) {
+            if matches!(
+                record.resolution,
+                TxnResolution::InProgress | TxnResolution::Abort
+            ) {
+                self.abort_cleanup_members.insert(txn_id);
+            } else {
+                self.abort_cleanup_members.remove(&txn_id);
+            }
             self.coordinator_status
                 .insert(txn_id, CoordinatorStatus::Decided(record));
         }
@@ -172,19 +183,21 @@ impl CanonicalLogState {
 
     fn apply_coordinator_completion(&mut self, txn_id: TxnId, record: CoordinatorCompletionRecord) {
         if record.finalized_participants != record.participants {
-            if self.incomplete_retirement_members.insert(txn_id) {
-                self.incomplete_retirement_queue.push_back(txn_id);
-            }
+            self.incomplete_retirement_members.insert(txn_id);
         } else {
             self.incomplete_retirement_members.remove(&txn_id);
+            if self.incomplete_retirement_members.is_empty() {
+                self.incomplete_retirement_cursor = None;
+            }
         }
+        self.abort_cleanup_members.remove(&txn_id);
         self.coordinator_status
             .insert(txn_id, CoordinatorStatus::Completed(record));
     }
 
     fn rebuild_incomplete_retirements(&mut self) {
-        self.incomplete_retirement_queue.clear();
         self.incomplete_retirement_members.clear();
+        self.incomplete_retirement_cursor = None;
         for (tid, status) in &self.coordinator_status {
             if matches!(
                 status,
@@ -192,24 +205,88 @@ impl CanonicalLogState {
                     if record.finalized_participants != record.participants
             ) {
                 self.incomplete_retirement_members.insert(*tid);
-                self.incomplete_retirement_queue.push_back(*tid);
+            }
+        }
+        self.abort_cleanup_members.clear();
+        self.abort_cleanup_cursor = None;
+        for (tid, status) in &self.coordinator_status {
+            if matches!(
+                status,
+                CoordinatorStatus::Decided(CoordinatorDecisionRecord {
+                    resolution: TxnResolution::InProgress | TxnResolution::Abort,
+                    ..
+                })
+            ) {
+                self.abort_cleanup_members.insert(*tid);
             }
         }
     }
 
     fn retirement_candidates(&mut self, limit: usize) -> Vec<TxnId> {
+        if self.incomplete_retirement_members.is_empty() || limit == 0 {
+            return Vec::new();
+        }
         let mut candidates =
             Vec::with_capacity(limit.min(self.incomplete_retirement_members.len()));
-        let mut examined = 0;
-        while examined < limit {
-            let Some(tid) = self.incomplete_retirement_queue.pop_front() else {
-                break;
-            };
-            examined += 1;
-            if self.incomplete_retirement_members.contains(&tid) {
-                candidates.push(tid);
-                self.incomplete_retirement_queue.push_back(tid);
+        if let Some(after) = self.incomplete_retirement_cursor {
+            candidates.extend(
+                self.incomplete_retirement_members
+                    .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                    .take(limit)
+                    .copied(),
+            );
+            if candidates.len() < limit {
+                candidates.extend(
+                    self.incomplete_retirement_members
+                        .range(..=after)
+                        .take(limit - candidates.len())
+                        .copied(),
+                );
             }
+        } else {
+            candidates.extend(
+                self.incomplete_retirement_members
+                    .iter()
+                    .take(limit)
+                    .copied(),
+            );
+        }
+        if let Some(last) = candidates.last() {
+            self.incomplete_retirement_cursor = Some(*last);
+        }
+        candidates
+    }
+
+    #[cfg(test)]
+    fn retirement_discovery_storage_len(&self) -> usize {
+        self.incomplete_retirement_members.len()
+    }
+
+    fn abort_cleanup_candidates(&mut self, limit: usize) -> Vec<TxnId> {
+        if self.abort_cleanup_members.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut candidates = Vec::with_capacity(limit.min(self.abort_cleanup_members.len()));
+        if let Some(after) = self.abort_cleanup_cursor {
+            candidates.extend(
+                self.abort_cleanup_members
+                    .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                    .take(limit)
+                    .copied(),
+            );
+            if candidates.len() < limit {
+                candidates.extend(
+                    self.abort_cleanup_members
+                        .range(..=after)
+                        .take(limit - candidates.len())
+                        .copied(),
+                );
+            }
+        } else {
+            candidates.extend(self.abort_cleanup_members.iter().take(limit).copied());
+        }
+        if let Some(last) = candidates.last() {
+            self.abort_cleanup_cursor = Some(*last);
         }
         candidates
     }
@@ -535,7 +612,9 @@ fn encode_coordinator_decision_record(
     txn_id: &TxnId,
     record: &CoordinatorDecisionRecord,
 ) -> io::Result<Vec<u8>> {
-    validate_final_resolution(record.resolution)?;
+    if record.resolution != TxnResolution::InProgress {
+        validate_final_resolution(record.resolution)?;
+    }
     let txn_id_bytes =
         serde_json::to_vec(txn_id).map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
     let participants_bytes = serde_json::to_vec(&record.participants)
@@ -572,7 +651,14 @@ fn encode_coordinator_decision_record(
             bytes.extend_from_slice(&txn_id_len.to_le_bytes());
             bytes.extend_from_slice(&txn_id_bytes);
         }
-        TxnResolution::InProgress | TxnResolution::Unknown => unreachable!(),
+        TxnResolution::InProgress => {
+            return encode_json_payload_record(
+                ENTRY_TYPE_COORDINATOR_DISPATCH_INTENT,
+                txn_id,
+                record,
+            );
+        }
+        TxnResolution::Unknown => unreachable!(),
     }
     bytes.extend_from_slice(&participants_len.to_le_bytes());
     bytes.extend_from_slice(&participants_bytes);
@@ -1038,6 +1124,25 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                     }
                     offset += size;
                 }
+                ENTRY_TYPE_COORDINATOR_DISPATCH_INTENT => {
+                    let (record, size): (CoordinatorDecisionRecord, _) =
+                        decode_json_payload_record(&buffer, offset, txn_id_len)?;
+                    if record.resolution != TxnResolution::InProgress {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "coordinator dispatch intent must be InProgress",
+                        ));
+                    }
+                    if !matches!(
+                        state.coordinator_status.get(&txn_id),
+                        Some(CoordinatorStatus::Completed(_))
+                    ) {
+                        state
+                            .coordinator_status
+                            .insert(txn_id, CoordinatorStatus::Decided(record));
+                    }
+                    offset += size;
+                }
                 ENTRY_TYPE_COORDINATOR_COMPLETION => {
                     let (record, size): (CoordinatorCompletionRecord, _) =
                         decode_json_payload_record(&buffer, offset, txn_id_len)?;
@@ -1488,6 +1593,27 @@ impl UndoLogger {
         Ok(())
     }
 
+    /// Persist the exact participant set immediately before concurrent
+    /// prepare/commit dispatch. A restart treats this non-final decision as
+    /// Abort cleanup work until a final Commit/Abort record supersedes it.
+    pub(crate) fn write_coordinator_dispatch_intent(
+        &self,
+        txn_id: &TxnId,
+        participants: &[u64],
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        self.rotate_before_record_if_requested_for_test()?;
+        let record = CoordinatorDecisionRecord {
+            resolution: TxnResolution::InProgress,
+            participants: participants.iter().copied().collect(),
+        };
+        let bytes =
+            encode_json_payload_record(ENTRY_TYPE_COORDINATOR_DISPATCH_INTENT, txn_id, &record)?;
+        self.write_synced_record(&bytes, |state| {
+            state.apply_coordinator_decision(*txn_id, record)
+        })
+    }
+
     /// Persist the distributed coordinator's irrevocable abort decision.
     ///
     /// Like the coordinator commit record, this does not suppress participant
@@ -1732,6 +1858,13 @@ impl UndoLogger {
             ));
         }
         Ok(self.canonical_state.lock().retirement_candidates(limit))
+    }
+
+    pub(crate) fn coordinator_abort_cleanup_candidates(
+        &self,
+        limit: usize,
+    ) -> io::Result<Vec<TxnId>> {
+        Ok(self.canonical_state.lock().abort_cleanup_candidates(limit))
     }
 
     #[cfg(test)]
@@ -2674,6 +2807,67 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_dispatch_intent_is_restartable_abort_work_until_completion() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let tid = test_hlc(300, 8);
+
+        {
+            let undo =
+                UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
+            undo.write_coordinator_dispatch_intent(&tid, &[11, 12])
+                .unwrap();
+            assert_eq!(
+                undo.coordinator_status(&tid).unwrap(),
+                Some(CoordinatorStatus::Decided(CoordinatorDecisionRecord {
+                    resolution: TxnResolution::InProgress,
+                    participants: BTreeSet::from([11, 12]),
+                }))
+            );
+            assert_eq!(
+                undo.coordinator_abort_cleanup_candidates(8).unwrap(),
+                vec![tid],
+                "an in-progress dispatch intent is canonical restartable Abort work"
+            );
+        }
+
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("reopened undo logger");
+        assert_eq!(
+            reopened.coordinator_abort_cleanup_candidates(8).unwrap(),
+            vec![tid],
+            "restart must rediscover a crash after intent persistence"
+        );
+        reopened.compact_logs_at(0).unwrap();
+        drop(reopened);
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("compacted undo logger");
+        assert_eq!(
+            reopened.coordinator_abort_cleanup_candidates(8).unwrap(),
+            vec![tid],
+            "compaction must retain an unresolved dispatch intent"
+        );
+        reopened
+            .write_coordinator_abort_decision(&tid, &[11, 12])
+            .unwrap();
+        assert_eq!(
+            reopened.coordinator_abort_cleanup_candidates(8).unwrap(),
+            vec![tid],
+            "durable Abort remains cleanup work until completion"
+        );
+        reopened
+            .write_coordinator_completion(&tid, TxnResolution::Abort, &[11, 12], i64::MAX)
+            .unwrap();
+        assert!(
+            reopened
+                .coordinator_abort_cleanup_candidates(8)
+                .unwrap()
+                .is_empty(),
+            "completion must physically remove canonical Abort cleanup work"
+        );
+    }
+
+    #[test]
     fn later_coordinator_completion_masks_older_decision_across_restart() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().join("undo");
@@ -2745,6 +2939,21 @@ mod tests {
             reopened.coordinator_decision(&tid).unwrap(),
             None,
             "restart must preserve the completion tombstone until compaction installs a barrier"
+        );
+        reopened.compact_logs_at(0).unwrap();
+        assert_eq!(
+            reopened.coordinator_decision(&tid).unwrap(),
+            None,
+            "compaction at the exact expiry boundary must not reveal the older decision"
+        );
+        drop(reopened);
+
+        let compacted =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("compacted undo logger");
+        assert_eq!(
+            compacted.coordinator_decision(&tid).unwrap(),
+            None,
+            "restart after compaction must not resurrect the older durable decision"
         );
     }
 
@@ -3436,6 +3645,80 @@ mod tests {
             undo.full_log_scan_count_for_test(),
             scans_after_startup,
             "bounded retirement discovery and a normal append must not rescan log files"
+        );
+
+        undo.compact_logs_at(1_000_000).unwrap();
+        drop(undo);
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("reopened undo logger");
+        let after_reopen: BTreeSet<_> = reopened
+            .coordinator_retirement_candidates(37)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            after_reopen.len(),
+            37,
+            "compaction/reopen must rebuild only live canonical retirement work"
+        );
+    }
+
+    #[test]
+    fn durable_retirement_discovery_has_no_completed_tombstones_or_live_prefix_starvation() {
+        let mut state = CanonicalLogState::default();
+        for offset in 0..2_048 {
+            let tid = test_hlc(30_000 + offset, 70);
+            state.apply_coordinator_completion(
+                tid,
+                CoordinatorCompletionRecord {
+                    resolution: TxnResolution::Abort,
+                    participants: BTreeSet::from([70]),
+                    expires_at_ms: i64::MAX,
+                    retired_participants: BTreeSet::new(),
+                    finalized_participants: BTreeSet::new(),
+                },
+            );
+            state.apply_coordinator_completion(
+                tid,
+                CoordinatorCompletionRecord {
+                    resolution: TxnResolution::Abort,
+                    participants: BTreeSet::from([70]),
+                    expires_at_ms: i64::MAX,
+                    retired_participants: BTreeSet::from([70]),
+                    finalized_participants: BTreeSet::from([70]),
+                },
+            );
+        }
+        let live = BTreeSet::from([
+            test_hlc(50_001, 70),
+            test_hlc(50_002, 70),
+            test_hlc(50_003, 70),
+        ]);
+        for tid in &live {
+            state.apply_coordinator_completion(
+                *tid,
+                CoordinatorCompletionRecord {
+                    resolution: TxnResolution::Abort,
+                    participants: BTreeSet::from([70]),
+                    expires_at_ms: i64::MAX,
+                    retired_participants: BTreeSet::new(),
+                    finalized_participants: BTreeSet::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            state.retirement_discovery_storage_len(),
+            live.len(),
+            "completed durable retirements must leave no scheduling tombstones"
+        );
+        let mut observed = BTreeSet::new();
+        for _ in 0..3 {
+            observed.extend(state.retirement_candidates(1));
+        }
+        assert_eq!(
+            observed, live,
+            "bounded canonical rotation must reach every remaining live retirement"
         );
     }
 
@@ -5393,12 +5676,11 @@ mod tests {
             other => panic!("Prepare should succeed, got {:?}", other),
         }
         let abort_failure =
-            transactions::data_site::install_abort_cannot_end_for_cell(txn_id, cell_id);
+            transactions::data_site::install_persistent_abort_cannot_end_for_cell(txn_id, cell_id);
         assert_eq!(
             txn.abort(txn_id).await.unwrap().unwrap(),
             AbortResult::CheckFailed(CheckError::CannotEnd)
         );
-        drop(abort_failure);
 
         // Archive segments before shutdown
         for chunk in &server.chunks().list {
@@ -5432,6 +5714,7 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(abort_failure);
 
         server2.meta().schemas.debug_only_new_schema(schema.clone());
 
@@ -5579,12 +5862,11 @@ mod tests {
             other => panic!("Prepare should succeed, got {:?}", other),
         }
         let abort_failure =
-            transactions::data_site::install_abort_cannot_end_for_cell(txn_id, cell_id);
+            transactions::data_site::install_persistent_abort_cannot_end_for_cell(txn_id, cell_id);
         assert_eq!(
             txn.abort(txn_id).await.unwrap().unwrap(),
             AbortResult::CheckFailed(CheckError::CannotEnd)
         );
-        drop(abort_failure);
 
         // Archive segments before shutdown
         for chunk in &server.chunks().list {
@@ -5618,6 +5900,7 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(abort_failure);
 
         // Cell should have original value after rollback
         let restored_cell = server2.chunks().read_cell(&cell_id).unwrap();
@@ -5743,12 +6026,11 @@ mod tests {
             other => panic!("Prepare should succeed, got {:?}", other),
         }
         let abort_failure =
-            transactions::data_site::install_abort_cannot_end_for_cell(txn_id, cell_id);
+            transactions::data_site::install_persistent_abort_cannot_end_for_cell(txn_id, cell_id);
         assert_eq!(
             txn.abort(txn_id).await.unwrap().unwrap(),
             AbortResult::CheckFailed(CheckError::CannotEnd)
         );
-        drop(abort_failure);
 
         // Archive segments before shutdown
         for chunk in &server.chunks().list {
@@ -5782,6 +6064,7 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(abort_failure);
 
         // Cell should exist after rollback
         let restored_cell = server2.chunks().read_cell(&cell_id).unwrap();
