@@ -2231,6 +2231,12 @@ impl Chunks {
         &self.revision_clock
     }
 
+    pub(crate) fn durable_storage_configured(&self) -> bool {
+        self.list
+            .iter()
+            .any(|chunk| chunk.wal_storage.is_some() || chunk.backup_storage.is_some())
+    }
+
     pub fn establish_recovery_floor(&self) -> Result<u64, WriteError> {
         let recovery_floor = self
             .revision_clock
@@ -2517,6 +2523,111 @@ impl Chunks {
     pub fn abort_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
         self.locate_chunk_by_partition(installed.id.higher)
             .abort_revision(installed)
+    }
+
+    pub(crate) fn force_sync_installed_revisions<'a>(
+        &self,
+        installed_revisions: impl IntoIterator<Item = &'a InstalledRevision>,
+    ) -> io::Result<()> {
+        let mut segments = HashSet::new();
+        for installed in installed_revisions {
+            let chunk = self.locate_chunk_by_partition(installed.id.higher);
+            let current = chunk.history.current(&installed.id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "installed revision {:?} has no current chain head",
+                        installed.id
+                    ),
+                )
+            })?;
+            if !Arc::ptr_eq(&current, &installed.node) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "installed revision {:?} is no longer the current chain head",
+                        installed.id
+                    ),
+                ));
+            }
+            let (state, location) = installed.node.load();
+            if chunk
+                .history
+                .location(&installed.id, installed.node.revision_ts)
+                != Some(location)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "installed revision {:?} location no longer matches its chain node",
+                        installed.id
+                    ),
+                ));
+            }
+            match state {
+                RevisionState::PendingPresent | RevisionState::CommittedPresent => {
+                    let header = cell_header_from_entry_content_addr(Entry::content_pos(location));
+                    if Id::from_header(&header) != installed.id
+                        || header.revision_ts != installed.node.revision_ts
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "installed present revision {:?} does not match its output",
+                                installed.id
+                            ),
+                        ));
+                    }
+                }
+                RevisionState::PendingDeleted | RevisionState::CommittedDeleted => {
+                    let tombstone = Tombstone::read(location);
+                    if Id::new(tombstone.partition, tombstone.hash) != installed.id
+                        || tombstone.revision_ts != installed.node.revision_ts
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "installed tombstone revision {:?} does not match its output",
+                                installed.id
+                            ),
+                        ));
+                    }
+                }
+                RevisionState::Aborted | RevisionState::Expired => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("installed revision {:?} is not live", installed.id),
+                    ));
+                }
+            }
+            let segment = chunk.locate_segment(location).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "installed revision {:?} has no containing segment",
+                        installed.id
+                    ),
+                )
+            })?;
+            segments.insert((chunk.id, segment.id));
+        }
+
+        for (chunk_id, segment_id) in segments {
+            let chunk = self.list.get(chunk_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "installed output chunk disappeared",
+                )
+            })?;
+            let segment = chunk.segs.get(&(segment_id as usize)).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "installed output segment disappeared",
+                )
+            })?;
+            segment.force_wal_sync()?;
+        }
+        Ok(())
     }
 
     fn install_compensation(

@@ -2,7 +2,7 @@ use crate::ram::cell::{cell_header_from_entry_content_addr, CellHeader, OwnedCel
 use crate::ram::chunk::Chunks;
 use crate::ram::entry::Entry;
 use crate::ram::io::reader;
-use crate::ram::types::Id;
+use crate::ram::types::{FromHeader, Id};
 use log::{debug, error, info};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use super::TxnId;
 
 /// Undo log entry stored in the log file
-/// Format: [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][installed_revision_ts: u64][prior_revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
+/// Format: [entry_type: u8 = 4][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][installed_revision_ts: u64][prior_revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
 ///
 /// The `txn_id` is now a serialized `bifrost::hlc::Hlc` (16-byte fixed HLC),
 /// not the former variable-length vector clock; its serialized byte shape
@@ -75,7 +75,10 @@ impl UndoOpType {
     }
 }
 
-const ENTRY_TYPE_UNDO: u8 = 1;
+// Type 1 was the legacy single-revision undo layout. Reusing it would make
+// framing undecidable when a following record supplies enough bytes to satisfy
+// the larger two-revision minimum length.
+const ENTRY_TYPE_UNDO: u8 = 4;
 const ENTRY_TYPE_COMMIT: u8 = 2;
 const ENTRY_TYPE_ABORT: u8 = 3;
 const UNDO_FIXED_PAYLOAD_LEN: usize = 16 + 1 + 8 + 8 + 8 + 8 + 8;
@@ -381,6 +384,10 @@ pub struct UndoLogger {
     max_log_size: u64,
     #[cfg(test)]
     fail_next_undo_write: AtomicBool,
+    #[cfg(test)]
+    fail_next_commit_marker: AtomicBool,
+    #[cfg(test)]
+    fail_next_abort_marker: AtomicBool,
 }
 
 impl UndoLogger {
@@ -397,6 +404,10 @@ impl UndoLogger {
             max_log_size: 64 * 1024 * 1024, // 64MB
             #[cfg(test)]
             fail_next_undo_write: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_commit_marker: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_abort_marker: AtomicBool::new(false),
         });
 
         // Open or create initial log file
@@ -479,6 +490,13 @@ impl UndoLogger {
 
     /// Write a commit marker for a transaction
     pub fn write_commit_marker(&self, txn_id: &TxnId) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_commit_marker.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected commit marker failure",
+            ));
+        }
         let txn_id_bytes =
             serde_json::to_vec(txn_id).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let txn_id_len = txn_id_bytes.len() as u32;
@@ -509,6 +527,13 @@ impl UndoLogger {
 
     /// Write an abort marker for a transaction
     pub fn write_abort_marker(&self, txn_id: &TxnId) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_abort_marker.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected abort marker failure",
+            ));
+        }
         let txn_id_bytes =
             serde_json::to_vec(txn_id).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let txn_id_len = txn_id_bytes.len() as u32;
@@ -537,6 +562,16 @@ impl UndoLogger {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_commit_marker_for_test(&self) {
+        self.fail_next_commit_marker.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_abort_marker_for_test(&self) {
+        self.fail_next_abort_marker.store(true, Ordering::SeqCst);
+    }
+
     /// Perform rollback for all incomplete transactions
     /// Must be called after segment recovery is complete
     /// Takes the txn_index built during recovery as a parameter
@@ -545,6 +580,25 @@ impl UndoLogger {
         txn_index: HashMap<TxnId, Vec<UndoLogEntry>>,
         chunks: &Arc<Chunks>,
     ) -> io::Result<()> {
+        if let Some(max_installed_revision_ts) = txn_index
+            .values()
+            .flat_map(|entries| entries.iter())
+            .map(|entry| entry.installed_revision_ts)
+            .max()
+        {
+            chunks
+                .revision_clock()
+                .try_observe(bifrost::hlc::Hlc {
+                    ts: max_installed_revision_ts,
+                    node: chunks.revision_clock().node(),
+                })
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        "undo installed revision clock is exhausted",
+                    )
+                })?;
+        }
         if txn_index.is_empty() {
             info!("No incomplete transactions to rollback");
             return Ok(());
@@ -636,7 +690,13 @@ impl UndoLogger {
         }
         chunks
             .compensate_recovered(&entry.cell_id, entry.installed_revision_ts, None)
-            .map(|_| ())
+            .and_then(|compensation| {
+                chunks
+                    .force_sync_installed_revisions([&compensation])
+                    .map_err(|error| {
+                        crate::ram::cell::WriteError::DurabilityFailure(error.to_string())
+                    })
+            })
             .map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::Other,
@@ -721,7 +781,13 @@ impl UndoLogger {
                 entry.installed_revision_ts,
                 Some(old_cell),
             )
-            .map(|_| ())
+            .and_then(|compensation| {
+                chunks
+                    .force_sync_installed_revisions([&compensation])
+                    .map_err(|error| {
+                        crate::ram::cell::WriteError::DurabilityFailure(error.to_string())
+                    })
+            })
             .map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::Other,
@@ -763,12 +829,13 @@ impl UndoLogger {
             ));
         }
 
-        if cell_header.hash != cell_id.lower {
+        if Id::from_header(&cell_header) != *cell_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Cell hash mismatch at offset: expected {}, found {}",
-                    cell_id.lower, cell_header.hash
+                    "Cell identity mismatch at offset: expected {:?}, found {:?}",
+                    cell_id,
+                    Id::from_header(&cell_header)
                 ),
             ));
         }
@@ -1115,7 +1182,7 @@ mod tests {
     fn undo_decoder_rejects_legacy_single_revision_layout() {
         let txn_id_bytes = serde_json::to_vec(&test_hlc(10, 1)).unwrap();
         let mut bytes = Vec::new();
-        bytes.push(ENTRY_TYPE_UNDO);
+        bytes.push(1);
         bytes.extend_from_slice(&(txn_id_bytes.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&txn_id_bytes);
         bytes.extend_from_slice(&1u64.to_le_bytes());
@@ -1128,6 +1195,31 @@ mod tests {
 
         UndoLogEntry::from_bytes(&bytes)
             .expect_err("the legacy single-revision undo layout must not be decoded");
+    }
+
+    #[test]
+    fn undo_decoder_rejects_legacy_layout_even_when_an_adjacent_record_supplies_extra_bytes() {
+        let txn_id = test_hlc(10, 1);
+        let txn_id_bytes = serde_json::to_vec(&txn_id).unwrap();
+        let mut bytes = Vec::new();
+        bytes.push(1);
+        bytes.extend_from_slice(&(txn_id_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&txn_id_bytes);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.push(UndoOpType::Update as u8);
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&64u64.to_le_bytes());
+
+        bytes.push(ENTRY_TYPE_COMMIT);
+        bytes.extend_from_slice(&(txn_id_bytes.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&txn_id_bytes);
+
+        UndoLogEntry::from_bytes(&bytes).expect_err(
+            "an adjacent record must not make the legacy single-revision layout look current",
+        );
     }
 
     #[test]
@@ -2475,6 +2567,33 @@ mod tests {
     }
 
     #[test]
+    fn recovery_observes_undo_installed_timestamp_even_when_mutation_was_not_durable() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_schema, chunks) = compensation_test_chunks("recovery_undo_clock_floor");
+        let undo =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+        let tid = test_hlc(24, 1);
+        let cell_id = Id::new(0, 705);
+        let physical_floor = chunks.revision_clock().try_now().unwrap().ts;
+        let undo_only_installed_ts = physical_floor.checked_add(1_000_000).unwrap();
+        undo.write_undo_entry(UndoLogEntry::new_write(
+            tid,
+            cell_id,
+            undo_only_installed_ts,
+        ))
+        .unwrap();
+
+        let recovered = undo.recover().unwrap();
+        undo.rollback_incomplete_transactions(recovered, &chunks)
+            .unwrap();
+        let next = chunks.next_revision_ts(0).unwrap();
+        assert!(
+            next > undo_only_installed_ts,
+            "new traffic must start above every durable undo installed timestamp"
+        );
+    }
+
+    #[test]
     fn recovery_compensates_update_with_newer_content_idempotently() {
         let temp_dir = TempDir::new().unwrap();
         let (schema, chunks) = compensation_test_chunks("recovery_update_compensation");
@@ -2537,6 +2656,95 @@ mod tests {
         let retained = chunks.read_cell(&id).unwrap().to_owned();
         assert_eq!(retained.header.revision_ts, later_header.revision_ts);
         assert_eq!(retained.data, later.data);
+    }
+
+    #[test]
+    fn recovery_rejects_prior_source_with_same_hash_and_revision_but_wrong_partition() {
+        let temp_dir = TempDir::new().unwrap();
+        let (schema, chunks) = compensation_test_chunks("recovery_full_id_validation");
+        let wrong_source_id = Id::new(2, 704);
+        let target_id = Id::new(4, 704);
+        let prior_revision_ts = 100;
+        let installed_revision_ts = 200;
+
+        let mut wrong_source = OwnedCell::new_with_id(
+            schema.id,
+            &wrong_source_id,
+            data_map_value!(id: 1i32, value: "wrong-partition".to_string()),
+        );
+        chunks
+            .write_cell_at_revision(
+                &mut wrong_source,
+                crate::ram::cell::RevisionWrite::committed(prior_revision_ts),
+            )
+            .unwrap();
+        let (chunk_id, seq_id, cell_offset) = stable_cell_location(&chunks, &wrong_source_id);
+        chunks
+            .remove_cell_at_revision(
+                &wrong_source_id,
+                crate::ram::cell::RevisionWrite::committed(150),
+            )
+            .unwrap();
+
+        let mut original = OwnedCell::new_with_id(
+            schema.id,
+            &target_id,
+            data_map_value!(id: 2i32, value: "target-original".to_string()),
+        );
+        chunks
+            .write_cell_at_revision(
+                &mut original,
+                crate::ram::cell::RevisionWrite::committed(prior_revision_ts),
+            )
+            .unwrap();
+        let mut failed = OwnedCell::new_with_id(
+            schema.id,
+            &target_id,
+            data_map_value!(id: 3i32, value: "target-failed".to_string()),
+        );
+        chunks
+            .update_cell_at_revision(
+                &mut failed,
+                crate::ram::cell::RevisionWrite::committed(installed_revision_ts),
+            )
+            .unwrap();
+
+        let tid = test_hlc(23, 1);
+        let entry = UndoLogEntry::new_restore(
+            tid,
+            target_id,
+            UndoOpType::Update,
+            installed_revision_ts,
+            prior_revision_ts,
+            chunk_id,
+            seq_id,
+            cell_offset,
+        );
+        let undo =
+            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+
+        let error = undo
+            .rollback_incomplete_transactions(HashMap::from([(tid, vec![entry])]), &chunks)
+            .expect_err("the wrong partition must make the restore source invalid");
+        assert!(
+            error.to_string().contains("partition")
+                || error.to_string().contains("identity")
+                || error.to_string().contains("restore")
+        );
+        let retained = chunks.read_cell(&target_id).unwrap().to_owned();
+        assert_eq!(retained.header.revision_ts, installed_revision_ts);
+        assert_eq!(retained.data, failed.data);
+        assert_eq!(
+            chunks
+                .locate_chunk_by_partition(target_id.higher)
+                .history
+                .current(&target_id)
+                .unwrap()
+                .load()
+                .0,
+            crate::ram::history::RevisionState::CommittedPresent,
+            "source validation must happen before invalidating the failed installed head"
+        );
     }
 
     #[test]

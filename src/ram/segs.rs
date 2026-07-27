@@ -120,6 +120,10 @@ pub struct Segment {
     // WAL batch sync tracking (for group commit optimization)
     pub last_sync_time: AtomicI64, // Timestamp of last fsync in milliseconds
     pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
+    #[cfg(test)]
+    force_wal_sync_count: AtomicUsize,
+    #[cfg(test)]
+    fail_next_force_wal_sync: AtomicBool,
 }
 
 /// File state for a segment, protected by a mutex
@@ -213,6 +217,10 @@ impl Segment {
             is_dirty: AtomicBool::new(true), // Start dirty
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
+            #[cfg(test)]
+            force_wal_sync_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_force_wal_sync: AtomicBool::new(false),
         }
     }
 
@@ -760,6 +768,16 @@ impl Segment {
     /// Force a WAL sync, ensuring all buffered data is persisted to disk
     /// This is useful for transaction commits and other critical durability points
     pub fn force_wal_sync(&self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.force_wal_sync_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next_force_wal_sync.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected WAL force-sync failure",
+                ));
+            }
+        }
         let mut state = self.file_state.lock();
         if let Some(ref mut file) = state.wal {
             file.sync_all()?;
@@ -772,6 +790,16 @@ impl Segment {
             trace!("Forced WAL sync for segment {}", self.id);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_wal_sync_count_for_test(&self) -> usize {
+        self.force_wal_sync_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_force_wal_sync_for_test(&self) {
+        self.fail_next_force_wal_sync.store(true, Ordering::SeqCst);
     }
 
     pub fn no_references(&self) -> bool {

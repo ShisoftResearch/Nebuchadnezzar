@@ -29,6 +29,61 @@ fn test_chunks() -> Arc<Chunks> {
     )
 }
 
+#[test]
+fn exact_transaction_output_segments_sync_insert_update_and_delete_once() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let schema = Schema::new_with_id(1, "durable-output", None, default_fields(), false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(schema);
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        Some(temp_dir.path().join("wal").to_string_lossy().into_owned()),
+        None,
+    );
+    let insert_id = Id::new(1, 80);
+    let update_id = Id::new(1, 81);
+    let delete_id = Id::new(1, 82);
+
+    crate::ram::chunk::set_transaction_context(true);
+    let mut inserted = test_cell(insert_id, 1);
+    let insert = chunks
+        .write_cell_at_revision(&mut inserted, RevisionWrite::pending(200))
+        .unwrap();
+    let mut original = test_cell(update_id, 2);
+    chunks
+        .write_cell_at_revision(&mut original, RevisionWrite::committed(100))
+        .unwrap();
+    let mut updated = test_cell(update_id, 2);
+    let update = chunks
+        .update_cell_at_revision(&mut updated, RevisionWrite::pending(200))
+        .unwrap();
+    let mut deleted = test_cell(delete_id, 3);
+    chunks
+        .write_cell_at_revision(&mut deleted, RevisionWrite::committed(100))
+        .unwrap();
+    let delete = chunks
+        .remove_cell_at_revision(&delete_id, RevisionWrite::pending(200))
+        .unwrap();
+    crate::ram::chunk::set_transaction_context(false);
+
+    let segment = chunks.list[0]
+        .locate_segment(insert.node.load().1)
+        .expect("installed insert segment");
+    let before = segment.force_wal_sync_count_for_test();
+    chunks
+        .force_sync_installed_revisions([&insert, &update, &delete])
+        .unwrap();
+    assert_eq!(
+        segment.force_wal_sync_count_for_test(),
+        before + 1,
+        "all three exact outputs share one segment and must be deduplicated"
+    );
+}
+
 fn test_cell(id: Id, value: u64) -> OwnedCell {
     OwnedCell::new_with_id(
         1,

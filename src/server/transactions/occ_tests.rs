@@ -1801,7 +1801,7 @@ async fn abort_queued_behind_commit_reports_already_cleanup() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
+async fn partial_abort_failure_retains_all_site_owners_until_retry_resolves_every_site() {
     let _ = env_logger::try_init();
     let addresses = ["127.0.0.1:5366", "127.0.0.1:5367"];
     let group = "txn_occ_partial_abort_retry";
@@ -1890,16 +1890,30 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
         "an accepted abort decision must make commit permanently illegal"
     );
 
+    let expected_owner = Some(TxnPriority::new(tid, servers[0].server_id));
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            success_server_id,
+            group,
+            group,
+            &success_id,
+        ),
+        expected_owner,
+        "a compensated participant must retain its owner until every participant aborts"
+    );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(fail_server_id, group, group, &fail_id,),
+        expected_owner,
+        "the unresolved participant must retain its owner"
+    );
+
     let probe_tid = txn.begin().await.unwrap().unwrap();
-    let released = timeout(
-        Duration::from_secs(1),
-        txn.read(probe_tid.clone(), success_id),
-    )
-    .await
-    .expect("the successful abort participant should release its lock")
-    .unwrap()
-    .unwrap();
-    assert_eq!(score_of(&accepted_cell(released)), 1);
+    assert!(
+        timeout(Duration::from_millis(250), txn.read(probe_tid, success_id),)
+            .await
+            .is_err(),
+        "the compensated participant must remain behind the owner barrier"
+    );
     abort_txn(&txn, probe_tid).await;
 
     assert!(matches!(
@@ -1907,6 +1921,19 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
         AbortResult::Success(_)
     ));
     assert_eq!(manager.transaction_count(), 0);
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(
+            success_server_id,
+            group,
+            group,
+            &success_id,
+        ),
+        None
+    );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(fail_server_id, group, group, &fail_id,),
+        None
+    );
 
     let verify_tid = txn.begin().await.unwrap().unwrap();
     assert_eq!(

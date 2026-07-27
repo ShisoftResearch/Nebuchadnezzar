@@ -386,6 +386,7 @@ struct Transaction {
     installed: BTreeMap<Id, InstalledRevision>,
     commit_hlc: Option<Hlc>,
     commit_ops: Option<Vec<CommitOp>>,
+    durable_decision: Option<TxnState>,
     last_activity: i64,
     history: CommitHistory,
     /// RAII guards that hold segment references during this transaction
@@ -393,17 +394,16 @@ struct Transaction {
     rollback_guards: Vec<SegmentReferenceGuard>,
 }
 
-#[derive(Debug)]
 struct CellHistory {
     cell: Option<OwnedCellRef>,
-    compensation_revision_ts: Option<u64>,
+    compensation: Option<InstalledRevision>,
 }
 
 impl CellHistory {
     pub fn new(cell: Option<OwnedCellRef>) -> CellHistory {
         CellHistory {
             cell,
-            compensation_revision_ts: None,
+            compensation: None,
         }
     }
 }
@@ -443,6 +443,8 @@ pub struct DataManager {
     /// the coordinator-side `TransactionManager`. Stamps every participant
     /// response clock and observes the coordinator's incoming clock.
     hlc: Arc<bifrost::hlc::HlcSource>,
+    #[cfg(test)]
+    fail_next_undo_availability: AtomicBool,
 }
 
 #[cfg(test)]
@@ -518,6 +520,8 @@ impl DataManager {
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
             hlc,
+            #[cfg(test)]
+            fail_next_undo_availability: AtomicBool::new(false),
         });
         #[cfg(test)]
         register_data_manager_for_test(&manager);
@@ -585,6 +589,7 @@ impl DataManager {
                 installed: BTreeMap::new(),
                 commit_hlc: None,
                 commit_ops: None,
+                durable_decision: None,
                 last_activity: get_time(),
                 history: BTreeMap::new(),
                 rollback_guards: Vec::with_capacity(4), // Pre-allocate for common case
@@ -711,6 +716,12 @@ impl DataManager {
         self.database_runtime.undo_log()
     }
 
+    #[cfg(test)]
+    fn fail_next_undo_availability_for_test(&self) {
+        self.fail_next_undo_availability
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Create a segment reference guard to prevent eviction during transaction.
     /// Returns None if segment not found (already freed/evicted).
     /// The guard is RAII - reference is automatically released when dropped.
@@ -738,16 +749,9 @@ impl DataManager {
     ) -> Vec<RollbackFailure> {
         let mut failures = Vec::new();
         for (id, history) in history.iter_mut() {
-            debug!("ROLLING BACK {:?} - {:?}", id, history);
-            let result = match history.compensation_revision_ts {
-                Some(compensation_revision_ts) => {
-                    if self.chunks().current_revision_ts(id) == Some(compensation_revision_ts) {
-                        Ok(())
-                    } else {
-                        Err(WriteError::CellRevisionMismatch)
-                    }
-                }
-                None => installed_revisions
+            debug!("ROLLING BACK {:?}", id);
+            let install_result = if history.compensation.is_none() {
+                installed_revisions
                     .get(id)
                     .ok_or(WriteError::CellRevisionMismatch)
                     .and_then(|installed| {
@@ -757,9 +761,20 @@ impl DataManager {
                         )
                     })
                     .map(|compensation| {
-                        history.compensation_revision_ts = Some(compensation.node.revision_ts);
-                    }),
+                        history.compensation = Some(compensation);
+                    })
+            } else {
+                Ok(())
             };
+            let result = install_result.and_then(|()| {
+                let compensation = history
+                    .compensation
+                    .as_ref()
+                    .expect("successful compensation install retains its exact handle");
+                self.chunks()
+                    .force_sync_installed_revisions([compensation])
+                    .map_err(|error| WriteError::DurabilityFailure(error.to_string()))
+            });
             let error = result.err();
             if let Some(error) = error {
                 failures.push(RollbackFailure { id: *id, error });
@@ -1147,6 +1162,18 @@ impl DataManager {
             TxnState::Prepared => {}
         };
 
+        let mut undo_available = self.undo_log().is_some();
+        #[cfg(test)]
+        if self
+            .fail_next_undo_availability
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            undo_available = false;
+        }
+        if self.chunks().durable_storage_configured() && !undo_available {
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
+        }
+
         if let Err(result) = Self::validate_commit_subset(&txn, &cells) {
             return result;
         }
@@ -1415,24 +1442,6 @@ impl DataManager {
         }
 
         txn.state = TxnState::Committed;
-        for guard in &txn.rollback_guards {
-            let chunk_idx = guard.chunk_id();
-            let seg_id = guard.segment_id();
-            let chunk = &self.chunks().list[chunk_idx];
-            if let Some(segment) = chunk.segs.get(&(seg_id as usize)) {
-                if let Err(error) = segment.force_wal_sync() {
-                    error!(
-                        "Failed to sync WAL for segment {} during commit: {:?}",
-                        seg_id, error
-                    );
-                } else {
-                    debug!(
-                        "Synced segment {} (chunk {}) WAL to disk for transaction commit",
-                        seg_id, chunk_idx
-                    );
-                }
-            }
-        }
 
         DMCommitResult::Success
     }
@@ -1629,6 +1638,7 @@ mod tests {
     use futures::future::join_all;
     use lightning::map::Map as LFMapTrait;
     use std::sync::Arc;
+    use tempfile::TempDir;
 
     #[test]
     fn scoped_data_manager_service_ids_differ_between_databases() {
@@ -1888,6 +1898,34 @@ mod tests {
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![NebService::Cell, NebService::Transaction],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn start_durable_transaction_test_server(
+        address: &str,
+        group: &str,
+        temp_dir: &TempDir,
+    ) -> Arc<crate::server::NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: SEGMENT_SIZE,
+                db_size: SEGMENT_SIZE,
+                history_retention_ms: 300_000,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().into_owned()),
+                undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().into_owned()),
                 raft_storage: None,
                 index_enabled: false,
                 services: vec![NebService::Cell, NebService::Transaction],
@@ -4611,11 +4649,307 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn commit_marker_failure_keeps_pending_revision_owner_and_transaction_for_retry() {
+        let _ = env_logger::try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5407";
+        let group = "txn_data_site_end_marker_failure";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99041);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        let coordinator_id = 51;
+        let owner = TxnPriority::new(tid, coordinator_id);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                coordinator_id,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    9,
+                    "end-marker-failure",
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        let installed_location = manager.txns.get(&tid).unwrap().lock().installed[&cell_id]
+            .node
+            .load()
+            .1;
+        let installed_segment = runtime.chunks().list[0]
+            .locate_segment(installed_location)
+            .unwrap();
+        let syncs_before_end = installed_segment.force_wal_sync_count_for_test();
+
+        installed_segment.fail_next_force_wal_sync_for_test();
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        assert!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .contains_key(&tid),
+            "output sync failure must happen before the commit marker"
+        );
+
+        runtime
+            .undo_log()
+            .unwrap()
+            .fail_next_commit_marker_for_test();
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        assert_eq!(
+            installed_segment.force_wal_sync_count_for_test(),
+            syncs_before_end + 2,
+            "exact installed output must be synced before attempting the commit marker"
+        );
+        let txn_lock = manager
+            .txns
+            .get(&tid)
+            .expect("marker failure must preserve transaction state");
+        assert_eq!(
+            txn_lock.lock().installed[&cell_id].node.load().0,
+            RevisionState::PendingPresent
+        );
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner.clone())
+        );
+
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_mutation_without_available_undo_is_rejected_before_cell_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5409";
+        let group = "txn_data_site_durable_requires_undo";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99043);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                53,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+
+        manager.fail_next_undo_availability_for_test();
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    9,
+                    "must-not-be-installed",
+                ))],
+            )
+            .await,
+            DMCommitResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let retained = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(retained.header.revision_ts, initial_revision);
+        assert_eq!(*retained.data["score"].u64().unwrap(), 1);
+
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            AbortResult::Success(None)
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compensation_sync_failure_retries_the_exact_handle_without_duplicate_output() {
+        let _ = env_logger::try_init();
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5408";
+        let group = "txn_data_site_compensation_sync_retry";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99042);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        let coordinator_id = 52;
+        let owner = TxnPriority::new(tid, coordinator_id);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                coordinator_id,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    9,
+                    "compensation-sync-failed-output",
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        let installed_location = manager.txns.get(&tid).unwrap().lock().installed[&cell_id]
+            .node
+            .load()
+            .1;
+        runtime.chunks().list[0]
+            .locate_segment(installed_location)
+            .unwrap()
+            .fail_next_force_wal_sync_for_test();
+
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            AbortResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let compensation = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*compensation.data["score"].u64().unwrap(), 1);
+        let compensation_ts = compensation.header.revision_ts;
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner.clone())
+        );
+
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            AbortResult::Success(None)
+        );
+        assert_eq!(
+            runtime
+                .chunks()
+                .read_cell(&cell_id)
+                .unwrap()
+                .header
+                .revision_ts,
+            compensation_ts,
+            "retry must sync the retained exact compensation instead of installing another"
+        );
+        runtime
+            .undo_log()
+            .unwrap()
+            .fail_next_abort_marker_for_test();
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        assert!(
+            manager.txns.get(&tid).is_some(),
+            "abort marker failure must preserve retryable transaction state"
+        );
+        assert!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .contains_key(&tid),
+            "a failed abort marker must not suppress recovery"
+        );
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(owner),
+            "abort marker failure must preserve the owner barrier"
+        );
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        assert!(
+            !runtime
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .contains_key(&tid),
+            "the synced abort marker must suppress recovery only after exact compensation sync"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn end_partial_promotion_failure_restores_pending_barrier_for_retry() {
         let _ = env_logger::try_init();
+        let temp_dir = TempDir::new().unwrap();
         let address = "127.0.0.1:5406";
         let group = "txn_data_site_end_partial_promotion";
-        let server = start_transaction_test_server(address, group).await;
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
@@ -4682,6 +5016,27 @@ mod tests {
             .get(&tid)
             .expect("failed promotion must preserve transaction state");
         assert_eq!(txn_lock.lock().state, TxnState::Committed);
+        assert_eq!(
+            txn_lock.lock().durable_decision,
+            Some(TxnState::Committed),
+            "the synced marker remains the irrevocable commit decision"
+        );
+        assert!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .get(&tid)
+                .is_none(),
+            "the durable commit marker must suppress undo before promotion retry"
+        );
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            AbortResult::CheckFailed(CheckError::AlreadyCommitted)
+        );
         for id in [first_id, second_id] {
             assert_eq!(
                 txn_lock.lock().installed[&id].node.load().0,
@@ -4982,6 +5337,9 @@ impl Service for DataManager {
             return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted));
         };
         let mut txn = txn_lock.lock();
+        if txn.durable_decision == Some(TxnState::Committed) {
+            return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyCommitted));
+        }
         if txn.state == TxnState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
         }
@@ -5116,7 +5474,54 @@ impl Service for DataManager {
                 }) {
                     break 'end EndResult::CheckFailed(CheckError::CannotEnd);
                 }
+                if let Err(error) = self
+                    .chunks()
+                    .force_sync_installed_revisions(txn.installed.values())
+                {
+                    error!(
+                        "Failed to sync exact installed output for transaction {:?}: {:?}",
+                        tid, error
+                    );
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                }
+            }
+            if txn.state == TxnState::Aborted {
+                if txn
+                    .history
+                    .values()
+                    .any(|history| history.compensation.is_none())
+                {
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                }
+                if let Err(error) = self.chunks().force_sync_installed_revisions(
+                    txn.history
+                        .values()
+                        .filter_map(|history| history.compensation.as_ref()),
+                ) {
+                    error!(
+                        "Failed to sync exact compensation output for transaction {:?}: {:?}",
+                        tid, error
+                    );
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                }
+            }
 
+            if txn.durable_decision.is_none() {
+                if let Some(undo_log) = self.undo_log() {
+                    let log_result = match txn.state {
+                        TxnState::Committed => undo_log.write_commit_marker(&tid),
+                        TxnState::Aborted => undo_log.write_abort_marker(&tid),
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = log_result {
+                        error!("Failed to write transaction completion marker: {:?}", error);
+                        break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                    }
+                    txn.durable_decision = Some(txn.state);
+                }
+            }
+
+            if txn.state == TxnState::Committed {
                 let mut promoted = Vec::new();
                 let mut promotion_failed = false;
                 for installed in txn.installed.values() {
@@ -5164,17 +5569,6 @@ impl Service for DataManager {
             for meta in &mut cell_guards {
                 meta.owner = None;
                 meta.lock_acquired_at = None;
-            }
-
-            if let Some(undo_log) = self.undo_log() {
-                let log_result = match txn.state {
-                    TxnState::Committed => undo_log.write_commit_marker(&tid),
-                    TxnState::Aborted => undo_log.write_abort_marker(&tid),
-                    _ => Ok(()),
-                };
-                if let Err(error) = log_result {
-                    error!("Failed to write transaction completion marker: {:?}", error);
-                }
             }
 
             let guards_to_drop = std::mem::take(&mut txn.rollback_guards);

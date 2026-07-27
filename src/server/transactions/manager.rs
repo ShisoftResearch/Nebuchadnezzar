@@ -1541,6 +1541,16 @@ impl TransactionManager {
             }
         }
 
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        if let Some(failure) = first_failure {
+            return Ok(failure);
+        }
+        if !rollback_failures.is_empty() {
+            return Ok(AbortResult::Success(Some(rollback_failures)));
+        }
+
         let end_futures: FuturesUnordered<_> = sites_to_end
             .iter()
             .map(|server_id| {
@@ -1587,14 +1597,7 @@ impl TransactionManager {
         if let Some(error) = first_error {
             return Err(error);
         }
-        if let Some(failure) = first_failure {
-            return Ok(failure);
-        }
-        Ok(AbortResult::Success(if rollback_failures.is_empty() {
-            None
-        } else {
-            Some(rollback_failures)
-        }))
+        Ok(AbortResult::Success(None))
     }
     async fn sites_end(
         &self,

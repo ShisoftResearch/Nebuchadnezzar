@@ -1535,6 +1535,17 @@ impl NebServer {
             raft_storage: storage_layout.raft_storage,
             ..opts.clone()
         };
+        let durable_storage = effective_opts.enable_recovery
+            || effective_opts.wal_storage.is_some()
+            || effective_opts.backup_storage.is_some();
+        if durable_storage
+            && effective_opts.services.contains(&Service::Transaction)
+            && effective_opts.undo_log_storage.is_none()
+        {
+            return Err(ServerError::CannotInitializeDatabaseServices(
+                "durable transactional storage requires undo log storage".to_string(),
+            ));
+        }
 
         let schema_plane_client =
             raft_client.plane(database_meta_plane_id(group_name, database_name));
@@ -1677,13 +1688,15 @@ impl NebServer {
                 index_builder.initialize_inverted_indexer(&chunks);
                 index_builder.start_inverted_indexer_background_flush();
             }
-            match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
-                Ok(log) => Some(log),
-                Err(error) => {
-                    error!("Failed to initialize undo log: {:?}", error);
-                    None
-                }
-            }
+            Some(
+                transactions::undo_log::UndoLogger::new(undo_log_path.clone()).map_err(
+                    |error| {
+                        ServerError::CannotInitializeDatabaseServices(format!(
+                            "failed to initialize durable undo log: {error}"
+                        ))
+                    },
+                )?,
+            )
         } else {
             if let Some(ref index_builder) = index_builder {
                 index_builder.initialize_inverted_indexer(&chunks);

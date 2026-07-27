@@ -99,6 +99,7 @@ pub enum WriteError {
     DataMismatchSchema(Field, OwnedValue),
     CellRevisionMismatch,
     RevisionClockExhausted,
+    DurabilityFailure(String),
     CompressionFailed(Field, String),
 }
 

@@ -59,6 +59,80 @@ pub async fn init() {
 }
 
 #[tokio::test]
+async fn durable_transaction_configuration_requires_undo_storage() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let result = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: crate::ram::segs::SEGMENT_SIZE,
+            db_size: crate::ram::segs::SEGMENT_SIZE,
+            history_retention_ms: 300_000,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().into_owned()),
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &String::from("127.0.0.1:5419"),
+        &String::from("durable_transactions_require_undo"),
+        async |_| {},
+    )
+    .await;
+
+    match result {
+        Err(ServerError::CannotInitializeDatabaseServices(message)) => {
+            assert!(message.contains("undo"));
+        }
+        Err(other) => panic!("unexpected startup failure: {other}"),
+        Ok(server) => {
+            server.shutdown().await;
+            panic!("durable transactional storage must not start without undo");
+        }
+    }
+}
+
+#[tokio::test]
+async fn durable_undo_initialization_failure_is_fatal() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let invalid_undo_path = temp_dir.path().join("undo-is-a-file");
+    std::fs::write(&invalid_undo_path, b"not a directory").unwrap();
+    let result = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: crate::ram::segs::SEGMENT_SIZE,
+            db_size: crate::ram::segs::SEGMENT_SIZE,
+            history_retention_ms: 300_000,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().into_owned()),
+            undo_log_storage: Some(invalid_undo_path.to_string_lossy().into_owned()),
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &String::from("127.0.0.1:5420"),
+        &String::from("durable_undo_init_failure"),
+        async |_| {},
+    )
+    .await;
+
+    match result {
+        Err(ServerError::CannotInitializeDatabaseServices(message)) => {
+            assert!(message.contains("undo"));
+        }
+        Err(other) => panic!("unexpected startup failure: {other}"),
+        Ok(server) => {
+            server.shutdown().await;
+            panic!("durable undo initialization failure must abort startup");
+        }
+    }
+}
+
+#[tokio::test]
 pub async fn explicit_database_binding_scopes_storage_roots() {
     let _ = env_logger::try_init();
     let temp_dir = tempfile::TempDir::new().unwrap();
