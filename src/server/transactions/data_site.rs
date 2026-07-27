@@ -19,6 +19,7 @@ use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -53,6 +54,7 @@ pub(crate) fn full_read_rpc_count() -> usize {
 
 const DEFAULT_LOCK_TIMEOUT_MS: i64 = 30_000;
 const VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS: i64 = 300_000;
+const PARTICIPANT_LIFECYCLE_SHARD_COUNT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ParticipantCompletionEvidence {
@@ -61,12 +63,10 @@ struct ParticipantCompletionEvidence {
 }
 
 impl ParticipantCompletionEvidence {
-    fn completed_at(outcome: TxnState, completed_at_ms: i64) -> Self {
+    fn pending_retirement(outcome: TxnState) -> Self {
         Self {
             outcome,
-            expires_at_ms: Some(
-                completed_at_ms.saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS),
-            ),
+            expires_at_ms: None,
         }
     }
 
@@ -81,6 +81,51 @@ impl ParticipantCompletionEvidence {
         self.expires_at_ms
             .is_none_or(|expires_at_ms| now_ms < expires_at_ms)
             .then_some(self.outcome)
+    }
+}
+
+#[derive(Default)]
+struct OwnerIndex {
+    by_owner: HashMap<(TxnId, u64), usize>,
+    by_tid: HashMap<TxnId, usize>,
+}
+
+impl OwnerIndex {
+    fn add(&mut self, owner: &TxnPriority, count: usize) {
+        if count == 0 {
+            return;
+        }
+        *self
+            .by_owner
+            .entry((owner.tid, owner.coordinator_id))
+            .or_default() += count;
+        *self.by_tid.entry(owner.tid).or_default() += count;
+    }
+
+    fn remove(&mut self, owner: &TxnPriority, count: usize) {
+        if count == 0 {
+            return;
+        }
+        Self::subtract_count(
+            &mut self.by_owner,
+            &(owner.tid, owner.coordinator_id),
+            count,
+        );
+        Self::subtract_count(&mut self.by_tid, &owner.tid, count);
+    }
+
+    fn subtract_count<K: Eq + Hash + Copy>(counts: &mut HashMap<K, usize>, key: &K, count: usize) {
+        let remaining = counts
+            .get(key)
+            .copied()
+            .expect("owner index transition must remove an existing owner")
+            .checked_sub(count)
+            .expect("owner index transition must not underflow");
+        if remaining == 0 {
+            counts.remove(key);
+        } else {
+            counts.insert(*key, remaining);
+        }
     }
 }
 
@@ -460,6 +505,89 @@ fn pause_after_txn_registry_publish(tid: &TxnId) {
 }
 
 #[cfg(test)]
+struct RetirementReadPauseHandle {
+    key: (TxnId, bool),
+    state: Arc<BeforeStorageMutationState>,
+}
+
+#[cfg(test)]
+impl RetirementReadPauseHandle {
+    async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    fn release(&self) {
+        let mut released = self.state.released.lock();
+        if !*released {
+            *released = true;
+            self.state.released_condvar.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RetirementReadPauseHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = retirement_read_pause_hooks().lock();
+        if hooks
+            .get(&self.key)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            hooks.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+static RETIREMENT_READ_PAUSE_HOOKS: OnceLock<
+    Mutex<BTreeMap<(TxnId, bool), Arc<BeforeStorageMutationState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn retirement_read_pause_hooks(
+) -> &'static Mutex<BTreeMap<(TxnId, bool), Arc<BeforeStorageMutationState>>> {
+    RETIREMENT_READ_PAUSE_HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn install_retirement_read_pause(tid: TxnId, finalized: bool) -> RetirementReadPauseHandle {
+    let key = (tid, finalized);
+    let state = Arc::new(BeforeStorageMutationState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: Mutex::new(false),
+        released_condvar: Condvar::new(),
+    });
+    retirement_read_pause_hooks()
+        .lock()
+        .insert(key, state.clone());
+    RetirementReadPauseHandle { key, state }
+}
+
+#[cfg(test)]
+fn pause_after_retirement_read(tid: &TxnId, finalized: bool) {
+    let Some(state) = retirement_read_pause_hooks()
+        .lock()
+        .remove(&(*tid, finalized))
+    else {
+        return;
+    };
+    state
+        .entered
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state.entered_notify.notify_waiters();
+    let mut released = state.released.lock();
+    while !*released {
+        state.released_condvar.wait(&mut released);
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct AbortCannotEndHandle {
     key: (TxnId, Id),
 }
@@ -610,8 +738,12 @@ pub struct DataManager {
     txn_registry_lock: Mutex<()>,
     cell_cleanup_lock: Mutex<()>,
     resolving_owners: Mutex<BTreeSet<(TxnId, u64)>>,
+    owner_index: Mutex<OwnerIndex>,
+    participant_lifecycle_shards: [Mutex<()>; PARTICIPANT_LIFECYCLE_SHARD_COUNT],
     participant_completions: Mutex<HashMap<TxnId, ParticipantCompletionEvidence>>,
     participant_completion_cache_ready: bool,
+    #[cfg(test)]
+    participant_clock_overrides: Mutex<HashMap<TxnId, i64>>,
     #[cfg(test)]
     resolution_attempts: Mutex<BTreeMap<(TxnId, u64), u64>>,
     database_runtime: Arc<DatabaseRuntime>,
@@ -650,6 +782,54 @@ fn register_data_manager_for_test(manager: &Arc<DataManager>) {
 }
 
 #[cfg(test)]
+pub(crate) struct ParticipantClockHandle {
+    manager: Weak<DataManager>,
+    tid: TxnId,
+}
+
+#[cfg(test)]
+impl ParticipantClockHandle {
+    pub(crate) fn advance_by(&self, delta_ms: i64) {
+        if let Some(manager) = self.manager.upgrade() {
+            let mut clocks = manager.participant_clock_overrides.lock();
+            let now_ms = clocks
+                .get_mut(&self.tid)
+                .expect("participant test clock must remain installed");
+            *now_ms = now_ms.saturating_add(delta_ms);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ParticipantClockHandle {
+    fn drop(&mut self) {
+        if let Some(manager) = self.manager.upgrade() {
+            manager.participant_clock_overrides.lock().remove(&self.tid);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_participant_clock_for_test(
+    server_id: u64,
+    group_name: &str,
+    database_name: &str,
+    tid: TxnId,
+    now_ms: i64,
+) -> Option<ParticipantClockHandle> {
+    let key = (server_id, group_name.to_string(), database_name.to_string());
+    let manager = test_data_managers().lock().get(&key)?.upgrade()?;
+    manager
+        .participant_clock_overrides
+        .lock()
+        .insert(tid, now_ms);
+    Some(ParticipantClockHandle {
+        manager: Arc::downgrade(&manager),
+        tid,
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn participant_owner_for_test(
     server_id: u64,
     group_name: &str,
@@ -661,6 +841,42 @@ pub(crate) fn participant_owner_for_test(
     let cell_meta = manager.cells.get(id)?;
     let owner = cell_meta.lock().owner.clone();
     owner
+}
+
+#[cfg(test)]
+pub(crate) fn participant_completion_for_test(
+    server_id: u64,
+    group_name: &str,
+    database_name: &str,
+    tid: &TxnId,
+) -> Option<(TxnState, Option<i64>)> {
+    let key = (server_id, group_name.to_string(), database_name.to_string());
+    let manager = test_data_managers().lock().get(&key)?.upgrade()?;
+    let completion = manager
+        .participant_completions
+        .lock()
+        .get(tid)
+        .copied()
+        .map(|evidence| (evidence.outcome, evidence.expires_at_ms));
+    completion
+}
+
+#[cfg(test)]
+pub(crate) fn participant_completion_outcome_at_for_test(
+    server_id: u64,
+    group_name: &str,
+    database_name: &str,
+    tid: &TxnId,
+    now_ms: i64,
+) -> Option<TxnState> {
+    let key = (server_id, group_name.to_string(), database_name.to_string());
+    let manager = test_data_managers().lock().get(&key)?.upgrade()?;
+    let outcome = manager
+        .participant_completions
+        .lock()
+        .get(tid)
+        .and_then(|evidence| evidence.outcome_at(now_ms));
+    outcome
 }
 
 service! {
@@ -681,8 +897,8 @@ service! {
     // Retirement is off the user-visible completion path. The prepare step
     // retains idempotence evidence until the coordinator durably acknowledges
     // it; finalize starts the participant-side expiry clock.
-    rpc retire(clock: Hlc, tid: TxnId, resolution: TxnResolution, expires_at_ms: i64) -> DataSiteResponse<EndResult>;
-    rpc finalize_retirement(clock: Hlc, tid: TxnId, resolution: TxnResolution, expires_at_ms: i64) -> DataSiteResponse<EndResult>;
+    rpc retire(clock: Hlc, tid: TxnId, resolution: TxnResolution) -> DataSiteResponse<EndResult>;
+    rpc finalize_retirement(clock: Hlc, tid: TxnId, resolution: TxnResolution) -> DataSiteResponse<EndResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -747,8 +963,12 @@ impl DataManager {
             txn_registry_lock: Mutex::new(()),
             cell_cleanup_lock: Mutex::new(()),
             resolving_owners: Mutex::new(BTreeSet::new()),
+            owner_index: Mutex::new(OwnerIndex::default()),
+            participant_lifecycle_shards: std::array::from_fn(|_| Mutex::new(())),
             participant_completions: Mutex::new(participant_completions),
             participant_completion_cache_ready,
+            #[cfg(test)]
+            participant_clock_overrides: Mutex::new(HashMap::new()),
             #[cfg(test)]
             resolution_attempts: Mutex::new(BTreeMap::new()),
             database_runtime,
@@ -802,6 +1022,20 @@ impl DataManager {
             .retain(|_, completion| completion.outcome_at(now_ms).is_some());
     }
 
+    #[cfg(test)]
+    fn participant_time(&self, tid: &TxnId) -> i64 {
+        self.participant_clock_overrides
+            .lock()
+            .get(tid)
+            .copied()
+            .unwrap_or_else(get_time)
+    }
+
+    #[cfg(not(test))]
+    fn participant_time(&self, _tid: &TxnId) -> i64 {
+        get_time()
+    }
+
     fn cached_participant_completion_at(&self, tid: &TxnId, now_ms: i64) -> Option<TxnState> {
         let mut completions = self.participant_completions.lock();
         match completions.get(tid).copied() {
@@ -816,7 +1050,8 @@ impl DataManager {
         }
     }
 
-    fn record_volatile_completion_at(&self, tid: TxnId, outcome: TxnState, now_ms: i64) {
+    fn record_volatile_completion(&self, tid: TxnId, outcome: TxnState) {
+        let now_ms = self.participant_time(&tid);
         let mut completions = self.participant_completions.lock();
         if completions
             .get(&tid)
@@ -826,7 +1061,7 @@ impl DataManager {
         }
         completions
             .entry(tid)
-            .or_insert_with(|| ParticipantCompletionEvidence::completed_at(outcome, now_ms));
+            .or_insert_with(|| ParticipantCompletionEvidence::pending_retirement(outcome));
     }
 
     fn record_durable_completion(&self, tid: TxnId, outcome: TxnState, expires_at_ms: Option<i64>) {
@@ -850,8 +1085,15 @@ impl DataManager {
         Ok(self.cached_participant_completion_at(tid, now_ms))
     }
 
+    fn participant_lifecycle_guard(&self, tid: &TxnId) -> parking_lot::MutexGuard<'_, ()> {
+        let mut hasher = DefaultHasher::new();
+        tid.hash(&mut hasher);
+        let shard = (hasher.finish() as usize) % PARTICIPANT_LIFECYCLE_SHARD_COUNT;
+        self.participant_lifecycle_shards[shard].lock()
+    }
+
     fn end_result_from_completion_evidence(&self, tid: &TxnId) -> EndResult {
-        match self.participant_completion_evidence(tid, get_time()) {
+        match self.participant_completion_evidence(tid, self.participant_time(tid)) {
             Ok(Some(TxnState::Committed | TxnState::Aborted)) => EndResult::Success,
             Ok(_) => EndResult::CheckFailed(CheckError::NotExisted),
             Err(error) => {
@@ -865,7 +1107,7 @@ impl DataManager {
     }
 
     fn abort_result_from_completion_evidence(&self, tid: &TxnId) -> AbortResult {
-        match self.participant_completion_evidence(tid, get_time()) {
+        match self.participant_completion_evidence(tid, self.participant_time(tid)) {
             Ok(Some(TxnState::Aborted)) => AbortResult::CheckFailed(CheckError::AlreadyAborted),
             Ok(Some(TxnState::Committed)) => AbortResult::CheckFailed(CheckError::AlreadyCommitted),
             Ok(_) => AbortResult::CheckFailed(CheckError::NotExisted),
@@ -965,32 +1207,14 @@ impl DataManager {
     }
 
     fn owner_is_present(&self, owner: &TxnPriority) -> bool {
-        for cell_id_ref in self.cell_list.iter_front() {
-            let cell_id = cell_id_ref.deref();
-            if self
-                .cells
-                .get(&cell_id)
-                .is_some_and(|cell| cell.lock().owner.as_ref() == Some(owner))
-            {
-                return true;
-            }
-        }
-        false
+        self.owner_index
+            .lock()
+            .by_owner
+            .contains_key(&(owner.tid, owner.coordinator_id))
     }
 
     fn transaction_owner_is_present(&self, tid: &TxnId) -> bool {
-        for cell_id_ref in self.cell_list.iter_front() {
-            let cell_id = cell_id_ref.deref();
-            if self.cells.get(&cell_id).is_some_and(|cell| {
-                cell.lock()
-                    .owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.tid == *tid)
-            }) {
-                return true;
-            }
-        }
-        false
+        self.owner_index.lock().by_tid.contains_key(tid)
     }
 
     fn resolution_outcome(resolution: TxnResolution) -> Option<TxnState> {
@@ -1117,18 +1341,49 @@ impl DataManager {
         &self,
         tid: &TxnId,
         resolution: TxnResolution,
-        expires_at_ms: i64,
         finalized: bool,
     ) -> EndResult {
         let Some(outcome) = Self::resolution_outcome(resolution) else {
             return EndResult::CheckFailed(CheckError::CannotEnd);
         };
-        let Some(undo_log) = self.undo_log() else {
-            return EndResult::CheckFailed(CheckError::NotExisted);
-        };
+        let _lifecycle_guard = self.participant_lifecycle_guard(tid);
         if self.find_transaction(tid).is_some() || self.transaction_owner_is_present(tid) {
             return EndResult::CheckFailed(CheckError::CannotEnd);
         }
+
+        let Some(undo_log) = self.undo_log() else {
+            let now_ms = self.participant_time(tid);
+            let mut completions = self.participant_completions.lock();
+            let completion = completions.get(tid).copied();
+            if completion.is_some_and(|completion| completion.outcome != outcome) {
+                return EndResult::CheckFailed(CheckError::CannotEnd);
+            }
+            if !finalized {
+                return if completion
+                    .and_then(|completion| completion.outcome_at(now_ms))
+                    .is_some()
+                {
+                    EndResult::Success
+                } else {
+                    EndResult::CheckFailed(CheckError::NotExisted)
+                };
+            }
+            if completion.is_some_and(|completion| {
+                completion
+                    .expires_at_ms
+                    .is_some_and(|expires_at_ms| now_ms < expires_at_ms)
+            }) {
+                return EndResult::Success;
+            }
+            completions.insert(
+                *tid,
+                ParticipantCompletionEvidence::durable(
+                    outcome,
+                    Some(now_ms.saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS)),
+                ),
+            );
+            return EndResult::Success;
+        };
 
         let retirement = match undo_log.participant_retirement(tid) {
             Ok(retirement) => retirement,
@@ -1144,11 +1399,12 @@ impl DataManager {
             if record.outcome != outcome {
                 return EndResult::CheckFailed(CheckError::CannotEnd);
             }
-            if record.finalized {
+            if record.finalized && (!finalized || self.participant_time(tid) < record.expires_at_ms)
+            {
                 self.record_durable_completion(*tid, outcome, Some(record.expires_at_ms));
                 return EndResult::Success;
             }
-            if !finalized {
+            if !record.finalized && !finalized {
                 self.record_durable_completion(*tid, outcome, None);
                 return EndResult::Success;
             }
@@ -1171,10 +1427,15 @@ impl DataManager {
             }
         }
 
+        #[cfg(test)]
+        pause_after_retirement_read(tid, finalized);
+        let expires_at_ms = self
+            .participant_time(tid)
+            .saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS);
         let result = if finalized {
             undo_log.finalize_participant_retirement(tid, outcome, expires_at_ms)
         } else {
-            undo_log.write_participant_retirement(tid, outcome, expires_at_ms)
+            undo_log.write_participant_retirement(tid, outcome, 0)
         };
         match result {
             Ok(()) => {
@@ -2617,12 +2878,14 @@ mod tests {
         drop(txn);
 
         let lock_time = get_time();
+        let owner_count = affected_cells.len();
         for id in affected_cells {
             let meta = manager.cell_meta_mutex(&id);
             let mut meta = meta.lock();
             meta.owner = Some(owner.clone());
             meta.lock_acquired_at = Some(lock_time);
         }
+        manager.owner_index.lock().add(&owner, owner_count);
     }
 
     async fn prepare_ops_local(
@@ -3961,16 +4224,169 @@ mod tests {
     }
 
     #[test]
-    fn volatile_completion_retention_uses_the_exact_logical_deadline() {
+    fn participant_completion_retention_uses_the_exact_logical_deadline() {
         assert_eq!(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS, 300_000);
-        let completed_at_ms = 10_000;
-        let completion =
-            ParticipantCompletionEvidence::completed_at(TxnState::Committed, completed_at_ms);
+        let accepted_at_ms: i64 = 10_000;
+        let pending = ParticipantCompletionEvidence::pending_retirement(TxnState::Committed);
+        assert_eq!(pending.outcome_at(i64::MAX), Some(TxnState::Committed));
+        let finalized = ParticipantCompletionEvidence::durable(
+            TxnState::Committed,
+            Some(accepted_at_ms.saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS)),
+        );
         assert_eq!(
-            completion.outcome_at(completed_at_ms + 299_999),
+            finalized.outcome_at(accepted_at_ms + 299_999),
             Some(TxnState::Committed)
         );
-        assert_eq!(completion.outcome_at(completed_at_ms + 300_000), None);
+        assert_eq!(finalized.outcome_at(accepted_at_ms + 300_000), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn identical_prepare_retry_preserves_original_owner_age() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5378";
+        let group = "txn_data_site_prepare_retry_owner_age";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = DataManager::new_with_lock_timeout(runtime.clone(), server.hlc.clone(), 8);
+        let cell_id = Id::new(0, 90506);
+        let revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 17, 0);
+        let tid = manager.hlc.now();
+        let owner = TxnPriority::new(tid, server.server_id);
+        let op = PrepareOp {
+            id: cell_id,
+            expectation: CellExpectation::Present(revision_ts),
+            intent: PrepareIntent::Write,
+        };
+
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &tid, vec![op.clone()]).await,
+            DMPrepareResult::Success
+        );
+        let first_acquired_at = manager
+            .cell_meta_mutex(&cell_id)
+            .lock()
+            .lock_acquired_at
+            .expect("successful prepare must timestamp the new owner");
+        runtime
+            .undo_log()
+            .unwrap()
+            .write_coordinator_abort_decision(&tid, &[server.server_id])
+            .unwrap();
+
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            assert_eq!(
+                prepare_ops_local(&manager, server.server_id, &tid, vec![op.clone()]).await,
+                DMPrepareResult::Success
+            );
+            assert_eq!(
+                manager.cell_meta_mutex(&cell_id).lock().lock_acquired_at,
+                Some(first_acquired_at),
+                "sub-timeout identical retries must not renew the stale-owner clock"
+            );
+        }
+
+        let contender = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &contender, vec![op.clone()]).await,
+            DMPrepareResult::NotRealizable,
+            "the younger contender still queues explicit resolution before wait-die rejection"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !manager.owner_is_present(&owner)
+                    && manager.resolution_attempt_count_for_test(&owner) > 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("original-age timeout must queue and converge the durable Abort decision");
+        assert_eq!(
+            prepare_ops_local(&manager, server.server_id, &contender, vec![op]).await,
+            DMPrepareResult::Success,
+            "the contender must acquire after explicit resolution releases the stale owner"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn volatile_end_evidence_waits_for_local_retirement_finalize() {
+        let address = "127.0.0.1:5379";
+        let group = "txn_data_site_volatile_retirement_handshake";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = manager.hlc.now();
+
+        manager.get_or_create_transaction(&tid).lock().state = TxnState::Aborted;
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        let pending = manager
+            .participant_completions
+            .lock()
+            .get(&tid)
+            .copied()
+            .expect("end must publish participant completion evidence");
+        assert_eq!(
+            pending.expires_at_ms, None,
+            "owner clear must not start the volatile completion TTL"
+        );
+        assert_eq!(
+            pending.outcome_at(get_time().saturating_add(300_001)),
+            Some(TxnState::Aborted),
+            "lost end responses remain retryable before retirement finalize"
+        );
+
+        assert_eq!(
+            <DataManager as Service>::retire(
+                &manager,
+                manager.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            )
+            .await
+            .payload,
+            EndResult::Success
+        );
+        let accepted_before = get_time();
+        assert_eq!(
+            <DataManager as Service>::finalize_retirement(
+                &manager,
+                manager.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            )
+            .await
+            .payload,
+            EndResult::Success
+        );
+        let accepted_after = get_time();
+        let finalized = manager
+            .participant_completions
+            .lock()
+            .get(&tid)
+            .copied()
+            .expect("finalize must retain volatile participant evidence");
+        let expires_at_ms = finalized
+            .expires_at_ms
+            .expect("finalize must start the participant-local TTL");
+        assert!(
+            expires_at_ms
+                >= accepted_before.saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS)
+                && expires_at_ms
+                    <= accepted_after.saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS),
+            "participant finalize must derive expiry from local acceptance"
+        );
+
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3993,16 +4409,14 @@ mod tests {
                 .payload,
             AbortResult::CheckFailed(CheckError::NotExisted)
         );
-        manager.record_volatile_completion_at(
+        manager.participant_completions.lock().insert(
             unknown_tid,
-            TxnState::Aborted,
-            get_time() - VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS,
+            ParticipantCompletionEvidence::durable(TxnState::Aborted, Some(get_time())),
         );
         let unrelated_expired_tid = manager.hlc.now();
-        manager.record_volatile_completion_at(
+        manager.participant_completions.lock().insert(
             unrelated_expired_tid,
-            TxnState::Committed,
-            get_time() - VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS,
+            ParticipantCompletionEvidence::durable(TxnState::Committed, Some(get_time())),
         );
         assert_eq!(
             <DataManager as Service>::end(&manager, manager.hlc.now(), unknown_tid)
@@ -4681,8 +5095,6 @@ mod tests {
         let cell_id = Id::new(0, 8212);
         let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 61, 0);
         let tid = server.hlc.try_now().unwrap();
-        let coordinator_expires_at_ms = get_time() - 1;
-        let participant_expires_at_ms = get_time() + 300_000;
 
         assert_eq!(
             prepare_ops_local(
@@ -4718,7 +5130,6 @@ mod tests {
                     server.hlc.now(),
                     tid,
                     TxnResolution::Abort,
-                    coordinator_expires_at_ms,
                 )
                 .await
                 .payload,
@@ -4733,37 +5144,265 @@ mod tests {
                 .unwrap(),
             Some(undo_log::ParticipantRetirementRecord {
                 outcome: TxnState::Aborted,
-                expires_at_ms: coordinator_expires_at_ms,
+                expires_at_ms: 0,
                 finalized: false,
             })
         );
 
-        for _ in 0..2 {
-            assert_eq!(
-                <DataManager as Service>::finalize_retirement(
-                    &manager,
-                    server.hlc.now(),
-                    tid,
-                    TxnResolution::Abort,
-                    participant_expires_at_ms,
-                )
-                .await
-                .payload,
-                EndResult::Success
-            );
-        }
+        let accepted_before = get_time();
+        assert_eq!(
+            <DataManager as Service>::finalize_retirement(
+                &manager,
+                server.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            )
+            .await
+            .payload,
+            EndResult::Success
+        );
+        let accepted_after = get_time();
+        let first_finalized = runtime
+            .undo_log()
+            .unwrap()
+            .participant_retirement(&tid)
+            .unwrap()
+            .expect("finalize must persist participant retirement");
+        assert_eq!(first_finalized.outcome, TxnState::Aborted);
+        assert!(first_finalized.finalized);
+        assert!(
+            first_finalized.expires_at_ms
+                >= accepted_before.saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS)
+                && first_finalized.expires_at_ms
+                    <= accepted_after.saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS),
+            "participant expiry must use its local finalize-acceptance clock"
+        );
+
+        assert_eq!(
+            <DataManager as Service>::finalize_retirement(
+                &manager,
+                server.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            )
+            .await
+            .payload,
+            EndResult::Success
+        );
         assert_eq!(
             runtime
                 .undo_log()
                 .unwrap()
                 .participant_retirement(&tid)
                 .unwrap(),
-            Some(undo_log::ParticipantRetirementRecord {
-                outcome: TxnState::Aborted,
-                expires_at_ms: participant_expires_at_ms,
-                finalized: true,
-            })
+            Some(first_finalized),
+            "idempotent finalize retry must preserve the first accepted TTL"
         );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn participant_finalize_ttl_starts_after_delayed_local_acceptance_under_clock_skew() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5382";
+        let group = "txn_data_site_retirement_delay_and_skew";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = manager.hlc.now();
+        runtime
+            .undo_log()
+            .unwrap()
+            .write_abort_marker(&tid)
+            .unwrap();
+        manager.record_durable_completion(tid, TxnState::Aborted, None);
+        assert_eq!(
+            <DataManager as Service>::retire(
+                &manager,
+                manager.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            )
+            .await
+            .payload,
+            EndResult::Success
+        );
+
+        let coordinator_send_ms = get_time();
+        let participant_send_ms = coordinator_send_ms.saturating_add(10_000_000);
+        let simulated_network_delay_ms = 120_000;
+        let participant_clock = install_participant_clock_for_test(
+            server.server_id,
+            group,
+            group,
+            tid,
+            participant_send_ms,
+        )
+        .expect("durable participant manager must be registered");
+        let pause = install_retirement_read_pause(tid, true);
+        let finalize_manager = manager.clone();
+        let finalize = tokio::spawn(async move {
+            <DataManager as Service>::finalize_retirement(
+                &finalize_manager,
+                finalize_manager.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            )
+            .await
+            .payload
+        });
+        pause.wait_until_entered().await;
+        participant_clock.advance_by(simulated_network_delay_ms);
+        pause.release();
+        assert_eq!(finalize.await.unwrap(), EndResult::Success);
+
+        let finalized = runtime
+            .undo_log()
+            .unwrap()
+            .participant_retirement(&tid)
+            .unwrap()
+            .expect("participant-local finalize evidence");
+        assert_eq!(
+            finalized.expires_at_ms,
+            participant_send_ms
+                .saturating_add(simulated_network_delay_ms)
+                .saturating_add(VOLATILE_PARTICIPANT_COMPLETION_RETENTION_MS),
+            "network delay and coordinator/participant clock skew must not shorten the local acceptance interval"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn participant_retirement_rmw_is_serialized_and_monotonic_per_tid() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5380";
+        let group = "txn_data_site_retirement_serialization";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = data_manager_for_database(&server, address, group).await;
+        let tid = manager.hlc.now();
+        runtime
+            .undo_log()
+            .unwrap()
+            .write_abort_marker(&tid)
+            .unwrap();
+        manager.record_durable_completion(tid, TxnState::Aborted, None);
+
+        let pause = install_retirement_read_pause(tid, false);
+        let old_manager = manager.clone();
+        let old_retire = tokio::task::spawn_blocking(move || {
+            futures::executor::block_on(<DataManager as Service>::retire(
+                &old_manager,
+                old_manager.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            ))
+            .payload
+        });
+        pause.wait_until_entered().await;
+
+        let finalize_manager = manager.clone();
+        let mut finalize = tokio::spawn(async move {
+            <DataManager as Service>::finalize_retirement(
+                &finalize_manager,
+                finalize_manager.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            )
+            .await
+            .payload
+        });
+        let finalized_while_old_read_was_paused =
+            tokio::time::timeout(Duration::from_millis(100), &mut finalize)
+                .await
+                .ok();
+        pause.release();
+
+        assert_eq!(old_retire.await.unwrap(), EndResult::Success);
+        let finalize_result = match finalized_while_old_read_was_paused {
+            Some(result) => result.unwrap(),
+            None => finalize.await.unwrap(),
+        };
+        assert_eq!(finalize_result, EndResult::Success);
+        let retirement = runtime
+            .undo_log()
+            .unwrap()
+            .participant_retirement(&tid)
+            .unwrap()
+            .expect("retirement evidence must remain present");
+        assert!(
+            retirement.finalized,
+            "an older retirement prepare may never overwrite accepted finalize evidence"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn expired_proof_refinalize_is_atomic_with_same_tid_prepare() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5381";
+        let group = "txn_data_site_refinalize_prepare_serialization";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let coordinator_id = server.server_id;
+        let cell_id = Id::new(0, 90507);
+        let revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 71, 0);
+        let tid = manager.hlc.now();
+        let undo = runtime.undo_log().unwrap();
+        undo.write_abort_marker(&tid).unwrap();
+        let expired_at_ms = get_time().saturating_sub(1);
+        undo.finalize_participant_retirement(&tid, TxnState::Aborted, expired_at_ms)
+            .unwrap();
+        manager.record_durable_completion(tid, TxnState::Aborted, Some(expired_at_ms));
+
+        let pause = install_retirement_read_pause(tid, true);
+        let finalize_manager = manager.clone();
+        let finalize = tokio::spawn(async move {
+            <DataManager as Service>::finalize_retirement(
+                &finalize_manager,
+                finalize_manager.hlc.now(),
+                tid,
+                TxnResolution::Abort,
+            )
+            .await
+            .payload
+        });
+        pause.wait_until_entered().await;
+
+        let prepare_manager = manager.clone();
+        let mut prepare = tokio::spawn(async move {
+            prepare_ops_local(
+                &prepare_manager,
+                coordinator_id,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(revision_ts),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut prepare)
+                .await
+                .is_err(),
+            "same-TID prepare must synchronize with retirement re-finalization"
+        );
+
+        pause.release();
+        assert_eq!(finalize.await.unwrap(), EndResult::Success);
+        assert_eq!(
+            prepare.await.unwrap(),
+            DMPrepareResult::StateError(TxnState::Aborted)
+        );
+        assert!(manager.find_transaction(&tid).is_none());
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
 
         server.shutdown().await;
     }
@@ -7163,7 +7802,7 @@ impl Service for DataManager {
             // minting any CellMeta entries. The checks inside the acquisition
             // loop remain authoritative: end or another prepare may race this
             // fail-fast snapshot.
-            match self.participant_completion_evidence(&tid, get_time()) {
+            match self.participant_completion_evidence(&tid, self.participant_time(&tid)) {
                 Ok(Some(state @ (TxnState::Committed | TxnState::Aborted))) => {
                     return self
                         .response_with(DMPrepareResult::StateError(state))
@@ -7212,20 +7851,48 @@ impl Service for DataManager {
                 Self::await_prepare_delay(&state).await;
             }
 
-            let result = 'result: loop {
-                let (txn_lock, created) = self.get_or_create_transaction_with_status(&tid);
-                let mut txn = txn_lock.lock();
-                if !self
-                    .txns
-                    .get(&tid)
-                    .is_some_and(|current| Arc::ptr_eq(&current, &txn_lock))
-                {
-                    drop(txn);
-                    match self.participant_completion_evidence(&tid, get_time()) {
+            let result = {
+                // Serialize the authoritative completion check, transaction
+                // publication, and owner acquisition with retirement
+                // re-finalization for this TID.
+                let _lifecycle_guard = self.participant_lifecycle_guard(&tid);
+                'result: loop {
+                    let (txn_lock, created) = self.get_or_create_transaction_with_status(&tid);
+                    let mut txn = txn_lock.lock();
+                    if !self
+                        .txns
+                        .get(&tid)
+                        .is_some_and(|current| Arc::ptr_eq(&current, &txn_lock))
+                    {
+                        drop(txn);
+                        match self
+                            .participant_completion_evidence(&tid, self.participant_time(&tid))
+                        {
+                            Ok(Some(state @ (TxnState::Committed | TxnState::Aborted))) => {
+                                break 'result DMPrepareResult::StateError(state);
+                            }
+                            Ok(_) => continue 'result,
+                            Err(error) => {
+                                error!(
+                                    "Failed to check participant completion before prepare {:?}: {:?}",
+                                    tid, error
+                                );
+                                break 'result DMPrepareResult::NotRealizable;
+                            }
+                        }
+                    }
+                    match self.participant_completion_evidence(
+                        &tid,
+                        self.participant_time(&tid),
+                    ) {
                         Ok(Some(state @ (TxnState::Committed | TxnState::Aborted))) => {
+                            if created {
+                                self.wipe_out_transaction(&tid, &txn_lock);
+                            }
                             break 'result DMPrepareResult::StateError(state);
                         }
-                        Ok(_) => continue 'result,
+                        Ok(Some(_)) => break 'result DMPrepareResult::NotRealizable,
+                        Ok(None) => {}
                         Err(error) => {
                             error!(
                                 "Failed to check participant completion before prepare {:?}: {:?}",
@@ -7234,116 +7901,108 @@ impl Service for DataManager {
                             break 'result DMPrepareResult::NotRealizable;
                         }
                     }
-                }
-                match self.participant_completion_evidence(&tid, get_time()) {
-                    Ok(Some(state @ (TxnState::Committed | TxnState::Aborted))) => {
-                        if created {
-                            self.wipe_out_transaction(&tid, &txn_lock);
+                    match txn.state {
+                        TxnState::Started => {}
+                        TxnState::Prepared => {
+                            if txn.coordinator_id != Some(coordinator_id)
+                                || txn.certified != prepared_ops_by_id
+                            {
+                                break 'result DMPrepareResult::StateError(TxnState::Prepared);
+                            }
                         }
-                        break 'result DMPrepareResult::StateError(state);
+                        _ => break 'result DMPrepareResult::StateError(txn.state),
                     }
-                    Ok(Some(_)) => break 'result DMPrepareResult::NotRealizable,
-                    Ok(None) => {}
-                    Err(error) => {
-                        error!(
-                            "Failed to check participant completion before prepare {:?}: {:?}",
-                            tid, error
-                        );
-                        break 'result DMPrepareResult::NotRealizable;
-                    }
-                }
-                match txn.state {
-                    TxnState::Started => {}
-                    TxnState::Prepared => {
-                        if txn.coordinator_id != Some(coordinator_id)
-                            || txn.certified != prepared_ops_by_id
+
+                    'acquire: loop {
+                        let mut cell_mutexes = prefetched_cell_mutexes.take().unwrap_or_else(|| {
+                            Vec::with_capacity(prepared_ops.len())
+                        });
+                        let mut cell_guards = Vec::with_capacity(prepared_ops.len());
+
+                        if cell_mutexes.is_empty() && !prepared_ops.is_empty() {
+                            for op in &prepared_ops {
+                                cell_mutexes.push(self.cell_meta_mutex(&op.id));
+                            }
+                        }
+                        for cell_mutex in &cell_mutexes {
+                            cell_guards.push(cell_mutex.lock());
+                        }
+                        if prepared_ops
+                            .iter()
+                            .zip(&cell_mutexes)
+                            .any(|(op, meta)| !self.cell_meta_is_current(&op.id, meta))
                         {
-                            break 'result DMPrepareResult::StateError(TxnState::Prepared);
+                            drop(cell_guards);
+                            continue 'acquire;
                         }
-                    }
-                    _ => break 'result DMPrepareResult::StateError(txn.state),
-                }
 
-                'acquire: loop {
-                    let mut cell_mutexes = prefetched_cell_mutexes.take().unwrap_or_else(|| {
-                        Vec::with_capacity(prepared_ops.len())
-                    });
-                    let mut cell_guards = Vec::with_capacity(prepared_ops.len());
+                        for meta in &cell_guards {
+                            if let Some(owner) = meta.owner.clone() {
+                                if owner != requester {
+                                    let lock_age = meta
+                                        .lock_acquired_at
+                                        .map(|acquired| get_time() - acquired)
+                                        .unwrap_or(0);
+                                    if lock_age > self.lock_timeout_ms {
+                                        self.queue_stale_owner_resolution(owner.clone());
+                                    }
 
-                    if cell_mutexes.is_empty() && !prepared_ops.is_empty() {
+                                    if requester.compare_age(&owner).is_gt() {
+                                        debug!(
+                                            "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
+                                            requester, owner, lock_age
+                                        );
+                                        break 'result DMPrepareResult::NotRealizable;
+                                    } else {
+                                        debug!(
+                                            "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?} (lock age: {}ms)",
+                                            requester, owner, lock_age
+                                        );
+                                        break 'result DMPrepareResult::Wait;
+                                    }
+                                }
+                            }
+                        }
+
+                        let lock_time = get_time();
+                        let mut owner_index = self.owner_index.lock();
+                        let mut newly_acquired = 0;
+                        for meta in &mut cell_guards {
+                            if meta.owner.is_none() {
+                                meta.owner = Some(requester.clone());
+                                meta.lock_acquired_at = Some(lock_time);
+                                newly_acquired += 1;
+                            }
+                        }
+                        owner_index.add(&requester, newly_acquired);
+
                         for op in &prepared_ops {
-                            cell_mutexes.push(self.cell_meta_mutex(&op.id));
-                        }
-                    }
-                    for cell_mutex in &cell_mutexes {
-                        cell_guards.push(cell_mutex.lock());
-                    }
-                    if prepared_ops
-                        .iter()
-                        .zip(&cell_mutexes)
-                        .any(|(op, meta)| !self.cell_meta_is_current(&op.id, meta))
-                    {
-                        drop(cell_guards);
-                        continue 'acquire;
-                    }
-
-                    for meta in &cell_guards {
-                        if let Some(owner) = meta.owner.clone() {
-                            if owner != requester {
-                                let lock_age = meta
-                                    .lock_acquired_at
-                                    .map(|acquired| get_time() - acquired)
-                                    .unwrap_or(0);
-                                if lock_age > self.lock_timeout_ms {
-                                    self.queue_stale_owner_resolution(owner.clone());
+                            if !self.prepare_expectation_matches(op) {
+                                debug!(
+                                    "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
+                                    requester, op.id, op
+                                );
+                                let mut released = 0;
+                                for meta in &mut cell_guards {
+                                    if meta.owner.as_ref() == Some(&requester) {
+                                        meta.owner = None;
+                                        meta.lock_acquired_at = None;
+                                        released += 1;
+                                    }
                                 }
-
-                                if requester.compare_age(&owner).is_gt() {
-                                    debug!(
-                                        "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
-                                        requester, owner, lock_age
-                                    );
-                                    break 'result DMPrepareResult::NotRealizable;
-                                } else {
-                                    debug!(
-                                        "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?} (lock age: {}ms)",
-                                        requester, owner, lock_age
-                                    );
-                                    break 'result DMPrepareResult::Wait;
-                                }
+                                owner_index.remove(&requester, released);
+                                break 'result DMPrepareResult::NotRealizable;
                             }
                         }
-                    }
 
-                    let lock_time = get_time();
-                    for meta in &mut cell_guards {
-                        meta.owner = Some(requester.clone());
-                        meta.lock_acquired_at = Some(lock_time);
+                        txn.certified = prepared_ops_by_id;
+                        txn.affected_cells = txn.certified.keys().copied().collect();
+                        txn.coordinator_id = Some(coordinator_id);
+                        txn.state = TxnState::Prepared;
+                        txn.last_activity = get_time();
+                        debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
+                        break 'result DMPrepareResult::Success;
                     }
-
-                    for op in &prepared_ops {
-                        if !self.prepare_expectation_matches(op) {
-                            debug!(
-                                "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
-                                requester, op.id, op
-                            );
-                            for meta in &mut cell_guards {
-                                if meta.owner.as_ref() == Some(&requester) {
-                                    meta.owner = None;
-                                    meta.lock_acquired_at = None;
-                                }
-                            }
-                            break 'result DMPrepareResult::NotRealizable;
-                        }
-                    }
-
-                    txn.certified = prepared_ops_by_id;
-                    txn.affected_cells = txn.certified.keys().copied().collect();
-                    txn.coordinator_id = Some(coordinator_id);
-                    txn.state = TxnState::Prepared;
-                    txn.last_activity = get_time();
-                    debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
-                    break 'result DMPrepareResult::Success;
                 }
             };
 
@@ -7644,13 +8303,26 @@ impl Service for DataManager {
                 tid
             );
 
-            for meta in &mut cell_guards {
-                meta.owner = None;
-                meta.lock_acquired_at = None;
+            if let Some(expected_owner) = expected_owner.as_ref() {
+                let mut owner_index = self.owner_index.lock();
+                let mut released = 0;
+                for meta in &mut cell_guards {
+                    if meta.owner.as_ref() == Some(expected_owner) {
+                        meta.owner = None;
+                        meta.lock_acquired_at = None;
+                        released += 1;
+                    }
+                }
+                owner_index.remove(expected_owner, released);
+            } else {
+                for meta in &mut cell_guards {
+                    meta.owner = None;
+                    meta.lock_acquired_at = None;
+                }
             }
 
             if self.undo_log().is_none() {
-                self.record_volatile_completion_at(tid, txn.state, get_time());
+                self.record_volatile_completion(tid, txn.state);
             } else {
                 self.record_durable_completion(tid, txn.state, None);
             }
@@ -7673,10 +8345,9 @@ impl Service for DataManager {
         clock: Hlc,
         tid: TxnId,
         resolution: TxnResolution,
-        expires_at_ms: i64,
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         self.update_clock(clock);
-        self.response_with(self.retire_participant_evidence(&tid, resolution, expires_at_ms, false))
+        self.response_with(self.retire_participant_evidence(&tid, resolution, false))
     }
 
     fn finalize_retirement(
@@ -7684,9 +8355,8 @@ impl Service for DataManager {
         clock: Hlc,
         tid: TxnId,
         resolution: TxnResolution,
-        expires_at_ms: i64,
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         self.update_clock(clock);
-        self.response_with(self.retire_participant_evidence(&tid, resolution, expires_at_ms, true))
+        self.response_with(self.retire_participant_evidence(&tid, resolution, true))
     }
 }

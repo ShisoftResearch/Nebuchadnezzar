@@ -553,12 +553,20 @@ mod startup_discovery_tests {
         database_meta_plane_id, database_meta_plane_seed_nodes,
         discover_databases_for_startup_schema_registration,
         discover_known_databases_from_raft_storage, discover_known_databases_from_storage_roots,
-        initialize_recovered_storage, shared_meta_plane_id,
+        initialize_recovered_storage, resolve_incomplete_transaction_decisions,
+        shared_meta_plane_id, NebServer, ServerError, ServerOptions, Service,
     };
     use crate::index::builder::{IndexBuilder, IndexError};
     use crate::ram::chunk::Chunks;
     use crate::ram::recovery::RecoverySummary;
-    use crate::server::transactions::undo_log::UndoLogger;
+    use crate::ram::types::Id;
+    use crate::server::transactions::undo_log::{UndoLogEntry, UndoLogger};
+    use bifrost::hlc::Hlc;
+    use bifrost::rpc::ClientPool;
+    use bifrost_hasher::hash_str;
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    use std::path::Path;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -677,6 +685,160 @@ mod startup_discovery_tests {
         let plane_id = database_meta_plane_id("group_a", "analytics");
         assert!(plane_id.is_type2());
         assert_ne!(plane_id.raw(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_recovery_coordinator_membership_is_fail_closed_and_retryable() {
+        let _ = env_logger::try_init();
+        let storage = tempfile::TempDir::new().expect("tempdir should be created");
+        let addresses = ["127.0.0.1:5478", "127.0.0.1:5479"];
+        let meta_servers = addresses
+            .iter()
+            .map(|address| address.to_string())
+            .collect::<Vec<_>>();
+        let group = "missing_recovery_coordinator_membership";
+        let options_at = |root: &Path| ServerOptions {
+            chunk_size: crate::ram::segs::SEGMENT_SIZE,
+            db_size: crate::ram::segs::SEGMENT_SIZE,
+            history_retention_ms: 300_000,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: Some(root.join("wal").to_string_lossy().into_owned()),
+            undo_log_storage: Some(root.join("undo").to_string_lossy().into_owned()),
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        };
+
+        let participant_options = options_at(&storage.path().join("participant"));
+        let participant = NebServer::new_cluster_from_opts(
+            &participant_options,
+            addresses[0],
+            &meta_servers,
+            group,
+            async |_| {},
+        )
+        .await
+        .expect("participant should start before the coordinator joins");
+        let coordinator_id = hash_str(addresses[1]);
+        assert_eq!(
+            participant
+                .consh
+                .to_server_name_option(Some(coordinator_id)),
+            None,
+            "the recovery coordinator must initially be absent from membership"
+        );
+
+        let tid = Hlc {
+            ts: 10,
+            node: coordinator_id,
+        };
+        let commit_hlc = Hlc {
+            ts: 11,
+            node: coordinator_id,
+        };
+        let participant_undo = participant
+            .current_database()
+            .undo_log()
+            .expect("durable participant should have an undo log")
+            .clone();
+        participant_undo
+            .write_undo_entry(UndoLogEntry::new_write(tid, Id::new(1, 1), 1))
+            .expect("unresolved participant undo should be durable");
+
+        let missing_attempt = AssertUnwindSafe(resolve_incomplete_transaction_decisions(
+            &participant_undo,
+            participant_undo
+                .recover()
+                .expect("participant undo should be readable"),
+            participant.server_id,
+            group,
+            group,
+            &participant.consh,
+            &Arc::new(ClientPool::new()),
+        ))
+        .catch_unwind()
+        .await;
+        let undo_was_preserved = participant_undo
+            .recover()
+            .expect("participant undo should remain readable")
+            .contains_key(&tid);
+
+        let coordinator_options = options_at(&storage.path().join("coordinator"));
+        let coordinator = NebServer::new_cluster_from_opts(
+            &coordinator_options,
+            addresses[1],
+            &meta_servers,
+            group,
+            async |_| {},
+        )
+        .await
+        .expect("coordinator should restore cluster membership");
+        assert_eq!(coordinator.server_id, coordinator_id);
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+            loop {
+                if participant
+                    .consh
+                    .to_server_name_option(Some(coordinator_id))
+                    .as_deref()
+                    == Some(addresses[1])
+                {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("participant membership should observe the restored coordinator");
+        coordinator
+            .current_database()
+            .undo_log()
+            .expect("durable coordinator should have an undo log")
+            .write_coordinator_commit_decision(&tid, commit_hlc, &[participant.server_id])
+            .expect("coordinator decision should be durable");
+
+        let retry_result = resolve_incomplete_transaction_decisions(
+            &participant_undo,
+            participant_undo
+                .recover()
+                .expect("preserved participant undo should be retryable"),
+            participant.server_id,
+            group,
+            group,
+            &participant.consh,
+            &Arc::new(ClientPool::new()),
+        )
+        .await;
+        let undo_was_completed = !participant_undo
+            .recover()
+            .expect("participant undo should remain readable after retry")
+            .contains_key(&tid);
+
+        coordinator.shutdown().await;
+        participant.shutdown().await;
+
+        let missing_result =
+            missing_attempt.expect("missing coordinator membership must not panic startup");
+        assert!(
+            matches!(missing_result, Err(ServerError::CannotRecoverStorage(_))),
+            "missing coordinator membership must fail startup closed"
+        );
+        assert!(
+            undo_was_preserved,
+            "fail-closed startup must preserve unresolved participant undo"
+        );
+        assert!(
+            retry_result
+                .expect("restored coordinator membership should resolve the decision")
+                .is_empty(),
+            "the durable Commit decision should complete participant recovery"
+        );
+        assert!(
+            undo_was_completed,
+            "successful retry should durably clear participant undo"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1149,11 +1311,17 @@ async fn resolve_incomplete_transaction_decisions(
             transactions::TxnResolution::Unknown
         } else {
             let coordinator_id = tid.node;
-            let conshasing = conshasing.clone();
+            let Some(coordinator_name) = conshasing.to_server_name_option(Some(coordinator_id))
+            else {
+                warn!(
+                    "Coordinator {} for recovered transaction {:?} is absent from membership",
+                    coordinator_id, tid
+                );
+                resolutions.insert(*tid, transactions::TxnResolution::Unknown);
+                continue;
+            };
             match member_pool
-                .get_by_id(coordinator_id, move |_| {
-                    conshasing.to_server_name(coordinator_id)
-                })
+                .get_by_id(coordinator_id, move |_| coordinator_name.clone())
                 .await
             {
                 Ok(client) => {

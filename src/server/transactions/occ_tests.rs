@@ -1485,6 +1485,7 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     );
 
     let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
+    let manager = servers[0].current_database().txn_manager().unwrap().clone();
     let tid = txn.begin().await.unwrap().unwrap();
     let slow_first = accepted_cell(txn.read(tid.clone(), slow_id).await.unwrap().unwrap());
     let fail_first = accepted_cell(txn.read(tid.clone(), fail_id).await.unwrap().unwrap());
@@ -1509,6 +1510,7 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     let slow_prepare =
         transactions::data_site::install_prepare_delay_for_cell(tid.clone(), slow_id);
     let fast_failure = transactions::manager::install_prepare_result_observer(tid.clone(), fail_id);
+    let abort_delay = transactions::manager::install_abort_entry_delay(tid);
     let prepare_client = txn.clone();
     let prepare_tid = tid.clone();
     let mut prepare_task =
@@ -1525,6 +1527,24 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
         early_prepare
     );
 
+    abort_delay.wait_until_entered().await;
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(slow_server_id, group, group, &slow_id,),
+        Some(TxnPriority::new(tid, servers[0].server_id)),
+        "the delayed successful participant must own its cell before failure cleanup"
+    );
+    assert_eq!(
+        manager.cleanup_stale_transactions(-1),
+        0,
+        "stale cleanup must skip the partial-failure abort handoff"
+    );
+    assert_eq!(
+        txn.resolve(tid).await.unwrap().unwrap(),
+        TxnResolution::InProgress,
+        "dispatch remains explicitly resolvable until abort cleanup completes"
+    );
+    abort_delay.release();
+
     let prepare_result = prepare_task.await.unwrap();
     assert_eq!(
         prepare_result,
@@ -1537,6 +1557,16 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
             .unwrap()
             .transaction_count(),
         0
+    );
+    assert_eq!(
+        transactions::data_site::participant_owner_for_test(slow_server_id, group, group, &slow_id,),
+        None,
+        "automatic abort/end must release the partially successful participant"
+    );
+    assert_eq!(
+        txn.resolve(tid).await.unwrap().unwrap(),
+        TxnResolution::Abort,
+        "the completed partial-failure cleanup must resolve as explicit Abort"
     );
 
     let retry_tid = txn.begin().await.unwrap().unwrap();
@@ -1817,6 +1847,140 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
             .to_owned()
             .data,
         retry.data
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn volatile_end_response_loss_waits_for_retirement_before_starting_ttl() {
+    let address = "127.0.0.1:5484";
+    let group = "txn_occ_volatile_end_response_retirement";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90_184);
+    let mut initial = counter_cell(schema.id, cell_id, 1, "volatile-end-loss-seed");
+    runtime.chunks().write_cell(&mut initial).unwrap();
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let manager = runtime.txn_manager().unwrap().clone();
+    let tid = txn.begin().await.unwrap().unwrap();
+    let _ = accepted_cell(txn.read(tid, cell_id).await.unwrap().unwrap());
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(schema.id, cell_id, 2, "volatile-end-loss-update"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+
+    let participant_clock = transactions::data_site::install_participant_clock_for_test(
+        server.server_id,
+        group,
+        group,
+        tid,
+        bifrost::utils::time::get_time(),
+    )
+    .expect("volatile participant manager must be registered");
+    manager.drop_next_end_response_for_test();
+    assert_eq!(
+        txn.abort(tid).await.unwrap(),
+        Err(TMError::RPCErrorFromCellServer)
+    );
+    assert_eq!(
+        transactions::data_site::participant_completion_for_test(
+            server.server_id,
+            group,
+            group,
+            &tid,
+        ),
+        Some((TxnState::Aborted, None)),
+        "a lost volatile end response must leave unexpired completion evidence"
+    );
+
+    participant_clock.advance_by(300_001);
+    assert_eq!(
+        transactions::data_site::participant_completion_for_test(
+            server.server_id,
+            group,
+            group,
+            &tid,
+        ),
+        Some((TxnState::Aborted, None)),
+        "advancing beyond 300s must not expire unfinalized participant evidence"
+    );
+    let data_site = scoped_data_site_client_for_database(address, group, group).await;
+    assert!(
+        matches!(
+            data_site
+            .prepare(server.server_id, tid, tid, vec![])
+            .await
+            .unwrap()
+            .payload,
+            DMPrepareResult::StateError(TxnState::Aborted) | DMPrepareResult::NotRealizable
+        ),
+        "a delayed duplicate prepare must remain rejected after more than 300s while retirement is unfinalized"
+    );
+    assert!(matches!(
+        txn.abort(tid).await.unwrap().unwrap(),
+        AbortResult::Success(None)
+    ));
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if transactions::data_site::participant_completion_for_test(
+                server.server_id,
+                group,
+                group,
+                &tid,
+            )
+            .is_some_and(|(outcome, expires_at_ms)| {
+                outcome == TxnState::Aborted
+                    && expires_at_ms
+                        .is_some_and(|deadline| deadline > bifrost::utils::time::get_time())
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("coordinator retirement must finalize volatile evidence asynchronously");
+    let (_, expires_at_ms) = transactions::data_site::participant_completion_for_test(
+        server.server_id,
+        group,
+        group,
+        &tid,
+    )
+    .expect("finalized participant completion evidence");
+    let expires_at_ms = expires_at_ms.expect("finalize must start the local TTL");
+    assert_eq!(
+        transactions::data_site::participant_completion_outcome_at_for_test(
+            server.server_id,
+            group,
+            group,
+            &tid,
+            expires_at_ms - 1,
+        ),
+        Some(TxnState::Aborted),
+        "participant evidence must remain at local acceptance + 299,999ms"
+    );
+    assert_eq!(
+        transactions::data_site::participant_completion_outcome_at_for_test(
+            server.server_id,
+            group,
+            group,
+            &tid,
+            expires_at_ms,
+        ),
+        None,
+        "participant evidence must expire exactly at local acceptance + 300,000ms"
     );
 
     server.shutdown().await;

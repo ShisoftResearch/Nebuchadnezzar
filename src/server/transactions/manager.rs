@@ -11,21 +11,190 @@ use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
 use lightning::map::{Map as LFMapT, PtrHashMap as LFMap};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
 use std::sync::Weak;
 use std::time::Duration;
-use tokio::sync::oneshot;
 #[cfg(test)]
 use tokio::sync::Notify;
+use tokio::sync::{mpsc, oneshot};
+
+#[cfg(test)]
+struct CompletionCleanupPauseState {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    released: parking_lot::Mutex<bool>,
+    released_condvar: parking_lot::Condvar,
+}
+
+#[cfg(test)]
+struct CompletionCleanupPauseHandle {
+    tid: TxnId,
+    state: Arc<CompletionCleanupPauseState>,
+}
+
+#[cfg(test)]
+impl CompletionCleanupPauseHandle {
+    async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    fn release(&self) {
+        let mut released = self.state.released.lock();
+        if !*released {
+            *released = true;
+            self.state.released_condvar.notify_all();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CompletionCleanupPauseHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = completion_cleanup_pause_hooks().lock();
+        if hooks
+            .get(&self.tid)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            hooks.remove(&self.tid);
+        }
+    }
+}
+
+#[cfg(test)]
+static COMPLETION_CLEANUP_PAUSE_HOOKS: OnceLock<
+    parking_lot::Mutex<BTreeMap<TxnId, Arc<CompletionCleanupPauseState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn completion_cleanup_pause_hooks(
+) -> &'static parking_lot::Mutex<BTreeMap<TxnId, Arc<CompletionCleanupPauseState>>> {
+    COMPLETION_CLEANUP_PAUSE_HOOKS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn install_completion_cleanup_pause(tid: TxnId) -> CompletionCleanupPauseHandle {
+    let state = Arc::new(CompletionCleanupPauseState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: parking_lot::Mutex::new(false),
+        released_condvar: parking_lot::Condvar::new(),
+    });
+    completion_cleanup_pause_hooks()
+        .lock()
+        .insert(tid, state.clone());
+    CompletionCleanupPauseHandle { tid, state }
+}
+
+#[cfg(test)]
+fn pause_after_completion_cleanup(tid: &TxnId) {
+    let Some(state) = completion_cleanup_pause_hooks().lock().remove(tid) else {
+        return;
+    };
+    state.entered.store(true, Ordering::SeqCst);
+    state.entered_notify.notify_waiters();
+    let mut released = state.released.lock();
+    while !*released {
+        state.released_condvar.wait(&mut released);
+    }
+}
+
+#[cfg(test)]
+struct RetirementRetryPauseState {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    released: AtomicBool,
+    released_notify: Notify,
+}
+
+#[cfg(test)]
+struct RetirementRetryPauseHandle {
+    tid: TxnId,
+    state: Arc<RetirementRetryPauseState>,
+}
+
+#[cfg(test)]
+impl RetirementRetryPauseHandle {
+    async fn wait_until_entered(&self) {
+        let notified = self.state.entered_notify.notified();
+        if self.state.entered.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+
+    fn release(&self) {
+        if !self.state.released.swap(true, Ordering::SeqCst) {
+            self.state.released_notify.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RetirementRetryPauseHandle {
+    fn drop(&mut self) {
+        self.release();
+        let mut hooks = retirement_retry_pause_hooks().lock();
+        if hooks
+            .get(&self.tid)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            hooks.remove(&self.tid);
+        }
+    }
+}
+
+#[cfg(test)]
+static RETIREMENT_RETRY_PAUSE_HOOKS: OnceLock<
+    parking_lot::Mutex<BTreeMap<TxnId, Arc<RetirementRetryPauseState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn retirement_retry_pause_hooks(
+) -> &'static parking_lot::Mutex<BTreeMap<TxnId, Arc<RetirementRetryPauseState>>> {
+    RETIREMENT_RETRY_PAUSE_HOOKS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn install_retirement_retry_pause(tid: TxnId) -> RetirementRetryPauseHandle {
+    let state = Arc::new(RetirementRetryPauseState {
+        entered: AtomicBool::new(false),
+        entered_notify: Notify::new(),
+        released: AtomicBool::new(false),
+        released_notify: Notify::new(),
+    });
+    retirement_retry_pause_hooks()
+        .lock()
+        .insert(tid, state.clone());
+    RetirementRetryPauseHandle { tid, state }
+}
+
+#[cfg(test)]
+async fn pause_after_retirement_lookup(tid: &TxnId) {
+    let Some(state) = retirement_retry_pause_hooks().lock().remove(tid) else {
+        return;
+    };
+    state.entered.store(true, Ordering::SeqCst);
+    state.entered_notify.notify_waiters();
+    while !state.released.load(Ordering::SeqCst) {
+        state.released_notify.notified().await;
+    }
+}
 
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
@@ -175,6 +344,82 @@ pub(crate) fn install_abort_entry_delay(tid: TxnId) -> AbortEntryDelayHandle {
     AbortEntryDelayHandle { tid, state }
 }
 
+#[cfg(test)]
+struct CompletionBoundaryClockState {
+    now_ms: AtomicI64,
+    after_cleanup_ms: i64,
+}
+
+#[cfg(test)]
+struct CompletionBoundaryClockHandle {
+    tid: TxnId,
+    state: Arc<CompletionBoundaryClockState>,
+}
+
+#[cfg(test)]
+impl Drop for CompletionBoundaryClockHandle {
+    fn drop(&mut self) {
+        let mut clocks = completion_boundary_clocks().lock();
+        if clocks
+            .get(&self.tid)
+            .is_some_and(|state| Arc::ptr_eq(state, &self.state))
+        {
+            clocks.remove(&self.tid);
+        }
+    }
+}
+
+#[cfg(test)]
+static COMPLETION_BOUNDARY_CLOCKS: OnceLock<
+    parking_lot::Mutex<BTreeMap<TxnId, Arc<CompletionBoundaryClockState>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+fn completion_boundary_clocks(
+) -> &'static parking_lot::Mutex<BTreeMap<TxnId, Arc<CompletionBoundaryClockState>>> {
+    COMPLETION_BOUNDARY_CLOCKS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn install_completion_boundary_clock(
+    tid: TxnId,
+    before_cleanup_ms: i64,
+    after_cleanup_ms: i64,
+) -> CompletionBoundaryClockHandle {
+    let state = Arc::new(CompletionBoundaryClockState {
+        now_ms: AtomicI64::new(before_cleanup_ms),
+        after_cleanup_ms,
+    });
+    completion_boundary_clocks()
+        .lock()
+        .insert(tid, state.clone());
+    CompletionBoundaryClockHandle { tid, state }
+}
+
+#[cfg(test)]
+fn completion_boundary_time(tid: &TxnId) -> i64 {
+    completion_boundary_clocks()
+        .lock()
+        .get(tid)
+        .map(|state| state.now_ms.load(Ordering::SeqCst))
+        .unwrap_or_else(get_time)
+}
+
+#[cfg(not(test))]
+fn completion_boundary_time(_tid: &TxnId) -> i64 {
+    get_time()
+}
+
+#[cfg(test)]
+fn note_completion_cleanup_boundary(tid: &TxnId) {
+    if let Some(state) = completion_boundary_clocks().lock().get(tid) {
+        state.now_ms.store(state.after_cleanup_ms, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(test))]
+fn note_completion_cleanup_boundary(_tid: &TxnId) {}
+
 /// Dependencies needed by TransactionManager, extracted from NebServer to break cyclic dependency
 pub struct TransactionManagerDeps {
     pub database_runtime: Arc<crate::server::DatabaseRuntime>,
@@ -247,6 +492,41 @@ struct PointReadCache {
 }
 
 const COMPLETED_DECISION_RETENTION_MS: i64 = 300_000;
+const RETIREMENT_DISCOVERY_BATCH: usize = 256;
+
+#[derive(Default)]
+struct RetirementDiscoveryState {
+    queue: VecDeque<TxnId>,
+    members: HashSet<TxnId>,
+}
+
+impl RetirementDiscoveryState {
+    fn insert(&mut self, tid: TxnId) {
+        if self.members.insert(tid) {
+            self.queue.push_back(tid);
+        }
+    }
+
+    fn remove(&mut self, tid: &TxnId) {
+        self.members.remove(tid);
+    }
+
+    fn candidates(&mut self, limit: usize) -> Vec<TxnId> {
+        let mut candidates = Vec::with_capacity(limit.min(self.members.len()));
+        let mut examined = 0;
+        while examined < limit {
+            let Some(tid) = self.queue.pop_front() else {
+                break;
+            };
+            examined += 1;
+            if self.members.contains(&tid) {
+                candidates.push(tid);
+                self.queue.push_back(tid);
+            }
+        }
+        candidates
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DecisionRecord {
@@ -267,10 +547,104 @@ impl DecisionRecord {
     }
 }
 
+const PREPARE_DISPATCH_CLOSED: usize = 1usize << (usize::BITS - 1);
+
+struct PrepareDispatchState {
+    word: AtomicUsize,
+}
+
+impl PrepareDispatchState {
+    fn new() -> Self {
+        Self {
+            word: AtomicUsize::new(0),
+        }
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        manager: Weak<TransactionManager>,
+        tid: TxnId,
+    ) -> Option<PrepareDispatchGuard> {
+        let mut current = self.word.load(Ordering::Acquire);
+        loop {
+            if current & PREPARE_DISPATCH_CLOSED != 0 || current == PREPARE_DISPATCH_CLOSED - 1 {
+                return None;
+            }
+            match self.word.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(PrepareDispatchGuard {
+                        state: self.clone(),
+                        manager,
+                        tid,
+                        cleanup_armed: true,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn try_close(&self) -> bool {
+        self.word
+            .compare_exchange(
+                0,
+                PREPARE_DISPATCH_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn release(&self) {
+        let previous = self.word.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0 && previous & PREPARE_DISPATCH_CLOSED == 0);
+    }
+}
+
+struct PrepareDispatchGuard {
+    state: Arc<PrepareDispatchState>,
+    manager: Weak<TransactionManager>,
+    tid: TxnId,
+    cleanup_armed: bool,
+}
+
+impl PrepareDispatchGuard {
+    fn disarm(&mut self) {
+        self.cleanup_armed = false;
+    }
+}
+
+impl Drop for PrepareDispatchGuard {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
+            let previous = self.state.word.fetch_add(1, Ordering::AcqRel);
+            debug_assert!(previous > 0 && previous & PREPARE_DISPATCH_CLOSED == 0);
+            let state = self.state.clone();
+            let manager = self.manager.upgrade();
+            let tid = self.tid;
+            if let (Some(manager), Ok(runtime)) = (manager, tokio::runtime::Handle::try_current()) {
+                runtime.spawn(async move {
+                    let _ = manager.abort(tid).await;
+                    state.release();
+                });
+            } else {
+                state.release();
+            }
+        }
+        self.state.release();
+    }
+}
+
 struct Transaction {
     data: HashMap<Id, DataObject>,
     affected_objects: AffectedObjs,
     state: TxnState,
+    prepare_dispatch: Arc<PrepareDispatchState>,
     commit_dispatch_started: bool,
     commit_hlc: Option<Hlc>,
     coordinator_decision_durable: bool,
@@ -303,13 +677,18 @@ pub struct TransactionManager {
     transactions: LFMap<TxnId, TxnMutex>,
     txn_ids: parking_lot::Mutex<BTreeSet<TxnId>>, // Track TxnIds for iteration (PtrHashMap doesn't support iteration)
     completed_decisions: parking_lot::Mutex<HashMap<TxnId, DecisionRecord>>,
-    retiring_transactions: parking_lot::Mutex<BTreeSet<TxnId>>,
+    retiring_transactions: parking_lot::Mutex<HashSet<TxnId>>,
+    retirement_records: parking_lot::Mutex<HashMap<TxnId, undo_log::CoordinatorCompletionRecord>>,
+    volatile_retirement_discovery: parking_lot::Mutex<RetirementDiscoveryState>,
+    retirement_sender: mpsc::Sender<TxnId>,
     replay_locks: parking_lot::Mutex<HashMap<TxnId, Weak<Mutex<()>>>>,
     data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
     wait_config: WaitConfig,
     shutdown: Arc<AtomicBool>, // Signal to stop background cleanup task
     #[cfg(test)]
     drop_next_retirement_prepare_response: AtomicBool,
+    #[cfg(test)]
+    drop_next_end_response: AtomicBool,
     #[cfg(test)]
     fail_next_resolution_request: AtomicBool,
 }
@@ -331,19 +710,27 @@ impl TransactionManager {
         wait_config: WaitConfig,
     ) -> Arc<TransactionManager> {
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (retirement_sender, mut retirement_receiver) = mpsc::channel(256);
         let manager = Arc::new_cyclic(|self_ref| Self {
             self_ref: self_ref.clone(),
             deps,
             transactions: LFMap::with_capacity(128),
             txn_ids: parking_lot::Mutex::new(BTreeSet::new()),
             completed_decisions: parking_lot::Mutex::new(HashMap::new()),
-            retiring_transactions: parking_lot::Mutex::new(BTreeSet::new()),
+            retiring_transactions: parking_lot::Mutex::new(HashSet::new()),
+            retirement_records: parking_lot::Mutex::new(HashMap::new()),
+            volatile_retirement_discovery: parking_lot::Mutex::new(
+                RetirementDiscoveryState::default(),
+            ),
+            retirement_sender,
             replay_locks: parking_lot::Mutex::new(HashMap::new()),
             data_sites: LFMap::with_capacity(8),
             wait_config,
             shutdown: shutdown.clone(),
             #[cfg(test)]
             drop_next_retirement_prepare_response: AtomicBool::new(false),
+            #[cfg(test)]
+            drop_next_end_response: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_resolution_request: AtomicBool::new(false),
         });
@@ -358,16 +745,61 @@ impl TransactionManager {
                     break;
                 }
 
-                // Sleep for 60 seconds
+                #[cfg(test)]
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                #[cfg(not(test))]
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
                 manager_clone.prune_completed_decisions_at(get_time());
+                manager_clone.prune_replay_locks();
+                manager_clone.restart_retirement_jobs();
 
                 // Clean up stale transactions (older than 5 minutes)
                 let cleaned = manager_clone.cleanup_stale_transactions(5 * 60 * 1000);
                 if cleaned > 0 {
                     warn!("Cleaned up {} stale transactions", cleaned);
                 }
+            }
+        });
+
+        let retirement_manager = manager.self_ref.clone();
+        tokio::spawn(async move {
+            while let Some(tid) = retirement_receiver.recv().await {
+                let Some(manager) = retirement_manager.upgrade() else {
+                    return;
+                };
+                if manager.shutdown.load(Ordering::Relaxed) {
+                    manager.retiring_transactions.lock().remove(&tid);
+                    return;
+                }
+                let finished = manager.retire_completion_once(&tid).await;
+                if finished {
+                    manager.retiring_transactions.lock().remove(&tid);
+                    manager.retirement_records.lock().remove(&tid);
+                    manager.volatile_retirement_discovery.lock().remove(&tid);
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if manager.retirement_sender.try_send(tid).is_err() {
+                    manager.retiring_transactions.lock().remove(&tid);
+                }
+            }
+        });
+
+        let retirement_discovery_manager = manager.self_ref.clone();
+        tokio::spawn(async move {
+            loop {
+                #[cfg(test)]
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                #[cfg(not(test))]
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(manager) = retirement_discovery_manager.upgrade() else {
+                    return;
+                };
+                if manager.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                manager.restart_retirement_jobs();
             }
         });
 
@@ -393,10 +825,16 @@ impl TransactionManager {
 
     fn cached_resolution_at(&self, tid: &TxnId, now_ms: i64) -> Option<TxnResolution> {
         let mut completed = self.completed_decisions.lock();
-        Self::prune_completed_decision_records_at(&mut completed, now_ms);
-        completed
-            .get(tid)
-            .and_then(|record| record.resolution_at(now_ms))
+        match completed.get(tid).copied() {
+            Some(record) => match record.resolution_at(now_ms) {
+                Some(resolution) => Some(resolution),
+                None => {
+                    completed.remove(tid);
+                    None
+                }
+            },
+            None => None,
+        }
     }
 
     fn prune_completed_decision_records_at(
@@ -450,37 +888,16 @@ impl TransactionManager {
     }
 
     fn queue_retirement(&self, tid: TxnId) {
-        if self.deps.database_runtime.undo_log().is_none()
-            || !self.retiring_transactions.lock().insert(tid)
-        {
+        if !self.retiring_transactions.lock().insert(tid) {
             return;
         }
-
-        let manager = self.self_ref.clone();
-        tokio::spawn(async move {
-            let mut retry_delay = Duration::from_millis(10);
-            loop {
-                let Some(manager) = manager.upgrade() else {
-                    return;
-                };
-                if manager.shutdown.load(Ordering::Relaxed) {
-                    manager.retiring_transactions.lock().remove(&tid);
-                    return;
-                }
-                if manager.retire_completion_once(&tid).await {
-                    manager.retiring_transactions.lock().remove(&tid);
-                    return;
-                }
-                drop(manager);
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(1));
-            }
-        });
+        if self.retirement_sender.try_send(tid).is_err() {
+            self.retiring_transactions.lock().remove(&tid);
+        }
     }
 
     fn replay_lock(&self, tid: &TxnId) -> Arc<Mutex<()>> {
         let mut locks = self.replay_locks.lock();
-        locks.retain(|_, lock| lock.strong_count() != 0);
         if let Some(lock) = locks.get(tid).and_then(Weak::upgrade) {
             return lock;
         }
@@ -489,24 +906,34 @@ impl TransactionManager {
         lock
     }
 
+    fn prune_replay_locks(&self) {
+        self.replay_locks
+            .lock()
+            .retain(|_, lock| lock.strong_count() != 0);
+    }
+
     fn restart_retirement_jobs(&self) {
-        let Some(undo_log) = self.deps.database_runtime.undo_log() else {
-            return;
-        };
-        match undo_log.coordinator_completions() {
-            Ok(completions) => {
-                for (tid, completion) in completions {
-                    if completion.finalized_participants != completion.participants {
+        if let Some(undo_log) = self.deps.database_runtime.undo_log() {
+            match undo_log.coordinator_retirement_candidates(RETIREMENT_DISCOVERY_BATCH) {
+                Ok(candidates) => {
+                    for tid in candidates {
                         self.queue_retirement(tid);
                     }
                 }
+                Err(error) => {
+                    error!(
+                        "Failed to restart durable coordinator retirement jobs: {:?}",
+                        error
+                    );
+                }
             }
-            Err(error) => {
-                error!(
-                    "Failed to restart durable coordinator retirement jobs: {:?}",
-                    error
-                );
-            }
+        }
+        let volatile_candidates = self
+            .volatile_retirement_discovery
+            .lock()
+            .candidates(RETIREMENT_DISCOVERY_BATCH);
+        for tid in volatile_candidates {
+            self.queue_retirement(tid);
         }
     }
 
@@ -516,21 +943,43 @@ impl TransactionManager {
             .store(true, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) fn drop_next_end_response_for_test(&self) {
+        self.drop_next_end_response.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn take_dropped_end_response_for_test(&self) -> bool {
+        self.drop_next_end_response.swap(false, Ordering::SeqCst)
+    }
+
+    #[cfg(not(test))]
+    fn take_dropped_end_response_for_test(&self) -> bool {
+        false
+    }
+
     async fn retire_completion_once(&self, tid: &TxnId) -> bool {
-        let Some(undo_log) = self.deps.database_runtime.undo_log() else {
-            return true;
+        let undo_log = self.deps.database_runtime.undo_log();
+        let mut record = match undo_log {
+            Some(undo_log) => match undo_log.coordinator_status(tid) {
+                Ok(Some(undo_log::CoordinatorStatus::Completed(record))) => record,
+                Ok(_) => return true,
+                Err(error) => {
+                    error!(
+                        "Failed to read coordinator completion for retirement {:?}: {:?}",
+                        tid, error
+                    );
+                    return false;
+                }
+            },
+            None => match self.retirement_records.lock().get(tid).cloned() {
+                Some(record) => record,
+                None => return true,
+            },
         };
-        let mut record = match undo_log.coordinator_status(tid) {
-            Ok(Some(undo_log::CoordinatorStatus::Completed(record))) => record,
-            Ok(_) => return true,
-            Err(error) => {
-                error!(
-                    "Failed to read coordinator completion for retirement {:?}: {:?}",
-                    tid, error
-                );
-                return false;
-            }
-        };
+
+        #[cfg(test)]
+        pause_after_retirement_lookup(tid).await;
 
         if record.finalized_participants == record.participants {
             return true;
@@ -547,12 +996,7 @@ impl TransactionManager {
                 continue;
             };
             match data_site
-                .retire(
-                    self.get_clock(),
-                    *tid,
-                    record.resolution,
-                    record.expires_at_ms,
-                )
+                .retire(self.get_clock(), *tid, record.resolution)
                 .await
             {
                 Ok(response) => {
@@ -578,13 +1022,16 @@ impl TransactionManager {
         }
         if !newly_retired.is_empty() {
             record.retired_participants.extend(newly_retired);
-            if let Err(error) = undo_log.write_coordinator_completion_record(tid, &record) {
-                error!(
-                    "Failed to persist retirement prepare acknowledgements for {:?}: {:?}",
-                    tid, error
-                );
-                return false;
+            if let Some(undo_log) = undo_log {
+                if let Err(error) = undo_log.write_coordinator_completion_record(tid, &record) {
+                    error!(
+                        "Failed to persist retirement prepare acknowledgements for {:?}: {:?}",
+                        tid, error
+                    );
+                    return false;
+                }
             }
+            self.retirement_records.lock().insert(*tid, record.clone());
         }
 
         let finalize_targets: Vec<_> = record
@@ -598,12 +1045,7 @@ impl TransactionManager {
                 continue;
             };
             match data_site
-                .finalize_retirement(
-                    self.get_clock(),
-                    *tid,
-                    record.resolution,
-                    get_time().saturating_add(COMPLETED_DECISION_RETENTION_MS),
-                )
+                .finalize_retirement(self.get_clock(), *tid, record.resolution)
                 .await
             {
                 Ok(response) => {
@@ -622,13 +1064,16 @@ impl TransactionManager {
         }
         if !newly_finalized.is_empty() {
             record.finalized_participants.extend(newly_finalized);
-            if let Err(error) = undo_log.write_coordinator_completion_record(tid, &record) {
-                error!(
-                    "Failed to persist retirement finalize acknowledgements for {:?}: {:?}",
-                    tid, error
-                );
-                return false;
+            if let Some(undo_log) = undo_log {
+                if let Err(error) = undo_log.write_coordinator_completion_record(tid, &record) {
+                    error!(
+                        "Failed to persist retirement finalize acknowledgements for {:?}: {:?}",
+                        tid, error
+                    );
+                    return false;
+                }
             }
+            self.retirement_records.lock().insert(*tid, record.clone());
         }
 
         record.finalized_participants == record.participants
@@ -666,7 +1111,7 @@ impl TransactionManager {
         Ok(())
     }
 
-    fn spawn_prepare_lifecycle(
+    async fn spawn_prepare_lifecycle(
         &self,
         tid: TxnId,
     ) -> Result<
@@ -677,6 +1122,14 @@ impl TransactionManager {
         TMError,
     > {
         let manager = self.self_ref.upgrade().ok_or(TMError::Other)?;
+        let txn_mutex = self.get_transaction(&tid)?;
+        let txn = txn_mutex.lock().await;
+        self.ensure_rw_state(&txn)?;
+        let mut dispatch_guard = txn
+            .prepare_dispatch
+            .acquire(self.self_ref.clone(), tid)
+            .ok_or(TMError::TransactionNotFound)?;
+        drop(txn);
         let (result_sender, result_receiver) = oneshot::channel();
         let (ack_sender, ack_receiver) = oneshot::channel();
         tokio::spawn(async move {
@@ -686,11 +1139,13 @@ impl TransactionManager {
                 if prepared {
                     let _ = manager.abort(tid).await;
                 }
+                dispatch_guard.disarm();
                 return;
             }
             if prepared && ack_receiver.await.is_err() {
                 let _ = manager.abort(tid).await;
             }
+            dispatch_guard.disarm();
         });
         Ok((result_receiver, ack_sender))
     }
@@ -776,7 +1231,7 @@ impl Service for TransactionManager {
     fn prepare(&self, tid: TxnId) -> BoxFuture<'_, Result<TMPrepareResult, TMError>> {
         async move {
             let prepare_tid = tid.clone();
-            let (result_receiver, ack_sender) = self.spawn_prepare_lifecycle(tid)?;
+            let (result_receiver, ack_sender) = self.spawn_prepare_lifecycle(tid).await?;
             match result_receiver.await {
                 Ok(result) => {
                     let _ = ack_sender.send(());
@@ -1004,6 +1459,7 @@ impl Service for TransactionManager {
                     data: HashMap::new(),
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
+                    prepare_dispatch: Arc::new(PrepareDispatchState::new()),
                     commit_dispatch_started: false,
                     commit_hlc: None,
                     coordinator_decision_durable: false,
@@ -1024,16 +1480,22 @@ impl Service for TransactionManager {
         async move {
             if let Ok(txn_lock) = self.get_transaction(&tid) {
                 let txn = txn_lock.lock().await;
-                return Ok(match txn.state {
+                let live_resolution = match txn.state {
                     TxnState::Committed if txn.coordinator_decision_durable => {
-                        TxnResolution::Commit(txn.commit_hlc.unwrap_or(tid))
+                        Some(TxnResolution::Commit(txn.commit_hlc.unwrap_or(tid)))
                     }
-                    TxnState::Committed => TxnResolution::InProgress,
-                    TxnState::Aborted if txn.coordinator_decision_durable => TxnResolution::Abort,
-                    TxnState::Aborted => TxnResolution::InProgress,
-                    TxnState::Started | TxnState::Prepared => TxnResolution::InProgress,
-                    TxnState::Cleanup => TxnResolution::Unknown,
-                });
+                    TxnState::Committed => Some(TxnResolution::InProgress),
+                    TxnState::Aborted if txn.coordinator_decision_durable => {
+                        Some(TxnResolution::Abort)
+                    }
+                    TxnState::Aborted => Some(TxnResolution::InProgress),
+                    TxnState::Started | TxnState::Prepared => Some(TxnResolution::InProgress),
+                    TxnState::Cleanup => None,
+                };
+                drop(txn);
+                if let Some(resolution) = live_resolution {
+                    return Ok(resolution);
+                }
             }
             let now_ms = get_time();
             if let Some(resolution) = self.cached_resolution_at(&tid, now_ms) {
@@ -2043,7 +2505,9 @@ impl TransactionManager {
             match result {
                 Ok(response) => {
                     self.merge_clock(response.clock);
-                    match response.payload {
+                    let payload = response.payload;
+                    let succeeded = matches!(&payload, EndResult::Success);
+                    match payload {
                         EndResult::Success => {}
                         other => {
                             error!(
@@ -2054,6 +2518,12 @@ impl TransactionManager {
                                 first_error = Some(TMError::AssertionError);
                             }
                         }
+                    }
+                    if succeeded
+                        && self.take_dropped_end_response_for_test()
+                        && first_error.is_none()
+                    {
+                        first_error = Some(TMError::RPCErrorFromCellServer);
                     }
                 }
                 Err(error) => {
@@ -2103,7 +2573,13 @@ impl TransactionManager {
                     let payload = result.payload;
                     match payload {
                         EndResult::Success => {
-                            completed.insert(server_id);
+                            if self.take_dropped_end_response_for_test() {
+                                if first_error.is_none() {
+                                    first_error = Some(TMError::RPCErrorFromCellServer);
+                                }
+                            } else {
+                                completed.insert(server_id);
+                            }
                         }
                         _ if first_failure.is_none() => first_failure = Some(payload),
                         _ => {}
@@ -2224,11 +2700,13 @@ impl TransactionManager {
             self.deps.database_runtime.undo_log().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "undo log not configured")
             })?;
+        self.completed_decisions.lock().insert(*tid, completed);
+        if !completion.participants.is_empty() {
+            self.retirement_records
+                .lock()
+                .insert(*tid, completion.clone());
+        }
         undo_log.write_coordinator_completion_record(tid, &completion)?;
-        let mut completed_decisions = self.completed_decisions.lock();
-        Self::prune_completed_decision_records_at(&mut completed_decisions, get_time());
-        completed_decisions.insert(*tid, completed);
-        drop(completed_decisions);
         if !completion.participants.is_empty() {
             self.queue_retirement(*tid);
         }
@@ -2349,6 +2827,9 @@ impl TransactionManager {
         txn.last_activity = get_time();
         let _ = self.transactions.remove(tid);
         self.txn_ids.lock().remove(tid);
+        note_completion_cleanup_boundary(tid);
+        #[cfg(test)]
+        pause_after_completion_cleanup(tid);
     }
 
     fn finish_transaction_guarded(
@@ -2357,22 +2838,34 @@ impl TransactionManager {
         txn: &mut Transaction,
         resolution: TxnResolution,
     ) -> io::Result<undo_log::CoordinatorCompletionRecord> {
-        let completed = DecisionRecord::completed_at(resolution, get_time());
+        let participants = txn.affected_objects.keys().copied().collect();
+        // Hold the completion index lock across removal of the live entry and
+        // publication of its retained decision. A resolver that misses the
+        // live map then waits here and can never observe an Unknown gap.
+        let mut completed_decisions = self.completed_decisions.lock();
+        self.cleanup_transaction_guarded(tid, txn);
+        let completed = DecisionRecord::completed_at(resolution, completion_boundary_time(tid));
         let completion = undo_log::CoordinatorCompletionRecord {
             resolution,
-            participants: txn.affected_objects.keys().copied().collect(),
+            participants,
             expires_at_ms: completed.expires_at_ms,
             retired_participants: BTreeSet::new(),
             finalized_participants: BTreeSet::new(),
         };
-        if let Some(undo_log) = self.deps.database_runtime.undo_log() {
-            undo_log.write_coordinator_completion_record(tid, &completion)?;
-        }
-        let mut completed_decisions = self.completed_decisions.lock();
-        Self::prune_completed_decision_records_at(&mut completed_decisions, get_time());
         completed_decisions.insert(*tid, completed);
         drop(completed_decisions);
-        self.cleanup_transaction_guarded(tid, txn);
+        let undo_log = self.deps.database_runtime.undo_log();
+        if !completion.participants.is_empty() {
+            self.retirement_records
+                .lock()
+                .insert(*tid, completion.clone());
+            if undo_log.is_none() {
+                self.volatile_retirement_discovery.lock().insert(*tid);
+            }
+        }
+        if let Some(undo_log) = undo_log {
+            undo_log.write_coordinator_completion_record(tid, &completion)?;
+        }
         Ok(completion)
     }
 
@@ -2396,6 +2889,7 @@ impl TransactionManager {
         if txn_guard.last_activity >= cutoff
             || txn_guard.state != TxnState::Started
             || txn_guard.commit_dispatch_started
+            || !txn_guard.prepare_dispatch.try_close()
         {
             return false;
         }
@@ -2636,6 +3130,329 @@ mod tests {
         assert!(records.contains_key(&live_tid));
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_lock_lookup_is_targeted_and_dead_entry_pruning_is_maintenance_only() {
+        let address = "127.0.0.1:5486";
+        let group = "txn_manager_targeted_replay_lock";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let dead_entries = 1_024;
+        {
+            let mut locks = manager.replay_locks.lock();
+            for node in 0..dead_entries {
+                locks.insert(test_hlc(10_000 + node, node), Weak::new());
+            }
+        }
+        let target = test_hlc(20_000, 99);
+
+        let live = manager.replay_lock(&target);
+        assert_eq!(
+            manager.replay_locks.lock().len(),
+            dead_entries as usize + 1,
+            "a normal targeted lookup must not sweep unrelated historical weak entries"
+        );
+        manager.prune_replay_locks();
+        assert_eq!(
+            manager.replay_locks.lock().len(),
+            1,
+            "periodic maintenance owns whole-map dead-entry pruning"
+        );
+        drop(live);
+        manager.prune_replay_locks();
+        assert!(manager.replay_locks.lock().is_empty());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manager_resolve_unknown_retries_use_only_targeted_canonical_lookups() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5487";
+        let group = "txn_manager_targeted_unknown_resolution";
+        let server = start_durable_manager_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = runtime.txn_manager().unwrap().clone();
+        let undo = runtime.undo_log().unwrap();
+        let scans_after_startup = undo.full_log_scan_count_for_test();
+
+        for offset in 0..256 {
+            let unknown_tid = test_hlc(30_000 + offset, 98);
+            assert_eq!(
+                <TransactionManager as super::Service>::resolve(&manager, unknown_tid)
+                    .await
+                    .unwrap(),
+                TxnResolution::Unknown
+            );
+        }
+        let decided_tid = test_hlc(40_000, server.server_id);
+        undo.write_coordinator_abort_decision(&decided_tid, &[])
+            .unwrap();
+        assert_eq!(
+            <TransactionManager as super::Service>::resolve(&manager, decided_tid)
+                .await
+                .unwrap(),
+            TxnResolution::Abort
+        );
+        assert_eq!(
+            undo.full_log_scan_count_for_test(),
+            scans_after_startup,
+            "manager cache misses, Unknown retries, and a normal decision append must not rescan log files"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paused_retirement_retry_does_not_hold_canonical_index_against_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5488";
+        let group = "txn_manager_retirement_retry_append";
+        let server = start_durable_manager_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = runtime.txn_manager().unwrap().clone();
+        let undo = runtime.undo_log().unwrap().clone();
+        let retirement_tid = test_hlc(41_000, server.server_id);
+        let appended_tid = test_hlc(41_001, server.server_id);
+        undo.write_coordinator_completion_record(
+            &retirement_tid,
+            &undo_log::CoordinatorCompletionRecord {
+                resolution: TxnResolution::Abort,
+                participants: BTreeSet::new(),
+                expires_at_ms: get_time() + COMPLETED_DECISION_RETENTION_MS,
+                retired_participants: BTreeSet::new(),
+                finalized_participants: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        let pause = install_retirement_retry_pause(retirement_tid);
+        let retry_manager = manager.clone();
+        let retry =
+            tokio::spawn(
+                async move { retry_manager.retire_completion_once(&retirement_tid).await },
+            );
+        pause.wait_until_entered().await;
+
+        let append_undo = undo.clone();
+        let append = tokio::task::spawn_blocking(move || {
+            append_undo.write_coordinator_abort_decision(&appended_tid, &[])
+        });
+        tokio::time::timeout(Duration::from_secs(1), append)
+            .await
+            .expect("normal append must not wait for paused retirement work")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            undo.coordinator_status(&appended_tid).unwrap(),
+            Some(undo_log::CoordinatorStatus::Decided(_))
+        ));
+
+        pause.release();
+        assert!(retry.await.unwrap());
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn maintenance_worker_eventually_prunes_idle_expired_cache_entries() {
+        let address = "127.0.0.1:5489";
+        let group = "txn_manager_periodic_cache_prune";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let expired_tid = test_hlc(42_000, server.server_id);
+        manager.completed_decisions.lock().insert(
+            expired_tid,
+            DecisionRecord {
+                resolution: TxnResolution::Abort,
+                expires_at_ms: get_time().saturating_sub(1),
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !manager
+                    .completed_decisions
+                    .lock()
+                    .contains_key(&expired_tid)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("periodic maintenance must prune an idle expired decision without a lookup");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coordinator_retention_starts_only_after_live_cleanup_boundary() {
+        let address = "127.0.0.1:5480";
+        let group = "txn_manager_completion_cleanup_boundary";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let tid = <TransactionManager as super::Service>::begin(&manager)
+            .await
+            .unwrap();
+        let before_cleanup_ms = 1_000_000;
+        let after_cleanup_ms = before_cleanup_ms + COMPLETED_DECISION_RETENTION_MS + 17;
+        let _clock = install_completion_boundary_clock(tid, before_cleanup_ms, after_cleanup_ms);
+        let txn_lock = manager.get_transaction(&tid).unwrap();
+        let mut txn = txn_lock.lock().await;
+
+        let completion = manager
+            .finish_transaction_guarded(&tid, &mut txn, TxnResolution::Abort)
+            .unwrap();
+        assert_eq!(
+            completion.expires_at_ms,
+            after_cleanup_ms + COMPLETED_DECISION_RETENTION_MS,
+            "the exact retention deadline must be allocated at the post-cleanup boundary"
+        );
+        assert_eq!(
+            manager.cached_resolution_at(
+                &tid,
+                after_cleanup_ms + COMPLETED_DECISION_RETENTION_MS - 1,
+            ),
+            Some(TxnResolution::Abort)
+        );
+        assert_eq!(
+            manager.cached_resolution_at(&tid, after_cleanup_ms + COMPLETED_DECISION_RETENTION_MS,),
+            None
+        );
+        assert_eq!(manager.transaction_count(), 0);
+        drop(txn);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resolve_never_observes_a_gap_between_live_cleanup_and_completion_publication() {
+        let address = "127.0.0.1:5485";
+        let group = "txn_manager_completion_publication_handoff";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let tid = <TransactionManager as super::Service>::begin(&manager)
+            .await
+            .unwrap();
+        let pause = install_completion_cleanup_pause(tid);
+        let abort_manager = manager.clone();
+        let abort = tokio::spawn(async move {
+            <TransactionManager as super::Service>::abort(&abort_manager, tid).await
+        });
+        pause.wait_until_entered().await;
+        assert_eq!(manager.transaction_count(), 0);
+
+        let resolve_manager = manager.clone();
+        let mut resolve = tokio::spawn(async move {
+            <TransactionManager as super::Service>::resolve(&resolve_manager, tid).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut resolve)
+                .await
+                .is_err(),
+            "resolve must synchronize with the live-to-completed publication barrier"
+        );
+
+        pause.release();
+        assert_eq!(abort.await.unwrap().unwrap(), AbortResult::Success(None));
+        assert_eq!(resolve.await.unwrap().unwrap(), TxnResolution::Abort);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completion_persistence_failure_after_cleanup_preserves_replay_source() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5481";
+        let group = "txn_manager_completion_failure_replay";
+        let server = start_durable_manager_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = runtime.txn_manager().unwrap().clone();
+        let undo = runtime.undo_log().unwrap();
+        let tid = <TransactionManager as super::Service>::begin(&manager)
+            .await
+            .unwrap();
+        undo.write_coordinator_abort_decision(&tid, &[]).unwrap();
+        undo.fail_next_coordinator_completion_for_test();
+        let txn_lock = manager.get_transaction(&tid).unwrap();
+        let mut txn = txn_lock.lock().await;
+        txn.coordinator_decision_durable = true;
+
+        assert!(manager
+            .finish_transaction_guarded(&tid, &mut txn, TxnResolution::Abort)
+            .is_err());
+        assert_eq!(manager.transaction_count(), 0);
+        assert_eq!(
+            manager.cached_resolution_at(&tid, get_time()),
+            Some(TxnResolution::Abort),
+            "the post-cleanup cache remains resolvable despite completion fsync failure"
+        );
+        assert!(matches!(
+            undo.coordinator_status(&tid).unwrap(),
+            Some(undo_log::CoordinatorStatus::Decided(
+                undo_log::CoordinatorDecisionRecord {
+                    resolution: TxnResolution::Abort,
+                    ..
+                }
+            ))
+        ));
+        drop(txn);
+
+        assert_eq!(
+            <TransactionManager as super::Service>::abort(&manager, tid)
+                .await
+                .unwrap(),
+            AbortResult::Success(None),
+            "retry must replay the older irrevocable decision and reconstruct completion"
+        );
+        assert!(matches!(
+            undo.coordinator_status(&tid).unwrap(),
+            Some(undo_log::CoordinatorStatus::Completed(_))
+        ));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropped_prepare_dispatch_guard_hands_off_abort_without_leaking_inflight_state() {
+        let address = "127.0.0.1:5482";
+        let group = "txn_manager_dispatch_drop_handoff";
+        let server = start_manager_test_server(address, group).await;
+        let manager = server.current_database().txn_manager().unwrap().clone();
+        let tid = <TransactionManager as super::Service>::begin(&manager)
+            .await
+            .unwrap();
+        let txn_lock = manager.get_transaction(&tid).unwrap();
+        let txn = txn_lock.lock().await;
+        let dispatch_state = txn.prepare_dispatch.clone();
+        let dispatch_guard = dispatch_state
+            .acquire(manager.self_ref.clone(), tid)
+            .expect("open transaction must admit prepare dispatch");
+        drop(txn);
+
+        drop(dispatch_guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if manager.transaction_count() == 0
+                    && dispatch_state.word.load(Ordering::SeqCst) == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Drop must hand off abort cleanup and release its replacement guard");
+        assert_eq!(
+            <TransactionManager as super::Service>::resolve(&manager, tid)
+                .await
+                .unwrap(),
+            TxnResolution::Abort
+        );
+
+        server.shutdown().await;
+    }
+
     #[test]
     fn unresolved_durable_decision_never_uses_completed_retention_deadline() {
         let commit_hlc = test_hlc(501, 21);
@@ -2844,6 +3661,53 @@ mod tests {
         })
         .await
         .expect("background retirement should durably prepare and finalize");
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retirement_discovery_worker_retries_after_transient_index_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5483";
+        let group = "txn_manager_retirement_discovery_retry";
+        let server = start_durable_manager_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = runtime.txn_manager().unwrap().clone();
+        let undo = runtime.undo_log().unwrap();
+        let tid = test_hlc(604, manager.deps.server_id);
+        undo.write_abort_marker(&tid).unwrap();
+        undo.write_coordinator_completion_record(
+            &tid,
+            &undo_log::CoordinatorCompletionRecord {
+                resolution: TxnResolution::Abort,
+                participants: BTreeSet::from([manager.deps.server_id]),
+                expires_at_ms: get_time() + COMPLETED_DECISION_RETENTION_MS,
+                retired_participants: BTreeSet::new(),
+                finalized_participants: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        undo.fail_next_coordinator_completions_read_for_test();
+        manager.restart_retirement_jobs();
+        assert!(
+            manager.retiring_transactions.lock().is_empty(),
+            "the injected discovery failure must leave the record for a later sweep"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    undo.coordinator_status(&tid).unwrap(),
+                    Some(undo_log::CoordinatorStatus::Completed(ref record))
+                        if record.finalized_participants == record.participants
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the maintenance discovery worker must retry and finish retirement");
 
         server.shutdown().await;
     }
@@ -3231,6 +4095,7 @@ mod tests {
             ]),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
+            prepare_dispatch: Arc::new(PrepareDispatchState::new()),
             commit_dispatch_started: false,
             commit_hlc: None,
             coordinator_decision_durable: false,
@@ -3279,6 +4144,7 @@ mod tests {
             )]),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
+            prepare_dispatch: Arc::new(PrepareDispatchState::new()),
             commit_dispatch_started: false,
             commit_hlc: None,
             coordinator_decision_durable: false,

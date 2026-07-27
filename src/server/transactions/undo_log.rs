@@ -7,7 +7,7 @@ use log::{debug, error, info};
 use parking_lot::{Mutex, RwLock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -120,13 +120,122 @@ struct CompactionSnapshotRecord {
     covered_through_seq: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CanonicalLogState {
-    participant_undo: BTreeMap<TxnId, Vec<UndoLogEntry>>,
-    participant_undo_records: BTreeMap<TxnId, BTreeSet<Vec<u8>>>,
-    participant_completion: BTreeMap<TxnId, TxnState>,
-    participant_retirement: BTreeMap<TxnId, ParticipantRetirementRecord>,
-    coordinator_status: BTreeMap<TxnId, CoordinatorStatus>,
+    participant_undo: HashMap<TxnId, Vec<UndoLogEntry>>,
+    participant_undo_records: HashMap<TxnId, BTreeSet<Vec<u8>>>,
+    participant_completion: HashMap<TxnId, TxnState>,
+    participant_retirement: HashMap<TxnId, ParticipantRetirementRecord>,
+    coordinator_status: HashMap<TxnId, CoordinatorStatus>,
+    incomplete_retirement_queue: VecDeque<TxnId>,
+    incomplete_retirement_members: HashSet<TxnId>,
+}
+
+impl CanonicalLogState {
+    fn apply_undo(&mut self, entry: UndoLogEntry, record_bytes: Vec<u8>) {
+        let txn_id = entry.txn_id;
+        self.participant_completion.remove(&txn_id);
+        self.participant_retirement.remove(&txn_id);
+        if self
+            .participant_undo_records
+            .entry(txn_id)
+            .or_default()
+            .insert(record_bytes)
+        {
+            self.participant_undo.entry(txn_id).or_default().push(entry);
+        }
+    }
+
+    fn apply_participant_completion(&mut self, txn_id: TxnId, outcome: TxnState) {
+        self.participant_undo.remove(&txn_id);
+        self.participant_undo_records.remove(&txn_id);
+        self.participant_retirement.remove(&txn_id);
+        self.participant_completion.insert(txn_id, outcome);
+    }
+
+    fn apply_participant_retirement(&mut self, txn_id: TxnId, record: ParticipantRetirementRecord) {
+        self.participant_undo.remove(&txn_id);
+        self.participant_undo_records.remove(&txn_id);
+        self.participant_completion.remove(&txn_id);
+        self.participant_retirement.insert(txn_id, record);
+    }
+
+    fn apply_coordinator_decision(&mut self, txn_id: TxnId, record: CoordinatorDecisionRecord) {
+        if !matches!(
+            self.coordinator_status.get(&txn_id),
+            Some(CoordinatorStatus::Completed(_))
+        ) {
+            self.coordinator_status
+                .insert(txn_id, CoordinatorStatus::Decided(record));
+        }
+    }
+
+    fn apply_coordinator_completion(&mut self, txn_id: TxnId, record: CoordinatorCompletionRecord) {
+        if record.finalized_participants != record.participants {
+            if self.incomplete_retirement_members.insert(txn_id) {
+                self.incomplete_retirement_queue.push_back(txn_id);
+            }
+        } else {
+            self.incomplete_retirement_members.remove(&txn_id);
+        }
+        self.coordinator_status
+            .insert(txn_id, CoordinatorStatus::Completed(record));
+    }
+
+    fn rebuild_incomplete_retirements(&mut self) {
+        self.incomplete_retirement_queue.clear();
+        self.incomplete_retirement_members.clear();
+        for (tid, status) in &self.coordinator_status {
+            if matches!(
+                status,
+                CoordinatorStatus::Completed(record)
+                    if record.finalized_participants != record.participants
+            ) {
+                self.incomplete_retirement_members.insert(*tid);
+                self.incomplete_retirement_queue.push_back(*tid);
+            }
+        }
+    }
+
+    fn retirement_candidates(&mut self, limit: usize) -> Vec<TxnId> {
+        let mut candidates =
+            Vec::with_capacity(limit.min(self.incomplete_retirement_members.len()));
+        let mut examined = 0;
+        while examined < limit {
+            let Some(tid) = self.incomplete_retirement_queue.pop_front() else {
+                break;
+            };
+            examined += 1;
+            if self.incomplete_retirement_members.contains(&tid) {
+                candidates.push(tid);
+                self.incomplete_retirement_queue.push_back(tid);
+            }
+        }
+        candidates
+    }
+
+    fn retained_at(&self, now_ms: i64) -> Self {
+        let mut retained = self.clone();
+        retained
+            .participant_retirement
+            .retain(|_, record| !record.finalized || now_ms < record.expires_at_ms);
+        retained
+            .coordinator_status
+            .retain(|_, status| match status {
+                CoordinatorStatus::Decided(_) => true,
+                CoordinatorStatus::Completed(record) => {
+                    record.finalized_participants != record.participants
+                        || now_ms < record.expires_at_ms
+                }
+            });
+        retained.rebuild_incomplete_retirements();
+        retained
+    }
+}
+
+struct CanonicalLogScan {
+    state: CanonicalLogState,
+    highest_barrier: Option<(u64, u64)>,
 }
 
 fn collect_undo_log_paths<I>(log_dir_path: &Path, entries: I) -> io::Result<Vec<(u64, PathBuf)>>
@@ -162,6 +271,76 @@ where
     }
     log_files.sort_by_key(|(seq, _)| *seq);
     Ok(log_files)
+}
+
+fn remove_abandoned_compacting_files(log_dir_path: &Path) -> io::Result<()> {
+    let mut first_error = None;
+    for entry in std::fs::read_dir(log_dir_path)? {
+        let path = entry?.path();
+        let is_compacting = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("undo-") && name.ends_with(".nlog.compacting"));
+        if is_compacting {
+            if let Err(error) = durable_fs::remove_file(&path) {
+                first_error.get_or_insert_with(|| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot durably remove abandoned compaction file {}: {}",
+                            path.display(),
+                            error
+                        ),
+                    )
+                });
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+static PERSISTENT_LOG_REMOVE_FAILURES: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn persistent_log_remove_failures() -> &'static Mutex<HashSet<PathBuf>> {
+    PERSISTENT_LOG_REMOVE_FAILURES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(test)]
+struct PersistentLogRemoveFailureHandle {
+    path: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for PersistentLogRemoveFailureHandle {
+    fn drop(&mut self) {
+        persistent_log_remove_failures().lock().remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+fn install_persistent_log_remove_failure(path: PathBuf) -> PersistentLogRemoveFailureHandle {
+    persistent_log_remove_failures().lock().insert(path.clone());
+    PersistentLogRemoveFailureHandle { path }
+}
+
+fn remove_log_file(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if persistent_log_remove_failures().lock().contains(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "injected persistent log remove failure for {}",
+                path.display()
+            ),
+        ));
+    }
+    durable_fs::remove_file(path)
 }
 
 /// Decode a serialized transaction id from the bytes stored in the undo log.
@@ -710,12 +889,14 @@ impl UndoLogEntry {
     }
 }
 
-fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<CanonicalLogState> {
+fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<CanonicalLogScan> {
     let mut state = CanonicalLogState::default();
+    let mut highest_barrier = None;
     for (seq, path) in log_files {
         let mut buffer = Vec::new();
         File::open(path)?.read_to_end(&mut buffer)?;
         let mut offset = 0;
+        let mut saw_snapshot = false;
         while offset < buffer.len() {
             if buffer.len() < offset + 5 {
                 return Err(io::Error::new(
@@ -745,18 +926,42 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                 ));
             }
             if entry_type == ENTRY_TYPE_COMPACTION_SNAPSHOT {
-                let (snapshot, size) =
-                    decode_compaction_snapshot_record(&buffer, offset, txn_id_len)?;
-                if snapshot.covered_through_seq >= *seq {
+                if offset != 0 || saw_snapshot {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "compaction snapshot in sequence {} cannot cover sequence {}",
+                            "compaction snapshot in sequence {} must be the first and only barrier record",
+                            seq
+                        ),
+                    ));
+                }
+                let (snapshot, size) =
+                    decode_compaction_snapshot_record(&buffer, offset, txn_id_len)?;
+                if snapshot.covered_through_seq.checked_add(1) != Some(*seq) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "compaction snapshot in sequence {} must immediately follow covered sequence {}",
                             seq, snapshot.covered_through_seq
                         ),
                     ));
                 }
+                if let Some((previous_snapshot_seq, previous_covered_through)) = highest_barrier {
+                    if snapshot.covered_through_seq < previous_snapshot_seq
+                        || snapshot.covered_through_seq <= previous_covered_through
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "compaction snapshot in sequence {} does not advance beyond prior barrier {} covering {}",
+                                seq, previous_snapshot_seq, previous_covered_through
+                            ),
+                        ));
+                    }
+                }
                 state = CanonicalLogState::default();
+                highest_barrier = Some((*seq, snapshot.covered_through_seq));
+                saw_snapshot = true;
                 offset += size;
                 continue;
             }
@@ -876,7 +1081,11 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
             }
         }
     }
-    Ok(state)
+    state.rebuild_incomplete_retirements();
+    Ok(CanonicalLogScan {
+        state,
+        highest_barrier,
+    })
 }
 
 #[cfg(test)]
@@ -930,6 +1139,12 @@ pub struct UndoLogger {
     log_seq: AtomicU64,
     /// Set of active (incomplete) transaction IDs for trimming
     active_txns: Mutex<HashSet<TxnId>>,
+    /// Canonical targeted lookup index, rebuilt once at startup and updated
+    /// only after the corresponding record is durably appended.
+    canonical_state: Mutex<CanonicalLogState>,
+    /// Covered old sequences whose durable unlink has not yet converged.
+    /// Compaction must clear this before publishing another snapshot.
+    pending_cleanup_through: Mutex<Option<u64>>,
     /// Maximum log file size before rotation (default 64MB)
     max_log_size: u64,
     #[cfg(test)]
@@ -943,13 +1158,17 @@ pub struct UndoLogger {
     #[cfg(test)]
     fail_next_coordinator_abort_decision: AtomicBool,
     #[cfg(test)]
-    rotate_before_next_record: AtomicBool,
+    fail_next_coordinator_completion: AtomicBool,
     #[cfg(test)]
-    pause_next_scan: Mutex<Option<Arc<ScanPauseState>>>,
+    fail_next_coordinator_completions_read: AtomicBool,
+    #[cfg(test)]
+    rotate_before_next_record: AtomicBool,
     #[cfg(test)]
     pause_before_snapshot_adoption: Mutex<Option<Arc<ScanPauseState>>>,
     #[cfg(test)]
     coordinator_completion_writes: AtomicU64,
+    #[cfg(test)]
+    full_log_scans: AtomicU64,
 }
 
 impl UndoLogger {
@@ -957,10 +1176,27 @@ impl UndoLogger {
     pub fn new(log_dir: String) -> io::Result<Arc<Self>> {
         let log_dir_path = Path::new(&log_dir);
         durable_fs::ensure_directory(log_dir_path)?;
+        remove_abandoned_compacting_files(log_dir_path)?;
         let existing_logs = collect_undo_log_paths(
             log_dir_path,
             std::fs::read_dir(log_dir_path)?.map(|entry| entry.map(|entry| entry.path())),
         )?;
+        let scan = read_canonical_log_state(&existing_logs)?;
+        let mut pending_cleanup_through = None;
+        if let Some((_snapshot_seq, covered_through_seq)) = scan.highest_barrier {
+            for (seq, path) in &existing_logs {
+                if *seq <= covered_through_seq {
+                    if let Err(error) = remove_log_file(path) {
+                        error!(
+                            "Could not finish covered undo-log cleanup for {} at startup: {:?}",
+                            path.display(),
+                            error
+                        );
+                        pending_cleanup_through = Some(covered_through_seq);
+                    }
+                }
+            }
+        }
         let next_log_seq = existing_logs
             .last()
             .map(|(seq, _)| {
@@ -973,6 +1209,8 @@ impl UndoLogger {
             })
             .transpose()?
             .unwrap_or(0);
+        let pending_active_path = pending_cleanup_through
+            .and_then(|_| existing_logs.last().map(|(_, path)| path.clone()));
 
         let log = Arc::new(Self {
             log_dir: log_dir.clone(),
@@ -981,7 +1219,9 @@ impl UndoLogger {
             log_file_name: Mutex::new(None),
             publication_sync_pending: Mutex::new(None),
             log_seq: AtomicU64::new(next_log_seq),
-            active_txns: Mutex::new(HashSet::new()),
+            active_txns: Mutex::new(scan.state.participant_undo.keys().copied().collect()),
+            canonical_state: Mutex::new(scan.state),
+            pending_cleanup_through: Mutex::new(pending_cleanup_through),
             max_log_size: 64 * 1024 * 1024, // 64MB
             #[cfg(test)]
             fail_next_undo_write: AtomicBool::new(false),
@@ -994,17 +1234,29 @@ impl UndoLogger {
             #[cfg(test)]
             fail_next_coordinator_abort_decision: AtomicBool::new(false),
             #[cfg(test)]
-            rotate_before_next_record: AtomicBool::new(false),
+            fail_next_coordinator_completion: AtomicBool::new(false),
             #[cfg(test)]
-            pause_next_scan: Mutex::new(None),
+            fail_next_coordinator_completions_read: AtomicBool::new(false),
+            #[cfg(test)]
+            rotate_before_next_record: AtomicBool::new(false),
             #[cfg(test)]
             pause_before_snapshot_adoption: Mutex::new(None),
             #[cfg(test)]
             coordinator_completion_writes: AtomicU64::new(0),
+            #[cfg(test)]
+            full_log_scans: AtomicU64::new(1),
         });
 
-        // Open or create initial log file
-        log.rotate_log()?;
+        // Reuse the latest authoritative generation while covered-file cleanup
+        // is pending. Repeated crash/restart prefixes must not create an empty
+        // active generation each time the same durable unlink keeps failing.
+        if let Some(active_path) = pending_active_path {
+            let file = durable_fs::open_or_create_append(&active_path)?;
+            *log.log_file.lock() = Some(BufWriter::with_capacity(4096, file));
+            *log.log_file_name.lock() = Some(active_path.to_string_lossy().into_owned());
+        } else {
+            log.rotate_log()?;
+        }
 
         Ok(log)
     }
@@ -1059,9 +1311,9 @@ impl UndoLogger {
             writer.flush()?;
             writer.get_ref().sync_data()?;
 
-            // Track active transaction
+            self.canonical_state.lock().apply_undo(entry.clone(), bytes);
+            self.active_txns.lock().insert(entry.txn_id);
             drop(log_file_guard);
-            self.active_txns.lock().insert(entry.txn_id.clone());
 
             // Check if we need to rotate
             let log_file_name = self.log_file_name.lock();
@@ -1113,9 +1365,11 @@ impl UndoLogger {
             writer.flush()?;
             writer.get_ref().sync_data()?;
 
-            // Remove from in-memory index
-            drop(log_file_guard);
+            self.canonical_state
+                .lock()
+                .apply_participant_completion(*txn_id, TxnState::Committed);
             self.active_txns.lock().remove(txn_id);
+            drop(log_file_guard);
 
             Ok(())
         } else {
@@ -1151,9 +1405,11 @@ impl UndoLogger {
             writer.flush()?;
             writer.get_ref().sync_data()?;
 
-            // Remove from in-memory index
-            drop(log_file_guard);
+            self.canonical_state
+                .lock()
+                .apply_participant_completion(*txn_id, TxnState::Aborted);
             self.active_txns.lock().remove(txn_id);
+            drop(log_file_guard);
 
             Ok(())
         } else {
@@ -1221,7 +1477,15 @@ impl UndoLogger {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Log file not initialized"))?;
         writer.write_all(&bytes)?;
         writer.flush()?;
-        writer.get_ref().sync_data()
+        writer.get_ref().sync_data()?;
+        self.canonical_state.lock().apply_coordinator_decision(
+            *txn_id,
+            CoordinatorDecisionRecord {
+                resolution: TxnResolution::Commit(commit_hlc),
+                participants,
+            },
+        );
+        Ok(())
     }
 
     /// Persist the distributed coordinator's irrevocable abort decision.
@@ -1271,10 +1535,21 @@ impl UndoLogger {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Log file not initialized"))?;
         writer.write_all(&bytes)?;
         writer.flush()?;
-        writer.get_ref().sync_data()
+        writer.get_ref().sync_data()?;
+        self.canonical_state.lock().apply_coordinator_decision(
+            *txn_id,
+            CoordinatorDecisionRecord {
+                resolution: TxnResolution::Abort,
+                participants,
+            },
+        );
+        Ok(())
     }
 
-    fn write_synced_record(&self, bytes: &[u8]) -> io::Result<()> {
+    fn write_synced_record<F>(&self, bytes: &[u8], update: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut CanonicalLogState),
+    {
         let mut log_file_guard = self.log_file.lock();
         self.finish_pending_publication()?;
         let writer = log_file_guard
@@ -1282,7 +1557,9 @@ impl UndoLogger {
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Log file not initialized"))?;
         writer.write_all(bytes)?;
         writer.flush()?;
-        writer.get_ref().sync_data()
+        writer.get_ref().sync_data()?;
+        update(&mut self.canonical_state.lock());
+        Ok(())
     }
 
     fn finish_pending_publication(&self) -> io::Result<()> {
@@ -1320,6 +1597,16 @@ impl UndoLogger {
         txn_id: &TxnId,
         record: &CoordinatorCompletionRecord,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_next_coordinator_completion
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected coordinator completion failure",
+            ));
+        }
         validate_final_resolution(record.resolution)?;
         if !record.retired_participants.is_subset(&record.participants)
             || !record
@@ -1332,7 +1619,9 @@ impl UndoLogger {
             ));
         }
         let bytes = encode_json_payload_record(ENTRY_TYPE_COORDINATOR_COMPLETION, txn_id, record)?;
-        self.write_synced_record(&bytes)?;
+        self.write_synced_record(&bytes, |state| {
+            state.apply_coordinator_completion(*txn_id, record.clone())
+        })?;
         #[cfg(test)]
         self.coordinator_completion_writes
             .fetch_add(1, Ordering::SeqCst);
@@ -1342,6 +1631,12 @@ impl UndoLogger {
     #[cfg(test)]
     pub(crate) fn coordinator_completion_write_count_for_test(&self) -> u64 {
         self.coordinator_completion_writes.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_coordinator_completion_for_test(&self) {
+        self.fail_next_coordinator_completion
+            .store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn write_participant_retirement(
@@ -1383,7 +1678,9 @@ impl UndoLogger {
     ) -> io::Result<()> {
         validate_participant_outcome(record.outcome)?;
         let bytes = encode_json_payload_record(ENTRY_TYPE_PARTICIPANT_RETIREMENT, txn_id, record)?;
-        self.write_synced_record(&bytes)
+        self.write_synced_record(&bytes, |state| {
+            state.apply_participant_retirement(*txn_id, record.clone())
+        })
     }
 
     pub fn coordinator_decision(&self, txn_id: &TxnId) -> io::Result<Option<TxnResolution>> {
@@ -1415,181 +1712,37 @@ impl UndoLogger {
         &self,
         txn_id: &TxnId,
     ) -> io::Result<Option<CoordinatorStatus>> {
-        self.coordinator_statuses()
-            .map(|mut statuses| statuses.remove(txn_id))
+        Ok(self
+            .canonical_state
+            .lock()
+            .coordinator_status
+            .get(txn_id)
+            .cloned())
     }
 
-    pub(crate) fn coordinator_completions(
-        &self,
-    ) -> io::Result<BTreeMap<TxnId, CoordinatorCompletionRecord>> {
-        self.coordinator_statuses().map(|statuses| {
-            statuses
-                .into_iter()
-                .filter_map(|(tid, status)| match status {
-                    CoordinatorStatus::Completed(record) => Some((tid, record)),
-                    CoordinatorStatus::Decided(_) => None,
-                })
-                .collect()
-        })
-    }
-
-    fn coordinator_statuses(&self) -> io::Result<BTreeMap<TxnId, CoordinatorStatus>> {
-        let _generation_guard = self.log_generation.read();
-        let mut writer_guard = self.log_file.lock();
-        if let Some(writer) = writer_guard.as_mut() {
-            writer.flush()?;
-        }
-        let log_dir_path = Path::new(&self.log_dir);
-        let entries = std::fs::read_dir(log_dir_path)?;
-        let log_files = collect_undo_log_paths(
-            log_dir_path,
-            entries.map(|entry| entry.map(|entry| entry.path())),
-        )?;
+    pub(crate) fn coordinator_retirement_candidates(&self, limit: usize) -> io::Result<Vec<TxnId>> {
         #[cfg(test)]
-        self.pause_scanner_if_requested_for_test();
-        let mut statuses = BTreeMap::new();
-
-        for (_seq, path) in log_files {
-            let mut buffer = Vec::new();
-            File::open(&path)?.read_to_end(&mut buffer)?;
-            let mut offset = 0;
-            while offset < buffer.len() {
-                if buffer.len() < offset + 5 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "cannot decode undo log {} at byte offset {}: incomplete entry header",
-                            path.display(),
-                            offset
-                        ),
-                    ));
-                }
-                let entry_type = buffer[offset];
-                let encoded_txn_id_len = u32::from_le_bytes([
-                    buffer[offset + 1],
-                    buffer[offset + 2],
-                    buffer[offset + 3],
-                    buffer[offset + 4],
-                ]) as usize;
-                if buffer.len() < offset + 5 + encoded_txn_id_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "cannot decode undo log {} at byte offset {}: incomplete transaction id",
-                            path.display(),
-                            offset
-                        ),
-                    ));
-                }
-                if entry_type == ENTRY_TYPE_COMPACTION_SNAPSHOT {
-                    let (_, size) =
-                        decode_compaction_snapshot_record(&buffer, offset, encoded_txn_id_len)?;
-                    statuses.clear();
-                    offset += size;
-                    continue;
-                }
-                let encoded_txn_id =
-                    decode_txn_id(&buffer[offset + 5..offset + 5 + encoded_txn_id_len])?;
-                match entry_type {
-                    ENTRY_TYPE_UNDO => {
-                        let (_, size) = UndoLogEntry::from_bytes(&buffer[offset..])?;
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
-                        offset += 5 + encoded_txn_id_len;
-                    }
-                    ENTRY_TYPE_COORDINATOR_COMMIT => {
-                        let (commit_hlc, participants, size) =
-                            coordinator_commit_record_size(&buffer, offset, encoded_txn_id_len)?;
-                        if !matches!(
-                            statuses.get(&encoded_txn_id),
-                            Some(CoordinatorStatus::Completed(_))
-                        ) {
-                            statuses.insert(
-                                encoded_txn_id,
-                                CoordinatorStatus::Decided(CoordinatorDecisionRecord {
-                                    resolution: TxnResolution::Commit(commit_hlc),
-                                    participants,
-                                }),
-                            );
-                        }
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COORDINATOR_ABORT => {
-                        let (participants, size) =
-                            coordinator_abort_record_size(&buffer, offset, encoded_txn_id_len)?;
-                        if !matches!(
-                            statuses.get(&encoded_txn_id),
-                            Some(CoordinatorStatus::Completed(_))
-                        ) {
-                            statuses.insert(
-                                encoded_txn_id,
-                                CoordinatorStatus::Decided(CoordinatorDecisionRecord {
-                                    resolution: TxnResolution::Abort,
-                                    participants,
-                                }),
-                            );
-                        }
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COORDINATOR_COMPLETION => {
-                        let (record, size): (CoordinatorCompletionRecord, _) =
-                            decode_json_payload_record(&buffer, offset, encoded_txn_id_len)?;
-                        validate_final_resolution(record.resolution)?;
-                        if !record.retired_participants.is_subset(&record.participants)
-                            || !record
-                                .finalized_participants
-                                .is_subset(&record.retired_participants)
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "invalid coordinator completion acknowledgement sets",
-                            ));
-                        }
-                        statuses.insert(encoded_txn_id, CoordinatorStatus::Completed(record));
-                        offset += size;
-                    }
-                    ENTRY_TYPE_PARTICIPANT_RETIREMENT => {
-                        let (_, size): (ParticipantRetirementRecord, _) =
-                            decode_json_payload_record(&buffer, offset, encoded_txn_id_len)?;
-                        offset += size;
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "cannot decode undo log {} at byte offset {}: invalid entry type {}",
-                                path.display(),
-                                offset,
-                                entry_type
-                            ),
-                        ));
-                    }
-                }
-            }
+        if self
+            .fail_next_coordinator_completions_read
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected coordinator completion discovery failure",
+            ));
         }
-
-        Ok(statuses)
+        Ok(self.canonical_state.lock().retirement_candidates(limit))
     }
 
     #[cfg(test)]
-    fn pause_next_coordinator_scan_for_test(&self) -> Arc<ScanPauseState> {
-        let state = Arc::new(ScanPauseState::new());
-        *self.pause_next_scan.lock() = Some(state.clone());
-        state
+    pub(crate) fn fail_next_coordinator_completions_read_for_test(&self) {
+        self.fail_next_coordinator_completions_read
+            .store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
-    fn pause_scanner_if_requested_for_test(&self) {
-        let Some(state) = self.pause_next_scan.lock().take() else {
-            return;
-        };
-        *state.entered.lock().unwrap() = true;
-        state.entered_cv.notify_all();
-        let mut released = state.released.lock().unwrap();
-        while !*released {
-            released = state.released_cv.wait(released).unwrap();
-        }
+    pub(crate) fn full_log_scan_count_for_test(&self) -> u64 {
+        self.full_log_scans.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -1634,26 +1787,16 @@ impl UndoLogger {
         &self,
         now_ms: i64,
     ) -> io::Result<BTreeMap<TxnId, (TxnState, Option<i64>)>> {
-        let _generation_guard = self.log_generation.read();
-        let mut writer_guard = self.log_file.lock();
-        if let Some(writer) = writer_guard.as_mut() {
-            writer.flush()?;
-        }
-        let log_dir_path = Path::new(&self.log_dir);
-        let log_files = collect_undo_log_paths(
-            log_dir_path,
-            std::fs::read_dir(log_dir_path)?.map(|entry| entry.map(|entry| entry.path())),
-        )?;
-        let state = read_canonical_log_state(&log_files)?;
+        let state = self.canonical_state.lock();
         let mut completions = state
             .participant_completion
-            .into_iter()
-            .map(|(tid, outcome)| (tid, (outcome, None)))
+            .iter()
+            .map(|(tid, outcome)| (*tid, (*outcome, None)))
             .collect::<BTreeMap<_, _>>();
-        for (tid, retirement) in state.participant_retirement {
+        for (tid, retirement) in &state.participant_retirement {
             if !retirement.finalized || now_ms < retirement.expires_at_ms {
                 completions.insert(
-                    tid,
+                    *tid,
                     (
                         retirement.outcome,
                         retirement.finalized.then_some(retirement.expires_at_ms),
@@ -1672,118 +1815,11 @@ impl UndoLogger {
         &self,
         txn_id: &TxnId,
     ) -> io::Result<(Option<TxnState>, Option<ParticipantRetirementRecord>)> {
-        let _generation_guard = self.log_generation.read();
-        let mut writer_guard = self.log_file.lock();
-        if let Some(writer) = writer_guard.as_mut() {
-            writer.flush()?;
-        }
-        let log_dir_path = Path::new(&self.log_dir);
-        let entries = std::fs::read_dir(log_dir_path)?;
-        let log_files = collect_undo_log_paths(
-            log_dir_path,
-            entries.map(|entry| entry.map(|entry| entry.path())),
-        )?;
-        let mut completion = None;
-        let mut retirement = None;
-
-        for (_seq, path) in log_files {
-            let mut buffer = Vec::new();
-            File::open(&path)?.read_to_end(&mut buffer)?;
-            let mut offset = 0;
-            while offset < buffer.len() {
-                if buffer.len() < offset + 5 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "cannot decode undo log {} at byte offset {}: incomplete entry header",
-                            path.display(),
-                            offset
-                        ),
-                    ));
-                }
-                let entry_type = buffer[offset];
-                let encoded_txn_id_len = u32::from_le_bytes([
-                    buffer[offset + 1],
-                    buffer[offset + 2],
-                    buffer[offset + 3],
-                    buffer[offset + 4],
-                ]) as usize;
-                if buffer.len() < offset + 5 + encoded_txn_id_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "cannot decode undo log {} at byte offset {}: incomplete transaction id",
-                            path.display(),
-                            offset
-                        ),
-                    ));
-                }
-                if entry_type == ENTRY_TYPE_COMPACTION_SNAPSHOT {
-                    let (_, size) =
-                        decode_compaction_snapshot_record(&buffer, offset, encoded_txn_id_len)?;
-                    completion = None;
-                    retirement = None;
-                    offset += size;
-                    continue;
-                }
-                let encoded_txn_id =
-                    decode_txn_id(&buffer[offset + 5..offset + 5 + encoded_txn_id_len])?;
-                match entry_type {
-                    ENTRY_TYPE_UNDO => {
-                        let (_, size) = UndoLogEntry::from_bytes(&buffer[offset..])?;
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
-                        if encoded_txn_id == *txn_id {
-                            completion = Some(if entry_type == ENTRY_TYPE_COMMIT {
-                                TxnState::Committed
-                            } else {
-                                TxnState::Aborted
-                            });
-                        }
-                        offset += 5 + encoded_txn_id_len;
-                    }
-                    ENTRY_TYPE_COORDINATOR_COMMIT => {
-                        let (_, _, size) =
-                            coordinator_commit_record_size(&buffer, offset, encoded_txn_id_len)?;
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COORDINATOR_ABORT => {
-                        let (_, size) =
-                            coordinator_abort_record_size(&buffer, offset, encoded_txn_id_len)?;
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COORDINATOR_COMPLETION => {
-                        let (_, size): (CoordinatorCompletionRecord, _) =
-                            decode_json_payload_record(&buffer, offset, encoded_txn_id_len)?;
-                        offset += size;
-                    }
-                    ENTRY_TYPE_PARTICIPANT_RETIREMENT => {
-                        let (record, size): (ParticipantRetirementRecord, _) =
-                            decode_json_payload_record(&buffer, offset, encoded_txn_id_len)?;
-                        validate_participant_outcome(record.outcome)?;
-                        if encoded_txn_id == *txn_id {
-                            completion = Some(record.outcome);
-                            retirement = Some(record);
-                        }
-                        offset += size;
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "cannot decode undo log {} at byte offset {}: invalid entry type {}",
-                                path.display(),
-                                offset,
-                                entry_type
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-
-        Ok((completion, retirement))
+        let state = self.canonical_state.lock();
+        Ok((
+            state.participant_completion.get(txn_id).copied(),
+            state.participant_retirement.get(txn_id).cloned(),
+        ))
     }
 
     pub fn resolve_recovered_transactions(
@@ -2056,6 +2092,36 @@ impl UndoLogger {
         self.compact_logs_at(bifrost::utils::time::get_time())
     }
 
+    fn remove_covered_log_files(
+        &self,
+        log_files: &[(u64, PathBuf)],
+        covered_through_seq: u64,
+    ) -> io::Result<()> {
+        let mut first_error = None;
+        for (seq, path) in log_files {
+            if *seq > covered_through_seq {
+                continue;
+            }
+            debug!("Trimming superseded undo log: {:?}", path);
+            if let Err(error) = remove_log_file(path) {
+                first_error.get_or_insert_with(|| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot durably remove covered undo log {}: {}",
+                            path.display(),
+                            error
+                        ),
+                    )
+                });
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn compact_logs_at(&self, now_ms: i64) -> io::Result<()> {
         // Holding the writer lock freezes the complete input set. The new
         // higher-sequence snapshot is synced and published before any source
@@ -2071,10 +2137,19 @@ impl UndoLogger {
         current_writer.get_ref().sync_all()?;
 
         let log_dir_path = Path::new(&self.log_dir);
-        let log_files = collect_undo_log_paths(
+        let mut log_files = collect_undo_log_paths(
             log_dir_path,
             std::fs::read_dir(log_dir_path)?.map(|entry| entry.map(|entry| entry.path())),
         )?;
+        let pending_cleanup = *self.pending_cleanup_through.lock();
+        if let Some(covered_through_seq) = pending_cleanup {
+            self.remove_covered_log_files(&log_files, covered_through_seq)?;
+            *self.pending_cleanup_through.lock() = None;
+            log_files = collect_undo_log_paths(
+                log_dir_path,
+                std::fs::read_dir(log_dir_path)?.map(|entry| entry.map(|entry| entry.path())),
+            )?;
+        }
         let Some((covered_through_seq, _)) = log_files.last() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -2093,7 +2168,7 @@ impl UndoLogger {
                 "undo log sequence number is exhausted",
             )
         })?;
-        let state = read_canonical_log_state(&log_files)?;
+        let state = self.canonical_state.lock().retained_at(now_ms);
 
         let staging_path = log_dir_path.join(format!("undo-{}.nlog.compacting", snapshot_seq));
         let snapshot_path = log_dir_path.join(format!("undo-{}.nlog", snapshot_seq));
@@ -2172,194 +2247,29 @@ impl UndoLogger {
         *self.log_file_name.lock() = Some(snapshot_path.to_string_lossy().into_owned());
         self.log_seq.store(next_seq, Ordering::SeqCst);
         *self.active_txns.lock() = state.participant_undo.keys().copied().collect();
+        *self.canonical_state.lock() = state;
+        *self.pending_cleanup_through.lock() = Some(*covered_through_seq);
 
         if let Some(error) = publication_error {
             *self.publication_sync_pending.lock() = Some(snapshot_path);
             return Err(error);
         }
 
-        for (_, path) in log_files {
-            debug!("Trimming superseded undo log: {:?}", path);
-            durable_fs::remove_file(&path)?;
-        }
+        self.remove_covered_log_files(&log_files, *covered_through_seq)?;
+        *self.pending_cleanup_through.lock() = None;
         Ok(())
     }
 
     /// Recover undo log from disk on startup
     /// Returns a HashMap of incomplete transactions for rollback
     pub fn recover(&self) -> io::Result<HashMap<TxnId, Vec<UndoLogEntry>>> {
-        let _generation_guard = self.log_generation.read();
-        let mut writer_guard = self.log_file.lock();
-        if let Some(writer) = writer_guard.as_mut() {
-            writer.flush()?;
-        }
-        let log_dir_path = Path::new(&self.log_dir);
-
-        // Collect all log files
-        let entries = std::fs::read_dir(log_dir_path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot read undo log directory {}: {}",
-                    log_dir_path.display(),
-                    error
-                ),
-            )
-        })?;
-        let log_files = collect_undo_log_paths(
-            log_dir_path,
-            entries.map(|entry| entry.map(|entry| entry.path())),
-        )?;
-
-        // Rebuild in-memory index
-        let mut txn_index = HashMap::new();
-        for (_seq, path) in &log_files {
-            let mut file = File::open(path)?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)?;
-
-            let mut offset = 0;
-            while offset < buffer.len() {
-                if buffer.len() < offset + 5 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "cannot decode undo log {} at byte offset {}: incomplete entry header",
-                            path.display(),
-                            offset
-                        ),
-                    ));
-                }
-
-                let entry_type = buffer[offset];
-                let txn_id_len = u32::from_le_bytes([
-                    buffer[offset + 1],
-                    buffer[offset + 2],
-                    buffer[offset + 3],
-                    buffer[offset + 4],
-                ]) as usize;
-
-                if buffer.len() < offset + 5 + txn_id_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "cannot decode undo log {} at byte offset {}: incomplete transaction id",
-                            path.display(),
-                            offset
-                        ),
-                    ));
-                }
-
-                if entry_type == ENTRY_TYPE_COMPACTION_SNAPSHOT {
-                    let (_, size) = decode_compaction_snapshot_record(&buffer, offset, txn_id_len)?;
-                    txn_index.clear();
-                    offset += size;
-                    continue;
-                }
-                let txn_id: TxnId = decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])
-                    .map_err(|error| {
-                        io::Error::new(
-                            error.kind(),
-                            format!(
-                                "cannot decode undo log {} at byte offset {}: {}",
-                                path.display(),
-                                offset,
-                                error
-                            ),
-                        )
-                    })?;
-
-                match entry_type {
-                    ENTRY_TYPE_UNDO => {
-                        let (entry, size) =
-                            UndoLogEntry::from_bytes(&buffer[offset..]).map_err(|error| {
-                                io::Error::new(
-                                    error.kind(),
-                                    format!(
-                                        "cannot decode undo log {} at byte offset {}: {}",
-                                        path.display(),
-                                        offset,
-                                        error
-                                    ),
-                                )
-                            })?;
-                        txn_index
-                            .entry(txn_id.clone())
-                            .or_insert_with(Vec::new)
-                            .push(entry);
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
-                        txn_index.remove(&txn_id);
-                        offset += 5 + txn_id_len;
-                    }
-                    ENTRY_TYPE_COORDINATOR_COMMIT => {
-                        let (_, _, size) = coordinator_commit_record_size(
-                            &buffer, offset, txn_id_len,
-                        )
-                        .map_err(|error| {
-                            io::Error::new(
-                                error.kind(),
-                                format!(
-                                    "cannot decode undo log {} at byte offset {}: {}",
-                                    path.display(),
-                                    offset,
-                                    error
-                                ),
-                            )
-                        })?;
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COORDINATOR_ABORT => {
-                        let (_, size) = coordinator_abort_record_size(&buffer, offset, txn_id_len)
-                            .map_err(|error| {
-                                io::Error::new(
-                                    error.kind(),
-                                    format!(
-                                        "cannot decode undo log {} at byte offset {}: {}",
-                                        path.display(),
-                                        offset,
-                                        error
-                                    ),
-                                )
-                            })?;
-                        offset += size;
-                    }
-                    ENTRY_TYPE_COORDINATOR_COMPLETION => {
-                        let (_, size): (CoordinatorCompletionRecord, _) =
-                            decode_json_payload_record(&buffer, offset, txn_id_len)?;
-                        offset += size;
-                    }
-                    ENTRY_TYPE_PARTICIPANT_RETIREMENT => {
-                        let (_, size): (ParticipantRetirementRecord, _) =
-                            decode_json_payload_record(&buffer, offset, txn_id_len)?;
-                        txn_index.remove(&txn_id);
-                        offset += size;
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "cannot decode undo log {} at byte offset {}: invalid entry type {}",
-                                path.display(),
-                                offset,
-                                entry_type
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Update active transactions set for trimming
-        let active_txns_set: HashSet<TxnId> = txn_index.keys().cloned().collect();
-        *self.active_txns.lock() = active_txns_set;
-
-        // Update log sequence number
-        if let Some((max_seq, _)) = log_files.last() {
-            self.log_seq.store(*max_seq + 1, Ordering::SeqCst);
-        }
-
+        let txn_index: HashMap<_, _> = self
+            .canonical_state
+            .lock()
+            .participant_undo
+            .iter()
+            .map(|(tid, entries)| (*tid, entries.clone()))
+            .collect();
         info!(
             "Recovered undo log with {} incomplete transactions",
             txn_index.len()
@@ -2913,6 +2823,117 @@ mod tests {
     }
 
     #[test]
+    fn targeted_participant_state_follows_later_undo_and_completion_chronology() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let tid = test_hlc(324, 70);
+        let undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).unwrap();
+
+        undo.write_commit_marker(&tid).unwrap();
+        undo.finalize_participant_retirement(&tid, TxnState::Committed, 2_000_000)
+            .unwrap();
+        assert!(undo.participant_retirement(&tid).unwrap().is_some());
+
+        undo.write_undo_entry(UndoLogEntry::new_write(tid, Id::new(1, 324), 1_324))
+            .unwrap();
+        assert_eq!(
+            undo.participant_retirement(&tid).unwrap(),
+            None,
+            "a later undo must supersede stale retirement proof for the same TID"
+        );
+        assert_eq!(
+            undo.participant_completion(&tid).unwrap(),
+            None,
+            "a later undo must also supersede stale participant completion"
+        );
+
+        undo.write_abort_marker(&tid).unwrap();
+        assert_eq!(
+            undo.participant_retirement(&tid).unwrap(),
+            None,
+            "a later completion must not reveal the retirement it superseded"
+        );
+        assert_eq!(
+            undo.participant_completion(&tid).unwrap(),
+            Some(TxnState::Aborted)
+        );
+    }
+
+    #[test]
+    fn startup_rejects_invalid_or_out_of_order_snapshot_barriers() {
+        let invalid_dir = TempDir::new().unwrap();
+        std::fs::write(
+            invalid_dir.path().join("undo-0.nlog"),
+            encode_compaction_snapshot_record(0),
+        )
+        .unwrap();
+        let invalid = UndoLogger::new(invalid_dir.path().to_string_lossy().into_owned());
+        assert!(
+            invalid.is_err(),
+            "a snapshot may not cover its own containing sequence"
+        );
+
+        let out_of_order_dir = TempDir::new().unwrap();
+        std::fs::write(
+            out_of_order_dir.path().join("undo-1.nlog"),
+            encode_compaction_snapshot_record(0),
+        )
+        .unwrap();
+        std::fs::write(
+            out_of_order_dir.path().join("undo-2.nlog"),
+            encode_compaction_snapshot_record(0),
+        )
+        .unwrap();
+        let out_of_order = UndoLogger::new(out_of_order_dir.path().to_string_lossy().into_owned());
+        assert!(
+            out_of_order.is_err(),
+            "snapshot barriers must advance monotonically across generations"
+        );
+
+        let under_covering_dir = TempDir::new().unwrap();
+        std::fs::write(
+            under_covering_dir.path().join("undo-1.nlog"),
+            encode_participant_completion_record(&test_hlc(12, 34), TxnState::Aborted).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            under_covering_dir.path().join("undo-100.nlog"),
+            encode_compaction_snapshot_record(0),
+        )
+        .unwrap();
+        let under_covering =
+            UndoLogger::new(under_covering_dir.path().to_string_lossy().into_owned());
+        assert!(
+            under_covering.is_err(),
+            "a snapshot barrier must cover the immediately preceding generation before resetting canonical state"
+        );
+    }
+
+    #[test]
+    fn startup_durably_removes_abandoned_compacting_snapshots() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let abandoned = [
+            log_dir.join("undo-7.nlog.compacting"),
+            log_dir.join("undo-900.nlog.compacting"),
+        ];
+        for path in &abandoned {
+            std::fs::write(path, b"crash prefix").unwrap();
+        }
+
+        let _undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).unwrap();
+
+        for path in abandoned {
+            assert!(
+                !path.exists(),
+                "startup must remove ignored compaction staging file {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn global_compaction_expires_acknowledged_evidence_but_retains_unresolved_state() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().join("undo");
@@ -3051,6 +3072,100 @@ mod tests {
         assert!(matches!(
             undo.coordinator_status(&incomplete_completion_tid).unwrap(),
             Some(CoordinatorStatus::Completed(_))
+        ));
+    }
+
+    #[test]
+    fn persistent_unlink_failure_allows_only_one_pending_snapshot_generation() {
+        fn log_footprint(log_dir: &Path) -> (usize, u64) {
+            let paths = collect_undo_log_paths(
+                log_dir,
+                std::fs::read_dir(log_dir)
+                    .unwrap()
+                    .map(|entry| entry.map(|entry| entry.path())),
+            )
+            .unwrap();
+            let bytes = paths
+                .iter()
+                .map(|(_, path)| std::fs::metadata(path).unwrap().len())
+                .sum();
+            (paths.len(), bytes)
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let tid = test_hlc(460, 70);
+        let undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
+        undo.write_coordinator_abort_decision(&tid, &[70]).unwrap();
+        undo.rotate_log().unwrap();
+        let failed_path = log_dir.join("undo-0.nlog");
+        let failure = install_persistent_log_remove_failure(failed_path.clone());
+
+        assert!(
+            undo.compact_logs_at(1_000_000).is_err(),
+            "the adopted snapshot must report covered-file cleanup failure"
+        );
+        assert!(
+            !log_dir.join("undo-1.nlog").exists(),
+            "cleanup must attempt later safe files after the oldest unlink fails"
+        );
+        let first_failed_footprint = log_footprint(&log_dir);
+        for _ in 0..8 {
+            assert!(
+                undo.compact_logs_at(1_000_000).is_err(),
+                "pending cleanup must be retried before another snapshot is published"
+            );
+            assert_eq!(
+                log_footprint(&log_dir),
+                first_failed_footprint,
+                "persistent unlink failure must not accumulate snapshot generations or bytes"
+            );
+        }
+        drop(undo);
+
+        for _ in 0..4 {
+            let reopened = UndoLogger::new(log_dir.to_string_lossy().into_owned())
+                .expect("reopened undo logger during persistent unlink failure");
+            assert!(matches!(
+                reopened.coordinator_status(&tid).unwrap(),
+                Some(CoordinatorStatus::Decided(_))
+            ));
+            assert_eq!(
+                log_footprint(&log_dir),
+                first_failed_footprint,
+                "repeated crash/restart prefixes must not create empty active generations"
+            );
+            drop(reopened);
+        }
+
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("reopened undo logger");
+        assert!(matches!(
+            reopened.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(_))
+        ));
+        let restarted_footprint = log_footprint(&log_dir);
+        for _ in 0..4 {
+            assert!(
+                reopened.compact_logs_at(1_000_000).is_err(),
+                "restart must recover and retry the highest barrier cleanup first"
+            );
+            assert_eq!(
+                log_footprint(&log_dir),
+                restarted_footprint,
+                "restart retries must remain bounded while unlink failure persists"
+            );
+        }
+
+        drop(failure);
+        reopened
+            .compact_logs_at(1_000_000)
+            .expect("cleanup and compaction should converge after unlink recovers");
+        assert_eq!(log_footprint(&log_dir).0, 1);
+        assert!(!failed_path.exists());
+        assert!(matches!(
+            reopened.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(_))
         ));
     }
 
@@ -3240,70 +3355,88 @@ mod tests {
     }
 
     #[test]
-    fn paused_generation_scan_cannot_lose_enumerated_files_to_compaction() {
+    fn targeted_resolution_and_retirement_reads_never_rescan_log_files() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().join("undo");
         let tid = test_hlc(311, 70);
-        let append_tid = test_hlc(311, 71);
+        let participant_tid = test_hlc(311, 71);
         let undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
         undo.write_coordinator_abort_decision(&tid, &[70]).unwrap();
-        let pause = undo.pause_next_coordinator_scan_for_test();
+        undo.write_abort_marker(&participant_tid).unwrap();
+        undo.write_participant_retirement(&participant_tid, TxnState::Aborted, 0)
+            .unwrap();
+        let scans_after_startup = undo.full_log_scan_count_for_test();
 
-        let scanning_undo = undo.clone();
-        let scanner = std::thread::spawn(move || scanning_undo.coordinator_status(&tid));
-        pause.wait_until_entered();
-
-        let compacting_undo = undo.clone();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let compactor = std::thread::spawn(move || {
-            let result = compacting_undo.compact_logs_at(1_000_000);
-            finished_tx.send(result).unwrap();
-        });
-        let appending_undo = undo.clone();
-        let (append_tx, append_rx) = std::sync::mpsc::channel();
-        let appender = std::thread::spawn(move || {
-            append_tx
-                .send(appending_undo.write_undo_entry(UndoLogEntry::new_write(
-                    append_tid,
-                    Id::new(1, 209),
-                    605,
-                )))
-                .unwrap();
-        });
-        assert!(
-            matches!(
-                finished_rx.recv_timeout(std::time::Duration::from_millis(50)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "compaction must wait while a scanner owns the enumerated generation"
-        );
-        assert!(
-            matches!(
-                append_rx.recv_timeout(std::time::Duration::from_millis(50)),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            ),
-            "an append must not expose a partial active record to a paused scanner"
-        );
-
-        pause.release();
+        for unknown_offset in 0..256 {
+            let unknown_tid = test_hlc(500 + unknown_offset, 99);
+            assert!(undo.coordinator_status(&unknown_tid).unwrap().is_none());
+            assert!(undo.participant_completion(&unknown_tid).unwrap().is_none());
+            assert!(undo.participant_retirement(&unknown_tid).unwrap().is_none());
+            assert!(matches!(
+                undo.coordinator_status(&tid).unwrap(),
+                Some(CoordinatorStatus::Decided(_))
+            ));
+            assert!(undo
+                .participant_retirement(&participant_tid)
+                .unwrap()
+                .is_some());
+        }
         assert_eq!(
-            scanner.join().unwrap().unwrap(),
-            Some(CoordinatorStatus::Decided(CoordinatorDecisionRecord {
-                resolution: TxnResolution::Abort,
-                participants: BTreeSet::from([70]),
-            }))
+            undo.full_log_scan_count_for_test(),
+            scans_after_startup,
+            "targeted hit/miss and retirement retries must use only the canonical index"
         );
-        finished_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("compaction should continue after scan release")
+    }
+
+    #[test]
+    fn retirement_discovery_is_bounded_round_robin_and_releases_index_before_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
+        for offset in 0..600 {
+            let tid = test_hlc(1_000 + offset, 70);
+            undo.write_coordinator_completion_record(
+                &tid,
+                &CoordinatorCompletionRecord {
+                    resolution: TxnResolution::Abort,
+                    participants: BTreeSet::from([70]),
+                    expires_at_ms: 2_000_000,
+                    retired_participants: BTreeSet::new(),
+                    finalized_participants: BTreeSet::new(),
+                },
+            )
             .unwrap();
-        append_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("append should continue after scan release")
-            .unwrap();
-        compactor.join().unwrap();
-        appender.join().unwrap();
-        assert!(undo.recover().unwrap().contains_key(&append_tid));
+        }
+        let scans_after_startup = undo.full_log_scan_count_for_test();
+        let first: HashSet<_> = undo
+            .coordinator_retirement_candidates(37)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let second: HashSet<_> = undo
+            .coordinator_retirement_candidates(37)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(first.len(), 37);
+        assert_eq!(second.len(), 37);
+        assert!(
+            first.is_disjoint(&second),
+            "bounded discovery must rotate rather than starve later incomplete TIDs"
+        );
+
+        let appended_tid = test_hlc(9_999, 71);
+        undo.write_coordinator_abort_decision(&appended_tid, &[71])
+            .expect("candidate extraction must release the canonical index before append");
+        assert!(matches!(
+            undo.coordinator_status(&appended_tid).unwrap(),
+            Some(CoordinatorStatus::Decided(_))
+        ));
+        assert_eq!(
+            undo.full_log_scan_count_for_test(),
+            scans_after_startup,
+            "bounded retirement discovery and a normal append must not rescan log files"
+        );
     }
 
     #[test]
@@ -3615,26 +3748,25 @@ mod tests {
     }
 
     #[test]
-    fn recovery_propagates_undo_directory_open_failure() {
+    fn recovery_uses_the_startup_index_after_undo_directory_is_removed() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().join("undo");
         let undo_log = UndoLogger::new(log_dir.to_string_lossy().into_owned()).unwrap();
+        let tid = test_hlc(601, 70);
+        undo_log
+            .write_undo_entry(UndoLogEntry::new_write(tid, Id::new(7, 8), 9))
+            .unwrap();
+        let scans_after_startup = undo_log.full_log_scan_count_for_test();
         std::fs::rename(&log_dir, temp_dir.path().join("moved-undo")).unwrap();
 
-        let error = undo_log
+        let recovered = undo_log
             .recover()
-            .expect_err("a missing undo directory must fail recovery");
-        let message = error.to_string();
-
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            .expect("recovery must use the canonical index built at startup");
         assert!(
-            message.contains("cannot read undo log directory"),
-            "{message}"
+            recovered.contains_key(&tid),
+            "removing the directory after startup must not force a synchronous recovery rescan"
         );
-        assert!(
-            message.contains(log_dir.to_string_lossy().as_ref()),
-            "{message}"
-        );
+        assert_eq!(undo_log.full_log_scan_count_for_test(), scans_after_startup);
     }
 
     #[test]
@@ -3977,13 +4109,13 @@ mod tests {
         // Write it as a log file a fresh UndoLogger will pick up on recovery.
         std::fs::write(format!("{}/undo-0.nlog", log_dir), &bytes).unwrap();
 
-        let undo_log = UndoLogger::new(log_dir).unwrap();
-        let recover_err = undo_log
-            .recover()
-            .expect_err("recovering a pre-HLC undo log must fail, not silently succeed");
+        let recover_err = match UndoLogger::new(log_dir) {
+            Ok(_) => panic!("startup must reject a pre-HLC undo log, not silently succeed"),
+            Err(error) => error,
+        };
         assert!(
             recover_err.to_string().contains("pre-HLC"),
-            "expected a pre-HLC error message from recover(), got: {}",
+            "expected a pre-HLC error message from startup index rebuild, got: {}",
             recover_err
         );
     }
