@@ -732,3 +732,42 @@ Every required gate completed before the next began, with
 Coordinator decisions and participant completion evidence remain retained
 conservatively until Task 10 provides an acknowledged, bounded
 retirement/compaction protocol. The existing Task 10 deferrals are unchanged.
+
+## Review Fixes Round 5
+
+### Implementation and Audit
+
+- Removed the unused public `SegmentFileManager::create_backup_file` and
+  `open_or_create_backup_writer` methods. No caller can obtain a writable
+  handle to a recovery-visible final backup through the file-manager API.
+- Added a static production-source regression that rejects those APIs and
+  direct writer primitives, limits file creation to the WAL and ignored
+  staging paths, and requires staging open, file sync, and atomic final rename.
+- The full `ram` audit found two backup publication consumers:
+  `Segment::archive` and cold recovery through `copy_wal_to_backup`. Both write
+  an opaque `StagedBackupFile` and use `publish_staged_backup`; cleaner reaches
+  that same path through `Segment::archive`. Other production backup-path uses
+  are read, existence, or deletion operations.
+
+### TDD and Serial Verification
+
+- Baseline `ram::file_manager::tests`: 8 passed, 0 failed.
+- Focused RED
+  `ram::file_manager::tests::final_backup_publication_is_sealed_behind_staging`:
+  0 passed, 1 failed, 766 filtered. It failed on the exposed
+  `create_backup_file` API before production changes.
+- Focused GREEN: 1 passed, 0 failed, 766 filtered after removing only the two
+  unused direct-final writer methods.
+- `cargo test --lib ram::file_manager::tests -- --test-threads=1`: 9 passed,
+  0 failed, 758 filtered; 0.07s wall.
+- `cargo test --lib ram::recovery -- --test-threads=1`: 41 passed, 0 failed,
+  2 ignored, 724 filtered; 3.96s wall.
+- `cargo test --lib ram::cleaner -- --test-threads=1`: 24 passed, 0 failed,
+  743 filtered; 0.42s wall.
+- `cargo check --lib`: exit 0 in 0.95s with 60 existing warnings and no errors.
+- Scoped `rustfmt --check` and `git diff --check`: exit 0.
+
+### Files
+
+- `src/ram/file_manager.rs`
+- `.superpowers/sdd/task-9-report.md`

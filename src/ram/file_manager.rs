@@ -99,21 +99,6 @@ impl SegmentFileManager {
         }
     }
 
-    /// Create a backup file
-    pub fn create_backup_file(
-        &self,
-        chunk_id: usize,
-        seg_id: u64,
-        seq_id: u64,
-    ) -> io::Result<Option<File>> {
-        if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
-            let file = durable_fs::open_or_create(Path::new(&backup_path), true)?;
-            Ok(Some(file))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Open an existing backup file for reading
     pub fn open_backup_file(
         &self,
@@ -127,23 +112,6 @@ impl SegmentFileManager {
             } else {
                 Ok(None)
             }
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Open or create a backup file for writing (unbuffered for memory efficiency)
-    /// If the file exists, it opens for read/write without truncating
-    /// If the file doesn't exist, it creates a new one
-    pub fn open_or_create_backup_writer(
-        &self,
-        chunk_id: usize,
-        seg_id: u64,
-        seq_id: u64,
-    ) -> io::Result<Option<File>> {
-        if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
-            let file = durable_fs::open_or_create(Path::new(&backup_path), false)?;
-            Ok(Some(file))
         } else {
             Ok(None)
         }
@@ -467,6 +435,56 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn final_backup_publication_is_sealed_behind_staging() {
+        let source = include_str!("file_manager.rs");
+        let production_source = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production_source, _)| production_source)
+            .expect("file_manager.rs should contain its private test module");
+
+        for forbidden_api in [
+            "pub fn create_backup_file(",
+            "pub fn open_or_create_backup_writer(",
+        ] {
+            assert!(
+                !production_source.contains(forbidden_api),
+                "final backups must not expose direct writer API `{forbidden_api}`"
+            );
+        }
+
+        for forbidden_writer in [
+            "durable_fs::open_or_create(Path::new(&backup_path)",
+            "File::create(",
+            "OpenOptions::new(",
+            "fs::write(",
+            "std::fs::write(",
+        ] {
+            assert!(
+                !production_source.contains(forbidden_writer),
+                "final backups must not have a direct writer path containing `{forbidden_writer}`"
+            );
+        }
+
+        assert_eq!(
+            production_source
+                .matches("durable_fs::open_or_create(")
+                .count(),
+            2,
+            "file creation must remain limited to the WAL and ignored backup staging paths"
+        );
+        for staged_publication_step in [
+            "durable_fs::open_or_create(&staging_path, true)?",
+            "durable_fs::sync_file(&file, &staging_path)?",
+            "durable_fs::rename(&staging_path, &final_path)",
+        ] {
+            assert!(
+                production_source.contains(staged_publication_step),
+                "atomic backup publication must retain `{staged_publication_step}`"
+            );
+        }
+    }
 
     #[test]
     fn new_wal_publication_syncs_directory_once_and_existing_fast_path_does_not_resync() {
