@@ -545,3 +545,130 @@ The remaining final-text gates passed:
 
 The 11 unrelated B-tree/range-service worktree modifications remained
 untouched and excluded from staging throughout Round 2.
+
+## Review Fixes Round 3
+
+### Restartable durable dispatch intent
+
+Startup recovery now distinguishes coordinator ownership before resolving
+participant undo. A foreign coordinator's targeted decision is still read
+without mutation and remains fail-closed for `InProgress`, `Unknown`, missing
+membership, and RPC failure. For a local coordinator only, startup may promote
+an exact durable `Decided(InProgress)` dispatch intent to final Abort.
+
+Promotion holds the undo-log writer lock, finishes any pending publication,
+and rechecks canonical status while serialized against decision appends and
+compaction. Existing Commit, Abort, and retained Completed records are returned
+unchanged. An `InProgress` intent is appended as Abort with the exact original
+participant set, flushed, and synchronously persisted through the active
+generation's exact path before canonical state is updated. Thus participant
+compensation cannot observe Abort before its decision is durable.
+
+The real startup-order RED
+`startup_promotes_local_dispatch_intent_to_abort_before_recovery_compensation`
+created a server with no TransactionManager, installed participant output and
+undo, destroyed the original runtime, and restarted through normal recovery.
+Before the fix it failed with the local intent still `InProgress` and a
+`CannotRecoverStorage` error (1 failed, 838 filtered; 17.48s). GREEN proves
+durable Abort precedes local compensation, owner release, manager construction,
+canonical cleanup, and persistent `Completed(Abort)`.
+
+### Sync failure, distributed cleanup, and crash tails
+
+The two-server
+`startup_sync_failure_preserves_distributed_dispatch_intent_for_retry`
+fixture has no original coordinator manager. It durably records the exact
+local/remote participant set, installs pending local and remote output, drops
+the coordinator runtime, and keeps the remote participant live. The first
+semantic RED showed that `fail_next_file_sync_for_test` was not consumed
+because promotion called `sync_data` directly: startup unexpectedly succeeded
+and the test failed at the required sync-failure boundary (1 failed,
+842 filtered; 18.62s). Promotion now uses the common durability wrapper with
+the exact active log path. The fixture verifies the injected error and path,
+remote owner and `SnapshotRead::Wait` preservation, exact reopen state, later
+local compensation, remote Abort/end by the newly constructed manager, and
+durable exact-set `Completed(Abort)`.
+
+The first crash image discarded all unsynced Abort bytes and passed in 29.84s.
+A fresh audit identified two additional legal post-error images:
+
+- a complete flushed but uncertified Abort could be readable on process
+  restart and used for compensation without any successful sync;
+- a partially persisted Abort tail caused `UnexpectedEof`, permanently
+  preventing the required retry.
+
+The deterministic partial-tail RED retained the exact newest Abort record
+minus its last byte and failed reopen with
+`UnexpectedEof("incomplete coordinator abort participants")` (1 failed,
+842 filtered; 13.50s). Startup canonical scanning now records a repair only
+for an incomplete final record in the newest non-snapshot generation. Before
+exposing the rebuilt canonical state, startup truncates to the last valid
+offset when required and synchronously persists the newest generation.
+Complete readable newest records are also re-synced before recovery trusts
+them. Any stabilization sync failure stops startup and remains retryable.
+Older incomplete generations, incomplete compaction snapshots, invalid entry
+types, and complete malformed payloads remain fatal.
+
+The partial-tail distributed E2E passed 1/1 in 24.83s. The focused startup
+group passed 9/9 in 52.46s and includes:
+
+- newest-only incomplete-record repair with durable reopen;
+- older-tail, incomplete-snapshot, and complete-corruption rejection;
+- complete recovered decision re-sync failure and retry;
+- tail-repair sync failure and retry;
+- final-decision non-downgrade and both restart E2Es.
+
+The distributed fixture uses isolated local ports 5522/5523. All correctness
+testing remained local; the benchmark-only remote host was not used.
+
+### Startup-boundary test corrections
+
+Canonical startup indexing made two older server tests invalid because they
+mutated the undo path after `UndoLogger::new` and expected `recover()` to
+rescan it. The tests now inject at the real production boundary:
+
+- a complete malformed record with a valid HLC frame exists before canonical
+  index construction and fails with its path and offset before continuation or
+  recovery floors;
+- a regular file occupies the configured undo-directory path before
+  `UndoLogger::new`, producing a path-rich discovery failure before the
+  ordered recovery barrier, floors, or background workers.
+
+Both exact tests passed 1/1. The final local `startup_` filter passed 27/27,
+0 failed, 820 filtered in 69.73s.
+
+### Focused audit and serial verification
+
+The recovered original 35-case focused aggregate plus seven final-text
+sync/tail/startup cases passed 42/42, 0 failed in 367s, one test process at a
+time. A fresh integrated read-only audit first found the sync-boundary and
+remote-fixture evidence gaps, then the full-unsynced and partial-tail crash
+cases. After the fixes and negative tests, its final verdict was APPROVED:
+0 Critical, 0 Important, and 0 Minor findings.
+
+All final gates ran locally, strictly serially, with no overlap:
+
+- `cargo test --lib server::transactions::undo_log -- --test-threads=1`:
+  76 passed, 0 failed, 771 filtered in 82.16s.
+- `cargo test --lib server::transactions::manager -- --test-threads=1`:
+  38 passed, 0 failed, 809 filtered in 321.77s.
+- `cargo test --lib server::transactions::data_site -- --test-threads=1`:
+  78 passed, 0 failed, 769 filtered in 807.68s.
+- `cargo test --lib server::transactions::occ_tests -- --test-threads=1`:
+  49 passed, 0 failed, 798 filtered in 594.58s.
+- `cargo test --lib ram::recovery -- --test-threads=1`:
+  41 passed, 0 failed, 2 ignored, 804 filtered in 3.87s.
+- `cargo test --lib server::transactions::tests -- --test-threads=1`:
+  5 passed, 0 failed, 842 filtered in 5.08s.
+- `cargo test --lib server::tests::durable_ -- --test-threads=1`:
+  2 passed, 0 failed, 845 filtered in 2.01s.
+- `cargo test --lib --features occ_phase_profile server::transactions::phase_profile::tests -- --test-threads=1`:
+  5 passed, 0 failed, 849 filtered in 0.00s after a 10.69s feature build.
+- `cargo test --lib ram::cell::tests::revision_header_is_exactly_32_bytes -- --exact --test-threads=1`:
+  1 passed, 0 failed, 846 filtered in 0.00s.
+- `cargo check --lib`: passed in 1.39s with existing repository warnings.
+- Scoped rustfmt check over `server/mod.rs` and
+  `server/transactions/undo_log.rs`, plus scoped `git diff --check`: passed.
+
+The 11 unrelated B-tree/range-service worktree modifications remained
+untouched throughout Round 3 and are excluded from the scoped commit.

@@ -8,7 +8,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -313,6 +313,7 @@ impl CanonicalLogState {
 struct CanonicalLogScan {
     state: CanonicalLogState,
     highest_barrier: Option<(u64, u64)>,
+    newest_tail_repair: Option<(PathBuf, u64)>,
 }
 
 fn collect_undo_log_paths<I>(log_dir_path: &Path, entries: I) -> io::Result<Vec<(u64, PathBuf)>>
@@ -978,13 +979,21 @@ impl UndoLogEntry {
 fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<CanonicalLogScan> {
     let mut state = CanonicalLogState::default();
     let mut highest_barrier = None;
-    for (seq, path) in log_files {
+    let mut newest_tail_repair = None;
+    for (file_index, (seq, path)) in log_files.iter().enumerate() {
+        let is_newest_generation = file_index + 1 == log_files.len();
         let mut buffer = Vec::new();
         File::open(path)?.read_to_end(&mut buffer)?;
         let mut offset = 0;
         let mut saw_snapshot = false;
-        while offset < buffer.len() {
+        'records: while offset < buffer.len() {
             if buffer.len() < offset + 5 {
+                if is_newest_generation
+                    && buffer.get(offset).copied() != Some(ENTRY_TYPE_COMPACTION_SNAPSHOT)
+                {
+                    newest_tail_repair = Some((path.clone(), offset as u64));
+                    break;
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!(
@@ -1002,6 +1011,10 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                 buffer[offset + 4],
             ]) as usize;
             if buffer.len() < offset + 5 + txn_id_len {
+                if is_newest_generation && entry_type != ENTRY_TYPE_COMPACTION_SNAPSHOT {
+                    newest_tail_repair = Some((path.clone(), offset as u64));
+                    break;
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!(
@@ -1053,9 +1066,25 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
             }
 
             let txn_id = decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])?;
+            macro_rules! decode_active_record {
+                ($decode:expr) => {
+                    match $decode {
+                        Ok(record) => record,
+                        Err(error)
+                            if is_newest_generation
+                                && error.kind() == io::ErrorKind::UnexpectedEof =>
+                        {
+                            newest_tail_repair = Some((path.clone(), offset as u64));
+                            break 'records;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+            }
             match entry_type {
                 ENTRY_TYPE_UNDO => {
-                    let (entry, size) = UndoLogEntry::from_bytes(&buffer[offset..])?;
+                    let (entry, size) =
+                        decode_active_record!(UndoLogEntry::from_bytes(&buffer[offset..]));
                     let record_bytes = buffer[offset..offset + size].to_vec();
                     // Preserve chronological restart semantics even if a
                     // transaction identifier is reused: a later undo record
@@ -1091,8 +1120,9 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                     offset += 5 + txn_id_len;
                 }
                 ENTRY_TYPE_COORDINATOR_COMMIT => {
-                    let (commit_hlc, participants, size) =
-                        coordinator_commit_record_size(&buffer, offset, txn_id_len)?;
+                    let (commit_hlc, participants, size) = decode_active_record!(
+                        coordinator_commit_record_size(&buffer, offset, txn_id_len)
+                    );
                     if !matches!(
                         state.coordinator_status.get(&txn_id),
                         Some(CoordinatorStatus::Completed(_))
@@ -1108,8 +1138,9 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                     offset += size;
                 }
                 ENTRY_TYPE_COORDINATOR_ABORT => {
-                    let (participants, size) =
-                        coordinator_abort_record_size(&buffer, offset, txn_id_len)?;
+                    let (participants, size) = decode_active_record!(
+                        coordinator_abort_record_size(&buffer, offset, txn_id_len)
+                    );
                     if !matches!(
                         state.coordinator_status.get(&txn_id),
                         Some(CoordinatorStatus::Completed(_))
@@ -1125,8 +1156,9 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                     offset += size;
                 }
                 ENTRY_TYPE_COORDINATOR_DISPATCH_INTENT => {
-                    let (record, size): (CoordinatorDecisionRecord, _) =
-                        decode_json_payload_record(&buffer, offset, txn_id_len)?;
+                    let (record, size): (CoordinatorDecisionRecord, _) = decode_active_record!(
+                        decode_json_payload_record(&buffer, offset, txn_id_len)
+                    );
                     if record.resolution != TxnResolution::InProgress {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -1144,8 +1176,9 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                     offset += size;
                 }
                 ENTRY_TYPE_COORDINATOR_COMPLETION => {
-                    let (record, size): (CoordinatorCompletionRecord, _) =
-                        decode_json_payload_record(&buffer, offset, txn_id_len)?;
+                    let (record, size): (CoordinatorCompletionRecord, _) = decode_active_record!(
+                        decode_json_payload_record(&buffer, offset, txn_id_len)
+                    );
                     validate_final_resolution(record.resolution)?;
                     if !record.retired_participants.is_subset(&record.participants)
                         || !record
@@ -1163,8 +1196,9 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                     offset += size;
                 }
                 ENTRY_TYPE_PARTICIPANT_RETIREMENT => {
-                    let (record, size): (ParticipantRetirementRecord, _) =
-                        decode_json_payload_record(&buffer, offset, txn_id_len)?;
+                    let (record, size): (ParticipantRetirementRecord, _) = decode_active_record!(
+                        decode_json_payload_record(&buffer, offset, txn_id_len)
+                    );
                     validate_participant_outcome(record.outcome)?;
                     state.participant_undo.remove(&txn_id);
                     state.participant_undo_records.remove(&txn_id);
@@ -1190,6 +1224,7 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
     Ok(CanonicalLogScan {
         state,
         highest_barrier,
+        newest_tail_repair,
     })
 }
 
@@ -1287,6 +1322,22 @@ impl UndoLogger {
             std::fs::read_dir(log_dir_path)?.map(|entry| entry.map(|entry| entry.path())),
         )?;
         let scan = read_canonical_log_state(&existing_logs)?;
+        if let Some((_, newest_path)) = existing_logs.last() {
+            let newest_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(newest_path)?;
+            if let Some((repair_path, valid_len)) = scan.newest_tail_repair.as_ref() {
+                debug_assert_eq!(repair_path, newest_path);
+                newest_file.set_len(*valid_len)?;
+            }
+            // A prior process may have returned an error after flushing but
+            // before syncing its final record. Make every complete record
+            // still visible after restart durable before recovery can trust
+            // it, and durably publish any newest-tail repair for later
+            // restarts.
+            durable_fs::sync_file(&newest_file, newest_path)?;
+        }
         let mut pending_cleanup_through = None;
         if let Some((_snapshot_seq, covered_through_seq)) = scan.highest_barrier {
             for (seq, path) in &existing_logs {
@@ -1670,6 +1721,88 @@ impl UndoLogger {
             },
         );
         Ok(())
+    }
+
+    /// During startup, turn this server's exact pre-dispatch intent into the
+    /// final Abort decision that makes participant compensation safe.
+    ///
+    /// The writer lock serializes the status recheck with every decision
+    /// append and compaction. Canonical state remains InProgress until the
+    /// Abort record is fully synced, so a failed promotion cannot expose Abort
+    /// to recovery or overwrite a concurrently durable final decision.
+    pub(crate) fn promote_local_dispatch_intent_to_abort(
+        &self,
+        txn_id: &TxnId,
+    ) -> io::Result<Option<CoordinatorDecisionRecord>> {
+        let mut log_file_guard = self.log_file.lock();
+        self.finish_pending_publication()?;
+        let status = self
+            .canonical_state
+            .lock()
+            .coordinator_status
+            .get(txn_id)
+            .cloned();
+        let Some(status) = status else {
+            return Ok(None);
+        };
+        let CoordinatorStatus::Decided(record) = status else {
+            return Ok(match status {
+                CoordinatorStatus::Completed(record)
+                    if bifrost::utils::time::get_time() < record.expires_at_ms =>
+                {
+                    Some(CoordinatorDecisionRecord {
+                        resolution: record.resolution,
+                        participants: record.participants,
+                    })
+                }
+                CoordinatorStatus::Completed(_) => None,
+                CoordinatorStatus::Decided(_) => unreachable!(),
+            });
+        };
+        if record.resolution != TxnResolution::InProgress {
+            return Ok(Some(record));
+        }
+
+        #[cfg(test)]
+        if self
+            .fail_next_coordinator_abort_decision
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected coordinator abort decision failure",
+            ));
+        }
+        let abort = CoordinatorDecisionRecord {
+            resolution: TxnResolution::Abort,
+            participants: record.participants,
+        };
+        let bytes = encode_coordinator_decision_record(txn_id, &abort)?;
+        let writer = log_file_guard
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Log file not initialized"))?;
+        let active_path =
+            self.log_file_name.lock().clone().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "Log file path not initialized")
+            })?;
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+        durable_fs::sync_file(writer.get_ref(), Path::new(&active_path))?;
+        self.canonical_state
+            .lock()
+            .apply_coordinator_decision(*txn_id, abort.clone());
+        Ok(Some(abort))
+    }
+
+    pub(crate) fn coordinator_recovery_decision(
+        &self,
+        txn_id: &TxnId,
+        local_server_id: u64,
+    ) -> io::Result<Option<CoordinatorDecisionRecord>> {
+        if txn_id.node != local_server_id {
+            return self.coordinator_decision_record(txn_id);
+        }
+        self.promote_local_dispatch_intent_to_abort(txn_id)
     }
 
     fn write_synced_record<F>(&self, bytes: &[u8], update: F) -> io::Result<()>
@@ -2864,6 +2997,372 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "completion must physically remove canonical Abort cleanup work"
+        );
+    }
+
+    #[test]
+    fn failed_startup_intent_promotion_preserves_output_undo_and_retryability() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let (schema, chunks) = compensation_test_chunks("failed_startup_intent_promotion");
+        let tid = test_hlc(300, 81);
+        let cell_id = Id::new(0, 708);
+        let mut installed = OwnedCell::new_with_id(
+            schema.id,
+            &cell_id,
+            data_map_value!(id: 1i32, value: "pending-local-intent".to_string()),
+        );
+        let installed_revision_ts = chunks.write_cell(&mut installed).unwrap().revision_ts;
+
+        {
+            let undo =
+                UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
+            undo.write_coordinator_dispatch_intent(&tid, &[81, 82])
+                .unwrap();
+            undo.write_undo_entry(UndoLogEntry::new_write(tid, cell_id, installed_revision_ts))
+                .unwrap();
+            undo.fail_next_coordinator_abort_decision_for_test();
+
+            assert!(
+                undo.promote_local_dispatch_intent_to_abort(&tid).is_err(),
+                "a failed decision sync must stop before compensation"
+            );
+            assert_eq!(
+                undo.coordinator_status(&tid).unwrap(),
+                Some(CoordinatorStatus::Decided(CoordinatorDecisionRecord {
+                    resolution: TxnResolution::InProgress,
+                    participants: BTreeSet::from([81, 82]),
+                }))
+            );
+            assert!(undo.recover().unwrap().contains_key(&tid));
+            assert_eq!(
+                chunks.read_cell(&cell_id).unwrap().header.revision_ts,
+                installed_revision_ts
+            );
+        }
+
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("reopened undo logger");
+        assert_eq!(
+            reopened.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(CoordinatorDecisionRecord {
+                resolution: TxnResolution::InProgress,
+                participants: BTreeSet::from([81, 82]),
+            })),
+            "a later restart must retry the exact durable intent"
+        );
+        assert_eq!(
+            reopened
+                .promote_local_dispatch_intent_to_abort(&tid)
+                .unwrap(),
+            Some(CoordinatorDecisionRecord {
+                resolution: TxnResolution::Abort,
+                participants: BTreeSet::from([81, 82]),
+            })
+        );
+        let unresolved = reopened
+            .resolve_recovered_transactions(
+                reopened.recover().unwrap(),
+                &HashMap::from([(tid, TxnResolution::Abort)]),
+            )
+            .unwrap();
+        reopened
+            .rollback_incomplete_transactions(unresolved, &chunks)
+            .unwrap();
+        assert!(chunks.read_cell(&cell_id).is_err());
+        assert!(!reopened.recover().unwrap().contains_key(&tid));
+        drop(reopened);
+
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("reopened undo logger");
+        assert_eq!(
+            reopened.coordinator_decision(&tid).unwrap(),
+            Some(TxnResolution::Abort),
+            "the retry must durably supersede the older InProgress record"
+        );
+    }
+
+    #[test]
+    fn startup_repairs_only_the_newest_incomplete_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+        let tid = test_hlc(304, 81);
+        let intent = CoordinatorDecisionRecord {
+            resolution: TxnResolution::InProgress,
+            participants: BTreeSet::from([81, 82]),
+        };
+        let abort = CoordinatorDecisionRecord {
+            resolution: TxnResolution::Abort,
+            participants: intent.participants.clone(),
+        };
+        std::fs::write(
+            log_dir.join("undo-0.nlog"),
+            encode_coordinator_decision_record(&tid, &intent).unwrap(),
+        )
+        .unwrap();
+        let abort_bytes = encode_coordinator_decision_record(&tid, &abort).unwrap();
+        std::fs::write(
+            log_dir.join("undo-1.nlog"),
+            &abort_bytes[..abort_bytes.len() - 1],
+        )
+        .unwrap();
+
+        let recovered =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("repairable tail");
+        assert_eq!(
+            recovered.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(intent.clone()))
+        );
+        assert_eq!(
+            std::fs::metadata(log_dir.join("undo-1.nlog"))
+                .unwrap()
+                .len(),
+            0,
+            "startup must durably discard only the incomplete newest record"
+        );
+        drop(recovered);
+
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("repaired reopen");
+        assert_eq!(
+            reopened.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(intent))
+        );
+    }
+
+    #[test]
+    fn startup_rejects_an_older_incomplete_record_and_complete_corruption() {
+        let older_tail_dir = TempDir::new().unwrap();
+        let tid = test_hlc(305, 81);
+        let intent = CoordinatorDecisionRecord {
+            resolution: TxnResolution::InProgress,
+            participants: BTreeSet::from([81, 82]),
+        };
+        std::fs::write(
+            older_tail_dir.path().join("undo-0.nlog"),
+            encode_coordinator_decision_record(&tid, &intent).unwrap(),
+        )
+        .unwrap();
+        let abort_bytes = encode_coordinator_decision_record(
+            &tid,
+            &CoordinatorDecisionRecord {
+                resolution: TxnResolution::Abort,
+                participants: intent.participants.clone(),
+            },
+        )
+        .unwrap();
+        std::fs::write(
+            older_tail_dir.path().join("undo-1.nlog"),
+            &abort_bytes[..abort_bytes.len() - 1],
+        )
+        .unwrap();
+        std::fs::write(older_tail_dir.path().join("undo-2.nlog"), []).unwrap();
+        let older_error =
+            match UndoLogger::new(older_tail_dir.path().to_string_lossy().into_owned()) {
+                Ok(_) => panic!("an older incomplete generation must remain fatal"),
+                Err(error) => error,
+            };
+        assert_eq!(older_error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let corrupt_dir = TempDir::new().unwrap();
+        std::fs::write(
+            corrupt_dir.path().join("undo-0.nlog"),
+            encode_coordinator_decision_record(&tid, &intent).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            corrupt_dir.path().join("undo-1.nlog"),
+            [u8::MAX, 0, 0, 0, 0],
+        )
+        .unwrap();
+        let corrupt_error = match UndoLogger::new(corrupt_dir.path().to_string_lossy().into_owned())
+        {
+            Ok(_) => panic!("complete newest-generation corruption must remain fatal"),
+            Err(error) => error,
+        };
+        assert_eq!(corrupt_error.kind(), io::ErrorKind::InvalidData);
+
+        let partial_snapshot_dir = TempDir::new().unwrap();
+        let snapshot = encode_compaction_snapshot_record(0);
+        std::fs::write(
+            partial_snapshot_dir.path().join("undo-1.nlog"),
+            &snapshot[..snapshot.len() - 1],
+        )
+        .unwrap();
+        let snapshot_error =
+            match UndoLogger::new(partial_snapshot_dir.path().to_string_lossy().into_owned()) {
+                Ok(_) => panic!("an incomplete compaction snapshot must remain fatal"),
+                Err(error) => error,
+            };
+        assert_eq!(snapshot_error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn startup_syncs_a_recovered_complete_decision_before_exposing_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+        let tid = test_hlc(306, 81);
+        let intent = CoordinatorDecisionRecord {
+            resolution: TxnResolution::InProgress,
+            participants: BTreeSet::from([81, 82]),
+        };
+        let abort = CoordinatorDecisionRecord {
+            resolution: TxnResolution::Abort,
+            participants: intent.participants.clone(),
+        };
+        std::fs::write(
+            log_dir.join("undo-0.nlog"),
+            encode_coordinator_decision_record(&tid, &intent).unwrap(),
+        )
+        .unwrap();
+        let newest_path = log_dir.join("undo-1.nlog");
+        std::fs::write(
+            &newest_path,
+            encode_coordinator_decision_record(&tid, &abort).unwrap(),
+        )
+        .unwrap();
+        fail_next_file_sync_for_test(&newest_path);
+
+        let error = match UndoLogger::new(log_dir.to_string_lossy().into_owned()) {
+            Ok(_) => panic!("an unsynced recovered final decision must not be exposed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("injected file sync failure"),
+            "{error}"
+        );
+
+        let retried = UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("sync retry");
+        assert_eq!(
+            retried.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(abort))
+        );
+    }
+
+    #[test]
+    fn startup_tail_repair_sync_failure_is_retryable() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+        let tid = test_hlc(307, 81);
+        let intent = CoordinatorDecisionRecord {
+            resolution: TxnResolution::InProgress,
+            participants: BTreeSet::from([81, 82]),
+        };
+        std::fs::write(
+            log_dir.join("undo-0.nlog"),
+            encode_coordinator_decision_record(&tid, &intent).unwrap(),
+        )
+        .unwrap();
+        let abort_bytes = encode_coordinator_decision_record(
+            &tid,
+            &CoordinatorDecisionRecord {
+                resolution: TxnResolution::Abort,
+                participants: intent.participants.clone(),
+            },
+        )
+        .unwrap();
+        let newest_path = log_dir.join("undo-1.nlog");
+        std::fs::write(&newest_path, &abort_bytes[..abort_bytes.len() - 1]).unwrap();
+        fail_next_file_sync_for_test(&newest_path);
+
+        let error = match UndoLogger::new(log_dir.to_string_lossy().into_owned()) {
+            Ok(_) => panic!("a failed tail-repair sync must stop startup"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("injected file sync failure"),
+            "{error}"
+        );
+
+        let retried =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("repair sync retry");
+        assert_eq!(
+            retried.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(intent))
+        );
+    }
+
+    #[test]
+    fn startup_intent_promotion_never_downgrades_a_final_decision() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let commit_tid = test_hlc(301, 81);
+        let commit_hlc = test_hlc(401, 81);
+        let abort_tid = test_hlc(302, 81);
+        let undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
+
+        undo.write_coordinator_dispatch_intent(&commit_tid, &[81, 82])
+            .unwrap();
+        undo.write_coordinator_commit_decision(&commit_tid, commit_hlc, &[81, 82])
+            .unwrap();
+        assert_eq!(
+            undo.promote_local_dispatch_intent_to_abort(&commit_tid)
+                .unwrap(),
+            Some(CoordinatorDecisionRecord {
+                resolution: TxnResolution::Commit(commit_hlc),
+                participants: BTreeSet::from([81, 82]),
+            })
+        );
+
+        undo.write_coordinator_dispatch_intent(&abort_tid, &[81, 83])
+            .unwrap();
+        undo.write_coordinator_abort_decision(&abort_tid, &[81, 83])
+            .unwrap();
+        assert_eq!(
+            undo.promote_local_dispatch_intent_to_abort(&abort_tid)
+                .unwrap(),
+            Some(CoordinatorDecisionRecord {
+                resolution: TxnResolution::Abort,
+                participants: BTreeSet::from([81, 83]),
+            })
+        );
+        drop(undo);
+
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("reopened undo logger");
+        assert_eq!(
+            reopened.coordinator_decision(&commit_tid).unwrap(),
+            Some(TxnResolution::Commit(commit_hlc))
+        );
+        assert_eq!(
+            reopened.coordinator_decision(&abort_tid).unwrap(),
+            Some(TxnResolution::Abort)
+        );
+    }
+
+    #[test]
+    fn foreign_dispatch_intent_remains_inprogress_during_local_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let local_server_id = 81;
+        let foreign_tid = test_hlc(303, 82);
+        let undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
+        undo.write_coordinator_dispatch_intent(&foreign_tid, &[81, 82])
+            .unwrap();
+
+        assert_eq!(
+            undo.coordinator_recovery_decision(&foreign_tid, local_server_id)
+                .unwrap(),
+            Some(CoordinatorDecisionRecord {
+                resolution: TxnResolution::InProgress,
+                participants: BTreeSet::from([81, 82]),
+            })
+        );
+        assert_eq!(
+            undo.coordinator_status(&foreign_tid).unwrap(),
+            Some(CoordinatorStatus::Decided(CoordinatorDecisionRecord {
+                resolution: TxnResolution::InProgress,
+                participants: BTreeSet::from([81, 82]),
+            })),
+            "recovery must never infer Abort for a foreign coordinator"
+        );
+        drop(undo);
+
+        let reopened =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("reopened undo logger");
+        assert_eq!(
+            reopened.coordinator_decision(&foreign_tid).unwrap(),
+            Some(TxnResolution::InProgress)
         );
     }
 
@@ -6073,6 +6572,580 @@ mod tests {
             &original_name,
             "Uncommitted remove should be rolled back and cell restored"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_promotes_local_dispatch_intent_to_abort_before_recovery_compensation() {
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::tests::default_fields;
+        use crate::server::transactions;
+        use crate::server::{NebServer, ServerOptions, Service};
+        use tempfile::TempDir;
+        use tokio::time::{sleep, timeout, Duration};
+
+        let temp_dir = TempDir::new().unwrap();
+        let undo_log_path = temp_dir.path().join("undo");
+        let backup_path = temp_dir.path().join("backup");
+        let wal_path = temp_dir.path().join("wal");
+        let raft_path = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_path).unwrap();
+        let server_addr = String::from("127.0.0.1:5321");
+        let group_name = "startup_promotes_local_dispatch_intent";
+        let options = |enable_recovery, services| ServerOptions {
+            chunk_size: SEGMENT_SIZE * 4,
+            db_size: SEGMENT_SIZE * 4,
+            history_retention_ms: 300_000,
+            tiered_config: None,
+            backup_storage: Some(backup_path.to_string_lossy().into_owned()),
+            wal_storage: Some(wal_path.to_string_lossy().into_owned()),
+            index_enabled: false,
+            services,
+            enable_recovery,
+            disable_storage_locks: true,
+            undo_log_storage: Some(undo_log_path.to_string_lossy().into_owned()),
+            raft_storage: Some(raft_path.to_string_lossy().into_owned()),
+        };
+
+        let server = NebServer::new_from_opts(
+            &options(false, vec![]),
+            &server_addr,
+            group_name,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let server_id = server.server_id;
+        let schema = crate::ram::schema::Schema::new_with_id(
+            1,
+            &String::from("startup_dispatch_intent"),
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        server.meta().schemas.debug_only_new_schema(schema.clone());
+        let original_runtime = server.current_database();
+        let participant =
+            transactions::data_site::DataManager::new(original_runtime.clone(), server.hlc.clone());
+        let participant_weak = Arc::downgrade(&participant);
+        let tid = server.hlc.try_now().unwrap();
+        let cell = OwnedCell::new_with_id(
+            schema.id,
+            &random_id(),
+            data_map_value!(
+                id: 5321i64,
+                name: "installed-before-crash".to_string(),
+                score: 1u64
+            ),
+        );
+        let cell_id = cell.id();
+        let original_runtime_weak = Arc::downgrade(&original_runtime);
+        let original_undo = original_runtime.undo_log().unwrap().clone();
+        original_undo
+            .write_coordinator_dispatch_intent(&tid, &[server_id])
+            .unwrap();
+        assert_eq!(
+            <transactions::data_site::DataManager as transactions::data_site::Service>::prepare(
+                &participant,
+                server_id,
+                tid,
+                tid,
+                vec![super::super::PrepareOp {
+                    id: cell_id,
+                    expectation: super::super::CellExpectation::Absent(None),
+                    intent: super::super::PrepareIntent::Write,
+                }],
+            )
+            .await
+            .payload,
+            super::super::DMPrepareResult::Success
+        );
+        assert_eq!(
+            <transactions::data_site::DataManager as transactions::data_site::Service>::commit(
+                &participant,
+                server.hlc.try_now().unwrap(),
+                tid,
+                vec![super::super::CommitOp::Write(cell)],
+            )
+            .await
+            .payload,
+            super::super::DMCommitResult::Success
+        );
+
+        assert_eq!(
+            original_undo.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(CoordinatorDecisionRecord {
+                resolution: TxnResolution::InProgress,
+                participants: BTreeSet::from([server_id]),
+            }))
+        );
+        assert!(original_undo.recover().unwrap().contains_key(&tid));
+        assert!(
+            transactions::data_site::participant_owner_for_test(
+                server_id, group_name, group_name, &cell_id,
+            )
+            .is_some(),
+            "the installed participant output must still be owned before the crash"
+        );
+
+        server.shutdown().await;
+        drop(participant);
+        drop(original_runtime);
+        drop(server);
+        drop(original_undo);
+        timeout(Duration::from_secs(2), async {
+            while participant_weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original participant and all of its workers must be destroyed");
+        assert!(
+            original_runtime_weak.upgrade().is_none(),
+            "the original storage runtime must be destroyed after its participant is gone"
+        );
+
+        let restarted = NebServer::new_from_opts(
+            &options(true, vec![Service::Cell, Service::Transaction]),
+            &server_addr,
+            group_name,
+            async |_| {},
+        )
+        .await
+        .expect("startup recovery must not loop forever on a local durable dispatch intent");
+        restarted
+            .meta()
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        assert!(
+            restarted.chunks().read_cell(&cell_id).is_err(),
+            "startup must compensate the installed output after durably deciding Abort"
+        );
+        assert!(
+            !restarted
+                .current_database()
+                .undo_log()
+                .unwrap()
+                .recover()
+                .unwrap()
+                .contains_key(&tid),
+            "participant recovery must durably complete local undo"
+        );
+        assert_eq!(
+            transactions::data_site::participant_owner_for_test(
+                server_id, group_name, group_name, &cell_id,
+            ),
+            None,
+            "the recovered participant must not retain the crashed owner"
+        );
+
+        let restarted_undo = restarted.current_database().undo_log().unwrap().clone();
+        timeout(Duration::from_secs(15), async {
+            loop {
+                if matches!(
+                    restarted_undo.coordinator_status(&tid).unwrap(),
+                    Some(CoordinatorStatus::Completed(ref record))
+                        if record.resolution == TxnResolution::Abort
+                            && record.participants == BTreeSet::from([server_id])
+                ) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the restarted manager must finish canonical participant cleanup");
+        restarted.shutdown().await;
+        drop(restarted_undo);
+        drop(restarted);
+
+        let completed =
+            UndoLogger::new(undo_log_path.to_string_lossy().into_owned()).expect("completed log");
+        assert!(
+            matches!(
+                completed.coordinator_status(&tid).unwrap(),
+                Some(CoordinatorStatus::Completed(ref record))
+                    if record.resolution == TxnResolution::Abort
+                        && record.participants == BTreeSet::from([server_id])
+            ),
+            "reopen must retain Completed(Abort) and mask the older InProgress intent"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_sync_failure_preserves_distributed_dispatch_intent_for_retry() {
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::tests::default_fields;
+        use crate::server::transactions;
+        use crate::server::{NebServer, ServerOptions, Service};
+        use bifrost::rpc::ServiceClient;
+        use tempfile::TempDir;
+        use tokio::time::{sleep, timeout, Duration};
+
+        let temp_dir = TempDir::new().unwrap();
+        let coordinator_root = temp_dir.path().join("coordinator");
+        let remote_root = temp_dir.path().join("remote");
+        let coordinator_undo = coordinator_root.join("undo");
+        let addresses = [
+            String::from("127.0.0.1:5522"),
+            String::from("127.0.0.1:5523"),
+        ];
+        let meta_servers = addresses.to_vec();
+        let group_name = "startup_distributed_dispatch_intent_sync_failure";
+        let options = |root: &Path,
+                       raft_root: &Path,
+                       enable_recovery: bool,
+                       services: Vec<Service>| ServerOptions {
+            chunk_size: SEGMENT_SIZE * 4,
+            db_size: SEGMENT_SIZE * 4,
+            history_retention_ms: 300_000,
+            tiered_config: None,
+            backup_storage: Some(root.join("backup").to_string_lossy().into_owned()),
+            wal_storage: Some(root.join("wal").to_string_lossy().into_owned()),
+            index_enabled: false,
+            services,
+            enable_recovery,
+            disable_storage_locks: true,
+            undo_log_storage: Some(root.join("undo").to_string_lossy().into_owned()),
+            raft_storage: Some(raft_root.to_string_lossy().into_owned()),
+        };
+
+        let remote = NebServer::new_cluster_from_opts(
+            &options(
+                &remote_root,
+                &remote_root.join("raft"),
+                false,
+                vec![Service::Cell, Service::Transaction],
+            ),
+            &addresses[0],
+            &meta_servers,
+            group_name,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let coordinator = NebServer::new_cluster_from_opts(
+            &options(
+                &coordinator_root,
+                &coordinator_root.join("raft-initial"),
+                false,
+                vec![],
+            ),
+            &addresses[1],
+            &meta_servers,
+            group_name,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let coordinator_id = coordinator.server_id;
+        let remote_id = remote.server_id;
+        assert_ne!(coordinator_id, remote_id);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let coordinator_sees_remote = coordinator
+                    .conshash()
+                    .to_server_name_option(Some(remote_id))
+                    .is_some();
+                let remote_sees_coordinator = remote
+                    .conshash()
+                    .to_server_name_option(Some(coordinator_id))
+                    .is_some();
+                if coordinator_sees_remote && remote_sees_coordinator {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both servers must observe the distributed membership");
+
+        let schema = crate::ram::schema::Schema::new_with_id(
+            1,
+            &String::from("distributed_dispatch_intent"),
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        coordinator
+            .meta()
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        remote.meta().schemas.debug_only_new_schema(schema.clone());
+        let coordinator_runtime = coordinator.current_database();
+        let coordinator_participant = transactions::data_site::DataManager::new(
+            coordinator_runtime.clone(),
+            coordinator.hlc.clone(),
+        );
+        let coordinator_participant_weak = Arc::downgrade(&coordinator_participant);
+        let coordinator_runtime_weak = Arc::downgrade(&coordinator_runtime);
+        let tid = coordinator.hlc.try_now().unwrap();
+        let local_id = Id::new(5523, 1);
+        let remote_cell_id = Id::new(5522, 1);
+        let local_cell = OwnedCell::new_with_id(
+            schema.id,
+            &local_id,
+            data_map_value!(
+                id: 5523i64,
+                name: "local-installed-before-crash".to_string(),
+                score: 1u64
+            ),
+        );
+        let remote_cell = OwnedCell::new_with_id(
+            schema.id,
+            &remote_cell_id,
+            data_map_value!(
+                id: 5522i64,
+                name: "remote-installed-before-crash".to_string(),
+                score: 2u64
+            ),
+        );
+        let original_undo = coordinator_runtime.undo_log().unwrap().clone();
+        original_undo
+            .write_coordinator_dispatch_intent(&tid, &[coordinator_id, remote_id])
+            .unwrap();
+        assert_eq!(
+            <transactions::data_site::DataManager as transactions::data_site::Service>::prepare(
+                &coordinator_participant,
+                coordinator_id,
+                tid,
+                tid,
+                vec![super::super::PrepareOp {
+                    id: local_id,
+                    expectation: super::super::CellExpectation::Absent(None),
+                    intent: super::super::PrepareIntent::Write,
+                }],
+            )
+            .await
+            .payload,
+            super::super::DMPrepareResult::Success
+        );
+        assert_eq!(
+            <transactions::data_site::DataManager as transactions::data_site::Service>::commit(
+                &coordinator_participant,
+                coordinator.hlc.try_now().unwrap(),
+                tid,
+                vec![super::super::CommitOp::Write(local_cell)],
+            )
+            .await
+            .payload,
+            super::super::DMCommitResult::Success
+        );
+
+        let remote_rpc = bifrost::rpc::DEFAULT_CLIENT_POOL
+            .get(&addresses[0])
+            .await
+            .unwrap();
+        let remote_participant = transactions::data_site::AsyncServiceClient::new_with_service_id(
+            transactions::data_site::generate_scoped_service_id(group_name, group_name),
+            &remote_rpc,
+        );
+        assert_eq!(
+            remote_participant
+                .prepare(
+                    coordinator_id,
+                    tid,
+                    tid,
+                    vec![super::super::PrepareOp {
+                        id: remote_cell_id,
+                        expectation: super::super::CellExpectation::Absent(None),
+                        intent: super::super::PrepareIntent::Write,
+                    }],
+                )
+                .await
+                .unwrap()
+                .payload,
+            super::super::DMPrepareResult::Success
+        );
+        assert_eq!(
+            remote_participant
+                .commit(
+                    coordinator.hlc.try_now().unwrap(),
+                    tid,
+                    vec![super::super::CommitOp::Write(remote_cell)],
+                )
+                .await
+                .unwrap()
+                .payload,
+            super::super::DMCommitResult::Success
+        );
+        let expected_owner = Some(super::super::TxnPriority::new(tid, coordinator_id));
+        assert_eq!(
+            transactions::data_site::participant_owner_for_test(
+                remote_id,
+                group_name,
+                group_name,
+                &remote_cell_id,
+            ),
+            expected_owner
+        );
+        assert!(matches!(
+            remote
+                .chunks()
+                .head_snapshot(&remote_cell_id, u64::MAX)
+                .unwrap(),
+            crate::ram::cell::SnapshotRead::Wait
+        ));
+        let failed_generation = coordinator_undo.join(format!(
+            "undo-{}.nlog",
+            original_undo.log_seq.load(Ordering::SeqCst)
+        ));
+
+        coordinator.shutdown().await;
+        drop(coordinator_participant);
+        drop(coordinator_runtime);
+        drop(coordinator);
+        drop(original_undo);
+        timeout(Duration::from_secs(2), async {
+            while coordinator_participant_weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original coordinator participant must be destroyed");
+        assert!(
+            coordinator_runtime_weak.upgrade().is_none(),
+            "the original coordinator runtime must be destroyed"
+        );
+
+        fail_next_file_sync_for_test(&failed_generation);
+        let failed_restart = NebServer::new_cluster_from_opts(
+            &options(
+                &coordinator_root,
+                &coordinator_root.join("raft-failed-restart"),
+                true,
+                vec![Service::Cell, Service::Transaction],
+            ),
+            &addresses[1],
+            &meta_servers,
+            group_name,
+            async |_| {},
+        )
+        .await;
+        let startup_error = match failed_restart {
+            Ok(unexpected_server) => {
+                unexpected_server.shutdown().await;
+                panic!("an injected Abort-decision sync failure must fail startup");
+            }
+            Err(error) => error,
+        };
+        let startup_error_message = startup_error.to_string();
+        assert!(
+            startup_error_message.contains("injected file sync failure")
+                && startup_error_message.contains(failed_generation.to_string_lossy().as_ref()),
+            "startup must fail at the injected Abort-decision sync boundary: \
+             {startup_error_message}"
+        );
+        assert_eq!(
+            transactions::data_site::participant_owner_for_test(
+                remote_id,
+                group_name,
+                group_name,
+                &remote_cell_id,
+            ),
+            expected_owner,
+            "failed startup must not release the remote participant owner"
+        );
+        assert!(matches!(
+            remote
+                .chunks()
+                .head_snapshot(&remote_cell_id, u64::MAX)
+                .unwrap(),
+            crate::ram::cell::SnapshotRead::Wait
+        ));
+
+        let failed_bytes = std::fs::read(&failed_generation).unwrap_or_else(|error| {
+            panic!(
+                "failed startup did not reach the expected promotion generation: \
+                 startup={startup_error:?}, file={error:?}"
+            )
+        });
+        assert!(
+            failed_bytes.len() > 1,
+            "the failed generation must contain the flushed Abort record"
+        );
+        let failed_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&failed_generation)
+            .unwrap();
+        failed_file
+            .set_len((failed_bytes.len() - 1) as u64)
+            .unwrap();
+        failed_file.sync_all().unwrap();
+        drop(failed_file);
+        let reopened = UndoLogger::new(coordinator_undo.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(
+            reopened.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Decided(CoordinatorDecisionRecord {
+                resolution: TxnResolution::InProgress,
+                participants: BTreeSet::from([coordinator_id, remote_id]),
+            })),
+            "after crash loss of the unsynced generation, reopen must retry the exact intent"
+        );
+        assert!(reopened.recover().unwrap().contains_key(&tid));
+        drop(reopened);
+
+        let restarted = NebServer::new_cluster_from_opts(
+            &options(
+                &coordinator_root,
+                &coordinator_root.join("raft-failed-restart"),
+                true,
+                vec![Service::Cell, Service::Transaction],
+            ),
+            &addresses[1],
+            &meta_servers,
+            group_name,
+            async |_| {},
+        )
+        .await
+        .expect("a later startup must durably promote and recover the intent");
+        restarted
+            .meta()
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        assert!(restarted.chunks().read_cell(&local_id).is_err());
+        let restarted_undo = restarted.current_database().undo_log().unwrap().clone();
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let remote_released = transactions::data_site::participant_owner_for_test(
+                    remote_id,
+                    group_name,
+                    group_name,
+                    &remote_cell_id,
+                )
+                .is_none();
+                let remote_compensated = remote.chunks().read_cell(&remote_cell_id).is_err();
+                let completed = matches!(
+                    restarted_undo.coordinator_status(&tid).unwrap(),
+                    Some(CoordinatorStatus::Completed(ref record))
+                        if record.resolution == TxnResolution::Abort
+                            && record.participants
+                                == BTreeSet::from([coordinator_id, remote_id])
+                );
+                if remote_released && remote_compensated && completed {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the restarted manager must rediscover and clean the exact remote participant");
+
+        restarted.shutdown().await;
+        remote.shutdown().await;
+        drop(remote_participant);
+        drop(restarted_undo);
+        drop(restarted);
+        drop(remote);
+
+        let completed = UndoLogger::new(coordinator_undo.to_string_lossy().into_owned()).unwrap();
+        assert!(matches!(
+            completed.coordinator_status(&tid).unwrap(),
+            Some(CoordinatorStatus::Completed(ref record))
+                if record.resolution == TxnResolution::Abort
+                    && record.participants == BTreeSet::from([coordinator_id, remote_id])
+        ));
     }
 
     /// E2E test: Committed transactions should not be rolled back

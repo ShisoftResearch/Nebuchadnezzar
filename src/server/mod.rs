@@ -953,30 +953,31 @@ mod startup_discovery_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn malformed_undo_record_fails_startup_before_the_floor() {
         let temp = tempfile::TempDir::new().expect("tempdir should be created");
-        let undo_log = UndoLogger::new(temp.path().to_string_lossy().into_owned())
-            .expect("undo log should be created");
-        std::fs::write(temp.path().join("undo-0.nlog"), [1_u8, 2, 3])
+        let txn_id = serde_json::to_vec(&bifrost::hlc::Hlc { ts: 1, node: 1 }).unwrap();
+        let mut malformed = vec![u8::MAX];
+        malformed.extend_from_slice(&(txn_id.len() as u32).to_le_bytes());
+        malformed.extend_from_slice(&txn_id);
+        std::fs::write(temp.path().join("undo-0.nlog"), malformed)
             .expect("malformed undo record should be written");
         let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
+        let continued = AtomicBool::new(false);
 
-        let result = initialize_recovered_storage(
-            &chunks,
-            RecoverySummary::default(),
-            false,
-            || {},
-            || {
-                undo_log
-                    .recover()
-                    .map_err(|error| super::ServerError::CannotRecoverStorage(error.to_string()))
-            },
-            || {},
-        )
+        let result: Result<(), super::ServerError> = async {
+            UndoLogger::new(temp.path().to_string_lossy().into_owned())
+                .map_err(|error| super::ServerError::CannotRecoverStorage(error.to_string()))?;
+            continued.store(true, Ordering::Release);
+            Ok(())
+        }
         .await;
 
         let error = result.expect_err("malformed undo recovery must fail startup");
         let message = error.to_string();
         assert!(message.contains("undo-0.nlog"), "{message}");
         assert!(message.contains("offset 0"), "{message}");
+        assert!(
+            !continued.load(Ordering::Acquire),
+            "startup must stop at canonical undo-log index construction"
+        );
         assert!(chunks
             .list
             .iter()
@@ -987,15 +988,19 @@ mod startup_discovery_tests {
     async fn undo_directory_failure_stops_the_ordered_startup_barrier() {
         let temp = tempfile::TempDir::new().expect("tempdir should be created");
         let log_dir = temp.path().join("undo");
-        let undo_log = UndoLogger::new(log_dir.to_string_lossy().into_owned())
-            .expect("undo log should be created");
-        std::fs::rename(&log_dir, temp.path().join("moved-undo"))
-            .expect("undo directory should be moved out of the recovery path");
+        std::fs::write(&log_dir, b"not a directory")
+            .expect("a non-directory undo path should be created");
         let chunks = Chunks::new_dummy(2, crate::ram::segs::SEGMENT_SIZE);
         let continued = AtomicBool::new(false);
         let index_worker_activated = AtomicBool::new(false);
 
         let result: Result<(), super::ServerError> = async {
+            let undo_log =
+                UndoLogger::new(log_dir.to_string_lossy().into_owned()).map_err(|error| {
+                    super::ServerError::CannotRecoverStorage(format!(
+                        "undo recovery failed: {error}"
+                    ))
+                })?;
             initialize_recovered_storage(
                 &chunks,
                 RecoverySummary::default(),
@@ -1303,13 +1308,11 @@ async fn resolve_incomplete_transaction_decisions(
     let mut resolutions = HashMap::with_capacity(txn_index.len());
     for tid in txn_index.keys() {
         let local_decision = undo_log
-            .coordinator_decision(tid)
+            .coordinator_recovery_decision(tid, local_server_id)
             .map_err(|error| ServerError::CannotRecoverStorage(error.to_string()))?;
-        let resolution = if let Some(decision) = local_decision {
-            decision
-        } else if tid.node == local_server_id {
-            transactions::TxnResolution::Unknown
-        } else {
+        let resolution = if let Some(record) = local_decision {
+            record.resolution
+        } else if tid.node != local_server_id {
             let coordinator_id = tid.node;
             let Some(coordinator_name) = conshasing.to_server_name_option(Some(coordinator_id))
             else {
@@ -1359,6 +1362,8 @@ async fn resolve_incomplete_transaction_decisions(
                     transactions::TxnResolution::Unknown
                 }
             }
+        } else {
+            transactions::TxnResolution::Unknown
         };
         resolutions.insert(*tid, resolution);
     }
