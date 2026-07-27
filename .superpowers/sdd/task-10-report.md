@@ -672,3 +672,85 @@ All final gates ran locally, strictly serially, with no overlap:
 
 The 11 unrelated B-tree/range-service worktree modifications remained
 untouched throughout Round 3 and are excluded from the scoped commit.
+
+## Review Fixes Round 4
+
+### Torn snapshot generations fail closed
+
+The sole full-range Critical finding was a generation-boundary error in
+startup tail repair. Once a valid compaction barrier resets canonical state,
+every record following that barrier is the sole retained transaction state.
+The scanner nevertheless treated an `UnexpectedEof` after the barrier as an
+ordinary newest-generation tail, allowing startup to truncate and synchronize
+the authoritative snapshot after covered source generations had been masked
+or removed.
+
+The deterministic RED
+`startup_never_repairs_a_torn_post_snapshot_record` uses production
+compaction to publish and adopt a sequence-1 snapshot containing a valid
+barrier and retained `Decided(InProgress)` coordinator record, then verifies
+that the covered sequence-0 source is already durably removed. The fixture
+appends each of the three repairable input forms after that retained state:
+
+- a one-byte short record header;
+- a complete header claiming a missing transaction ID;
+- a coordinator Abort record with a torn decoded payload.
+
+Before the fix, both startup attempts repaired every form and returned
+success. Each attempt truncated the exact snapshot from 93 to 92 bytes for the
+short header, 97 to 92 bytes for the short transaction ID, and 127 to 92 bytes
+for the decoded payload. The RED result was 0 passed, 1 failed, 847 filtered
+in 0.00s (5.98s including compilation).
+
+All three repair predicates now require `!saw_snapshot` in addition to the
+newest-generation condition. A decoder `UnexpectedEof` that cannot be
+repaired is reported with the snapshot path and exact byte offset. No startup
+write, truncate, sync, or covered-file cleanup is reached. The GREEN fixture
+runs two attempts for every torn form and proves the exact original content
+and length are unchanged after each failure. It passed 1/1 with 847 filtered
+in 0.00s (5.31s including compilation).
+
+The per-generation `saw_snapshot` flag leaves ordinary newest non-snapshot
+repair unchanged. The startup-focused undo-log group passed 10/10 with 838
+filtered in 52.45s (52.53s wall), including ordinary truncate/sync/reopen,
+complete-newest re-sync, both injected sync-failure retries, older-tail,
+incomplete-barrier, complete-corruption, final-decision, and distributed
+restart cases.
+
+### Audit and final local verification
+
+A fresh read-only Fix Round 4 delta audit returned APPROVED with 0 Critical,
+0 Important, and 0 Minor findings. The exact prior 42-case focused aggregate,
+extended with the torn-snapshot regression as case 43, passed 43/43 with no
+failures in 369s. Every case ran as a separate local Cargo process and no test
+processes overlapped.
+
+All final-text gates ran locally and strictly serially. The benchmark-only
+remote host was not used:
+
+- `cargo test --lib startup_ -- --test-threads=1`: 28 passed, 0 failed,
+  820 filtered in 69.72s (69.84s wall).
+- `cargo test --lib server::transactions::undo_log -- --test-threads=1`:
+  77 passed, 0 failed, 771 filtered in 82.13s (82.25s wall).
+- `cargo test --lib server::transactions::manager -- --test-threads=1`:
+  38 passed, 0 failed, 810 filtered in 321.78s (321.91s wall).
+- `cargo test --lib server::transactions::data_site -- --test-threads=1`:
+  78 passed, 0 failed, 770 filtered in 807.59s (807.72s wall).
+- `cargo test --lib server::transactions::occ_tests -- --test-threads=1`:
+  49 passed, 0 failed, 799 filtered in 589.55s (589.73s wall).
+- `cargo test --lib ram::recovery -- --test-threads=1`: 41 passed, 0 failed,
+  2 ignored, 805 filtered in 3.85s (4.00s wall).
+- `cargo test --lib server::transactions::tests -- --test-threads=1`:
+  5 passed, 0 failed, 843 filtered in 5.04s (5.20s wall).
+- `cargo test --lib server::tests::durable_ -- --test-threads=1`: 2 passed,
+  0 failed, 846 filtered in 2.01s (2.10s wall).
+- `cargo test --lib --features occ_phase_profile server::transactions::phase_profile::tests -- --test-threads=1`:
+  5 passed, 0 failed, 850 filtered in 0.00s (6.80s including the feature
+  build).
+- `cargo test --lib ram::cell::tests::revision_header_is_exactly_32_bytes -- --exact --test-threads=1`:
+  1 passed, 0 failed, 847 filtered in 0.00s (0.10s wall).
+- `cargo check --lib`: passed in 1.01s (1.10s wall) with existing repository
+  warnings.
+
+The 11 unrelated B-tree/range-service worktree modifications remained
+untouched throughout Round 4 and are excluded from the scoped commit.

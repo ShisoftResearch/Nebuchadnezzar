@@ -989,6 +989,7 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
         'records: while offset < buffer.len() {
             if buffer.len() < offset + 5 {
                 if is_newest_generation
+                    && !saw_snapshot
                     && buffer.get(offset).copied() != Some(ENTRY_TYPE_COMPACTION_SNAPSHOT)
                 {
                     newest_tail_repair = Some((path.clone(), offset as u64));
@@ -1011,7 +1012,10 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                 buffer[offset + 4],
             ]) as usize;
             if buffer.len() < offset + 5 + txn_id_len {
-                if is_newest_generation && entry_type != ENTRY_TYPE_COMPACTION_SNAPSHOT {
+                if is_newest_generation
+                    && !saw_snapshot
+                    && entry_type != ENTRY_TYPE_COMPACTION_SNAPSHOT
+                {
                     newest_tail_repair = Some((path.clone(), offset as u64));
                     break;
                 }
@@ -1072,10 +1076,22 @@ fn read_canonical_log_state(log_files: &[(u64, PathBuf)]) -> io::Result<Canonica
                         Ok(record) => record,
                         Err(error)
                             if is_newest_generation
+                                && !saw_snapshot
                                 && error.kind() == io::ErrorKind::UnexpectedEof =>
                         {
                             newest_tail_repair = Some((path.clone(), offset as u64));
                             break 'records;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                            return Err(io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "cannot decode undo log {} at byte offset {}: {}",
+                                    path.display(),
+                                    offset,
+                                    error
+                                ),
+                            ));
                         }
                         Err(error) => return Err(error),
                     }
@@ -3127,6 +3143,106 @@ mod tests {
         assert_eq!(
             reopened.coordinator_status(&tid).unwrap(),
             Some(CoordinatorStatus::Decided(intent))
+        );
+    }
+
+    #[test]
+    fn startup_never_repairs_a_torn_post_snapshot_record() {
+        let mut violations = Vec::new();
+
+        for torn_form in ["short header", "short transaction id", "decoded payload"] {
+            let temp_dir = TempDir::new().unwrap();
+            let log_dir = temp_dir.path();
+            let retained_tid = test_hlc(304, 82);
+            let retained = CoordinatorDecisionRecord {
+                resolution: TxnResolution::InProgress,
+                participants: BTreeSet::from([81, 82]),
+            };
+            let undo =
+                UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("undo logger");
+            undo.write_coordinator_dispatch_intent(&retained_tid, &[81, 82])
+                .unwrap();
+            undo.compact_logs_at(0).expect("adopted snapshot");
+            assert_eq!(
+                undo.coordinator_status(&retained_tid).unwrap(),
+                Some(CoordinatorStatus::Decided(retained)),
+                "the adopted snapshot must contain retained canonical transaction state"
+            );
+            let snapshot_path = PathBuf::from(
+                undo.log_file_name
+                    .lock()
+                    .clone()
+                    .expect("active snapshot path"),
+            );
+            drop(undo);
+
+            assert!(
+                !log_dir.join("undo-0.nlog").exists(),
+                "the covered source generation must already be durably removed"
+            );
+            let valid_snapshot = std::fs::read(&snapshot_path).unwrap();
+            let torn_offset = valid_snapshot.len();
+            let torn_tail = match torn_form {
+                "short header" => vec![ENTRY_TYPE_COORDINATOR_ABORT],
+                "short transaction id" => {
+                    let mut bytes = vec![ENTRY_TYPE_COORDINATOR_ABORT];
+                    bytes.extend_from_slice(&1u32.to_le_bytes());
+                    bytes
+                }
+                "decoded payload" => {
+                    let bytes = encode_coordinator_decision_record(
+                        &test_hlc(305, 82),
+                        &CoordinatorDecisionRecord {
+                            resolution: TxnResolution::Abort,
+                            participants: BTreeSet::from([81, 82]),
+                        },
+                    )
+                    .unwrap();
+                    bytes[..bytes.len() - 1].to_vec()
+                }
+                _ => unreachable!(),
+            };
+            let mut torn_snapshot = valid_snapshot;
+            torn_snapshot.extend_from_slice(&torn_tail);
+            std::fs::write(&snapshot_path, &torn_snapshot).unwrap();
+
+            for attempt in 1..=2 {
+                match UndoLogger::new(log_dir.to_string_lossy().into_owned()) {
+                    Ok(logger) => {
+                        drop(logger);
+                        violations.push(format!(
+                            "{torn_form} attempt {attempt} unexpectedly repaired the snapshot"
+                        ));
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        if error.kind() != io::ErrorKind::UnexpectedEof
+                            || !message.contains(snapshot_path.to_string_lossy().as_ref())
+                            || !message.contains(&format!("byte offset {torn_offset}"))
+                        {
+                            violations.push(format!(
+                                "{torn_form} attempt {attempt} reported {error:?}, \
+                                 expected UnexpectedEof with path {} and byte offset {torn_offset}",
+                                snapshot_path.display()
+                            ));
+                        }
+                    }
+                }
+                let after = std::fs::read(&snapshot_path).unwrap();
+                if after != torn_snapshot {
+                    violations.push(format!(
+                        "{torn_form} attempt {attempt} changed the snapshot from {} to {} bytes",
+                        torn_snapshot.len(),
+                        after.len()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "torn snapshot generations must fail closed without mutation:\n{}",
+            violations.join("\n")
         );
     }
 
