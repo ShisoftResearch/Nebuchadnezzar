@@ -5,6 +5,7 @@ pub mod cell;
 pub mod chunk;
 pub mod cleaner;
 pub mod compression;
+pub(crate) mod durable_fs;
 pub mod entry;
 pub mod file_manager;
 pub mod history;

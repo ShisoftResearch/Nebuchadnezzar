@@ -926,7 +926,7 @@ impl Chunk {
         let orphan_segment = pending_entry.seg.clone();
         let write_result =
             self.write_cell_to_chunk(cell, &write_plan, &pending_entry, write.revision_ts)?;
-        drop(pending_entry);
+        pending_entry.finish()?;
         let node = Arc::new(RevisionNode::new(
             write.revision_ts,
             Self::revision_state(write.visibility, false),
@@ -988,7 +988,7 @@ impl Chunk {
         let orphan_segment = pending_entry.seg.clone();
         let write_result =
             self.write_cell_to_chunk(cell, &write_plan, &pending_entry, write.revision_ts)?;
-        drop(pending_entry);
+        pending_entry.finish()?;
         let node = Arc::new(RevisionNode::new(
             write.revision_ts,
             Self::revision_state(write.visibility, false),
@@ -1083,10 +1083,10 @@ impl Chunk {
             id.higher,
             id.lower,
         );
+        let tombstone_location = pending_entry.addr;
+        pending_entry.finish()?;
         tombstone_segment.tombstones.fetch_add(1, Ordering::Relaxed);
         tombstone_segment.note_dead_bytes_change();
-        let tombstone_location = pending_entry.addr;
-        drop(pending_entry);
         let node = Arc::new(RevisionNode::new(
             write.revision_ts,
             Self::revision_state(write.visibility, true),
@@ -1432,7 +1432,7 @@ impl Chunk {
         self.segs.insert_back(segment_key, AArc::new(segment));
     }
 
-    pub fn remove_segment(&self, segment_id: u64) {
+    pub fn remove_segment(&self, segment_id: u64) -> io::Result<bool> {
         debug!(
             "Removing segment for chunk {} with id {}",
             self.id, segment_id
@@ -1441,22 +1441,24 @@ impl Chunk {
         // Check if segment is hot BEFORE removing to avoid race with full scan
         // If we decrement after removing, a full scan could miss the removed segment
         // and update the cache, then we'd decrement again, leading to under-counting
-        let should_decrement = if let Some(seg) = self.segs.get(&(segment_id as usize)) {
-            let is_hot = seg.is_hot();
-            if !is_hot {
-                error!(
-                    "Segment {} is not hot in chunk {} to remove",
-                    segment_id, self.id
-                );
-            }
-            is_hot
-        } else {
+        let Some(segment) = self.segs.get(&(segment_id as usize)) else {
             error!(
                 "Segment {} not found in chunk {} to remove",
                 segment_id, self.id
             );
-            false
+            return Ok(false);
         };
+        let should_decrement = segment.is_hot();
+        if !should_decrement {
+            error!(
+                "Segment {} is not hot in chunk {} to remove",
+                segment_id, self.id
+            );
+        }
+
+        // Keep the segment registered and its memory readable until every
+        // source filename removal is durably published.
+        segment.dispense()?;
 
         // Decrement cache BEFORE removing from list
         if should_decrement {
@@ -1469,13 +1471,13 @@ impl Chunk {
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
             // Free the segment memory
             seg.free_memory();
-            // Free the segment files
-            seg.dispense();
+            Ok(true)
         } else {
             error!(
                 "Segment {} not found in chunk {} to remove",
                 segment_id, self.id
             );
+            Ok(false)
         }
     }
 
@@ -1927,13 +1929,25 @@ pub struct PendingEntry {
     pub skip_sync: bool, // Skip fsync if part of a transaction (will be synced at commit)
 }
 
-impl Drop for PendingEntry {
-    // dealing with entry write ahead log
-    fn drop(&mut self) {
-        self.seg
-            .write_wal(self.addr, self.size, self.skip_sync)
-            .unwrap();
+impl PendingEntry {
+    /// Publish the newly written entry to its segment WAL. Callers must finish
+    /// this fallible step before installing the entry in revision history.
+    pub fn finish(self) -> Result<(), WriteError> {
+        if let Err(error) = self.seg.write_wal(self.addr, self.size, self.skip_sync) {
+            // The segment append cursor has already reserved these bytes, but
+            // no revision points at them. Account the orphan immediately so
+            // repeated retryable durability failures cannot leak live space.
+            self.seg.dead_space.fetch_add(self.size, Ordering::Relaxed);
+            self.seg.note_dead_bytes_change();
+            return Err(WriteError::DurabilityFailure(error.to_string()));
+        }
         self.seg.set_dirty();
+        Ok(())
+    }
+}
+
+impl Drop for PendingEntry {
+    fn drop(&mut self) {
         self.seg.decr_references();
     }
 }

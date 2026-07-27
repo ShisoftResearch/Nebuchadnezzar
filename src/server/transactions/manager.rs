@@ -2065,6 +2065,7 @@ impl TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ram::durable_fs::fail_next_directory_sync_for_test;
     use crate::ram::schema::Schema;
     use crate::ram::tests::default_fields;
     use crate::ram::types::{OwnedMap, OwnedValue};
@@ -2073,6 +2074,7 @@ mod tests {
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::Map;
     use futures::future::join_all;
+    use tempfile::TempDir;
 
     #[test]
     fn scoped_transaction_manager_service_ids_differ_between_databases() {
@@ -2145,6 +2147,34 @@ mod tests {
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell, Service::Transaction],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &address.to_string(),
+            &group.to_string(),
+            async |_| {},
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn start_durable_manager_test_server(
+        address: &str,
+        group: &str,
+        temp_dir: &TempDir,
+    ) -> Arc<NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: crate::ram::segs::SEGMENT_SIZE,
+                db_size: crate::ram::segs::SEGMENT_SIZE,
+                history_retention_ms: 300_000,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().into_owned()),
+                undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().into_owned()),
                 raft_storage: None,
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
@@ -2259,6 +2289,56 @@ mod tests {
         assert!(!TransactionManager::abort_cleanup_complete(&Ok(
             AbortResult::Success(Some(vec![]))
         )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_rotation_directory_failure_prevents_commit_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5439";
+        let group = "txn_manager_coordinator_directory_sync_failure";
+        let server = start_durable_manager_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = runtime.txn_manager().unwrap().clone();
+        let client = scoped_txn_client_for_database(address, group, group).await;
+        let tid = client.begin().await.unwrap().unwrap();
+        let id = Id::new(0, 99055);
+        {
+            let txn_lock = manager.get_transaction(&tid).unwrap();
+            let mut txn = txn_lock.lock().await;
+            txn.state = TxnState::Prepared;
+            txn.commit_hlc = Some(manager.deps.hlc.now());
+            txn.affected_objects.insert(
+                77,
+                BTreeMap::from([(
+                    id,
+                    DataObject {
+                        server: 77,
+                        cell: Some(counter_cell(1, id, 2)),
+                        expectation: CellExpectation::Present(1),
+                        changed: true,
+                        new: false,
+                        point_cache: PointReadCache::default(),
+                    },
+                )]),
+            );
+        }
+        let undo = runtime.undo_log().expect("durable coordinator undo log");
+        undo.rotate_before_next_record_for_test();
+        fail_next_directory_sync_for_test(&undo.log_directory_for_test());
+
+        assert_eq!(
+            client.commit(tid).await.unwrap().unwrap(),
+            EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let txn_lock = manager.get_transaction(&tid).unwrap();
+        let txn = txn_lock.lock().await;
+        assert_eq!(txn.state, TxnState::Committed);
+        assert!(!txn.coordinator_decision_durable);
+        drop(txn);
+        assert_eq!(undo.coordinator_decision(&tid).unwrap(), None);
+
+        manager.cleanup_transaction(&tid);
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -9,6 +9,7 @@ use crate::ram::types::{FromHeader, Id};
 use itertools::Itertools;
 use rayon::prelude::*;
 use std::collections::HashSet;
+use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
@@ -69,6 +70,66 @@ struct Relocation {
     kind: RevisionKind,
     entry_size: usize,
     history_live: bool,
+}
+
+struct UnpublishedSegment<'a> {
+    segment: Option<Segment>,
+    chunk: &'a Chunk,
+}
+
+impl<'a> UnpublishedSegment<'a> {
+    fn new(chunk: &'a Chunk, segment: Segment) -> Self {
+        Self {
+            segment: Some(segment),
+            chunk,
+        }
+    }
+
+    fn segment(&self) -> &Segment {
+        self.segment
+            .as_ref()
+            .expect("unpublished segment guard must own its segment")
+    }
+
+    fn publish(mut self) -> Segment {
+        self.segment
+            .take()
+            .expect("unpublished segment guard must own its segment")
+    }
+
+    fn discard(mut self, cause: io::Error) -> io::Error {
+        let segment = self
+            .segment
+            .take()
+            .expect("unpublished segment guard must own its segment");
+        let cleanup = segment.dispense();
+        segment.mem_drop(self.chunk);
+        match cleanup {
+            Ok(()) => cause,
+            Err(cleanup_error) => io::Error::new(
+                cause.kind(),
+                format!(
+                    "{cause}; also failed to durably discard unpublished cleaner destination {}: {cleanup_error}",
+                    segment.id
+                ),
+            ),
+        }
+    }
+}
+
+impl Drop for UnpublishedSegment<'_> {
+    fn drop(&mut self) {
+        let Some(segment) = self.segment.take() else {
+            return;
+        };
+        if let Err(error) = segment.dispense() {
+            error!(
+                "Failed to durably discard unpublished cleaner destination {} during unwinding: {}",
+                segment.id, error
+            );
+        }
+        segment.mem_drop(self.chunk);
+    }
 }
 
 struct DummySegment {
@@ -269,17 +330,24 @@ impl CombinedCleaner {
         source_segment_ids: &HashSet<u64>,
         #[cfg(test)] before_relocate: &BeforeRelocateHook<'_>,
         #[cfg(test)] after_history_relocate: &AfterHistoryRelocateHook<'_>,
-    ) -> (Vec<usize>, bool) {
+    ) -> io::Result<(Vec<usize>, bool)> {
         let safe_to_reclaim = AtomicBool::new(true);
         // Use global thread pool for segment allocation
         let segments = COMBINE_ALLOC_POOL.install(|| {
             pending_segments
                 .par_iter()
-                .map(|dummy_seg| {
+                .map(|dummy_seg| -> io::Result<_> {
                     let new_seg = chunk
                         .allocator
                         .alloc_seg_with_class(&chunk.file_manager, dummy_seg.segment_class)
-                        .expect("No space left during combine");
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::OutOfMemory,
+                                "no space left during combine",
+                            )
+                        })?;
+                    let unpublished = UnpublishedSegment::new(chunk, new_seg);
+                    let new_seg = unpublished.segment();
                     let new_seg_id = new_seg.id;
                     let mut relocations = Vec::with_capacity(dummy_seg.entries.len());
                     let mut seg_cursor = new_seg.addr;
@@ -320,27 +388,26 @@ impl CombinedCleaner {
                         new_seg.shrink(used_size);
                     }
                     if new_seg.wal_storage_configured() {
-                        new_seg
+                        if let Err(error) = new_seg
                             .write_wal(new_seg.addr, used_size as u32, true)
                             .and_then(|()| new_seg.force_wal_sync_required())
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "Combine failed to persist destination segment {} WAL before source reclaim: {}",
-                                    new_seg.id, error
-                                )
-                            });
+                        {
+                            return Err(unpublished.discard(error));
+                        }
                     }
                     cleaned_total_live_space.fetch_add(new_seg.used_spaces() as usize, Relaxed);
-                    return (new_seg, relocations);
+                    Ok((unpublished, relocations))
                 })
-                .map(|(segment, relocations)| {
+                .map(|result| -> io::Result<usize> {
+                    let (unpublished, relocations) = result?;
+                    let segment = unpublished.segment();
                     trace!(
                         "Putting new segment {}, revisions {}",
                         segment.id,
                         relocations.len()
                     );
-                    let archive_result = segment.archive();
-                    match archive_result {
+                    match segment.archive() {
+                        Err(error) => return Err(unpublished.discard(error)),
                         Ok(true) => {
                             trace!("Segment {} archived successfully", segment.id);
                         }
@@ -360,17 +427,8 @@ impl CombinedCleaner {
                                 trace!("Segment {} not archived (no backup storage configured)", segment.id);
                             }
                         }
-                        Err(e) => {
-                            debug!(
-                                "[COMBINE CRITICAL] Segment {} (chunk={}, seq_id={}) archive failed: {} - NOT putting in list",
-                                segment.id, segment.chunk_id, segment.seq_id, e
-                            );
-                            panic!(
-                                "Combine failed: segment {} archive error: {}",
-                                segment.id, e
-                            );
-                        }
                     }
+                    let segment = unpublished.publish();
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();
@@ -492,25 +550,31 @@ impl CombinedCleaner {
                                 }
                             });
                     });
-                    new_seg_id
+                    Ok(new_seg_id)
                 })
-                .collect::<Vec<_>>()
-        });
-        (segments, safe_to_reclaim.load(Ordering::Acquire))
+                .collect::<io::Result<Vec<_>>>()
+        })?;
+        Ok((segments, safe_to_reclaim.load(Ordering::Acquire)))
     }
 
-    fn cleanup_segments(chunk: &Chunk, segments: &[SegmentCandidate]) {
+    fn cleanup_segments(chunk: &Chunk, segments: &[SegmentCandidate]) -> io::Result<()> {
         debug!("Released references for {} source segments", segments.len());
         for old_seg in segments {
-            chunk.remove_segment(old_seg.id);
+            if !chunk.remove_segment(old_seg.id)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("cleaner source segment {} disappeared", old_seg.id),
+                ));
+            }
             old_seg.mem_drop(chunk);
         }
+        Ok(())
     }
 
     pub fn combine_segments(
         chunk: &Chunk,
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
-    ) -> (usize, usize) {
+    ) -> io::Result<(usize, usize)> {
         #[cfg(test)]
         {
             return Self::combine_segments_with_hook(
@@ -531,7 +595,7 @@ impl CombinedCleaner {
         chunk: &Chunk,
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
         before_relocate: F,
-    ) -> (usize, usize)
+    ) -> io::Result<(usize, usize)>
     where
         F: Fn(Id, u64, usize, usize) + Sync,
     {
@@ -549,7 +613,7 @@ impl CombinedCleaner {
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
         before_relocate: F,
         after_history_relocate: G,
-    ) -> (usize, usize)
+    ) -> io::Result<(usize, usize)>
     where
         F: Fn(Id, u64, usize, usize) + Sync,
         G: Fn(Id, u64, usize, usize) + Sync,
@@ -567,10 +631,10 @@ impl CombinedCleaner {
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
         #[cfg(test)] before_relocate: &BeforeRelocateHook<'_>,
         #[cfg(test)] after_history_relocate: &AfterHistoryRelocateHook<'_>,
-    ) -> (usize, usize) {
+    ) -> io::Result<(usize, usize)> {
         let segments = Self::select_candidate_segments(chunk, selected_segments);
         if segments.is_empty() {
-            return (0, 0);
+            return Ok((0, 0));
         }
 
         let space_to_collect = segments
@@ -604,7 +668,7 @@ impl CombinedCleaner {
                 for seg in segments.iter() {
                     seg.mark_clean_no_progress();
                 }
-                return (0, 0);
+                return Ok((0, 0));
             }
 
             debug!(
@@ -622,13 +686,13 @@ impl CombinedCleaner {
                 before_relocate,
                 #[cfg(test)]
                 after_history_relocate,
-            );
+            )?;
             if !safe_to_reclaim {
                 error!(
                     "Cleaner retained source segments {:?} because current history and cell-index publication could not be reconciled",
                     segment_ids_to_combine
                 );
-                return (0, 0);
+                return Ok((0, 0));
             }
 
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
@@ -651,13 +715,13 @@ impl CombinedCleaner {
             chunk.get_head_seg_id()
         );
 
-        Self::cleanup_segments(chunk, &segments);
+        Self::cleanup_segments(chunk, &segments)?;
 
         debug!(
             "End combining segments, totally cleaned {} bytes, with {} segments.",
             space_cleaned, len_cleaned_segments
         );
         debug_assert!(num_reduced_segments >= 0);
-        (space_cleaned, num_reduced_segments as usize)
+        Ok((space_cleaned, num_reduced_segments as usize))
     }
 }

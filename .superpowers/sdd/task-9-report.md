@@ -442,3 +442,199 @@ their safety proof. A bounded, acknowledged retirement/compaction protocol is
 deferred to Task 10; until then these records can grow the undo-log footprint.
 Task 10 stale-owner resolution, index/range MVCC, and unrelated
 non-transactional isolation behavior also remain deferred.
+
+## Review Fixes Round 3
+
+### Root-Cause Trace
+
+#### Recovery files were individually synced but their directory entries were not
+
+WAL and undo-log creation used normal filesystem opens after recursive directory
+creation. Backup replacement used a direct final filename, and WAL/backup
+deletion did not synchronize the containing directory. A successful file
+`fsync` therefore did not prove that a newly created filename, rename, or
+unlink would survive a crash. Storage locking also pre-created scoped storage
+roots without publishing each new directory entry, hiding the same gap from
+lower-level open paths.
+
+`ram::durable_fs` now centralizes the publication protocol. It creates nested
+directories one component at a time and synchronizes the parent after every
+new entry; opens existing files without a directory sync; synchronizes the
+parent after new files, renames, and removals; handles bare relative paths via
+`.`; and makes failed new-directory publication retryable by removing the
+uncertain entry before returning the failure. A missing-file unlink retry
+re-synchronizes the parent because an earlier unlink may have succeeded before
+its directory sync failed.
+
+The file manager, segment lifecycle, undo logger, and storage lock now use that
+protocol. Backup publication writes a `.nbackup.staging` file that discovery
+ignores, synchronizes its complete padded contents, then renames it to the final
+backup name and synchronizes the directory. Cleaner archive publication follows
+the same staged path. Source WAL removal happens only after the destination WAL
+or staged backup is durable, and every deletion failure propagates before the
+source is removed from the registry or freed from memory.
+
+#### Fallible durability work happened in destructors or was discarded
+
+`PendingEntry::drop` previously attempted the WAL write and unwrapped its
+result. A directory-publication failure could therefore panic during a normal
+mutation and provided no structured way to stop history publication. Cleaner
+combine and segment disposal also discarded or collapsed errors, allowing
+in-memory reclamation to outrun durable source cleanup. Failed unpublished
+cleaner destinations consumed allocator capacity across retries.
+
+All mutation paths now call fallible `PendingEntry::finish` before installing a
+revision in history. A failed WAL publication accounts the reserved bytes as a
+dead orphan while leaving tombstone counters unchanged. Drop only releases the
+allocation reference. Segment removal and cleaner combine return durability
+errors; the background boolean interface logs the error and reports no
+progress. An unpublished-destination guard durably discards a failed cleaner
+output and returns its allocator slot. On source unlink failure, the source
+stays registered and readable; a subsequent combine retries the missing-parent
+sync and completes cleanup.
+
+#### Undo depended on a reclaimable segment location and transaction lifetime pin
+
+The prior undo layout stored a chunk/sequence/offset locator and transactions
+kept rollback segment guards alive for their entire lifetime. That made undo
+recovery depend on a source segment that cleaner wanted to reclaim, and the
+lifetime guards prevented reclamation while transactions remained in doubt.
+
+Fresh undo format tag 7 owns the complete prior `OwnedCell` payload for update
+and remove records. Insert undo has no prior payload. The payload uses bincode
+v2 serde encoding so all value types round-trip without JSON's loss of IEEE
+NaN/infinity bit patterns. Decoding validates the fresh tag, operation/payload
+shape, complete transaction and cell IDs, revision ordering, exact record
+length, and a 16 MiB payload bound; legacy raw-location layouts are rejected.
+Recovery compensates from the owned payload after exact installed-head
+validation and synchronizes the compensation before the abort marker.
+
+`Transaction::rollback_guards`, the segment-guard acquisition helper, and every
+transaction-lifetime rollback pin were removed. Data-site update/remove clones
+the prior cell while the ordinary current-cell guard is scoped to the mutation,
+and both the durable undo record and in-memory `CellHistory` own that clone.
+The cleaner can consequently relocate and reclaim the prior source while a
+transaction is in doubt, and live abort still restores the prior value at a
+newer revision.
+
+#### Failed undo rotation could age the active writer into the trim window
+
+Rotation incremented the log sequence before a newly published writer was
+available. Repeated directory-sync failures could make the still-active file
+look old enough for trimming. Rotation is now serialized through the writer
+mutex and does not advance `log_seq` or replace the old writer until the new
+file is open and durably published. Decision writes propagate rotation errors,
+so neither participant nor coordinator can report success without a durable
+record.
+
+The variable-length trim scanner was also corrected to advance by each decoded
+record size. Distributed decisions and participant completion evidence remain
+conservatively retained.
+
+### Focused TDD Evidence
+
+All focused GREEN runs used one test thread. The principal RED-to-GREEN checks
+were:
+
+- `failed_new_directory_publication_can_be_retried_safely`: RED left an
+  uncertain new directory entry after its parent sync failed; GREEN proved the
+  entry is removed and a retry succeeds.
+- `bare_relative_directory_is_durably_created`: RED mishandled an empty lexical
+  parent; GREEN normalizes it to `.` and records the parent sync.
+- `lock_startup_durably_publishes_new_storage_directory`: RED observed zero
+  parent syncs for a new scoped storage root; GREEN observed one.
+- WAL publication tests proved a new filename is synchronized once, an existing
+  WAL remains on the fast path without another directory sync, and directory
+  failure reaches the caller.
+- `backup_publication_syncs_staging_contents_before_final_rename`: RED had no
+  staged rename; GREEN orders staging creation, complete file sync, final
+  rename, and directory sync.
+- `failed_tombstone_wal_publication_accounts_orphan_without_tombstone_drift`:
+  RED left the reserved bytes live; GREEN accounts the orphan once without
+  incrementing logical tombstone state.
+- `cleaner_repeated_destination_publication_failures_reuse_unpublished_capacity`:
+  RED exhausted the chunk after six injected failures; GREEN reuses each
+  unpublished allocation and permits the final retry.
+- `cleaner_source_directory_sync_failure_returns_error_and_retains_sources`:
+  GREEN proves failure propagation, readable registered sources, and successful
+  retry cleanup.
+- Undo creation/rotation tests prove one directory publication per new file,
+  existing-file fast paths, creation failure propagation, coordinator decision
+  failure propagation, and repeated failed rotations retaining the active file.
+- `undo_owned_prior_round_trips_by_operation_without_a_raw_location` and
+  `restart_compensation_uses_owned_payload_after_source_wal_is_removed` prove
+  the fresh owned-payload format and source-independent restart recovery.
+- `undo_owned_prior_payload_preserves_ieee_float_bits`: RED JSON decoded
+  non-finite floats as invalid/null; GREEN bincode preserves their exact bits.
+- `trimming_follows_owned_prior_payload_to_participant_completion`: RED the
+  variable-size parser lost the following completion; GREEN retains the
+  completed outcome.
+- Participant and manager WAL/undo directory failure tests prove `CannotEnd`,
+  no success marker, no panic, no cell publication, and no durable coordinator
+  choice on publication failure.
+- `in_doubt_update_does_not_pin_prior_segment_and_abort_uses_owned_prior`
+  proves an exclusive cleaner lease and real combine/reclamation can complete
+  while the transaction is in doubt, after which abort restores from owned
+  history at a newer revision.
+- The required full cleaner gate first exposed a deterministic test-helper RED:
+  the helper requested revision 100 at snapshot boundary 100, while MVCC
+  visibility is strictly before the snapshot and correctly returned
+  `Absent(None)`. It now reads the predecessor at installed timestamp 200 and
+  asserts that the returned revision is exactly 100. Both marked recovery
+  tests then passed together, 2 passed, 0 failed, 759 filtered, in 0.01s.
+
+A final focused aggregate ran 22 exact durability, owned-undo, rotation,
+cleaner, recovery, participant, and manager regressions strictly serially:
+22 passed, 0 failed, in 35s total.
+
+### Serial Verification
+
+Every required suite completed before the next began, with
+`--test-threads=1` and an explicit timeout. No timeout was reached.
+
+- `cargo test --lib server::transactions::undo_log -- --test-threads=1`:
+  46 passed, 0 failed, 0 ignored, 715 filtered; 29.56s test time, 29.72s wall.
+- `cargo test --lib server::transactions::occ_tests -- --test-threads=1`:
+  45 passed, 0 failed, 0 ignored, 716 filtered; 549.58s test time, 549.75s wall.
+- `cargo test --lib ram::recovery -- --test-threads=1`: 37 passed, 0 failed,
+  2 ignored, 722 filtered; 3.37s test time, 3.50s wall.
+- `cargo test --lib ram::cleaner -- --test-threads=1`: 24 passed, 0 failed,
+  0 ignored, 737 filtered; 0.35s test time, 0.50s wall.
+- `cargo test --lib server::transactions::data_site -- --test-threads=1`:
+  55 passed, 0 failed, 0 ignored, 706 filtered; 538.91s test time, 539.05s wall.
+- `cargo test --lib server::transactions::manager -- --test-threads=1`:
+  16 passed, 0 failed, 0 ignored, 745 filtered; 121.27s test time, 121.37s wall.
+- `cargo test --lib server::transactions::tests -- --test-threads=1`: 5
+  passed, 0 failed, 0 ignored, 756 filtered; 5.04s test time, 5.20s wall.
+- `cargo check --lib`: exit 0; 19.25s cargo time, 19.31s wall, 60 existing
+  warnings and no errors.
+- `git diff --check`: exit 0.
+- Static transaction audit found no `rollback_guards`,
+  `acquire_segment_guard`, or transaction use of `SegmentReferenceGuard::new`;
+  the fresh undo layout contains no prior chunk/sequence/offset/address fields.
+
+### Files
+
+- `Cargo.toml`
+- `src/ram/durable_fs.rs`
+- `src/ram/file_manager.rs`
+- `src/ram/segs.rs`
+- `src/ram/chunk.rs`
+- `src/ram/cleaner/combine.rs`
+- `src/ram/cleaner/mod.rs`
+- `src/ram/cleaner/tests.rs`
+- `src/ram/mod.rs`
+- `src/ram/tests/blob_schema.rs`
+- `src/ram/tests/cell.rs`
+- `src/server/storage_lock.rs`
+- `src/server/transactions/data_site.rs`
+- `src/server/transactions/manager.rs`
+- `src/server/transactions/occ_tests.rs`
+- `src/server/transactions/undo_log.rs`
+- `.superpowers/sdd/task-9-report.md`
+
+Coordinator decisions and participant completion evidence are still retained
+conservatively until an acknowledged, bounded retirement/compaction protocol
+exists. That storage-growth concern remains deferred to Task 10, together with
+stale-owner resolution, index/range MVCC, and unrelated non-transactional
+isolation work.

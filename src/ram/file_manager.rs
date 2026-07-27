@@ -1,6 +1,7 @@
 use crate::ram::compression;
-use std::fs::{self, create_dir_all, remove_file, File};
-use std::io::{self, Read, Write};
+use crate::ram::durable_fs;
+use std::fs::{self, create_dir_all, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Unified file manager for segment file operations
@@ -8,6 +9,18 @@ use std::path::{Path, PathBuf};
 pub struct SegmentFileManager {
     backup_storage: Option<String>,
     wal_storage: Option<String>,
+}
+
+pub(crate) struct StagedBackupFile {
+    file: File,
+    staging_path: PathBuf,
+    final_path: PathBuf,
+}
+
+impl StagedBackupFile {
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
 }
 
 impl SegmentFileManager {
@@ -48,10 +61,10 @@ impl SegmentFileManager {
     /// Initialize storage directories
     pub fn init_directories(&self) -> io::Result<()> {
         if let Some(backup_storage) = &self.backup_storage {
-            create_dir_all(backup_storage)?;
+            durable_fs::ensure_directory(Path::new(backup_storage))?;
         }
         if let Some(wal_storage) = &self.wal_storage {
-            create_dir_all(wal_storage)?;
+            durable_fs::ensure_directory(Path::new(wal_storage))?;
         }
         Ok(())
     }
@@ -78,7 +91,8 @@ impl SegmentFileManager {
         seq_id: u64,
     ) -> io::Result<Option<File>> {
         if let Some(wal_path) = self.wal_path(chunk_id, seg_id, seq_id) {
-            let file = File::create(&wal_path)?;
+            let mut file = durable_fs::open_or_create(Path::new(&wal_path), false)?;
+            file.seek(SeekFrom::End(0))?;
             Ok(Some(file))
         } else {
             Ok(None)
@@ -93,11 +107,7 @@ impl SegmentFileManager {
         seq_id: u64,
     ) -> io::Result<Option<File>> {
         if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
-            // Ensure parent directory exists
-            if let Some(parent) = Path::new(&backup_path).parent() {
-                create_dir_all(parent)?;
-            }
-            let file = File::create(&backup_path)?;
+            let file = durable_fs::open_or_create(Path::new(&backup_path), true)?;
             Ok(Some(file))
         } else {
             Ok(None)
@@ -132,19 +142,41 @@ impl SegmentFileManager {
         seq_id: u64,
     ) -> io::Result<Option<File>> {
         if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
-            // Ensure parent directory exists
-            if let Some(parent) = Path::new(&backup_path).parent() {
-                create_dir_all(parent)?;
-            }
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&backup_path)?;
+            let file = durable_fs::open_or_create(Path::new(&backup_path), false)?;
             Ok(Some(file))
         } else {
             Ok(None)
         }
+    }
+
+    pub(crate) fn stage_backup_file(
+        &self,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+    ) -> io::Result<Option<StagedBackupFile>> {
+        let Some(final_path) = self.backup_path(chunk_id, seg_id, seq_id) else {
+            return Ok(None);
+        };
+        let final_path = PathBuf::from(final_path);
+        let staging_path = PathBuf::from(format!("{}.staging", final_path.display()));
+        let file = durable_fs::open_or_create(&staging_path, true)?;
+        Ok(Some(StagedBackupFile {
+            file,
+            staging_path,
+            final_path,
+        }))
+    }
+
+    pub(crate) fn publish_staged_backup(&self, staged: StagedBackupFile) -> io::Result<()> {
+        let StagedBackupFile {
+            file,
+            staging_path,
+            final_path,
+        } = staged;
+        durable_fs::sync_file(&file, &staging_path)?;
+        drop(file);
+        durable_fs::rename(&staging_path, &final_path)
     }
 
     /// Open an existing WAL file for reading
@@ -183,9 +215,7 @@ impl SegmentFileManager {
     pub fn delete_backup(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> io::Result<()> {
         if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
             let path = Path::new(&backup_path);
-            if path.exists() {
-                remove_file(path)?;
-            }
+            durable_fs::remove_file(path)?;
         }
         Ok(())
     }
@@ -194,9 +224,7 @@ impl SegmentFileManager {
     pub fn delete_wal(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> io::Result<()> {
         if let Some(wal_path) = self.wal_path(chunk_id, seg_id, seq_id) {
             let path = Path::new(&wal_path);
-            if path.exists() {
-                remove_file(path)?;
-            }
+            durable_fs::remove_file(path)?;
         }
         Ok(())
     }
@@ -221,20 +249,10 @@ impl SegmentFileManager {
             None => return Ok(false),
         };
 
-        let backup_path = match self.backup_path(chunk_id, seg_id, seq_id) {
-            Some(path) => path,
-            None => return Ok(false),
-        };
-
         // Check if WAL exists
         let wal_path_ref = Path::new(&wal_path);
         if !wal_path_ref.exists() {
             return Ok(false);
-        }
-
-        // Ensure backup parent directory exists
-        if let Some(parent) = Path::new(&backup_path).parent() {
-            create_dir_all(parent)?;
         }
 
         // Read WAL file
@@ -243,20 +261,23 @@ impl SegmentFileManager {
         wal_file.read_to_end(&mut wal_data)?;
         let wal_size = wal_data.len();
 
-        // Create backup file and write data
-        let mut backup_file = File::create(&backup_path)?;
-        backup_file.write_all(&wal_data)?;
+        // Write an ignored staging name. Only a fully synced file is renamed
+        // to the recovery-visible backup name.
+        let Some(mut staged) = self.stage_backup_file(chunk_id, seg_id, seq_id)? else {
+            return Ok(false);
+        };
+        staged.file_mut().write_all(&wal_data)?;
 
         // Pad if requested
         if let Some(target_size) = pad_to_size {
             if wal_size < target_size {
                 let padding_size = target_size - wal_size;
                 let padding = vec![0u8; padding_size];
-                backup_file.write_all(&padding)?;
+                staged.file_mut().write_all(&padding)?;
             }
         }
 
-        backup_file.sync_all()?;
+        self.publish_staged_backup(staged)?;
         Ok(true)
     }
 
@@ -439,8 +460,113 @@ impl SegmentFileInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ram::durable_fs::{
+        directory_sync_count_for_test, durability_events_for_test,
+        fail_next_directory_sync_for_test, DurabilityEvent,
+    };
     use std::fs::File;
+    use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn new_wal_publication_syncs_directory_once_and_existing_fast_path_does_not_resync() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+        let manager = SegmentFileManager::new(None, Some(wal_dir.to_string_lossy().into_owned()));
+        manager.init_directories().unwrap();
+        let before = directory_sync_count_for_test(&wal_dir);
+
+        let mut wal = manager
+            .create_wal_file(1, 2, 3)
+            .unwrap()
+            .expect("configured WAL");
+        wal.write_all(b"first").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        assert_eq!(
+            directory_sync_count_for_test(&wal_dir),
+            before + 1,
+            "publishing a new WAL filename must sync its containing directory"
+        );
+
+        drop(
+            manager
+                .create_wal_file(1, 2, 3)
+                .unwrap()
+                .expect("existing configured WAL"),
+        );
+        assert_eq!(
+            directory_sync_count_for_test(&wal_dir),
+            before + 1,
+            "opening an existing WAL must not add a directory sync per transaction"
+        );
+    }
+
+    #[test]
+    fn wal_publication_propagates_directory_sync_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+        let manager = SegmentFileManager::new(None, Some(wal_dir.to_string_lossy().into_owned()));
+        manager.init_directories().unwrap();
+        fail_next_directory_sync_for_test(&wal_dir);
+
+        let error = manager
+            .create_wal_file(4, 5, 6)
+            .expect_err("directory publication failure must reject WAL creation");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error
+            .to_string()
+            .contains("injected directory sync failure"));
+    }
+
+    #[test]
+    fn backup_publication_syncs_staging_contents_before_final_rename() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_dir = temp_dir.path().join("backup");
+        let wal_dir = temp_dir.path().join("wal");
+        let manager = SegmentFileManager::new(
+            Some(backup_dir.to_string_lossy().into_owned()),
+            Some(wal_dir.to_string_lossy().into_owned()),
+        );
+        manager.init_directories().unwrap();
+        let mut wal = manager
+            .create_wal_file(3, 4, 5)
+            .unwrap()
+            .expect("configured WAL");
+        wal.write_all(b"durable-wal").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let event_start = durability_events_for_test().len();
+
+        assert!(manager.copy_wal_to_backup(3, 4, 5, Some(64)).unwrap());
+
+        let final_path = PathBuf::from(manager.backup_path(3, 4, 5).unwrap());
+        let events = durability_events_for_test();
+        let events = &events[event_start..];
+        let (rename_index, staging_path) = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                DurabilityEvent::FileRenamed { from, to } if to == &final_path => {
+                    Some((index, from.clone()))
+                }
+                _ => None,
+            })
+            .expect("final backup must be published by atomic rename");
+        let sync_index = events
+            .iter()
+            .position(|event| event == &DurabilityEvent::FileSynced(staging_path.clone()))
+            .expect("staging contents must be synced");
+        assert!(
+            sync_index < rename_index,
+            "staging file contents must be durable before final-name publication: {events:?}"
+        );
+        assert!(final_path.exists());
+        assert!(!staging_path.exists());
+        let mut expected = b"durable-wal".to_vec();
+        expected.resize(64, 0);
+        assert_eq!(manager.read_file(&final_path).unwrap(), expected);
+    }
 
     #[test]
     fn test_path_generation() {

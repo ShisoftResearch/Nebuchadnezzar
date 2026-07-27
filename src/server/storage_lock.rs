@@ -1,4 +1,5 @@
 use super::database::DatabaseStorageLayout;
+use crate::ram::durable_fs;
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
@@ -104,7 +105,7 @@ impl StorageDirectoryLocks {
 
 impl DirectoryLockGuard {
     fn acquire(directory: &Path) -> Result<Self, StorageLockError> {
-        std::fs::create_dir_all(directory).map_err(|e| StorageLockError::Io {
+        durable_fs::ensure_directory(directory).map_err(|e| StorageLockError::Io {
             directory: directory.to_path_buf(),
             source: e.to_string(),
         })?;
@@ -236,6 +237,7 @@ fn is_pid_running(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{read_lock_pid, DirectoryLockGuard, StorageDirectoryLocks, LOCK_FILE_NAME};
+    use crate::ram::durable_fs::directory_sync_count_for_test;
     use crate::server::database::DatabaseStorageLayout;
     use std::fs::OpenOptions;
 
@@ -259,6 +261,25 @@ mod tests {
         let contents = std::fs::read_to_string(storage_path.join(LOCK_FILE_NAME))
             .expect("lock file should be readable");
         assert!(contents.contains(&format!("pid={}", std::process::id())));
+    }
+
+    #[test]
+    fn lock_startup_durably_publishes_new_storage_directory() {
+        let temp = tempfile::TempDir::new().expect("tempdir should be created");
+        let storage_path = temp.path().join("databases").join("analytics");
+        let databases_path = storage_path
+            .parent()
+            .expect("scoped storage directory should have a parent");
+        let before = directory_sync_count_for_test(databases_path);
+
+        let _locks = StorageDirectoryLocks::acquire_impl(&layout_with_raft_path(&storage_path))
+            .expect("lock should be acquired");
+
+        assert_eq!(
+            directory_sync_count_for_test(databases_path),
+            before + 1,
+            "creating a scoped durable storage root must sync its parent"
+        );
     }
 
     #[test]

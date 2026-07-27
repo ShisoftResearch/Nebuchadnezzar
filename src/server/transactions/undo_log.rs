@@ -1,13 +1,12 @@
-use crate::ram::cell::{cell_header_from_entry_content_addr, CellHeader, OwnedCell};
+use crate::ram::cell::OwnedCell;
 use crate::ram::chunk::Chunks;
-use crate::ram::entry::Entry;
-use crate::ram::io::reader;
-use crate::ram::types::{FromHeader, Id};
+use crate::ram::durable_fs;
+use crate::ram::types::Id;
 use bifrost::hlc::Hlc;
 use log::{debug, error, info};
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs::{create_dir_all, remove_file, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -18,7 +17,9 @@ use std::sync::Arc;
 use super::{TxnId, TxnResolution, TxnState};
 
 /// Undo log entry stored in the log file
-/// Format: [entry_type: u8 = 4][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][installed_revision_ts: u64][prior_revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
+/// Format: [entry_type: u8 = 7][txn_id_len: u32][txn_id: bytes][cell_id: Id]
+/// [op_type: u8][installed_revision_ts: u64][prior_cell_len: u32]
+/// [prior_owned_cell: bytes]
 ///
 /// The `txn_id` is now a serialized `bifrost::hlc::Hlc` (16-byte fixed HLC),
 /// not the former variable-length vector clock; its serialized byte shape
@@ -30,11 +31,8 @@ use super::{TxnId, TxnResolution, TxnState};
 /// before the migration must be discarded, not recovered.
 ///
 /// All operations store the installed revision for exact recovery ownership.
-/// Update and remove also store the prior revision whose immutable bytes are
-/// addressed by the stable chunk/sequence/offset tuple.
-///
-/// Note: seg_id is NOT stored because it's address-derived and changes across recoveries.
-/// Only seq_id is stable across recoveries and sufficient for segment lookup.
+/// Update and remove own the complete immutable prior cell, so recovery is
+/// independent of cleaner relocation and source-segment lifetime.
 #[derive(Debug, Clone)]
 pub struct UndoLogEntry {
     pub txn_id: TxnId,
@@ -42,16 +40,8 @@ pub struct UndoLogEntry {
     pub op_type: UndoOpType,
     /// Revision installed by the incomplete transaction.
     pub installed_revision_ts: u64,
-    /// Revision whose immutable contents must be restored. Inserts have no
-    /// prior revision.
-    pub prior_revision_ts: Option<u64>,
-    /// For Update/Remove: chunk_id where old cell is located (0 for Write)
-    pub chunk_id: u64,
-    /// For Update/Remove: seq_id of segment where old cell is located (0 for Write)
-    /// Note: seq_id is stable across recoveries, unlike seg_id which is address-derived
-    pub seq_id: u64,
-    /// For Update/Remove: offset within segment where old cell is located (0 for Write)
-    pub cell_offset: u64,
+    /// Complete prior immutable cell for Update/Remove. Inserts have no prior.
+    pub prior_cell: Option<OwnedCell>,
 }
 
 /// Type of operation that needs to be undone
@@ -76,15 +66,15 @@ impl UndoOpType {
     }
 }
 
-// Type 1 was the legacy single-revision undo layout. Reusing it would make
-// framing undecidable when a following record supplies enough bytes to satisfy
-// the larger two-revision minimum length.
-const ENTRY_TYPE_UNDO: u8 = 4;
+// Types 1 and 4 were raw-location undo layouts. Reusing either would make
+// framing ambiguous and could silently reinterpret an adjacent record.
+const ENTRY_TYPE_UNDO: u8 = 7;
 const ENTRY_TYPE_COMMIT: u8 = 2;
 const ENTRY_TYPE_ABORT: u8 = 3;
 const ENTRY_TYPE_COORDINATOR_COMMIT: u8 = 5;
 const ENTRY_TYPE_COORDINATOR_ABORT: u8 = 6;
-const UNDO_FIXED_PAYLOAD_LEN: usize = 16 + 1 + 8 + 8 + 8 + 8 + 8;
+const UNDO_FIXED_PAYLOAD_LEN: usize = 16 + 1 + 8 + 4;
+const MAX_UNDO_PRIOR_CELL_LEN: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct CoordinatorDecisionRecord {
@@ -238,20 +228,14 @@ impl UndoLogEntry {
         cell_id: Id,
         op_type: UndoOpType,
         installed_revision_ts: u64,
-        prior_revision_ts: Option<u64>,
-        chunk_id: u64,
-        seq_id: u64,
-        cell_offset: u64,
+        prior_cell: Option<OwnedCell>,
     ) -> Self {
         Self {
             txn_id,
             cell_id,
             op_type,
             installed_revision_ts,
-            prior_revision_ts,
-            chunk_id,
-            seq_id,
-            cell_offset,
+            prior_cell,
         }
     }
 
@@ -264,24 +248,17 @@ impl UndoLogEntry {
             UndoOpType::Write,
             installed_revision_ts,
             None,
-            0,
-            0,
-            0,
         )
     }
 
-    /// Helper to create an Update/Remove entry (with old cell revision_ts, segment seq_id, and offset)
-    /// Stores both the old revision_ts for verification and exact segment location for fast restoration
-    /// Note: only seq_id is stored, not seg_id, because seg_id changes across recoveries
+    /// Helper to create an Update/Remove entry that owns the immutable prior
+    /// cell independently of its physical source segment.
     pub fn new_restore(
         txn_id: TxnId,
         cell_id: Id,
         op_type: UndoOpType,
         installed_revision_ts: u64,
-        prior_revision_ts: u64,
-        chunk_id: u64,
-        seq_id: u64,
-        cell_offset: u64,
+        prior_cell: OwnedCell,
     ) -> Self {
         debug_assert!(
             op_type != UndoOpType::Write,
@@ -292,20 +269,77 @@ impl UndoLogEntry {
             cell_id,
             op_type,
             installed_revision_ts,
-            Some(prior_revision_ts),
-            chunk_id,
-            seq_id,
-            cell_offset,
+            Some(prior_cell),
         )
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        match (self.op_type, self.prior_cell.as_ref()) {
+            (UndoOpType::Write, None) => Ok(()),
+            (UndoOpType::Write, Some(_)) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "insert undo entry unexpectedly contains a prior cell",
+            )),
+            (UndoOpType::Update | UndoOpType::Remove, None) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{:?} undo entry has no prior cell", self.op_type),
+            )),
+            (UndoOpType::Update | UndoOpType::Remove, Some(prior_cell)) => {
+                if prior_cell.header.id() != self.cell_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "undo prior cell identity mismatch: expected {:?}, found {:?}",
+                            self.cell_id,
+                            prior_cell.header.id()
+                        ),
+                    ));
+                }
+                if prior_cell.header.revision_ts == 0
+                    || prior_cell.header.revision_ts >= self.installed_revision_ts
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid undo revision order: prior {}, installed {}",
+                            prior_cell.header.revision_ts, self.installed_revision_ts
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Serialize entry to bytes
     pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
+        self.validate()?;
         let txn_id_bytes = serde_json::to_vec(&self.txn_id)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let txn_id_len = txn_id_bytes.len() as u32;
+        let txn_id_len = u32::try_from(txn_id_bytes.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "transaction id too large"))?;
+        let prior_cell_bytes = self
+            .prior_cell
+            .as_ref()
+            .map(|prior_cell| {
+                bincode::serde::encode_to_vec(prior_cell, bincode::config::standard())
+            })
+            .transpose()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .unwrap_or_default();
+        if prior_cell_bytes.len() > MAX_UNDO_PRIOR_CELL_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "undo prior cell exceeds maximum encoded size",
+            ));
+        }
+        let prior_cell_len = u32::try_from(prior_cell_bytes.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "undo prior cell is too large")
+        })?;
 
-        let mut bytes = Vec::with_capacity(1 + 4 + txn_id_bytes.len() + UNDO_FIXED_PAYLOAD_LEN);
+        let mut bytes = Vec::with_capacity(
+            1 + 4 + txn_id_bytes.len() + UNDO_FIXED_PAYLOAD_LEN + prior_cell_bytes.len(),
+        );
         bytes.push(ENTRY_TYPE_UNDO);
         bytes.extend_from_slice(&txn_id_len.to_le_bytes());
         bytes.extend_from_slice(&txn_id_bytes);
@@ -313,10 +347,8 @@ impl UndoLogEntry {
         bytes.extend_from_slice(&self.cell_id.lower.to_le_bytes());
         bytes.push(self.op_type as u8);
         bytes.extend_from_slice(&self.installed_revision_ts.to_le_bytes());
-        bytes.extend_from_slice(&self.prior_revision_ts.unwrap_or(0).to_le_bytes());
-        bytes.extend_from_slice(&self.chunk_id.to_le_bytes());
-        bytes.extend_from_slice(&self.seq_id.to_le_bytes());
-        bytes.extend_from_slice(&self.cell_offset.to_le_bytes());
+        bytes.extend_from_slice(&prior_cell_len.to_le_bytes());
+        bytes.extend_from_slice(&prior_cell_bytes);
 
         Ok(bytes)
     }
@@ -388,76 +420,57 @@ impl UndoLogEntry {
         ]);
         offset += 8;
 
-        let encoded_prior_revision_ts = u64::from_le_bytes([
+        let prior_cell_len = u32::from_le_bytes([
             bytes[offset],
             bytes[offset + 1],
             bytes[offset + 2],
             bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]);
-        offset += 8;
-        let prior_revision_ts =
-            (encoded_prior_revision_ts != 0).then_some(encoded_prior_revision_ts);
+        ]) as usize;
+        offset += 4;
+        if prior_cell_len > MAX_UNDO_PRIOR_CELL_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "undo prior cell exceeds maximum encoded size",
+            ));
+        }
+        let total_size = offset.checked_add(prior_cell_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "undo record size overflow")
+        })?;
+        if bytes.len() < total_size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete undo prior cell payload",
+            ));
+        }
+        let prior_cell = if prior_cell_len == 0 {
+            None
+        } else {
+            let (prior_cell, decoded_len): (OwnedCell, usize) = bincode::serde::decode_from_slice(
+                &bytes[offset..total_size],
+                bincode::config::standard(),
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if decoded_len != prior_cell_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "undo prior cell payload has trailing bytes",
+                ));
+            }
+            Some(prior_cell)
+        };
 
-        let chunk_id = u64::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]);
-        offset += 8;
-
-        // Removed seg_id field deserialization
-
-        let seq_id = u64::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]);
-        offset += 8;
-
-        let cell_offset = u64::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]);
-        offset += 8;
-
-        let total_size = offset;
-
-        Ok((
-            Self {
-                txn_id,
-                cell_id: Id {
-                    higher: cell_id_higher,
-                    lower: cell_id_lower,
-                },
-                op_type,
-                installed_revision_ts,
-                prior_revision_ts,
-                chunk_id,
-                seq_id,
-                cell_offset,
+        let entry = Self {
+            txn_id,
+            cell_id: Id {
+                higher: cell_id_higher,
+                lower: cell_id_lower,
             },
-            total_size,
-        ))
+            op_type,
+            installed_revision_ts,
+            prior_cell,
+        };
+        entry.validate()?;
+        Ok((entry, total_size))
     }
 }
 
@@ -485,13 +498,15 @@ pub struct UndoLogger {
     fail_next_coordinator_commit_decision: AtomicBool,
     #[cfg(test)]
     fail_next_coordinator_abort_decision: AtomicBool,
+    #[cfg(test)]
+    rotate_before_next_record: AtomicBool,
 }
 
 impl UndoLogger {
     /// Create a new undo log manager
     pub fn new(log_dir: String) -> io::Result<Arc<Self>> {
-        create_dir_all(&log_dir)?;
         let log_dir_path = Path::new(&log_dir);
+        durable_fs::ensure_directory(log_dir_path)?;
         let existing_logs = collect_undo_log_paths(
             log_dir_path,
             std::fs::read_dir(log_dir_path)?.map(|entry| entry.map(|entry| entry.path())),
@@ -526,6 +541,8 @@ impl UndoLogger {
             fail_next_coordinator_commit_decision: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_coordinator_abort_decision: AtomicBool::new(false),
+            #[cfg(test)]
+            rotate_before_next_record: AtomicBool::new(false),
         });
 
         // Open or create initial log file
@@ -536,26 +553,31 @@ impl UndoLogger {
 
     /// Rotate to a new log file
     fn rotate_log(&self) -> io::Result<()> {
-        let seq = self.log_seq.fetch_add(1, Ordering::SeqCst);
+        // Serialize rotation through the active writer so a failed publication
+        // cannot age the still-active file into the trimmer's old-log window.
+        let mut log_file_guard = self.log_file.lock();
+        let seq = self.log_seq.load(Ordering::SeqCst);
+        let next_seq = seq.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "undo log sequence number is exhausted",
+            )
+        })?;
         let log_file_path = format!("{}/undo-{}.nlog", self.log_dir, seq);
 
         debug!("Rotating undo log to: {}", log_file_path);
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file_path)?;
-
+        let file = durable_fs::open_or_create_append(Path::new(&log_file_path))?;
         let writer = BufWriter::with_capacity(4096, file);
 
-        let mut log_file_guard = self.log_file.lock();
-        if let Some(mut old_writer) = log_file_guard.take() {
+        if let Some(old_writer) = log_file_guard.as_mut() {
             old_writer.flush()?;
             old_writer.get_ref().sync_all()?;
         }
 
         *log_file_guard = Some(writer);
         *self.log_file_name.lock() = Some(log_file_path);
+        self.log_seq.store(next_seq, Ordering::SeqCst);
 
         Ok(())
     }
@@ -692,6 +714,8 @@ impl UndoLogger {
         participants: &[u64],
     ) -> io::Result<()> {
         #[cfg(test)]
+        self.rotate_before_record_if_requested_for_test()?;
+        #[cfg(test)]
         if self
             .fail_next_coordinator_commit_decision
             .swap(false, Ordering::SeqCst)
@@ -747,6 +771,8 @@ impl UndoLogger {
         txn_id: &TxnId,
         participants: &[u64],
     ) -> io::Result<()> {
+        #[cfg(test)]
+        self.rotate_before_record_if_requested_for_test()?;
         #[cfg(test)]
         if self
             .fail_next_coordinator_abort_decision
@@ -1029,6 +1055,24 @@ impl UndoLogger {
             .store(true, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) fn rotate_before_next_record_for_test(&self) {
+        self.rotate_before_next_record.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn log_directory_for_test(&self) -> PathBuf {
+        PathBuf::from(&self.log_dir)
+    }
+
+    #[cfg(test)]
+    fn rotate_before_record_if_requested_for_test(&self) -> io::Result<()> {
+        if self.rotate_before_next_record.swap(false, Ordering::SeqCst) {
+            self.rotate_log()?;
+        }
+        Ok(())
+    }
+
     /// Perform rollback for all incomplete transactions
     /// Must be called after segment recovery is complete
     /// Takes the txn_index built during recovery as a parameter
@@ -1176,24 +1220,22 @@ impl UndoLogger {
     /// Compensate a recovered update or remove by restoring the immutable prior
     /// contents as a newer committed revision.
     fn rollback_restore(&self, entry: &UndoLogEntry, chunks: &Arc<Chunks>) -> io::Result<()> {
-        let prior_revision_ts = entry.prior_revision_ts.ok_or_else(|| {
+        entry.validate()?;
+        let old_cell = entry.prior_cell.clone().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{:?} undo entry for {:?} has no prior revision",
+                    "{:?} undo entry for {:?} has no prior cell",
                     entry.op_type, entry.cell_id
                 ),
             )
         })?;
         debug!(
-            "Compensating recovered {:?}: cell_id={:?}, installed_revision_ts={}, prior_revision_ts={}, from chunk={}, seq={}, offset={}",
+            "Compensating recovered {:?}: cell_id={:?}, installed_revision_ts={}, prior_revision_ts={}",
             entry.op_type,
             entry.cell_id,
             entry.installed_revision_ts,
-            prior_revision_ts,
-            entry.chunk_id,
-            entry.seq_id,
-            entry.cell_offset
+            old_cell.header.revision_ts,
         );
         if chunks.current_revision_ts(&entry.cell_id) != Some(entry.installed_revision_ts) {
             debug!(
@@ -1203,49 +1245,8 @@ impl UndoLogger {
             return Ok(());
         }
 
-        // Get the chunk and find the segment in memory
-        let chunk = chunks.list.get(entry.chunk_id as usize).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("undo entry references missing chunk {}", entry.chunk_id),
-            )
-        })?;
-
-        // Find the segment by seq_id (segments are already loaded in memory after recovery)
-        // Note: seg_id in the undo log is the OLD segment ID from before recovery,
-        // so we can only rely on seq_id which is stable across recoveries.
-        // If multiple segments have the same seq_id (e.g., bootstrap segment + recovered segment),
-        // prefer the one with actual data (non-zero append_header offset)
-        let segment = chunk
-            .segments()
-            .into_iter()
-            .filter(|seg| seg.seq_id == entry.seq_id)
-            .max_by_key(|seg| seg.append_header.load(Ordering::Acquire) - seg.addr) // Prefer segment with more data
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "Segment with seq_id {} not found in chunk {}",
-                        entry.seq_id, entry.chunk_id
-                    ),
-                )
-            })?;
-
-        debug!(
-            "Found segment in memory: seg_id={}, seq_id={}, addr={:#x}",
-            segment.id, segment.seq_id, segment.addr
-        );
-
-        // Directly read the old cell from the specified offset (no scanning needed!)
-        let cell_addr = segment.addr + entry.cell_offset as usize;
-        let old_cell =
-            self.read_cell_from_address(cell_addr, chunk, &entry.cell_id, prior_revision_ts)?;
         chunks
-            .compensate_recovered(
-                &entry.cell_id,
-                entry.installed_revision_ts,
-                Some(old_cell),
-            )
+            .compensate_recovered(&entry.cell_id, entry.installed_revision_ts, Some(old_cell))
             .and_then(|compensation| {
                 chunks
                     .force_sync_installed_revisions([&compensation])
@@ -1257,86 +1258,11 @@ impl UndoLogger {
                 io::Error::new(
                     io::ErrorKind::Other,
                     format!(
-                        "restore compensation for cell {:?} from chunk {} segment {} offset {} failed: {:?}",
-                        entry.cell_id,
-                        entry.chunk_id,
-                        entry.seq_id,
-                        entry.cell_offset,
-                        error
+                        "restore compensation for cell {:?} failed: {:?}",
+                        entry.cell_id, error
                     ),
                 )
             })
-    }
-
-    /// Read a cell directly from a memory address (using stored offset, no scanning!)
-    ///
-    /// # Arguments
-    /// * `cell_addr` - Memory address of the entry (not content address)
-    /// * `chunk` - The chunk containing the cell
-    /// * `cell_id` - Expected cell ID (for verification)
-    /// * `expected_revision_ts` - Expected immutable prior revision
-    fn read_cell_from_address(
-        &self,
-        cell_addr: usize,
-        chunk: &crate::ram::chunk::Chunk,
-        cell_id: &Id,
-        expected_revision_ts: u64,
-    ) -> io::Result<OwnedCell> {
-        // Read cell header from the entry content address
-        let content_addr = Entry::content_pos(cell_addr);
-        let cell_header = cell_header_from_entry_content_addr(content_addr);
-
-        // Check if segment has been cleaned (hash=0 indicates freed/cleaned segment)
-        if cell_header.hash == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Cell at offset {} has been cleaned (hash=0)", cell_addr),
-            ));
-        }
-
-        if Id::from_header(&cell_header) != *cell_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Cell identity mismatch at offset: expected {:?}, found {:?}",
-                    cell_id,
-                    Id::from_header(&cell_header)
-                ),
-            ));
-        }
-
-        if cell_header.revision_ts != expected_revision_ts {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Cell revision_ts mismatch at offset: expected {}, found {}",
-                    expected_revision_ts, cell_header.revision_ts
-                ),
-            ));
-        }
-
-        debug!(
-            "Reading verified cell from offset: hash={}, revision_ts={}, schema={}",
-            cell_header.hash, cell_header.revision_ts, cell_header.schema
-        );
-
-        // Get schema to deserialize data
-        let schema = chunk.meta.schemas.get(&cell_header.schema).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Schema {} not found", cell_header.schema),
-            )
-        })?;
-
-        // Read cell data using the schema
-        let data_ptr = content_addr + std::mem::size_of::<CellHeader>();
-        let cell_data = reader::read_by_schema(data_ptr, &schema);
-
-        // Convert to owned
-        Ok(OwnedCell {
-            header: cell_header,
-            data: cell_data.owned(),
-        })
     }
 
     /// Trim old log files that only contain committed/aborted transactions
@@ -1368,7 +1294,7 @@ impl UndoLogger {
                                                 .log_contains_active_txns(&path, &active_txns)?
                                             {
                                                 debug!("Trimming old undo log: {:?}", path);
-                                                remove_file(&path)?;
+                                                durable_fs::remove_file(&path)?;
                                             }
                                         }
                                     }
@@ -1415,8 +1341,8 @@ impl UndoLogger {
 
             match entry_type {
                 ENTRY_TYPE_UNDO => {
-                    // Skip the rest of the undo entry
-                    offset += 5 + txn_id_len + UNDO_FIXED_PAYLOAD_LEN;
+                    let (_, size) = UndoLogEntry::from_bytes(&buffer[offset..])?;
+                    offset += size;
                 }
                 ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
                     // Participant completion evidence is retained until a
@@ -1607,6 +1533,9 @@ impl UndoLogger {
 mod tests {
     use super::*;
     use crate::ram::cell::ReadError;
+    use crate::ram::durable_fs::{
+        directory_sync_count_for_test, fail_next_directory_sync_for_test,
+    };
     use crate::ram::types::{OwnedMap, OwnedValue};
     use crate::server::transactions::test_hlc;
     use crate::server::transactions::{
@@ -1626,6 +1555,65 @@ mod tests {
             higher: now.as_secs(),
             lower: now.subsec_nanos() as u64,
         }
+    }
+
+    fn test_prior_cell(id: Id, revision_ts: u64) -> OwnedCell {
+        let mut cell = OwnedCell::new_with_id(0, &id, OwnedValue::Null);
+        cell.header.revision_ts = revision_ts;
+        cell
+    }
+
+    #[test]
+    fn undo_owned_prior_payload_preserves_ieee_float_bits() {
+        let id = Id::new(91, 92);
+        let f64_nan_bits = 0x7ff8_0000_0000_0042;
+        let f32_nan_bits = 0x7fc0_0042;
+        let mut prior = OwnedCell::new_with_id(
+            0,
+            &id,
+            OwnedValue::Array(vec![
+                OwnedValue::F64(f64::from_bits(f64_nan_bits)),
+                OwnedValue::F64(f64::INFINITY),
+                OwnedValue::F64(-0.0),
+                OwnedValue::F32(f32::from_bits(f32_nan_bits)),
+                OwnedValue::F32(f32::NEG_INFINITY),
+                OwnedValue::F32(0.0),
+            ]),
+        );
+        prior.header.revision_ts = 100;
+        let encoded =
+            UndoLogEntry::new_restore(test_hlc(99, 7), id, UndoOpType::Update, 101, prior)
+                .to_bytes()
+                .expect("valid IEEE values must be encodable");
+        let (decoded, consumed) =
+            UndoLogEntry::from_bytes(&encoded).expect("owned prior payload must decode");
+        assert_eq!(consumed, encoded.len());
+
+        let OwnedValue::Array(values) = decoded
+            .prior_cell
+            .expect("update must retain its prior cell")
+            .data
+        else {
+            panic!("expected float array");
+        };
+        assert_eq!(values[0].f64().expect("f64 NaN").to_bits(), f64_nan_bits);
+        assert_eq!(
+            values[1].f64().expect("f64 infinity").to_bits(),
+            f64::INFINITY.to_bits()
+        );
+        assert_eq!(
+            values[2].f64().expect("f64 signed zero").to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(values[3].f32().expect("f32 NaN").to_bits(), f32_nan_bits);
+        assert_eq!(
+            values[4].f32().expect("f32 infinity").to_bits(),
+            f32::NEG_INFINITY.to_bits()
+        );
+        assert_eq!(
+            values[5].f32().expect("f32 signed zero").to_bits(),
+            0.0f32.to_bits()
+        );
     }
 
     fn compensation_test_chunks(name: &str) -> (crate::ram::schema::Schema, Arc<Chunks>) {
@@ -1656,17 +1644,99 @@ mod tests {
         (schema, chunks)
     }
 
-    fn stable_cell_location(chunks: &Chunks, id: &Id) -> (u64, u64, u64) {
-        let chunk = chunks.locate_chunk_by_partition(id.higher);
-        let address = chunks.address_of(id);
-        let (_, seq_id) = chunk.get_cell_segment_info(address);
-        let segment_base = chunk
-            .segments()
-            .into_iter()
-            .find(|segment| segment.contains_address(address))
-            .unwrap()
-            .addr;
-        (chunk.id as u64, seq_id, (address - segment_base) as u64)
+    #[test]
+    fn undo_log_creation_and_rotation_durably_publish_each_new_filename_once() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let before = directory_sync_count_for_test(&log_dir);
+
+        let undo =
+            UndoLogger::new(log_dir.to_string_lossy().into_owned()).expect("initial undo log");
+        assert_eq!(directory_sync_count_for_test(&log_dir), before + 1);
+
+        undo.write_undo_entry(UndoLogEntry::new_write(test_hlc(1, 1), Id::new(1, 1), 2))
+            .unwrap();
+        assert_eq!(
+            directory_sync_count_for_test(&log_dir),
+            before + 1,
+            "ordinary records on an existing undo file must not resync its directory"
+        );
+
+        undo.rotate_log().expect("rotate undo log");
+        assert_eq!(
+            directory_sync_count_for_test(&log_dir),
+            before + 2,
+            "a newly rotated filename must be durably published"
+        );
+    }
+
+    #[test]
+    fn undo_log_creation_propagates_directory_sync_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        fail_next_directory_sync_for_test(&log_dir);
+
+        let error = match UndoLogger::new(log_dir.to_string_lossy().into_owned()) {
+            Ok(_) => panic!("undo logger must reject an undurable initial filename"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error
+            .to_string()
+            .contains("injected directory sync failure"));
+    }
+
+    #[test]
+    fn failed_rotations_do_not_make_active_log_trim_eligible() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).unwrap();
+        let active_path = PathBuf::from(
+            undo.log_file_name
+                .lock()
+                .clone()
+                .expect("active log filename"),
+        );
+
+        for _ in 0..3 {
+            fail_next_directory_sync_for_test(&log_dir);
+            undo.rotate_log()
+                .expect_err("injected rotation publication must fail");
+        }
+        undo.trim_old_logs().unwrap();
+
+        assert!(
+            active_path.exists(),
+            "failed rotations must not age the still-active log into the trim window"
+        );
+        let tid = test_hlc(5, 9);
+        undo.write_coordinator_abort_decision(&tid, &[17]).unwrap();
+        drop(undo);
+        let reopened = UndoLogger::new(log_dir.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(
+            reopened.coordinator_decision(&tid).unwrap(),
+            Some(TxnResolution::Abort),
+            "records appended after failed rotations must remain crash-visible"
+        );
+    }
+
+    #[test]
+    fn coordinator_decision_rotation_directory_failure_prevents_durable_decision() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().join("undo");
+        let undo = UndoLogger::new(log_dir.to_string_lossy().into_owned()).unwrap();
+        let tid = test_hlc(8, 2);
+        undo.rotate_before_next_record_for_test();
+        fail_next_directory_sync_for_test(&log_dir);
+
+        let error = undo
+            .write_coordinator_commit_decision(&tid, test_hlc(9, 2), &[11])
+            .expect_err("undurable rotated filename must reject coordinator decision");
+        assert!(error
+            .to_string()
+            .contains("injected directory sync failure"));
+        assert_eq!(undo.coordinator_decision(&tid).unwrap(), None);
     }
 
     #[test]
@@ -1676,7 +1746,13 @@ mod tests {
             higher: 1,
             lower: 2,
         };
-        let entry = UndoLogEntry::new(txn_id, cell_id, UndoOpType::Update, 6, Some(5), 0, 1000, 50);
+        let entry = UndoLogEntry::new_restore(
+            txn_id,
+            cell_id,
+            UndoOpType::Update,
+            6,
+            test_prior_cell(cell_id, 5),
+        );
 
         let bytes = entry.to_bytes().unwrap();
         let (recovered, size) = UndoLogEntry::from_bytes(&bytes).unwrap();
@@ -1685,9 +1761,47 @@ mod tests {
         assert_eq!(recovered.cell_id, entry.cell_id);
         assert_eq!(recovered.op_type, entry.op_type);
         assert_eq!(recovered.installed_revision_ts, entry.installed_revision_ts);
-        assert_eq!(recovered.prior_revision_ts, entry.prior_revision_ts);
-        assert_eq!(recovered.chunk_id, entry.chunk_id);
-        assert_eq!(recovered.seq_id, entry.seq_id);
+        assert_eq!(
+            serde_json::to_vec(&recovered.prior_cell).unwrap(),
+            serde_json::to_vec(&entry.prior_cell).unwrap()
+        );
+    }
+
+    #[test]
+    fn undo_owned_prior_round_trips_by_operation_without_a_raw_location() {
+        let id = Id::new(1, 2);
+        let mut prior = OwnedCell::new_with_id(
+            7,
+            &id,
+            data_map_value!(id: 1i32, value: "prior".to_string()),
+        );
+        prior.header.revision_ts = 100;
+
+        for operation in [UndoOpType::Update, UndoOpType::Remove] {
+            let entry =
+                UndoLogEntry::new_restore(test_hlc(10, 1), id, operation, 200, prior.clone());
+            let decoded = UndoLogEntry::from_bytes(&entry.to_bytes().unwrap())
+                .unwrap()
+                .0;
+            assert_eq!(decoded.op_type, operation);
+            let decoded_prior = decoded
+                .prior_cell
+                .expect("update/remove undo must own prior bytes");
+            assert_eq!(
+                serde_json::to_vec(&decoded_prior).unwrap(),
+                serde_json::to_vec(&prior).unwrap()
+            );
+        }
+
+        let insert = UndoLogEntry::new_write(test_hlc(11, 1), id, 201);
+        assert!(
+            UndoLogEntry::from_bytes(&insert.to_bytes().unwrap())
+                .unwrap()
+                .0
+                .prior_cell
+                .is_none(),
+            "insert undo has no prior bytes"
+        );
     }
 
     #[test]
@@ -1736,21 +1850,19 @@ mod tests {
 
     #[test]
     fn undo_bytes_record_installed_and_prior_revisions() {
+        let id = Id::new(1, 2);
         let entry = UndoLogEntry::new_restore(
             test_hlc(10, 1),
-            Id::new(1, 2),
+            id,
             UndoOpType::Update,
             200,
-            100,
-            0,
-            9,
-            64,
+            test_prior_cell(id, 100),
         );
         let decoded = UndoLogEntry::from_bytes(&entry.to_bytes().unwrap())
             .unwrap()
             .0;
         assert_eq!(decoded.installed_revision_ts, 200);
-        assert_eq!(decoded.prior_revision_ts, Some(100));
+        assert_eq!(decoded.prior_cell.unwrap().header.revision_ts, 100);
     }
 
     #[test]
@@ -1949,6 +2061,38 @@ mod tests {
     }
 
     #[test]
+    fn trimming_follows_owned_prior_payload_to_participant_completion() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_string_lossy().into_owned();
+        let participant_tid = test_hlc(310, 11);
+        let cell_id = Id::new(1, 160);
+
+        {
+            let undo = UndoLogger::new(log_dir.clone()).unwrap();
+            undo.write_undo_entry(UndoLogEntry::new_restore(
+                participant_tid,
+                cell_id,
+                UndoOpType::Update,
+                312,
+                test_prior_cell(cell_id, 311),
+            ))
+            .unwrap();
+            undo.write_commit_marker(&participant_tid).unwrap();
+            for _ in 0..4 {
+                undo.rotate_log().unwrap();
+            }
+            undo.trim_old_logs().unwrap();
+        }
+
+        let reopened = UndoLogger::new(log_dir).unwrap();
+        assert_eq!(
+            reopened.participant_completion(&participant_tid).unwrap(),
+            Some(TxnState::Committed),
+            "trimming must step over the variable owned-prior payload before retaining completion"
+        );
+    }
+
+    #[test]
     fn test_undo_log_basic() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
@@ -1960,15 +2104,12 @@ mod tests {
             higher: 1,
             lower: 2,
         };
-        let entry = UndoLogEntry::new(
+        let entry = UndoLogEntry::new_restore(
             txn_id.clone(),
             cell_id,
             UndoOpType::Update,
             4,
-            Some(3),
-            0,
-            1000,
-            50,
+            test_prior_cell(cell_id, 3),
         );
 
         undo_log.write_undo_entry(entry.clone()).unwrap();
@@ -1995,15 +2136,12 @@ mod tests {
             higher: 1,
             lower: 2,
         };
-        let entry = UndoLogEntry::new(
+        let entry = UndoLogEntry::new_restore(
             txn_id.clone(),
             cell_id,
             UndoOpType::Remove,
             3,
-            Some(2),
-            0,
-            1000,
-            50,
+            test_prior_cell(cell_id, 2),
         );
 
         {
@@ -2087,15 +2225,12 @@ mod tests {
         };
 
         let entry1 = UndoLogEntry::new_write(txn_id.clone(), cell_id1, 1);
-        let entry2 = UndoLogEntry::new(
+        let entry2 = UndoLogEntry::new_restore(
             txn_id.clone(),
             cell_id2,
             UndoOpType::Update,
             5,
-            Some(4),
-            0,
-            2000,
-            100,
+            test_prior_cell(cell_id2, 4),
         );
 
         undo_log.write_undo_entry(entry1).unwrap();
@@ -2132,7 +2267,7 @@ mod tests {
         assert_eq!(entries.len(), 1, "Should have 1 undo entry before commit");
         assert_eq!(entries[0].op_type, UndoOpType::Write);
         assert_eq!(entries[0].installed_revision_ts, 1);
-        assert_eq!(entries[0].prior_revision_ts, None);
+        assert!(entries[0].prior_cell.is_none());
 
         // Commit the transaction
         undo_log.write_commit_marker(&txn1).unwrap();
@@ -2178,8 +2313,13 @@ mod tests {
 
         // Write, Update, and Remove operations
         let entry1 = UndoLogEntry::new_write(txn.clone(), cell_id1, 1);
-        let entry2 =
-            UndoLogEntry::new_restore(txn.clone(), cell_id2, UndoOpType::Update, 6, 5, 0, 1000, 50);
+        let entry2 = UndoLogEntry::new_restore(
+            txn.clone(),
+            cell_id2,
+            UndoOpType::Update,
+            6,
+            test_prior_cell(cell_id2, 5),
+        );
 
         undo_log.write_undo_entry(entry1).unwrap();
         undo_log.write_undo_entry(entry2).unwrap();
@@ -2244,20 +2384,14 @@ mod tests {
                 cell_id2,
                 UndoOpType::Update,
                 4,
-                3,
-                0,
-                500,
-                25,
+                test_prior_cell(cell_id2, 3),
             );
             let entry3 = UndoLogEntry::new_restore(
                 txn_incomplete.clone(),
                 cell_id3,
                 UndoOpType::Remove,
                 8,
-                7,
-                1,
-                750,
-                37,
+                test_prior_cell(cell_id3, 7),
             );
 
             undo_log.write_undo_entry(entry1).unwrap();
@@ -2279,23 +2413,23 @@ mod tests {
         assert_eq!(entries[0].cell_id, cell_id1);
         assert_eq!(entries[0].op_type, UndoOpType::Write);
         assert_eq!(entries[0].installed_revision_ts, 1);
-        assert_eq!(entries[0].prior_revision_ts, None);
+        assert!(entries[0].prior_cell.is_none());
 
         assert_eq!(entries[1].cell_id, cell_id2);
         assert_eq!(entries[1].op_type, UndoOpType::Update);
         assert_eq!(entries[1].installed_revision_ts, 4);
-        assert_eq!(entries[1].prior_revision_ts, Some(3));
-        assert_eq!(entries[1].chunk_id, 0);
-        // Removed seg_id assertion
-        assert_eq!(entries[1].seq_id, 500);
+        assert_eq!(
+            entries[1].prior_cell.as_ref().unwrap().header.revision_ts,
+            3
+        );
 
         assert_eq!(entries[2].cell_id, cell_id3);
         assert_eq!(entries[2].op_type, UndoOpType::Remove);
         assert_eq!(entries[2].installed_revision_ts, 8);
-        assert_eq!(entries[2].prior_revision_ts, Some(7));
-        assert_eq!(entries[2].chunk_id, 1);
-        // Removed seg_id assertion
-        assert_eq!(entries[2].seq_id, 750);
+        assert_eq!(
+            entries[2].prior_cell.as_ref().unwrap().header.revision_ts,
+            7
+        );
     }
 
     /// Test if TxnId (Hlc) equality works after JSON serialization
@@ -2364,7 +2498,7 @@ mod tests {
         // UndoLogEntry::to_bytes() frames a new one:
         // [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id.higher: u64]
         // [cell_id.lower: u64][op_type: u8][installed_revision_ts: u64]
-        // [prior_revision_ts: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
+        // [prior_cell_len: u32][prior_owned_cell: bytes]
         let mut bytes = Vec::new();
         bytes.push(ENTRY_TYPE_UNDO);
         bytes.extend_from_slice(&(old_txn_id_bytes.len() as u32).to_le_bytes());
@@ -2373,10 +2507,7 @@ mod tests {
         bytes.extend_from_slice(&2u64.to_le_bytes()); // cell_id.lower
         bytes.push(UndoOpType::Write as u8);
         bytes.extend_from_slice(&1u64.to_le_bytes()); // installed_revision_ts
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // prior_revision_ts (None)
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // chunk_id
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // seq_id
-        bytes.extend_from_slice(&0u64.to_le_bytes()); // cell_offset
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // prior_cell_len (None)
 
         // Also exercise the entry-level parser directly with the same
         // hand-assembled bytes.
@@ -2480,10 +2611,12 @@ mod tests {
                 );
                 entry_count += 1;
 
-                // Skip to next entry (approximate)
                 match entry_type {
-                    1 => offset += 5 + txn_id_len + 49, // UNDO entry
-                    2 | 3 => offset += 5 + txn_id_len,  // COMMIT/ABORT marker
+                    ENTRY_TYPE_UNDO => {
+                        let (_, size) = UndoLogEntry::from_bytes(&contents[offset..]).unwrap();
+                        offset += size;
+                    }
+                    ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => offset += 5 + txn_id_len,
                     _ => break,
                 }
             }
@@ -2794,34 +2927,30 @@ mod tests {
         undo_log.write_undo_entry(write_entry).unwrap();
 
         // Update records both installed and prior revisions.
+        let update_id = Id {
+            higher: 1,
+            lower: 2,
+        };
         let update_entry = UndoLogEntry::new_restore(
             txn.clone(),
-            Id {
-                higher: 1,
-                lower: 2,
-            },
+            update_id,
             UndoOpType::Update,
-            21,   // installed revision_ts
-            20,   // prior revision_ts
-            0,    // chunk_id
-            1000, // seq_id
-            50,   // cell_offset
+            21,
+            test_prior_cell(update_id, 20),
         );
         undo_log.write_undo_entry(update_entry).unwrap();
 
         // Remove records the installed tombstone and prior present revision.
+        let remove_id = Id {
+            higher: 1,
+            lower: 3,
+        };
         let remove_entry = UndoLogEntry::new_restore(
             txn.clone(),
-            Id {
-                higher: 1,
-                lower: 3,
-            },
+            remove_id,
             UndoOpType::Remove,
-            31,   // installed revision_ts
-            30,   // prior revision_ts
-            1,    // chunk_id
-            2000, // seq_id
-            100,  // cell_offset
+            31,
+            test_prior_cell(remove_id, 30),
         );
         undo_log.write_undo_entry(remove_entry).unwrap();
 
@@ -2834,26 +2963,23 @@ mod tests {
         // Verify Write entry
         assert_eq!(entries[0].op_type, UndoOpType::Write);
         assert_eq!(entries[0].installed_revision_ts, 10);
-        assert_eq!(entries[0].prior_revision_ts, None);
-        assert_eq!(entries[0].chunk_id, 0);
-        // Removed seg_id assertions
-        assert_eq!(entries[0].seq_id, 0);
+        assert!(entries[0].prior_cell.is_none());
 
         // Verify Update entry
         assert_eq!(entries[1].op_type, UndoOpType::Update);
         assert_eq!(entries[1].installed_revision_ts, 21);
-        assert_eq!(entries[1].prior_revision_ts, Some(20));
-        assert_eq!(entries[1].chunk_id, 0);
-        // Removed seg_id assertion
-        assert_eq!(entries[1].seq_id, 1000);
+        assert_eq!(
+            entries[1].prior_cell.as_ref().unwrap().header.revision_ts,
+            20
+        );
 
         // Verify Remove entry
         assert_eq!(entries[2].op_type, UndoOpType::Remove);
         assert_eq!(entries[2].installed_revision_ts, 31);
-        assert_eq!(entries[2].prior_revision_ts, Some(30));
-        assert_eq!(entries[2].chunk_id, 1);
-        // Removed seg_id assertion
-        assert_eq!(entries[2].seq_id, 2000);
+        assert_eq!(
+            entries[2].prior_cell.as_ref().unwrap().header.revision_ts,
+            30
+        );
     }
 
     /// Test end-to-end: Rollback Write operations (delete new cells)
@@ -3074,16 +3200,7 @@ mod tests {
             data_map_value!(id: 1i32, value: "restore".to_string()),
         );
         chunks.write_cell(&mut cell).unwrap();
-        let chunk = chunks.locate_chunk_by_partition(cell_id.higher);
-        let old_addr = chunks.address_of(&cell_id);
-        let (_, seq_id) = chunk.get_cell_segment_info(old_addr);
-        let segment_base = chunk
-            .segments()
-            .into_iter()
-            .find(|segment| segment.contains_address(old_addr))
-            .unwrap()
-            .addr;
-        let prior_revision_ts = cell.header.revision_ts;
+        let prior_cell = cell.clone();
         chunks.remove_cell(&cell_id).unwrap();
         let installed_revision_ts = chunks.current_revision_ts(&cell_id).unwrap();
         let entry = UndoLogEntry::new_restore(
@@ -3091,10 +3208,7 @@ mod tests {
             cell_id,
             UndoOpType::Remove,
             installed_revision_ts,
-            prior_revision_ts,
-            chunk.id as u64,
-            seq_id,
-            (old_addr - segment_base) as u64,
+            prior_cell,
         );
         chunks.fail_next_allocation_for_test(&cell_id);
         let unrelated_id = Id::new(2, 602);
@@ -3183,21 +3297,8 @@ mod tests {
         );
         chunks.write_cell(&mut cell).unwrap();
         let initial_revision_ts = cell.header.revision_ts;
+        let prior_cell = cell.clone();
         println!("Created cell with revision_ts {}", initial_revision_ts);
-
-        // Get cell location for undo log
-        let chunk = chunks.locate_chunk_by_partition(cell_id.higher);
-        let (_cell_addr, _seg_id, seq_id, cell_offset) = {
-            // Scope the guard so it's dropped immediately after we extract the info
-            let guard = chunk.location_for_read(cell_id.lower).unwrap();
-            let addr = *guard;
-            drop(guard); // Explicitly drop to release lock
-
-            let (seg_id, seq_id) = chunk.get_cell_segment_info(addr);
-            let segment_base_addr = chunk.allocator.addr_by_id(seg_id as usize);
-            let offset = (addr - segment_base_addr) as u64;
-            (addr, seg_id, seq_id, offset)
-        };
 
         let mut failed = OwnedCell::new_with_id(
             0,
@@ -3213,10 +3314,7 @@ mod tests {
             cell_id,
             UndoOpType::Update,
             installed_revision_ts,
-            initial_revision_ts,
-            chunk.id as u64,
-            seq_id,
-            cell_offset,
+            prior_cell,
         );
         undo_log.write_undo_entry(undo_entry).unwrap();
 
@@ -3311,7 +3409,7 @@ mod tests {
             data_map_value!(id: 1i32, value: "original".to_string()),
         );
         let prior_revision_ts = chunks.write_cell(&mut original).unwrap().revision_ts;
-        let (chunk_id, seq_id, cell_offset) = stable_cell_location(&chunks, &id);
+        let prior_cell = original.clone();
         let mut failed = OwnedCell::new_with_id(
             schema.id,
             &id,
@@ -3324,10 +3422,7 @@ mod tests {
             id,
             UndoOpType::Update,
             installed_revision_ts,
-            prior_revision_ts,
-            chunk_id,
-            seq_id,
-            cell_offset,
+            prior_cell,
         );
         let undo =
             UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
@@ -3366,6 +3461,125 @@ mod tests {
     }
 
     #[test]
+    fn restart_compensation_uses_owned_payload_after_source_wal_is_removed() {
+        use crate::ram::schema::{Field, Schema};
+        use crate::ram::segs::SEGMENT_SIZE;
+        use dovahkiin::types::Type;
+
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+        let undo_dir = temp_dir.path().join("undo");
+        let raft_dir = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_dir).unwrap();
+        let schema = Schema::new(
+            "restart_owned_undo_payload",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::I32),
+                Field::new_unindexed("value", Type::String),
+            ]),
+            false,
+            false,
+        );
+        let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let meta = Arc::new(crate::server::ServerMeta { schemas });
+        let id = Id::new(0, 705);
+        let tid = test_hlc(24, 1);
+        let installed_revision_ts;
+
+        {
+            let chunks = Chunks::new(
+                1,
+                SEGMENT_SIZE * 4,
+                meta.clone(),
+                None,
+                None,
+                Some(wal_dir.to_string_lossy().into_owned()),
+                None,
+            );
+            let mut original = OwnedCell::new_with_id(
+                schema.id,
+                &id,
+                data_map_value!(id: 1i32, value: "owned-prior".to_string()),
+            );
+            chunks.write_cell(&mut original).unwrap();
+            let prior_cell = original.clone();
+            let chunk = chunks.locate_chunk_by_partition(id.higher);
+            let source = chunk
+                .locate_segment(chunks.address_of(&id))
+                .expect("prior source segment");
+            let source_wal = chunk
+                .file_manager
+                .wal_path(chunk.id, source.id, source.seq_id)
+                .expect("prior source WAL");
+            source.append_header.store(source.bound, Ordering::Release);
+
+            let mut failed = OwnedCell::new_with_id(
+                schema.id,
+                &id,
+                data_map_value!(id: 1i32, value: "failed-update".to_string()),
+            );
+            installed_revision_ts = chunks
+                .next_revision_ts(prior_cell.header.revision_ts)
+                .unwrap();
+            let installed = chunks
+                .update_cell_at_revision(
+                    &mut failed,
+                    crate::ram::cell::RevisionWrite::committed(installed_revision_ts),
+                )
+                .unwrap();
+            chunks.force_sync_installed_revisions([&installed]).unwrap();
+            let undo = UndoLogger::new(undo_dir.to_string_lossy().into_owned()).unwrap();
+            undo.write_undo_entry(UndoLogEntry::new_restore(
+                tid,
+                id,
+                UndoOpType::Update,
+                installed_revision_ts,
+                prior_cell,
+            ))
+            .unwrap();
+
+            assert!(chunk.remove_segment(source.id).unwrap());
+            source.mem_drop(chunk);
+            assert!(
+                !std::path::Path::new(&source_wal).exists(),
+                "the old physical source must be unavailable before restart"
+            );
+        }
+
+        let (recovered, recovery) = Chunks::recover_with_clock(
+            1,
+            SEGMENT_SIZE * 4,
+            meta,
+            None,
+            None,
+            Some(wal_dir.to_string_lossy().into_owned()),
+            None,
+            Some(raft_dir.to_string_lossy().into_owned()),
+            Arc::new(bifrost::hlc::HlcSource::new(0)),
+            300_000,
+        )
+        .unwrap();
+        recovered
+            .revision_clock()
+            .try_observe(test_hlc(recovery.max_revision_ts, 0))
+            .unwrap();
+        assert_eq!(
+            recovered.current_revision_ts(&id),
+            Some(installed_revision_ts)
+        );
+        let undo = UndoLogger::new(undo_dir.to_string_lossy().into_owned()).unwrap();
+        let entries = undo.recover().unwrap();
+        undo.rollback_incomplete_transactions(entries, &recovered)
+            .unwrap();
+
+        let restored = recovered.read_cell(&id).unwrap().to_owned();
+        assert_eq!(restored.data["value"].string().unwrap(), "owned-prior");
+        assert!(restored.header.revision_ts > installed_revision_ts);
+    }
+
+    #[test]
     fn recovery_rejects_prior_source_with_same_hash_and_revision_but_wrong_partition() {
         let temp_dir = TempDir::new().unwrap();
         let (schema, chunks) = compensation_test_chunks("recovery_full_id_validation");
@@ -3385,7 +3599,6 @@ mod tests {
                 crate::ram::cell::RevisionWrite::committed(prior_revision_ts),
             )
             .unwrap();
-        let (chunk_id, seq_id, cell_offset) = stable_cell_location(&chunks, &wrong_source_id);
         chunks
             .remove_cell_at_revision(
                 &wrong_source_id,
@@ -3422,10 +3635,7 @@ mod tests {
             target_id,
             UndoOpType::Update,
             installed_revision_ts,
-            prior_revision_ts,
-            chunk_id,
-            seq_id,
-            cell_offset,
+            wrong_source.clone(),
         );
         let undo =
             UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
@@ -3465,7 +3675,7 @@ mod tests {
             data_map_value!(id: 1i32, value: "original".to_string()),
         );
         let prior_revision_ts = chunks.write_cell(&mut original).unwrap().revision_ts;
-        let (chunk_id, seq_id, cell_offset) = stable_cell_location(&chunks, &id);
+        let prior_cell = original.clone();
         chunks.remove_cell(&id).unwrap();
         let installed_revision_ts = chunks.current_revision_ts(&id).unwrap();
         let tid = test_hlc(22, 1);
@@ -3474,10 +3684,7 @@ mod tests {
             id,
             UndoOpType::Remove,
             installed_revision_ts,
-            prior_revision_ts,
-            chunk_id,
-            seq_id,
-            cell_offset,
+            prior_cell,
         );
         let undo =
             UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();

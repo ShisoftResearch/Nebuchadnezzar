@@ -2,6 +2,10 @@ use crate::dovahkiin::types::Map;
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
 use crate::ram::cleaner::combine;
+use crate::ram::durable_fs::{
+    durability_events_for_test, fail_directory_sync_after_for_test,
+    fail_next_directory_sync_for_test, DurabilityEvent,
+};
 use crate::ram::entry::{EntryContent, EntryType};
 use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::Field;
@@ -134,24 +138,14 @@ fn restore_undo_entry(
     installed_revision_ts: u64,
     prior_revision_ts: u64,
 ) -> UndoLogEntry {
-    let chunk = chunks.locate_chunk_by_partition(id.higher);
-    let prior_addr = chunks
-        .history_location(&id, prior_revision_ts)
-        .expect("prior immutable revision");
-    let (_, seq_id) = chunk.get_cell_segment_info(prior_addr);
-    let source = chunk
-        .locate_segment(prior_addr)
-        .expect("prior immutable segment");
-    UndoLogEntry::new_restore(
-        txn_id,
-        id,
-        op_type,
-        installed_revision_ts,
-        prior_revision_ts,
-        chunk.id as u64,
-        seq_id,
-        (prior_addr - source.addr) as u64,
-    )
+    let prior_cell = match chunks
+        .read_cell_snapshot(&id, installed_revision_ts)
+        .expect("read prior immutable revision")
+    {
+        SnapshotRead::Present(cell) if cell.header.revision_ts == prior_revision_ts => cell,
+        other => panic!("expected prior immutable revision, found {other:?}"),
+    };
+    UndoLogEntry::new_restore(txn_id, id, op_type, installed_revision_ts, prior_cell)
 }
 
 fn install_current_only_cell(
@@ -186,7 +180,7 @@ fn write_physical_cell(
     let write_result = chunk
         .write_cell_to_chunk(&cell, &write_plan, &pending_entry, revision_ts)
         .unwrap();
-    drop(pending_entry);
+    pending_entry.finish().unwrap();
     (write_result.addr, entry_size)
 }
 
@@ -231,7 +225,7 @@ fn combine_relocates_a_current_only_cell_without_a_history_node() {
     assert_eq!(selected.len(), 2);
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
 
-    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected);
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap();
 
     assert_eq!(reduced, 1);
     let destination = chunks.address_of(&id);
@@ -294,7 +288,8 @@ fn current_only_lower_key_collision_does_not_move_another_full_id() {
                     .expect("current mirror") = colliding_location;
             }
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(reduced, 1);
     assert!(changed.load(Ordering::Acquire));
@@ -345,7 +340,8 @@ fn current_only_mirror_change_keeps_the_successor_current() {
                     .expect("current mirror") = successor;
             }
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(reduced, 1);
     assert!(changed.load(Ordering::Acquire));
@@ -393,7 +389,7 @@ fn current_only_mirror_change_into_another_source_retains_sources() {
     );
 
     assert_eq!(
-        result,
+        result.unwrap(),
         (0, 0),
         "a changed mirror inside the cleanup set must retain every source"
     );
@@ -451,7 +447,7 @@ fn unresolved_current_only_mirror_retains_the_readable_source() {
         },
     );
 
-    assert_eq!(result, (0, 0));
+    assert_eq!(result.unwrap(), (0, 0));
     assert!(unresolved.load(Ordering::Acquire));
     assert!(
         selected
@@ -511,7 +507,7 @@ fn combine_relocates_current_and_historical_revisions_for_one_id() {
     );
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
 
-    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected);
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap();
 
     assert_eq!(reduced, 1);
     let first_destination = assert_relocated_revision(&chunks, &id, 100, first_source);
@@ -561,7 +557,7 @@ fn combine_skips_a_source_with_an_active_shared_lease() {
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
 
     assert_eq!(
-        combine::CombinedCleaner::combine_segments(chunk, &selected),
+        combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap(),
         (0, 0)
     );
     assert!(
@@ -656,7 +652,7 @@ fn exact_output_sync_short_lease_blocks_cleaner_relocation_only_until_sync_finis
 
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
     assert_eq!(
-        combine::CombinedCleaner::combine_segments(chunk, &selected),
+        combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap(),
         (0, 0),
         "cleaner must skip an exact output source while its sync lease is held"
     );
@@ -666,7 +662,8 @@ fn exact_output_sync_short_lease_blocks_cleaner_relocation_only_until_sync_finis
     sync.join().unwrap().unwrap();
     chunk.set_exact_sync_lease_hook_for_test(None);
 
-    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+    let (_, reduced) =
+        combine::CombinedCleaner::combine_segments(chunk, &chunk.segments()).unwrap();
     assert_eq!(reduced, 1);
     assert!(
         !chunk.contains_seg(source.id),
@@ -711,8 +708,9 @@ fn wal_only_relocation_persists_destination_before_source_cleanup_and_recovery()
         })
         .collect();
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+    let event_start = durability_events_for_test().len();
 
-    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected);
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap();
     assert_eq!(reduced, 1);
     let destination = chunk
         .locate_segment(chunks.history_location(&id, 100).unwrap())
@@ -731,6 +729,40 @@ fn wal_only_relocation_persists_destination_before_source_cleanup_and_recovery()
         std::path::Path::new(&destination_wal).exists(),
         "cleaner must create a durable WAL for the relocated destination"
     );
+    let events = durability_events_for_test();
+    let events = &events[event_start..];
+    let destination_path = std::path::PathBuf::from(&destination_wal);
+    let wal_directory = destination_path.parent().unwrap().to_path_buf();
+    let destination_create = events
+        .iter()
+        .position(|event| event == &DurabilityEvent::FileCreated(destination_path.clone()))
+        .expect("destination create event");
+    let destination_directory_sync = events
+        .iter()
+        .enumerate()
+        .skip(destination_create + 1)
+        .find_map(|(index, event)| {
+            (event == &DurabilityEvent::DirectorySynced(wal_directory.clone())).then_some(index)
+        })
+        .expect("destination directory sync");
+    for source_wal in &source_wals {
+        let source_path = std::path::PathBuf::from(source_wal);
+        let source_remove = events
+            .iter()
+            .position(|event| event == &DurabilityEvent::FileRemoved(source_path.clone()))
+            .expect("source removal event");
+        assert!(
+            destination_directory_sync < source_remove,
+            "destination publication must precede every source removal: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .skip(source_remove + 1)
+                .any(|event| event == &DurabilityEvent::DirectorySynced(wal_directory.clone())),
+            "each source directory mutation must be durably published: {events:?}"
+        );
+    }
 
     drop(chunks);
     let schemas = LocalSchemasCache::new_local("");
@@ -751,6 +783,125 @@ fn wal_only_relocation_persists_destination_before_source_cleanup_and_recovery()
     let restored = recovered.read_cell(&id).unwrap().to_owned();
     assert_eq!(restored.header.revision_ts, 100);
     assert_eq!(restored.data["id"].i32(), Some(&10));
+}
+
+#[test]
+fn cleaner_source_directory_sync_failure_returns_error_and_retains_sources() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let (chunks, schema) =
+        retained_revision_chunks_with_wal(5, wal_dir.path().to_string_lossy().into_owned());
+    let chunk = &chunks.list[0];
+    let first_id = Id::new(72, 9_108);
+    let mut first = revision_cell(schema.id, &first_id, 10);
+    chunks
+        .write_cell_at_revision(&mut first, RevisionWrite::committed(100))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let second_id = Id::new(72, 9_109);
+    let mut second = revision_cell(schema.id, &second_id, 20);
+    chunks
+        .write_cell_at_revision(&mut second, RevisionWrite::committed(100))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let selected = chunk.segments();
+    assert_eq!(selected.len(), 2);
+    for source in &selected {
+        source.force_wal_sync().unwrap();
+    }
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+    let wal_directory = std::path::Path::new(
+        chunk
+            .file_manager
+            .wal_storage()
+            .expect("configured WAL directory"),
+    );
+    // The first sync publishes the destination. Fail the next sync, which
+    // publishes the first source unlink.
+    fail_directory_sync_after_for_test(wal_directory, 1);
+
+    let error = combine::CombinedCleaner::combine_segments(chunk, &selected)
+        .expect_err("source directory failure must stop cleanup");
+    assert!(error
+        .to_string()
+        .contains("injected directory sync failure"));
+    assert!(
+        selected.iter().all(|source| chunk.contains_seg(source.id)),
+        "no source registry or memory entry may be removed after an undurable unlink"
+    );
+    assert_eq!(
+        chunks.read_cell(&first_id).unwrap().to_owned().data["id"].i32(),
+        Some(&10),
+        "the relocated first cell must remain readable while sources are retained"
+    );
+    assert_eq!(
+        chunks.read_cell(&second_id).unwrap().to_owned().data["id"].i32(),
+        Some(&20),
+        "the relocated second cell must remain readable while sources are retained"
+    );
+
+    combine::CombinedCleaner::combine_segments(chunk, &selected)
+        .expect("retry must durably resync the prior unlink and finish source cleanup");
+    assert!(
+        selected.iter().all(|source| !chunk.contains_seg(source.id)),
+        "a clean retry must finish reclaiming every retained source"
+    );
+    assert_eq!(
+        chunks.read_cell(&first_id).unwrap().to_owned().data["id"].i32(),
+        Some(&10)
+    );
+    assert_eq!(
+        chunks.read_cell(&second_id).unwrap().to_owned().data["id"].i32(),
+        Some(&20)
+    );
+}
+
+#[test]
+fn cleaner_repeated_destination_publication_failures_reuse_unpublished_capacity() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let (chunks, schema) =
+        retained_revision_chunks_with_wal(5, wal_dir.path().to_string_lossy().into_owned());
+    let chunk = &chunks.list[0];
+    let first_id = Id::new(72, 9_110);
+    let mut first = revision_cell(schema.id, &first_id, 10);
+    chunks
+        .write_cell_at_revision(&mut first, RevisionWrite::committed(100))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let second_id = Id::new(72, 9_111);
+    let mut second = revision_cell(schema.id, &second_id, 20);
+    chunks
+        .write_cell_at_revision(&mut second, RevisionWrite::committed(100))
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let selected = chunk.segments();
+    assert_eq!(selected.len(), 2);
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+    let output_wal_directory = std::path::Path::new(
+        chunk
+            .file_manager
+            .wal_storage()
+            .expect("configured WAL directory"),
+    );
+
+    // Five configured segments round up to an eight-segment chunk. With two
+    // sources, six failed destinations consume every remaining allocator slot
+    // unless each unpublished destination is returned.
+    for attempt in 0..6 {
+        fail_next_directory_sync_for_test(output_wal_directory);
+        let error = combine::CombinedCleaner::combine_segments(chunk, &selected)
+            .expect_err("destination publication failure must stop relocation");
+        assert!(
+            error
+                .to_string()
+                .contains("injected directory sync failure"),
+            "attempt {attempt} unexpectedly exhausted capacity instead of returning the injected failure: {error}"
+        );
+        assert!(selected.iter().all(|source| chunk.contains_seg(source.id)));
+    }
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected)
+        .expect("freed unpublished destination capacity must permit a clean retry");
+    assert_eq!(reduced, 1);
 }
 
 #[test]
@@ -835,7 +986,7 @@ fn marked_committed_insert_update_delete_survive_relocation_and_recovery() {
     let sources = chunk.segments();
     assert!(sources.len() >= 5, "setup must span cleaner sources");
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
-    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &sources);
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &sources).unwrap();
     assert!(reduced > 0, "cleaner must reclaim marked-output sources");
     for (id, old_location) in committed_sources {
         assert_relocated_revision(&chunks, &id, 200, old_location);
@@ -913,7 +1064,7 @@ fn marked_aborted_compensation_survives_relocation_and_recovery() {
     let sources = chunk.segments();
     assert!(sources.len() >= 3, "setup must span cleaner sources");
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
-    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &sources);
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &sources).unwrap();
     assert!(reduced > 0, "cleaner must reclaim the compensation source");
     assert_relocated_revision(&chunks, &id, compensation_ts, compensation_source);
 
@@ -928,6 +1079,63 @@ fn marked_aborted_compensation_survives_relocation_and_recovery() {
     let restored = recovered.read_cell(&id).unwrap().to_owned();
     assert_eq!(restored.header.revision_ts, compensation_ts);
     assert_eq!(restored.data["id"].i32(), Some(&40));
+}
+
+#[test]
+fn owned_live_abort_after_cleaner_relocation_restores_prior_at_newer_revision() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let (chunks, schema) =
+        retained_revision_chunks_with_wal(6, wal_dir.path().to_string_lossy().into_owned());
+    let chunk = &chunks.list[0];
+    let id = Id::new(73, 9_206);
+    let mut prior = revision_cell(schema.id, &id, 60);
+    chunks
+        .write_cell_at_revision(&mut prior, RevisionWrite::committed(100))
+        .unwrap();
+    let owned_prior = chunks.read_cell(&id).unwrap().to_owned();
+    force_next_write_to_new_segment(chunk);
+
+    crate::ram::chunk::set_transaction_context(true);
+    let mut failed = revision_cell(schema.id, &id, 61);
+    let failed_revision = chunks
+        .update_cell_at_revision(&mut failed, RevisionWrite::pending(200))
+        .unwrap();
+    crate::ram::chunk::set_transaction_context(false);
+    chunks
+        .force_sync_installed_revisions([&failed_revision])
+        .unwrap();
+    force_next_write_to_new_segment(chunk);
+    let sources = chunk.segments();
+    let source_ids: HashSet<_> = sources.iter().map(|source| source.id).collect();
+    assert_eq!(sources.len(), 2);
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &sources).unwrap();
+    assert_eq!(reduced, 1);
+    assert!(
+        source_ids
+            .iter()
+            .all(|source_id| !chunk.contains_seg(*source_id)),
+        "cleaner must relocate and reclaim both in-doubt source segments"
+    );
+    let destination_head = chunk
+        .segments()
+        .into_iter()
+        .find(|segment| !source_ids.contains(&segment.id))
+        .expect("relocated destination head");
+    chunk
+        .head_seg_id
+        .store(destination_head.id, Ordering::Release);
+
+    let compensation = chunks
+        .compensate(&failed_revision, Some(owned_prior))
+        .expect("live abort must follow the relocated revision identity");
+    chunks
+        .force_sync_installed_revisions([&compensation])
+        .unwrap();
+    let restored = chunks.read_cell(&id).unwrap().to_owned();
+    assert_eq!(restored.data["id"].i32(), Some(&60));
+    assert!(restored.header.revision_ts > 200);
 }
 
 #[test]
@@ -977,7 +1185,7 @@ fn combine_preserves_current_and_historical_tombstones_for_colliding_full_ids() 
     );
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
 
-    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected);
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap();
 
     assert_eq!(reduced, 4);
     for (id, revision_ts, old_location) in sources {
@@ -1010,7 +1218,7 @@ fn combine_preserves_current_and_historical_tombstones_for_colliding_full_ids() 
         .map(|(id, revision_ts, _)| chunks.history_location(id, *revision_ts).unwrap())
         .collect();
     assert_eq!(
-        combine::CombinedCleaner::combine_segments(chunk, &chunk.segments()),
+        combine::CombinedCleaner::combine_segments(chunk, &chunk.segments()).unwrap(),
         (0, 0)
     );
     let repeated_locations: Vec<_> = sources
@@ -1047,7 +1255,8 @@ fn relocation_lost_to_expiration_marks_the_destination_dead_once() {
                 chunk.history.expire_due_for_test(u64::MAX);
             }
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(reduced, 1);
     assert!(expired.load(Ordering::Acquire));
@@ -1108,7 +1317,7 @@ fn unreconciled_current_mirror_keeps_source_and_retires_destination_copy() {
         },
     );
 
-    assert_eq!(result, (0, 0));
+    assert_eq!(result.unwrap(), (0, 0));
     assert!(removed_mirror.load(Ordering::Acquire));
     assert!(
         selected.iter().all(|source| chunk.contains_seg(source.id)),
@@ -1194,7 +1403,8 @@ fn historical_reader_retries_from_exclusive_source_to_relocated_destination() {
                 );
             }
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(reduced, 1);
     let SnapshotRead::Present(read) = result_rx
@@ -1275,7 +1485,7 @@ fn historical_reader_lease_prevents_source_reclamation() {
     lease_acquired.wait();
 
     assert_eq!(
-        combine::CombinedCleaner::combine_segments(chunk, &selected),
+        combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap(),
         (0, 0),
         "normal snapshot reader lease must reject cleaner exclusivity"
     );
@@ -1374,7 +1584,8 @@ fn assigned_writer_retries_after_history_relocation_and_wins_current() {
                 );
             }
         },
-    );
+    )
+    .unwrap();
 
     assert_eq!(reduced, 1);
     assert!(after_history.load(Ordering::Acquire));
@@ -1478,7 +1689,7 @@ pub fn full_clean_cycle_without_compact() {
             .head_seg_id
             .store(1234, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            combine::CombinedCleaner::combine_segments(chunk, &chunk.segments()),
+            combine::CombinedCleaner::combine_segments(chunk, &chunk.segments()).unwrap(),
             (0, 0)
         );
         assert_eq!(chunk.segments().len(), 2);
@@ -1490,7 +1701,8 @@ pub fn full_clean_cycle_without_compact() {
     chunk.history.expire_due_for_test(u64::MAX);
     chunk.drain_history_dead();
     {
-        let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
+        let (_, reduced) =
+            combine::CombinedCleaner::combine_segments(chunk, &chunk.segments()).unwrap();
         assert_eq!(reduced, 1);
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])

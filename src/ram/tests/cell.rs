@@ -1,5 +1,6 @@
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
+use crate::ram::durable_fs::fail_next_directory_sync_for_test;
 use crate::ram::entry::ENTRY_HEAD_SIZE;
 use crate::ram::schema::*;
 use crate::ram::types;
@@ -109,6 +110,78 @@ fn physical_accounting(chunks: &Chunks) -> Vec<(u64, usize, u32, u32)> {
             )
         })
         .collect()
+}
+
+#[test]
+fn failed_tombstone_wal_publication_accounts_orphan_without_tombstone_drift() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = temp_dir.path().join("wal");
+    let schema = Schema::new_with_id(
+        1,
+        "failed-tombstone-publication",
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.debug_only_new_schema(schema);
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        Some(wal_dir.to_string_lossy().into_owned()),
+        None,
+    );
+    let id = Id::new(1, 89);
+    let mut original = test_cell(id, 1);
+    chunks
+        .write_cell_at_revision(&mut original, RevisionWrite::committed(100))
+        .unwrap();
+    let chunk = &chunks.list[0];
+    let head = chunk
+        .segs
+        .get(&(chunk.get_head_seg_id() as usize))
+        .expect("active head");
+    let wal_path = {
+        let mut state = head.file_state.lock();
+        let wal_path = state
+            .manager
+            .wal_path(head.chunk_id, head.id, head.seq_id)
+            .expect("configured WAL path");
+        drop(state.wal.take());
+        state
+            .manager
+            .delete_wal(head.chunk_id, head.id, head.seq_id)
+            .unwrap();
+        std::path::PathBuf::from(wal_path)
+    };
+    assert!(!wal_path.exists(), "test must force lazy WAL recreation");
+    let output_wal_dir = wal_path.parent().expect("WAL path should have a parent");
+    let used_before = head.used_spaces();
+    let dead_before = head.dead_space();
+    let tombstones_before = head.tombstones.load(Ordering::Acquire);
+    fail_next_directory_sync_for_test(output_wal_dir);
+
+    let error = match chunks.remove_cell_at_revision(&id, RevisionWrite::pending(200)) {
+        Ok(_) => panic!("WAL filename publication failure must reject the tombstone"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, WriteError::DurabilityFailure(_)));
+    let used_delta = head.used_spaces() - used_before;
+    assert!(used_delta > 0);
+    assert_eq!(
+        head.dead_space() - dead_before,
+        used_delta,
+        "the uninstalled allocation must be immediately dead-accounted"
+    );
+    assert_eq!(
+        head.tombstones.load(Ordering::Acquire),
+        tombstones_before,
+        "a failed tombstone must not affect live tombstone accounting"
+    );
 }
 
 fn assert_zero_write_rejected(result: Result<InstalledRevision, WriteError>) {
@@ -703,6 +776,7 @@ pub fn cell_rw() {
         .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.revision_ts)
         .unwrap();
     let cell_1_ptr = write_result.addr;
+    pending_entry.finish().unwrap();
     {
         let (stored_cell, _) =
             SharedCellData::from_chunk_raw(id1.lower, cell_1_ptr, &chunk).unwrap();
@@ -725,6 +799,7 @@ pub fn cell_rw() {
         .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.revision_ts)
         .unwrap();
     let cell_2_ptr = write_result.addr;
+    pending_entry.finish().unwrap();
     {
         let stored_cell = SharedCellData::from_chunk_raw(id2.lower, cell_2_ptr, &chunk)
             .unwrap()

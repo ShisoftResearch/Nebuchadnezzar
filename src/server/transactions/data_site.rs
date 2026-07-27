@@ -1,7 +1,6 @@
 use super::*;
 use crate::ram::cell::{InstalledRevision, OwnedCellRef, RevisionWrite};
 use crate::ram::history::RevisionState;
-use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::{FromHeader, Id, OwnedMap, OwnedPrimArray, OwnedValue};
 use crate::server::DatabaseRuntime;
 use crate::{
@@ -391,9 +390,6 @@ struct Transaction {
     durable_decision: Option<TxnState>,
     last_activity: i64,
     history: CommitHistory,
-    /// RAII guards that hold segment references during this transaction
-    /// Automatically released when guards are dropped (no leak risk)
-    rollback_guards: Vec<SegmentReferenceGuard>,
 }
 
 struct CellHistory {
@@ -596,7 +592,6 @@ impl DataManager {
                 durable_decision: None,
                 last_activity: get_time(),
                 history: BTreeMap::new(),
-                rollback_guards: Vec::with_capacity(4), // Pre-allocate for common case
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -726,26 +721,6 @@ impl DataManager {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Create a segment reference guard to prevent eviction during transaction.
-    /// Returns None if segment not found (already freed/evicted).
-    /// The guard is RAII - reference is automatically released when dropped.
-    #[inline]
-    fn acquire_segment_guard(
-        &self,
-        chunk_idx: usize,
-        segment_id: u64,
-    ) -> Option<SegmentReferenceGuard> {
-        if let Some(chunk) = self.chunks().list.get(chunk_idx) {
-            if let Some(segment) = chunk.segs.get(&(segment_id as usize)) {
-                return Some(SegmentReferenceGuard::new(segment));
-            }
-        }
-        warn!(
-            "Could not find segment {} in chunk {} to acquire guard",
-            segment_id, chunk_idx
-        );
-        None
-    }
     fn rollback(
         &self,
         history: &mut CommitHistory,
@@ -1280,7 +1255,7 @@ impl DataManager {
                             .certified_present_revision_ts(cell_id)
                             .expect("commit payload validation requires present certification");
 
-                        let (cell_addr, old_cell_ref) = {
+                        let old_cell = {
                             let shared_cell = match self.chunks().read_cell(cell_id) {
                                 Ok(cell) => cell,
                                 Err(read_error) => {
@@ -1293,24 +1268,7 @@ impl DataManager {
                                 write_error = Some((*cell_id, WriteError::CellRevisionMismatch));
                                 break;
                             }
-                            let addr = shared_cell.cell_guard().get_ptr();
-                            let cell_ref = shared_cell.to_owned().into_ref();
-                            (addr, cell_ref)
-                        };
-                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
-                        let chunk_idx = chunk.id;
-                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
-                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
-                        let cell_offset = (cell_addr - segment_base_addr) as u64;
-                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
-                            Some(guard) => guard,
-                            None => {
-                                write_error = Some((
-                                    *cell_id,
-                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                ));
-                                break;
-                            }
+                            shared_cell.to_owned()
                         };
 
                         if let Some(undo_log) = self.undo_log() {
@@ -1319,10 +1277,7 @@ impl DataManager {
                                 *cell_id,
                                 super::undo_log::UndoOpType::Remove,
                                 commit_hlc.ts,
-                                expected_revision_ts,
-                                chunk_idx as u64,
-                                seq_id,
-                                cell_offset,
+                                old_cell.clone(),
                             );
                             if let Err(error) = undo_log.write_undo_entry(undo_entry) {
                                 error!("Failed to write undo log entry: {:?}", error);
@@ -1340,10 +1295,9 @@ impl DataManager {
                         {
                             Ok(installed) => {
                                 txn.history
-                                    .insert(*cell_id, CellHistory::new(Some(old_cell_ref)));
+                                    .insert(*cell_id, CellHistory::new(Some(old_cell.into_ref())));
                                 txn.installed.insert(*cell_id, installed);
                                 meta.write = commit_hlc;
-                                txn.rollback_guards.push(guard);
                             }
                             Err(error) => {
                                 write_error = Some((*cell_id, error));
@@ -1357,7 +1311,7 @@ impl DataManager {
                             .certified_present_revision_ts(&cell_id)
                             .expect("commit payload validation requires present certification");
 
-                        let (cell_addr, old_cell_ref) = {
+                        let old_cell = {
                             let shared_cell = match self.chunks().read_cell(&cell_id) {
                                 Ok(cell) => cell,
                                 Err(read_error) => {
@@ -1370,25 +1324,7 @@ impl DataManager {
                                 write_error = Some((cell_id, WriteError::CellRevisionMismatch));
                                 break;
                             }
-                            (
-                                shared_cell.cell_guard().get_ptr(),
-                                shared_cell.to_owned().into_ref(),
-                            )
-                        };
-                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
-                        let chunk_idx = chunk.id;
-                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
-                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
-                        let cell_offset = (cell_addr - segment_base_addr) as u64;
-                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
-                            Some(guard) => guard,
-                            None => {
-                                write_error = Some((
-                                    cell_id,
-                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
-                                ));
-                                break;
-                            }
+                            shared_cell.to_owned()
                         };
 
                         if let Some(undo_log) = self.undo_log() {
@@ -1397,10 +1333,7 @@ impl DataManager {
                                 cell_id,
                                 super::undo_log::UndoOpType::Update,
                                 commit_hlc.ts,
-                                expected_revision_ts,
-                                chunk_idx as u64,
-                                seq_id,
-                                cell_offset,
+                                old_cell.clone(),
                             );
                             if let Err(error) = undo_log.write_undo_entry(undo_entry) {
                                 error!("Failed to write undo log entry: {:?}", error);
@@ -1417,10 +1350,9 @@ impl DataManager {
                         ) {
                             Ok(installed) => {
                                 txn.history
-                                    .insert(cell_id, CellHistory::new(Some(old_cell_ref)));
+                                    .insert(cell_id, CellHistory::new(Some(old_cell.into_ref())));
                                 txn.installed.insert(cell_id, installed);
                                 meta.write = commit_hlc;
-                                txn.rollback_guards.push(guard);
                             }
                             Err(error) => {
                                 write_error = Some((cell_id, error));
@@ -1612,6 +1544,9 @@ impl DataManager {
     }
 
     fn map_commit_write_error(txn: &Transaction, id: Id, error: WriteError) -> DMCommitResult {
+        if matches!(error, WriteError::DurabilityFailure(_)) {
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
+        }
         let expected_present = txn.certified_present_revision_ts(&id).is_some();
         let expected_absent_write = txn.certified_expects_absent_write(&id);
         let is_cell_changed = match &error {
@@ -1644,8 +1579,10 @@ impl DataManager {
 mod tests {
     use super::*;
     use crate::ram::cell::OwnedCell;
+    use crate::ram::cleaner::combine;
+    use crate::ram::durable_fs::fail_next_directory_sync_for_test;
     use crate::ram::schema::Schema;
-    use crate::ram::segs::SEGMENT_SIZE;
+    use crate::ram::segs::{SegmentExclusiveRefGuard, SEGMENT_SIZE};
     use crate::ram::tests::default_fields;
     use crate::ram::types::{Id, OwnedMap, OwnedPrimArray, OwnedValue, Pos3d32};
     use crate::server::transactions::test_hlc;
@@ -1934,10 +1871,25 @@ mod tests {
         group: &str,
         temp_dir: &TempDir,
     ) -> Arc<crate::server::NebServer> {
+        start_durable_transaction_test_server_with_chunk_size(
+            address,
+            group,
+            temp_dir,
+            SEGMENT_SIZE,
+        )
+        .await
+    }
+
+    async fn start_durable_transaction_test_server_with_chunk_size(
+        address: &str,
+        group: &str,
+        temp_dir: &TempDir,
+        chunk_size: usize,
+    ) -> Arc<crate::server::NebServer> {
         NebServer::new_from_opts(
             &ServerOptions {
-                chunk_size: SEGMENT_SIZE,
-                db_size: SEGMENT_SIZE,
+                chunk_size,
+                db_size: chunk_size,
                 history_retention_ms: 300_000,
                 tiered_config: None,
                 backup_storage: None,
@@ -4983,6 +4935,211 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn wal_directory_sync_failure_rejects_participant_success_without_panicking() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5437";
+        let group = "txn_data_site_wal_directory_sync_failure";
+        let server = start_durable_transaction_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99053);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let chunk = runtime.chunks().locate_chunk_by_partition(cell_id.higher);
+        let head = chunk
+            .segs
+            .get(&(chunk.get_head_seg_id() as usize))
+            .expect("active head");
+        let wal_dir = {
+            let mut file_state = head.file_state.lock();
+            let wal_dir = std::path::PathBuf::from(
+                file_state
+                    .manager
+                    .wal_storage()
+                    .expect("durable test WAL storage"),
+            );
+            drop(file_state.wal.take());
+            file_state
+                .manager
+                .delete_wal(head.chunk_id, head.id, head.seq_id)
+                .unwrap();
+            wal_dir
+        };
+        let tid = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                63,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        fail_next_directory_sync_for_test(&wal_dir);
+
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    2,
+                    "directory-sync-failure",
+                ))],
+            )
+            .await,
+            DMCommitResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let txn = manager.txns.get(&tid).expect("retry state retained");
+        assert!(!txn.lock().installed_output_durable);
+        assert_eq!(
+            runtime
+                .undo_log()
+                .unwrap()
+                .participant_completion(&tid)
+                .unwrap(),
+            None
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_doubt_update_does_not_pin_prior_segment_and_abort_uses_owned_prior() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5438";
+        let group = "txn_data_site_in_doubt_without_segment_pin";
+        let server = start_durable_transaction_test_server_with_chunk_size(
+            address,
+            group,
+            &temp_dir,
+            SEGMENT_SIZE * 5,
+        )
+        .await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99054);
+        let prior_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let prior_segment = runtime
+            .chunks()
+            .locate_chunk_by_partition(cell_id.higher)
+            .locate_segment(runtime.chunks().address_of(&cell_id))
+            .expect("prior source segment");
+        prior_segment
+            .append_header
+            .store(prior_segment.bound, std::sync::atomic::Ordering::Release);
+        let tid = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                64,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(prior_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    2,
+                    "in-doubt-update",
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+        let installed_revision = runtime
+            .chunks()
+            .current_revision_ts(&cell_id)
+            .expect("pending installed revision");
+        let chunk = runtime.chunks().locate_chunk_by_partition(cell_id.higher);
+        let installed_source = chunk
+            .locate_segment(
+                runtime
+                    .chunks()
+                    .history_location(&cell_id, installed_revision)
+                    .expect("installed history location"),
+            )
+            .expect("installed source segment");
+
+        let exclusive = SegmentExclusiveRefGuard::new(&prior_segment)
+            .expect("in-doubt rollback state must not pin the prior segment");
+        drop(exclusive);
+
+        installed_source
+            .append_header
+            .store(installed_source.bound, std::sync::atomic::Ordering::Release);
+        let filler_id = Id::new(0, 99055);
+        seed_cell_revision(&runtime, schema.id, filler_id, 3, 0);
+        let filler_source = chunk
+            .locate_segment(runtime.chunks().address_of(&filler_id))
+            .expect("filler source segment");
+        filler_source
+            .append_header
+            .store(filler_source.bound, std::sync::atomic::Ordering::Release);
+        let selected = chunk.segments();
+        let source_ids: std::collections::HashSet<_> =
+            selected.iter().map(|segment| segment.id).collect();
+        let installed_source_location = runtime
+            .chunks()
+            .history_location(&cell_id, installed_revision)
+            .expect("installed source location");
+        chunk
+            .head_seg_id
+            .store(u64::MAX - 7, std::sync::atomic::Ordering::Release);
+        let (_, reduced) = combine::CombinedCleaner::combine_segments(chunk, &selected)
+            .expect("cleaner relocation should succeed without transaction-owned pins");
+        assert!(reduced > 0);
+        let relocated_location = runtime
+            .chunks()
+            .history_location(&cell_id, installed_revision)
+            .expect("relocated installed revision");
+        assert_ne!(relocated_location, installed_source_location);
+        let destination = chunk
+            .locate_segment(relocated_location)
+            .expect("registered cleaner destination");
+        assert!(!source_ids.contains(&destination.id));
+        assert!(selected.iter().all(|source| !chunk.contains_seg(source.id)));
+        chunk
+            .head_seg_id
+            .store(destination.id, std::sync::atomic::Ordering::Release);
+
+        assert_eq!(
+            <DataManager as Service>::abort(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            AbortResult::Success(None)
+        );
+        let restored = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*restored.data["score"].u64().unwrap(), 1);
+        assert!(restored.header.revision_ts > installed_revision);
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn durable_mutation_without_available_undo_is_rejected_before_cell_change() {
         let temp_dir = TempDir::new().unwrap();
         let address = "127.0.0.1:5409";
@@ -5667,12 +5824,10 @@ impl Service for DataManager {
         }
 
         if txn.history.is_empty() {
-            let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
             txn.last_activity = get_time();
             txn.compensation_output_durable = true;
             txn.state = TxnState::Aborted;
             drop(txn);
-            drop(guards_to_drop);
             return self.response_with(AbortResult::Success(None));
         }
 
@@ -5723,18 +5878,12 @@ impl Service for DataManager {
             return self.response_with(AbortResult::CheckFailed(CheckError::CannotEnd));
         }
 
-        // Keep the old immutable locations protected until every compensation
-        // is complete. A failed attempt retains both these guards and the cell
-        // owners so a later abort call can resume an already-aborted installed
-        // node without duplicating completed compensation.
-        let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
         txn.last_activity = get_time();
         txn.compensation_output_durable = true;
         txn.state = TxnState::Aborted;
 
         drop(cell_guards);
         drop(txn);
-        drop(guards_to_drop);
 
         self.response_with(AbortResult::Success(None))
     }
@@ -5890,10 +6039,8 @@ impl Service for DataManager {
                 meta.lock_acquired_at = None;
             }
 
-            let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
             self.wipe_out_transaction(&tid);
             drop(txn);
-            drop(guards_to_drop);
             self.cleanup_signal.store(true, Relaxed);
             debug!("ENDED: {:?} after atomic owner barrier", tid);
             EndResult::Success

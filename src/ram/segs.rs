@@ -1,6 +1,7 @@
 use crate::ram::chunk::Chunk;
 #[cfg(feature = "compress_backups")]
 use crate::ram::compression;
+use crate::ram::durable_fs;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
 use crate::ram::file_manager::SegmentFileManager;
@@ -13,7 +14,6 @@ use libc::*;
 use lightning::list::LinkedRingBufferList;
 use lightning::spin_hint::Backoff;
 use parking_lot;
-use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::path::Path;
@@ -568,7 +568,10 @@ impl Segment {
             if has_old_backup {
                 debug!("Backup file {} already exists, moving to .old", backup_file);
                 // Handle race condition where file might be deleted between check and rename
-                match fs::rename(&backup_file, format!("{}.old", backup_file)) {
+                match durable_fs::rename(
+                    Path::new(&backup_file),
+                    Path::new(&format!("{}.old", backup_file)),
+                ) {
                     Ok(_) => {
                         debug!("Successfully moved old backup file to .old");
                     }
@@ -581,59 +584,51 @@ impl Segment {
                         return Err(e);
                     }
                 }
-                // Prepare the new backup file by creating a fresh writer
-                let _ = state.manager.open_or_create_backup_writer(
-                    self.chunk_id,
-                    self.id,
-                    self.seq_id,
-                )?;
             }
             {
-                // Always open a fresh backup writer for this archive operation
-                if let Some(mut file) = state.manager.open_or_create_backup_writer(
-                    self.chunk_id,
-                    self.id,
-                    self.seq_id,
-                )? {
-                    // Truncate the file to zero and write from beginning
-                    file.set_len(0)?;
-                    file.sync_all()?;
+                // A staging filename is ignored by recovery. Publish the final
+                // backup name only after all staged contents are file-synced.
+                if let Some(mut staged) =
+                    state
+                        .manager
+                        .stage_backup_file(self.chunk_id, self.id, self.seq_id)?
+                {
+                    {
+                        let file = staged.file_mut();
+                        unsafe {
+                            let data_block =
+                                slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
 
-                    unsafe {
-                        let data_block =
-                            slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
+                            // Create a padded copy to SEGMENT_SIZE to match WAL-based archiving behavior
+                            let padded_data = Vec::from(data_block);
 
-                        // Create a padded copy to SEGMENT_SIZE to match WAL-based archiving behavior
-                        let padded_data = Vec::from(data_block);
+                            debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
 
-                        debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
+                            // Conditionally compress based on feature flag
+                            #[cfg(feature = "compress_backups")]
+                            {
+                                let compressed_data = compression::compress(&padded_data)?;
+                                file.write_all(&compressed_data)?;
+                                debug!(
+                                    "Archived segment {} with compression: {} bytes -> {} bytes (ratio: {:.2}%)",
+                                    self.id,
+                                    SEGMENT_SIZE,
+                                    compressed_data.len(),
+                                    (compressed_data.len() as f64 / SEGMENT_SIZE as f64) * 100.0
+                                );
+                            }
 
-                        // Conditionally compress based on feature flag
-                        #[cfg(feature = "compress_backups")]
-                        {
-                            let compressed_data = compression::compress(&padded_data)?;
-                            file.write_all(&compressed_data)?;
-                            debug!(
-                                "Archived segment {} with compression: {} bytes -> {} bytes (ratio: {:.2}%)",
-                                self.id,
-                                SEGMENT_SIZE,
-                                compressed_data.len(),
-                                (compressed_data.len() as f64 / SEGMENT_SIZE as f64) * 100.0
-                            );
-                        }
-
-                        #[cfg(not(feature = "compress_backups"))]
-                        {
-                            file.write_all(&padded_data)?;
-                            debug!(
-                                "Archived segment {} without compression: {} bytes",
-                                self.id, SEGMENT_SIZE
-                            );
+                            #[cfg(not(feature = "compress_backups"))]
+                            {
+                                file.write_all(&padded_data)?;
+                                debug!(
+                                    "Archived segment {} without compression: {} bytes",
+                                    self.id, SEGMENT_SIZE
+                                );
+                            }
                         }
                     }
-
-                    file.sync_all()?;
-                    drop(file);
+                    state.manager.publish_staged_backup(staged)?;
 
                     #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
                     {
@@ -676,14 +671,10 @@ impl Segment {
                     }
 
                     // Delete the WAL file from disk
-                    if let Err(e) = state
+                    state
                         .manager
-                        .delete_wal(self.chunk_id, self.id, self.seq_id)
-                    {
-                        warn!("Failed to delete WAL file for segment {}: {}", self.id, e);
-                    } else {
-                        debug!("Deleted WAL file for archived segment {}", self.id);
-                    }
+                        .delete_wal(self.chunk_id, self.id, self.seq_id)?;
+                    debug!("Deleted WAL file for archived segment {}", self.id);
 
                     return Ok(true);
                 } else {
@@ -937,7 +928,7 @@ impl Segment {
         }
     }
     // remove the backup if it have one
-    pub fn dispense(&self) {
+    pub fn dispense(&self) -> io::Result<()> {
         let backtrace = std::backtrace::Backtrace::capture();
         debug!(
             "[DISPENSE] segment {} (chunk={}, seq_id={}) - tiered_state={}\nBacktrace:\n{}",
@@ -947,7 +938,8 @@ impl Segment {
             if self.is_hot() { "HOT" } else { "COLD" },
             backtrace
         );
-        let state = self.file_state.lock();
+        let mut state = self.file_state.lock();
+        drop(state.wal.take());
         if let Some(backup_path) = state
             .manager
             .backup_path(self.chunk_id, self.id, self.seq_id)
@@ -958,20 +950,14 @@ impl Segment {
                 self.id, self.chunk_id, self.seq_id, backup_path, exists
             );
         }
-        if let Err(e) = state
+        state
             .manager
-            .delete_all(self.chunk_id, self.id, self.seq_id)
-        {
-            debug!(
-                "[DISPENSE ERROR] Failed to delete files for segment {} (chunk={}, seq_id={}): {}",
-                self.id, self.chunk_id, self.seq_id, e
-            );
-        } else {
-            debug!(
-                "[DISPENSE SUCCESS] Deleted files for segment {} (chunk={}, seq_id={})",
-                self.id, self.chunk_id, self.seq_id
-            );
-        }
+            .delete_all(self.chunk_id, self.id, self.seq_id)?;
+        debug!(
+            "[DISPENSE SUCCESS] Deleted files for segment {} (chunk={}, seq_id={})",
+            self.id, self.chunk_id, self.seq_id
+        );
+        Ok(())
     }
 
     // Tiered memory helper methods (stubs when tiered memory is disabled)

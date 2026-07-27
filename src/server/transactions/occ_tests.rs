@@ -1207,10 +1207,15 @@ async fn undo_is_durable_before_transactional_storage_mutation() {
         .expect("the synced undo entry must be recoverable before mutation");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].installed_revision_ts, commit_hlc.ts);
+    let durable_prior = entries[0]
+        .prior_cell
+        .as_ref()
+        .expect("update undo must own the prior cell");
     assert_eq!(
-        entries[0].prior_revision_ts,
-        Some(original_header.revision_ts)
+        durable_prior.header.revision_ts,
+        original_header.revision_ts
     );
+    assert_eq!(durable_prior.data, original.data);
 
     pause.release();
     assert_eq!(commit_task.await.unwrap(), DMCommitResult::Success);

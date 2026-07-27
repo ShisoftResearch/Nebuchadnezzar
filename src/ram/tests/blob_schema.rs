@@ -494,7 +494,7 @@ fn blob_schema_combine_preserves_blob_segment_class() {
         .all(|seg| seg.segment_class() == SegmentClass::Blob));
 
     let (_, reduced_segments) =
-        combine::CombinedCleaner::combine_segments(chunk, &selected_segments);
+        combine::CombinedCleaner::combine_segments(chunk, &selected_segments).unwrap();
     assert!(
         reduced_segments > 0,
         "combine should collapse fragmented blob segments into fewer replacements"
