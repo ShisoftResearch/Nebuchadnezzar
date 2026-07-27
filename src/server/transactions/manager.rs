@@ -242,6 +242,7 @@ struct Transaction {
     data: HashMap<Id, DataObject>,
     affected_objects: AffectedObjs,
     state: TxnState,
+    commit_dispatch_started: bool,
     last_activity: i64, // Unix timestamp in milliseconds for detecting stale transactions
 }
 
@@ -516,6 +517,9 @@ impl Service for TransactionManager {
                 Self::await_abort_entry_delay(&state).await;
             }
             let mut txn = txn_lock.lock().await;
+            if txn.state == TxnState::Started && txn.commit_dispatch_started {
+                return Ok(AbortResult::CheckFailed(CheckError::AlreadyCommitted));
+            }
             match txn.state {
                 TxnState::Cleanup => {
                     return Ok(AbortResult::CheckFailed(CheckError::AlreadyCleanup));
@@ -566,6 +570,7 @@ impl Service for TransactionManager {
                     data: HashMap::new(),
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
+                    commit_dispatch_started: false,
                     last_activity: now,
                 })),
             )
@@ -1704,6 +1709,7 @@ impl TransactionManager {
                             // Aborted transactions may still need rollback retries.
                             if txn_guard.last_activity < cutoff
                                 && txn_guard.state == TxnState::Started
+                                && !txn_guard.commit_dispatch_started
                             {
                                 return Some(tid.clone());
                             }
@@ -1734,6 +1740,9 @@ impl TransactionManager {
             let mut txn = txn_mutex.lock().await;
             let result = {
                 self.ensure_rw_state(&txn)?;
+                if txn.commit_dispatch_started {
+                    return Err(TMError::InvalidTransactionState(TxnState::Committed));
+                }
                 {
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard = super::phase_profile::guard(
@@ -1741,22 +1750,22 @@ impl TransactionManager {
                     );
                     self.generate_affected_objs(&mut txn);
                 }
-                let affect_objs = &txn.affected_objects;
                 let data_sites = {
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard = super::phase_profile::guard(
                         super::phase_profile::Phase::PrepareParticipantLookup,
                     );
-                    self.data_sites_for_objs(affect_objs).await?
+                    self.data_sites_for_objs(&txn.affected_objects).await?
                 };
                 let sites_prepare_result = {
                     #[cfg(feature = "occ_phase_profile")]
                     let _phase_guard =
                         super::phase_profile::guard(super::phase_profile::Phase::PrepareBarrier);
-                    self.sites_prepare(&tid, affect_objs, &data_sites).await?
+                    self.sites_prepare(&tid, &txn.affected_objects, &data_sites)
+                        .await?
                 };
                 if sites_prepare_result == DMPrepareResult::Success {
-                    if affect_objs.is_empty() {
+                    if txn.affected_objects.is_empty() {
                         TMPrepareResult::Success
                     } else {
                         let commit_hlc = self
@@ -1765,12 +1774,13 @@ impl TransactionManager {
                             .try_now()
                             .map_err(|_| TMError::ClockExhausted)?;
                         debug_assert!(commit_hlc.ts > tid.ts);
+                        txn.commit_dispatch_started = true;
                         let sites_commit_result = {
                             #[cfg(feature = "occ_phase_profile")]
                             let _phase_guard = super::phase_profile::guard(
                                 super::phase_profile::Phase::CommitBarrier,
                             );
-                            self.sites_commit(&tid, commit_hlc, affect_objs, &data_sites)
+                            self.sites_commit(&tid, commit_hlc, &txn.affected_objects, &data_sites)
                                 .await?
                         };
                         match sites_commit_result {
@@ -1801,11 +1811,17 @@ impl TransactionManager {
         // the transaction ID mid-flight, breaking the client's reference.
         // For remaining NotRealizable errors, clients should retry with a new transaction.
         let result = self.do_prepare(&tid).await;
-        match &result {
-            Ok(TMPrepareResult::Success) => {}
-            Ok(_) | Err(_) => {
-                let _ = self.abort(tid.clone()).await;
+        let failed = !matches!(&result, Ok(TMPrepareResult::Success));
+        let preserve_commit_barrier = if failed {
+            match self.get_transaction(&tid) {
+                Ok(txn) => txn.lock().await.commit_dispatch_started,
+                Err(_) => false,
             }
+        } else {
+            false
+        };
+        if failed && !preserve_commit_barrier {
+            let _ = self.abort(tid.clone()).await;
         }
         result
     }
@@ -2071,6 +2087,7 @@ mod tests {
             ]),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
+            commit_dispatch_started: false,
             last_activity: get_time(),
         });
 
@@ -2115,6 +2132,7 @@ mod tests {
             )]),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started,
+            commit_dispatch_started: false,
             last_activity: get_time(),
         });
 

@@ -113,3 +113,75 @@ Additional GREEN checks:
 
 Recurring service-lookup messages during server shutdown are pre-existing test
 fixture teardown logs; all counted suites exited successfully.
+
+## Review Fixes Round 1
+
+### Findings and invariants
+
+- A coordinator commit RPC failure after dispatch began could previously enter
+  ordinary abort cleanup and erase a participant's successfully installed
+  pending revision. The coordinator now records the commit-dispatch boundary
+  before sending RPCs and preserves the transaction once that boundary has
+  been crossed. Task 9 compensation and Task 10 stale-owner cleanup remain
+  intentionally deferred.
+- Participant `end` is now a canonical, owner-validated promotion barrier. It
+  locks transaction state and all affected cell metadata in full-`Id` order,
+  validates every owner and every installed pending revision before promotion,
+  and releases no owner or transaction state on validation failure. If a later
+  promotion fails, earlier promotions are restored to pending before returning,
+  so the entire end operation remains retryable.
+- Same-HLC commit retries now require exact canonical request identity:
+  operation kind, full `Id`, complete cell header, payload bytes, and canonical
+  operation order. A changed same-HLC request and a different-HLC request both
+  fail without mutating the already installed pending state.
+- Prepare no longer takes over an owner based on lock age. Wait-Die remains the
+  only live conflict rule; lock age is diagnostic only.
+- Distributed tests that seed a remote participant directly now propagate the
+  actual returned seed revision into server 0's HLC before opening a
+  transaction. This models causality across the deliberate non-transactional
+  fixture boundary and avoids snapshot races caused by wall-clock timing.
+
+### TDD evidence
+
+Focused RED checks compiled successfully and failed on the intended missing
+behavior:
+
+- aged foreign owner: prepare returned `Success` instead of
+  `NotRealizable`;
+- changed same-HLC payload: commit returned `Success` instead of
+  `AlreadyCommitted`;
+- owner loss during end: end returned `Success` instead of `CannotEnd`;
+- multi-cell owner mismatch: an earlier cell was promoted before
+  `SomeLocksNotReleased`, instead of returning `CannotEnd` without promotion;
+- distributed commit-stage failure: installed-peer pending count was `0`
+  instead of `1`;
+- injected later-promotion failure: end returned `Success` instead of
+  `CannotEnd`.
+
+The corresponding focused GREEN checks each passed after the implementation.
+
+### Serial verification
+
+- `timeout 650s cargo test --lib server::transactions::occ_tests -- --test-threads=1`:
+  34 passed, 0 failed, 659 filtered, 408.63s.
+- `timeout 650s cargo test --lib server::transactions::data_site -- --test-threads=1`:
+  42 passed, 0 failed, 651 filtered, 438.85s.
+- `timeout 650s cargo test --lib server::transactions::manager -- --test-threads=1`:
+  15 passed, 0 failed, 678 filtered, 110.14s.
+- `timeout 650s cargo test --lib server::transactions::tests -- --test-threads=1`:
+  5 passed, 0 failed, 688 filtered, 5.04s.
+- `timeout 300s cargo check --lib`: passed.
+
+The full-worktree `cargo fmt --all -- --check` gate remains blocked by
+pre-existing formatting debt outside Task 8, including trailing whitespace in
+the sibling `bifrost/src/membership/server.rs` worktree and formatting
+differences in existing B-tree files. No Task 8 file appeared in that diff;
+touched-file `rustfmt --check` and `git diff --check` are used as the scoped
+format and whitespace gates.
+
+Post-review cleanup verification was run against the exact final Rust sources:
+
+- the six focused participant regressions above each passed 1/1;
+- `commit_stage_failure_preserves_installed_peer_barrier` passed 1/1;
+- `cargo check --lib`, touched-file `rustfmt --check`, and
+  `git diff --check` passed.

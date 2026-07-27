@@ -49,15 +49,10 @@ pub(crate) fn full_read_rpc_count() -> usize {
     FULL_READ_RPC_COUNT.load(Relaxed)
 }
 
-// Lock timeout in milliseconds - locks held longer than this are considered stale
-// and can be reclaimed (default: 30 seconds)
+// Test age used to prove that elapsed wall-clock time never authorizes owner
+// takeover. Stale-owner resolution is an explicit later protocol phase.
+#[cfg(test)]
 const LOCK_TIMEOUT_MS: i64 = 30_000;
-
-// Maximum retries for lock release (Option 6: Two-Phase Lock Release)
-const MAX_LOCK_RELEASE_RETRIES: usize = 3;
-
-// Backoff between lock release retries in milliseconds
-const LOCK_RELEASE_RETRY_BACKOFF_MS: u64 = 100;
 
 #[cfg(test)]
 struct PrepareDelayState {
@@ -225,6 +220,40 @@ pub(crate) fn install_abort_cannot_end_for_cell(tid: TxnId, id: Id) -> AbortCann
     AbortCannotEndHandle { key }
 }
 
+#[cfg(test)]
+struct EndPromotionFailureHandle {
+    key: (TxnId, Id),
+}
+
+#[cfg(test)]
+impl Drop for EndPromotionFailureHandle {
+    fn drop(&mut self) {
+        end_promotion_failure_hooks().lock().remove(&self.key);
+    }
+}
+
+#[cfg(test)]
+static END_PROMOTION_FAILURE_HOOKS: OnceLock<Mutex<BTreeSet<(TxnId, Id)>>> = OnceLock::new();
+
+#[cfg(test)]
+fn end_promotion_failure_hooks() -> &'static Mutex<BTreeSet<(TxnId, Id)>> {
+    END_PROMOTION_FAILURE_HOOKS.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn install_end_promotion_failure(tid: TxnId, id: Id) -> EndPromotionFailureHandle {
+    let key = (tid, id);
+    end_promotion_failure_hooks().lock().insert(key.clone());
+    EndPromotionFailureHandle { key }
+}
+
+#[cfg(test)]
+fn should_fail_end_promotion(tid: &TxnId, id: &Id) -> bool {
+    end_promotion_failure_hooks()
+        .lock()
+        .contains(&(tid.clone(), *id))
+}
+
 type CommitHistory = BTreeMap<Id, CellHistory>;
 type CellMetaMutex = Arc<Mutex<CellMeta>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
@@ -234,7 +263,7 @@ type TxnMutex = Arc<Mutex<Transaction>>;
 /// Implements a hybrid timestamp-ordering + lock-based protocol with Wait-Die:
 /// - `read` / `write`: Track timestamps for timestamp-ordering validation
 /// - `owner`: Acts as a write lock during prepare/commit phases
-/// - `lock_acquired_at`: Timestamp when lock was acquired (for timeout detection)
+/// - `lock_acquired_at`: Timestamp used for diagnostics only
 ///
 /// Wait-Die Protocol:
 /// - When a transaction wants to acquire a cell already owned by another:
@@ -243,9 +272,8 @@ type TxnMutex = Arc<Mutex<Transaction>>;
 /// - This prevents deadlock while reducing contention on hot cells
 /// - Waiters poll via backoff rather than blocking on a condition variable
 ///
-/// Lock Timeout:
-/// - Locks are considered stale after LOCK_TIMEOUT_MS milliseconds
-/// - Stale locks can be reclaimed by any transaction (logged as warning)
+/// Owner age never authorizes takeover. Task 10 adds explicit stale-owner
+/// resolution; until then every owner participates in Wait-Die.
 #[derive(Debug)]
 pub struct CellMeta {
     read: TxnId,
@@ -261,6 +289,7 @@ struct Transaction {
     coordinator_id: Option<u64>,
     installed: BTreeMap<Id, InstalledRevision>,
     commit_hlc: Option<Hlc>,
+    commit_ops: Option<Vec<CommitOp>>,
     last_activity: i64,
     history: CommitHistory,
     /// RAII guards that hold segment references during this transaction
@@ -418,6 +447,7 @@ impl DataManager {
                 coordinator_id: None,
                 installed: BTreeMap::new(),
                 commit_hlc: None,
+                commit_ops: None,
                 last_activity: get_time(),
                 history: BTreeMap::new(),
                 rollback_guards: Vec::with_capacity(4), // Pre-allocate for common case
@@ -726,90 +756,6 @@ impl DataManager {
         }
     }
 
-    /// Attempt to release locks for a transaction
-    /// Returns (number of locks released, Vec of failures)
-    /// Option 5: Ensures metadata isn't cleaned up while locks are held
-    /// Option 6: Provides detailed failure information for retry logic
-    fn attempt_lock_release(
-        &self,
-        expected_owner: Option<&TxnPriority>,
-        affected_cell_ids: &[Id],
-    ) -> (usize, Vec<LockReleaseFailure>) {
-        let affected_cell_ids: Vec<_> = affected_cell_ids
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let mut failures = Vec::new();
-        let current_time = get_time();
-        let mut cell_mutexes = Vec::with_capacity(affected_cell_ids.len());
-        for cell_id in &affected_cell_ids {
-            if let Some(cell_mutex) = self.cells.get(cell_id) {
-                cell_mutexes.push(cell_mutex);
-            } else {
-                let reason = "Cell metadata not found (may have been cleaned up)".to_string();
-                warn!(
-                    "Cannot release lock on cell {:?} for {:?}: {}",
-                    cell_id, expected_owner, reason
-                );
-                failures.push(LockReleaseFailure {
-                    cell_id: *cell_id,
-                    reason,
-                });
-            }
-        }
-        if !failures.is_empty() {
-            return (0, failures);
-        }
-
-        let mut cell_guards: Vec<_> = cell_mutexes.iter().map(|cell| cell.lock()).collect();
-        for (cell_id, meta) in affected_cell_ids.iter().zip(cell_guards.iter()) {
-            match (expected_owner, &meta.owner) {
-                (Some(expected), Some(actual)) if expected == actual => {}
-                (Some(_), None) | (None, None) => {}
-                (Some(expected), Some(actual)) => {
-                    failures.push(LockReleaseFailure {
-                        cell_id: *cell_id,
-                        reason: format!(
-                            "Cell lock owned by different transaction: expected {:?}, found {:?}",
-                            expected, actual
-                        ),
-                    });
-                }
-                (None, Some(actual)) => {
-                    failures.push(LockReleaseFailure {
-                        cell_id: *cell_id,
-                        reason: format!(
-                            "Missing coordinator id for release; cell still owned by {:?}",
-                            actual
-                        ),
-                    });
-                }
-            }
-        }
-        if !failures.is_empty() {
-            return (0, failures);
-        }
-
-        for (cell_id, meta) in affected_cell_ids.iter().zip(cell_guards.iter_mut()) {
-            if meta.owner.is_some() {
-                let lock_age = meta
-                    .lock_acquired_at
-                    .map(|acquired| current_time - acquired)
-                    .unwrap_or(0);
-                debug!(
-                    "Released lock on cell {:?} owned by {:?} (held for {}ms)",
-                    cell_id, expected_owner, lock_age
-                );
-            }
-            meta.owner = None;
-            meta.lock_acquired_at = None;
-        }
-
-        (affected_cell_ids.len(), failures)
-    }
-
     fn warn_on_index_wait_results<I>(&self, tid: &TxnId, results: I)
     where
         I: IntoIterator<
@@ -835,6 +781,48 @@ impl DataManager {
         }
     }
 
+    fn commit_cells_equal(left: &OwnedCell, right: &OwnedCell) -> bool {
+        left.header.revision_ts == right.header.revision_ts
+            && left.header.flags == right.header.flags
+            && left.header.schema == right.header.schema
+            && left.header.partition == right.header.partition
+            && left.header.hash == right.header.hash
+            && left.data == right.data
+    }
+
+    fn commit_ops_equal(left: &CommitOp, right: &CommitOp) -> bool {
+        match (left, right) {
+            (CommitOp::Write(left), CommitOp::Write(right))
+            | (CommitOp::Update(left), CommitOp::Update(right)) => {
+                Self::commit_cells_equal(left, right)
+            }
+            (CommitOp::Remove(left), CommitOp::Remove(right)) => left == right,
+            (CommitOp::Read(left_id, left_revision), CommitOp::Read(right_id, right_revision)) => {
+                left_id == right_id && left_revision == right_revision
+            }
+            (CommitOp::None, CommitOp::None) => true,
+            _ => false,
+        }
+    }
+
+    fn canonical_commit_ops(mut cells: Vec<CommitOp>) -> Result<Vec<CommitOp>, DMCommitResult> {
+        let mut keyed = Vec::with_capacity(cells.len());
+        for cell in cells.drain(..) {
+            let id = Self::commit_op_cell_id(&cell).map_err(DMCommitResult::CheckFailed)?;
+            keyed.push((id, cell));
+        }
+        keyed.sort_by_key(|(id, _)| *id);
+        Ok(keyed.into_iter().map(|(_, cell)| cell).collect())
+    }
+
+    fn commit_requests_equal(left: &[CommitOp], right: &[CommitOp]) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| Self::commit_ops_equal(left, right))
+    }
+
     fn apply_commit_ops(
         &self,
         txn_lock: &TxnMutex,
@@ -842,6 +830,10 @@ impl DataManager {
         commit_hlc: Hlc,
         cells: Vec<CommitOp>,
     ) -> DMCommitResult {
+        let cells = match Self::canonical_commit_ops(cells) {
+            Ok(cells) => cells,
+            Err(result) => return result,
+        };
         let mut txn = txn_lock.lock();
         txn.last_activity = get_time();
         match txn.state {
@@ -853,8 +845,10 @@ impl DataManager {
             }
             TxnState::Committed => {
                 if txn.commit_hlc == Some(commit_hlc)
-                    && Self::validate_commit_subset(&txn, &cells).is_ok()
-                    && Self::validate_commit_payload(&txn, &cells).is_ok()
+                    && txn
+                        .commit_ops
+                        .as_ref()
+                        .is_some_and(|stored| Self::commit_requests_equal(stored, &cells))
                     && self.installed_revisions_agree(&txn)
                 {
                     return DMCommitResult::Success;
@@ -879,6 +873,13 @@ impl DataManager {
         if txn
             .commit_hlc
             .is_some_and(|installed_hlc| installed_hlc != commit_hlc)
+        {
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
+        }
+        if txn
+            .commit_ops
+            .as_ref()
+            .is_some_and(|stored| !Self::commit_requests_equal(stored, &cells))
         {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
@@ -907,6 +908,7 @@ impl DataManager {
         }
 
         txn.commit_hlc = Some(commit_hlc);
+        txn.commit_ops = Some(cells.clone());
         crate::ram::chunk::set_transaction_context(true);
         let mut write_error: Option<(Id, WriteError)> = None;
         {
@@ -1334,6 +1336,76 @@ mod tests {
             generate_scoped_service_id(group, "db_a"),
             generate_scoped_service_id(group, "db_b")
         );
+    }
+
+    #[test]
+    fn canonical_commit_identity_covers_kind_full_id_header_and_payload() {
+        let first_id = Id::new(7, 11);
+        let second_id = Id::new(8, 11);
+        let mut first = counter_cell(990, first_id, 1, "first");
+        first.header.revision_ts = 17;
+        first.header.flags = 3;
+        let second = counter_cell(990, second_id, 2, "second");
+        let expected = DataManager::canonical_commit_ops(vec![
+            CommitOp::Update(second.clone()),
+            CommitOp::Update(first.clone()),
+        ])
+        .unwrap();
+        let reordered = DataManager::canonical_commit_ops(vec![
+            CommitOp::Update(first.clone()),
+            CommitOp::Update(second.clone()),
+        ])
+        .unwrap();
+        assert!(DataManager::commit_requests_equal(&expected, &reordered));
+
+        let changed_kind = DataManager::canonical_commit_ops(vec![
+            CommitOp::Remove(first_id),
+            CommitOp::Update(second.clone()),
+        ])
+        .unwrap();
+        assert!(!DataManager::commit_requests_equal(
+            &expected,
+            &changed_kind
+        ));
+
+        let changed_id = DataManager::canonical_commit_ops(vec![
+            CommitOp::Update(counter_cell(990, Id::new(9, 11), 1, "first")),
+            CommitOp::Update(second.clone()),
+        ])
+        .unwrap();
+        assert!(!DataManager::commit_requests_equal(&expected, &changed_id));
+
+        let mut header_variants = Vec::new();
+        for mutate in [
+            |cell: &mut OwnedCell| cell.header.revision_ts += 1,
+            |cell: &mut OwnedCell| cell.header.flags += 1,
+            |cell: &mut OwnedCell| cell.header.schema += 1,
+        ] {
+            let mut changed = first.clone();
+            mutate(&mut changed);
+            header_variants.push(changed);
+        }
+        for changed in header_variants {
+            let changed_header = DataManager::canonical_commit_ops(vec![
+                CommitOp::Update(changed),
+                CommitOp::Update(second.clone()),
+            ])
+            .unwrap();
+            assert!(!DataManager::commit_requests_equal(
+                &expected,
+                &changed_header
+            ));
+        }
+
+        let changed_payload = DataManager::canonical_commit_ops(vec![
+            CommitOp::Update(counter_cell(990, first_id, 99, "changed")),
+            CommitOp::Update(second),
+        ])
+        .unwrap();
+        assert!(!DataManager::commit_requests_equal(
+            &expected,
+            &changed_payload
+        ));
     }
 
     #[cfg(feature = "occ_phase_profile")]
@@ -2735,22 +2807,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_validation_rejects_stale_prepared_owner_before_storage_mutation() {
+    async fn prepare_does_not_reclaim_aged_foreign_owner() {
         let _ = env_logger::try_init();
         let address = "127.0.0.1:5346";
-        let group = "txn_data_site_commit_stale_owner";
+        let group = "txn_data_site_aged_owner_wait_die";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
         let cell_id = Id::new(0, 8205);
-        let initial_score = 21;
-        let initial_revision_ts =
-            seed_cell_revision(&runtime, schema.id, cell_id, initial_score, 0);
+        let initial_revision_ts = seed_cell_revision(&runtime, schema.id, cell_id, 21, 0);
         let t1 = test_hlc(1, 21);
         let t2 = test_hlc(1, 22);
         let t1_owner = TxnPriority::new(t1.clone(), 21);
-        let t2_owner = TxnPriority::new(t2.clone(), 22);
         let prepare_op = PrepareOp {
             id: cell_id,
             expectation: CellExpectation::Present(initial_revision_ts),
@@ -2769,7 +2838,7 @@ mod tests {
         assert_eq!(first, DMPrepareResult::Success);
         assert_eq!(
             manager.cell_meta_mutex(&cell_id).lock().owner,
-            Some(t1_owner)
+            Some(t1_owner.clone())
         );
 
         {
@@ -2787,41 +2856,11 @@ mod tests {
         )
         .await
         .payload;
-        assert_eq!(second, DMPrepareResult::Success);
+        assert_eq!(second, DMPrepareResult::NotRealizable);
         assert_eq!(
             manager.cell_meta_mutex(&cell_id).lock().owner,
-            Some(t2_owner.clone())
-        );
-
-        let commit = <DataManager as Service>::commit(
-            &manager,
-            manager.hlc.now(),
-            t1.clone(),
-            vec![CommitOp::Update(counter_cell(
-                schema.id,
-                cell_id,
-                99,
-                "counter_stale_owner_commit",
-            ))],
-        )
-        .await
-        .payload;
-
-        assert_eq!(commit, DMCommitResult::CheckFailed(CheckError::CannotEnd));
-
-        let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
-        assert_eq!(*persisted.data["score"].u64().unwrap(), initial_score);
-        assert_eq!(persisted.header.revision_ts, initial_revision_ts);
-
-        let t1_txn_lock = manager.txns.get(&t1).expect("t1 should remain tracked");
-        let t1_txn = t1_txn_lock.lock();
-        assert_eq!(t1_txn.state, TxnState::Prepared);
-        assert!(t1_txn.history.is_empty());
-        drop(t1_txn);
-
-        assert_eq!(
-            manager.cell_meta_mutex(&cell_id).lock().owner,
-            Some(t2_owner.clone())
+            Some(t1_owner.clone()),
+            "owner age must not permit blind takeover"
         );
 
         let abort_t2 = <DataManager as Service>::abort(&manager, t2.clone(), t2.clone())
@@ -2832,6 +2871,10 @@ mod tests {
             .await
             .payload;
         assert_eq!(end_t2, EndResult::Success);
+        assert_eq!(
+            manager.cell_meta_mutex(&cell_id).lock().owner,
+            Some(t1_owner)
+        );
 
         let abort_t1 = <DataManager as Service>::abort(&manager, t1.clone(), t1.clone())
             .await
@@ -3784,6 +3827,414 @@ mod tests {
 
         server.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_retry_same_hlc_requires_exact_operation_and_cell_without_mutation() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5403";
+        let group = "txn_data_site_commit_retry_exact_payload";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99035);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                47,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+
+        let commit_hlc = manager.hlc.now();
+        let original = CommitOp::Update(counter_cell(
+            schema.id,
+            cell_id,
+            9,
+            "exact-payload-original",
+        ));
+        assert_eq!(
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![original.clone()],)
+                .await
+                .payload,
+            DMCommitResult::Success
+        );
+
+        let txn_lock = manager.txns.get(&tid).expect("transaction should exist");
+        let installed_before = txn_lock.lock().installed[&cell_id].node.load();
+        let changed = CommitOp::Update(counter_cell(
+            schema.id,
+            cell_id,
+            10,
+            "exact-payload-changed",
+        ));
+        assert_eq!(
+            <DataManager as Service>::commit(&manager, commit_hlc, tid, vec![changed])
+                .await
+                .payload,
+            DMCommitResult::CheckFailed(CheckError::AlreadyCommitted)
+        );
+        assert_eq!(
+            <DataManager as Service>::commit(
+                &manager,
+                commit_hlc,
+                tid,
+                vec![CommitOp::Remove(cell_id)],
+            )
+            .await
+            .payload,
+            DMCommitResult::CheckFailed(CheckError::AlreadyCommitted)
+        );
+        let mut changed_header = counter_cell(schema.id, cell_id, 9, "exact-payload-original");
+        changed_header.header.flags = 1;
+        assert_eq!(
+            <DataManager as Service>::commit(
+                &manager,
+                commit_hlc,
+                tid,
+                vec![CommitOp::Update(changed_header)],
+            )
+            .await
+            .payload,
+            DMCommitResult::CheckFailed(CheckError::AlreadyCommitted)
+        );
+        assert_eq!(
+            <DataManager as Service>::commit(
+                &manager,
+                commit_hlc,
+                tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    Id::new(1, cell_id.lower),
+                    9,
+                    "exact-payload-original",
+                ))],
+            )
+            .await
+            .payload,
+            DMCommitResult::CheckFailed(CheckError::AlreadyCommitted)
+        );
+        assert_eq!(
+            txn_lock.lock().installed[&cell_id].node.load(),
+            installed_before,
+            "a conflicting retry must not mutate the installed revision"
+        );
+
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        let current = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(*current.data["score"].u64().unwrap(), 9);
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_owner_loss_preserves_pending_state_and_can_retry() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5404";
+        let group = "txn_data_site_end_owner_loss";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99036);
+        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
+        let tid = manager.hlc.now();
+        let coordinator_id = 48;
+        let owner = TxnPriority::new(tid, coordinator_id);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                coordinator_id,
+                &tid,
+                vec![PrepareOp {
+                    id: cell_id,
+                    expectation: CellExpectation::Present(initial_revision),
+                    intent: PrepareIntent::Write,
+                }],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![CommitOp::Update(counter_cell(
+                    schema.id,
+                    cell_id,
+                    9,
+                    "end-owner-loss-pending",
+                ))],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+
+        {
+            let meta = manager.cell_meta_mutex(&cell_id);
+            let mut meta = meta.lock();
+            meta.owner = None;
+            meta.lock_acquired_at = None;
+        }
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let txn_lock = manager
+            .txns
+            .get(&tid)
+            .expect("failed end must preserve transaction state");
+        assert_eq!(txn_lock.lock().state, TxnState::Committed);
+        assert_eq!(
+            txn_lock.lock().installed[&cell_id].node.load().0,
+            RevisionState::PendingPresent,
+            "failed end must not promote before validating ownership"
+        );
+
+        {
+            let meta = manager.cell_meta_mutex(&cell_id);
+            let mut meta = meta.lock();
+            meta.owner = Some(owner);
+            meta.lock_acquired_at = Some(get_time());
+        }
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        match runtime
+            .chunks()
+            .read_cell_snapshot(&cell_id, u64::MAX)
+            .unwrap()
+        {
+            SnapshotRead::Present(cell) => {
+                assert_eq!(*cell.data["score"].u64().unwrap(), 9);
+            }
+            other => panic!("expected promoted retry, got {other:?}"),
+        }
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_validates_all_cell_owners_before_multi_cell_promotion() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5405";
+        let group = "txn_data_site_end_multi_cell_barrier";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let first_id = Id::new(0, 99037);
+        let second_id = Id::new(0, 99038);
+        let first_revision = seed_cell_revision(&runtime, schema.id, first_id, 1, 0);
+        let second_revision = seed_cell_revision(&runtime, schema.id, second_id, 2, 0);
+        let tid = manager.hlc.now();
+        let coordinator_id = 49;
+        let owner = TxnPriority::new(tid, coordinator_id);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                coordinator_id,
+                &tid,
+                vec![
+                    PrepareOp {
+                        id: first_id,
+                        expectation: CellExpectation::Present(first_revision),
+                        intent: PrepareIntent::Write,
+                    },
+                    PrepareOp {
+                        id: second_id,
+                        expectation: CellExpectation::Present(second_revision),
+                        intent: PrepareIntent::Write,
+                    },
+                ],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![
+                    CommitOp::Update(counter_cell(schema.id, first_id, 11, "end-barrier-first",)),
+                    CommitOp::Update(counter_cell(schema.id, second_id, 12, "end-barrier-second",)),
+                ],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+
+        let foreign_owner = TxnPriority::new(manager.hlc.now(), 99);
+        {
+            let meta = manager.cell_meta_mutex(&second_id);
+            let mut meta = meta.lock();
+            meta.owner = Some(foreign_owner.clone());
+            meta.lock_acquired_at = Some(get_time());
+        }
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let txn_lock = manager
+            .txns
+            .get(&tid)
+            .expect("failed end must preserve transaction state");
+        for id in [first_id, second_id] {
+            assert_eq!(
+                txn_lock.lock().installed[&id].node.load().0,
+                RevisionState::PendingPresent,
+                "owner validation failure must precede every promotion"
+            );
+        }
+        assert_eq!(
+            manager.cell_meta_mutex(&first_id).lock().owner,
+            Some(owner.clone())
+        );
+        assert_eq!(
+            manager.cell_meta_mutex(&second_id).lock().owner,
+            Some(foreign_owner)
+        );
+
+        {
+            let meta = manager.cell_meta_mutex(&second_id);
+            let mut meta = meta.lock();
+            meta.owner = Some(owner);
+            meta.lock_acquired_at = Some(get_time());
+        }
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_partial_promotion_failure_restores_pending_barrier_for_retry() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5406";
+        let group = "txn_data_site_end_partial_promotion";
+        let server = start_transaction_test_server(address, group).await;
+        let runtime = server.current_database();
+        let schema = install_prepare_test_schema(&runtime);
+        let manager = data_manager_for_database(&server, address, group).await;
+        let first_id = Id::new(0, 99039);
+        let second_id = Id::new(0, 99040);
+        let first_revision = seed_cell_revision(&runtime, schema.id, first_id, 1, 0);
+        let second_revision = seed_cell_revision(&runtime, schema.id, second_id, 2, 0);
+        let tid = manager.hlc.now();
+        let coordinator_id = 50;
+        let owner = TxnPriority::new(tid, coordinator_id);
+        assert_eq!(
+            prepare_ops_local(
+                &manager,
+                coordinator_id,
+                &tid,
+                vec![
+                    PrepareOp {
+                        id: first_id,
+                        expectation: CellExpectation::Present(first_revision),
+                        intent: PrepareIntent::Write,
+                    },
+                    PrepareOp {
+                        id: second_id,
+                        expectation: CellExpectation::Present(second_revision),
+                        intent: PrepareIntent::Write,
+                    },
+                ],
+            )
+            .await,
+            DMPrepareResult::Success
+        );
+        assert_eq!(
+            commit_ops_local(
+                &manager,
+                &tid,
+                vec![
+                    CommitOp::Update(counter_cell(
+                        schema.id,
+                        first_id,
+                        11,
+                        "partial-promotion-first",
+                    )),
+                    CommitOp::Update(counter_cell(
+                        schema.id,
+                        second_id,
+                        12,
+                        "partial-promotion-second",
+                    )),
+                ],
+            )
+            .await,
+            DMCommitResult::Success
+        );
+
+        let failure = install_end_promotion_failure(tid, second_id);
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::CheckFailed(CheckError::CannotEnd)
+        );
+        let txn_lock = manager
+            .txns
+            .get(&tid)
+            .expect("failed promotion must preserve transaction state");
+        assert_eq!(txn_lock.lock().state, TxnState::Committed);
+        for id in [first_id, second_id] {
+            assert_eq!(
+                txn_lock.lock().installed[&id].node.load().0,
+                RevisionState::PendingPresent,
+                "partial failure must restore the complete pending barrier"
+            );
+            assert_eq!(
+                manager.cell_meta_mutex(&id).lock().owner,
+                Some(owner.clone()),
+                "partial failure must preserve every owner"
+            );
+        }
+
+        drop(failure);
+        assert_eq!(
+            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
+                .await
+                .payload,
+            EndResult::Success
+        );
+        for (id, expected_score) in [(first_id, 11), (second_id, 12)] {
+            match runtime.chunks().read_cell_snapshot(&id, u64::MAX).unwrap() {
+                SnapshotRead::Present(cell) => {
+                    assert_eq!(*cell.data["score"].u64().unwrap(), expected_score);
+                }
+                other => panic!("expected promoted retry, got {other:?}"),
+            }
+        }
+
+        server.shutdown().await;
+    }
 }
 
 impl Service for DataManager {
@@ -3923,24 +4374,16 @@ impl Service for DataManager {
                     cell_mutices.push(self.cell_meta_mutex(&op.id));
                 }
                 for cell_mutex in &cell_mutices {
-                    let mut meta = cell_mutex.lock();
-                    let current_time = get_time();
+                    let meta = cell_mutex.lock();
 
                     if let Some(owner) = meta.owner.clone() {
                         if owner != requester {
                             let lock_age = meta
                                 .lock_acquired_at
-                                .map(|acquired| current_time - acquired)
+                                .map(|acquired| get_time() - acquired)
                                 .unwrap_or(0);
 
-                            if lock_age > LOCK_TIMEOUT_MS {
-                                warn!(
-                                    "PREPARE: Reclaiming stale lock on cell (held for {}ms by {:?}), now claimed by {:?}",
-                                    lock_age, owner, requester
-                                );
-                                meta.owner = None;
-                                meta.lock_acquired_at = None;
-                            } else if requester.compare_age(&owner).is_gt() {
+                            if requester.compare_age(&owner).is_gt() {
                                 debug!(
                                     "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
                                     requester, owner, lock_age
@@ -4130,177 +4573,129 @@ impl Service for DataManager {
         let phase_guard = super::phase_profile::guard(super::phase_profile::Phase::ParticipantEnd);
         self.update_clock(clock);
 
-        // Option 6: Two-Phase Lock Release with Verification and Retry
-        let (affected_cell_ids, txn_state, expected_owner) = {
+        let result = 'end: {
             let Some(txn_lock) = self.find_transaction(&tid) else {
                 return self.response_with(EndResult::CheckFailed(CheckError::NotExisted));
             };
-            let txn = txn_lock.lock();
+            let mut txn = txn_lock.lock();
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
-                return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                break 'end EndResult::CheckFailed(CheckError::CannotEnd);
             }
+
+            let guarded_cell_ids = Self::guarded_txn_cell_ids(&txn);
+            let expected_owner = if guarded_cell_ids.is_empty() {
+                None
+            } else {
+                let Some(coordinator_id) = txn.coordinator_id else {
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                };
+                Some(TxnPriority::new(tid, coordinator_id))
+            };
+            let mut cell_mutexes = Vec::with_capacity(guarded_cell_ids.len());
+            for cell_id in &guarded_cell_ids {
+                let Some(cell_mutex) = self.cells.get(cell_id) else {
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                };
+                cell_mutexes.push(cell_mutex);
+            }
+            let mut cell_guards: Vec<_> = cell_mutexes.iter().map(|cell| cell.lock()).collect();
+            if let Some(expected_owner) = expected_owner.as_ref() {
+                if cell_guards
+                    .iter()
+                    .any(|meta| meta.owner.as_ref() != Some(expected_owner))
+                {
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                }
+            }
+
             if txn.state == TxnState::Committed {
                 if !self.installed_revisions_agree(&txn) {
-                    return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
                 }
+                if txn.installed.values().any(|installed| {
+                    !matches!(
+                        installed.node.load().0,
+                        RevisionState::PendingPresent
+                            | RevisionState::PendingDeleted
+                            | RevisionState::CommittedPresent
+                            | RevisionState::CommittedDeleted
+                    )
+                }) {
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
+                }
+
+                let mut promoted = Vec::new();
+                let mut promotion_failed = false;
                 for installed in txn.installed.values() {
                     match installed.node.load().0 {
-                        RevisionState::PendingPresent | RevisionState::PendingDeleted => {
-                            if self.chunks().promote_revision(installed).is_err() {
-                                return self
-                                    .response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                        state @ (RevisionState::PendingPresent | RevisionState::PendingDeleted) => {
+                            #[cfg(test)]
+                            if should_fail_end_promotion(&tid, &installed.id) {
+                                promotion_failed = true;
+                                break;
                             }
+                            if self.chunks().promote_revision(installed).is_err() {
+                                promotion_failed = true;
+                                break;
+                            }
+                            let committed = match state {
+                                RevisionState::PendingPresent => RevisionState::CommittedPresent,
+                                RevisionState::PendingDeleted => RevisionState::CommittedDeleted,
+                                _ => unreachable!(),
+                            };
+                            promoted.push((installed.node.clone(), state, committed));
                         }
                         RevisionState::CommittedPresent | RevisionState::CommittedDeleted => {}
-                        RevisionState::Aborted | RevisionState::Expired => {
-                            return self
-                                .response_with(EndResult::CheckFailed(CheckError::CannotEnd));
-                        }
+                        RevisionState::Aborted | RevisionState::Expired => unreachable!(
+                            "installed revision states were prevalidated before promotion"
+                        ),
                     }
                 }
-                if !self.installed_revisions_agree(&txn) {
-                    return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                if promotion_failed || !self.installed_revisions_agree(&txn) {
+                    for (node, pending, committed) in promoted.into_iter().rev() {
+                        if !node.compare_exchange_state(committed, pending) {
+                            error!("Could not restore pending promotion barrier for {:?}", tid);
+                        }
+                    }
+                    break 'end EndResult::CheckFailed(CheckError::CannotEnd);
                 }
             }
+
             debug!(
                 "AFFECTED: {}, {:?}, {:?}",
-                txn.affected_cells.len(),
+                guarded_cell_ids.len(),
                 txn.state,
                 tid
             );
-            (
-                txn.affected_cells.clone(),
-                txn.state,
-                txn.coordinator_id
-                    .map(|coordinator_id| TxnPriority::new(tid.clone(), coordinator_id)),
-            )
+
+            for meta in &mut cell_guards {
+                meta.owner = None;
+                meta.lock_acquired_at = None;
+            }
+
+            if let Some(undo_log) = self.undo_log() {
+                let log_result = match txn.state {
+                    TxnState::Committed => undo_log.write_commit_marker(&tid),
+                    TxnState::Aborted => undo_log.write_abort_marker(&tid),
+                    _ => Ok(()),
+                };
+                if let Err(error) = log_result {
+                    error!("Failed to write transaction completion marker: {:?}", error);
+                }
+            }
+
+            let guards_to_drop = std::mem::take(&mut txn.rollback_guards);
+            self.wipe_out_transaction(&tid);
+            drop(txn);
+            drop(guards_to_drop);
+            self.cleanup_signal.store(true, Relaxed);
+            debug!("ENDED: {:?} after atomic owner barrier", tid);
+            EndResult::Success
         };
-
-        // Attempt lock release with retries
-        let mut retry_attempt = 0;
-        let mut lock_release_result = None;
-
-        while retry_attempt <= MAX_LOCK_RELEASE_RETRIES {
-            if retry_attempt > 0 {
-                debug!(
-                    "Retrying lock release for {:?} (attempt {}/{})",
-                    tid, retry_attempt, MAX_LOCK_RELEASE_RETRIES
-                );
-                std::thread::sleep(Duration::from_millis(LOCK_RELEASE_RETRY_BACKOFF_MS));
-            }
-
-            let (released_count, failed_releases) =
-                self.attempt_lock_release(expected_owner.as_ref(), &affected_cell_ids);
-            let total_cells = affected_cell_ids.len();
-
-            if failed_releases.is_empty() {
-                // All locks released successfully
-                debug!(
-                    "Successfully released all {} locks for {:?}, total locks: {}",
-                    released_count,
-                    tid,
-                    self.txns.len()
-                );
-                lock_release_result = Some(Ok(()));
-                break;
-            } else if retry_attempt == MAX_LOCK_RELEASE_RETRIES {
-                // Retries exhausted - CRITICAL ERROR
-                error!(
-                    "CRITICAL: Lock release retries exhausted for {:?}: {}/{} locks released, {} failures",
-                    tid,
-                    released_count,
-                    total_cells,
-                    failed_releases.len()
-                );
-                for failure in &failed_releases {
-                    error!(
-                        "  - Cell {:?} lock release failed: {}",
-                        failure.cell_id, failure.reason
-                    );
-                }
-                lock_release_result = Some(Err((released_count, total_cells, failed_releases)));
-                break;
-            } else {
-                // Partial failure on this attempt, will retry
-                error!(
-                    "Lock release failed for {:?} on attempt {}/{}: {}/{} locks released, {} failures - retrying",
-                    tid,
-                    retry_attempt + 1,
-                    MAX_LOCK_RELEASE_RETRIES + 1,
-                    released_count,
-                    total_cells,
-                    failed_releases.len()
-                );
-                for failure in &failed_releases {
-                    error!(
-                        "  - Cell {:?} lock release failed: {}",
-                        failure.cell_id, failure.reason
-                    );
-                }
-            }
-
-            retry_attempt += 1;
-        }
         async move {
             #[cfg(feature = "occ_phase_profile")]
             let _phase_guard = phase_guard;
-            // Return appropriate result based on lock release outcome
-            match lock_release_result {
-                Some(Ok(())) => {
-                    // Release all segment references before wiping out transaction.
-                    let guards_to_drop = {
-                        if let Some(txn_lock) = self.find_transaction(&tid) {
-                            let mut txn = txn_lock.lock();
-                            std::mem::take(&mut txn.rollback_guards)
-                        } else {
-                            Vec::new()
-                        }
-                    };
-                    drop(guards_to_drop);
-
-                    if let Some(undo_log) = self.undo_log() {
-                        let log_result = match txn_state {
-                            TxnState::Committed => undo_log.write_commit_marker(&tid),
-                            TxnState::Aborted => undo_log.write_abort_marker(&tid),
-                            _ => Ok(()),
-                        };
-                        if let Err(e) = log_result {
-                            error!("Failed to write transaction completion marker: {:?}", e);
-                        }
-                    }
-
-                    self.wipe_out_transaction(&tid);
-                    self.cleanup_signal.store(true, Relaxed);
-                    debug!("ENDED: {:?} with all locks released", tid);
-                    self.response_with(EndResult::Success).await
-                }
-                Some(Err((released, total, failures))) => {
-                    // Option 1: Hard error on lock release failure
-                    error!(
-                        "ENDED: {:?} with lock release failures ({}/{} released)",
-                        tid, released, total
-                    );
-                    if failures.len() == total {
-                        // Complete failure - retries exhausted
-                        self.response_with(EndResult::LockReleaseRetriesExhausted { failures })
-                            .await
-                    } else {
-                        // Partial failure
-                        self.response_with(EndResult::SomeLocksNotReleased {
-                            released,
-                            total,
-                            failures,
-                        })
-                        .await
-                    }
-                }
-                None => {
-                    // This shouldn't happen, but handle it gracefully
-                    error!("ENDED: {:?} with unknown lock release status", tid);
-                    self.response_with(EndResult::LockReleaseRetriesExhausted { failures: vec![] })
-                        .await
-                }
-            }
+            self.response_with(result).await
         }
         .boxed()
     }

@@ -87,7 +87,7 @@ async fn start_occ_test_cluster(addresses: &[&str], group: &str) -> Vec<Arc<NebS
                 .unwrap(),
         );
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = ids_on_stably_routed_distinct_servers(&servers).await;
     servers
 }
 
@@ -136,21 +136,77 @@ fn counter_cell(schema_id: u32, id: Id, score: u64, name: &str) -> OwnedCell {
 }
 
 fn ids_on_distinct_servers(server: &Arc<NebServer>) -> ((Id, u64), (Id, u64)) {
+    try_ids_on_distinct_servers(server)
+        .expect("expected at least two routed servers in the test cluster")
+}
+
+fn try_ids_on_distinct_servers(server: &Arc<NebServer>) -> Option<((Id, u64), (Id, u64))> {
     let mut first = None;
     for partition in 1..8192u64 {
         let id = Id::new(partition, 90_000 + partition);
-        let server_id = server
-            .get_server_id_by_id(&id)
-            .expect("cluster should route every partition");
+        let server_id = server.get_server_id_by_id(&id)?;
         if let Some((first_id, first_server_id)) = first {
             if server_id != first_server_id {
-                return ((first_id, first_server_id), (id, server_id));
+                return Some(((first_id, first_server_id), (id, server_id)));
             }
         } else {
             first = Some((id, server_id));
         }
     }
-    panic!("expected at least two routed servers in the test cluster");
+    None
+}
+
+async fn ids_on_stably_routed_distinct_servers(
+    servers: &[Arc<NebServer>],
+) -> ((Id, u64), (Id, u64)) {
+    timeout(Duration::from_secs(5), async {
+        let mut last_candidate = None;
+        let mut confirmations = 0;
+        loop {
+            let candidate = try_ids_on_distinct_servers(&servers[0]).filter(
+                |((first_id, first_server_id), (second_id, second_server_id))| {
+                    servers
+                        .iter()
+                        .any(|server| server.server_id == *first_server_id)
+                        && servers
+                            .iter()
+                            .any(|server| server.server_id == *second_server_id)
+                        && servers.iter().all(|server| {
+                            server.get_server_id_by_id(first_id) == Some(*first_server_id)
+                                && server.get_server_id_by_id(second_id) == Some(*second_server_id)
+                        })
+                },
+            );
+            if candidate.is_some() && candidate == last_candidate {
+                confirmations += 1;
+            } else {
+                last_candidate = candidate;
+                confirmations = usize::from(last_candidate.is_some());
+            }
+            if confirmations >= 3 {
+                return last_candidate.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(
+        "cluster routing should converge on both current server IDs with identical ownership maps",
+    )
+}
+
+fn observe_distributed_seed_revisions<I>(coordinator: &Arc<NebServer>, revision_timestamps: I)
+where
+    I: IntoIterator<Item = u64>,
+{
+    let max_revision_ts = revision_timestamps
+        .into_iter()
+        .max()
+        .expect("distributed seed set should not be empty");
+    coordinator.hlc.observe(bifrost::hlc::Hlc {
+        ts: max_revision_ts,
+        node: coordinator.hlc.node(),
+    });
 }
 
 fn score_of(cell: &OwnedCell) -> u64 {
@@ -310,17 +366,24 @@ async fn all_participants_install_the_same_commit_timestamp() {
         .collect();
 
     let mut first_seed = counter_cell(schema.id, first_id, 1, "shared-hlc-first");
-    servers_by_id[&first_server_id]
+    let first_seed_header = servers_by_id[&first_server_id]
         .current_database()
         .chunks()
         .write_cell(&mut first_seed)
         .unwrap();
     let mut second_seed = counter_cell(schema.id, second_id, 2, "shared-hlc-second");
-    servers_by_id[&second_server_id]
+    let second_seed_header = servers_by_id[&second_server_id]
         .current_database()
         .chunks()
         .write_cell(&mut second_seed)
         .unwrap();
+    observe_distributed_seed_revisions(
+        &servers[0],
+        [
+            first_seed_header.revision_ts,
+            second_seed_header.revision_ts,
+        ],
+    );
 
     let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
@@ -399,17 +462,24 @@ async fn participant_delay_after_peer_install_never_exposes_partial_commit() {
         .collect();
 
     let mut first_seed = counter_cell(schema.id, first_id, 1, "partial-first-old");
-    servers_by_id[&first_server_id]
+    let first_seed_header = servers_by_id[&first_server_id]
         .current_database()
         .chunks()
         .write_cell(&mut first_seed)
         .unwrap();
     let mut second_seed = counter_cell(schema.id, second_id, 2, "partial-second-old");
-    servers_by_id[&second_server_id]
+    let second_seed_header = servers_by_id[&second_server_id]
         .current_database()
         .chunks()
         .write_cell(&mut second_seed)
         .unwrap();
+    observe_distributed_seed_revisions(
+        &servers[0],
+        [
+            first_seed_header.revision_ts,
+            second_seed_header.revision_ts,
+        ],
+    );
 
     let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
     let observer = txn.begin().await.unwrap().unwrap();
@@ -549,6 +619,146 @@ async fn participant_delay_after_peer_install_never_exposes_partial_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn commit_stage_failure_preserves_installed_peer_barrier() {
+    let _ = env_logger::try_init();
+    let addresses = ["127.0.0.1:5406", "127.0.0.1:5407"];
+    let group = "txn_occ_commit_failure_pending_barrier";
+    let servers = start_occ_test_cluster(&addresses, group).await;
+    let schema = install_occ_schema_on_servers(&servers);
+    let ((first_id, first_server_id), (second_id, second_server_id)) =
+        ids_on_distinct_servers(&servers[0]);
+    let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
+        .iter()
+        .map(|server| (server.server_id, server.clone()))
+        .collect();
+
+    let mut first_seed = counter_cell(schema.id, first_id, 1, "commit-failure-first-seed");
+    let first_seed_header = servers_by_id[&first_server_id]
+        .current_database()
+        .chunks()
+        .write_cell(&mut first_seed)
+        .unwrap();
+    let mut second_seed = counter_cell(schema.id, second_id, 2, "commit-failure-second-seed");
+    let second_seed_header = servers_by_id[&second_server_id]
+        .current_database()
+        .chunks()
+        .write_cell(&mut second_seed)
+        .unwrap();
+    observe_distributed_seed_revisions(
+        &servers[0],
+        [
+            first_seed_header.revision_ts,
+            second_seed_header.revision_ts,
+        ],
+    );
+
+    let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
+    let manager = servers[0].current_database().txn_manager().unwrap().clone();
+    let tid = txn.begin().await.unwrap().unwrap();
+    let first = accepted_cell(txn.read(tid, first_id).await.unwrap().unwrap());
+    let second = accepted_cell(txn.read(tid, second_id).await.unwrap().unwrap());
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(
+                schema.id,
+                first_id,
+                score_of(&first) + 10,
+                "commit-failure-first-pending",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.update(
+            tid,
+            counter_cell(
+                schema.id,
+                second_id,
+                score_of(&second) + 10,
+                "commit-failure-second-pending",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    let delayed_commit = transactions::data_site::install_commit_delay_for_cell(tid, second_id);
+    let prepare_client = txn.clone();
+    let prepare_task =
+        tokio::spawn(async move { prepare_client.prepare(tid).await.unwrap().unwrap() });
+    delayed_commit.wait_until_entered().await;
+
+    let first_runtime = servers_by_id[&first_server_id].current_database();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                first_runtime
+                    .chunks()
+                    .read_cell_snapshot(&first_id, u64::MAX)
+                    .unwrap(),
+                crate::ram::cell::SnapshotRead::Wait
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("participant A should install pending before participant B fails");
+
+    let mut conflicting = counter_cell(schema.id, second_id, 99, "commit-failure-second-conflict");
+    servers_by_id[&second_server_id]
+        .current_database()
+        .chunks()
+        .update_cell(&mut conflicting)
+        .unwrap();
+    delayed_commit.release();
+
+    assert_eq!(
+        prepare_task.await.unwrap(),
+        TMPrepareResult::DMCommitError(DMCommitResult::CellChanged(second_id))
+    );
+    assert_eq!(
+        manager.transaction_count(),
+        1,
+        "coordinator state must remain for later explicit resolution"
+    );
+    assert!(matches!(
+        first_runtime
+            .chunks()
+            .read_cell_snapshot(&first_id, u64::MAX)
+            .unwrap(),
+        crate::ram::cell::SnapshotRead::Wait
+    ));
+
+    let first_server_index = servers
+        .iter()
+        .position(|server| server.server_id == first_server_id)
+        .unwrap();
+    let first_site =
+        scoped_data_site_client_for_database(addresses[first_server_index], group, group).await;
+    let reader_tid = servers_by_id[&first_server_id].hlc.now();
+    assert!(matches!(
+        first_site
+            .read(first_server_id, reader_tid, reader_tid, first_id)
+            .await
+            .unwrap()
+            .payload,
+        TxnExecResult::Wait
+    ));
+
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn equal_commit_timestamp_is_invisible_to_snapshot() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5396";
@@ -605,18 +815,22 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
         .expect("fast-failure cell owner should exist");
 
     let mut slow_seed = counter_cell(schema.id, slow_id, 1, "counter_slow_seed");
-    slow_server
+    let slow_seed_header = slow_server
         .current_database()
         .chunks()
         .write_cell(&mut slow_seed)
         .unwrap();
 
     let mut fail_seed = counter_cell(schema.id, fail_id, 2, "counter_fail_seed");
-    fail_server
+    let fail_seed_header = fail_server
         .current_database()
         .chunks()
         .write_cell(&mut fail_seed)
         .unwrap();
+    observe_distributed_seed_revisions(
+        &servers[0],
+        [slow_seed_header.revision_ts, fail_seed_header.revision_ts],
+    );
 
     let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
@@ -749,18 +963,22 @@ async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_backgroun
         .expect("fast-failure cell owner should exist");
 
     let mut slow_seed = counter_cell(schema.id, slow_id, 1, "counter_cancel_slow_seed");
-    slow_server
+    let slow_seed_header = slow_server
         .current_database()
         .chunks()
         .write_cell(&mut slow_seed)
         .unwrap();
 
     let mut fail_seed = counter_cell(schema.id, fail_id, 2, "counter_cancel_fail_seed");
-    fail_server
+    let fail_seed_header = fail_server
         .current_database()
         .chunks()
         .write_cell(&mut fail_seed)
         .unwrap();
+    observe_distributed_seed_revisions(
+        &servers[0],
+        [slow_seed_header.revision_ts, fail_seed_header.revision_ts],
+    );
 
     let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
     let manager = servers[0].current_database().txn_manager().unwrap().clone();
@@ -1024,17 +1242,24 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
         .expect("failing abort participant should exist");
 
     let mut success_seed = counter_cell(schema.id, success_id, 1, "partial-abort-success-seed");
-    success_server
+    let success_seed_header = success_server
         .current_database()
         .chunks()
         .write_cell(&mut success_seed)
         .unwrap();
     let mut fail_seed = counter_cell(schema.id, fail_id, 2, "partial-abort-fail-seed");
-    fail_server
+    let fail_seed_header = fail_server
         .current_database()
         .chunks()
         .write_cell(&mut fail_seed)
         .unwrap();
+    observe_distributed_seed_revisions(
+        &servers[0],
+        [
+            success_seed_header.revision_ts,
+            fail_seed_header.revision_ts,
+        ],
+    );
 
     let txn = scoped_txn_client_for_database(addresses[0], group, group).await;
     let manager = servers[0].current_database().txn_manager().unwrap().clone();
