@@ -1,7 +1,6 @@
 use crate::ram::chunk::Chunk;
 #[cfg(feature = "compress_backups")]
 use crate::ram::compression;
-use crate::ram::durable_fs;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
 use crate::ram::file_manager::SegmentFileManager;
@@ -562,29 +561,6 @@ impl Segment {
             // 2. Waiting here could deadlock if another component holds tiered_lock
             // 3. Reading segment memory during archive is safe - data is copied atomically
             // The reference counter is only for preventing madvise_free during eviction
-            let backup_file_path = Path::new(&backup_file);
-            let has_old_backup = backup_file_path.exists();
-            // If backup file already exists, we use make a backup of the existing file
-            if has_old_backup {
-                debug!("Backup file {} already exists, moving to .old", backup_file);
-                // Handle race condition where file might be deleted between check and rename
-                match durable_fs::rename(
-                    Path::new(&backup_file),
-                    Path::new(&format!("{}.old", backup_file)),
-                ) {
-                    Ok(_) => {
-                        debug!("Successfully moved old backup file to .old");
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        // File was deleted between exists() check and rename - this is fine
-                        debug!("Backup file disappeared before rename (likely deleted by another process)");
-                    }
-                    Err(e) => {
-                        // Other errors should be propagated
-                        return Err(e);
-                    }
-                }
-            }
             {
                 // A staging filename is ignored by recovery. Publish the final
                 // backup name only after all staged contents are file-synced.

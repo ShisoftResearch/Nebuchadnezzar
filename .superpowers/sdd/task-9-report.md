@@ -638,3 +638,97 @@ conservatively until an acknowledged, bounded retirement/compaction protocol
 exists. That storage-growth concern remains deferred to Task 10, together with
 stale-owner resolution, index/range MVCC, and unrelated non-transactional
 isolation work.
+
+## Review Fixes Round 4
+
+### Root-Cause Trace
+
+`Segment::archive()` moved an existing recovery-visible final backup to
+`*.nbackup.old` before it opened, wrote, padded, or synchronized the staged
+replacement. Recovery discovery ignores both `.old` and `.staging` names, so a
+write, file-sync, or publication failure in that interval could leave no valid
+backup visible to recovery even though the old final had been complete.
+
+The pre-rename-to-`.old` path is removed. Both live segment archival and the
+shared WAL-to-backup helper now retain the current final while they create and
+completely write the discovery-ignored staging file. The shared publication
+primitive synchronizes staging contents, atomically renames staging over the
+final, and synchronizes the containing directory. `Segment::archive()` reaches
+WAL close/removal only after that primitive returns success; the durable unlink
+then synchronizes the WAL directory.
+
+A deterministic test-only fault can now fail file synchronization, fail a
+destination rename before the OS rename, or return an error after the OS rename
+but before its directory sync. The last case deliberately leaves the complete
+new final in place and retains the WAL. Repeating the normal archive operation
+rewrites staging, publishes over that valid final, synchronizes the directory,
+and only then removes the WAL.
+
+### Focused TDD Evidence
+
+The first exact RED ran before removing the `.old` path:
+
+- `cargo test --lib
+  ram::recovery::tests::archive_staging_sync_failure_preserves_recovery_visible_final_backup
+  -- --exact --test-threads=1`: 0 passed, 1 failed, 764 filtered. The assertion
+  failed because the prior recovery-visible final backup had been renamed away.
+
+The complete four-test archive replacement group was then RED together:
+0 passed, 4 failed, 761 filtered. The staging-sync and final-rename cases lost
+the final, the ordering case observed two renames (final to `.old`, then staging
+to final), and the post-rename case retained `.old`.
+
+After deleting only the unsafe production pre-rename, the group passed 4/4.
+The final post-format focused runs, each bounded and using one test thread,
+were:
+
+- `cargo test --lib ram::recovery::tests::archive_ --
+  --test-threads=1`: 4 passed, 0 failed, 762 filtered; 0.49s test time,
+  0.60s wall.
+- `cargo test --lib ram::file_manager::tests:: -- --test-threads=1`: 8
+  passed, 0 failed, 758 filtered; 0.00s test time, 0.10s wall.
+
+These regressions prove that staging synchronization and destination-rename
+failures preserve the prior final byte-for-byte and recovery-visible; recovery
+ignores incomplete staging; successful replacement has staging sync before
+exactly one staging-to-final rename, no final-to-`.old` rename, and no residual
+staging file; the complete new final recovers; WAL removal follows the final
+directory sync; and a post-OS-rename/pre-directory-sync error retains the
+complete final and WAL until a clean retry converges.
+
+The shared WAL-to-backup audit found no alternate replacement protocol:
+`copy_wal_to_backup` and `Segment::archive` are the two consumers of
+`stage_backup_file`/`publish_staged_backup`. The WAL helper's replacement test
+seeds an existing final, observes one staging-to-final rename after staging
+sync, and proves an injected staging-sync failure preserves the final before a
+successful retry.
+
+### Serial Verification
+
+Every required gate completed before the next began, with
+`--test-threads=1` for tests and an explicit timeout. No timeout was reached.
+
+- `cargo test --lib ram::cleaner -- --test-threads=1`: 24 passed, 0 failed,
+  0 ignored, 742 filtered; 0.35s test time, 3.30s wall.
+- `cargo test --lib ram::recovery -- --test-threads=1`: 41 passed, 0 failed,
+  2 ignored, 723 filtered; 3.86s test time, 4.00s wall.
+- `cargo test --lib server::transactions::occ_tests -- --test-threads=1`:
+  45 passed, 0 failed, 0 ignored, 721 filtered; 544.29s test time, 544.47s
+  wall.
+- `cargo check --lib`: exit 0; 1.00s wall, 60 existing warnings and no errors.
+- Scoped `rustfmt --check`: exit 0.
+- `git diff --check`: exit 0.
+- Static audit found no production `.old` backup path and no backup publication
+  call site outside the shared staging/publication primitive.
+
+### Files
+
+- `src/ram/durable_fs.rs`
+- `src/ram/file_manager.rs`
+- `src/ram/recovery.rs`
+- `src/ram/segs.rs`
+- `.superpowers/sdd/task-9-report.md`
+
+Coordinator decisions and participant completion evidence remain retained
+conservatively until Task 10 provides an acknowledged, bounded
+retirement/compaction protocol. The existing Task 10 deferrals are unchanged.

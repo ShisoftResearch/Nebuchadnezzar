@@ -1297,6 +1297,10 @@ mod tests {
     use crate::dovahkiin::types::Map;
     use crate::ram::cell::*;
     use crate::ram::chunk::Chunks;
+    use crate::ram::durable_fs::{
+        durability_events_for_test, fail_next_file_sync_for_test,
+        fail_next_rename_directory_sync_for_test, fail_next_rename_for_test, DurabilityEvent,
+    };
     use crate::ram::schema::{Field, LocalSchemasCache, Schema};
     use crate::ram::segs::{SegmentClass, SEGMENT_SIZE};
     use crate::ram::tiered::{manager::TieredMemoryManager, SharedMemoryPool, TieredConfig};
@@ -1304,7 +1308,7 @@ mod tests {
     use crate::server::ServerMeta;
     use dovahkiin::types::Type;
     use std::collections::HashSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1514,6 +1518,263 @@ mod tests {
             _backup_dir: backup_dir,
             _raft_dir: raft_dir,
         })
+    }
+
+    struct BackupReplacementFixture {
+        chunks: Arc<Chunks>,
+        backup_dir: TempDir,
+        wal_dir: TempDir,
+        raft_dir: TempDir,
+        final_path: PathBuf,
+        staging_path: PathBuf,
+        old_path: PathBuf,
+        original_bytes: Vec<u8>,
+        original_id: Id,
+        replacement_id: Id,
+    }
+
+    impl BackupReplacementFixture {
+        fn archive(&self) -> io::Result<bool> {
+            let segments = self.chunks.list[0].segments();
+            assert_eq!(segments.len(), 1, "fixture must use one segment generation");
+            segments[0].archive()
+        }
+
+        fn wal_path(&self) -> PathBuf {
+            let segments = self.chunks.list[0].segments();
+            PathBuf::from(
+                self.chunks.list[0]
+                    .file_manager
+                    .wal_path(0, segments[0].id, segments[0].seq_id)
+                    .expect("fixture WAL path"),
+            )
+        }
+
+        fn recover(&self) -> Arc<Chunks> {
+            Chunks::new_with_recovery_for_test(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta {
+                    schemas: setup_test_schema(),
+                }),
+                None,
+                Some(self.backup_dir.path().to_string_lossy().into_owned()),
+                Some(self.wal_dir.path().to_string_lossy().into_owned()),
+                None,
+                true,
+                Some(self.raft_dir.path().to_string_lossy().into_owned()),
+            )
+        }
+
+        fn assert_original_final_is_preserved_and_recoverable(&self) {
+            assert!(
+                self.final_path.exists(),
+                "the prior recovery-visible final backup must remain in place"
+            );
+            let actual = fs::read(&self.final_path).expect("read preserved final backup");
+            assert!(
+                actual == self.original_bytes,
+                "a pre-publication failure must preserve the prior final byte-for-byte"
+            );
+            assert!(
+                !self.old_path.exists(),
+                "the recovery-visible final must never be renamed aside"
+            );
+
+            let recovered = self.recover();
+            assert!(
+                recovered.read_cell(&self.original_id).is_ok(),
+                "recovery must retain the original final-backup cell"
+            );
+            assert!(
+                recovered.read_cell(&self.replacement_id).is_err(),
+                "an unpublished staging file must remain invisible to recovery"
+            );
+        }
+
+        fn assert_complete_replacement_is_recoverable(&self) {
+            assert!(self.final_path.exists());
+            assert!(
+                !self.staging_path.exists(),
+                "successful publication must consume the staging file"
+            );
+            assert!(
+                !self.old_path.exists(),
+                "backup replacement must not leave a recovery-invisible .old file"
+            );
+
+            let recovered = self.recover();
+            assert!(recovered.read_cell(&self.original_id).is_ok());
+            assert!(
+                recovered.read_cell(&self.replacement_id).is_ok(),
+                "the published final must contain the complete new segment"
+            );
+        }
+    }
+
+    fn backup_replacement_fixture() -> BackupReplacementFixture {
+        let backup_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let raft_dir = TempDir::new().unwrap();
+        let chunks = Chunks::new_with_recovery_for_test(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_string_lossy().into_owned()),
+            Some(wal_dir.path().to_string_lossy().into_owned()),
+            None,
+            false,
+            Some(raft_dir.path().to_string_lossy().into_owned()),
+        );
+        let original_id = Id::new(0, 9_200);
+        let mut original = default_cell(&original_id);
+        chunks.write_cell(&mut original).unwrap();
+
+        let segments = chunks.list[0].segments();
+        assert_eq!(segments.len(), 1);
+        segments[0].archive().expect("publish initial final backup");
+        let final_path = PathBuf::from(
+            chunks.list[0]
+                .file_manager
+                .backup_path(0, segments[0].id, segments[0].seq_id)
+                .expect("fixture backup path"),
+        );
+        let staging_path = PathBuf::from(format!("{}.staging", final_path.display()));
+        let old_path = PathBuf::from(format!("{}.old", final_path.display()));
+        let original_bytes = fs::read(&final_path).expect("read initial final backup");
+
+        let replacement_id = Id::new(0, 9_201);
+        let mut replacement = default_cell(&replacement_id);
+        chunks.write_cell(&mut replacement).unwrap();
+        assert_eq!(
+            chunks.list[0].segments().len(),
+            1,
+            "replacement must target the existing segment generation"
+        );
+
+        BackupReplacementFixture {
+            chunks,
+            backup_dir,
+            wal_dir,
+            raft_dir,
+            final_path,
+            staging_path,
+            old_path,
+            original_bytes,
+            original_id,
+            replacement_id,
+        }
+    }
+
+    #[test]
+    fn archive_staging_sync_failure_preserves_recovery_visible_final_backup() {
+        let fixture = backup_replacement_fixture();
+        fail_next_file_sync_for_test(&fixture.staging_path);
+
+        let error = fixture
+            .archive()
+            .expect_err("injected staging sync failure must reject publication");
+        assert!(error.to_string().contains("injected file sync failure"));
+        fixture.assert_original_final_is_preserved_and_recoverable();
+    }
+
+    #[test]
+    fn archive_final_rename_failure_preserves_recovery_visible_final_backup() {
+        let fixture = backup_replacement_fixture();
+        fail_next_rename_for_test(&fixture.final_path);
+
+        let error = fixture
+            .archive()
+            .expect_err("injected final rename failure must reject publication");
+        assert!(error.to_string().contains("injected rename failure"));
+        fixture.assert_original_final_is_preserved_and_recoverable();
+    }
+
+    #[test]
+    fn archive_replacement_syncs_staging_before_single_final_rename_and_recovers_complete_output() {
+        let fixture = backup_replacement_fixture();
+        let event_start = durability_events_for_test().len();
+        let wal_path = fixture.wal_path();
+
+        assert!(fixture.archive().expect("publish replacement backup"));
+
+        let events = durability_events_for_test();
+        let events = &events[event_start..];
+        let renames = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                DurabilityEvent::FileRenamed { from, to } => Some((index, from, to)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            renames.len(),
+            1,
+            "replacement must use exactly one atomic rename: {events:?}"
+        );
+        let (rename_index, from, to) = renames[0];
+        assert_eq!(from, &fixture.staging_path);
+        assert_eq!(to, &fixture.final_path);
+        let staging_sync_index = events
+            .iter()
+            .position(|event| event == &DurabilityEvent::FileSynced(fixture.staging_path.clone()))
+            .expect("complete staging file sync");
+        assert!(
+            staging_sync_index < rename_index,
+            "staging contents must be synced before the final rename: {events:?}"
+        );
+        let final_directory = fixture.final_path.parent().unwrap().to_path_buf();
+        let final_directory_sync_index = events
+            .iter()
+            .enumerate()
+            .skip(rename_index + 1)
+            .find_map(|(index, event)| {
+                (event == &DurabilityEvent::DirectorySynced(final_directory.clone()))
+                    .then_some(index)
+            })
+            .expect("final rename directory sync");
+        let wal_remove_index = events
+            .iter()
+            .position(|event| event == &DurabilityEvent::FileRemoved(wal_path.clone()))
+            .expect("source WAL removal");
+        assert!(
+            final_directory_sync_index < wal_remove_index,
+            "the WAL must remain until final publication is directory-durable: {events:?}"
+        );
+        fixture.assert_complete_replacement_is_recoverable();
+    }
+
+    #[test]
+    fn archive_retry_after_final_directory_sync_failure_converges_without_losing_backup() {
+        let fixture = backup_replacement_fixture();
+        let wal_path = fixture.wal_path();
+        fail_next_rename_directory_sync_for_test(&fixture.final_path);
+
+        let error = fixture
+            .archive()
+            .expect_err("post-rename directory sync failure must reach the caller");
+        assert!(error
+            .to_string()
+            .contains("injected directory sync failure after rename"));
+        assert!(
+            wal_path.exists(),
+            "WAL cleanup must not run after a final-directory durability failure"
+        );
+        fixture.assert_complete_replacement_is_recoverable();
+
+        assert!(
+            fixture.archive().expect("retry replacement publication"),
+            "a clean retry must converge"
+        );
+        assert!(
+            !wal_path.exists(),
+            "the WAL may be removed only after the retry publishes durably"
+        );
+        fixture.assert_complete_replacement_is_recoverable();
     }
 
     #[test]

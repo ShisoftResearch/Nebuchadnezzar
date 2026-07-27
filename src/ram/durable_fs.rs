@@ -139,12 +139,29 @@ pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     if let Some(parent) = parent_directory(to) {
         ensure_directory(parent)?;
     }
+    #[cfg(test)]
+    if should_fail_rename_for_test(to) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("injected rename failure for {}", to.to_string_lossy()),
+        ));
+    }
     fs::rename(from, to)?;
     #[cfg(test)]
     record_event_for_test(DurabilityEvent::FileRenamed {
         from: from.to_path_buf(),
         to: to.to_path_buf(),
     });
+    #[cfg(test)]
+    if should_fail_rename_directory_sync_for_test(to) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "injected directory sync failure after rename to {}",
+                to.to_string_lossy()
+            ),
+        ));
+    }
 
     let from_parent = parent_directory(from);
     let to_parent = parent_directory(to);
@@ -170,6 +187,13 @@ pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn sync_file(file: &File, path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if should_fail_file_sync_for_test(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("injected file sync failure for {}", path.to_string_lossy()),
+        ));
+    }
     file.sync_all()?;
     #[cfg(test)]
     record_event_for_test(DurabilityEvent::FileSynced(path.to_path_buf()));
@@ -211,6 +235,9 @@ pub(crate) enum DurabilityEvent {
 struct TestDurabilityState {
     directory_syncs: std::collections::HashMap<PathBuf, usize>,
     failed_directory_syncs: std::collections::HashMap<PathBuf, std::collections::VecDeque<usize>>,
+    failed_file_syncs: std::collections::HashMap<PathBuf, usize>,
+    failed_renames: std::collections::HashMap<PathBuf, usize>,
+    failed_rename_directory_syncs: std::collections::HashMap<PathBuf, usize>,
     events: Vec<DurabilityEvent>,
 }
 
@@ -236,6 +263,48 @@ fn should_fail_directory_sync_for_test(path: &Path) -> bool {
     }
     scheduled.pop_front();
     true
+}
+
+#[cfg(test)]
+fn take_scheduled_path_failure(
+    scheduled: &mut std::collections::HashMap<PathBuf, usize>,
+    path: &Path,
+) -> bool {
+    let Some(remaining) = scheduled.get_mut(path) else {
+        return false;
+    };
+    *remaining -= 1;
+    if *remaining == 0 {
+        scheduled.remove(path);
+    }
+    true
+}
+
+#[cfg(test)]
+fn should_fail_file_sync_for_test(path: &Path) -> bool {
+    take_scheduled_path_failure(
+        &mut test_durability_state().lock().unwrap().failed_file_syncs,
+        path,
+    )
+}
+
+#[cfg(test)]
+fn should_fail_rename_for_test(path: &Path) -> bool {
+    take_scheduled_path_failure(
+        &mut test_durability_state().lock().unwrap().failed_renames,
+        path,
+    )
+}
+
+#[cfg(test)]
+fn should_fail_rename_directory_sync_for_test(path: &Path) -> bool {
+    take_scheduled_path_failure(
+        &mut test_durability_state()
+            .lock()
+            .unwrap()
+            .failed_rename_directory_syncs,
+        path,
+    )
 }
 
 #[cfg(test)]
@@ -283,6 +352,36 @@ pub(crate) fn fail_directory_sync_after_for_test(path: &Path, successful_syncs: 
         .entry(path.to_path_buf())
         .or_default()
         .push_back(successful_syncs);
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_file_sync_for_test(path: &Path) {
+    *test_durability_state()
+        .lock()
+        .unwrap()
+        .failed_file_syncs
+        .entry(path.to_path_buf())
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_rename_for_test(path: &Path) {
+    *test_durability_state()
+        .lock()
+        .unwrap()
+        .failed_renames
+        .entry(path.to_path_buf())
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_rename_directory_sync_for_test(path: &Path) {
+    *test_durability_state()
+        .lock()
+        .unwrap()
+        .failed_rename_directory_syncs
+        .entry(path.to_path_buf())
+        .or_default() += 1;
 }
 
 #[cfg(test)]

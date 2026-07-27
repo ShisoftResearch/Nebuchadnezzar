@@ -462,7 +462,7 @@ mod tests {
     use super::*;
     use crate::ram::durable_fs::{
         directory_sync_count_for_test, durability_events_for_test,
-        fail_next_directory_sync_for_test, DurabilityEvent,
+        fail_next_directory_sync_for_test, fail_next_file_sync_for_test, DurabilityEvent,
     };
     use std::fs::File;
     use std::io::Write;
@@ -536,36 +536,83 @@ mod tests {
         wal.write_all(b"durable-wal").unwrap();
         wal.sync_all().unwrap();
         drop(wal);
+        let final_path = PathBuf::from(manager.backup_path(3, 4, 5).unwrap());
+        fs::write(&final_path, b"prior-final").unwrap();
         let event_start = durability_events_for_test().len();
 
         assert!(manager.copy_wal_to_backup(3, 4, 5, Some(64)).unwrap());
 
-        let final_path = PathBuf::from(manager.backup_path(3, 4, 5).unwrap());
         let events = durability_events_for_test();
         let events = &events[event_start..];
-        let (rename_index, staging_path) = events
+        let renames = events
             .iter()
             .enumerate()
-            .find_map(|(index, event)| match event {
+            .filter_map(|(index, event)| match event {
                 DurabilityEvent::FileRenamed { from, to } if to == &final_path => {
                     Some((index, from.clone()))
                 }
                 _ => None,
             })
-            .expect("final backup must be published by atomic rename");
+            .collect::<Vec<_>>();
+        assert_eq!(
+            renames.len(),
+            1,
+            "replacement must use one staging-to-final rename: {events:?}"
+        );
+        let (rename_index, staging_path) = &renames[0];
         let sync_index = events
             .iter()
             .position(|event| event == &DurabilityEvent::FileSynced(staging_path.clone()))
             .expect("staging contents must be synced");
         assert!(
-            sync_index < rename_index,
+            sync_index < *rename_index,
             "staging file contents must be durable before final-name publication: {events:?}"
         );
         assert!(final_path.exists());
         assert!(!staging_path.exists());
+        assert!(!PathBuf::from(format!("{}.old", final_path.display())).exists());
         let mut expected = b"durable-wal".to_vec();
         expected.resize(64, 0);
         assert_eq!(manager.read_file(&final_path).unwrap(), expected);
+    }
+
+    #[test]
+    fn wal_to_backup_staging_failure_preserves_existing_final_and_retry_converges() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_dir = temp_dir.path().join("backup");
+        let wal_dir = temp_dir.path().join("wal");
+        let manager = SegmentFileManager::new(
+            Some(backup_dir.to_string_lossy().into_owned()),
+            Some(wal_dir.to_string_lossy().into_owned()),
+        );
+        manager.init_directories().unwrap();
+        let mut wal = manager
+            .create_wal_file(6, 7, 8)
+            .unwrap()
+            .expect("configured WAL");
+        wal.write_all(b"replacement").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let final_path = PathBuf::from(manager.backup_path(6, 7, 8).unwrap());
+        let staging_path = PathBuf::from(format!("{}.staging", final_path.display()));
+        fs::write(&final_path, b"prior-final").unwrap();
+        fail_next_file_sync_for_test(&staging_path);
+
+        let error = manager
+            .copy_wal_to_backup(6, 7, 8, Some(32))
+            .expect_err("injected staging sync failure");
+        assert!(error.to_string().contains("injected file sync failure"));
+        assert_eq!(fs::read(&final_path).unwrap(), b"prior-final");
+        assert!(
+            SegmentFileInfo::parse_filename(&staging_path).is_none(),
+            "recovery discovery must ignore staging"
+        );
+
+        assert!(manager.copy_wal_to_backup(6, 7, 8, Some(32)).unwrap());
+        let mut expected = b"replacement".to_vec();
+        expected.resize(32, 0);
+        assert_eq!(manager.read_file(&final_path).unwrap(), expected);
+        assert!(!staging_path.exists());
     }
 
     #[test]
