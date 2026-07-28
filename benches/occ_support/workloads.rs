@@ -11,7 +11,7 @@ use std::{
 use dovahkiin::types::{Map as _, Value as _};
 use neb::{
     ram::{
-        cell::{OwnedCell, ReadError},
+        cell::{OwnedCell, ReadError, SnapshotRead},
         types::{Id, OwnedValue},
     },
     server::transactions::{
@@ -19,10 +19,11 @@ use neb::{
     },
 };
 
-use super::fixture::{counter_cell, OccFixture};
+use super::fixture::{counter_cell, HistoryChain, OccFixture, RetainedRevision};
 use super::metrics::BatchMetrics;
 
 const MAX_ATTEMPTS_PER_LOGICAL_OPERATION: u64 = 10_000;
+const DIRECT_UPDATE_RECLAIM_INTERVAL: u64 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttemptOutcome {
@@ -72,6 +73,7 @@ pub struct BatchSpec {
 
 #[derive(Clone, Copy, Debug)]
 pub enum ProjectionMode {
+    Full,
     Head,
     Selected,
     Mixed,
@@ -80,6 +82,36 @@ pub enum ProjectionMode {
 pub struct TimedBatch {
     pub metrics: BatchMetrics,
     pub elapsed: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct HeldSnapshot {
+    pub tid: TxnId,
+    pub history: HistoryChain,
+    pub expected_revision_ts: u64,
+    pub expected_score: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CleanerHistory {
+    pub chains: Arc<Vec<HistoryChain>>,
+    pub predecessors: Arc<Vec<RetainedRevision>>,
+    initial_locations: Arc<Vec<(RetainedRevision, usize)>>,
+    relocation_seen: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CleanerHistory {
+    pub fn relocation_observed(&self) -> bool {
+        self.relocation_seen.load(Ordering::Acquire)
+    }
+}
+
+impl HeldSnapshot {
+    pub async fn abort(&self, fixture: &OccFixture) {
+        abort_started(fixture, self.tid.clone())
+            .await
+            .unwrap_or_else(|error| panic!("abort held old snapshot: {error}"));
+    }
 }
 
 async fn abort_started(fixture: &OccFixture, tid: TxnId) -> Result<(), String> {
@@ -115,6 +147,10 @@ async fn confirm_prepare_cleanup(fixture: &OccFixture, tid: TxnId) -> Result<(),
         Ok(Err(TMError::RPCErrorFromCellServer)) => Err(format!(
             "abort({tid:?}) manager error: {:?}",
             TMError::RPCErrorFromCellServer
+        )),
+        Ok(Err(TMError::ClockExhausted)) => Err(format!(
+            "abort({tid:?}) manager error: {:?}",
+            TMError::ClockExhausted
         )),
         Ok(Err(TMError::AssertionError)) => Err(format!(
             "abort({tid:?}) manager error: {:?}",
@@ -909,6 +945,10 @@ async fn projected_observations(
     mode: ProjectionMode,
 ) -> Result<Vec<ProjectionObservation>, AttemptOutcome> {
     match mode {
+        ProjectionMode::Full => Ok(vec![
+            transactional_full_revision(fixture, tid.clone(), id).await?,
+            transactional_full_revision(fixture, tid.clone(), id).await?,
+        ]),
         ProjectionMode::Head => Ok(vec![
             transactional_head_revision(fixture, tid.clone(), id).await?,
             transactional_head_revision(fixture, tid.clone(), id).await?,
@@ -1074,6 +1114,559 @@ pub async fn run_fixed_success_rmw(
         }
     }
 
+    TimedBatch { metrics, elapsed }
+}
+
+pub async fn run_non_transactional_read_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    validate_unique_ids(ids.as_ref(), "non-transactional read");
+    let mut metrics = BatchMetrics::default();
+    let started = Instant::now();
+    for logical_index in 0..operations {
+        let id = cyclic_id(ids.as_ref(), logical_index);
+        let operation_started = Instant::now();
+        match fixture.client.read_cell(id).await {
+            Ok(Ok(cell)) if cell.data["score"].u64().is_some() => {
+                metrics.record_success(operation_started.elapsed(), 1, 0);
+            }
+            Ok(Ok(cell)) => metrics.record_unexpected(format!(
+                "non-transactional read returned no score for {:?}: {:?}",
+                id, cell.data
+            )),
+            Ok(Err(error)) => metrics.record_unexpected(format!(
+                "non-transactional read failed for {:?}: {:?}",
+                id, error
+            )),
+            Err(error) => metrics.record_unexpected(format!(
+                "non-transactional read RPC failed for {:?}: {:?}",
+                id, error
+            )),
+        }
+    }
+    TimedBatch {
+        metrics,
+        elapsed: started.elapsed(),
+    }
+}
+
+pub async fn run_non_transactional_update_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    run_non_transactional_update_batch_inner(fixture, ids, operations).await
+}
+
+pub async fn run_storage_bounded_non_transactional_update_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    let mut completed = 0u64;
+    let mut metrics = BatchMetrics::default();
+    let mut measured_elapsed = Duration::default();
+    while completed < operations {
+        let batch_operations = (operations - completed).min(DIRECT_UPDATE_RECLAIM_INTERVAL);
+        let batch =
+            run_non_transactional_update_batch(fixture.clone(), ids.clone(), batch_operations)
+                .await;
+        metrics.merge(batch.metrics);
+        measured_elapsed += batch.elapsed;
+        completed += batch_operations;
+
+        // Retention waiting and full cleaner passes are maintenance. Criterion
+        // receives only `measured_elapsed`, the sum of actual update latencies.
+        fixture.expire_retained_revisions_and_clean().await;
+    }
+    TimedBatch {
+        metrics,
+        elapsed: measured_elapsed,
+    }
+}
+
+async fn run_non_transactional_update_batch_inner(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    validate_unique_ids(ids.as_ref(), "non-transactional update");
+    let mut metrics = BatchMetrics::default();
+    let mut measured_elapsed = Duration::default();
+    for logical_index in 0..operations {
+        let id = cyclic_id(ids.as_ref(), logical_index);
+        let operation_started = Instant::now();
+        let result = async {
+            let mut cell = fixture
+                .client
+                .read_cell(id)
+                .await
+                .map_err(|error| format!("read RPC: {error:?}"))?
+                .map_err(|error| format!("read: {error:?}"))?;
+            let score = cell.data["score"]
+                .u64()
+                .copied()
+                .ok_or_else(|| "score was not u64".to_string())?;
+            let next = score
+                .checked_add(1)
+                .ok_or_else(|| "score overflow".to_string())?;
+            let map = match &cell.data {
+                OwnedValue::Map(map) => map.owned(),
+                _ => return Err("cell data was not a map".to_string()),
+            };
+            let mut map = map;
+            replace_score_value(&mut map, next);
+            cell.data = OwnedValue::Map(map);
+            fixture
+                .client
+                .update_cell(cell)
+                .await
+                .map_err(|error| format!("update RPC: {error:?}"))?
+                .map_err(|error| format!("update: {error:?}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        let operation_elapsed = operation_started.elapsed();
+        match result {
+            Ok(()) => metrics.record_success(operation_elapsed, 1, 0),
+            Err(error) => {
+                metrics.record_unexpected(format!("non-transactional update {:?}: {error}", id))
+            }
+        }
+        measured_elapsed += operation_elapsed;
+    }
+    TimedBatch {
+        metrics,
+        elapsed: measured_elapsed,
+    }
+}
+
+pub async fn build_history_chain(
+    fixture: Arc<OccFixture>,
+    id: Id,
+    predecessor_count: usize,
+) -> HistoryChain {
+    assert!(
+        predecessor_count > 0,
+        "history chain requires at least one predecessor"
+    );
+    let mut predecessors = Vec::with_capacity(predecessor_count);
+    let mut oldest_score = None;
+    for _ in 0..predecessor_count {
+        let mut cell = fixture
+            .client
+            .read_cell(id)
+            .await
+            .expect("read history fixture cell RPC")
+            .expect("read history fixture cell");
+        let score = *cell.data["score"]
+            .u64()
+            .expect("history fixture score must be u64");
+        oldest_score.get_or_insert(score);
+        predecessors.push(RetainedRevision {
+            id,
+            revision_ts: cell.header.revision_ts,
+        });
+        let next = score
+            .checked_add(1)
+            .expect("history fixture score overflow");
+        let map = match &cell.data {
+            OwnedValue::Map(map) => map.owned(),
+            _ => panic!("history fixture cell data must be a map"),
+        };
+        let mut map = map;
+        replace_score_value(&mut map, next);
+        cell.data = OwnedValue::Map(map);
+        fixture
+            .client
+            .update_cell(cell)
+            .await
+            .expect("update history fixture cell RPC")
+            .expect("update history fixture cell");
+    }
+
+    let current = fixture
+        .client
+        .read_cell(id)
+        .await
+        .expect("read current history fixture cell RPC")
+        .expect("read current history fixture cell");
+    let oldest_snapshot_ts = predecessors[0]
+        .revision_ts
+        .checked_add(1)
+        .expect("history fixture snapshot timestamp overflow");
+    let chain = HistoryChain {
+        id,
+        predecessors,
+        current_revision_ts: current.header.revision_ts,
+        oldest_snapshot_ts,
+        oldest_score: oldest_score.expect("history fixture oldest score"),
+    };
+    let telemetry = fixture.retention_telemetry(&chain.predecessors);
+    assert_eq!(
+        telemetry.retained_revisions,
+        u64::try_from(predecessor_count).expect("predecessor count must fit in u64"),
+        "history fixture must retain exactly the requested predecessors"
+    );
+    chain
+}
+
+pub async fn hold_old_snapshot_across_newer_writes(
+    fixture: Arc<OccFixture>,
+    id: Id,
+    predecessor_count: usize,
+) -> HeldSnapshot {
+    let tid = begin_transaction(&fixture)
+        .await
+        .unwrap_or_else(|outcome| panic!("begin held old snapshot: {outcome:?}"));
+    let observation = transactional_full_revision(&fixture, tid.clone(), id)
+        .await
+        .unwrap_or_else(|outcome| panic!("establish held old snapshot: {outcome:?}"));
+    let history = build_history_chain(fixture, id, predecessor_count).await;
+    HeldSnapshot {
+        tid,
+        history,
+        expected_revision_ts: observation.revision_ts,
+        expected_score: observation
+            .score
+            .expect("held full snapshot observation must include score"),
+    }
+}
+
+pub async fn run_visible_history_read_batch(
+    fixture: Arc<OccFixture>,
+    chain: HistoryChain,
+    operations: u64,
+) -> TimedBatch {
+    let server = fixture
+        .servers
+        .iter()
+        .find(|server| {
+            fixture
+                .client
+                .locate_server_id(&chain.id)
+                .is_ok_and(|server_id| server_id == server.server_id)
+        })
+        .expect("history chain must route to a fixture server");
+    let mut metrics = BatchMetrics::default();
+    let mut elapsed = Duration::default();
+    for _ in 0..operations {
+        let started = Instant::now();
+        let result = server
+            .chunks()
+            .read_cell_snapshot(&chain.id, chain.oldest_snapshot_ts);
+        let operation_elapsed = started.elapsed();
+        elapsed += operation_elapsed;
+        match result {
+            Ok(SnapshotRead::Present(cell))
+                if cell.header.revision_ts == chain.predecessors[0].revision_ts
+                    && cell.data["score"].u64().copied() == Some(chain.oldest_score) =>
+            {
+                metrics.record_success(operation_elapsed, 1, 0);
+            }
+            other => metrics.record_unexpected(format!(
+                "history read {:?}@{} returned {:?}",
+                chain.id, chain.oldest_snapshot_ts, other
+            )),
+        }
+    }
+    TimedBatch { metrics, elapsed }
+}
+
+pub async fn run_expired_snapshot_read_batch(
+    fixture: Arc<OccFixture>,
+    chain: HistoryChain,
+    operations: u64,
+) -> TimedBatch {
+    let server = fixture
+        .servers
+        .iter()
+        .find(|server| {
+            fixture
+                .client
+                .locate_server_id(&chain.id)
+                .is_ok_and(|server_id| server_id == server.server_id)
+        })
+        .expect("history chain must route to a fixture server");
+    let mut metrics = BatchMetrics::default();
+    let mut elapsed = Duration::default();
+    for _ in 0..operations {
+        let started = Instant::now();
+        let result = server
+            .chunks()
+            .read_cell_snapshot(&chain.id, chain.oldest_snapshot_ts);
+        let operation_elapsed = started.elapsed();
+        elapsed += operation_elapsed;
+        match result {
+            Err(ReadError::SnapshotTooOld) => metrics.record_success(operation_elapsed, 1, 0),
+            other => metrics.record_unexpected(format!(
+                "expired history read {:?}@{} returned {:?}",
+                chain.id, chain.oldest_snapshot_ts, other
+            )),
+        }
+    }
+    TimedBatch { metrics, elapsed }
+}
+
+pub async fn run_held_snapshot_read_batch(
+    fixture: Arc<OccFixture>,
+    held: HeldSnapshot,
+    operations: u64,
+) -> TimedBatch {
+    let mut metrics = BatchMetrics::default();
+    let mut elapsed = Duration::default();
+    for _ in 0..operations {
+        let started = Instant::now();
+        let observation =
+            transactional_full_revision(&fixture, held.tid.clone(), held.history.id).await;
+        let operation_elapsed = started.elapsed();
+        elapsed += operation_elapsed;
+        match observation {
+            Ok(observation)
+                if observation.revision_ts == held.expected_revision_ts
+                    && observation.score == Some(held.expected_score) =>
+            {
+                metrics.record_success(operation_elapsed, 1, 0);
+            }
+            other => metrics.record_unexpected(format!(
+                "held snapshot {:?} expected revision {} score {}, got {:?}",
+                held.history.id, held.expected_revision_ts, held.expected_score, other
+            )),
+        }
+    }
+    TimedBatch { metrics, elapsed }
+}
+
+pub async fn build_cleaner_history(
+    fixture: Arc<OccFixture>,
+    target_ids: Arc<Vec<Id>>,
+    sacrificial_ids: Arc<Vec<Id>>,
+) -> CleanerHistory {
+    validate_unique_ids(&target_ids, "cleaner target history");
+    validate_unique_ids(&sacrificial_ids, "cleaner sacrificial history");
+    assert_eq!(
+        target_ids.len(),
+        sacrificial_ids.len(),
+        "cleaner target and sacrificial fixtures must be balanced"
+    );
+
+    // Put the next target and sacrificial current cells in the same source
+    // segments. This makes the setup repeatable across Criterion callbacks:
+    // the sacrificial half can expire while the target half stays current.
+    for (target_id, sacrificial_id) in target_ids.iter().zip(sacrificial_ids.iter()) {
+        for id in [target_id, sacrificial_id] {
+            let batch =
+                run_non_transactional_update_batch(fixture.clone(), Arc::new(vec![*id]), 1).await;
+            assert_eq!(
+                batch.metrics.committed, 1,
+                "cleaner source-layout update must commit"
+            );
+            assert!(
+                batch.metrics.unexpected.is_empty(),
+                "cleaner source-layout update failed: {:?}",
+                batch.metrics.unexpected
+            );
+        }
+    }
+
+    let mut sacrificial_chains = Vec::with_capacity(sacrificial_ids.len());
+    for id in sacrificial_ids.iter() {
+        sacrificial_chains.push(build_history_chain(fixture.clone(), *id, 1).await);
+    }
+    // Every sacrificial chain was created before this wait, so one retention
+    // window expires the whole set. Waiting once avoids aging the subsequently
+    // created retained target history during benchmark setup.
+    fixture
+        .wait_for_history_expiration(
+            sacrificial_chains
+                .first()
+                .expect("cleaner history requires at least one sacrificial chain"),
+        )
+        .await;
+
+    let mut chains = Vec::with_capacity(target_ids.len());
+    for id in target_ids.iter() {
+        chains.push(build_history_chain(fixture.clone(), *id, 1).await);
+    }
+    let predecessors = chains
+        .iter()
+        .flat_map(|chain| chain.predecessors.iter().copied())
+        .collect::<Vec<_>>();
+    let initial_locations = predecessors
+        .iter()
+        .map(|revision| {
+            let server = fixture
+                .servers
+                .iter()
+                .find(|server| {
+                    fixture
+                        .client
+                        .locate_server_id(&revision.id)
+                        .is_ok_and(|server_id| server_id == server.server_id)
+                })
+                .expect("cleaner revision must route to a fixture server");
+            let location = server
+                .chunks()
+                .history_location(&revision.id, revision.revision_ts)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "cleaner predecessor {:?}@{} must be retained",
+                        revision.id, revision.revision_ts
+                    )
+                });
+            (*revision, location)
+        })
+        .collect();
+    CleanerHistory {
+        chains: Arc::new(chains),
+        predecessors: Arc::new(predecessors),
+        initial_locations: Arc::new(initial_locations),
+        relocation_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+fn run_full_cleaner_pass(fixture: &OccFixture) {
+    for server in &fixture.servers {
+        for chunk in &server.chunks().list {
+            let _ = neb::ram::cleaner::Cleaner::clean(chunk, true, true);
+        }
+    }
+}
+
+fn observe_cleaner_relocation(fixture: &OccFixture, history: &CleanerHistory) -> bool {
+    let moved = history
+        .initial_locations
+        .iter()
+        .any(|(revision, initial_location)| {
+            fixture
+                .servers
+                .iter()
+                .find(|server| {
+                    fixture
+                        .client
+                        .locate_server_id(&revision.id)
+                        .is_ok_and(|server_id| server_id == server.server_id)
+                })
+                .and_then(|server| {
+                    server
+                        .chunks()
+                        .history_location(&revision.id, revision.revision_ts)
+                })
+                .is_some_and(|location| location != *initial_location)
+        });
+    if moved {
+        history.relocation_seen.store(true, Ordering::Release);
+    }
+    history.relocation_observed()
+}
+
+pub async fn run_cleaner_relocation_batch(
+    fixture: Arc<OccFixture>,
+    history: CleanerHistory,
+    operations: u64,
+) -> TimedBatch {
+    let mut metrics = BatchMetrics::default();
+    let mut elapsed = Duration::default();
+    for _ in 0..operations {
+        let started = Instant::now();
+        run_full_cleaner_pass(&fixture);
+        let operation_elapsed = started.elapsed();
+        elapsed += operation_elapsed;
+        metrics.record_success(operation_elapsed, 1, 0);
+    }
+    if !observe_cleaner_relocation(&fixture, &history) {
+        metrics.record_unexpected(
+            "cleaner did not relocate any real retained-history revision".to_string(),
+        );
+    }
+    TimedBatch { metrics, elapsed }
+}
+
+pub async fn run_cleaner_reader_contention_batch(
+    fixture: Arc<OccFixture>,
+    history: CleanerHistory,
+    operations: u64,
+) -> TimedBatch {
+    let reader_chain = history
+        .chains
+        .first()
+        .expect("cleaner reader contention requires a history chain")
+        .clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
+    let read_errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader_fixture = fixture.clone();
+    let reader_stop = stop.clone();
+    let reader_reads = reads.clone();
+    let reader_errors = read_errors.clone();
+    let reader = tokio::spawn(async move {
+        while !reader_stop.load(Ordering::Acquire) {
+            let server = reader_fixture
+                .servers
+                .iter()
+                .find(|server| {
+                    reader_fixture
+                        .client
+                        .locate_server_id(&reader_chain.id)
+                        .is_ok_and(|server_id| server_id == server.server_id)
+                })
+                .expect("cleaner reader id must route to a fixture server");
+            match server
+                .chunks()
+                .read_cell_snapshot(&reader_chain.id, reader_chain.oldest_snapshot_ts)
+            {
+                Ok(SnapshotRead::Present(cell))
+                    if cell.header.revision_ts == reader_chain.predecessors[0].revision_ts =>
+                {
+                    reader_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                other => {
+                    reader_errors
+                        .lock()
+                        .expect("lock cleaner reader errors")
+                        .push(format!("cleaner reader returned {other:?}"));
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let reader_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while reads.load(Ordering::Acquire) == 0 && tokio::time::Instant::now() < reader_deadline {
+        tokio::task::yield_now().await;
+    }
+
+    let mut metrics = BatchMetrics::default();
+    let mut elapsed = Duration::default();
+    for _ in 0..operations {
+        let started = Instant::now();
+        run_full_cleaner_pass(&fixture);
+        let operation_elapsed = started.elapsed();
+        elapsed += operation_elapsed;
+        metrics.record_success(operation_elapsed, 1, 0);
+    }
+    stop.store(true, Ordering::Release);
+    if let Err(error) = reader.await {
+        metrics.record_unexpected(format!("cleaner reader task failed: {error:?}"));
+    }
+    for error in read_errors
+        .lock()
+        .expect("lock cleaner reader errors")
+        .drain(..)
+    {
+        metrics.record_unexpected(error);
+    }
+    if reads.load(Ordering::Acquire) == 0 {
+        metrics.record_unexpected("cleaner reader made no reads during cleaner pass".to_string());
+    }
+    if !observe_cleaner_relocation(&fixture, &history) {
+        metrics.record_unexpected(
+            "cleaner contention did not relocate real retained history".to_string(),
+        );
+    }
     TimedBatch { metrics, elapsed }
 }
 
@@ -1373,7 +1966,40 @@ mod tests {
         let _ = run_blind_remove_batch;
         let _ = run_projected_read_batch;
         let _ = ProjectionMode::Head;
+        let _ = ProjectionMode::Full;
         let _ = ProjectionMode::Selected;
         let _ = ProjectionMode::Mixed;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn direct_updates_remain_storage_bounded_between_measured_batches() {
+        let fixture = Arc::new(
+            OccFixture::single_with_history_retention(
+                "127.0.0.1:54510",
+                "occ_direct_update_reclaim",
+                1,
+            )
+            .await,
+        );
+        let server_id = fixture.servers[0].server_id;
+        let id = fixture.ids_for_server(server_id, 1, 54_510)[0];
+        fixture.seed_counter(id, 0).await;
+
+        let batch = run_storage_bounded_non_transactional_update_batch(
+            fixture.clone(),
+            Arc::new(vec![id]),
+            512,
+        )
+        .await;
+        let summary = batch.metrics.summary(batch.elapsed);
+        let score = fixture.score(id).await;
+
+        let fixture = Arc::try_unwrap(fixture)
+            .unwrap_or_else(|_| panic!("direct update test retained fixture owners"));
+        fixture.shutdown().await;
+
+        assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+        assert_eq!(summary.committed, 512);
+        assert_eq!(score, 512);
     }
 }

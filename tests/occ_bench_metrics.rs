@@ -20,7 +20,12 @@ mod workloads;
 #[cfg(feature = "occ_phase_profile")]
 use metrics::PhaseSnapshotError;
 use metrics::{BatchMetrics, RunReport, ScenarioSummary};
-use workloads::{run_fixed_success_rmw, AttemptOutcome, AttemptTally, BatchSpec};
+use workloads::{
+    build_cleaner_history, build_history_chain, hold_old_snapshot_across_newer_writes,
+    run_cleaner_reader_contention_batch, run_expired_snapshot_read_batch, run_fixed_success_rmw,
+    run_held_snapshot_read_batch, run_storage_bounded_non_transactional_update_batch,
+    run_visible_history_read_batch, AttemptOutcome, AttemptTally, BatchSpec,
+};
 
 #[test]
 fn occ_driver_routes_all_groups_through_flat_sampling_helper() {
@@ -74,8 +79,8 @@ fn occ_driver_routes_all_groups_through_flat_sampling_helper() {
     );
     assert_eq!(
         compact_driver.matches("occ_group(").count(),
-        4,
-        "all four OCC group construction sites must call the shared helper"
+        5,
+        "all OCC group construction sites must call the shared helper"
     );
 }
 
@@ -298,12 +303,16 @@ fn run_report_replaces_a_scenario_by_name() {
         attempts: 1,
         not_realizable: 0,
         logical_retries: 0,
+        waits: 0,
         commits_per_second: 0.5,
         p50_ns: 2_000_000,
         p95_ns: 2_000_000,
         p99_ns: 2_000_000,
         unexpected: Vec::new(),
         invariants_passed: true,
+        retained_revisions: 0,
+        retained_bytes: 0,
+        segment_count: 0,
         #[cfg(feature = "occ_phase_profile")]
         phases: std::collections::BTreeMap::new(),
     };
@@ -312,12 +321,16 @@ fn run_report_replaces_a_scenario_by_name() {
         attempts: 1,
         not_realizable: 0,
         logical_retries: 0,
+        waits: 0,
         commits_per_second: 1.0,
         p50_ns: 1_000_000,
         p95_ns: 1_000_000,
         p99_ns: 1_000_000,
         unexpected: Vec::new(),
         invariants_passed: true,
+        retained_revisions: 0,
+        retained_bytes: 0,
+        segment_count: 0,
         #[cfg(feature = "occ_phase_profile")]
         phases: std::collections::BTreeMap::new(),
     };
@@ -409,6 +422,210 @@ async fn fixed_success_hot_cell_batch_smoke_test() {
     assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
     assert!(summary.invariants_passed);
     assert_eq!(final_score, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clustered_seed_is_transactionally_visible_before_multi_participant_timing() {
+    let fixture = fixture::OccFixture::cluster(
+        fixture::PortPlan::new(54_600).cluster(0),
+        "occ_bench_cluster_visibility",
+    )
+    .await;
+    let ids = fixture
+        .servers
+        .iter()
+        .enumerate()
+        .flat_map(|(index, server)| {
+            fixture.ids_for_server(server.server_id, 1, 54_600 + index as u64 * 10_000)
+        })
+        .collect::<Vec<_>>();
+    let seed_revisions =
+        futures::future::join_all(ids.iter().map(|id| fixture.seed_counter(*id, 0)))
+            .await
+            .into_iter()
+            .map(|header| header.revision_ts)
+            .collect::<Vec<_>>();
+    let max_seed_revision = *seed_revisions
+        .iter()
+        .max()
+        .expect("cluster visibility test seeded revisions");
+    let first_coordinator_tid = fixture.observe_distributed_seed_revisions(seed_revisions);
+
+    assert!(
+        first_coordinator_tid > max_seed_revision,
+        "first transaction coordinator TID must be newer than every direct seed revision"
+    );
+    fixture.assert_transactional_visibility(&ids).await;
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deterministic_history_chain_reports_real_retained_state() {
+    let fixture =
+        Arc::new(fixture::OccFixture::single("127.0.0.1:54520", "occ_bench_history_chain").await);
+    let server_id = fixture.servers[0].server_id;
+    let id = fixture.ids_for_server(server_id, 1, 54_520)[0];
+    fixture.seed_counter(id, 0).await;
+
+    let chain = build_history_chain(fixture.clone(), id, 8).await;
+    let telemetry = fixture.retention_telemetry(&chain.predecessors);
+    let batch = run_visible_history_read_batch(fixture.clone(), chain.clone(), 3).await;
+    let summary = batch.metrics.summary(batch.elapsed);
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("history chain test retained fixture owners"));
+    fixture.shutdown().await;
+
+    assert_eq!(chain.predecessors.len(), 8);
+    assert_eq!(telemetry.retained_revisions, 8);
+    assert!(telemetry.retained_bytes > 0);
+    assert!(telemetry.segment_count > 0);
+    assert_eq!(summary.committed, 3);
+    assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_transaction_snapshot_reads_old_revision_after_newer_writes() {
+    let fixture =
+        Arc::new(fixture::OccFixture::single("127.0.0.1:54530", "occ_bench_old_snapshot").await);
+    let server_id = fixture.servers[0].server_id;
+    let id = fixture.ids_for_server(server_id, 1, 54_530)[0];
+    fixture.seed_counter(id, 0).await;
+
+    let held = hold_old_snapshot_across_newer_writes(fixture.clone(), id, 8).await;
+    let batch = run_held_snapshot_read_batch(fixture.clone(), held.clone(), 3).await;
+    let summary = batch.metrics.summary(batch.elapsed);
+    held.abort(&fixture).await;
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("old snapshot test retained fixture owners"));
+    fixture.shutdown().await;
+
+    assert_eq!(held.history.predecessors.len(), 8);
+    assert_eq!(summary.committed, 3);
+    assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_history_is_reported_after_retention_window() {
+    let fixture = Arc::new(
+        fixture::OccFixture::single_with_history_retention(
+            "127.0.0.1:54540",
+            "occ_bench_history_expiration",
+            50,
+        )
+        .await,
+    );
+    let server_id = fixture.servers[0].server_id;
+    let id = fixture.ids_for_server(server_id, 1, 54_540)[0];
+    fixture.seed_counter(id, 0).await;
+
+    let chain = build_history_chain(fixture.clone(), id, 8).await;
+    fixture.wait_for_history_expiration(&chain).await;
+    let batch = run_expired_snapshot_read_batch(fixture.clone(), chain, 3).await;
+    let summary = batch.metrics.summary(batch.elapsed);
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("history expiration test retained fixture owners"));
+    fixture.shutdown().await;
+
+    assert_eq!(summary.committed, 3);
+    assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_direct_update_maintenance_is_excluded_from_measured_elapsed() {
+    let fixture = Arc::new(
+        fixture::OccFixture::single_with_history_retention(
+            "127.0.0.1:54550",
+            "occ_bench_bounded_updates",
+            1,
+        )
+        .await,
+    );
+    let server_id = fixture.servers[0].server_id;
+    let id = fixture.ids_for_server(server_id, 1, 54_550)[0];
+    fixture.seed_counter(id, 0).await;
+
+    let wall_started = std::time::Instant::now();
+    let batch = run_storage_bounded_non_transactional_update_batch(
+        fixture.clone(),
+        Arc::new(vec![id]),
+        128,
+    )
+    .await;
+    let wall_elapsed = wall_started.elapsed();
+    let summary = batch.metrics.summary(batch.elapsed);
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("bounded update test retained fixture owners"));
+    fixture.shutdown().await;
+
+    assert_eq!(summary.committed, 128);
+    assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+    assert!(
+        wall_elapsed.saturating_sub(batch.elapsed) >= Duration::from_millis(2),
+        "maintenance delay must stay outside returned measured elapsed: wall={wall_elapsed:?} measured={:?}",
+        batch.elapsed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cleaner_relocates_retained_history_while_reader_is_active() {
+    let fixture = Arc::new(
+        fixture::OccFixture::single_with_history_retention(
+            "127.0.0.1:54560",
+            "occ_bench_cleaner_contention",
+            2_000,
+        )
+        .await,
+    );
+    fixture.servers[0].cleaner().pause();
+    let server_id = fixture.servers[0].server_id;
+    let all_ids = fixture
+        .ids_for_server(server_id, 512, 54_560)
+        .into_iter()
+        .filter(|id| id.higher % 4 == 0)
+        .take(48)
+        .collect::<Vec<_>>();
+    assert_eq!(all_ids.len(), 48);
+    let target_ids = Arc::new(all_ids.iter().step_by(2).copied().collect::<Vec<_>>());
+    let sacrificial_ids = Arc::new(
+        all_ids
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .copied()
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(target_ids.len(), 24);
+    assert_eq!(sacrificial_ids.len(), 24);
+    for (target, sacrificial) in target_ids.iter().zip(sacrificial_ids.iter()) {
+        for id in [target, sacrificial] {
+            fixture
+                .client
+                .write_cell(fixture::counter_cell(fixture.schema.id, *id, 0, 512 * 1024))
+                .await
+                .expect("seed cleaner history RPC")
+                .expect("seed cleaner history");
+        }
+    }
+
+    let cleaner_history = build_cleaner_history(fixture.clone(), target_ids, sacrificial_ids).await;
+    let batch =
+        run_cleaner_reader_contention_batch(fixture.clone(), cleaner_history.clone(), 1).await;
+    let summary = batch.metrics.summary(batch.elapsed);
+    let telemetry = fixture.retention_telemetry(&cleaner_history.predecessors);
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("cleaner contention test retained fixture owners"));
+    fixture.shutdown().await;
+
+    assert!(cleaner_history.relocation_observed());
+    assert_eq!(telemetry.retained_revisions, 24);
+    assert_eq!(summary.committed, 1);
+    assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
 }
 
 #[test]

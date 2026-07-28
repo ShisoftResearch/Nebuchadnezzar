@@ -17,6 +17,10 @@ pub struct BatchMetrics {
     pub committed: u64,
     pub not_realizable: u64,
     pub logical_retries: u64,
+    pub waits: u64,
+    pub retained_revisions: u64,
+    pub retained_bytes: u64,
+    pub segment_count: u64,
     pub unexpected: Vec<String>,
 }
 
@@ -49,6 +53,10 @@ impl BatchMetrics {
         self.committed += other.committed;
         self.not_realizable += other.not_realizable;
         self.logical_retries += other.logical_retries;
+        self.waits += other.waits;
+        self.retained_revisions += other.retained_revisions;
+        self.retained_bytes += other.retained_bytes;
+        self.segment_count = self.segment_count.max(other.segment_count);
         self.unexpected.extend(other.unexpected);
     }
 
@@ -61,12 +69,16 @@ impl BatchMetrics {
             attempts: self.attempts,
             not_realizable: self.not_realizable,
             logical_retries: self.logical_retries,
+            waits: self.waits,
             commits_per_second: commits_per_second(self.committed, elapsed),
             p50_ns: nearest_rank_percentile(&latency_ns, 50),
             p95_ns: nearest_rank_percentile(&latency_ns, 95),
             p99_ns: nearest_rank_percentile(&latency_ns, 99),
             unexpected: self.unexpected.clone(),
             invariants_passed: self.unexpected.is_empty(),
+            retained_revisions: self.retained_revisions,
+            retained_bytes: self.retained_bytes,
+            segment_count: self.segment_count,
             #[cfg(feature = "occ_phase_profile")]
             phases: BTreeMap::new(),
         }
@@ -94,12 +106,20 @@ pub struct ScenarioSummary {
     pub attempts: u64,
     pub not_realizable: u64,
     pub logical_retries: u64,
+    #[serde(default)]
+    pub waits: u64,
     pub commits_per_second: f64,
     pub p50_ns: u64,
     pub p95_ns: u64,
     pub p99_ns: u64,
     pub unexpected: Vec<String>,
     pub invariants_passed: bool,
+    #[serde(default)]
+    pub retained_revisions: u64,
+    #[serde(default)]
+    pub retained_bytes: u64,
+    #[serde(default)]
+    pub segment_count: u64,
     #[cfg(feature = "occ_phase_profile")]
     #[serde(default)]
     pub phases: BTreeMap<String, PhaseSummary>,
@@ -211,4 +231,19 @@ fn sibling_tmp_path(path: &Path) -> io::Result<PathBuf> {
     })?;
 
     Ok(path.with_file_name(format!("{}.tmp", file_name.to_string_lossy())))
+}
+
+#[cfg(test)]
+mod mvcc_summary_tests {
+    use super::*;
+
+    #[test]
+    fn summaries_include_mvcc_wait_and_retention_telemetry() {
+        let summary = BatchMetrics::default().summary(Duration::from_secs(1));
+
+        assert_eq!(summary.waits, 0);
+        assert_eq!(summary.retained_revisions, 0);
+        assert_eq!(summary.retained_bytes, 0);
+        assert_eq!(summary.segment_count, 0);
+    }
 }

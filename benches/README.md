@@ -79,12 +79,12 @@ search/1000_docs/single_word  time:   [345.67 us 356.78 us 367.89 us]
 
 ## OCC transaction benchmarks
 
-Run a local smoke pass with:
+Run the local MVCC smoke/correctness portfolio with:
 
 ```bash
-NEB_OCC_BENCH_REVISION="$(git rev-parse HEAD)" \
-NEB_OCC_BENCH_LABEL=smoke \
-  cargo bench --bench occ_transactions -- --test
+cargo bench --bench occ_transactions -- --test
+NEB_OCC_BENCH_LABEL=mvcc-smoke \
+  cargo bench --bench occ_transactions -- --sample-size 10
 ```
 
 Save a baseline with:
@@ -99,16 +99,45 @@ NEB_OCC_BENCH_LABEL=occ-initial \
 transaction report JSON is written under `target/occ-bench/`, while Criterion's
 HTML reports and baselines are written under `target/criterion/`.
 
-Each scenario reports attempts, commits, `NotRealizable` outcomes, logical
-retries, p50/p95/p99 latency, and unexpected errors/invariant failures. A change
-is accepted when targeted stable throughput or p95 improves by at least 5%, the
-geometric-mean/aggregate throughput does not decline, secondary throughput is no
-worse than 3%, secondary p95 is no worse than 5%, unexpected errors remain zero,
-and all correctness suites pass.
+The MVCC portfolio is `mvcc/non_transactional_read`,
+`mvcc/non_transactional_update`, `mvcc/read_only_current`, `mvcc/rmw_one_cell`,
+`mvcc/rmw_multi_cell`, `mvcc/multi_participant`, `mvcc/blind_update`,
+`mvcc/blind_remove`, `mvcc/full_read`, `mvcc/selected_read`, `mvcc/head_read`,
+`mvcc/partial_read`, `mvcc/history_depth_1`, `mvcc/history_depth_8`,
+`mvcc/history_depth_32`, `mvcc/hot_cell_old_snapshot`,
+`mvcc/history_expiration`, `mvcc/cleaner_retained_revisions`,
+`mvcc/cleaner_reader_contention`, and `mvcc/hlc_contention`.
 
-Accurate performance work should run on a dedicated idle host. This project's
-controlled loop uses `192.168.10.17` with identical NUMA binding for every
-baseline and candidate; remote execution is intentionally not hardcoded in Rust.
+Each JSON scenario contains `committed`, `attempts`, `not_realizable`,
+`logical_retries`, `waits`, `commits_per_second`, `p50_ns`, `p95_ns`, `p99_ns`,
+`unexpected`, `invariants_passed`, `retained_revisions`, `retained_bytes`, and
+`segment_count`. History-expiration uses a dedicated fixture with
+`history_retention_ms=50`; the normal benchmark fixture keeps the 300,000 ms
+retention setting.
+
+Accept-grade comparisons run only on the idle primary host `192.168.10.87`, with
+separate baseline (Nebuchadnezzar revision `a82ccd46`, paired Bifrost revision
+`b078ce7`) and candidate worktrees. Capture three identically bound runs for each
+side, then enforce the gate with:
+
+```bash
+scripts/compare-mvcc-benchmarks.sh \
+  target/occ-bench/develop-1.json \
+  target/occ-bench/develop-2.json \
+  target/occ-bench/develop-3.json \
+  -- \
+  target/occ-bench/mvcc-1.json \
+  target/occ-bench/mvcc-2.json \
+  target/occ-bench/mvcc-3.json
+```
+
+The comparator rejects mismatched scenario names or unexpected outcomes, requires
+throughput CV below 5% on both sides, and fails non-historical scenarios whose
+median throughput declines by over 5% or median p99 rises by over 5%.
+
+Accurate performance work should run on the dedicated idle `192.168.10.87` host
+with identical release flags, NUMA binding, port range, and dataset for baseline
+and candidate; remote execution is intentionally not hardcoded in Rust.
 
 ### OCC phase profiling
 
@@ -147,7 +176,7 @@ batches as quiescent or otherwise serialize them.
 
 The controlled profiling portfolio is exactly `independent_rmw/1`,
 `hot_rmw/8`, `hot_rmw/32`, `multi_cell/8`, `multi_participant/1`, and
-`multi_participant/4`, run serially on `192.168.10.17` with NUMA node 0
+`multi_participant/4`, run serially on `192.168.10.87` with NUMA node 0
 binding.
 
 Generated profiling artifacts stay under `target/` and are not committed.
