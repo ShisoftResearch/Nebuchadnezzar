@@ -754,3 +754,57 @@ remote host was not used:
 
 The 11 unrelated B-tree/range-service worktree modifications remained
 untouched throughout Round 4 and are excluded from the scoped commit.
+
+## Retention-Boundary Resolution Round
+
+### Decision
+
+The full-range review at `b0cce785` left one Important: the specification
+contradiction between the Fix Round 2 brief's "anchor the exact 300,000ms
+logical window at that successful cleanup boundary" and the implemented
+boundary, which is sampled at atomic `CleanupPending` publication/live-state
+removal before completion persistence. Per
+`.superpowers/sdd/task-10-retention-handoff.md`, a second opinion resolved
+the contract choice: **Interpretation A is adopted** and Protocol B (durable
+Pending then immutable Anchor) is rejected. The full rationale, answers to
+the seven handoff questions, and the normative guarantee are recorded in
+`.superpowers/sdd/task-10-retention-decision.md`; the Fix Round 2 brief's
+Important 1 now carries an explicit amendment note naming the logical
+cleanup boundary as the anchor the successful sync certifies.
+
+Decisive points: no candidate protocol on POSIX append+fsync can anchor
+retention at physical sync return (B's own anchor is sampled before its
+second fsync), the window is an idempotence/liveness aid whose expiry fails
+closed rather than a safety property, and B's permanent per-completion
+record+fsync plus nonexpiring-Pending masking hazard buys coverage only for
+a doubly-degraded-storage corner. No production code changed in this round.
+
+### Certifying evidence
+
+`delayed_completion_sync_keeps_pending_explicit_and_deadline_at_logical_cleanup`
+(deterministic, injected boundary clock plus completion-cleanup pause) holds
+completion between `CleanupPending` publication and the durable sync and
+asserts: the live coordinator is removed atomically at publication; while
+the sync is stalled, cached resolution stays explicit at the nominal
+deadline and at `i64::MAX`, and a live `resolve` answers immediately without
+waiting on the stalled sync; after release, the returned, cached, and
+durable deadlines all equal `boundary + 300,000ms`; durable resolution is
+explicit at `boundary + 299,999ms` and `Unknown` at `boundary + 300,000ms`.
+Under Protocol B semantics the deadline assertions fail, so the test pins
+the adopted interpretation. It passed in 11.12s on first run after the
+GREEN build.
+
+### Local verification
+
+All checks ran locally; the benchmark-only remote host was not used:
+
+- `cargo test --lib delayed_completion_sync -- --test-threads=1`: 1 passed,
+  0 failed, 848 filtered in 11.12s.
+- `cargo test --lib server::transactions::manager -- --test-threads=1`:
+  39 passed (38 prior + the new certifying test), 0 failed, 810 filtered in
+  332.83s.
+- `cargo check --lib`, scoped rustfmt on `manager.rs` (`--check` clean), and
+  `git diff --check`: passed.
+
+The 11 unrelated B-tree/range-service worktree modifications remained
+untouched and are excluded from the scoped commit.

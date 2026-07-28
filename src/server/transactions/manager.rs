@@ -3889,6 +3889,108 @@ mod tests {
         server.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delayed_completion_sync_keeps_pending_explicit_and_deadline_at_logical_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = "127.0.0.1:5490";
+        let group = "txn_manager_delayed_completion_sync";
+        let server = start_durable_manager_test_server(address, group, &temp_dir).await;
+        let runtime = server.current_database();
+        let manager = runtime.txn_manager().unwrap().clone();
+        let undo = runtime.undo_log().unwrap();
+        let tid = <TransactionManager as super::Service>::begin(&manager)
+            .await
+            .unwrap();
+        undo.write_coordinator_abort_decision(&tid, &[]).unwrap();
+        let cleanup_boundary_ms = 1_000_000;
+        let _clock = install_completion_boundary_clock(tid, 0, cleanup_boundary_ms);
+        let pause = install_completion_cleanup_pause(tid);
+        let txn_lock = manager.get_transaction(&tid).unwrap();
+        {
+            let mut txn = txn_lock.lock().await;
+            txn.state = TxnState::Aborted;
+            txn.coordinator_decision_durable = true;
+        }
+
+        let finish_manager = manager.clone();
+        let finish_lock = txn_lock.clone();
+        let finish = tokio::spawn(async move {
+            let mut txn = finish_lock.lock().await;
+            finish_manager
+                .finish_transaction_guarded(&tid, &finish_lock, &mut txn, TxnResolution::Abort)
+                .await
+        });
+        pause.wait_until_entered().await;
+        assert_eq!(
+            manager.transaction_count(),
+            0,
+            "cleanup-pending publication must atomically remove the live coordinator"
+        );
+        assert_eq!(
+            manager
+                .cached_resolution_at(&tid, cleanup_boundary_ms + COMPLETED_DECISION_RETENTION_MS),
+            Some(TxnResolution::Abort),
+            "a completion sync stalled past the nominal window must stay explicitly resolvable"
+        );
+        assert_eq!(
+            manager.cached_resolution_at(&tid, i64::MAX),
+            Some(TxnResolution::Abort),
+            "cleanup-pending resolution must never expire while persistence is in flight"
+        );
+        let resolve_manager = manager.clone();
+        let mut resolve = tokio::spawn(async move {
+            <TransactionManager as super::Service>::resolve(&resolve_manager, tid).await
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut resolve)
+                .await
+                .expect("cleanup-pending resolution must not wait for the stalled sync")
+                .unwrap()
+                .unwrap(),
+            TxnResolution::Abort
+        );
+
+        pause.release();
+        let completion = finish.await.unwrap().unwrap();
+        assert_eq!(
+            completion.expires_at_ms,
+            cleanup_boundary_ms + COMPLETED_DECISION_RETENTION_MS,
+            "the retention deadline must stay anchored at logical cleanup publication"
+        );
+        let completed = match undo.coordinator_status(&tid).unwrap() {
+            Some(undo_log::CoordinatorStatus::Completed(record)) => record,
+            other => panic!("expected a durable completion after the delayed sync, got {other:?}"),
+        };
+        assert_eq!(
+            completed.expires_at_ms,
+            cleanup_boundary_ms + COMPLETED_DECISION_RETENTION_MS,
+            "a sync returning after the nominal window must not extend the durable deadline"
+        );
+        assert_eq!(
+            TransactionManager::durable_resolution_at(
+                &undo_log::CoordinatorStatus::Completed(completed.clone()),
+                cleanup_boundary_ms + COMPLETED_DECISION_RETENTION_MS - 1,
+            ),
+            TxnResolution::Abort
+        );
+        assert_eq!(
+            TransactionManager::durable_resolution_at(
+                &undo_log::CoordinatorStatus::Completed(completed),
+                cleanup_boundary_ms + COMPLETED_DECISION_RETENTION_MS,
+            ),
+            TxnResolution::Unknown,
+            "a resolution first attempted after the late sync is Unknown by contract"
+        );
+        assert_eq!(
+            manager
+                .cached_resolution_at(&tid, cleanup_boundary_ms + COMPLETED_DECISION_RETENTION_MS),
+            None,
+            "the published cache record honors the same logical-cleanup deadline"
+        );
+
+        server.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn dropped_prepare_dispatch_guard_hands_off_abort_without_leaking_inflight_state() {
         let address = "127.0.0.1:5482";
