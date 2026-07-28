@@ -5393,7 +5393,7 @@ mod tests {
 
     /// Test end-to-end: installed and prior revision persistence by operation.
     #[test]
-    fn test_e2e_version_verification() {
+    fn test_e2e_revision_verification() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
@@ -5439,7 +5439,7 @@ mod tests {
         );
         undo_log.write_undo_entry(remove_entry).unwrap();
 
-        // Recover and verify all versions are preserved
+        // Recover and verify all revisions are preserved.
         let txn_index = undo_log.recover().unwrap();
         let entries = txn_index.get(&txn).cloned().unwrap_or_default();
 
@@ -5742,7 +5742,7 @@ mod tests {
     /// Test: Rollback restores old data with new revision_ts
     /// Verifies that rollback restores the old cell data but with a new, incremented revision_ts
     #[test]
-    fn test_rollback_with_new_version() {
+    fn test_rollback_with_new_revision() {
         let _ = env_logger::builder()
             .filter_level(log::LevelFilter::Debug)
             .is_test(true)

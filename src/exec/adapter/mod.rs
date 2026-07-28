@@ -47,3 +47,33 @@ pub fn shared_with_header<'a>(
     }
     return value;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dovahkiin::types::key_hash;
+
+    #[test]
+    fn owned_header_exposes_u64_revision_timestamp_without_counter() {
+        let header = CellHeader {
+            revision_ts: u64::from(u32::MAX) + 17,
+            flags: 0,
+            schema: 9,
+            partition: 10,
+            hash: 11,
+        };
+        let value = owned_with_header(header, OwnedValue::Map(OwnedMap::new()));
+        let OwnedValue::Map(value) = value else {
+            panic!("adapter output must remain a map");
+        };
+        let OwnedValue::Map(header_value) = value.get("__header") else {
+            panic!("adapter output must contain __header metadata");
+        };
+
+        assert_eq!(header_value.get("ts"), &OwnedValue::U64(header.revision_ts));
+        assert!(
+            header_value.map.get(&key_hash("ver")).is_none(),
+            "removed revision counters must not be exposed"
+        );
+    }
+}

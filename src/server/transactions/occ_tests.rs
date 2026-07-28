@@ -3682,7 +3682,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
 
     let mut initial = counter_cell(schema.id, cell_id, 0, "counter_shape_gated_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
-    let seeded_version = initial.header.revision_ts;
+    let seeded_revision = initial.header.revision_ts;
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
@@ -3691,7 +3691,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
     let before_partial = transactions::data_site::full_read_rpc_count();
 
     let head = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(head.revision_ts, seeded_version);
+    assert_eq!(head.revision_ts, seeded_revision);
 
     let selected = accepted_cell(
         txn.read_selected(tid.clone(), cell_id, vec![hash_str("score")])
@@ -3753,7 +3753,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn head_read_certifies_snapshot_version_and_aborts_on_conflict() {
+async fn head_read_certifies_snapshot_revision_and_aborts_on_conflict() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5381";
     let group = "txn_occ_shape_gated_certify";
@@ -3765,7 +3765,7 @@ async fn head_read_certifies_snapshot_version_and_aborts_on_conflict() {
 
     let mut read_seed = counter_cell(schema.id, read_id, 0, "counter_certify_read_seed");
     runtime.chunks().write_cell(&mut read_seed).unwrap();
-    let read_version = read_seed.header.revision_ts;
+    let read_revision = read_seed.header.revision_ts;
     let mut write_seed = counter_cell(schema.id, write_id, 0, "counter_certify_write_seed");
     runtime.chunks().write_cell(&mut write_seed).unwrap();
 
@@ -3776,7 +3776,7 @@ async fn head_read_certifies_snapshot_version_and_aborts_on_conflict() {
     // without transferring the whole cell.
     let before_partial = transactions::data_site::full_read_rpc_count();
     let head = accepted_head(txn.head(tid.clone(), read_id).await.unwrap().unwrap());
-    assert_eq!(head.revision_ts, read_version);
+    assert_eq!(head.revision_ts, read_revision);
     assert_eq!(
         transactions::data_site::full_read_rpc_count(),
         before_partial,
@@ -3816,7 +3816,7 @@ async fn head_read_certifies_snapshot_version_and_aborts_on_conflict() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn selected_read_certifies_snapshot_version_and_aborts_on_conflict() {
+async fn selected_read_certifies_snapshot_revision_and_aborts_on_conflict() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5400";
     let group = "txn_occ_selected_read_certificate";
@@ -3869,29 +3869,29 @@ async fn selected_read_certifies_snapshot_version_and_aborts_on_conflict() {
 async fn snapshot_read_survives_concurrent_non_transactional_overwrite() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5382";
-    let group = "txn_occ_pin_survives_overwrite";
+    let group = "txn_occ_history_survives_overwrite";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::new(0, 90133);
 
     // Seed revision_ts A.
-    let mut version_a = counter_cell(schema.id, cell_id, 100, "counter_overwrite_a");
-    runtime.chunks().write_cell(&mut version_a).unwrap();
-    let version_a_version = version_a.header.revision_ts;
+    let mut revision_a = counter_cell(schema.id, cell_id, 100, "counter_overwrite_a");
+    runtime.chunks().write_cell(&mut revision_a).unwrap();
+    let revision_a_ts = revision_a.header.revision_ts;
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
     // head resolves revision_ts A at the transaction's fixed snapshot.
     let head_a = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(head_a.revision_ts, version_a_version);
+    assert_eq!(head_a.revision_ts, revision_a_ts);
 
     // Overwrite the cell NON-transactionally: this writes a NEW revision_ts B and
     // only marks revision_ts A dead (copy-on-write) rather than mutating it in place.
-    let mut version_b = counter_cell(schema.id, cell_id, 200, "counter_overwrite_b");
-    let version_b_header = runtime.chunks().update_cell(&mut version_b).unwrap();
-    assert!(version_b_header.revision_ts > head_a.revision_ts);
+    let mut revision_b = counter_cell(schema.id, cell_id, 200, "counter_overwrite_b");
+    let revision_b_header = runtime.chunks().update_cell(&mut revision_b).unwrap();
+    assert!(revision_b_header.revision_ts > head_a.revision_ts);
 
     // Force a deterministic storage cleaner pass between the overwrite and the
     // snapshot reads below. `Cleaner::clean` (src/ram/cleaner/mod.rs) is the real
@@ -3924,7 +3924,7 @@ async fn snapshot_read_survives_concurrent_non_transactional_overwrite() {
     // A different, fresh transaction sees the current revision_ts B.
     let tid2 = txn.begin().await.unwrap().unwrap();
     let full_b = accepted_cell(txn.read(tid2.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(full_b.header.revision_ts, version_b_header.revision_ts);
+    assert_eq!(full_b.header.revision_ts, revision_b_header.revision_ts);
     assert_eq!(score_of(&full_b), 200);
 
     abort_txn(&txn, tid).await;
@@ -3936,23 +3936,23 @@ async fn snapshot_read_survives_concurrent_non_transactional_overwrite() {
 async fn snapshot_read_survives_concurrent_transactional_remove() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5383";
-    let group = "txn_occ_pin_survives_remove";
+    let group = "txn_occ_history_survives_remove";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::new(0, 90134);
 
     // Seed revision_ts A.
-    let mut version_a = counter_cell(schema.id, cell_id, 42, "counter_remove_pin_seed");
-    runtime.chunks().write_cell(&mut version_a).unwrap();
-    let version_a_version = version_a.header.revision_ts;
+    let mut revision_a = counter_cell(schema.id, cell_id, 42, "counter_remove_history_seed");
+    runtime.chunks().write_cell(&mut revision_a).unwrap();
+    let revision_a_ts = revision_a.header.revision_ts;
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
-    // head pins revision_ts A for tid.
+    // head records revision_ts A for tid.
     let head_a = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
-    assert_eq!(head_a.revision_ts, version_a_version);
+    assert_eq!(head_a.revision_ts, revision_a_ts);
 
     // A concurrent transaction removes the cell and commits.
     let tid2 = txn.begin().await.unwrap().unwrap();
@@ -3993,7 +3993,7 @@ async fn snapshot_read_survives_concurrent_transactional_remove() {
 async fn snapshot_read_caches_absence_across_concurrent_transactional_insert() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5384";
-    let group = "txn_occ_pin_absence_insert";
+    let group = "txn_occ_history_absence_insert";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);

@@ -778,7 +778,7 @@ impl TransactionManager {
         });
 
         // Spawn background cleanup task
-        let manager_clone = manager.clone();
+        let cleanup_manager = manager.self_ref.clone();
         tokio::spawn(async move {
             loop {
                 // Check if we should shutdown
@@ -792,16 +792,23 @@ impl TransactionManager {
                 #[cfg(not(test))]
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
-                manager_clone.prune_completed_decisions_at(get_time());
-                manager_clone.prune_replay_locks();
-                manager_clone.restart_retirement_jobs();
-                manager_clone.restart_abort_cleanup_jobs();
+                let Some(manager) = cleanup_manager.upgrade() else {
+                    return;
+                };
+                if manager.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                manager.prune_completed_decisions_at(get_time());
+                manager.prune_replay_locks();
+                manager.restart_retirement_jobs();
+                manager.restart_abort_cleanup_jobs();
 
                 // Clean up stale transactions (older than 5 minutes)
-                let cleaned = manager_clone.cleanup_stale_transactions(5 * 60 * 1000);
+                let cleaned = manager.cleanup_stale_transactions(5 * 60 * 1000);
                 if cleaned > 0 {
                     warn!("Cleaned up {} stale transactions", cleaned);
                 }
+                drop(manager);
             }
         });
 
@@ -4083,7 +4090,10 @@ mod tests {
             .unwrap()
     }
 
-    async fn start_manager_test_server(address: &str, group: &str) -> Arc<NebServer> {
+    async fn try_start_manager_test_server(
+        address: &str,
+        group: &str,
+    ) -> Result<Arc<NebServer>, crate::server::ServerError> {
         NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: crate::ram::segs::SEGMENT_SIZE,
@@ -4104,7 +4114,10 @@ mod tests {
             async |_| {},
         )
         .await
-        .unwrap()
+    }
+
+    async fn start_manager_test_server(address: &str, group: &str) -> Arc<NebServer> {
+        try_start_manager_test_server(address, group).await.unwrap()
     }
 
     async fn start_durable_manager_test_server(
@@ -4133,6 +4146,210 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn subscription_callback_snapshot() -> Option<(String, usize)> {
+        let callback = bifrost::raft::client::CALLBACK
+            .read()
+            .await
+            .as_ref()?
+            .upgrade()?;
+        Some((
+            callback.server_address.clone(),
+            Arc::strong_count(&callback) - 1,
+        ))
+    }
+
+    async fn subscription_callback_shortcut_is_registered(address: &str) -> bool {
+        bifrost::raft::state_machine::callback::get_local(
+            hash_str(address),
+            bifrost::raft::state_machine::callback::DEFAULT_SERVICE_ID,
+        )
+        .await
+        .is_some()
+    }
+
+    #[test]
+    fn sequential_manager_servers_rebind_subscription_callback_after_shutdown() {
+        let _ = env_logger::try_init();
+        let first_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let after_first_shutdown = first_runtime.block_on(async {
+            let server =
+                start_manager_test_server("127.0.0.1:5496", "txn_manager_callback_rebind_a").await;
+            assert_eq!(
+                subscription_callback_snapshot().await.map(|state| state.0),
+                Some("127.0.0.1:5496".to_string())
+            );
+            server.shutdown().await;
+            (
+                subscription_callback_snapshot().await,
+                subscription_callback_shortcut_is_registered("127.0.0.1:5496").await,
+            )
+        });
+        drop(first_runtime);
+
+        let after_first_runtime_drop =
+            futures::executor::block_on(subscription_callback_snapshot());
+
+        let second_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        second_runtime.block_on(async {
+            let before_second_start = subscription_callback_snapshot().await;
+            let server = try_start_manager_test_server(
+                "127.0.0.1:5497",
+                "txn_manager_callback_rebind_b",
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "second startup failed with {error:?}; callback after first shutdown={after_first_shutdown:?}, after first runtime drop={after_first_runtime_drop:?}, before second startup={before_second_start:?}"
+                )
+            });
+            assert_eq!(
+                subscription_callback_snapshot().await.map(|state| state.0),
+                Some("127.0.0.1:5497".to_string())
+            );
+            server.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn graceful_shutdown_releases_complete_manager_server_graph() {
+        let _ = env_logger::try_init();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (
+            server_ref,
+            raft_service_ref,
+            rpc_ref,
+            database_runtime_ref,
+            transaction_runtime_ref,
+            manager_ref,
+            consh_ref,
+            membership_ref,
+            raft_client_ref,
+            callback_ref,
+        ) = runtime.block_on(async {
+            let server =
+                start_manager_test_server("127.0.0.1:5498", "txn_manager_server_graph_drop").await;
+            let database_runtime = server.current_database();
+            let manager = database_runtime.txn_manager().unwrap().clone();
+            let callback_ref = bifrost::raft::client::CALLBACK.read().await.clone();
+            let refs = (
+                Arc::downgrade(&server),
+                Arc::downgrade(&server.raft_service),
+                Arc::downgrade(&server.rpc),
+                Arc::downgrade(&database_runtime),
+                Arc::downgrade(&manager.deps.database_runtime),
+                Arc::downgrade(&manager),
+                Arc::downgrade(&server.consh),
+                Arc::downgrade(&server.membership),
+                Arc::downgrade(&server.raft_client),
+                callback_ref,
+            );
+
+            server.shutdown().await;
+            drop(manager);
+            drop(database_runtime);
+            drop(server);
+            refs
+        });
+        drop(runtime);
+
+        for _ in 0..100 {
+            if server_ref.upgrade().is_none()
+                && raft_service_ref.upgrade().is_none()
+                && rpc_ref.upgrade().is_none()
+                && database_runtime_ref.upgrade().is_none()
+                && transaction_runtime_ref.upgrade().is_none()
+                && manager_ref.upgrade().is_none()
+                && consh_ref.upgrade().is_none()
+                && membership_ref.upgrade().is_none()
+                && raft_client_ref.upgrade().is_none()
+                && callback_ref
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                    .is_none()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut survivors = Vec::new();
+        if server_ref.upgrade().is_some() {
+            survivors.push("NebServer");
+        }
+        if raft_service_ref.upgrade().is_some() {
+            survivors.push("RaftService");
+        }
+        if rpc_ref.upgrade().is_some() {
+            survivors.push("rpc::Server");
+        }
+        if database_runtime_ref.upgrade().is_some() {
+            survivors.push("final DatabaseRuntime");
+        }
+        if transaction_runtime_ref.upgrade().is_some() {
+            survivors.push("transaction DatabaseRuntime");
+        }
+        if manager_ref.upgrade().is_some() {
+            survivors.push("TransactionManager");
+        }
+        if consh_ref.upgrade().is_some() {
+            survivors.push("ConsistentHashing");
+        }
+        if membership_ref.upgrade().is_some() {
+            survivors.push("ObserverClient");
+        }
+        if raft_client_ref.upgrade().is_some() {
+            survivors.push("RaftClient");
+        }
+        if callback_ref
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some()
+        {
+            survivors.push("SubscriptionService");
+        }
+        assert!(
+            survivors.is_empty(),
+            "graceful shutdown retained {survivors:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_manager_releases_periodic_cleanup_worker_and_deps() {
+        let address = "127.0.0.1:5495";
+        let group = "txn_manager_cleanup_worker_drop";
+        let server = start_manager_test_server(address, group).await;
+        let deps = Arc::new(TransactionManagerDeps {
+            database_runtime: server.current_database(),
+            server_id: server.server_id,
+            consh: server.consh.clone(),
+            member_pool: server.member_pool.clone(),
+            hlc: server.hlc.clone(),
+        });
+        let deps_ref = Arc::downgrade(&deps);
+        let manager = TransactionManager::new(deps);
+        let manager_ref = Arc::downgrade(&manager);
+
+        drop(manager);
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while manager_ref.upgrade().is_some() || deps_ref.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the periodic cleanup worker must not retain its manager or dependencies");
+
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

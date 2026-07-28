@@ -260,14 +260,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn point_read_mapping_preserves_snapshot_too_old() {
-        let result = Transaction::map_point_read::<OwnedCell>(
+    fn point_read_mapping_distinguishes_snapshot_too_old_from_absence() {
+        let id = Id::new(0, 1);
+        let absent = Transaction::map_point_read::<OwnedCell>(
+            TxnExecResult::Error(ReadError::CellDoesNotExisted),
+            id,
+        );
+        let too_old = Transaction::map_point_read::<OwnedCell>(
             TxnExecResult::Error(ReadError::SnapshotTooOld),
-            Id::new(0, 1),
+            id,
         );
 
+        assert!(matches!(absent, Ok(None)));
         assert!(matches!(
-            result,
+            too_old,
             Err(TxnError::ReadError(ReadError::SnapshotTooOld))
         ));
     }
