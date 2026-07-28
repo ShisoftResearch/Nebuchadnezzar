@@ -51,9 +51,63 @@ for index, throughput in enumerate((90.0, 100.0, 110.0), 1):
     high_cv["scenarios"]["mvcc/rmw_one_cell"]["commits_per_second"] = throughput
     with (directory / f"candidate-high-cv-{index}.json").open("w", encoding="utf-8") as handle:
         json.dump(high_cv, handle)
+invalid_reports = {
+    "candidate-json-nan": ("label", float("nan")),
+    "candidate-json-infinity": ("label", float("inf")),
+    "candidate-json-negative-infinity": ("label", float("-inf")),
+}
+for name, (field, value) in invalid_reports.items():
+    invalid = json.loads(json.dumps(report))
+    invalid[field] = value
+    with (directory / f"{name}.json").open("w", encoding="utf-8") as handle:
+        json.dump(invalid, handle)
+invalid_metrics = {
+    "candidate-string-nan-throughput": ("commits_per_second", "NaN"),
+    "candidate-string-infinity-p99": ("p99_ns", "Infinity"),
+    "candidate-bool-throughput": ("commits_per_second", True),
+    "candidate-string-finite-throughput": ("commits_per_second", "100.0"),
+    "candidate-bool-p99": ("p99_ns", False),
+    "candidate-string-finite-p99": ("p99_ns", "20"),
+    "candidate-huge-throughput": ("commits_per_second", 10 ** 4_000),
+    "candidate-zero-throughput": ("commits_per_second", 0),
+    "candidate-negative-throughput": ("commits_per_second", -1),
+    "candidate-negative-p99": ("p99_ns", -1),
+}
+for name, (field, value) in invalid_metrics.items():
+    invalid = json.loads(json.dumps(report))
+    invalid["scenarios"]["mvcc/rmw_one_cell"][field] = value
+    with (directory / f"{name}.json").open("w", encoding="utf-8") as handle:
+        json.dump(invalid, handle)
 PY
   "$0" "$test_dir/base-1.json" "$test_dir/base-2.json" "$test_dir/base-3.json" -- \
     "$test_dir/candidate-1.json" "$test_dir/candidate-2.json" "$test_dir/candidate-3.json"
+  expect_invalid_report() {
+    local invalid_report="$1"
+    local status=0
+    "$0" "$test_dir/base-1.json" "$test_dir/base-2.json" "$test_dir/base-3.json" -- \
+      "$test_dir/$invalid_report.json" "$test_dir/candidate-2.json" "$test_dir/candidate-3.json" ||
+      status=$?
+    if [[ "$status" -ne 2 ]]; then
+      echo "self-test expected $invalid_report to be rejected as an invalid report, got status $status" >&2
+      exit 1
+    fi
+  }
+  for invalid_report in \
+    candidate-json-nan \
+    candidate-json-infinity \
+    candidate-json-negative-infinity \
+    candidate-string-nan-throughput \
+    candidate-string-infinity-p99 \
+    candidate-bool-throughput \
+    candidate-string-finite-throughput \
+    candidate-bool-p99 \
+    candidate-string-finite-p99 \
+    candidate-huge-throughput \
+    candidate-zero-throughput \
+    candidate-negative-throughput \
+    candidate-negative-p99; do
+    expect_invalid_report "$invalid_report"
+  done
   if "$0" "$test_dir/base-1.json" "$test_dir/base-2.json" "$test_dir/base-3.json" -- \
     "$test_dir/candidate-bad.json" "$test_dir/candidate-2.json" "$test_dir/candidate-3.json"; then
     echo "self-test expected the unexpected-outcome case to fail" >&2
@@ -102,12 +156,40 @@ import sys
 baseline_paths = sys.argv[1:4]
 candidate_paths = sys.argv[5:8]
 
+def reject_nonfinite_constant(value):
+    raise ValueError(f"non-finite JSON number {value}")
+
 def load(path):
     with open(path, encoding="utf-8") as handle:
-        report = json.load(handle)
+        report = json.load(handle, parse_constant=reject_nonfinite_constant)
     scenarios = report.get("scenarios")
     if not isinstance(scenarios, dict):
         raise ValueError(f"{path}: missing scenarios object")
+    for name, summary in scenarios.items():
+        if not isinstance(summary, dict):
+            raise ValueError(f"{path} {name}: scenario summary must be an object")
+        throughput_value = summary.get("commits_per_second")
+        p99_value = summary.get("p99_ns")
+        if (
+            not isinstance(throughput_value, (int, float))
+            or isinstance(throughput_value, bool)
+        ):
+            raise ValueError(
+                f"{path} {name}: commits_per_second must be a JSON number"
+            )
+        if not isinstance(p99_value, (int, float)) or isinstance(p99_value, bool):
+            raise ValueError(f"{path} {name}: p99_ns must be a JSON number")
+        try:
+            throughput = float(throughput_value)
+            p99 = float(p99_value)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f"{path} {name}: invalid metric: {error}") from error
+        if not math.isfinite(throughput) or throughput <= 0:
+            raise ValueError(
+                f"{path} {name}: commits_per_second must be finite and greater than zero"
+            )
+        if not math.isfinite(p99) or p99 < 0:
+            raise ValueError(f"{path} {name}: p99_ns must be finite and nonnegative")
     return scenarios
 
 def cv(values):
@@ -126,7 +208,7 @@ def historical(name):
 try:
     baseline = [load(path) for path in baseline_paths]
     candidate = [load(path) for path in candidate_paths]
-except (OSError, ValueError, json.JSONDecodeError) as error:
+except (OSError, ValueError, OverflowError, json.JSONDecodeError) as error:
     print(f"invalid benchmark report: {error}", file=sys.stderr)
     sys.exit(2)
 
@@ -155,7 +237,7 @@ for name in sorted(expected):
         after_tp = [float(report[name]["commits_per_second"]) for report in candidate]
         before_p99 = [float(report[name]["p99_ns"]) for report in baseline]
         after_p99 = [float(report[name]["p99_ns"]) for report in candidate]
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
         print(f"{name}: invalid metric: {error}", file=sys.stderr)
         failed = True
         continue

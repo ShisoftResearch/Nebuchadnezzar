@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use bifrost::hlc::HlcSource;
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
     SamplingMode, Throughput,
@@ -17,17 +18,20 @@ use occ_support::{
     fixture::{counter_cell, OccFixture, PortPlan, RetainedRevision},
     metrics::RunReport,
     workloads::{
-        build_cleaner_history, build_history_chain, hold_old_snapshot_across_newer_writes,
-        run_blind_remove_batch, run_blind_update_batch, run_cleaner_reader_contention_batch,
-        run_cleaner_relocation_batch, run_expired_snapshot_read_batch, run_fixed_success_rmw,
-        run_held_snapshot_read_batch, run_non_transactional_read_batch, run_projected_read_batch,
+        build_history_chain, hold_old_snapshot_across_newer_writes, run_blind_remove_batch,
+        run_blind_update_batch, run_expired_snapshot_read_batch, run_fixed_success_rmw,
+        run_fresh_cleaner_reader_contention_batch, run_fresh_cleaner_relocation_batch,
+        run_held_snapshot_read_batch, run_hlc_allocation_batch, run_non_transactional_read_batch,
+        run_projected_read_batch, run_read_only_current_batch,
         run_storage_bounded_non_transactional_update_batch, run_visible_history_read_batch,
         BatchSpec, ProjectionMode, TimedBatch,
     },
 };
 
 const OCC_SAMPLE_SIZE: usize = 10;
+const OCC_WARMUP_SECONDS: u64 = 3;
 const OCC_MEASUREMENT_SECONDS: u64 = 10;
+const CLEANER_SAMPLE_BOUND_NANOS: u64 = 1;
 
 const REQUIRED_MVCC_SCENARIOS: &[&str] = &[
     "mvcc/non_transactional_read",
@@ -159,11 +163,11 @@ fn seed(runtime: &Runtime, fixture: &OccFixture, ids: &[Id], payload_bytes: usiz
     });
 }
 
-fn prepare_cleaner_history(
+fn seed_cleaner_ids(
     runtime: &Runtime,
     fixture: Arc<OccFixture>,
     ids: Arc<Vec<Id>>,
-) -> occ_support::workloads::CleanerHistory {
+) -> (Arc<Vec<Id>>, Arc<Vec<Id>>) {
     assert_eq!(ids.len(), 48, "cleaner history requires 48 routed ids");
     let target_ids = Arc::new(ids.iter().step_by(2).copied().collect::<Vec<_>>());
     let sacrificial_ids = Arc::new(ids.iter().skip(1).step_by(2).copied().collect::<Vec<_>>());
@@ -180,7 +184,7 @@ fn prepare_cleaner_history(
                 .expect("seed cleaner benchmark counter");
         }
     }
-    runtime.block_on(build_cleaner_history(fixture, target_ids, sacrificial_ids))
+    (target_ids, sacrificial_ids)
 }
 
 fn prepare_cleaner_fixture(
@@ -189,11 +193,11 @@ fn prepare_cleaner_fixture(
     slot: u16,
     group: &str,
     id_start: u64,
-) -> (Arc<OccFixture>, Arc<occ_support::workloads::CleanerHistory>) {
+) -> (Arc<OccFixture>, Arc<Vec<Id>>, Arc<Vec<Id>>) {
     let fixture = Arc::new(runtime.block_on(OccFixture::single_with_history_retention(
         plan.single(slot),
         group,
-        30_000,
+        2_000,
     )));
     fixture.servers[0].cleaner().pause();
     let server_id = fixture.servers[0].server_id;
@@ -206,8 +210,8 @@ fn prepare_cleaner_fixture(
             .collect::<Vec<_>>(),
     );
     assert_eq!(ids.len(), 48, "prepare cleaner benchmark ids");
-    let history = Arc::new(prepare_cleaner_history(runtime, fixture.clone(), ids));
-    (fixture, history)
+    let (target_ids, sacrificial_ids) = seed_cleaner_ids(runtime, fixture.clone(), ids);
+    (fixture, target_ids, sacrificial_ids)
 }
 
 fn shutdown_fixture(runtime: &Runtime, fixture: Arc<OccFixture>) {
@@ -225,11 +229,23 @@ fn finish_fixture(runtime: Runtime, fixture: Arc<OccFixture>) {
 
 fn occ_group<'a>(criterion: &'a mut Criterion, name: &str) -> BenchmarkGroup<'a, WallTime> {
     let mut group = criterion.benchmark_group(name);
-    group.sampling_mode(SamplingMode::Flat);
-    group.sample_size(OCC_SAMPLE_SIZE);
-    group.measurement_time(Duration::from_secs(OCC_MEASUREMENT_SECONDS));
+    configure_standard_sampling(&mut group);
     group.throughput(Throughput::Elements(1));
     group
+}
+
+fn configure_standard_sampling(group: &mut BenchmarkGroup<'_, WallTime>) {
+    group.sampling_mode(SamplingMode::Flat);
+    group.sample_size(OCC_SAMPLE_SIZE);
+    group.warm_up_time(Duration::from_secs(OCC_WARMUP_SECONDS));
+    group.measurement_time(Duration::from_secs(OCC_MEASUREMENT_SECONDS));
+}
+
+fn configure_bounded_cleaner_sampling(group: &mut BenchmarkGroup<'_, WallTime>) {
+    group.sampling_mode(SamplingMode::Flat);
+    group.sample_size(OCC_SAMPLE_SIZE);
+    group.warm_up_time(Duration::from_nanos(CLEANER_SAMPLE_BOUND_NANOS));
+    group.measurement_time(Duration::from_nanos(CLEANER_SAMPLE_BOUND_NANOS));
 }
 
 fn register_rmw(
@@ -529,10 +545,19 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
             .collect::<Vec<_>>(),
     );
     seed(&runtime, &cluster_fixture, cluster_ids.as_ref(), 0);
+    let hlc_source = Arc::new(HlcSource::new(server_id));
 
     let runtime_ref = &runtime;
     let mut group = occ_group(criterion, "mvcc");
     for scenario in REQUIRED_MVCC_SCENARIOS {
+        if matches!(
+            *scenario,
+            "mvcc/cleaner_retained_revisions" | "mvcc/cleaner_reader_contention"
+        ) {
+            configure_bounded_cleaner_sampling(&mut group);
+        } else if *scenario == "mvcc/hlc_contention" {
+            configure_standard_sampling(&mut group);
+        }
         let fixture = fixture.clone();
         let ids = ids.clone();
         let remove_ids = remove_ids.clone();
@@ -546,6 +571,7 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
         let history_depth_32 = history_depth_32.clone();
         let held_old_snapshot = held_old_snapshot.clone();
         let expired_history = expired_history.clone();
+        let hlc_source = hlc_source.clone();
         let cleaner_setup = match *scenario {
             "mvcc/cleaner_retained_revisions" => Some(prepare_cleaner_fixture(
                 &runtime,
@@ -563,8 +589,15 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
             )),
             _ => None,
         };
-        let cleaner_fixture = cleaner_setup.as_ref().map(|(fixture, _)| fixture.clone());
-        let cleaner_history = cleaner_setup.as_ref().map(|(_, history)| history.clone());
+        let cleaner_fixture = cleaner_setup
+            .as_ref()
+            .map(|(fixture, _, _)| fixture.clone());
+        let cleaner_target_ids = cleaner_setup
+            .as_ref()
+            .map(|(_, target_ids, _)| target_ids.clone());
+        let cleaner_sacrificial_ids = cleaner_setup
+            .as_ref()
+            .map(|(_, _, sacrificial_ids)| sacrificial_ids.clone());
         let cleaner_fixture_to_shutdown = cleaner_fixture.clone();
         let scenario = (*scenario).to_string();
         group.bench_function(
@@ -583,8 +616,10 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
                 let history_depth_32 = history_depth_32.clone();
                 let held_old_snapshot = held_old_snapshot.clone();
                 let expired_history = expired_history.clone();
+                let hlc_source = hlc_source.clone();
                 let cleaner_fixture = cleaner_fixture.clone();
-                let cleaner_history = cleaner_history.clone();
+                let cleaner_target_ids = cleaner_target_ids.clone();
+                let cleaner_sacrificial_ids = cleaner_sacrificial_ids.clone();
                 let scenario = scenario.clone();
                 bench.iter_custom(move |iterations| {
                     reset_phase_profile();
@@ -613,11 +648,10 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
                                     Vec::new(),
                                 ),
                                 "mvcc/read_only_current" => (
-                                    run_projected_read_batch(
+                                    run_read_only_current_batch(
                                         fixture.clone(),
                                         ids.clone(),
                                         operations,
-                                        ProjectionMode::Full,
                                     )
                                     .await,
                                     fixture.clone(),
@@ -779,67 +813,57 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
                                     retained_fixture.clone(),
                                     Vec::new(),
                                 ),
-                                "mvcc/cleaner_retained_revisions" => (
-                                    run_cleaner_relocation_batch(
-                                        cleaner_fixture
-                                            .as_ref()
-                                            .expect("cleaner retained fixture setup")
-                                            .clone(),
-                                        cleaner_history
-                                            .as_ref()
-                                            .expect("cleaner retained history setup")
-                                            .as_ref()
-                                            .clone(),
-                                        operations,
-                                    )
-                                    .await,
-                                    cleaner_fixture
+                                "mvcc/cleaner_retained_revisions" => {
+                                    let cleaner_fixture = cleaner_fixture
                                         .as_ref()
                                         .expect("cleaner retained fixture setup")
-                                        .clone(),
-                                    cleaner_history
-                                        .as_ref()
-                                        .expect("cleaner retained history setup")
-                                        .predecessors
-                                        .as_ref()
-                                        .clone(),
-                                ),
-                                "mvcc/cleaner_reader_contention" => (
-                                    run_cleaner_reader_contention_batch(
-                                        cleaner_fixture
+                                        .clone();
+                                    let (batch, history) = run_fresh_cleaner_relocation_batch(
+                                        cleaner_fixture.clone(),
+                                        cleaner_target_ids
                                             .as_ref()
-                                            .expect("cleaner reader fixture setup")
+                                            .expect("cleaner retained target ids")
                                             .clone(),
-                                        cleaner_history
+                                        cleaner_sacrificial_ids
                                             .as_ref()
-                                            .expect("cleaner reader history setup")
-                                            .as_ref()
+                                            .expect("cleaner retained sacrificial ids")
                                             .clone(),
                                         operations,
                                     )
-                                    .await,
-                                    cleaner_fixture
+                                    .await;
+                                    (
+                                        batch,
+                                        cleaner_fixture,
+                                        history.predecessors.as_ref().clone(),
+                                    )
+                                }
+                                "mvcc/cleaner_reader_contention" => {
+                                    let cleaner_fixture = cleaner_fixture
                                         .as_ref()
                                         .expect("cleaner reader fixture setup")
-                                        .clone(),
-                                    cleaner_history
-                                        .as_ref()
-                                        .expect("cleaner reader history setup")
-                                        .predecessors
-                                        .as_ref()
-                                        .clone(),
-                                ),
-                                "mvcc/hlc_contention" => (
-                                    run_fixed_success_rmw(
-                                        fixture.clone(),
-                                        Arc::new(vec![ids[6]]),
-                                        BatchSpec {
-                                            successes: operations,
-                                            concurrency: 16,
-                                            cells_per_txn: 1,
-                                        },
+                                        .clone();
+                                    let (batch, history) =
+                                        run_fresh_cleaner_reader_contention_batch(
+                                            cleaner_fixture.clone(),
+                                            cleaner_target_ids
+                                                .as_ref()
+                                                .expect("cleaner reader target ids")
+                                                .clone(),
+                                            cleaner_sacrificial_ids
+                                                .as_ref()
+                                                .expect("cleaner reader sacrificial ids")
+                                                .clone(),
+                                            operations,
+                                        )
+                                        .await;
+                                    (
+                                        batch,
+                                        cleaner_fixture,
+                                        history.predecessors.as_ref().clone(),
                                     )
-                                    .await,
+                                }
+                                "mvcc/hlc_contention" => (
+                                    run_hlc_allocation_batch(hlc_source.clone(), operations, 16),
                                     fixture.clone(),
                                     Vec::new(),
                                 ),

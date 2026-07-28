@@ -3,11 +3,12 @@ use std::{
     future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Barrier,
     },
     time::{Duration, Instant},
 };
 
+use bifrost::hlc::{Hlc, HlcSource};
 use dovahkiin::types::{Map as _, Value as _};
 use neb::{
     ram::{
@@ -26,10 +27,61 @@ const MAX_ATTEMPTS_PER_LOGICAL_OPERATION: u64 = 10_000;
 const DIRECT_UPDATE_RECLAIM_INTERVAL: u64 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AttemptOutcome {
+pub enum AttemptDisposition {
     Committed,
     Retryable,
     Unexpected(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptOutcome {
+    disposition: AttemptDisposition,
+    waits: u64,
+}
+
+#[allow(non_upper_case_globals, non_snake_case)]
+impl AttemptOutcome {
+    pub const Committed: Self = Self {
+        disposition: AttemptDisposition::Committed,
+        waits: 0,
+    };
+    pub const Retryable: Self = Self {
+        disposition: AttemptDisposition::Retryable,
+        waits: 0,
+    };
+
+    pub fn Unexpected(message: String) -> Self {
+        Self::unexpected(message)
+    }
+
+    pub fn retryable() -> Self {
+        Self::Retryable
+    }
+
+    pub fn unexpected(message: impl Into<String>) -> Self {
+        Self {
+            disposition: AttemptDisposition::Unexpected(message.into()),
+            waits: 0,
+        }
+    }
+
+    pub fn with_wait(mut self) -> Self {
+        self.waits = self.waits.saturating_add(1);
+        self
+    }
+
+    fn with_wait_count(mut self, waits: u64) -> Self {
+        self.waits = self.waits.saturating_add(waits);
+        self
+    }
+}
+
+fn account_attempt_outcome(
+    metrics: &mut BatchMetrics,
+    outcome: AttemptOutcome,
+) -> AttemptDisposition {
+    metrics.waits = metrics.waits.saturating_add(outcome.waits);
+    outcome.disposition
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -37,6 +89,7 @@ pub struct AttemptTally {
     pub attempts: u64,
     pub committed: u64,
     pub not_realizable: u64,
+    pub waits: u64,
     pub unexpected: Vec<String>,
 }
 
@@ -48,14 +101,15 @@ impl AttemptTally {
         let mut tally = Self::default();
         for outcome in outcomes {
             tally.attempts += 1;
-            match outcome {
-                AttemptOutcome::Committed => {
+            tally.waits = tally.waits.saturating_add(outcome.waits);
+            match outcome.disposition {
+                AttemptDisposition::Committed => {
                     tally.committed += 1;
                 }
-                AttemptOutcome::Retryable => {
+                AttemptDisposition::Retryable => {
                     tally.not_realizable += 1;
                 }
-                AttemptOutcome::Unexpected(message) => {
+                AttemptDisposition::Unexpected(message) => {
                     tally.unexpected.push(message);
                 }
             }
@@ -96,13 +150,16 @@ pub struct HeldSnapshot {
 pub struct CleanerHistory {
     pub chains: Arc<Vec<HistoryChain>>,
     pub predecessors: Arc<Vec<RetainedRevision>>,
-    initial_locations: Arc<Vec<(RetainedRevision, usize)>>,
-    relocation_seen: Arc<std::sync::atomic::AtomicBool>,
+    relocations_observed: Arc<AtomicU64>,
 }
 
 impl CleanerHistory {
     pub fn relocation_observed(&self) -> bool {
-        self.relocation_seen.load(Ordering::Acquire)
+        self.relocations_observed() != 0
+    }
+
+    pub fn relocations_observed(&self) -> u64 {
+        self.relocations_observed.load(Ordering::Acquire)
     }
 }
 
@@ -256,6 +313,18 @@ async fn finish_once(fixture: &OccFixture, tid: TxnId) -> AttemptOutcome {
             )
             .await;
         }
+        Ok(Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::Wait))) => {
+            return unexpected_after_prepare_cleanup(
+                fixture,
+                tid.clone(),
+                format!(
+                    "prepare({tid:?}) returned {:?}",
+                    TMPrepareResult::DMPrepareError(DMPrepareResult::Wait)
+                ),
+            )
+            .await
+            .with_wait();
+        }
         Ok(Ok(other)) => {
             return unexpected_after_prepare_cleanup(
                 fixture,
@@ -317,7 +386,8 @@ async fn read_modify_write_once(fixture: &OccFixture, ids: &[Id]) -> AttemptOutc
                     tid.clone(),
                     format!("transactional read waited unexpectedly for {:?}", id),
                 )
-                .await;
+                .await
+                .with_wait();
             }
             Ok(Ok(TxnExecResult::Error(err))) => {
                 return unexpected_after_abort(
@@ -408,7 +478,8 @@ async fn read_modify_write_once(fixture: &OccFixture, ids: &[Id]) -> AttemptOutc
                     tid.clone(),
                     format!("transactional update waited unexpectedly for {:?}", id),
                 )
-                .await;
+                .await
+                .with_wait();
             }
             Ok(Ok(TxnExecResult::Error(err))) => {
                 return unexpected_after_abort(
@@ -550,8 +621,8 @@ where
             let (next_setup, outcome) = attempt_fn(fixture.clone(), logical_index, id, setup).await;
             setup = next_setup;
 
-            match outcome {
-                AttemptOutcome::Committed => {
+            match account_attempt_outcome(&mut metrics, outcome) {
+                AttemptDisposition::Committed => {
                     let logical_elapsed = logical_started.elapsed();
                     elapsed += logical_elapsed;
                     metrics.record_success(logical_elapsed, attempts, retries);
@@ -568,11 +639,11 @@ where
                     }
                     break;
                 }
-                AttemptOutcome::Retryable => {
+                AttemptDisposition::Retryable => {
                     retries += 1;
                     metrics.record_retryable();
                 }
-                AttemptOutcome::Unexpected(message) => {
+                AttemptDisposition::Unexpected(message) => {
                     elapsed += logical_started.elapsed();
                     metrics.attempts += attempts;
                     metrics.logical_retries += retries;
@@ -648,17 +719,16 @@ async fn blind_update_once(fixture: &OccFixture, template: OwnedCell) -> Attempt
             )
             .await
         }
-        Ok(Ok(TxnExecResult::Wait)) => {
-            unexpected_after_abort(
-                fixture,
-                tid.clone(),
-                format!(
-                    "transactional blind update waited unexpectedly for {:?}",
-                    id
-                ),
-            )
-            .await
-        }
+        Ok(Ok(TxnExecResult::Wait)) => unexpected_after_abort(
+            fixture,
+            tid.clone(),
+            format!(
+                "transactional blind update waited unexpectedly for {:?}",
+                id
+            ),
+        )
+        .await
+        .with_wait(),
         Ok(Ok(TxnExecResult::Error(err))) => {
             unexpected_after_abort(
                 fixture,
@@ -719,17 +789,16 @@ async fn blind_remove_once(fixture: &OccFixture, id: Id) -> AttemptOutcome {
             )
             .await
         }
-        Ok(Ok(TxnExecResult::Wait)) => {
-            unexpected_after_abort(
-                fixture,
-                tid.clone(),
-                format!(
-                    "transactional blind remove waited unexpectedly for {:?}",
-                    id
-                ),
-            )
-            .await
-        }
+        Ok(Ok(TxnExecResult::Wait)) => unexpected_after_abort(
+            fixture,
+            tid.clone(),
+            format!(
+                "transactional blind remove waited unexpectedly for {:?}",
+                id
+            ),
+        )
+        .await
+        .with_wait(),
         Ok(Ok(TxnExecResult::Error(err))) => {
             unexpected_after_abort(
                 fixture,
@@ -843,10 +912,11 @@ async fn transactional_head_revision(
             score: None,
         }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
-        Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::Unexpected(format!(
+        Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::unexpected(format!(
             "transactional head waited unexpectedly for {:?}",
             id
-        ))),
+        ))
+        .with_wait()),
         Ok(Ok(TxnExecResult::Error(err))) => Err(AttemptOutcome::Unexpected(format!(
             "transactional head error for {:?}: {:?}",
             id, err
@@ -881,10 +951,11 @@ async fn transactional_selected_revision(
             score: Some(selected_score(&cell, id)?),
         }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
-        Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::Unexpected(format!(
+        Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::unexpected(format!(
             "transactional selected read waited unexpectedly for {:?}",
             id
-        ))),
+        ))
+        .with_wait()),
         Ok(Ok(TxnExecResult::Error(err))) => Err(AttemptOutcome::Unexpected(format!(
             "transactional selected read error for {:?}: {:?}",
             id, err
@@ -915,10 +986,11 @@ async fn transactional_full_revision(
             score: Some(full_score(&cell, id)?),
         }),
         Ok(Ok(TxnExecResult::Rejected)) => Err(AttemptOutcome::Retryable),
-        Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::Unexpected(format!(
+        Ok(Ok(TxnExecResult::Wait)) => Err(AttemptOutcome::unexpected(format!(
             "transactional full read waited unexpectedly for {:?}",
             id
-        ))),
+        ))
+        .with_wait()),
         Ok(Ok(TxnExecResult::Error(err))) => Err(AttemptOutcome::Unexpected(format!(
             "transactional full read error for {:?}: {:?}",
             id, err
@@ -973,27 +1045,32 @@ async fn projected_read_once(fixture: &OccFixture, id: Id, mode: ProjectionMode)
 
     let observations = match projected_observations(fixture, tid.clone(), id, mode).await {
         Ok(observations) => observations,
-        Err(AttemptOutcome::Retryable) => {
-            return retry_after_abort(
-                fixture,
-                tid.clone(),
-                format!("projected read rejected for {:?} in {:?}", id, mode),
-            )
-            .await;
-        }
-        Err(AttemptOutcome::Unexpected(message)) => {
-            return unexpected_after_abort(fixture, tid.clone(), message).await;
-        }
-        Err(AttemptOutcome::Committed) => {
-            return unexpected_after_abort(
-                fixture,
-                tid.clone(),
-                format!(
-                    "projected read helper returned committed unexpectedly for {:?}",
-                    id
-                ),
-            )
-            .await;
+        Err(outcome) => {
+            let AttemptOutcome { disposition, waits } = outcome;
+            return match disposition {
+                AttemptDisposition::Retryable => retry_after_abort(
+                    fixture,
+                    tid.clone(),
+                    format!("projected read rejected for {:?} in {:?}", id, mode),
+                )
+                .await
+                .with_wait_count(waits),
+                AttemptDisposition::Unexpected(message) => {
+                    unexpected_after_abort(fixture, tid.clone(), message)
+                        .await
+                        .with_wait_count(waits)
+                }
+                AttemptDisposition::Committed => unexpected_after_abort(
+                    fixture,
+                    tid.clone(),
+                    format!(
+                        "projected read helper returned committed unexpectedly for {:?}",
+                        id
+                    ),
+                )
+                .await
+                .with_wait_count(waits),
+            };
         }
     };
 
@@ -1010,6 +1087,63 @@ async fn projected_read_once(fixture: &OccFixture, id: Id, mode: ProjectionMode)
     }
 
     finish_once(fixture, tid).await
+}
+
+async fn read_only_current_once(fixture: &OccFixture, id: Id) -> AttemptOutcome {
+    let tid = match begin_transaction(fixture).await {
+        Ok(tid) => tid,
+        Err(outcome) => return outcome,
+    };
+
+    match transactional_full_revision(fixture, tid.clone(), id).await {
+        Ok(ProjectionObservation { score: Some(_), .. }) => {
+            match abort_started(fixture, tid.clone()).await {
+                Ok(()) => AttemptOutcome::Committed,
+                Err(error) => AttemptOutcome::unexpected(format!(
+                    "read-only current abort cleanup failed for {:?}: {error}",
+                    id
+                )),
+            }
+        }
+        Ok(observation) => {
+            unexpected_after_abort(
+                fixture,
+                tid,
+                format!(
+                    "read-only current returned no score for {:?}: {:?}",
+                    id, observation
+                ),
+            )
+            .await
+        }
+        Err(outcome) => {
+            let AttemptOutcome { disposition, waits } = outcome;
+            match disposition {
+                AttemptDisposition::Retryable => retry_after_abort(
+                    fixture,
+                    tid,
+                    format!("read-only current rejected for {:?}", id),
+                )
+                .await
+                .with_wait_count(waits),
+                AttemptDisposition::Unexpected(message) => {
+                    unexpected_after_abort(fixture, tid, message)
+                        .await
+                        .with_wait_count(waits)
+                }
+                AttemptDisposition::Committed => unexpected_after_abort(
+                    fixture,
+                    tid,
+                    format!(
+                        "read-only current helper returned committed before cleanup for {:?}",
+                        id
+                    ),
+                )
+                .await
+                .with_wait_count(waits),
+            }
+        }
+    }
 }
 
 pub async fn run_fixed_success_rmw(
@@ -1056,17 +1190,18 @@ pub async fn run_fixed_success_rmw(
                         return metrics;
                     }
 
-                    match read_modify_write_once(&fixture, &logical_ids).await {
-                        AttemptOutcome::Committed => {
+                    let outcome = read_modify_write_once(&fixture, &logical_ids).await;
+                    match account_attempt_outcome(&mut metrics, outcome) {
+                        AttemptDisposition::Committed => {
                             committed.fetch_add(1, Ordering::Relaxed);
                             metrics.record_success(logical_started.elapsed(), attempts, retries);
                             break;
                         }
-                        AttemptOutcome::Retryable => {
+                        AttemptDisposition::Retryable => {
                             retries += 1;
                             metrics.record_retryable();
                         }
-                        AttemptOutcome::Unexpected(message) => {
+                        AttemptDisposition::Unexpected(message) => {
                             metrics.attempts += attempts;
                             metrics.logical_retries += retries;
                             metrics.record_unexpected(message);
@@ -1112,6 +1247,97 @@ pub async fn run_fixed_success_rmw(
                 score_before, score_after, expected_delta
             ));
         }
+    }
+
+    TimedBatch { metrics, elapsed }
+}
+
+pub fn run_hlc_allocation_batch(
+    source: Arc<HlcSource>,
+    operations: u64,
+    concurrency: usize,
+) -> TimedBatch {
+    assert!(concurrency > 0, "HLC allocation requires concurrency > 0");
+    if operations == 0 {
+        return TimedBatch {
+            metrics: BatchMetrics::default(),
+            elapsed: Duration::ZERO,
+        };
+    }
+
+    let worker_count = concurrency.min(usize::try_from(operations).unwrap_or(usize::MAX));
+    let start = Arc::new(Barrier::new(worker_count));
+    let base_operations = operations / worker_count as u64;
+    let remainder = operations % worker_count as u64;
+    let mut worker_outputs = Vec::with_capacity(worker_count);
+    let mut metrics = BatchMetrics::default();
+
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker_index in 0..worker_count {
+            let source = source.clone();
+            let start = start.clone();
+            let worker_operations = base_operations + u64::from((worker_index as u64) < remainder);
+            workers.push(scope.spawn(move || {
+                start.wait();
+                let worker_started = Instant::now();
+                let mut allocations = Vec::with_capacity(
+                    usize::try_from(worker_operations).expect("worker operations fit in usize"),
+                );
+                for _ in 0..worker_operations {
+                    let allocation_started = Instant::now();
+                    let allocation = source.try_now();
+                    allocations.push((allocation_started.elapsed(), allocation));
+                }
+                (worker_started.elapsed(), allocations)
+            }));
+        }
+
+        for worker in workers {
+            match worker.join() {
+                Ok(output) => worker_outputs.push(output),
+                Err(_) => metrics.record_unexpected("HLC allocation worker panicked"),
+            }
+        }
+    });
+
+    let elapsed = worker_outputs
+        .iter()
+        .map(|(worker_elapsed, _)| *worker_elapsed)
+        .max()
+        .unwrap_or(Duration::ZERO);
+    let mut allocated = Vec::<Hlc>::with_capacity(
+        usize::try_from(operations).expect("HLC allocation count must fit in usize"),
+    );
+    for (_, allocations) in worker_outputs {
+        for (latency, allocation) in allocations {
+            match allocation {
+                Ok(hlc) => {
+                    metrics.record_success(latency, 1, 0);
+                    allocated.push(hlc);
+                }
+                Err(error) => {
+                    metrics.attempts += 1;
+                    metrics.record_unexpected(format!("checked HLC allocation failed: {error:?}"));
+                }
+            }
+        }
+    }
+
+    if metrics.committed != operations {
+        metrics.record_unexpected(format!(
+            "HLC allocation produced {} timestamps, expected {operations}",
+            metrics.committed
+        ));
+    }
+    if allocated.iter().any(|hlc| hlc.node != source.node()) {
+        metrics.record_unexpected("HLC allocation returned an unexpected node id");
+    }
+    allocated.sort_unstable_by_key(|hlc| hlc.ts);
+    if allocated.windows(2).any(|pair| pair[0].ts >= pair[1].ts) {
+        metrics.record_unexpected(
+            "concurrent checked HLC allocations were not globally unique and monotonic",
+        );
     }
 
     TimedBatch { metrics, elapsed }
@@ -1494,36 +1720,10 @@ pub async fn build_cleaner_history(
         .iter()
         .flat_map(|chain| chain.predecessors.iter().copied())
         .collect::<Vec<_>>();
-    let initial_locations = predecessors
-        .iter()
-        .map(|revision| {
-            let server = fixture
-                .servers
-                .iter()
-                .find(|server| {
-                    fixture
-                        .client
-                        .locate_server_id(&revision.id)
-                        .is_ok_and(|server_id| server_id == server.server_id)
-                })
-                .expect("cleaner revision must route to a fixture server");
-            let location = server
-                .chunks()
-                .history_location(&revision.id, revision.revision_ts)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "cleaner predecessor {:?}@{} must be retained",
-                        revision.id, revision.revision_ts
-                    )
-                });
-            (*revision, location)
-        })
-        .collect();
     CleanerHistory {
         chains: Arc::new(chains),
         predecessors: Arc::new(predecessors),
-        initial_locations: Arc::new(initial_locations),
-        relocation_seen: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        relocations_observed: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -1535,12 +1735,15 @@ fn run_full_cleaner_pass(fixture: &OccFixture) {
     }
 }
 
-fn observe_cleaner_relocation(fixture: &OccFixture, history: &CleanerHistory) -> bool {
-    let moved = history
-        .initial_locations
+fn cleaner_history_locations(
+    fixture: &OccFixture,
+    history: &CleanerHistory,
+) -> Result<Vec<usize>, String> {
+    history
+        .predecessors
         .iter()
-        .any(|(revision, initial_location)| {
-            fixture
+        .map(|revision| {
+            let server = fixture
                 .servers
                 .iter()
                 .find(|server| {
@@ -1549,17 +1752,35 @@ fn observe_cleaner_relocation(fixture: &OccFixture, history: &CleanerHistory) ->
                         .locate_server_id(&revision.id)
                         .is_ok_and(|server_id| server_id == server.server_id)
                 })
-                .and_then(|server| {
-                    server
-                        .chunks()
-                        .history_location(&revision.id, revision.revision_ts)
+                .ok_or_else(|| {
+                    format!(
+                        "cleaner predecessor {:?}@{} did not route to a fixture server",
+                        revision.id, revision.revision_ts
+                    )
+                })?;
+            server
+                .chunks()
+                .history_location(&revision.id, revision.revision_ts)
+                .ok_or_else(|| {
+                    format!(
+                        "cleaner predecessor {:?}@{} was not retained",
+                        revision.id, revision.revision_ts
+                    )
                 })
-                .is_some_and(|location| location != *initial_location)
-        });
+        })
+        .collect()
+}
+
+fn current_cleaner_relocation(history: &CleanerHistory, before: &[usize], after: &[usize]) -> bool {
+    let moved = before.len() == after.len()
+        && before
+            .iter()
+            .zip(after)
+            .any(|(before, after)| before != after);
     if moved {
-        history.relocation_seen.store(true, Ordering::Release);
+        history.relocations_observed.fetch_add(1, Ordering::AcqRel);
     }
-    history.relocation_observed()
+    moved
 }
 
 pub async fn run_cleaner_relocation_batch(
@@ -1570,16 +1791,26 @@ pub async fn run_cleaner_relocation_batch(
     let mut metrics = BatchMetrics::default();
     let mut elapsed = Duration::default();
     for _ in 0..operations {
+        let before = match cleaner_history_locations(&fixture, &history) {
+            Ok(locations) => locations,
+            Err(error) => {
+                metrics.record_unexpected(error);
+                continue;
+            }
+        };
         let started = Instant::now();
         run_full_cleaner_pass(&fixture);
         let operation_elapsed = started.elapsed();
         elapsed += operation_elapsed;
-        metrics.record_success(operation_elapsed, 1, 0);
-    }
-    if !observe_cleaner_relocation(&fixture, &history) {
-        metrics.record_unexpected(
-            "cleaner did not relocate any real retained-history revision".to_string(),
-        );
+        match cleaner_history_locations(&fixture, &history) {
+            Ok(after) if current_cleaner_relocation(&history, &before, &after) => {
+                metrics.record_success(operation_elapsed, 1, 0);
+            }
+            Ok(_) => metrics.record_unexpected(
+                "cleaner did not relocate real retained history in the current operation",
+            ),
+            Err(error) => metrics.record_unexpected(error),
+        }
     }
     TimedBatch { metrics, elapsed }
 }
@@ -1642,11 +1873,26 @@ pub async fn run_cleaner_reader_contention_batch(
     let mut metrics = BatchMetrics::default();
     let mut elapsed = Duration::default();
     for _ in 0..operations {
+        let before = match cleaner_history_locations(&fixture, &history) {
+            Ok(locations) => locations,
+            Err(error) => {
+                metrics.record_unexpected(error);
+                continue;
+            }
+        };
         let started = Instant::now();
         run_full_cleaner_pass(&fixture);
         let operation_elapsed = started.elapsed();
         elapsed += operation_elapsed;
-        metrics.record_success(operation_elapsed, 1, 0);
+        match cleaner_history_locations(&fixture, &history) {
+            Ok(after) if current_cleaner_relocation(&history, &before, &after) => {
+                metrics.record_success(operation_elapsed, 1, 0);
+            }
+            Ok(_) => metrics.record_unexpected(
+                "cleaner contention did not relocate real retained history in the current operation",
+            ),
+            Err(error) => metrics.record_unexpected(error),
+        }
     }
     stop.store(true, Ordering::Release);
     if let Err(error) = reader.await {
@@ -1662,12 +1908,62 @@ pub async fn run_cleaner_reader_contention_batch(
     if reads.load(Ordering::Acquire) == 0 {
         metrics.record_unexpected("cleaner reader made no reads during cleaner pass".to_string());
     }
-    if !observe_cleaner_relocation(&fixture, &history) {
-        metrics.record_unexpected(
-            "cleaner contention did not relocate real retained history".to_string(),
-        );
-    }
     TimedBatch { metrics, elapsed }
+}
+
+async fn run_fresh_cleaner_batch(
+    fixture: Arc<OccFixture>,
+    target_ids: Arc<Vec<Id>>,
+    sacrificial_ids: Arc<Vec<Id>>,
+    operations: u64,
+    reader_contention: bool,
+) -> (TimedBatch, CleanerHistory) {
+    assert!(
+        operations > 0,
+        "fresh cleaner batch requires at least one operation"
+    );
+    let mut metrics = BatchMetrics::default();
+    let mut elapsed = Duration::ZERO;
+    let mut last_history = None;
+
+    for _ in 0..operations {
+        // Fragmentation construction and retention waiting are deliberately
+        // outside the elapsed duration returned to Criterion.
+        let history =
+            build_cleaner_history(fixture.clone(), target_ids.clone(), sacrificial_ids.clone())
+                .await;
+        let operation = if reader_contention {
+            run_cleaner_reader_contention_batch(fixture.clone(), history.clone(), 1).await
+        } else {
+            run_cleaner_relocation_batch(fixture.clone(), history.clone(), 1).await
+        };
+        metrics.merge(operation.metrics);
+        elapsed += operation.elapsed;
+        last_history = Some(history);
+    }
+
+    (
+        TimedBatch { metrics, elapsed },
+        last_history.expect("fresh cleaner batch must construct history"),
+    )
+}
+
+pub async fn run_fresh_cleaner_relocation_batch(
+    fixture: Arc<OccFixture>,
+    target_ids: Arc<Vec<Id>>,
+    sacrificial_ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> (TimedBatch, CleanerHistory) {
+    run_fresh_cleaner_batch(fixture, target_ids, sacrificial_ids, operations, false).await
+}
+
+pub async fn run_fresh_cleaner_reader_contention_batch(
+    fixture: Arc<OccFixture>,
+    target_ids: Arc<Vec<Id>>,
+    sacrificial_ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> (TimedBatch, CleanerHistory) {
+    run_fresh_cleaner_batch(fixture, target_ids, sacrificial_ids, operations, true).await
 }
 
 pub async fn run_blind_update_batch(
@@ -1729,17 +2025,17 @@ pub async fn run_blind_update_batch(
             logical_elapsed += attempt_started.elapsed();
             attempts += 1;
 
-            match outcome {
-                AttemptOutcome::Committed => {
+            match account_attempt_outcome(&mut metrics, outcome) {
+                AttemptDisposition::Committed => {
                     elapsed += logical_elapsed;
                     metrics.record_success(logical_elapsed, attempts, retries);
                     break;
                 }
-                AttemptOutcome::Retryable => {
+                AttemptDisposition::Retryable => {
                     retries += 1;
                     metrics.record_retryable();
                 }
-                AttemptOutcome::Unexpected(message) => {
+                AttemptDisposition::Unexpected(message) => {
                     elapsed += logical_elapsed;
                     metrics.attempts += attempts;
                     metrics.logical_retries += retries;
@@ -1845,6 +2141,27 @@ pub async fn run_projected_read_batch(
         |_fixture, _logical_index, _id| Box::pin(async move { Ok(()) }),
         move |fixture, _logical_index, id, setup| {
             Box::pin(async move { (setup, projected_read_once(&fixture, id, mode).await) })
+        },
+        |_fixture, _logical_index, _id, _setup| Box::pin(async move { Ok(()) }),
+    )
+    .await
+}
+
+pub async fn run_read_only_current_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    validate_unique_ids(ids.as_ref(), "read-only current");
+
+    run_sequential_fixed_success(
+        fixture.clone(),
+        ids.clone(),
+        operations,
+        "read-only current",
+        |_fixture, _logical_index, _id| Box::pin(async move { Ok(()) }),
+        move |fixture, _logical_index, id, setup| {
+            Box::pin(async move { (setup, read_only_current_once(&fixture, id).await) })
         },
         |_fixture, _logical_index, _id, _setup| Box::pin(async move { Ok(()) }),
     )
@@ -1958,6 +2275,25 @@ mod tests {
                 score: Some(4),
             },
         ]));
+    }
+
+    #[test]
+    fn waited_outcomes_preserve_disposition_and_increment_metrics() {
+        let mut metrics = BatchMetrics::default();
+
+        let retryable =
+            account_attempt_outcome(&mut metrics, AttemptOutcome::retryable().with_wait());
+        let unexpected = account_attempt_outcome(
+            &mut metrics,
+            AttemptOutcome::unexpected("waited failure").with_wait(),
+        );
+
+        assert_eq!(retryable, AttemptDisposition::Retryable);
+        assert_eq!(
+            unexpected,
+            AttemptDisposition::Unexpected("waited failure".to_string())
+        );
+        assert_eq!(metrics.waits, 2);
     }
 
     #[test]

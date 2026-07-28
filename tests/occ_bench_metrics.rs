@@ -1,5 +1,6 @@
 use std::{fs, sync::Arc, time::Duration};
 
+use bifrost::hlc::HlcSource;
 use serde_json::Value;
 
 #[cfg(feature = "occ_phase_profile")]
@@ -21,10 +22,11 @@ mod workloads;
 use metrics::PhaseSnapshotError;
 use metrics::{BatchMetrics, RunReport, ScenarioSummary};
 use workloads::{
-    build_cleaner_history, build_history_chain, hold_old_snapshot_across_newer_writes,
-    run_cleaner_reader_contention_batch, run_expired_snapshot_read_batch, run_fixed_success_rmw,
-    run_held_snapshot_read_batch, run_storage_bounded_non_transactional_update_batch,
-    run_visible_history_read_batch, AttemptOutcome, AttemptTally, BatchSpec,
+    build_history_chain, hold_old_snapshot_across_newer_writes, run_expired_snapshot_read_batch,
+    run_fixed_success_rmw, run_fresh_cleaner_reader_contention_batch, run_held_snapshot_read_batch,
+    run_hlc_allocation_batch, run_projected_read_batch, run_read_only_current_batch,
+    run_storage_bounded_non_transactional_update_batch, run_visible_history_read_batch,
+    AttemptOutcome, AttemptTally, BatchSpec, ProjectionMode,
 };
 
 #[test]
@@ -60,8 +62,8 @@ fn occ_driver_routes_all_groups_through_flat_sampling_helper() {
         compact_driver
             .matches(".sample_size(OCC_SAMPLE_SIZE)")
             .count(),
-        1,
-        "OCC group helper must centralize the confirmed sample count"
+        2,
+        "standard and bounded cleaner sampling must use the confirmed sample count"
     );
     assert_eq!(
         compact_driver
@@ -81,6 +83,51 @@ fn occ_driver_routes_all_groups_through_flat_sampling_helper() {
         compact_driver.matches("occ_group(").count(),
         5,
         "all OCC group construction sites must call the shared helper"
+    );
+    assert!(compact_driver.contains("constCLEANER_SAMPLE_BOUND_NANOS:u64=1;"));
+    assert!(
+        compact_driver.contains(".warm_up_time(Duration::from_nanos(CLEANER_SAMPLE_BOUND_NANOS))")
+    );
+    assert!(compact_driver
+        .contains(".measurement_time(Duration::from_nanos(CLEANER_SAMPLE_BOUND_NANOS))"));
+    assert!(compact_driver.contains(
+        "elseif*scenario==\"mvcc/hlc_contention\"{configure_standard_sampling(&mutgroup);"
+    ));
+}
+
+#[test]
+fn bounded_cleaner_flat_sampling_requests_one_iteration_per_sample() {
+    fn iterations_per_sample(measurement_ns: f64, samples: u64, mean_execution_ns: f64) -> u64 {
+        ((measurement_ns / samples as f64 / mean_execution_ns).ceil() as u64).max(1)
+    }
+
+    assert_eq!(iterations_per_sample(1.0, 10, 1.0), 1);
+    assert_eq!(iterations_per_sample(1.0, 10, 1_000_000_000.0), 1);
+}
+
+#[test]
+fn mvcc_current_and_full_reads_use_distinct_workloads() {
+    let driver = include_str!("../benches/occ_transactions.rs");
+    let compact_driver: String = driver
+        .chars()
+        .filter(|char| !char.is_whitespace())
+        .collect();
+
+    assert!(compact_driver.contains("\"mvcc/read_only_current\"=>(run_read_only_current_batch("));
+    assert!(compact_driver.contains("\"mvcc/full_read\"=>(run_projected_read_batch("));
+}
+
+#[test]
+fn prepare_wait_responses_are_counted() {
+    let workloads = include_str!("../benches/occ_support/workloads.rs");
+    let arm_start = workloads
+        .find("TMPrepareResult::DMPrepareError(DMPrepareResult::Wait)")
+        .expect("finish_once must handle participant prepare waits explicitly");
+    let arm_end = (arm_start + 700).min(workloads.len());
+
+    assert!(
+        workloads[arm_start..arm_end].contains(".with_wait()"),
+        "the explicit participant prepare-wait arm must increment wait metrics"
     );
 }
 
@@ -119,6 +166,22 @@ fn retries_and_failures_cannot_be_counted_as_throughput() {
     assert_eq!(summary.commits_per_second, 0.5);
     assert_eq!(summary.unexpected, vec![String::from("rpc disconnected")]);
     assert!(!summary.invariants_passed);
+}
+
+#[test]
+fn checked_hlc_contention_allocates_every_requested_unique_timestamp() {
+    let source = Arc::new(HlcSource::new(7));
+
+    let batch = run_hlc_allocation_batch(source, 4_096, 16);
+    let summary = batch.metrics.summary(batch.elapsed);
+
+    assert_eq!(summary.committed, 4_096);
+    assert_eq!(summary.attempts, 4_096);
+    assert_eq!(summary.logical_retries, 0);
+    assert_eq!(summary.waits, 0);
+    assert!(batch.elapsed > Duration::ZERO);
+    assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+    assert!(summary.invariants_passed);
 }
 
 #[cfg(feature = "occ_phase_profile")]
@@ -425,6 +488,33 @@ async fn fixed_success_hot_cell_batch_smoke_test() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn current_read_only_lifecycle_and_projected_full_read_both_preserve_state() {
+    let fixture =
+        Arc::new(fixture::OccFixture::single("127.0.0.1:54570", "occ_bench_distinct_reads").await);
+    let server_id = fixture.servers[0].server_id;
+    let id = fixture.ids_for_server(server_id, 1, 54_570)[0];
+    fixture.seed_counter(id, 9).await;
+
+    let current = run_read_only_current_batch(fixture.clone(), Arc::new(vec![id]), 2).await;
+    let projected =
+        run_projected_read_batch(fixture.clone(), Arc::new(vec![id]), 2, ProjectionMode::Full)
+            .await;
+    let current_summary = current.metrics.summary(current.elapsed);
+    let projected_summary = projected.metrics.summary(projected.elapsed);
+    let final_score = fixture.score(id).await;
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("distinct read test retained fixture owners"));
+    fixture.shutdown().await;
+
+    assert_eq!(current_summary.committed, 2);
+    assert!(current_summary.unexpected.is_empty());
+    assert_eq!(projected_summary.committed, 2);
+    assert!(projected_summary.unexpected.is_empty());
+    assert_eq!(final_score, 9);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn clustered_seed_is_transactionally_visible_before_multi_participant_timing() {
     let fixture = fixture::OccFixture::cluster(
         fixture::PortPlan::new(54_600).cluster(0),
@@ -612,9 +702,9 @@ async fn cleaner_relocates_retained_history_while_reader_is_active() {
         }
     }
 
-    let cleaner_history = build_cleaner_history(fixture.clone(), target_ids, sacrificial_ids).await;
-    let batch =
-        run_cleaner_reader_contention_batch(fixture.clone(), cleaner_history.clone(), 1).await;
+    let (batch, cleaner_history) =
+        run_fresh_cleaner_reader_contention_batch(fixture.clone(), target_ids, sacrificial_ids, 2)
+            .await;
     let summary = batch.metrics.summary(batch.elapsed);
     let telemetry = fixture.retention_telemetry(&cleaner_history.predecessors);
 
@@ -622,9 +712,10 @@ async fn cleaner_relocates_retained_history_while_reader_is_active() {
         .unwrap_or_else(|_| panic!("cleaner contention test retained fixture owners"));
     fixture.shutdown().await;
 
-    assert!(cleaner_history.relocation_observed());
+    assert_eq!(cleaner_history.relocations_observed(), 1);
     assert_eq!(telemetry.retained_revisions, 24);
-    assert_eq!(summary.committed, 1);
+    assert_eq!(summary.committed, 2);
+    assert_eq!(summary.attempts, 2);
     assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
 }
 
