@@ -2158,8 +2158,10 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     // to write full SEGMENT_SIZE won't apply to old truncated files
     let backup_dir = "/tmp/neb_large_scale_bk";
     let wal_dir = "/tmp/neb_large_scale_wal";
+    let undo_dir = "/tmp/neb_large_scale_undo";
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(undo_dir);
 
     // Configure: 64MB physical limit, 1GB virtual capacity
     let physical_limit = 64 * 1024 * 1024; // 64MB = 8 segments
@@ -2182,7 +2184,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
-            undo_log_storage: None,
+            undo_log_storage: Some(undo_dir.to_string()),
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -2489,7 +2491,8 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
 
-    // Drop server first to ensure all operations complete
+    // Shut down and drop the server before removing its durable storage.
+    server.shutdown().await;
     drop(server);
 
     // Wait for operations to complete
@@ -2498,6 +2501,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     // Clean up files
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(undo_dir);
 
     info!("=== Large-Scale Tiered Memory Transaction Test Complete ===");
 }
@@ -2521,8 +2525,10 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     let server_addr = String::from("127.0.0.1:5401");
     let backup_dir = "/tmp/neb_stress_test_bk";
     let wal_dir = "/tmp/neb_stress_test_wal";
+    let undo_dir = "/tmp/neb_stress_test_undo";
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(undo_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -2532,7 +2538,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
-            undo_log_storage: None,
+            undo_log_storage: Some(undo_dir.to_string()),
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -2710,8 +2716,11 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
+    server.shutdown().await;
+    drop(server);
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(undo_dir);
 
     info!("=== Stress Test Complete ===");
 }

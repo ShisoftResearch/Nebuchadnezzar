@@ -131,6 +131,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
     }
 
     println!("All transactions completed");
+    server.shutdown().await;
 }
 
 /// Test high-frequency updates with varying data sizes
@@ -234,6 +235,7 @@ async fn test_varying_size_concurrent_updates() {
     }
 
     println!("All varying-size updates completed");
+    server.shutdown().await;
 }
 
 /// Test multiple cells being updated concurrently within transactions
@@ -339,6 +341,7 @@ async fn test_multi_cell_concurrent_transactions() {
     }
 
     println!("All multi-cell transactions completed");
+    server.shutdown().await;
 }
 
 /// Test rapid commit sequence - commits happening in quick succession
@@ -427,6 +430,7 @@ async fn test_rapid_commit_sequence() {
     }
 
     println!("Rapid commit sequence completed");
+    server.shutdown().await;
 }
 
 /// Test interleaved prepare and commit operations
@@ -534,6 +538,7 @@ async fn test_interleaved_prepare_commit() {
     }
 
     println!("Interleaved prepare/commit test completed");
+    server.shutdown().await;
 }
 
 /// Stress test with maximum concurrency on a single cell
@@ -646,6 +651,7 @@ async fn test_maximum_concurrency_stress() {
         "Maximum concurrency stress test completed: {} tasks finished",
         completed
     );
+    server.shutdown().await;
 }
 
 /// Test that mimics the exact wikidata import scenario
@@ -773,6 +779,7 @@ async fn test_wikidata_import_scenario() {
     }
 
     println!("Wikidata import scenario test completed");
+    server.shutdown().await;
 }
 
 /// Test update_cell_by specifically - this is where the panic occurs
@@ -884,4 +891,5 @@ async fn test_update_cell_by_stress() {
     }
 
     println!("update_cell_by stress test completed");
+    server.shutdown().await;
 }
