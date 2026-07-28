@@ -12,6 +12,7 @@ const STATE_MASK: usize = 0b111;
 const LOCATION_MASK: usize = !STATE_MASK;
 const WORKER_MAX_PARK_MS: u64 = 50;
 const EXPIRATION_WORK_BUDGET: usize = 256;
+const CHAIN_CANCELLATION_CHECK_INTERVAL: usize = 64;
 const HISTORY_MAP_INITIAL_CAPACITY: usize = 4_096;
 
 static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -218,6 +219,18 @@ impl RevisionNode {
 pub struct RevisionChain {
     revisions: LinkedRingBufferList<Option<Arc<RevisionNode>>, 32>,
     truncated_before_ts: AtomicU64,
+    #[cfg(test)]
+    expiration_scan_steps: AtomicUsize,
+    #[cfg(test)]
+    expiration_scan_pause_at: AtomicUsize,
+    #[cfg(test)]
+    expiration_scan_paused: AtomicBool,
+    #[cfg(test)]
+    expiration_prune_steps: AtomicUsize,
+    #[cfg(test)]
+    expiration_prune_pause_at: AtomicUsize,
+    #[cfg(test)]
+    expiration_prune_paused: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,6 +238,7 @@ enum ExpirationReadiness {
     Ready,
     Blocked,
     AlreadyRemoved,
+    Cancelled,
 }
 
 impl RevisionChain {
@@ -232,6 +246,18 @@ impl RevisionChain {
         Self {
             revisions: LinkedRingBufferList::new(),
             truncated_before_ts: AtomicU64::new(0),
+            #[cfg(test)]
+            expiration_scan_steps: AtomicUsize::new(0),
+            #[cfg(test)]
+            expiration_scan_pause_at: AtomicUsize::new(0),
+            #[cfg(test)]
+            expiration_scan_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            expiration_prune_steps: AtomicUsize::new(0),
+            #[cfg(test)]
+            expiration_prune_pause_at: AtomicUsize::new(0),
+            #[cfg(test)]
+            expiration_prune_paused: AtomicBool::new(false),
         }
     }
 
@@ -298,8 +324,19 @@ impl RevisionChain {
     }
 
     fn prune_retired_suffix(&self) {
+        self.prune_retired_suffix_until(&|| false);
+    }
+
+    fn prune_retired_suffix_until<F>(&self, should_cancel: &F)
+    where
+        F: Fn() -> bool,
+    {
         let mut pruned = false;
+        let mut steps = 0;
         loop {
+            if steps % CHAIN_CANCELLATION_CHECK_INTERVAL == 0 && should_cancel() {
+                break;
+            }
             let Some(oldest) = self.oldest() else {
                 break;
             };
@@ -315,6 +352,18 @@ impl RevisionChain {
                 Some(None) => {}
                 None => break,
             }
+            steps += 1;
+            #[cfg(test)]
+            {
+                self.expiration_prune_steps.store(steps, Ordering::Release);
+                if self.expiration_prune_pause_at.load(Ordering::Acquire) == steps {
+                    self.expiration_prune_paused.store(true, Ordering::Release);
+                    while self.expiration_prune_pause_at.load(Ordering::Acquire) == steps {
+                        thread::yield_now();
+                    }
+                    self.expiration_prune_paused.store(false, Ordering::Release);
+                }
+            }
         }
 
         if pruned {
@@ -325,10 +374,36 @@ impl RevisionChain {
         }
     }
 
-    fn prepare_expiration(&self, expiring: &Arc<RevisionNode>) -> ExpirationReadiness {
+    fn prepare_expiration_until<F>(
+        &self,
+        expiring: &Arc<RevisionNode>,
+        should_cancel: &F,
+    ) -> ExpirationReadiness
+    where
+        F: Fn() -> bool,
+    {
         let mut found_expiring = false;
         let mut blocked_by_older = false;
+        let mut scan_steps = 0;
+        if should_cancel() {
+            return ExpirationReadiness::Cancelled;
+        }
         for revision_ref in self.revisions.iter_back() {
+            scan_steps += 1;
+            #[cfg(test)]
+            {
+                let step = self.expiration_scan_steps.fetch_add(1, Ordering::AcqRel) + 1;
+                if self.expiration_scan_pause_at.load(Ordering::Acquire) == step {
+                    self.expiration_scan_paused.store(true, Ordering::Release);
+                    while self.expiration_scan_pause_at.load(Ordering::Acquire) == step {
+                        thread::yield_now();
+                    }
+                    self.expiration_scan_paused.store(false, Ordering::Release);
+                }
+            }
+            if scan_steps % CHAIN_CANCELLATION_CHECK_INTERVAL == 0 && should_cancel() {
+                return ExpirationReadiness::Cancelled;
+            }
             let Some(node) = revision_ref.deref().flatten() else {
                 continue;
             };
@@ -409,6 +484,12 @@ struct ExpirationRecord {
     chain: Arc<RevisionChain>,
     node: Arc<RevisionNode>,
     deadline_ms: u64,
+}
+
+enum ExpirationAttempt {
+    Completed,
+    Blocked,
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -518,7 +599,9 @@ impl HistoryIndex {
                     if history.stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    let park_ms = history.expire_due(monotonic_ms());
+                    let park_ms = history.expire_due_until(monotonic_ms(), &|| {
+                        history.stopped.load(Ordering::Acquire)
+                    });
                     if history.stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -683,11 +766,23 @@ impl HistoryIndex {
     }
 
     fn expire_due(&self, now_ms: u64) -> u64 {
+        self.expire_due_until(now_ms, &|| false)
+    }
+
+    fn expire_due_until<F>(&self, now_ms: u64, should_cancel: &F) -> u64
+    where
+        F: Fn() -> bool,
+    {
         // Producers stay on the lock-free ingress path. The worker bounds both
         // ingestion and due work so a shutdown join never waits for the whole
         // retirement backlog.
         let mut ingested = Vec::with_capacity(EXPIRATION_WORK_BUDGET);
+        let mut pass_cancelled = false;
         while ingested.len() < EXPIRATION_WORK_BUDGET {
+            if should_cancel() {
+                pass_cancelled = true;
+                break;
+            }
             let Some(scheduled) = self.expiration_ingress.pop_back() else {
                 break;
             };
@@ -705,6 +800,10 @@ impl HistoryIndex {
             let mut expirations = self.expirations.lock();
             expirations.extend(ingested);
             while due.len() < EXPIRATION_WORK_BUDGET {
+                if should_cancel() {
+                    pass_cancelled = true;
+                    break;
+                }
                 let Some(next) = expirations.peek() else {
                     break;
                 };
@@ -721,22 +820,40 @@ impl HistoryIndex {
 
         let due_budget_exhausted = due.len() == EXPIRATION_WORK_BUDGET;
         let mut blocked = Vec::new();
-        for mut scheduled in due {
+        let mut deferred = Vec::new();
+        let mut due = due.into_iter();
+        while let Some(mut scheduled) = due.next() {
+            if should_cancel() {
+                pass_cancelled = true;
+                deferred.push(scheduled);
+                deferred.extend(due);
+                break;
+            }
             #[cfg(test)]
             self.expiration_checks.fetch_add(1, Ordering::Relaxed);
-            if !self.expire_record(&scheduled.expiration) {
-                // A blocked middle revision must yield to later heap entries;
-                // one of those can be the older suffix record that unblocks it.
-                scheduled.expiration.deadline_ms = now_ms.saturating_add(1).max(1);
-                scheduled.sequence = self.expiration_sequence.fetch_add(1, Ordering::Relaxed);
-                blocked.push(scheduled);
+            match self.expire_record_until(&scheduled.expiration, should_cancel) {
+                ExpirationAttempt::Completed => {}
+                ExpirationAttempt::Blocked => {
+                    // A blocked middle revision must yield to later heap entries;
+                    // one of those can be the older suffix record that unblocks it.
+                    scheduled.expiration.deadline_ms = now_ms.saturating_add(1).max(1);
+                    scheduled.sequence = self.expiration_sequence.fetch_add(1, Ordering::Relaxed);
+                    blocked.push(scheduled);
+                }
+                ExpirationAttempt::Cancelled => {
+                    pass_cancelled = true;
+                    deferred.push(scheduled);
+                    deferred.extend(due);
+                    break;
+                }
             }
         }
 
         let blocked_pending = !blocked.is_empty();
         let mut expirations = self.expirations.lock();
         expirations.extend(blocked);
-        if ingress_pending || due_budget_exhausted || blocked_pending {
+        expirations.extend(deferred);
+        if pass_cancelled || ingress_pending || due_budget_exhausted || blocked_pending {
             return 1;
         }
         expirations
@@ -758,15 +875,46 @@ impl HistoryIndex {
     where
         F: FnOnce(),
     {
+        matches!(
+            self.expire_record_until_with_hook(expiration, &|| false, after_expire),
+            ExpirationAttempt::Completed
+        )
+    }
+
+    fn expire_record_until<F>(
+        &self,
+        expiration: &ExpirationRecord,
+        should_cancel: &F,
+    ) -> ExpirationAttempt
+    where
+        F: Fn() -> bool,
+    {
+        self.expire_record_until_with_hook(expiration, should_cancel, || {})
+    }
+
+    fn expire_record_until_with_hook<C, H>(
+        &self,
+        expiration: &ExpirationRecord,
+        should_cancel: &C,
+        after_expire: H,
+    ) -> ExpirationAttempt
+    where
+        C: Fn() -> bool,
+        H: FnOnce(),
+    {
         if expiration.chain.is_current(&expiration.node) {
-            return false;
+            return ExpirationAttempt::Blocked;
         }
         // Ready publishes the TooOld boundary before making a suffix node
         // invisible. AlreadyRemoved means an earlier suffix prune published
         // that monotonic boundary before removing this scheduled node.
-        let readiness = expiration.chain.prepare_expiration(&expiration.node);
-        if matches!(readiness, ExpirationReadiness::Blocked) {
-            return false;
+        let readiness = expiration
+            .chain
+            .prepare_expiration_until(&expiration.node, should_cancel);
+        match readiness {
+            ExpirationReadiness::Blocked => return ExpirationAttempt::Blocked,
+            ExpirationReadiness::Cancelled => return ExpirationAttempt::Cancelled,
+            ExpirationReadiness::Ready | ExpirationReadiness::AlreadyRemoved => {}
         }
         // The retrying tagged-word CAS preserves a concurrently updated aligned
         // location and makes dead accounting single-winner.
@@ -776,9 +924,11 @@ impl HistoryIndex {
             self.dead.push_front(Some(dead));
         }
         if matches!(readiness, ExpirationReadiness::Ready) {
-            expiration.chain.prune_retired_suffix();
+            // The TooOld boundary, state transition, and dead accounting above
+            // are complete before pruning becomes cooperatively cancellable.
+            expiration.chain.prune_retired_suffix_until(should_cancel);
         }
-        true
+        ExpirationAttempt::Completed
     }
 
     pub(crate) fn pop_dead(&self) -> Option<DeadRevision> {
@@ -1162,6 +1312,150 @@ mod tests {
             checks <= EXPIRATION_WORK_BUDGET * 2,
             "one pass inspected {checks} due expirations instead of yielding after bounded work"
         );
+    }
+
+    #[test]
+    fn shutdown_cancels_expiration_inside_a_large_real_chain() {
+        const CHAIN_LEN: usize = 10_000;
+        const PAUSE_AT_STEP: usize = 128;
+
+        let history = HistoryIndex::new(0);
+        let chain = Arc::new(RevisionChain::new());
+        let revisions: Vec<_> = (0..CHAIN_LEN)
+            .map(|index| {
+                node(
+                    100 + index as u64,
+                    RevisionState::CommittedPresent,
+                    0x1000 + index * 8,
+                )
+            })
+            .collect();
+        for revision in &revisions {
+            chain.push_front(revision.clone());
+        }
+        chain
+            .expiration_scan_pause_at
+            .store(PAUSE_AT_STEP, Ordering::Release);
+
+        assert!(history.retire(&chain, &revisions[CHAIN_LEN - 2]));
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while !chain.expiration_scan_paused.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < timeout,
+                "history worker did not enter the long-chain expiration scan"
+            );
+            thread::yield_now();
+        }
+
+        let shutdown_history = history.clone();
+        let shutdown = thread::spawn(move || shutdown_history.shutdown());
+        while !history.stopped.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < timeout,
+                "shutdown did not publish its cooperative stop request"
+            );
+            thread::yield_now();
+        }
+        chain.expiration_scan_pause_at.store(0, Ordering::Release);
+        shutdown.join().expect("history shutdown panicked");
+
+        let scan_steps = chain.expiration_scan_steps.load(Ordering::Acquire);
+        assert!(
+            scan_steps <= PAUSE_AT_STEP + CHAIN_CANCELLATION_CHECK_INTERVAL,
+            "shutdown waited while one expiration scanned {scan_steps} real chain nodes"
+        );
+        assert_eq!(
+            revisions[CHAIN_LEN - 2].load().0,
+            RevisionState::CommittedPresent,
+            "cancelled preparation must not expire the scheduled revision"
+        );
+        assert_eq!(chain.truncated_before_ts.load(Ordering::Acquire), 0);
+        assert!(history.pop_dead().is_none());
+    }
+
+    #[test]
+    fn shutdown_cancels_large_suffix_prune_and_preserves_too_old_floor() {
+        const CHAIN_LEN: usize = 10_000;
+        const PAUSE_AFTER_POPS: usize = 128;
+
+        let history = HistoryIndex::new(0);
+        let chain = Arc::new(RevisionChain::new());
+        let mut revisions: Vec<_> = (0..CHAIN_LEN - 2)
+            .map(|index| {
+                node(
+                    100 + index as u64,
+                    RevisionState::Expired,
+                    0x1000 + index * 8,
+                )
+            })
+            .collect();
+        let expiring = node(
+            100 + (CHAIN_LEN - 2) as u64,
+            RevisionState::CommittedPresent,
+            0x1000 + (CHAIN_LEN - 2) * 8,
+        );
+        let current = node(
+            100 + (CHAIN_LEN - 1) as u64,
+            RevisionState::CommittedPresent,
+            0x1000 + (CHAIN_LEN - 1) * 8,
+        );
+        revisions.push(expiring.clone());
+        revisions.push(current.clone());
+        for revision in &revisions {
+            chain.push_front(revision.clone());
+        }
+        chain
+            .expiration_prune_pause_at
+            .store(PAUSE_AFTER_POPS, Ordering::Release);
+
+        assert!(history.retire(&chain, &expiring));
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while !chain.expiration_prune_paused.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < timeout,
+                "history worker did not enter the large suffix prune"
+            );
+            thread::yield_now();
+        }
+
+        let shutdown_history = history.clone();
+        let shutdown = thread::spawn(move || shutdown_history.shutdown());
+        while !history.stopped.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < timeout,
+                "shutdown did not publish its cooperative stop request"
+            );
+            thread::yield_now();
+        }
+        chain.expiration_prune_pause_at.store(0, Ordering::Release);
+        shutdown.join().expect("history shutdown panicked");
+
+        let prune_steps = chain.expiration_prune_steps.load(Ordering::Acquire);
+        assert!(
+            prune_steps <= PAUSE_AFTER_POPS + CHAIN_CANCELLATION_CHECK_INTERVAL,
+            "shutdown waited while one expiration pruned {prune_steps} real suffix nodes"
+        );
+        assert_eq!(expiring.load().0, RevisionState::Expired);
+        assert_eq!(
+            history.pop_dead(),
+            Some(DeadRevision {
+                location: expiring.load().1,
+                entry_size: expiring.entry_size,
+            }),
+            "cancellation after expiration must retain dead accounting"
+        );
+        assert!(Arc::ptr_eq(
+            &chain.current().expect("current revision must remain"),
+            &current
+        ));
+        assert!(
+            chain.truncated_before_ts.load(Ordering::Acquire) >= current.revision_ts,
+            "partial pruning must retain the published TooOld boundary"
+        );
+        assert!(matches!(
+            chain.resolve(current.revision_ts),
+            SnapshotRevision::TooOld
+        ));
     }
 
     #[test]
