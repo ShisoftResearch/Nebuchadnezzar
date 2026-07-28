@@ -2,6 +2,7 @@ use crate::ram::types::Id;
 use lightning::list::LinkedRingBufferList;
 use lightning::map::{Map, PtrHashMap};
 use parking_lot::Mutex;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 const STATE_MASK: usize = 0b111;
 const LOCATION_MASK: usize = !STATE_MASK;
 const WORKER_MAX_PARK_MS: u64 = 50;
+const EXPIRATION_WORK_BUDGET: usize = 256;
 const HISTORY_MAP_INITIAL_CAPACITY: usize = 4_096;
 
 static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -409,6 +411,39 @@ struct ExpirationRecord {
     deadline_ms: u64,
 }
 
+#[derive(Clone)]
+struct ScheduledExpiration {
+    expiration: ExpirationRecord,
+    sequence: u64,
+}
+
+impl PartialEq for ScheduledExpiration {
+    fn eq(&self, other: &Self) -> bool {
+        self.expiration.deadline_ms == other.expiration.deadline_ms
+            && self.sequence == other.sequence
+    }
+}
+
+impl Eq for ScheduledExpiration {}
+
+impl PartialOrd for ScheduledExpiration {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScheduledExpiration {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // BinaryHeap is a max-heap, so reverse both keys to pop the earliest
+        // deadline and then the oldest insertion first.
+        other
+            .expiration
+            .deadline_ms
+            .cmp(&self.expiration.deadline_ms)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeadRevision {
     pub location: usize,
@@ -425,7 +460,11 @@ pub(crate) enum RelocateResult {
 pub struct HistoryIndex {
     chains: PtrHashMap<Id, Arc<RevisionChain>>,
     chain_creation: Mutex<()>,
-    expirations: LinkedRingBufferList<Option<ExpirationRecord>, 64>,
+    expiration_ingress: LinkedRingBufferList<Option<ScheduledExpiration>, 64>,
+    expirations: Mutex<BinaryHeap<ScheduledExpiration>>,
+    expiration_sequence: AtomicU64,
+    #[cfg(test)]
+    expiration_checks: AtomicUsize,
     dead: LinkedRingBufferList<Option<DeadRevision>, 64>,
     retention_ms: u64,
     recovery_floor: AtomicU64,
@@ -446,7 +485,11 @@ impl HistoryIndex {
         let history = Arc::new(Self {
             chains: PtrHashMap::with_capacity(HISTORY_MAP_INITIAL_CAPACITY),
             chain_creation: Mutex::new(()),
-            expirations: LinkedRingBufferList::new(),
+            expiration_ingress: LinkedRingBufferList::new(),
+            expirations: Mutex::new(BinaryHeap::new()),
+            expiration_sequence: AtomicU64::new(0),
+            #[cfg(test)]
+            expiration_checks: AtomicUsize::new(0),
             dead: LinkedRingBufferList::new(),
             retention_ms,
             recovery_floor: AtomicU64::new(0),
@@ -621,36 +664,90 @@ impl HistoryIndex {
         if !node.schedule_retirement(deadline_ms) {
             return false;
         }
-        self.expirations.push_front(Some(ExpirationRecord {
+        self.schedule_expiration(ExpirationRecord {
             chain: chain.clone(),
             node: node.clone(),
             deadline_ms,
-        }));
+        });
         self.wake_worker();
         true
     }
 
+    fn schedule_expiration(&self, expiration: ExpirationRecord) {
+        let sequence = self.expiration_sequence.fetch_add(1, Ordering::Relaxed);
+        self.expiration_ingress
+            .push_front(Some(ScheduledExpiration {
+                expiration,
+                sequence,
+            }));
+    }
+
     fn expire_due(&self, now_ms: u64) -> u64 {
-        let mut next_park_ms = WORKER_MAX_PARK_MS;
-        let mut deferred = Vec::new();
-        while let Some(expiration) = self.expirations.pop_back() {
-            let Some(expiration) = expiration else {
+        // Producers stay on the lock-free ingress path. The worker bounds both
+        // ingestion and due work so a shutdown join never waits for the whole
+        // retirement backlog.
+        let mut ingested = Vec::with_capacity(EXPIRATION_WORK_BUDGET);
+        while ingested.len() < EXPIRATION_WORK_BUDGET {
+            let Some(scheduled) = self.expiration_ingress.pop_back() else {
+                break;
+            };
+            let Some(scheduled) = scheduled else {
                 continue;
             };
-            if expiration.deadline_ms > now_ms {
-                next_park_ms = next_park_ms.min(expiration.deadline_ms - now_ms);
-                deferred.push(expiration);
-                continue;
-            }
-            if !self.expire_record(&expiration) {
-                deferred.push(expiration);
-                next_park_ms = 1;
+            #[cfg(test)]
+            self.expiration_checks.fetch_add(1, Ordering::Relaxed);
+            ingested.push(scheduled);
+        }
+        let ingress_pending = self.expiration_ingress.peek_back().is_some();
+
+        let mut due = Vec::with_capacity(EXPIRATION_WORK_BUDGET);
+        {
+            let mut expirations = self.expirations.lock();
+            expirations.extend(ingested);
+            while due.len() < EXPIRATION_WORK_BUDGET {
+                let Some(next) = expirations.peek() else {
+                    break;
+                };
+                if next.expiration.deadline_ms > now_ms {
+                    break;
+                }
+                due.push(
+                    expirations
+                        .pop()
+                        .expect("peeked expiration must remain queued"),
+                );
             }
         }
-        for expiration in deferred {
-            self.expirations.push_front(Some(expiration));
+
+        let due_budget_exhausted = due.len() == EXPIRATION_WORK_BUDGET;
+        let mut blocked = Vec::new();
+        for mut scheduled in due {
+            #[cfg(test)]
+            self.expiration_checks.fetch_add(1, Ordering::Relaxed);
+            if !self.expire_record(&scheduled.expiration) {
+                // A blocked middle revision must yield to later heap entries;
+                // one of those can be the older suffix record that unblocks it.
+                scheduled.expiration.deadline_ms = now_ms.saturating_add(1).max(1);
+                scheduled.sequence = self.expiration_sequence.fetch_add(1, Ordering::Relaxed);
+                blocked.push(scheduled);
+            }
         }
-        next_park_ms.max(1)
+
+        let blocked_pending = !blocked.is_empty();
+        let mut expirations = self.expirations.lock();
+        expirations.extend(blocked);
+        if ingress_pending || due_budget_exhausted || blocked_pending {
+            return 1;
+        }
+        expirations
+            .peek()
+            .map(|next| {
+                next.expiration
+                    .deadline_ms
+                    .saturating_sub(now_ms)
+                    .clamp(1, WORKER_MAX_PARK_MS)
+            })
+            .unwrap_or(WORKER_MAX_PARK_MS)
     }
 
     fn expire_record(&self, expiration: &ExpirationRecord) -> bool {
@@ -713,6 +810,11 @@ impl HistoryIndex {
     #[cfg(test)]
     fn active_workers_for_test() -> usize {
         ACTIVE_HISTORY_WORKERS.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn take_expiration_checks_for_test(&self) -> usize {
+        self.expiration_checks.swap(0, Ordering::AcqRel)
     }
 }
 
@@ -1014,6 +1116,99 @@ mod tests {
     }
 
     #[test]
+    fn expiration_pass_bounds_large_future_queue_ingestion() {
+        const FUTURE_EXPIRATIONS: usize = 10_000;
+
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        let current = node(20_000, RevisionState::CommittedPresent, 0x2000);
+        chain.push_front(current);
+        for revision_ts in 0..FUTURE_EXPIRATIONS as u64 {
+            history.schedule_expiration(ExpirationRecord {
+                chain: chain.clone(),
+                node: node(revision_ts, RevisionState::CommittedPresent, 0x1000),
+                deadline_ms: 100_000,
+            });
+        }
+
+        assert_eq!(history.expire_due(1), 1);
+        assert!(
+            history.take_expiration_checks_for_test() <= EXPIRATION_WORK_BUDGET,
+            "a future-only pass must bound ingress scheduling work"
+        );
+    }
+
+    #[test]
+    fn expiration_pass_bounds_due_work_for_prompt_shutdown() {
+        const DUE_EXPIRATIONS: usize = 10_000;
+
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        let current = node(20_000, RevisionState::CommittedPresent, 0x2000);
+        chain.push_front(current);
+        for revision_ts in 0..DUE_EXPIRATIONS as u64 {
+            history.schedule_expiration(ExpirationRecord {
+                chain: chain.clone(),
+                node: node(revision_ts, RevisionState::CommittedPresent, 0x1000),
+                deadline_ms: 1,
+            });
+        }
+
+        assert_eq!(history.expire_due(1), 1);
+        let checks = history.take_expiration_checks_for_test();
+        assert!(
+            checks <= EXPIRATION_WORK_BUDGET * 2,
+            "one pass inspected {checks} due expirations instead of yielding after bounded work"
+        );
+    }
+
+    #[test]
+    fn blocked_expiration_batch_yields_to_later_unblocking_record() {
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        let revisions: Vec<_> = (0..=EXPIRATION_WORK_BUDGET + 1)
+            .map(|index| {
+                node(
+                    100 + index as u64,
+                    RevisionState::CommittedPresent,
+                    0x1000 + index * 8,
+                )
+            })
+            .collect();
+        for revision in &revisions {
+            chain.push_front(revision.clone());
+        }
+
+        // Fill the first work batch with middle revisions that are blocked by
+        // the oldest suffix record, then enqueue that unblocking record last.
+        for revision in &revisions[1..=EXPIRATION_WORK_BUDGET] {
+            history.schedule_expiration(ExpirationRecord {
+                chain: chain.clone(),
+                node: revision.clone(),
+                deadline_ms: 1,
+            });
+        }
+        history.schedule_expiration(ExpirationRecord {
+            chain,
+            node: revisions[0].clone(),
+            deadline_ms: 1,
+        });
+
+        assert_eq!(history.expire_due(1), 1);
+        assert_eq!(revisions[0].load().0, RevisionState::CommittedPresent);
+
+        assert_eq!(history.expire_due(1), 1);
+        assert_eq!(
+            revisions[0].load().0,
+            RevisionState::Expired,
+            "blocked retry records must yield to the suffix record that makes progress possible"
+        );
+    }
+
+    #[test]
     fn pending_boundary_that_aborts_keeps_retired_commit_visible() {
         let history = HistoryIndex::new(300_000);
         history.shutdown();
@@ -1099,7 +1294,8 @@ mod tests {
 
         assert_eq!(history.expire_due(u64::MAX), WORKER_MAX_PARK_MS);
         assert!(history.pop_dead().is_none());
-        assert!(history.expirations.pop_back().is_none());
+        assert!(history.expiration_ingress.peek_back().is_none());
+        assert!(history.expirations.lock().is_empty());
     }
 
     #[test]
