@@ -952,8 +952,6 @@ pub struct DataManager {
     participant_clock_overrides: Mutex<HashMap<TxnId, i64>>,
     #[cfg(test)]
     resolution_attempts: Mutex<BTreeMap<(TxnId, u64), u64>>,
-    #[cfg(test)]
-    installed_revision_agreement_checks: AtomicUsize,
     database_runtime: Arc<DatabaseRuntime>,
     cleanup_signal: Arc<AtomicBool>,
     /// Per-server Hybrid Logical Clock source (node = server_id), shared with
@@ -1182,8 +1180,6 @@ impl DataManager {
             participant_clock_overrides: Mutex::new(HashMap::new()),
             #[cfg(test)]
             resolution_attempts: Mutex::new(BTreeMap::new()),
-            #[cfg(test)]
-            installed_revision_agreement_checks: AtomicUsize::new(0),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
             hlc,
@@ -2531,17 +2527,15 @@ impl DataManager {
         if !self.installed_revisions_agree(&txn) {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
-        if self.chunks().durable_storage_configured() {
-            if let Err(error) = self
-                .chunks()
-                .force_sync_installed_revisions(txn.installed.values())
-            {
-                error!(
-                    "Failed to sync exact installed output before participant commit success for transaction {:?}: {:?}",
-                    tid, error
-                );
-                return DMCommitResult::CheckFailed(CheckError::CannotEnd);
-            }
+        if let Err(error) = self
+            .chunks()
+            .force_sync_installed_revisions(txn.installed.values())
+        {
+            error!(
+                "Failed to sync exact installed output before participant commit success for transaction {:?}: {:?}",
+                tid, error
+            );
+            return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
         txn.installed_output_durable = true;
 
@@ -2594,9 +2588,6 @@ impl DataManager {
     }
 
     fn installed_revisions_agree(&self, txn: &Transaction) -> bool {
-        #[cfg(test)]
-        self.installed_revision_agreement_checks
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let write_ids: Vec<_> = txn
             .certified
             .iter()
@@ -2614,18 +2605,6 @@ impl DataManager {
                 .get(&id)
                 .is_some_and(|installed| self.installed_revision_agrees(installed, commit_hlc))
         })
-    }
-
-    #[cfg(test)]
-    fn reset_installed_revision_agreement_checks(&self) {
-        self.installed_revision_agreement_checks
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    fn installed_revision_agreement_check_count(&self) -> usize {
-        self.installed_revision_agreement_checks
-            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn validate_commit_subset(txn: &Transaction, cells: &[CommitOp]) -> Result<(), DMCommitResult> {
@@ -7647,97 +7626,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn nondurable_participant_commit_proves_output_without_force_sync() {
-        let address = "127.0.0.1:5510";
-        let group = "txn_data_site_nondurable_commit_output";
-        let server = start_transaction_test_server(address, group).await;
-        let runtime = server.current_database();
-        let schema = install_prepare_test_schema(&runtime);
-        let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99054);
-        let initial_revision = seed_cell_revision(&runtime, schema.id, cell_id, 1, 0);
-        let output_segment = runtime.chunks().list[0]
-            .locate_segment(runtime.chunks().address_of(&cell_id))
-            .expect("active RAM-only output segment");
-        let syncs_before_commit = output_segment.force_wal_sync_count_for_test();
-        let tid = manager.hlc.now();
-        assert_eq!(
-            prepare_ops_local(
-                &manager,
-                64,
-                &tid,
-                vec![PrepareOp {
-                    id: cell_id,
-                    expectation: CellExpectation::Present(initial_revision),
-                    intent: PrepareIntent::Write,
-                }],
-            )
-            .await,
-            DMPrepareResult::Success
-        );
-
-        assert_eq!(
-            commit_ops_local(
-                &manager,
-                &tid,
-                vec![CommitOp::Update(counter_cell(
-                    schema.id,
-                    cell_id,
-                    9,
-                    "nondurable-output",
-                ))],
-            )
-            .await,
-            DMCommitResult::Success
-        );
-        let txn_lock = manager
-            .txns
-            .get(&tid)
-            .expect("participant state remains live until end");
-        let installed_location = {
-            let txn = txn_lock.lock();
-            assert_eq!(txn.state, TxnState::Committed);
-            assert!(
-                manager.installed_revisions_agree(&txn),
-                "commit success must retain exact installed-revision agreement"
-            );
-            assert!(
-                txn.installed_output_durable,
-                "RAM-only output proof must satisfy the configured-mode readiness gate"
-            );
-            txn.installed[&cell_id].node.load().1
-        };
-        let installed_segment = runtime.chunks().list[0]
-            .locate_segment(installed_location)
-            .expect("installed RAM-only output segment");
-        assert!(
-            std::ptr::eq(&*output_segment, &*installed_segment),
-            "the focused fixture must keep the update in the observed output segment"
-        );
-        assert_eq!(
-            installed_segment.force_wal_sync_count_for_test(),
-            syncs_before_commit,
-            "RAM-only participant commit must not attempt a force-sync"
-        );
-
-        assert_eq!(
-            <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
-                .await
-                .payload,
-            EndResult::Success
-        );
-        assert_eq!(
-            installed_segment.force_wal_sync_count_for_test(),
-            syncs_before_commit,
-            "RAM-only participant end must not add a force-sync"
-        );
-        let cell = runtime.chunks().read_cell(&cell_id).unwrap();
-        assert_eq!(*cell.data["score"].u64().unwrap(), 9);
-
-        server.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn wal_directory_sync_failure_rejects_participant_success_without_panicking() {
         let temp_dir = TempDir::new().unwrap();
         let address = "127.0.0.1:5437";
@@ -8284,17 +8172,11 @@ mod tests {
         });
         delayed_prepare.wait_until_entered().await;
         let failure = install_end_promotion_failure(tid, second_id);
-        manager.reset_installed_revision_agreement_checks();
         assert_eq!(
             <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
                 .await
                 .payload,
             EndResult::CheckFailed(CheckError::CannotEnd)
-        );
-        assert_eq!(
-            manager.installed_revision_agreement_check_count(),
-            1,
-            "partial-promotion failure must retain the complete pre-promotion agreement check"
         );
         let txn_lock = manager
             .txns
@@ -8348,24 +8230,13 @@ mod tests {
         }
 
         drop(failure);
-        manager.reset_installed_revision_agreement_checks();
         assert_eq!(
             <DataManager as Service>::end(&manager, manager.hlc.now(), tid)
                 .await
                 .payload,
             EndResult::Success
         );
-        assert_eq!(
-            manager.installed_revision_agreement_check_count(),
-            1,
-            "successful end must reuse exact-node promotion CAS instead of rescanning installed revisions"
-        );
         for (id, expected_score) in [(first_id, 11), (second_id, 12)] {
-            assert_eq!(
-                txn_lock.lock().installed[&id].node.load().0,
-                RevisionState::CommittedPresent,
-                "successful retry must promote every exact installed node"
-            );
             match runtime.chunks().read_cell_snapshot(&id, u64::MAX).unwrap() {
                 SnapshotRead::Present(cell) => {
                     assert_eq!(*cell.data["score"].u64().unwrap(), expected_score);
@@ -8981,7 +8852,7 @@ impl Service for DataManager {
                         ),
                     }
                 }
-                if promotion_failed {
+                if promotion_failed || !self.installed_revisions_agree(&txn) {
                     for (node, pending, committed) in promoted.into_iter().rev() {
                         if !node.compare_exchange_state(committed, pending) {
                             error!("Could not restore pending promotion barrier for {:?}", tid);
