@@ -34,7 +34,7 @@
 
 ---
 
-### Task 1: Protect every transactional fixture
+### Task 1: Protect, verify, and commit every transactional fixture
 
 **Files:**
 - Modify: `benches/occ_transactions.rs`
@@ -228,21 +228,18 @@ done
 
 Expected: exit 0 with no output.
 
----
-
-### Task 2: Verify and commit the disposable harnesses
-
 **Files:**
 - Test: `benches/occ_transactions.rs`
 - Generated, do not commit:
   - `target/occ-bench/task12-all-fixtures-baseline-local.json`
   - `target/occ-bench/task12-all-fixtures-candidate-local.json`
 
-**Interfaces:**
-- Consumes: the three retained cleanup-floor transaction IDs from Task 1
+**Verification interfaces:**
+- Consumes: the three retained cleanup-floor transaction IDs introduced in
+  Steps 3-5
 - Produces: two clean exact-13 local reports and one commit per comparison side
 
-- [ ] **Step 1: Run the baseline local test-mode benchmark**
+- [ ] **Step 9: Run the baseline local test-mode benchmark**
 
 ```bash
 NEB_OCC_BENCH_LABEL=task12-all-fixtures-baseline-local \
@@ -252,7 +249,7 @@ NEB_OCC_BENCH_REVISION='product-a82ccd46fa6c63ddaf0cd921fc1a09ea33dec539+harness
 
 Expected: exit 0 and Criterion `Success` for all 13 scenarios.
 
-- [ ] **Step 2: Strictly validate the baseline JSON**
+- [ ] **Step 10: Strictly validate the baseline JSON**
 
 ```bash
 jq -e '
@@ -268,7 +265,7 @@ jq -e '
 
 Expected: `true`, exit 0.
 
-- [ ] **Step 3: Run the candidate local test-mode benchmark**
+- [ ] **Step 11: Run the candidate local test-mode benchmark**
 
 ```bash
 NEB_OCC_BENCH_LABEL=task12-all-fixtures-candidate-local \
@@ -278,7 +275,7 @@ NEB_OCC_BENCH_REVISION='product-97f957e28925d3b0235049aec25237511bf85540+harness
 
 Expected: exit 0 and Criterion `Success` for all 13 scenarios.
 
-- [ ] **Step 4: Strictly validate the candidate JSON**
+- [ ] **Step 12: Strictly validate the candidate JSON**
 
 ```bash
 jq -e '
@@ -294,13 +291,13 @@ jq -e '
 
 Expected: `true`, exit 0.
 
-- [ ] **Step 5: Recheck formatting, scope, and byte identity**
+- [ ] **Step 13: Recheck formatting, scope, and byte identity**
 
 Run the Task 1 Step 6 checks in both trees and the Task 1 Step 8 identity loop.
 Expected: all exit 0; each tree modifies exactly
 `benches/occ_transactions.rs`.
 
-- [ ] **Step 6: Commit baseline**
+- [ ] **Step 14: Commit baseline**
 
 ```bash
 git add benches/occ_transactions.rs
@@ -310,7 +307,7 @@ git commit -m "fix(bench): protect every transactional fixture"
 Expected: one-file commit whose parent is
 `13879887f52031b595c9e051085e82b29dd99f19`.
 
-- [ ] **Step 7: Commit candidate**
+- [ ] **Step 15: Commit candidate**
 
 ```bash
 git add benches/occ_transactions.rs
@@ -320,7 +317,7 @@ git commit -m "fix(bench): protect every transactional fixture"
 Expected: one-file commit whose parent is
 `721b105b0002b6898af00d85f1e7af40ef7442f1`.
 
-- [ ] **Step 8: Audit both commits**
+- [ ] **Step 16: Audit both commits**
 
 ```bash
 git show --check --stat --oneline HEAD
@@ -333,16 +330,16 @@ Expected: no whitespace errors, exactly one changed path
 
 ---
 
-### Task 3: Review and transfer the harness commits
+### Task 2: Review and transfer the harness commits
 
 **Files:**
-- Review: the Task 2 commit on each comparison side
+- Review: the Task 1 commit on each comparison side
 - Generated, do not commit:
   - `transfer/baseline-all-fixtures.bundle`
   - `transfer/candidate-all-fixtures.bundle`
 
 **Interfaces:**
-- Consumes: clean reviewed commits from Task 2
+- Consumes: clean reviewed commits from Task 1
 - Produces: remote detached worktrees at those exact commits
 
 - [ ] **Step 1: Obtain an independent READY review**
@@ -414,7 +411,7 @@ statuses remain empty.
 
 ---
 
-### Task 4: Run the remote three-fixture behavioral GREEN gate
+### Task 3: Run the remote three-fixture behavioral GREEN gate
 
 **Files:**
 - Generated, do not commit:
@@ -423,7 +420,7 @@ statuses remain empty.
   - remote logs with matching labels
 
 **Interfaces:**
-- Consumes: exact remote commits from Task 3
+- Consumes: exact remote commits from Task 2
 - Produces: two exact-three clean reports that authorize full portfolio runs
 
 - [ ] **Step 1: Confirm the host is idle**
@@ -520,7 +517,7 @@ Expected: READY before any six-run acceptance sequence starts.
 
 ---
 
-### Task 5: Restart the accept-grade comparison
+### Task 4: Restart the accept-grade comparison
 
 **Files:**
 - Generated remotely, do not commit:
@@ -530,7 +527,7 @@ Expected: READY before any six-run acceptance sequence starts.
 - Use unchanged: `scripts/compare-mvcc-benchmarks.sh`
 
 **Interfaces:**
-- Consumes: READY behavioral gate from Task 4
+- Consumes: READY behavioral gate from Task 3
 - Produces: stable three-by-three throughput and p99 comparison
 
 - [ ] **Step 1: Run three serialized baseline portfolios**
