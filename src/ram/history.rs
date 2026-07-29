@@ -546,11 +546,19 @@ pub struct HistoryIndex {
     expiration_sequence: AtomicU64,
     #[cfg(test)]
     expiration_checks: AtomicUsize,
+    #[cfg(test)]
+    worker_unparks: AtomicUsize,
+    #[cfg(test)]
+    pause_before_worker_park: AtomicBool,
+    #[cfg(test)]
+    worker_paused_before_park: AtomicBool,
     dead: LinkedRingBufferList<Option<DeadRevision>, 64>,
     retention_ms: u64,
     recovery_floor: AtomicU64,
     stopped: AtomicBool,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    notification_pending: AtomicBool,
+    worker_thread: OnceLock<thread::Thread>,
+    worker_join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl HistoryIndex {
@@ -571,11 +579,19 @@ impl HistoryIndex {
             expiration_sequence: AtomicU64::new(0),
             #[cfg(test)]
             expiration_checks: AtomicUsize::new(0),
+            #[cfg(test)]
+            worker_unparks: AtomicUsize::new(0),
+            #[cfg(test)]
+            pause_before_worker_park: AtomicBool::new(false),
+            #[cfg(test)]
+            worker_paused_before_park: AtomicBool::new(false),
             dead: LinkedRingBufferList::new(),
             retention_ms,
             recovery_floor: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-            worker: Mutex::new(None),
+            notification_pending: AtomicBool::new(false),
+            worker_thread: OnceLock::new(),
+            worker_join: Mutex::new(None),
         });
         Self::start_worker(&history, chunk_id);
         history
@@ -599,9 +615,22 @@ impl HistoryIndex {
                     if history.stopped.load(Ordering::Acquire) {
                         break;
                     }
+                    // Consume the outstanding notification before inspecting
+                    // the queues. A producer that publishes during this pass
+                    // installs the next notification, which the final acquire
+                    // check observes before the worker can park.
+                    history.notification_pending.swap(false, Ordering::AcqRel);
                     let park_ms = history.expire_due_until(monotonic_ms(), &|| {
                         history.stopped.load(Ordering::Acquire)
                     });
+                    if history.stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if history.notification_pending.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    history.pause_before_worker_park_for_test();
                     if history.stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -610,7 +639,11 @@ impl HistoryIndex {
                 }
             })
             .expect("failed to start MVCC history worker");
-        *history.worker.lock() = Some(handle);
+        history
+            .worker_thread
+            .set(handle.thread().clone())
+            .expect("MVCC history worker thread handle must only be installed once");
+        *history.worker_join.lock() = Some(handle);
     }
 
     pub fn retention_ms(&self) -> u64 {
@@ -936,16 +969,26 @@ impl HistoryIndex {
     }
 
     fn wake_worker(&self) {
-        if let Some(handle) = self.worker.lock().as_ref() {
-            handle.thread().unpark();
+        // The queue publication precedes this release. One outstanding
+        // notification is sufficient: either the worker observes the latch
+        // before parking or Thread::unpark preserves a token across the race.
+        if self.notification_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(worker_thread) = self.worker_thread.get() {
+            #[cfg(test)]
+            self.worker_unparks.fetch_add(1, Ordering::AcqRel);
+            worker_thread.unpark();
         }
     }
 
     pub(crate) fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
-        let handle = self.worker.lock().take();
+        if let Some(worker_thread) = self.worker_thread.get() {
+            worker_thread.unpark();
+        }
+        let handle = self.worker_join.lock().take();
         if let Some(handle) = handle {
-            handle.thread().unpark();
             if handle.thread().id() != thread::current().id() {
                 let _ = handle.join();
             }
@@ -965,6 +1008,34 @@ impl HistoryIndex {
     #[cfg(test)]
     fn take_expiration_checks_for_test(&self) -> usize {
         self.expiration_checks.swap(0, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    fn pause_before_worker_park_for_test(&self) {
+        if !self.pause_before_worker_park.load(Ordering::Acquire) {
+            return;
+        }
+        self.worker_paused_before_park
+            .store(true, Ordering::Release);
+        while self.pause_before_worker_park.load(Ordering::Acquire)
+            && !self.stopped.load(Ordering::Acquire)
+        {
+            thread::yield_now();
+        }
+        self.worker_paused_before_park
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn wait_until_worker_pauses_before_park_for_test(&self) {
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while !self.worker_paused_before_park.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < timeout,
+                "history worker did not reach its pre-park boundary"
+            );
+            thread::yield_now();
+        }
     }
 }
 
@@ -1311,6 +1382,198 @@ mod tests {
         assert!(
             checks <= EXPIRATION_WORK_BUDGET * 2,
             "one pass inspected {checks} due expirations instead of yielding after bounded work"
+        );
+    }
+
+    #[test]
+    fn pending_retirement_notification_coalesces_worker_unparks() {
+        let history = HistoryIndex::new(300_000);
+        history
+            .pause_before_worker_park
+            .store(true, Ordering::Release);
+        history.wait_until_worker_pauses_before_park_for_test();
+        history.worker_unparks.store(0, Ordering::Release);
+
+        let chain = Arc::new(RevisionChain::new());
+        let retired: Vec<_> = (0..3)
+            .map(|index| {
+                node(
+                    100 + index,
+                    RevisionState::CommittedPresent,
+                    0x1000 + index as usize * 8,
+                )
+            })
+            .collect();
+        for revision in &retired {
+            chain.push_front(revision.clone());
+        }
+        chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+
+        for revision in &retired {
+            assert!(history.retire(&chain, revision));
+        }
+
+        assert_eq!(
+            history.worker_unparks.load(Ordering::Acquire),
+            1,
+            "one pending notification must cover every queued retirement"
+        );
+        history
+            .pause_before_worker_park
+            .store(false, Ordering::Release);
+        history.shutdown();
+    }
+
+    #[test]
+    fn retirement_at_worker_park_boundary_cannot_lose_wake() {
+        let history = HistoryIndex::new(0);
+        history
+            .pause_before_worker_park
+            .store(true, Ordering::Release);
+        history.wait_until_worker_pauses_before_park_for_test();
+
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(100, RevisionState::CommittedPresent, 0x1000);
+        chain.push_front(retired.clone());
+        chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+        assert!(history.retire(&chain, &retired));
+
+        history
+            .pause_before_worker_park
+            .store(false, Ordering::Release);
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while retired.load().0 != RevisionState::Expired {
+            assert!(
+                Instant::now() < timeout,
+                "retirement wake was lost across the worker's park boundary"
+            );
+            thread::yield_now();
+        }
+        history.shutdown();
+    }
+
+    #[test]
+    fn shutdown_joins_promptly_with_pending_retirement_backlog() {
+        const BACKLOG: usize = 10_000;
+
+        let history = HistoryIndex::new(300_000);
+        history
+            .pause_before_worker_park
+            .store(true, Ordering::Release);
+        history.wait_until_worker_pauses_before_park_for_test();
+        let chain = Arc::new(RevisionChain::new());
+        chain.push_front(node(
+            BACKLOG as u64 + 1,
+            RevisionState::CommittedPresent,
+            0x2000,
+        ));
+        for revision_ts in 0..BACKLOG as u64 {
+            history.schedule_expiration(ExpirationRecord {
+                chain: chain.clone(),
+                node: node(revision_ts, RevisionState::CommittedPresent, 0x1000),
+                deadline_ms: u64::MAX,
+            });
+        }
+        history.wake_worker();
+
+        let started = Instant::now();
+        history.shutdown();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown drained or waited behind the pending retirement backlog"
+        );
+    }
+
+    #[test]
+    fn retirement_records_keep_original_deadlines_and_all_expire_once_due() {
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let mut retired = Vec::new();
+
+        for index in 0..3 {
+            let chain = Arc::new(RevisionChain::new());
+            let revision = node(
+                100 + index,
+                RevisionState::CommittedPresent,
+                0x1000 + index as usize * 8,
+            );
+            chain.push_front(revision.clone());
+            chain.push_front(node(
+                200 + index,
+                RevisionState::CommittedPresent,
+                0x2000 + index as usize * 8,
+            ));
+            assert!(history.retire(&chain, &revision));
+            retired.push(revision);
+        }
+
+        let deadlines: Vec<_> = retired
+            .iter()
+            .map(|revision| revision.retire_deadline_ms.load(Ordering::Acquire))
+            .collect();
+        let earliest = *deadlines.iter().min().expect("retirement deadline");
+        history.expire_due_for_test(earliest - 1);
+        assert!(
+            retired
+                .iter()
+                .all(|revision| revision.load().0 == RevisionState::CommittedPresent),
+            "no revision may expire before its authoritative deadline"
+        );
+        assert!(history.pop_dead().is_none());
+
+        history.expire_due_for_test(*deadlines.iter().max().unwrap());
+        assert!(
+            retired
+                .iter()
+                .all(|revision| revision.load().0 == RevisionState::Expired),
+            "every queued retirement record must be processed"
+        );
+        let mut dead_locations = Vec::new();
+        while let Some(dead) = history.pop_dead() {
+            dead_locations.push(dead.location);
+        }
+        dead_locations.sort_unstable();
+        assert_eq!(dead_locations, vec![0x1000, 0x1008, 0x1010]);
+        assert_eq!(
+            retired
+                .iter()
+                .map(|revision| revision.retire_deadline_ms.load(Ordering::Acquire))
+                .collect::<Vec<_>>(),
+            deadlines,
+            "processing must not rewrite each node's authoritative original deadline"
+        );
+    }
+
+    #[test]
+    fn blocked_scheduler_retry_moves_without_rewriting_original_deadline() {
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        chain.push_front(node(100, RevisionState::CommittedPresent, 0x1000));
+        let blocked = node(200, RevisionState::CommittedPresent, 0x2000);
+        chain.push_front(blocked.clone());
+        chain.push_front(node(300, RevisionState::CommittedPresent, 0x3000));
+        assert!(blocked.schedule_retirement(1));
+        history.schedule_expiration(ExpirationRecord {
+            chain,
+            node: blocked.clone(),
+            deadline_ms: 1,
+        });
+
+        assert_eq!(history.expire_due(1), 1);
+
+        assert_eq!(blocked.retire_deadline_ms.load(Ordering::Acquire), 1);
+        assert_eq!(
+            history
+                .expirations
+                .lock()
+                .peek()
+                .expect("blocked expiration must remain scheduled")
+                .expiration
+                .deadline_ms,
+            2,
+            "blocked work must yield until now + 1 for suffix fairness"
         );
     }
 
