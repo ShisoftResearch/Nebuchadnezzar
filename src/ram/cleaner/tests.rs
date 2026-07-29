@@ -284,8 +284,7 @@ fn direct_tombstone_survives_after_predecessor_segment_is_cleaned_first() {
     drop(chunks);
     let recovered = recover_retained_revision_chunks_with_wal(8, wal_path, raft_path, schema);
     assert!(recovered.read_cell(&id).is_err());
-    // Task 4's raw-recovery conversion will additionally require that the
-    // recovered physical tombstone creates no HistoryIndex chain.
+    assert_eq!(recovered.list[0].history.revision_count_for_test(&id), 0);
 }
 
 #[test]

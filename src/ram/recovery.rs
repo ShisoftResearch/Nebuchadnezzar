@@ -2,7 +2,6 @@ use super::cell::cell_header_from_entry_content_addr;
 use super::chunk::Chunk;
 use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
-use super::history::{RevisionNode, RevisionState};
 use super::segs::{Segment, SegmentClass, SegmentReferenceGuard, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
 use super::types::{FromHeader, Id};
@@ -976,34 +975,8 @@ fn rebuild_recovered_current(
 
     for (id, candidate) in selected {
         let chunk = &chunks[id.higher as usize % chunks.len()];
-        let state = match candidate.kind {
-            RecoveredKind::Present => RevisionState::CommittedPresent,
-            RecoveredKind::Deleted => RevisionState::CommittedDeleted,
-        };
-        let node = Arc::new(RevisionNode::new(
-            candidate.revision_ts,
-            state,
-            candidate.entry_addr,
-            candidate.entry_size,
-        ));
-        chunk.history.install(id, node, None).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("duplicate recovered history head for {id:?}"),
-            )
-        })?;
-
         if candidate.kind == RecoveredKind::Present {
-            let mut current = chunk
-                .cell_index
-                .lock_or_insert(id.lower as usize, candidate.entry_addr);
-            if *current != candidate.entry_addr && *current != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("conflicting recovered current mirror for {id:?}"),
-                ));
-            }
-            *current = candidate.entry_addr;
+            chunk.publish_recovered_present(id, candidate.entry_addr)?;
         }
     }
 
@@ -1851,10 +1824,9 @@ mod tests {
         let segment = chunks.list[0].locate_segment(selected_addr).unwrap();
         assert_eq!(summary.max_revision_ts, 200);
         assert_eq!(chunks.head_cell(&id).unwrap().revision_ts, 200);
-        assert_eq!(
-            chunks.history_location(&id, 200),
-            Some(segment.addr + encoded.len())
-        );
+        assert_eq!(selected_addr, segment.addr + encoded.len());
+        assert_eq!(chunks.history_location(&id, 200), None);
+        assert_eq!(chunks.list[0].history.revision_count_for_test(&id), 0);
         assert_eq!(
             segment.dead_space.load(Ordering::Acquire),
             encoded.len() as u32
@@ -1917,14 +1889,22 @@ mod tests {
         ] {
             let recovered = recover_encoded_entries(&entries).unwrap();
             assert!(recovered.chunks.read_cell(&id).is_err());
+            assert!(recovered.chunks.list[0]
+                .cell_index
+                .get_from_mutex(&(id.lower as usize))
+                .is_none());
             assert_eq!(
                 recovered.chunks.list[0]
                     .history
-                    .current(&id)
-                    .unwrap()
-                    .load()
-                    .0,
-                RevisionState::CommittedDeleted
+                    .revision_count_for_test(&id),
+                0
+            );
+            assert_eq!(recovered.chunks.current_revision_ts(&id), Some(200));
+            assert_eq!(
+                recovered.chunks.list[0]
+                    .history
+                    .revision_count_for_test(&id),
+                0
             );
         }
 
@@ -2021,8 +2001,14 @@ mod tests {
                 .chunks
                 .read_cell_snapshot(&deleted_id, floor + 1)
                 .unwrap(),
-            SnapshotRead::Absent(Some(300))
+            SnapshotRead::Absent(None)
         ));
+        assert_eq!(
+            recovered.chunks.list[0]
+                .history
+                .revision_count_for_test(&deleted_id),
+            0
+        );
     }
 
     #[test]

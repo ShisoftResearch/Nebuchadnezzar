@@ -5893,7 +5893,7 @@ mod tests {
             &id,
             data_map_value!(id: 1i32, value: "original".to_string()),
         );
-        let prior_revision_ts = chunks.write_cell(&mut original).unwrap().revision_ts;
+        chunks.write_cell(&mut original).unwrap();
         let prior_cell = original.clone();
         let mut failed = OwnedCell::new_with_id(
             schema.id,
@@ -5920,9 +5920,7 @@ mod tests {
         let compensation_ts = compensated.header.revision_ts;
         assert!(matches!(
             chunks.read_cell_snapshot(&id, compensation_ts).unwrap(),
-            crate::ram::cell::SnapshotRead::Present(ref cell)
-                if cell.header.revision_ts == prior_revision_ts
-                    && cell.data == original.data
+            crate::ram::cell::SnapshotRead::Absent(None)
         ));
 
         undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry.clone()])]), &chunks)
@@ -6151,37 +6149,105 @@ mod tests {
 
     #[test]
     fn recovery_compensates_delete_with_newer_content_idempotently() {
-        let temp_dir = TempDir::new().unwrap();
-        let (schema, chunks) = compensation_test_chunks("recovery_delete_compensation");
-        let id = Id::new(0, 703);
-        let mut original = OwnedCell::new_with_id(
-            schema.id,
-            &id,
-            data_map_value!(id: 1i32, value: "original".to_string()),
-        );
-        let prior_revision_ts = chunks.write_cell(&mut original).unwrap().revision_ts;
-        let prior_cell = original.clone();
-        chunks.remove_cell(&id).unwrap();
-        let installed_revision_ts = chunks.current_revision_ts(&id).unwrap();
-        let tid = test_hlc(22, 1);
-        let entry = UndoLogEntry::new_restore(
-            tid,
-            id,
-            UndoOpType::Remove,
-            installed_revision_ts,
-            prior_cell,
-        );
-        let undo =
-            UndoLogger::new(temp_dir.path().join("undo").to_string_lossy().into_owned()).unwrap();
+        use crate::ram::schema::{Field, Schema};
+        use crate::ram::segs::SEGMENT_SIZE;
+        use dovahkiin::types::Type;
 
-        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry.clone()])]), &chunks)
+        let temp_dir = TempDir::new().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+        let undo_dir = temp_dir.path().join("undo");
+        let raft_dir = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_dir).unwrap();
+        let schema = Schema::new(
+            "recovery_delete_compensation",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::I32),
+                Field::new_unindexed("value", Type::String),
+            ]),
+            false,
+            false,
+        );
+        let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let meta = Arc::new(crate::server::ServerMeta { schemas });
+        let id = Id::new(0, 703);
+        let tid = test_hlc(22, 1);
+        let installed_revision_ts;
+        let original_data;
+
+        {
+            let chunks = Chunks::new(
+                1,
+                SEGMENT_SIZE * 4,
+                meta.clone(),
+                None,
+                None,
+                Some(wal_dir.to_string_lossy().into_owned()),
+                None,
+            );
+            let mut original = OwnedCell::new_with_id(
+                schema.id,
+                &id,
+                data_map_value!(id: 1i32, value: "original".to_string()),
+            );
+            chunks.write_cell(&mut original).unwrap();
+            let prior_cell = original.clone();
+            original_data = original.data.clone();
+            installed_revision_ts = chunks
+                .next_revision_ts(original.header.revision_ts)
+                .unwrap();
+            let installed = chunks
+                .remove_cell_at_revision(
+                    &id,
+                    crate::ram::cell::RevisionWrite::committed(installed_revision_ts),
+                )
+                .unwrap();
+            chunks.force_sync_installed_revisions([&installed]).unwrap();
+            let undo = UndoLogger::new(undo_dir.to_string_lossy().into_owned()).unwrap();
+            undo.write_undo_entry(UndoLogEntry::new_restore(
+                tid,
+                id,
+                UndoOpType::Remove,
+                installed_revision_ts,
+                prior_cell,
+            ))
+            .unwrap();
+        }
+
+        let (chunks, recovery) = Chunks::recover_with_clock(
+            1,
+            SEGMENT_SIZE * 4,
+            meta,
+            None,
+            None,
+            Some(wal_dir.to_string_lossy().into_owned()),
+            None,
+            Some(raft_dir.to_string_lossy().into_owned()),
+            Arc::new(bifrost::hlc::HlcSource::new(0)),
+            300_000,
+        )
+        .unwrap();
+        chunks
+            .revision_clock()
+            .try_observe(test_hlc(recovery.max_revision_ts, 0))
+            .unwrap();
+        assert!(chunks.read_cell(&id).is_err());
+        assert_eq!(chunks.list[0].history.revision_count_for_test(&id), 0);
+        assert_eq!(chunks.current_revision_ts(&id), Some(installed_revision_ts));
+        assert_eq!(chunks.list[0].history.revision_count_for_test(&id), 0);
+
+        let undo = UndoLogger::new(undo_dir.to_string_lossy().into_owned()).unwrap();
+        let entries = undo.recover().unwrap();
+        let repeated_entries = entries.clone();
+        undo.rollback_incomplete_transactions(entries, &chunks)
             .unwrap();
         let compensated = chunks.read_cell(&id).unwrap().to_owned();
-        assert_eq!(compensated.data, original.data);
+        assert_eq!(compensated.data, original_data);
         assert!(compensated.header.revision_ts > installed_revision_ts);
         let compensation_ts = compensated.header.revision_ts;
 
-        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![entry])]), &chunks)
+        undo.rollback_incomplete_transactions(repeated_entries, &chunks)
             .unwrap();
         assert_eq!(
             chunks.read_cell(&id).unwrap().header.revision_ts,

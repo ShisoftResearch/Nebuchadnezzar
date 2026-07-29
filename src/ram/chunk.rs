@@ -606,6 +606,18 @@ impl Chunk {
         Ok(())
     }
 
+    pub(crate) fn publish_recovered_present(&self, id: Id, address: usize) -> io::Result<()> {
+        let mut current = self.cell_index.lock_or_insert(id.lower as usize, 0);
+        if *current != 0 && *current != address {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("conflicting recovered current head for {id:?}"),
+            ));
+        }
+        *current = address;
+        Ok(())
+    }
+
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard<'_>, ReadError> {
         let guard = self.cell_index.lock(hash as usize);
         match guard {
@@ -1405,12 +1417,35 @@ impl Chunk {
         id: &Id,
         installed_revision_ts: u64,
     ) -> Result<InstalledRevision, WriteError> {
-        let current = self
-            .history
-            .current(id)
-            .filter(|current| current.revision_ts == installed_revision_ts)
-            .ok_or(WriteError::CellRevisionMismatch)?;
-        let (state, location) = current.load();
+        let node = if let Some(current) = self.history.current(id) {
+            if current.revision_ts != installed_revision_ts {
+                return Err(WriteError::CellRevisionMismatch);
+            }
+            current
+        } else if let Ok(mut guard) = CellGuard::for_read(id.lower, self) {
+            let location = guard.get_ptr();
+            let header = guard.head_cell().map_err(WriteError::ReadError)?;
+            if Id::from_header(&header) != *id || header.revision_ts != installed_revision_ts {
+                return Err(WriteError::CellRevisionMismatch);
+            }
+            self.ensure_present_predecessor(*id, &header, location)?
+        } else {
+            let (location, _) = self
+                .latest_physical_tombstone(id)
+                .filter(|(_, tombstone)| tombstone.revision_ts == installed_revision_ts)
+                .ok_or(WriteError::CellRevisionMismatch)?;
+            let node = Arc::new(RevisionNode::new(
+                installed_revision_ts,
+                RevisionState::CommittedDeleted,
+                location,
+                TOMBSTONE_ENTRY_SIZE as u32,
+            ));
+            self.history
+                .install(*id, node.clone(), None)
+                .map_err(|_| WriteError::CellRevisionMismatch)?;
+            node
+        };
+        let (state, location) = node.load();
         let mirror_matches = match state {
             RevisionState::CommittedPresent => CellGuard::for_read(id.lower, self)
                 .ok()
@@ -1432,13 +1467,10 @@ impl Chunk {
             | RevisionState::Aborted
             | RevisionState::Expired => false,
         };
-        if !mirror_matches || !current.compare_exchange_state(state, RevisionState::Aborted) {
+        if !mirror_matches || !node.compare_exchange_state(state, RevisionState::Aborted) {
             return Err(WriteError::CellRevisionMismatch);
         }
-        Ok(InstalledRevision {
-            id: *id,
-            node: current,
-        })
+        Ok(InstalledRevision { id: *id, node })
     }
 
     fn write_direct_cell_with_guard(
@@ -1855,6 +1887,27 @@ impl Chunk {
 
     pub fn segments(&self) -> Vec<AArc<Segment>> {
         self.segs.iter_front_values().collect()
+    }
+
+    fn latest_physical_tombstone(&self, id: &Id) -> Option<(usize, Tombstone)> {
+        self.segments()
+            .into_iter()
+            .flat_map(|segment| {
+                let segment_seq_id = segment.seq_id;
+                segment.entry_iter().filter_map(move |entry| {
+                    if entry.entry_header.entry_type != EntryType::TOMBSTONE {
+                        return None;
+                    }
+                    let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                    (Id::new(tombstone.partition, tombstone.hash) == *id).then_some((
+                        entry.entry_pos,
+                        tombstone,
+                        segment_seq_id,
+                    ))
+                })
+            })
+            .max_by_key(|(address, tombstone, seq_id)| (tombstone.revision_ts, *seq_id, *address))
+            .map(|(address, tombstone, _)| (address, tombstone))
     }
 
     pub fn segs_for_combine_cleaner(&self) -> Vec<(AArc<Segment>, f32)> {
@@ -2725,10 +2778,20 @@ impl Chunks {
     }
 
     pub(crate) fn current_revision_ts(&self, key: &Id) -> Option<u64> {
-        self.locate_chunk_by_partition(key.higher)
-            .history
-            .current(key)
-            .map(|node| node.revision_ts)
+        let chunk = self.locate_chunk_by_partition(key.higher);
+        if let Some(current) = chunk.history.current(key) {
+            return Some(current.revision_ts);
+        }
+        if let Ok(mut guard) = CellGuard::for_read(key.lower, chunk) {
+            if let Ok(header) = guard.head_cell() {
+                if Id::from_header(&header) == *key {
+                    return Some(header.revision_ts);
+                }
+            }
+        }
+        chunk
+            .latest_physical_tombstone(key)
+            .map(|(_, tombstone)| tombstone.revision_ts)
     }
 
     pub fn promote_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
