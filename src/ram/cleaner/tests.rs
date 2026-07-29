@@ -8,6 +8,7 @@ use crate::ram::durable_fs::{
 };
 use crate::ram::entry::{EntryContent, EntryType};
 use crate::ram::file_manager::SegmentFileManager;
+use crate::ram::history::{RevisionNode, RevisionState};
 use crate::ram::schema::Field;
 use crate::ram::schema::*;
 use crate::ram::segs::{
@@ -253,6 +254,57 @@ fn combine_relocates_a_current_only_cell_without_a_history_node() {
     };
     assert_eq!(predecessor.header.revision_ts, 100);
     assert_eq!(predecessor.data["id"].i32(), Some(&10));
+}
+
+#[test]
+fn current_only_snapshot_seed_after_history_relocation_moves_history_and_mirror() {
+    let (chunks, schema) = retained_revision_chunks(5);
+    let chunk = &chunks.list[0];
+    let id = Id::new(70, 8_903);
+    let (source, source_size) = install_current_only_cell(&chunks, schema.id, &id, 100, 10);
+    force_next_write_to_new_segment(chunk);
+
+    let filler_id = Id::new(70, 8_904);
+    install_current_only_cell(&chunks, schema.id, &filler_id, 110, 11);
+    force_next_write_to_new_segment(chunk);
+
+    let selected = chunk.segments();
+    assert_eq!(selected.len(), 2);
+    let seeded = AtomicBool::new(false);
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments_with_relocation_hooks(
+        chunk,
+        &selected,
+        |_, _, _, _| {},
+        |revision_id, revision_ts, _, _| {
+            if revision_id == id && revision_ts == 100 && !seeded.swap(true, Ordering::AcqRel) {
+                // The selected source holds an exclusive reference, so a real
+                // snapshot cannot materialize it from this synchronous hook.
+                // Install the same committed raw-head node that the snapshot
+                // would publish after acquiring the cell-index guard.
+                let node = Arc::new(RevisionNode::new(
+                    revision_ts,
+                    RevisionState::CommittedPresent,
+                    source,
+                    source_size,
+                ));
+                chunks.list[0]
+                    .history
+                    .install(id, node, None)
+                    .expect("equivalent snapshot seeding must install the raw head");
+                assert_eq!(chunks.history_location(&id, revision_ts), Some(source));
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(reduced, 1);
+    assert!(seeded.load(Ordering::Acquire));
+    let destination = chunks.address_of(&id);
+    assert_ne!(destination, source);
+    assert_eq!(chunks.history_location(&id, 100), Some(destination));
+    assert!(chunk.locate_segment(destination).is_some());
 }
 
 #[test]

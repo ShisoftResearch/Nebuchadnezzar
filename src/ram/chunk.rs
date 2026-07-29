@@ -1661,7 +1661,8 @@ impl Chunk {
             return CurrentAddressRelocation::Inconsistent;
         };
 
-        if *current_location == old_location {
+        let mirror_was_old = *current_location == old_location;
+        if mirror_was_old {
             let Ok((source_header, _)) = header_from_chunk_raw(old_location) else {
                 return CurrentAddressRelocation::Inconsistent;
             };
@@ -1675,50 +1676,70 @@ impl Chunk {
             {
                 return CurrentAddressRelocation::Inconsistent;
             }
-            *current_location = new_location;
-            return CurrentAddressRelocation::Moved;
+        } else {
+            if *current_location == 0 {
+                return CurrentAddressRelocation::Inconsistent;
+            }
+            let Some(current_segment) = self
+                .segments()
+                .into_iter()
+                .find(|segment| segment.contains_address(*current_location))
+            else {
+                return CurrentAddressRelocation::Inconsistent;
+            };
+            if source_segment_ids.contains(&current_segment.id) {
+                return CurrentAddressRelocation::Inconsistent;
+            }
+            let Some(header_end) = current_location
+                .checked_add(ENTRY_HEAD_SIZE)
+                .and_then(|entry_content| entry_content.checked_add(CELL_HEADER_SIZE))
+            else {
+                return CurrentAddressRelocation::Inconsistent;
+            };
+            if header_end > current_segment.append_header.load(Ordering::Acquire) {
+                return CurrentAddressRelocation::Inconsistent;
+            }
+            let Ok((current_header, _)) = header_from_chunk_raw(*current_location) else {
+                return CurrentAddressRelocation::Inconsistent;
+            };
+            if current_header.hash != id.lower {
+                return CurrentAddressRelocation::Inconsistent;
+            }
+            let current_id = Id::from_header(&current_header);
+            if *current_location == new_location {
+                if current_id != id || current_header.revision_ts != revision_ts {
+                    return CurrentAddressRelocation::Inconsistent;
+                }
+            } else if current_id == id && current_header.revision_ts < revision_ts {
+                return CurrentAddressRelocation::Inconsistent;
+            }
         }
 
-        if *current_location == 0 {
-            return CurrentAddressRelocation::Inconsistent;
+        // Snapshot seeding and assigned writers acquire this cell-index guard
+        // before touching history. Check the exact revision while it is held.
+        // `relocate` searches the complete chain, including an exact
+        // predecessor retained by a newer successor.
+        match self
+            .history
+            .relocate(id, revision_ts, old_location, new_location)
+        {
+            crate::ram::history::RelocateResult::HistoricalMoved
+            | crate::ram::history::RelocateResult::CurrentPresentMoved => {}
+            crate::ram::history::RelocateResult::LostRace => {
+                if self.history.is_live_at(id, revision_ts, old_location) {
+                    return CurrentAddressRelocation::Inconsistent;
+                }
+            }
         }
-        let Some(current_segment) = self
-            .segments()
-            .into_iter()
-            .find(|segment| segment.contains_address(*current_location))
-        else {
-            return CurrentAddressRelocation::Inconsistent;
-        };
-        if source_segment_ids.contains(&current_segment.id) {
-            return CurrentAddressRelocation::Inconsistent;
+
+        if mirror_was_old {
+            *current_location = new_location;
+            CurrentAddressRelocation::Moved
+        } else if *current_location == new_location {
+            CurrentAddressRelocation::Moved
+        } else {
+            CurrentAddressRelocation::NoLongerCurrent
         }
-        let Some(header_end) = current_location
-            .checked_add(ENTRY_HEAD_SIZE)
-            .and_then(|entry_content| entry_content.checked_add(CELL_HEADER_SIZE))
-        else {
-            return CurrentAddressRelocation::Inconsistent;
-        };
-        if header_end > current_segment.append_header.load(Ordering::Acquire) {
-            return CurrentAddressRelocation::Inconsistent;
-        }
-        let Ok((current_header, _)) = header_from_chunk_raw(*current_location) else {
-            return CurrentAddressRelocation::Inconsistent;
-        };
-        if current_header.hash != id.lower {
-            return CurrentAddressRelocation::Inconsistent;
-        }
-        let current_id = Id::from_header(&current_header);
-        if *current_location == new_location {
-            return if current_id == id && current_header.revision_ts == revision_ts {
-                CurrentAddressRelocation::Moved
-            } else {
-                CurrentAddressRelocation::Inconsistent
-            };
-        }
-        if current_id == id && current_header.revision_ts < revision_ts {
-            return CurrentAddressRelocation::Inconsistent;
-        }
-        CurrentAddressRelocation::NoLongerCurrent
     }
 
     // Decodes entry to get size and marks it dead
