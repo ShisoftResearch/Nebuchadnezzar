@@ -587,7 +587,8 @@ pub struct HistoryIndex {
     recovery_floor: AtomicU64,
     stopped: AtomicBool,
     published_worker_wake_ms: AtomicU64,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker_thread: OnceLock<thread::Thread>,
+    worker_join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl HistoryIndex {
@@ -625,7 +626,8 @@ impl HistoryIndex {
             recovery_floor: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             published_worker_wake_ms: AtomicU64::new(0),
-            worker: Mutex::new(None),
+            worker_thread: OnceLock::new(),
+            worker_join: Mutex::new(None),
         });
         Self::start_worker(&history, chunk_id);
         history
@@ -676,7 +678,11 @@ impl HistoryIndex {
                 }
             })
             .expect("failed to start MVCC history worker");
-        *history.worker.lock() = Some(handle);
+        history
+            .worker_thread
+            .set(handle.thread().clone())
+            .expect("MVCC history worker thread handle must only be installed once");
+        *history.worker_join.lock() = Some(handle);
     }
 
     pub fn retention_ms(&self) -> u64 {
@@ -1005,10 +1011,10 @@ impl HistoryIndex {
     }
 
     fn wake_worker(&self) {
-        if let Some(handle) = self.worker.lock().as_ref() {
+        if let Some(worker_thread) = self.worker_thread.get() {
             #[cfg(test)]
             self.worker_wakes.fetch_add(1, Ordering::AcqRel);
-            handle.thread().unpark();
+            worker_thread.unpark();
         }
     }
 
@@ -1038,9 +1044,11 @@ impl HistoryIndex {
 
     pub(crate) fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
-        let handle = self.worker.lock().take();
+        if let Some(worker_thread) = self.worker_thread.get() {
+            worker_thread.unpark();
+        }
+        let handle = self.worker_join.lock().take();
         if let Some(handle) = handle {
-            handle.thread().unpark();
             if handle.thread().id() != thread::current().id() {
                 let _ = handle.join();
             }
@@ -1483,6 +1491,41 @@ mod tests {
             checks <= EXPIRATION_WORK_BUDGET * 2,
             "one pass inspected {checks} due expirations instead of yielding after bounded work"
         );
+    }
+
+    #[test]
+    fn producer_wake_uses_startup_published_thread_while_join_is_locked() {
+        let history = HistoryIndex::new(300_000);
+        history
+            .worker_thread
+            .get()
+            .expect("startup must publish the immutable worker thread handle");
+        let worker_join = history.worker_join.lock();
+        assert!(
+            worker_join.is_some(),
+            "startup must retain the worker join handle independently"
+        );
+
+        let producer_history = history.clone();
+        let producer_started = Arc::new(Barrier::new(2));
+        let producer_barrier = producer_started.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let producer = thread::spawn(move || {
+            producer_barrier.wait();
+            producer_history.wake_worker();
+            completed_tx
+                .send(())
+                .expect("wake completion receiver must remain connected");
+        });
+        producer_started.wait();
+
+        completed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("producer wake must not wait for the worker join mutex");
+
+        drop(worker_join);
+        producer.join().expect("producer wake thread panicked");
+        history.shutdown();
     }
 
     #[test]
