@@ -32,6 +32,7 @@ pub enum TxnResolution {
 pub enum CellExpectation {
     Present(u64),
     Absent(Option<u64>),
+    UnobservedAbsent,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

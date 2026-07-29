@@ -928,7 +928,7 @@ impl Transaction {
             self.certified_op(id),
             Some(PrepareOp {
                 intent: PrepareIntent::Write,
-                expectation: CellExpectation::Absent(_),
+                expectation: CellExpectation::Absent(_) | CellExpectation::UnobservedAbsent,
                 ..
             })
         )
@@ -1838,9 +1838,19 @@ impl DataManager {
         }
     }
 
+    fn expectation_matches(op: &PrepareOp, current: &CellExpectation) -> bool {
+        match (&op.expectation, op.intent) {
+            (CellExpectation::UnobservedAbsent, PrepareIntent::Write) => {
+                matches!(current, CellExpectation::Absent(_))
+            }
+            (CellExpectation::UnobservedAbsent, _) => false,
+            (expected, _) => expected == current,
+        }
+    }
+
     fn prepare_expectation_matches(&self, op: &PrepareOp) -> bool {
         self.current_expectation(&op.id)
-            .is_ok_and(|current| current == op.expectation)
+            .is_ok_and(|current| Self::expectation_matches(op, &current))
     }
 
     #[inline]
@@ -2544,7 +2554,7 @@ impl DataManager {
                 let certified_revision = match op.expectation {
                     CellExpectation::Present(revision_ts)
                     | CellExpectation::Absent(Some(revision_ts)) => Some(revision_ts),
-                    CellExpectation::Absent(None) => None,
+                    CellExpectation::Absent(None) | CellExpectation::UnobservedAbsent => None,
                 };
                 certified_revision.is_some_and(|revision_ts| commit_hlc.ts <= revision_ts)
             })
@@ -2644,7 +2654,10 @@ impl DataManager {
             let valid = match op {
                 CommitOp::Write(_) => {
                     certified.intent == PrepareIntent::Write
-                        && matches!(certified.expectation, CellExpectation::Absent(_))
+                        && matches!(
+                            certified.expectation,
+                            CellExpectation::Absent(_) | CellExpectation::UnobservedAbsent
+                        )
                 }
                 CommitOp::Update(_) | CommitOp::Remove(_) => {
                     certified.intent == PrepareIntent::Write
@@ -2674,7 +2687,10 @@ impl DataManager {
             let certified = txn
                 .certified_op(&cell_id)
                 .ok_or(DMCommitResult::CheckFailed(CheckError::CannotEnd))?;
-            if self.current_expectation(&cell_id).ok().as_ref() != Some(&certified.expectation) {
+            if !self
+                .current_expectation(&cell_id)
+                .is_ok_and(|current| Self::expectation_matches(certified, &current))
+            {
                 return Err(DMCommitResult::CellChanged(cell_id));
             }
         }
@@ -6690,6 +6706,34 @@ mod tests {
         );
 
         abort_and_end_local(&manager, &insert_tid).await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unobserved_absence_requires_write_intent() {
+        let _ = env_logger::try_init();
+        let address = "127.0.0.1:5503";
+        let group = "txn_data_site_unobserved_absence_intent";
+        let server = start_transaction_test_server(address, group).await;
+        let manager = data_manager_for_database(&server, address, group).await;
+        let cell_id = Id::new(0, 99033);
+        let tid = manager.hlc.now();
+
+        let result = prepare_ops_local(
+            &manager,
+            41,
+            &tid,
+            vec![PrepareOp {
+                id: cell_id,
+                expectation: CellExpectation::UnobservedAbsent,
+                intent: PrepareIntent::Read,
+            }],
+        )
+        .await;
+
+        assert_eq!(result, DMPrepareResult::NotRealizable);
+        assert!(manager.cell_meta_mutex(&cell_id).lock().owner.is_none());
+
         server.shutdown().await;
     }
 

@@ -1740,7 +1740,7 @@ impl Service for TransactionManager {
                             DataObject {
                                 server: server_id,
                                 cell: Some(cell),
-                                expectation: CellExpectation::Absent(None),
+                                expectation: CellExpectation::UnobservedAbsent,
                                 new: true,
                                 changed: true,
                                 point_cache: PointReadCache::default(),
@@ -1753,8 +1753,10 @@ impl Service for TransactionManager {
                             return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
                         }
                         data_obj.cell = Some(cell);
-                        data_obj.new = matches!(data_obj.expectation, CellExpectation::Absent(_))
-                            && !data_obj.changed;
+                        data_obj.new = matches!(
+                            data_obj.expectation,
+                            CellExpectation::Absent(_) | CellExpectation::UnobservedAbsent
+                        ) && !data_obj.changed;
                         data_obj.changed = true;
                         Ok(TxnExecResult::Accepted(()))
                     }
@@ -1781,7 +1783,10 @@ impl Service for TransactionManager {
                     if txn.data.contains_key(&id) {
                         let data_obj = txn.data.get_mut(&id).unwrap();
                         if data_obj.cell.is_none()
-                            && matches!(data_obj.expectation, CellExpectation::Absent(_))
+                            && matches!(
+                                data_obj.expectation,
+                                CellExpectation::Absent(_) | CellExpectation::UnobservedAbsent
+                            )
                         {
                             return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
                         }
@@ -1974,7 +1979,12 @@ impl TransactionManager {
                 return Ok(TxnExecResult::Accepted(cell.clone()));
             }
             // A buffered remove within this transaction, or repeatable absence.
-            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent(_)) {
+            if data_obj.changed
+                || matches!(
+                    data_obj.expectation,
+                    CellExpectation::Absent(_) | CellExpectation::UnobservedAbsent
+                )
+            {
                 return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
             }
         }
@@ -2003,7 +2013,12 @@ impl TransactionManager {
             if let Some(cell) = &data_obj.cell {
                 return Ok(TxnExecResult::Accepted(cell.header.clone()));
             }
-            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent(_)) {
+            if data_obj.changed
+                || matches!(
+                    data_obj.expectation,
+                    CellExpectation::Absent(_) | CellExpectation::UnobservedAbsent
+                )
+            {
                 return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
             }
             if let Some(header) = data_obj.point_cache.header.as_ref() {
@@ -2040,7 +2055,12 @@ impl TransactionManager {
                     Err(error) => TxnExecResult::Error(error),
                 });
             }
-            if data_obj.changed || matches!(data_obj.expectation, CellExpectation::Absent(_)) {
+            if data_obj.changed
+                || matches!(
+                    data_obj.expectation,
+                    CellExpectation::Absent(_) | CellExpectation::UnobservedAbsent
+                )
+            {
                 return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
             }
             if let Some(projection) = data_obj.point_cache.projections.get(fields) {

@@ -3497,6 +3497,269 @@ async fn repeatable_blind_remove_missing_errors_immediately() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn transactional_blind_write_recreates_tombstoned_cell() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5501";
+    let group = "txn_occ_blind_recreate_tombstone";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90201);
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+
+    let create_tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.write(
+            create_tid.clone(),
+            counter_cell(schema.id, cell_id, 1, "blind-recreate-initial"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(create_tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(create_tid).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let remove_tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.remove(remove_tid.clone(), cell_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(remove_tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(remove_tid).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+    assert!(runtime.chunks().read_cell(&cell_id).is_err());
+
+    let recreate_tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.write(
+            recreate_tid.clone(),
+            counter_cell(schema.id, cell_id, 2, "blind-recreate-current"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        runtime
+            .txn_manager()
+            .unwrap()
+            .coordinator_expectation_for_test(&recreate_tid, &cell_id)
+            .await,
+        Some(CellExpectation::UnobservedAbsent)
+    );
+    assert_eq!(
+        txn.prepare(recreate_tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(recreate_tid).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let recreated = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(score_of(&recreated), 2);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn observed_never_absence_rejects_create_delete_aba() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5502";
+    let group = "txn_occ_observed_absence_aba";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90202);
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+
+    let observing_tid = txn.begin().await.unwrap().unwrap();
+    assert_missing(
+        txn.read(observing_tid.clone(), cell_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+
+    let create_tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.write(
+            create_tid.clone(),
+            counter_cell(schema.id, cell_id, 1, "observed-absence-aba-created"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(create_tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(create_tid).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let remove_tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.remove(remove_tid.clone(), cell_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(remove_tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(remove_tid).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    assert_eq!(
+        txn.write(
+            observing_tid.clone(),
+            counter_cell(schema.id, cell_id, 2, "observed-absence-aba-recreate"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        runtime
+            .txn_manager()
+            .unwrap()
+            .coordinator_expectation_for_test(&observing_tid, &cell_id)
+            .await,
+        Some(CellExpectation::Absent(None))
+    );
+    assert_eq!(
+        txn.prepare(observing_tid).await.unwrap().unwrap(),
+        TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
+    );
+    assert!(runtime.chunks().read_cell(&cell_id).is_err());
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blind_write_rejects_present_cell() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5504";
+    let group = "txn_occ_blind_write_present";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90204);
+
+    let mut original = counter_cell(schema.id, cell_id, 1, "blind-present-original");
+    runtime.chunks().write_cell(&mut original).unwrap();
+
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let tid = txn.begin().await.unwrap().unwrap();
+    assert_eq!(
+        txn.write(
+            tid.clone(),
+            counter_cell(schema.id, cell_id, 2, "blind-present-replacement"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        runtime
+            .txn_manager()
+            .unwrap()
+            .coordinator_expectation_for_test(&tid, &cell_id)
+            .await,
+        Some(CellExpectation::UnobservedAbsent)
+    );
+    assert_eq!(
+        txn.prepare(tid).await.unwrap().unwrap(),
+        TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
+    );
+
+    let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(persisted.data, original.data);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn competing_blind_writers_cannot_both_prepare() {
+    let _ = env_logger::try_init();
+    let address = "127.0.0.1:5505";
+    let group = "txn_occ_competing_blind_writers";
+    let server = start_occ_test_server(address, group).await;
+    let runtime = server.current_database();
+    let schema = install_occ_schema(&runtime);
+    let cell_id = Id::new(0, 90205);
+    let txn = scoped_txn_client_for_database(address, group, group).await;
+    let first_tid = txn.begin().await.unwrap().unwrap();
+    let second_tid = txn.begin().await.unwrap().unwrap();
+
+    assert_eq!(
+        txn.write(
+            first_tid.clone(),
+            counter_cell(schema.id, cell_id, 1, "blind-writer-first"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.write(
+            second_tid.clone(),
+            counter_cell(schema.id, cell_id, 2, "blind-writer-second"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+
+    assert_eq!(
+        txn.prepare(first_tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.prepare(second_tid).await.unwrap().unwrap(),
+        TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
+    );
+    assert_eq!(
+        txn.commit(first_tid).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let persisted = runtime.chunks().read_cell(&cell_id).unwrap().to_owned();
+    assert_eq!(score_of(&persisted), 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn occ_mixed_read_write_prepare_commit_updates_only_changed_cell() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5341";
