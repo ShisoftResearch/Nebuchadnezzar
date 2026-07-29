@@ -308,6 +308,101 @@ fn current_only_snapshot_seed_after_history_relocation_moves_history_and_mirror(
 }
 
 #[test]
+fn current_only_history_seed_with_assigned_successor_keeps_relocated_predecessor_live() {
+    let (chunks, schema) = retained_revision_chunks(6);
+    let chunk = &chunks.list[0];
+    let id = Id::new(70, 8_905);
+    let (source, source_size) = install_current_only_cell(&chunks, schema.id, &id, 100, 10);
+    force_next_write_to_new_segment(chunk);
+
+    let filler_id = Id::new(70, 8_906);
+    install_current_only_cell(&chunks, schema.id, &filler_id, 110, 11);
+    force_next_write_to_new_segment(chunk);
+    let selected = chunk.segments();
+    assert_eq!(selected.len(), 2);
+
+    let (successor, successor_size) = write_physical_cell(&chunks, schema.id, &id, 200, 20);
+    assert!(
+        !selected
+            .iter()
+            .any(|segment| segment.contains_address(successor)),
+        "assigned successor must be outside the cleaner source set"
+    );
+    let seeded = AtomicBool::new(false);
+    let predecessor = StdMutex::new(None);
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments_with_relocation_hooks(
+        chunk,
+        &selected,
+        |_, _, _, _| {},
+        |revision_id, revision_ts, _, _| {
+            if revision_id == id && revision_ts == 100 && !seeded.swap(true, Ordering::AcqRel) {
+                // The initial cleaner relocation has already observed LostRace.
+                // Publish the same predecessor/successor history state that an
+                // assigned writer would expose before replacing the raw mirror.
+                let old = Arc::new(RevisionNode::new(
+                    revision_ts,
+                    RevisionState::CommittedPresent,
+                    source,
+                    source_size,
+                ));
+                chunks.list[0]
+                    .history
+                    .install(id, old.clone(), None)
+                    .expect("equivalent snapshot seed must install the predecessor");
+                let new = Arc::new(RevisionNode::new(
+                    200,
+                    RevisionState::CommittedPresent,
+                    successor,
+                    successor_size,
+                ));
+                chunks.list[0]
+                    .history
+                    .install(id, new, Some(&old))
+                    .expect("assigned successor must retain the predecessor");
+                *chunk
+                    .cell_index
+                    .lock(id.lower as usize)
+                    .expect("current mirror") = successor;
+                *predecessor.lock().expect("predecessor slot") = Some(old);
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(reduced, 1);
+    assert!(seeded.load(Ordering::Acquire));
+    assert_eq!(chunks.address_of(&id), successor);
+    assert!(chunk.locate_segment(source).is_none());
+    let destination = assert_relocated_revision(&chunks, &id, 100, source);
+    let destination_segment = chunk
+        .locate_segment(destination)
+        .expect("relocated predecessor destination");
+    assert_eq!(
+        destination_segment.dead_space.load(Ordering::Acquire),
+        0,
+        "a live relocated predecessor must not be dead-accounted"
+    );
+
+    let predecessor = predecessor
+        .lock()
+        .expect("predecessor slot")
+        .clone()
+        .expect("injected predecessor");
+    let chain = chunk.history.chain(&id).expect("history chain");
+    assert!(chunk.history.retire(&chain, &predecessor));
+    chunk.history.expire_due_for_test(u64::MAX);
+    chunk.drain_history_dead();
+    chunk.drain_history_dead();
+    assert_eq!(
+        destination_segment.dead_space.load(Ordering::Acquire),
+        source_size,
+        "retiring the relocated predecessor must account its destination exactly once"
+    );
+}
+
+#[test]
 fn current_only_lower_key_collision_does_not_move_another_full_id() {
     let (chunks, schema) = retained_revision_chunks(6);
     let chunk = &chunks.list[0];

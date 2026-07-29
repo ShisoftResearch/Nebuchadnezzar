@@ -1719,23 +1719,26 @@ impl Chunk {
         // before touching history. Check the exact revision while it is held.
         // `relocate` searches the complete chain, including an exact
         // predecessor retained by a newer successor.
-        match self
+        let history_moved = match self
             .history
             .relocate(id, revision_ts, old_location, new_location)
         {
             crate::ram::history::RelocateResult::HistoricalMoved
-            | crate::ram::history::RelocateResult::CurrentPresentMoved => {}
+            | crate::ram::history::RelocateResult::CurrentPresentMoved => true,
             crate::ram::history::RelocateResult::LostRace => {
                 if self.history.is_live_at(id, revision_ts, old_location) {
                     return CurrentAddressRelocation::Inconsistent;
                 }
+                false
             }
-        }
+        };
 
         if mirror_was_old {
             *current_location = new_location;
             CurrentAddressRelocation::Moved
-        } else if *current_location == new_location {
+        } else if history_moved || *current_location == new_location {
+            // A retained predecessor can relocate while the raw mirror stays
+            // on a newer assigned successor. The copied entry remains live.
             CurrentAddressRelocation::Moved
         } else {
             CurrentAddressRelocation::NoLongerCurrent
