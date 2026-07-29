@@ -212,6 +212,141 @@ fn snapshot_reads_old_address_after_current_update() {
 }
 
 #[test]
+fn direct_update_reuses_one_chain_resolution_and_preserves_predecessor_snapshot() {
+    let chunks = test_chunks();
+    let id = Id::new(1, 105);
+    let mut first = test_cell(id, 10);
+    chunks.write_cell(&mut first).unwrap();
+    let predecessor_ts = first.header.revision_ts;
+    let predecessor_address = chunks.address_of(&id);
+    let history = &chunks.list[0].history;
+    history.take_chain_map_resolutions_for_test();
+
+    let mut second = test_cell(id, 20);
+    chunks.update_cell(&mut second).unwrap();
+
+    assert_eq!(
+        history.take_chain_map_resolutions_for_test(),
+        1,
+        "a successful direct update must resolve its revision chain once"
+    );
+    assert!(
+        second.header.revision_ts > predecessor_ts,
+        "the installed direct revision must be newer than its exact predecessor"
+    );
+    assert_eq!(
+        history.revision_count_for_test(&id),
+        2,
+        "one direct update must install exactly one successor"
+    );
+    let SnapshotRead::Present(predecessor) = chunks
+        .read_cell_snapshot(&id, second.header.revision_ts)
+        .unwrap()
+    else {
+        panic!("the predecessor must remain visible below the new revision boundary");
+    };
+    assert_eq!(predecessor.header.revision_ts, predecessor_ts);
+    assert_eq!(
+        chunks.history_location(&id, predecessor_ts),
+        Some(predecessor_address)
+    );
+}
+
+#[test]
+fn direct_update_revision_timestamps_are_strictly_increasing() {
+    let chunks = test_chunks();
+    let id = Id::new(1, 106);
+    let mut cell = test_cell(id, 10);
+    chunks.write_cell(&mut cell).unwrap();
+    let mut previous = cell.header.revision_ts;
+
+    for value in 11..=14 {
+        let mut updated = test_cell(id, value);
+        chunks.update_cell(&mut updated).unwrap();
+        assert!(updated.header.revision_ts > previous);
+        previous = updated.header.revision_ts;
+    }
+}
+
+#[test]
+fn every_direct_update_entry_point_resolves_its_chain_once() {
+    let chunks = test_chunks();
+    let history = &chunks.list[0].history;
+
+    let update_by_id = Id::new(1, 109);
+    let mut update_by_original = test_cell(update_by_id, 10);
+    chunks.write_cell(&mut update_by_original).unwrap();
+    history.take_chain_map_resolutions_for_test();
+    chunks
+        .update_cell_by(&update_by_id, |current| {
+            let mut updated = current.to_owned();
+            updated.data["score"] = OwnedValue::U64(11);
+            Some(updated)
+        })
+        .unwrap();
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 1);
+
+    let guarded_id = Id::new(1, 110);
+    let mut guarded_original = test_cell(guarded_id, 20);
+    chunks.write_cell(&mut guarded_original).unwrap();
+    let mut guarded_update = test_cell(guarded_id, 21);
+    let mut guard = chunks.lock_cell_for_write(&guarded_id, true).unwrap();
+    history.take_chain_map_resolutions_for_test();
+    guard.update_cell(&mut guarded_update).unwrap();
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 1);
+    drop(guard);
+
+    let upsert_id = Id::new(1, 111);
+    let mut upsert_original = test_cell(upsert_id, 30);
+    chunks.write_cell(&mut upsert_original).unwrap();
+    let mut upsert_update = test_cell(upsert_id, 31);
+    history.take_chain_map_resolutions_for_test();
+    chunks.upsert_cell(&mut upsert_update).unwrap();
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 1);
+
+    let guarded_upsert_id = Id::new(1, 112);
+    let mut guarded_upsert_original = test_cell(guarded_upsert_id, 40);
+    chunks.write_cell(&mut guarded_upsert_original).unwrap();
+    let mut guarded_upsert_update = test_cell(guarded_upsert_id, 41);
+    let mut guard = chunks
+        .lock_cell_for_write(&guarded_upsert_id, true)
+        .unwrap();
+    history.take_chain_map_resolutions_for_test();
+    guard.upsert_cell(&mut guarded_upsert_update).unwrap();
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 1);
+}
+
+#[test]
+fn direct_update_keeps_absent_and_tombstoned_cells_absent() {
+    let chunks = test_chunks();
+    let tombstoned_id = Id::new(1, 107);
+    let mut original = test_cell(tombstoned_id, 10);
+    chunks.write_cell(&mut original).unwrap();
+    chunks.remove_cell(&tombstoned_id).unwrap();
+
+    let mut tombstoned_update = test_cell(tombstoned_id, 20);
+    assert!(matches!(
+        chunks.update_cell(&mut tombstoned_update),
+        Err(WriteError::CellDoesNotExisted)
+    ));
+    assert!(matches!(
+        chunks.read_cell(&tombstoned_id),
+        Err(ReadError::CellDoesNotExisted)
+    ));
+
+    let absent_id = Id::new(1, 108);
+    let mut absent_update = test_cell(absent_id, 30);
+    assert!(matches!(
+        chunks.update_cell(&mut absent_update),
+        Err(WriteError::CellDoesNotExisted)
+    ));
+    assert!(matches!(
+        chunks.read_cell_snapshot(&absent_id, u64::MAX).unwrap(),
+        SnapshotRead::Absent(None)
+    ));
+}
+
+#[test]
 fn delete_and_recreate_preserve_revision_aware_absence() {
     let chunks = test_chunks();
     let id = Id::new(1, 92);

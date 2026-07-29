@@ -302,6 +302,30 @@ impl RevisionChain {
             .flatten()
     }
 
+    fn install(
+        &self,
+        node: Arc<RevisionNode>,
+        expected_predecessor: Option<&Arc<RevisionNode>>,
+    ) -> Result<Option<Arc<RevisionNode>>, ()> {
+        let predecessor = self.current();
+        if predecessor
+            .as_ref()
+            .is_some_and(|current| current.revision_ts >= node.revision_ts)
+        {
+            return Err(());
+        }
+        let predecessor_matches = match (expected_predecessor, predecessor.as_ref()) {
+            (None, None) => true,
+            (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        if !predecessor_matches {
+            return Err(());
+        }
+        self.push_front(node);
+        Ok(predecessor)
+    }
+
     fn find(&self, revision_ts: u64) -> Option<Arc<RevisionNode>> {
         self.revisions.iter_front().find_map(|revision_ref| {
             revision_ref
@@ -540,6 +564,8 @@ pub(crate) enum RelocateResult {
 
 pub struct HistoryIndex {
     chains: PtrHashMap<Id, Arc<RevisionChain>>,
+    #[cfg(test)]
+    chain_map_resolutions: AtomicUsize,
     chain_creation: Mutex<()>,
     expiration_ingress: LinkedRingBufferList<Option<ScheduledExpiration>, 64>,
     expirations: Mutex<BinaryHeap<ScheduledExpiration>>,
@@ -565,6 +591,8 @@ impl HistoryIndex {
     fn new_named(chunk_id: Option<usize>, retention_ms: u64) -> Arc<Self> {
         let history = Arc::new(Self {
             chains: PtrHashMap::with_capacity(HISTORY_MAP_INITIAL_CAPACITY),
+            #[cfg(test)]
+            chain_map_resolutions: AtomicUsize::new(0),
             chain_creation: Mutex::new(()),
             expiration_ingress: LinkedRingBufferList::new(),
             expirations: Mutex::new(BinaryHeap::new()),
@@ -617,8 +645,14 @@ impl HistoryIndex {
         self.retention_ms
     }
 
-    pub fn chain(&self, id: &Id) -> Option<Arc<RevisionChain>> {
+    fn lookup_chain(&self, id: &Id) -> Option<Arc<RevisionChain>> {
+        #[cfg(test)]
+        self.chain_map_resolutions.fetch_add(1, Ordering::Relaxed);
         self.chains.get(id)
+    }
+
+    pub fn chain(&self, id: &Id) -> Option<Arc<RevisionChain>> {
+        self.lookup_chain(id)
     }
 
     fn get_or_create_chain(&self, id: Id) -> Arc<RevisionChain> {
@@ -629,12 +663,12 @@ impl HistoryIndex {
     where
         F: FnOnce() -> Arc<RevisionChain>,
     {
-        if let Some(chain) = self.chains.get(&id) {
+        if let Some(chain) = self.lookup_chain(&id) {
             return chain;
         }
 
         let _creation = self.chain_creation.lock();
-        if let Some(chain) = self.chains.get(&id) {
+        if let Some(chain) = self.lookup_chain(&id) {
             return chain;
         }
 
@@ -669,23 +703,20 @@ impl HistoryIndex {
         expected_predecessor: Option<&Arc<RevisionNode>>,
     ) -> Result<(Arc<RevisionChain>, Option<Arc<RevisionNode>>), ()> {
         let chain = self.get_or_create_chain(id);
-        let predecessor = chain.current();
-        let predecessor_matches = match (expected_predecessor, predecessor.as_ref()) {
-            (None, None) => true,
-            (Some(expected), Some(actual)) => Arc::ptr_eq(expected, actual),
-            (None, Some(_)) | (Some(_), None) => false,
-        };
-        if !predecessor_matches {
-            return Err(());
-        }
-        if predecessor
-            .as_ref()
-            .is_some_and(|current| current.revision_ts >= node.revision_ts)
-        {
-            return Err(());
-        }
-        chain.push_front(node);
+        let predecessor = chain.install(node, expected_predecessor)?;
         Ok((chain, predecessor))
+    }
+
+    pub(crate) fn install_on_chain(
+        &self,
+        chain: &Arc<RevisionChain>,
+        node: Arc<RevisionNode>,
+        expected_predecessor: &Arc<RevisionNode>,
+    ) -> Result<(), ()> {
+        // The caller carries this chain from a resolution performed while it
+        // holds the cell's write guard. RevisionChain::install still rechecks
+        // the exact predecessor immediately before publishing the list node.
+        chain.install(node, Some(expected_predecessor)).map(|_| ())
     }
 
     pub(crate) fn location(&self, id: &Id, revision_ts: u64) -> Option<usize> {
@@ -965,6 +996,24 @@ impl HistoryIndex {
     #[cfg(test)]
     fn take_expiration_checks_for_test(&self) -> usize {
         self.expiration_checks.swap(0, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_chain_map_resolutions_for_test(&self) -> usize {
+        self.chain_map_resolutions.swap(0, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revision_count_for_test(&self, id: &Id) -> usize {
+        self.chain(id)
+            .map(|chain| {
+                chain
+                    .revisions
+                    .iter_front()
+                    .filter(|revision_ref| revision_ref.deref().flatten().is_some())
+                    .count()
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -1639,6 +1688,27 @@ mod tests {
         let current = history.current(&id).expect("first remains current");
         assert!(Arc::ptr_eq(&current, &first));
         assert_eq!(history.location(&id, 200), None);
+    }
+
+    #[test]
+    fn one_exact_predecessor_can_publish_only_one_successor() {
+        let history = HistoryIndex::new(300_000);
+        let id = Id::new(7, 10);
+        let first = node(100, RevisionState::CommittedPresent, 0x1000);
+        history.install(id, first.clone(), None).unwrap();
+        let winner = node(200, RevisionState::CommittedPresent, 0x2000);
+        let stale = node(300, RevisionState::CommittedPresent, 0x3000);
+
+        history
+            .install(id, winner.clone(), Some(&first))
+            .expect("the exact predecessor must accept its first successor");
+        assert!(
+            history.install(id, stale, Some(&first)).is_err(),
+            "a stale expected predecessor must not publish after the head advances"
+        );
+        let current = history.current(&id).expect("winner remains current");
+        assert!(Arc::ptr_eq(&current, &winner));
+        assert_eq!(history.location(&id, 300), None);
     }
 
     #[test]
