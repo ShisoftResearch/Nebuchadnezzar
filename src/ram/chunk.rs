@@ -1194,7 +1194,7 @@ impl Chunk {
             Ok(mut guard) => {
                 let location = guard.get_ptr();
                 let header = guard.head_cell()?;
-                if header.revision_ts < snapshot_ts {
+                if Id::from_header(&header) == *id && header.revision_ts < snapshot_ts {
                     match self.history.current(id) {
                         Some(current) => {
                             let (state, node_location) = current.load();
@@ -3094,6 +3094,10 @@ impl<'a> Drop for CellGuard<'a> {
     fn drop(&mut self) {
         #[cfg(feature = "tiered_memory")]
         self.decrement_segment_references();
+
+        if self.guard.is_some() && self.is_logically_absent() {
+            self.guard.take().expect("cell guard").remove();
+        }
     }
 }
 

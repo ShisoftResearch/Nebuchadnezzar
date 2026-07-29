@@ -212,6 +212,20 @@ fn snapshot_reads_old_address_after_current_update() {
 }
 
 #[test]
+fn direct_snapshot_rejects_colliding_full_id() {
+    let chunks = test_chunks();
+    let id = Id::new(1, 105);
+    let colliding_id = Id::new(2, id.lower);
+    let mut cell = test_cell(id, 10);
+    chunks.write_cell(&mut cell).unwrap();
+
+    assert!(matches!(
+        chunks.read_cell_snapshot(&colliding_id, u64::MAX).unwrap(),
+        SnapshotRead::Absent(None)
+    ));
+}
+
+#[test]
 fn direct_write_and_update_do_not_create_or_resolve_history() {
     let chunks = test_chunks();
     let id = Id::new(1, 105);
@@ -574,6 +588,33 @@ fn failed_delete_preserves_current_cell_and_secondary_indices() {
         .history
         .current(&id)
         .is_some_and(|node| node.revision_ts == 100));
+}
+
+#[test]
+fn failed_direct_insert_releases_cell_index_reservation() {
+    let chunks = test_chunks();
+    let id = Id::new(1, 108);
+    let chunk = &chunks.list[0];
+    let mut failed = test_cell(id, 10);
+    chunks.fail_next_allocation_for_test(&id);
+
+    assert!(matches!(
+        chunks.write_cell(&mut failed),
+        Err(WriteError::CannotAllocateSpace)
+    ));
+    assert_eq!(chunk.cell_count(), 0);
+    assert!(chunk
+        .cell_index
+        .get_from_mutex(&(id.lower as usize))
+        .is_none());
+
+    let mut retry = test_cell(id, 20);
+    chunks.write_cell(&mut retry).unwrap();
+    assert_eq!(chunk.cell_count(), 1);
+    assert_eq!(
+        chunks.read_cell(&id).unwrap().data["score"].u64(),
+        Some(&20)
+    );
 }
 
 #[test]
