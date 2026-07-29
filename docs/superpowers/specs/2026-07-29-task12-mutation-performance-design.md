@@ -79,7 +79,9 @@ Every optimization must preserve all of the following:
     finalize-retirement protocol step is removed.
 
 The documented non-transactional/transactional interoperability limitation is
-unchanged.
+unchanged. Pure non-transactional operations must now retain their direct
+storage path and pay no history cost, as specified in
+`2026-07-29-nontransaction-mvcc-cost-isolation-design.md`.
 
 ## Selected Optimization Tranches
 
@@ -103,31 +105,18 @@ reverse order.
 This tranche does not skip a distributed phase, a read validation, a storage
 mutation, or a durable sync.
 
-### Tranche B: reduce direct and shared history hot-path work
+### Tranche B: isolate direct operations from history
 
-The first history tranche is scoped to the direct update critical section. It
-will carry the already-resolved revision chain and predecessor through revision
-allocation, publication, and retirement. It must not perform an unlocked
-speculative lookup and then repeat the same map/current lookup after acquiring
-the cell guard. The remove and transaction-assigned revision paths remain on
-their current `HistoryIndex::install` path in this tranche; they require their
-own focused tombstone benchmark and tests before sharing a refactored API.
+The chain-reuse optimization was accepted for transaction-owned history, but
+history-worker wake experiments did not pass the zero-tail-regression gate and
+were reverted.
 
-History publication will continue to compare the exact predecessor pointer and
-revision timestamp before pushing the new node. The refactor only reuses the
-chain identity already established while holding the cell guard.
-
-The history worker wake path will replace the producer-side worker mutex with
-an immutable thread handle and a lost-wakeup-safe notification latch. At most
-one pending wake token is required. Every retired node keeps its authoritative
-original deadline, notification coalescing drops no expiration record, and no
-node may expire before that deadline. A blocked scheduler record may still be
-rescheduled later under the existing `now + 1` fairness rule so a middle
-revision cannot starve the older suffix that unblocks it.
-
-These changes are independent: history lookup reuse and wake coalescing must be
-benchmarked separately so a neutral or negative change can be rejected without
-discarding a useful one.
+Direct point-cell operations must not enter history at all. The cell index
+contains only raw present-cell addresses, and direct operations consult only
+that index. Assigned-revision and snapshot operations retain the existing
+history invariants without tagging the cell-index word. Direct delete removes
+the index entry and leaves only a legacy durable tombstone whose cleaner
+liveness is governed by its predecessor-segment sequence watermark.
 
 ### Deferred work
 

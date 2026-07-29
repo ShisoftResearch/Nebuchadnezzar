@@ -134,6 +134,15 @@ and cleaner temperature; it does not make non-transactional operations aware
 of transactional snapshots and does not create a mixed-mode isolation
 guarantee.
 
+Pure non-transactional mutations retain the direct cell-index storage path.
+They do not resolve or create history chains, allocate revision nodes, enqueue
+retention records, or wake history workers. The first transactional access to
+a direct current head converts that head to transaction-owned history and pays
+the conversion cost without changing the raw cell-index address. A direct
+delete writes a legacy durable tombstone and removes the cell-index entry; the
+tombstone is never indexed or added to history. See
+`2026-07-29-nontransaction-mvcc-cost-isolation-design.md`.
+
 The storage runtime must have access to the server HLC or an injected revision
 allocator. An unstamped caller-created cell has `revision_ts == 0`; only the
 storage layer assigns a persisted nonzero revision.
@@ -207,9 +216,11 @@ There is no backward compatibility:
 ## Chunk-Owned History Index
 
 Each `Chunk` owns a history index parallel to its cell index and keyed by the
-same cell identity. The cell index remains the authoritative optimized pointer
-for the current present cell. The history index owns logical revision order and
-historical liveness.
+same cell identity. The cell index contains only raw addresses of present
+current cells. For transaction-owned state, the history index owns logical
+revision order and historical liveness while the cell index mirrors a present
+current head. Direct tombstones are durable cleaner/recovery records and belong
+to neither index.
 
 Conceptually:
 
@@ -221,10 +232,11 @@ HistoryIndex[CellId]
     -> revision 120: Present(segment location A)
 ```
 
-The chain includes the logical current revision. A present current revision
-mirrors the cell index location; a deleted current revision represents the
-current tombstone. This makes visible absence and delete/recreate history
-explicit.
+A transaction-owned chain includes the logical current revision. A present
+current revision mirrors the raw cell-index location; a deleted current
+revision represents the current tombstone. Direct heads have no chain until
+their first transactional access. This makes transaction-visible absence and
+delete/recreate history explicit without charging direct operations.
 
 The top-level history index uses the same lock-free/sharded map family as the
 cell index. Each value owns one Lightning revision list:
@@ -429,6 +441,8 @@ greatest numeric version. Under MVCC it must:
 - treat every unexpired history node as live,
 - identify retained entries by `(CellId, revision_ts)`,
 - preserve current and historical tombstones needed by chains,
+- retain a legacy direct tombstone while any resident segment has a sequence
+  no greater than its recorded predecessor segment,
 - choose duplicate physical entries by `revision_ts`,
 - sort cleaner layout by revision recency and size,
 - copy retained historical entries during compaction,
@@ -495,7 +509,10 @@ expiration. This preserves revision-aware absence and prevents
 Historical chains are not recovered:
 
 - recovery selects only the latest durable cell or tombstone,
-- recovered current states receive one-node current chains as needed,
+- recovery publishes a selected present cell as a raw cell-index head,
+- a selected tombstone leaves the cell index absent,
+- the first later transactional access creates the singleton current chain as
+  needed,
 - old physical entries are classified as dead rather than linked,
 - the participant establishes a recovery snapshot floor, and
 - snapshots predating that floor return `SnapshotTooOld`.
@@ -648,6 +665,7 @@ chain or writing transaction read set in this implementation.
 
 ### Hot-path constraints
 
+- Pure non-transactional reads and mutations do not access MVCC history.
 - A visible current-head point read does not traverse the history index.
 - Transaction-private state stores a timestamp, not a segment pin.
 - History list operations use Lightning's mostly lock-free ring-buffer list.
@@ -697,8 +715,11 @@ Microbenchmarks compare:
 ### Acceptance
 
 - Every correctness invariant and unexpected-outcome list must be clean.
-- A reproducible regression greater than 5% on a non-historical hot path
-  requires investigation and an alternate design or explicit approval.
+- A reproducible throughput or p99 regression on a pure non-transactional
+  point-cell workload rejects the candidate. Transactional MVCC performance
+  cannot be purchased with direct-path overhead.
+- Both baseline and candidate benchmark populations must have coefficient of
+  variation below 5%.
 - Historical lookup and cleaner costs are compared against
   correctness-equivalent alternatives, not against a system that discards
   history.
