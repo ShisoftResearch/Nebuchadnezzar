@@ -212,44 +212,31 @@ fn snapshot_reads_old_address_after_current_update() {
 }
 
 #[test]
-fn direct_update_reuses_one_chain_resolution_and_preserves_predecessor_snapshot() {
+fn direct_write_and_update_do_not_create_or_resolve_history() {
     let chunks = test_chunks();
     let id = Id::new(1, 105);
+    let history = &chunks.list[0].history;
+    crate::ram::history::take_revision_node_allocations_for_test();
+    history.take_chain_map_resolutions_for_test();
+    history.take_direct_path_activity_for_test();
+
     let mut first = test_cell(id, 10);
     chunks.write_cell(&mut first).unwrap();
-    let predecessor_ts = first.header.revision_ts;
-    let predecessor_address = chunks.address_of(&id);
-    let history = &chunks.list[0].history;
-    history.take_chain_map_resolutions_for_test();
 
     let mut second = test_cell(id, 20);
     chunks.update_cell(&mut second).unwrap();
 
-    assert_eq!(
-        history.take_chain_map_resolutions_for_test(),
-        1,
-        "a successful direct update must resolve its revision chain once"
-    );
     assert!(
-        second.header.revision_ts > predecessor_ts,
-        "the installed direct revision must be newer than its exact predecessor"
+        second.header.revision_ts > first.header.revision_ts,
+        "the direct replacement must have a strictly newer revision"
     );
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 0);
     assert_eq!(
-        history.revision_count_for_test(&id),
-        2,
-        "one direct update must install exactly one successor"
+        crate::ram::history::take_revision_node_allocations_for_test(),
+        0
     );
-    let SnapshotRead::Present(predecessor) = chunks
-        .read_cell_snapshot(&id, second.header.revision_ts)
-        .unwrap()
-    else {
-        panic!("the predecessor must remain visible below the new revision boundary");
-    };
-    assert_eq!(predecessor.header.revision_ts, predecessor_ts);
-    assert_eq!(
-        chunks.history_location(&id, predecessor_ts),
-        Some(predecessor_address)
-    );
+    assert_eq!(history.take_direct_path_activity_for_test(), (0, 0));
+    assert_eq!(history.revision_count_for_test(&id), 0);
 }
 
 #[test]
@@ -269,40 +256,59 @@ fn direct_update_revision_timestamps_are_strictly_increasing() {
 }
 
 #[test]
-fn every_direct_update_entry_point_resolves_its_chain_once() {
+fn every_direct_update_entry_point_bypasses_history() {
     let chunks = test_chunks();
     let history = &chunks.list[0].history;
 
     let update_by_id = Id::new(1, 109);
     let mut update_by_original = test_cell(update_by_id, 10);
-    chunks.write_cell(&mut update_by_original).unwrap();
+    crate::ram::history::take_revision_node_allocations_for_test();
     history.take_chain_map_resolutions_for_test();
+    history.take_direct_path_activity_for_test();
+    chunks.write_cell(&mut update_by_original).unwrap();
+
+    let chunk = &chunks.list[0];
+    let old_location = chunks.address_of(&update_by_id);
+    let old_segment = chunk.locate_segment(old_location).unwrap();
+    let (old_entry, ()) = crate::ram::entry::Entry::decode_from(old_location, |_, _| ());
+    let old_entry_size = old_entry.content_length + crate::ram::entry::ENTRY_HEAD_SIZE as u32;
+    let dead_before = old_segment.dead_space.load(Ordering::Acquire);
+
+    let mut replacement = test_cell(update_by_id, 11);
+    chunks.update_cell(&mut replacement).unwrap();
+
+    assert_eq!(
+        old_segment.dead_space.load(Ordering::Acquire) - dead_before,
+        old_entry_size
+    );
+    let word = chunk
+        .cell_index
+        .get_from_mutex(&(update_by_id.lower as usize))
+        .expect("present direct head");
+    assert_eq!(word, chunks.address_of(&update_by_id));
+    assert_eq!(word & 0b111, 0);
+
     chunks
         .update_cell_by(&update_by_id, |current| {
             let mut updated = current.to_owned();
-            updated.data["score"] = OwnedValue::U64(11);
+            updated.data["score"] = OwnedValue::U64(12);
             Some(updated)
         })
         .unwrap();
-    assert_eq!(history.take_chain_map_resolutions_for_test(), 1);
 
     let guarded_id = Id::new(1, 110);
     let mut guarded_original = test_cell(guarded_id, 20);
     chunks.write_cell(&mut guarded_original).unwrap();
     let mut guarded_update = test_cell(guarded_id, 21);
     let mut guard = chunks.lock_cell_for_write(&guarded_id, true).unwrap();
-    history.take_chain_map_resolutions_for_test();
     guard.update_cell(&mut guarded_update).unwrap();
-    assert_eq!(history.take_chain_map_resolutions_for_test(), 1);
     drop(guard);
 
     let upsert_id = Id::new(1, 111);
     let mut upsert_original = test_cell(upsert_id, 30);
     chunks.write_cell(&mut upsert_original).unwrap();
     let mut upsert_update = test_cell(upsert_id, 31);
-    history.take_chain_map_resolutions_for_test();
     chunks.upsert_cell(&mut upsert_update).unwrap();
-    assert_eq!(history.take_chain_map_resolutions_for_test(), 1);
 
     let guarded_upsert_id = Id::new(1, 112);
     let mut guarded_upsert_original = test_cell(guarded_upsert_id, 40);
@@ -311,9 +317,60 @@ fn every_direct_update_entry_point_resolves_its_chain_once() {
     let mut guard = chunks
         .lock_cell_for_write(&guarded_upsert_id, true)
         .unwrap();
-    history.take_chain_map_resolutions_for_test();
     guard.upsert_cell(&mut guarded_upsert_update).unwrap();
-    assert_eq!(history.take_chain_map_resolutions_for_test(), 1);
+    drop(guard);
+
+    let empty_upsert_id = Id::new(1, 113);
+    let mut empty_upsert = test_cell(empty_upsert_id, 50);
+    chunks.upsert_cell(&mut empty_upsert).unwrap();
+
+    let conditional_update_id = Id::new(1, 114);
+    let mut conditional_update_original = test_cell(conditional_update_id, 60);
+    let conditional_update_revision = chunks
+        .write_cell(&mut conditional_update_original)
+        .unwrap()
+        .revision_ts;
+    let mut conditional_update = test_cell(conditional_update_id, 61);
+    chunks
+        .compare_revision_and_update_cell(
+            &conditional_update_id,
+            conditional_update_revision,
+            &mut conditional_update,
+        )
+        .unwrap();
+
+    let conditional_field_id = Id::new(1, 115);
+    let mut conditional_field_original = test_cell(conditional_field_id, 70);
+    let conditional_field_revision = chunks
+        .write_cell(&mut conditional_field_original)
+        .unwrap()
+        .revision_ts;
+    chunks
+        .compare_revision_and_set_field(
+            &conditional_field_id,
+            conditional_field_revision,
+            hash_str("score"),
+            OwnedValue::U64(71),
+        )
+        .unwrap();
+
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 0);
+    assert_eq!(
+        crate::ram::history::take_revision_node_allocations_for_test(),
+        0
+    );
+    assert_eq!(history.take_direct_path_activity_for_test(), (0, 0));
+    for id in [
+        update_by_id,
+        guarded_id,
+        upsert_id,
+        guarded_upsert_id,
+        empty_upsert_id,
+        conditional_update_id,
+        conditional_field_id,
+    ] {
+        assert_eq!(history.revision_count_for_test(&id), 0);
+    }
 }
 
 #[test]

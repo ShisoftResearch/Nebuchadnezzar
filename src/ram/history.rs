@@ -20,6 +20,9 @@ static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
 #[cfg(test)]
 static ACTIVE_HISTORY_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+static REVISION_NODE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
 fn monotonic_ms() -> u64 {
     PROCESS_EPOCH
         .get_or_init(Instant::now)
@@ -78,6 +81,8 @@ pub struct RevisionNode {
 
 impl RevisionNode {
     pub fn new(revision_ts: u64, state: RevisionState, location: usize, entry_size: u32) -> Self {
+        #[cfg(test)]
+        REVISION_NODE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         assert_eq!(
             location & STATE_MASK,
             0,
@@ -214,6 +219,11 @@ impl RevisionNode {
         self.state_and_location
             .store(location | (tag & STATE_MASK), Ordering::Release);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn take_revision_node_allocations_for_test() -> usize {
+    REVISION_NODE_ALLOCATIONS.swap(0, Ordering::AcqRel)
 }
 
 pub struct RevisionChain {
@@ -566,6 +576,10 @@ pub struct HistoryIndex {
     chains: PtrHashMap<Id, Arc<RevisionChain>>,
     #[cfg(test)]
     chain_map_resolutions: AtomicUsize,
+    #[cfg(test)]
+    expiration_schedules: AtomicUsize,
+    #[cfg(test)]
+    worker_wakes: AtomicUsize,
     chain_creation: Mutex<()>,
     expiration_ingress: LinkedRingBufferList<Option<ScheduledExpiration>, 64>,
     expirations: Mutex<BinaryHeap<ScheduledExpiration>>,
@@ -593,6 +607,10 @@ impl HistoryIndex {
             chains: PtrHashMap::with_capacity(HISTORY_MAP_INITIAL_CAPACITY),
             #[cfg(test)]
             chain_map_resolutions: AtomicUsize::new(0),
+            #[cfg(test)]
+            expiration_schedules: AtomicUsize::new(0),
+            #[cfg(test)]
+            worker_wakes: AtomicUsize::new(0),
             chain_creation: Mutex::new(()),
             expiration_ingress: LinkedRingBufferList::new(),
             expirations: Mutex::new(BinaryHeap::new()),
@@ -788,6 +806,8 @@ impl HistoryIndex {
     }
 
     fn schedule_expiration(&self, expiration: ExpirationRecord) {
+        #[cfg(test)]
+        self.expiration_schedules.fetch_add(1, Ordering::Relaxed);
         let sequence = self.expiration_sequence.fetch_add(1, Ordering::Relaxed);
         self.expiration_ingress
             .push_front(Some(ScheduledExpiration {
@@ -967,6 +987,8 @@ impl HistoryIndex {
     }
 
     fn wake_worker(&self) {
+        #[cfg(test)]
+        self.worker_wakes.fetch_add(1, Ordering::Relaxed);
         if let Some(handle) = self.worker.lock().as_ref() {
             handle.thread().unpark();
         }
@@ -1001,6 +1023,14 @@ impl HistoryIndex {
     #[cfg(test)]
     pub(crate) fn take_chain_map_resolutions_for_test(&self) -> usize {
         self.chain_map_resolutions.swap(0, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_direct_path_activity_for_test(&self) -> (usize, usize) {
+        (
+            self.expiration_schedules.swap(0, Ordering::AcqRel),
+            self.worker_wakes.swap(0, Ordering::AcqRel),
+        )
     }
 
     #[cfg(test)]
