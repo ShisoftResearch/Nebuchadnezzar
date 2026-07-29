@@ -1072,6 +1072,86 @@ impl Chunk {
         self.remove_cell_with_guard_at_revision(guard, id, write)
     }
 
+    fn remove_direct_cell_with_guard(
+        &self,
+        guard: CellGuard<'_>,
+        id: &Id,
+    ) -> Result<(), WriteError> {
+        self.remove_direct_cell_with_guard_for_indexing(guard, id, self.index_builder.is_some())
+    }
+
+    fn remove_direct_cell_with_guard_for_indexing(
+        &self,
+        mut guard: CellGuard<'_>,
+        id: &Id,
+        indexing_required: bool,
+    ) -> Result<(), WriteError> {
+        if guard.is_unassigned() || guard.hash != id.lower {
+            return Err(WriteError::CellDoesNotExisted);
+        }
+        let old_location = guard.get_ptr();
+        let old_header = guard.head_cell().map_err(WriteError::ReadError)?;
+        if Id::from_header(&old_header) != *id {
+            return Err(WriteError::CellDoesNotExisted);
+        }
+        let indexed_old_cell = if indexing_required {
+            let schema = self
+                .meta
+                .schemas
+                .get(&old_header.schema)
+                .ok_or(WriteError::SchemaDoesNotExisted(old_header.schema))?;
+            let (_, data_ptr) =
+                header_from_chunk_raw(old_location).map_err(WriteError::ReadError)?;
+            let compression_plan = if schema.compression_plan.is_empty() {
+                None
+            } else {
+                Some(schema.compression_plan.clone())
+            };
+            let old_cell = SharedCellData::from_data_with_plan(
+                old_header,
+                crate::ram::io::reader::read_by_schema(data_ptr, &schema),
+                compression_plan,
+            );
+            Some((old_cell, schema))
+        } else {
+            None
+        };
+        let revision_ts = self.next_revision_ts(old_header.revision_ts)?;
+        let old_segment = self.locate_segment_ensured(old_location, id);
+        let old_entry_size = self.entry_size_at(old_location);
+
+        let pending_entry = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true)?;
+        let tombstone_segment = pending_entry.seg.clone();
+        Tombstone::put(
+            pending_entry.addr,
+            old_segment.seq_id,
+            revision_ts,
+            id.higher,
+            id.lower,
+        );
+        pending_entry.finish()?;
+        tombstone_segment.tombstones.fetch_add(1, Ordering::Relaxed);
+        tombstone_segment.note_dead_bytes_change();
+
+        if let Some((old_cell, schema)) = indexed_old_cell {
+            #[cfg(test)]
+            if !schema.index_fields.is_empty() || schema.is_scannable {
+                self.secondary_index_removal_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            let shared = SharedCell::compose(old_cell, guard);
+            self.index_builder
+                .as_ref()
+                .expect("indexing preflight requires an index builder")
+                .remove_indices(&shared, &schema);
+            guard = shared.into_cell_guard();
+        }
+        guard.remove_index_entry();
+        self.refresh_statistics_for_schema(old_header.schema);
+        self.mark_dead_entry_with_size(old_location, old_entry_size, &old_segment);
+        Ok(())
+    }
+
     fn remove_cell_with_guard_at_revision(
         &self,
         guard: CellGuard<'_>,
@@ -1447,36 +1527,28 @@ impl Chunk {
         Ok(new_cell)
     }
 
-    fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
-        let mut guard =
-            CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
-        let header = guard.head_cell().map_err(WriteError::ReadError)?;
-        let revision_ts = self.next_revision_ts(header.revision_ts)?;
-        self.remove_cell_with_guard_at_revision(
-            guard,
-            &header.id(),
-            RevisionWrite::committed(revision_ts),
-        )?;
+    fn remove_cell(&self, id: &Id) -> Result<(), WriteError> {
+        let guard =
+            CellGuard::for_write(id.lower, true, self).ok_or(WriteError::CellDoesNotExisted)?;
+        self.remove_direct_cell_with_guard(guard, id)?;
         Ok(())
     }
 
-    fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
+    fn remove_cell_by<P>(&self, id: &Id, predict: P) -> Result<(), WriteError>
     where
         P: Fn(&SharedCell) -> bool,
     {
-        let guard = CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
+        let guard =
+            CellGuard::for_write(id.lower, true, self).ok_or(WriteError::CellDoesNotExisted)?;
         let (cell, _) =
-            SharedCell::from_chunk_raw(hash, guard, self).map_err(WriteError::ReadError)?;
+            SharedCell::from_chunk_raw(id.lower, guard, self).map_err(WriteError::ReadError)?;
+        if cell.id() != *id {
+            return Err(WriteError::CellDoesNotExisted);
+        }
         if !predict(&cell) {
             return Err(WriteError::CellDoesNotExisted);
         }
-        let header = cell.header;
-        let revision_ts = self.next_revision_ts(header.revision_ts)?;
-        self.remove_cell_with_guard_at_revision(
-            cell.into_cell_guard(),
-            &header.id(),
-            RevisionWrite::committed(revision_ts),
-        )?;
+        self.remove_direct_cell_with_guard(cell.into_cell_guard(), id)?;
         Ok(())
     }
 
@@ -1874,11 +1946,15 @@ impl Chunk {
     }
 
     pub fn live_entries<'a>(&'a self, seg: &'a Segment) -> impl Iterator<Item = Entry> + 'a {
+        let oldest_resident_seq = self
+            .segments()
+            .into_iter()
+            .map(|segment| segment.seq_id)
+            .min();
         seg.entry_iter()
             .filter_map(move |entry_meta| {
                 let chunk_id = &self.id;
                 let chunk_index = &self.cell_index;
-                let chunk_segs = &self.segs;
                 let entry_size = entry_meta.entry_size;
                 let entry_header = entry_meta.entry_header;
                 trace!("Iterating live entries on chunk {} segment {}. Got {:?} at {} size {}",
@@ -1899,7 +1975,12 @@ impl Chunk {
                         trace!("Cell header read, id is {:?}", cell_header.id());
                         let expect = Some(entry_meta.entry_pos);
                         let actual = chunk_index.get_from_mutex(&(cell_header.hash as usize));
-                        if expect == actual {
+                        let history_live = self.history.is_live_at(
+                            cell_header.id(),
+                            cell_header.revision_ts,
+                            entry_meta.entry_pos,
+                        );
+                        if expect == actual || history_live {
                             trace!(
                                 "Cell entry {:?} is valid", cell_header.id()
                             );
@@ -1917,8 +1998,15 @@ impl Chunk {
                         trace!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        let contains_seg = chunk_segs.contains_seq_id(tombstone.segment_seq_id);
-                        if contains_seg {
+                        let id = Id::new(tombstone.partition, tombstone.hash);
+                        let history_live = self.history.is_live_at(
+                            id,
+                            tombstone.revision_ts,
+                            entry_meta.entry_pos,
+                        );
+                        let direct_tombstone_live = oldest_resident_seq
+                            .is_some_and(|oldest| oldest <= tombstone.segment_seq_id);
+                        if history_live || direct_tombstone_live {
                             trace!("Tomestone entry {:?} - {:?} at seq_id {} is valid",
                                    tombstone.partition, tombstone.hash, tombstone.segment_seq_id);
                             return Some(Entry {
@@ -1926,7 +2014,7 @@ impl Chunk {
                                 content: EntryContent::Tombstone(tombstone)
                             });
                         } else {
-                            trace!("Tombstone target at seq_id {} have been removed, will be ditched", tombstone.segment_seq_id)
+                            trace!("Tombstone watermark at seq_id {} has expired, will be ditched", tombstone.segment_seq_id)
                         }
                 } else {
                     unreachable!(
@@ -2595,8 +2683,8 @@ impl Chunks {
         chunk.upsert_cell_at_revision(cell, write)
     }
     pub fn remove_cell(&self, key: &Id) -> Result<(), WriteError> {
-        let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.remove_cell(hash);
+        let (chunk, _) = self.locate_chunk_by_key(key);
+        return chunk.remove_cell(key);
     }
     pub fn remove_cell_at_revision(
         &self,
@@ -2622,8 +2710,8 @@ impl Chunks {
     where
         P: Fn(&SharedCell) -> bool,
     {
-        let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.remove_cell_by(hash, predict);
+        let (chunk, _) = self.locate_chunk_by_key(key);
+        return chunk.remove_cell_by(key, predict);
     }
     pub fn address_of(&self, key: &Id) -> usize {
         let (chunk, hash) = self.locate_chunk_by_key(key);
@@ -3215,7 +3303,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_less_remove_without_indexer_publishes_tombstone() {
+    fn schema_less_direct_remove_without_indexer_publishes_physical_tombstone() {
         let (chunks, schema) = setup_test_chunks();
         let id = Id::new(1, 41);
         let mut cell = payload_cell(schema.id, &id, 16);
@@ -3228,9 +3316,26 @@ mod tests {
             chunks.read_cell(&id),
             Err(ReadError::CellDoesNotExisted)
         ));
-        let current = chunks.list[0].history.current(&id).unwrap();
-        assert_eq!(current.load().0, RevisionState::CommittedDeleted);
-        assert!(current.revision_ts > cell.header.revision_ts);
+        let chunk = &chunks.list[0];
+        assert_eq!(chunk.history.revision_count_for_test(&id), 0);
+        let tombstone = chunk
+            .segments()
+            .into_iter()
+            .flat_map(|segment| {
+                segment
+                    .entry_iter()
+                    .filter_map(|entry| {
+                        if entry.entry_header.entry_type != EntryType::TOMBSTONE {
+                            return None;
+                        }
+                        let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                        (Id::new(tombstone.partition, tombstone.hash) == id).then_some(tombstone)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .next()
+            .expect("direct tombstone");
+        assert!(tombstone.revision_ts > cell.header.revision_ts);
     }
 
     #[test]
@@ -3244,35 +3349,54 @@ mod tests {
 
         let chunk = &chunks.list[0];
         let original_addr = chunks.address_of(&id);
-        let original_current = chunk.history.current(&id).unwrap();
-        let original_segment = chunk.locate_segment(original_addr).unwrap();
-        let original_append = original_segment.append_header.load(Ordering::Acquire);
-        let original_tombstones = original_segment.tombstones.load(Ordering::Acquire);
+        let original_raw_index = chunk
+            .cell_index
+            .get_from_mutex(&(id.lower as usize))
+            .unwrap();
+        let head_segment = chunk.segs.get(&(chunk.get_head_seg_id() as usize)).unwrap();
+        let original_append = head_segment.append_header.load(Ordering::Acquire);
+        let original_tombstones: u32 = chunk
+            .segments()
+            .iter()
+            .map(|segment| segment.tombstones.load(Ordering::Acquire))
+            .sum();
+        let original_dead_space: u32 = chunk
+            .segments()
+            .iter()
+            .map(|segment| segment.dead_space.load(Ordering::Acquire))
+            .sum();
         let guard = CellGuard::for_write(id.lower, true, chunk).unwrap();
 
-        let result = chunk.remove_cell_with_guard_at_revision_for_indexing(
-            guard,
-            &id,
-            RevisionWrite::committed(cell.header.revision_ts + 1),
-            true,
-        );
+        let result = chunk.remove_direct_cell_with_guard_for_indexing(guard, &id, true);
 
         assert!(matches!(
             result,
             Err(WriteError::SchemaDoesNotExisted(id)) if id == missing_schema_id
         ));
-        assert_eq!(chunks.address_of(&id), original_addr);
-        assert!(Arc::ptr_eq(
-            &chunk.history.current(&id).unwrap(),
-            &original_current
-        ));
         assert_eq!(
-            original_segment.append_header.load(Ordering::Acquire),
+            chunk.cell_index.get_from_mutex(&(id.lower as usize)),
+            Some(original_raw_index)
+        );
+        assert_eq!(chunks.address_of(&id), original_addr);
+        assert_eq!(
+            head_segment.append_header.load(Ordering::Acquire),
             original_append
         );
         assert_eq!(
-            original_segment.tombstones.load(Ordering::Acquire),
+            chunk
+                .segments()
+                .iter()
+                .map(|segment| segment.tombstones.load(Ordering::Acquire))
+                .sum::<u32>(),
             original_tombstones
+        );
+        assert_eq!(
+            chunk
+                .segments()
+                .iter()
+                .map(|segment| segment.dead_space.load(Ordering::Acquire))
+                .sum::<u32>(),
+            original_dead_space
         );
         assert_eq!(chunks.secondary_index_removal_attempts_for_test(&id), 0);
     }

@@ -639,6 +639,39 @@ fn failed_delete_preserves_current_cell_and_secondary_indices() {
 }
 
 #[test]
+fn failed_direct_delete_preserves_raw_current_without_history_activity() {
+    let chunks = test_chunks();
+    let id = Id::new(1, 108);
+    let mut cell = test_cell(id, 10);
+    chunks.write_cell(&mut cell).unwrap();
+    let chunk = &chunks.list[0];
+    let original_address = chunks.address_of(&id);
+    let original_accounting = physical_accounting(&chunks);
+    crate::ram::history::take_revision_node_allocations_for_test();
+    chunk.history.take_chain_map_resolutions_for_test();
+    chunk.history.take_direct_path_activity_for_test();
+    chunks.fail_next_allocation_for_test(&id);
+
+    assert!(matches!(
+        chunks.remove_cell(&id),
+        Err(WriteError::CannotAllocateSpace)
+    ));
+    assert_eq!(chunks.address_of(&id), original_address);
+    assert_eq!(physical_accounting(&chunks), original_accounting);
+    assert_eq!(chunk.history.take_chain_map_resolutions_for_test(), 0);
+    assert_eq!(
+        crate::ram::history::take_revision_node_allocations_for_test(),
+        0
+    );
+    assert_eq!(chunk.history.take_direct_path_activity_for_test(), (0, 0));
+    assert_eq!(chunk.history.revision_count_for_test(&id), 0);
+    assert_eq!(
+        chunks.read_cell(&id).unwrap().data["score"].u64(),
+        Some(&10)
+    );
+}
+
+#[test]
 fn failed_direct_insert_releases_cell_index_reservation() {
     let chunks = test_chunks();
     let id = Id::new(1, 108);
@@ -997,15 +1030,26 @@ fn legacy_upsert_and_guard_update_publish_new_current_revisions() {
 }
 
 #[test]
-fn legacy_guard_upsert_of_empty_slot_publishes_history() {
+fn direct_guard_upsert_of_empty_slot_bypasses_history() {
     let chunks = test_chunks();
     let id = Id::new(1, 101);
+    let history = &chunks.list[0].history;
+    crate::ram::history::take_revision_node_allocations_for_test();
+    history.take_chain_map_resolutions_for_test();
+    history.take_direct_path_activity_for_test();
     let mut cell = test_cell(id, 10);
     chunks.list[0]
         .lock_or_insert_cell(id.lower)
         .upsert_cell(&mut cell)
         .unwrap();
 
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 0);
+    assert_eq!(
+        crate::ram::history::take_revision_node_allocations_for_test(),
+        0
+    );
+    assert_eq!(history.take_direct_path_activity_for_test(), (0, 0));
+    assert_eq!(history.revision_count_for_test(&id), 0);
     assert!(matches!(
         chunks.read_cell_snapshot(&id, u64::MAX).unwrap(),
         SnapshotRead::Present(_)
@@ -1013,25 +1057,132 @@ fn legacy_guard_upsert_of_empty_slot_publishes_history() {
 }
 
 #[test]
-fn legacy_remove_paths_publish_revision_aware_tombstones() {
+fn direct_remove_paths_bypass_history_and_keep_cells_absent() {
     let chunks = test_chunks();
+    let chunk = &chunks.list[0];
+    let history = &chunk.history;
     let direct_id = Id::new(1, 102);
     let mut direct = test_cell(direct_id, 10);
     chunks.write_cell(&mut direct).unwrap();
+    let old_location = chunks.address_of(&direct_id);
+    let old_segment = chunk.locate_segment(old_location).unwrap();
+    let (old_entry, ()) = crate::ram::entry::Entry::decode_from(old_location, |_, _| ());
+    let old_entry_size = old_entry.content_length + crate::ram::entry::ENTRY_HEAD_SIZE as u32;
+    let dead_before = old_segment.dead_space.load(Ordering::Acquire);
+    crate::ram::history::take_revision_node_allocations_for_test();
+    history.take_chain_map_resolutions_for_test();
+    history.take_direct_path_activity_for_test();
+
     chunks.remove_cell(&direct_id).unwrap();
+
+    assert!(chunk
+        .cell_index
+        .get_from_mutex(&(direct_id.lower as usize))
+        .is_none());
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 0);
+    assert_eq!(
+        crate::ram::history::take_revision_node_allocations_for_test(),
+        0
+    );
+    assert_eq!(history.take_direct_path_activity_for_test(), (0, 0));
+    assert_eq!(history.revision_count_for_test(&direct_id), 0);
+    assert_eq!(chunks.count(), 0);
+    assert_eq!(chunks.clear_cell_index(), 0);
+    assert_eq!(
+        old_segment.dead_space.load(Ordering::Acquire) - dead_before,
+        old_entry_size
+    );
     assert!(matches!(
         chunks.read_cell_snapshot(&direct_id, u64::MAX).unwrap(),
-        SnapshotRead::Absent(Some(_))
+        SnapshotRead::Absent(None)
     ));
+    let direct_tombstone = chunk
+        .segments()
+        .into_iter()
+        .flat_map(|segment| {
+            segment
+                .entry_iter()
+                .filter_map(|entry| {
+                    if entry.entry_header.entry_type != crate::ram::entry::EntryType::TOMBSTONE {
+                        return None;
+                    }
+                    let tombstone = crate::ram::tombstone::Tombstone::read_from_entry_content_addr(
+                        entry.body_pos,
+                    );
+                    (Id::new(tombstone.partition, tombstone.hash) == direct_id).then_some(tombstone)
+                })
+                .collect::<Vec<_>>()
+        })
+        .next()
+        .expect("durable direct tombstone");
+    assert_eq!(direct_tombstone.segment_seq_id, old_segment.seq_id);
 
     let predicted_id = Id::new(1, 103);
     let mut predicted = test_cell(predicted_id, 20);
     chunks.write_cell(&mut predicted).unwrap();
+    let old_location = chunks.address_of(&predicted_id);
+    let old_segment = chunk.locate_segment(old_location).unwrap();
+    let (old_entry, ()) = crate::ram::entry::Entry::decode_from(old_location, |_, _| ());
+    let old_entry_size = old_entry.content_length + crate::ram::entry::ENTRY_HEAD_SIZE as u32;
+    let dead_before = old_segment.dead_space.load(Ordering::Acquire);
+    crate::ram::history::take_revision_node_allocations_for_test();
+    history.take_chain_map_resolutions_for_test();
+    history.take_direct_path_activity_for_test();
+
     chunks.remove_cell_by(&predicted_id, |_| true).unwrap();
+
+    assert!(chunk
+        .cell_index
+        .get_from_mutex(&(predicted_id.lower as usize))
+        .is_none());
+    assert_eq!(history.take_chain_map_resolutions_for_test(), 0);
+    assert_eq!(
+        crate::ram::history::take_revision_node_allocations_for_test(),
+        0
+    );
+    assert_eq!(history.take_direct_path_activity_for_test(), (0, 0));
+    assert_eq!(history.revision_count_for_test(&predicted_id), 0);
+    assert_eq!(chunks.count(), 0);
+    assert_eq!(chunks.clear_cell_index(), 0);
+    assert_eq!(
+        old_segment.dead_space.load(Ordering::Acquire) - dead_before,
+        old_entry_size
+    );
     assert!(matches!(
         chunks.read_cell_snapshot(&predicted_id, u64::MAX).unwrap(),
-        SnapshotRead::Absent(Some(_))
+        SnapshotRead::Absent(None)
     ));
+}
+
+#[test]
+fn direct_remove_paths_reject_full_id_collisions_without_side_effects() {
+    for remove_by in [false, true] {
+        let chunks = test_chunks();
+        let original_id = Id::new(1, 104);
+        let colliding_id = Id::new(2, original_id.lower);
+        let mut original = test_cell(original_id, 10);
+        chunks.write_cell(&mut original).unwrap();
+        let original_address = chunks.address_of(&original_id);
+        let original_accounting = physical_accounting(&chunks);
+
+        let result = if remove_by {
+            chunks.remove_cell_by(&colliding_id, |_| true)
+        } else {
+            chunks.remove_cell(&colliding_id)
+        };
+
+        assert!(matches!(result, Err(WriteError::CellDoesNotExisted)));
+        assert_eq!(chunks.address_of(&original_id), original_address);
+        assert_eq!(physical_accounting(&chunks), original_accounting);
+        assert_eq!(
+            chunks.read_cell(&original_id).unwrap().data["score"].u64(),
+            Some(&10)
+        );
+        assert_eq!(
+            chunks.list[0].history.revision_count_for_test(&original_id),
+            0
+        );
+    }
 }
 
 #[test]

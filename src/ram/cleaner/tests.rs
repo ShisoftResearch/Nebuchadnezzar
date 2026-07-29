@@ -14,6 +14,7 @@ use crate::ram::schema::*;
 use crate::ram::segs::{
     SegmentAllocator, SegmentExclusiveRefGuard, SegmentReferenceGuard, SEGMENT_SIZE,
 };
+use crate::ram::tombstone::Tombstone;
 use crate::ram::types::*;
 use crate::server::transactions::undo_log::{UndoLogEntry, UndoLogger, UndoOpType};
 use crate::server::ServerMeta;
@@ -203,6 +204,209 @@ fn assert_relocated_revision(
         "retained revision {revision_ts} must point into a published destination segment"
     );
     location
+}
+
+#[test]
+fn direct_tombstone_survives_after_predecessor_segment_is_cleaned_first() {
+    let wal_dir = tempfile::TempDir::new().unwrap();
+    let raft_dir = tempfile::TempDir::new().unwrap();
+    let wal_path = wal_dir.path().to_string_lossy().into_owned();
+    let raft_path = raft_dir.path().to_string_lossy().into_owned();
+    let (chunks, schema) = retained_revision_chunks_with_wal(8, wal_path.clone());
+    let chunk = &chunks.list[0];
+    let id = Id::new(69, 8_801);
+
+    let mut revision_a = revision_cell(schema.id, &id, 10);
+    chunks.write_cell(&mut revision_a).unwrap();
+    let oldest_segment = chunk
+        .locate_segment(chunks.address_of(&id))
+        .expect("oldest direct revision segment");
+    force_next_write_to_new_segment(chunk);
+
+    let mut revision_b = revision_cell(schema.id, &id, 20);
+    chunks.update_cell(&mut revision_b).unwrap();
+    let predecessor_segment = chunk
+        .locate_segment(chunks.address_of(&id))
+        .expect("deleted predecessor segment");
+    force_next_write_to_new_segment(chunk);
+
+    chunks.remove_cell(&id).unwrap();
+    let tombstone_segment = chunk
+        .segments()
+        .into_iter()
+        .find(|segment| {
+            segment.entry_iter().any(|entry| {
+                if entry.entry_header.entry_type != EntryType::TOMBSTONE {
+                    return false;
+                }
+                let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                Id::new(tombstone.partition, tombstone.hash) == id
+                    && tombstone.segment_seq_id == predecessor_segment.seq_id
+            })
+        })
+        .expect("direct tombstone segment");
+    assert_eq!(chunk.history.revision_count_for_test(&id), 0);
+    force_next_write_to_new_segment(chunk);
+
+    let filler_id = Id::new(69, 8_802);
+    let mut filler = revision_cell(schema.id, &filler_id, 30);
+    chunks.write_cell(&mut filler).unwrap();
+    let filler_segment = chunk
+        .locate_segment(chunks.address_of(&filler_id))
+        .expect("first filler segment");
+    force_next_write_to_new_segment(chunk);
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(
+        chunk,
+        &vec![predecessor_segment.clone(), filler_segment],
+    )
+    .unwrap();
+    assert_eq!(reduced, 1);
+    assert!(chunk.segs.contains_seq_id(oldest_segment.seq_id));
+    assert!(!chunk.segs.contains_seq_id(predecessor_segment.seq_id));
+    assert!(chunks.read_cell(&id).is_err());
+
+    let relocated_filler_segment = chunk
+        .locate_segment(chunks.address_of(&filler_id))
+        .expect("relocated filler segment");
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(
+        chunk,
+        &vec![tombstone_segment, relocated_filler_segment],
+    )
+    .unwrap();
+    assert_eq!(reduced, 1);
+    assert!(chunk.segs.contains_seq_id(oldest_segment.seq_id));
+    assert!(!chunk.segs.contains_seq_id(predecessor_segment.seq_id));
+    assert!(chunks.read_cell(&id).is_err());
+    assert_eq!(chunk.history.revision_count_for_test(&id), 0);
+
+    drop(chunks);
+    let recovered = recover_retained_revision_chunks_with_wal(8, wal_path, raft_path, schema);
+    assert!(recovered.read_cell(&id).is_err());
+    // Task 4's raw-recovery conversion will additionally require that the
+    // recovered physical tombstone creates no HistoryIndex chain.
+}
+
+#[test]
+fn direct_tombstone_expires_after_every_older_segment_is_removed() {
+    let (chunks, schema) = retained_revision_chunks(8);
+    let chunk = &chunks.list[0];
+    let id = Id::new(69, 8_811);
+
+    let mut revision_a = revision_cell(schema.id, &id, 10);
+    chunks.write_cell(&mut revision_a).unwrap();
+    let oldest_segment = chunk
+        .locate_segment(chunks.address_of(&id))
+        .expect("oldest direct revision segment");
+    force_next_write_to_new_segment(chunk);
+
+    let mut revision_b = revision_cell(schema.id, &id, 20);
+    chunks.update_cell(&mut revision_b).unwrap();
+    let predecessor_segment = chunk
+        .locate_segment(chunks.address_of(&id))
+        .expect("deleted predecessor segment");
+    force_next_write_to_new_segment(chunk);
+
+    chunks.remove_cell(&id).unwrap();
+    let tombstone_segment = chunk
+        .segments()
+        .into_iter()
+        .find(|segment| {
+            segment.entry_iter().any(|entry| {
+                if entry.entry_header.entry_type != EntryType::TOMBSTONE {
+                    return false;
+                }
+                let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                Id::new(tombstone.partition, tombstone.hash) == id
+                    && tombstone.segment_seq_id == predecessor_segment.seq_id
+            })
+        })
+        .expect("direct tombstone segment");
+    assert_eq!(chunk.history.revision_count_for_test(&id), 0);
+    force_next_write_to_new_segment(chunk);
+
+    let first_filler_id = Id::new(69, 8_812);
+    let mut first_filler = revision_cell(schema.id, &first_filler_id, 30);
+    chunks.write_cell(&mut first_filler).unwrap();
+    let first_filler_segment = chunk
+        .locate_segment(chunks.address_of(&first_filler_id))
+        .expect("first filler segment");
+    force_next_write_to_new_segment(chunk);
+
+    let second_filler_id = Id::new(69, 8_813);
+    let mut second_filler = revision_cell(schema.id, &second_filler_id, 40);
+    chunks.write_cell(&mut second_filler).unwrap();
+    let second_filler_segment = chunk
+        .locate_segment(chunks.address_of(&second_filler_id))
+        .expect("second filler segment");
+    force_next_write_to_new_segment(chunk);
+    chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(
+        chunk,
+        &vec![predecessor_segment.clone(), first_filler_segment],
+    )
+    .unwrap();
+    assert_eq!(reduced, 1);
+    let relocated_first_filler_segment = chunk
+        .locate_segment(chunks.address_of(&first_filler_id))
+        .expect("relocated first filler segment");
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(
+        chunk,
+        &vec![tombstone_segment, relocated_first_filler_segment],
+    )
+    .unwrap();
+    assert_eq!(reduced, 1);
+    let relocated_tombstone_segment = chunk
+        .segments()
+        .into_iter()
+        .find(|segment| {
+            segment.entry_iter().any(|entry| {
+                entry.entry_header.entry_type == EntryType::TOMBSTONE && {
+                    let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                    Id::new(tombstone.partition, tombstone.hash) == id
+                }
+            })
+        })
+        .expect("relocated direct tombstone segment");
+
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(
+        chunk,
+        &vec![oldest_segment.clone(), second_filler_segment],
+    )
+    .unwrap();
+    assert_eq!(reduced, 1);
+    assert!(!chunk.segs.contains_seq_id(oldest_segment.seq_id));
+    assert!(!chunk.segs.contains_seq_id(predecessor_segment.seq_id));
+
+    let relocated_second_filler_segment = chunk
+        .locate_segment(chunks.address_of(&second_filler_id))
+        .expect("relocated second filler segment");
+    let (_, reduced) = combine::CombinedCleaner::combine_segments(
+        chunk,
+        &vec![relocated_tombstone_segment, relocated_second_filler_segment],
+    )
+    .unwrap();
+    assert_eq!(reduced, 1);
+
+    let tombstones = chunk
+        .segments()
+        .into_iter()
+        .flat_map(|segment| {
+            segment
+                .entry_iter()
+                .filter_map(|entry| {
+                    if entry.entry_header.entry_type != EntryType::TOMBSTONE {
+                        return None;
+                    }
+                    let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                    (Id::new(tombstone.partition, tombstone.hash) == id).then_some(())
+                })
+                .collect::<Vec<_>>()
+        })
+        .count();
+    assert_eq!(tombstones, 0);
 }
 
 #[test]
@@ -1828,29 +2032,24 @@ pub fn full_clean_cycle_without_compact() {
         .live_entries(&chunk.segs.get(&1).unwrap())
         .collect::<Vec<_>>();
 
-    // The first combine must retain every historical cell and therefore
-    // cannot reduce two nearly-full source segments.
+    // Direct predecessors are dead immediately. The first combine therefore
+    // keeps only current cells plus direct tombstones whose source-sequence
+    // watermarks are live while these two source segments are resident.
     {
         // Cleaner refuses to work on head segment; set head to dummy to include both segments
         chunk
             .head_seg_id
             .store(1234, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            combine::CombinedCleaner::combine_segments(chunk, &chunk.segments()).unwrap(),
-            (0, 0)
-        );
-        assert_eq!(chunk.segments().len(), 2);
-    }
-
-    // Once the superseded cells expire, a repeated combine may reclaim them,
-    // but the eight logical current tombstones still have to move with the
-    // eight current present cells.
-    chunk.history.expire_due_for_test(u64::MAX);
-    chunk.drain_history_dead();
-    {
         let (_, reduced) =
             combine::CombinedCleaner::combine_segments(chunk, &chunk.segments()).unwrap();
         assert_eq!(reduced, 1);
+    }
+
+    // Once both sources are gone, live_entries applies the same watermark and
+    // history/raw ownership rule as the cleaner. The copied tombstones are no
+    // longer live, although they remain physical until another combine has at
+    // least two source segments to process.
+    {
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
             .map(|entry| {
@@ -1867,7 +2066,7 @@ pub fn full_clean_cycle_without_compact() {
         assert_eq!(
             chunk.segments()[0].entry_iter().count(),
             16,
-            "current tombstones remain physical retained revisions"
+            "expired copied tombstones remain physical until a later combine"
         );
         (0..8)
             .map(|n| n as u64 * 2 + 1)

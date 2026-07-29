@@ -61,6 +61,7 @@ struct DummyEntry {
     key: RevisionKey,
     kind: RevisionKind,
     history_live: bool,
+    direct_tombstone_live: bool,
 }
 
 struct Relocation {
@@ -70,6 +71,7 @@ struct Relocation {
     kind: RevisionKind,
     entry_size: usize,
     history_live: bool,
+    direct_tombstone_live: bool,
 }
 
 struct UnpublishedSegment<'a> {
@@ -229,9 +231,14 @@ impl CombinedCleaner {
         // liveness and deduplication identity.
         use std::collections::HashMap;
         let mut revisions: HashMap<RevisionKey, DummyEntry> = HashMap::new();
+        let oldest_resident_seq = chunk
+            .segments()
+            .into_iter()
+            .map(|segment| segment.seq_id)
+            .min();
 
         for entry in segments.iter().flat_map(|segment| segment.entry_iter()) {
-            let key_and_kind = match entry.entry_header.entry_type {
+            let (key, kind, direct_tombstone_live) = match entry.entry_header.entry_type {
                 EntryType::CELL => {
                     let header = cell::cell_header_from_entry_content_addr(entry.body_pos);
                     (
@@ -240,6 +247,7 @@ impl CombinedCleaner {
                             revision_ts: header.revision_ts,
                         },
                         RevisionKind::Cell,
+                        false,
                     )
                 }
                 EntryType::TOMBSTONE => {
@@ -250,18 +258,19 @@ impl CombinedCleaner {
                             revision_ts: tombstone.revision_ts,
                         },
                         RevisionKind::Tombstone,
+                        oldest_resident_seq
+                            .is_some_and(|oldest| oldest <= tombstone.segment_seq_id),
                     )
                 }
                 EntryType::UNDECIDED => continue,
             };
-            let (key, kind) = key_and_kind;
             let history_live = chunk
                 .history
                 .is_live_at(key.id, key.revision_ts, entry.entry_pos);
             let current_index_target = kind == RevisionKind::Cell
                 && chunk.cell_index.get_from_mutex(&(key.id.lower as usize))
                     == Some(entry.entry_pos);
-            if !history_live && !current_index_target {
+            if !history_live && !current_index_target && !direct_tombstone_live {
                 continue;
             }
 
@@ -271,6 +280,7 @@ impl CombinedCleaner {
                 key,
                 kind,
                 history_live,
+                direct_tombstone_live,
             };
             revisions
                 .entry(key)
@@ -375,6 +385,7 @@ impl CombinedCleaner {
                             kind: entry.kind,
                             entry_size: entry.size,
                             history_live: entry.history_live,
+                            direct_tombstone_live: entry.direct_tombstone_live,
                         });
                         seg_cursor += entry.size;
                     }
@@ -484,6 +495,10 @@ impl CombinedCleaner {
                                                         .store(false, Ordering::Release);
                                                 }
                                             }
+                                        } else if relocation.kind == RevisionKind::Tombstone
+                                            && relocation.direct_tombstone_live
+                                        {
+                                            return;
                                         }
                                         chunk.mark_dead_entry_with_size(
                                             relocation.new,

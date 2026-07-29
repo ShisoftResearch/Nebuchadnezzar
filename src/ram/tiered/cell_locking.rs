@@ -2,7 +2,7 @@ use crate::ram::cell::cell_hash_from_entry_content_addr;
 use crate::ram::chunk::Chunk;
 use crate::ram::entry::EntryType;
 use crate::ram::segs::{Segment, SegmentEntryIter};
-use lightning::map::{Map, WordMutexGuard};
+use lightning::map::WordMutexGuard;
 use std::collections::HashSet;
 use std::io;
 
