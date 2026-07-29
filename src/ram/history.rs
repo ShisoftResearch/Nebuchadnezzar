@@ -586,7 +586,6 @@ pub struct HistoryIndex {
     retention_ms: u64,
     recovery_floor: AtomicU64,
     stopped: AtomicBool,
-    notification_pending: AtomicBool,
     published_worker_wake_ms: AtomicU64,
     worker_thread: OnceLock<thread::Thread>,
     worker_join: Mutex<Option<JoinHandle<()>>>,
@@ -626,7 +625,6 @@ impl HistoryIndex {
             retention_ms,
             recovery_floor: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-            notification_pending: AtomicBool::new(false),
             published_worker_wake_ms: AtomicU64::new(0),
             worker_thread: OnceLock::new(),
             worker_join: Mutex::new(None),
@@ -654,7 +652,6 @@ impl HistoryIndex {
                     // while no wake is published must leave an unpark token for
                     // the scan-to-park race.
                     history.published_worker_wake_ms.store(0, Ordering::Release);
-                    history.notification_pending.swap(false, Ordering::AcqRel);
                     if history.stopped.load(Ordering::Acquire) {
                         break;
                     }
@@ -1014,9 +1011,6 @@ impl HistoryIndex {
     }
 
     fn wake_worker(&self) {
-        if self.notification_pending.swap(true, Ordering::AcqRel) {
-            return;
-        }
         if let Some(worker_thread) = self.worker_thread.get() {
             #[cfg(test)]
             self.worker_wakes.fetch_add(1, Ordering::AcqRel);
@@ -1190,66 +1184,6 @@ mod tests {
             ),
             deadline_ms,
         }
-    }
-
-    fn retire_independent_revisions(
-        history: &HistoryIndex,
-        count: usize,
-    ) -> Vec<Arc<RevisionNode>> {
-        (0..count)
-            .map(|index| {
-                let chain = Arc::new(RevisionChain::new());
-                let retired = node(
-                    100 + index as u64,
-                    RevisionState::CommittedPresent,
-                    0x1000 + index * 8,
-                );
-                chain.push_front(retired.clone());
-                chain.push_front(node(
-                    1_000 + index as u64,
-                    RevisionState::CommittedPresent,
-                    0x2000 + index * 8,
-                ));
-                assert!(history.retire(&chain, &retired));
-                retired
-            })
-            .collect()
-    }
-
-    fn wait_for_expired_revisions(
-        history: &HistoryIndex,
-        revisions: &[Arc<RevisionNode>],
-    ) -> Vec<usize> {
-        let timeout = Instant::now() + Duration::from_secs(2);
-        while !revisions
-            .iter()
-            .all(|revision| revision.load().0 == RevisionState::Expired)
-        {
-            assert!(
-                Instant::now() < timeout,
-                "history worker did not expire every notified revision"
-            );
-            thread::yield_now();
-        }
-
-        let mut dead_locations = Vec::with_capacity(revisions.len());
-        while dead_locations.len() < revisions.len() {
-            if let Some(dead) = history.pop_dead() {
-                dead_locations.push(dead.location);
-                continue;
-            }
-            assert!(
-                Instant::now() < timeout,
-                "history worker did not report every expired revision"
-            );
-            thread::yield_now();
-        }
-        assert!(
-            history.pop_dead().is_none(),
-            "notified revisions must enter the dead queue exactly once"
-        );
-        dead_locations.sort_unstable();
-        dead_locations
     }
 
     fn wait_for_worker_count(expected: usize) {
@@ -1595,65 +1529,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_earlier_deadline_requests_coalesce_to_one_actual_unpark() {
-        const PRODUCERS: usize = 32;
-        const NOW_MS: u64 = 10_000;
-        const PUBLISHED_WAKE_MS: u64 = 20_000;
-
-        let history = HistoryIndex::new(300_000);
-        history
-            .pause_after_wake_publication
-            .store(true, Ordering::Release);
-        history.wait_for_worker_pause_for_test(
-            &history.worker_paused_after_wake_publication,
-            "published-wake pre-park",
-        );
-        history
-            .published_worker_wake_ms
-            .store(PUBLISHED_WAKE_MS, Ordering::Release);
-        history.worker_wakes.store(0, Ordering::Release);
-        assert!(
-            !history.notification_pending.load(Ordering::Acquire),
-            "the worker must acknowledge any prior notification before scanning"
-        );
-
-        let chain = Arc::new(RevisionChain::new());
-        chain.push_front(node(1_000, RevisionState::CommittedPresent, 0x4000));
-        let start = Arc::new(Barrier::new(PRODUCERS + 1));
-        thread::scope(|scope| {
-            for index in 0..PRODUCERS {
-                let producer_history = history.clone();
-                let producer_chain = chain.clone();
-                let producer_start = start.clone();
-                scope.spawn(move || {
-                    producer_start.wait();
-                    producer_history.schedule_expiration_and_notify_at_for_test(
-                        expiration(&producer_chain, 100 + index as u64, PUBLISHED_WAKE_MS - 1),
-                        NOW_MS,
-                    );
-                });
-            }
-            start.wait();
-        });
-
-        assert_eq!(
-            history.worker_wakes.load(Ordering::Acquire),
-            1,
-            "concurrent earlier-deadline requests need one actual unpark token"
-        );
-        assert!(
-            history.notification_pending.load(Ordering::Acquire),
-            "the coalesced notification must remain pending until the next worker scan"
-        );
-        let mut queued = 0;
-        while history.expiration_ingress.pop_back().is_some() {
-            queued += 1;
-        }
-        assert_eq!(queued, PRODUCERS, "every producer record must be queued");
-        history.shutdown();
-    }
-
-    #[test]
     fn equal_and_later_deadlines_do_not_wake_worker_parked_until_earlier_deadline() {
         const NOW_MS: u64 = 10_000;
         const PUBLISHED_WAKE_MS: u64 = 20_000;
@@ -1694,10 +1569,6 @@ mod tests {
             0,
             "equal and later deadlines are already covered by the worker's published wake"
         );
-        assert!(
-            !history.notification_pending.load(Ordering::Acquire),
-            "suppressed equal and later deadlines must not publish a notification"
-        );
         assert_eq!(
             history
                 .expiration_ingress
@@ -1722,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn earlier_stale_and_active_worker_wake_requests_share_one_unpark() {
+    fn earlier_stale_and_active_worker_publications_request_a_wake() {
         const NOW_MS: u64 = 10_000;
         const PUBLISHED_WAKE_MS: u64 = 20_000;
 
@@ -1762,8 +1633,8 @@ mod tests {
 
         assert_eq!(
             history.worker_wakes.load(Ordering::Acquire),
-            1,
-            "an earlier deadline, stale publication, and active worker share one pending unpark"
+            3,
+            "an earlier deadline, stale publication, and active worker each require a wake"
         );
         history.shutdown();
     }
@@ -1825,9 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueues_after_pending_clear_and_scan_share_one_unpark_without_loss() {
-        const RETIRED: usize = 4;
-
+    fn enqueue_after_scan_before_wake_publication_preserves_unpark_token() {
         let history = HistoryIndex::new(0);
         history
             .pause_after_worker_scan
@@ -1837,39 +1706,34 @@ mod tests {
             "post-scan pre-publication",
         );
         history.worker_wakes.store(0, Ordering::Release);
-        assert!(
-            !history.notification_pending.load(Ordering::Acquire),
-            "the worker must clear the prior notification before scanning"
-        );
 
-        let retired = retire_independent_revisions(&history, RETIRED);
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(100, RevisionState::CommittedPresent, 0x1000);
+        chain.push_front(retired.clone());
+        chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+        assert!(history.retire(&chain, &retired));
         assert_eq!(
             history.worker_wakes.load(Ordering::Acquire),
             1,
-            "post-scan enqueues need one actual unpark token"
-        );
-        assert!(
-            history.notification_pending.load(Ordering::Acquire),
-            "the post-scan notification must remain pending until the next scan"
+            "an active worker must receive an unpark token before it publishes a deadline"
         );
 
         history
             .pause_after_worker_scan
             .store(false, Ordering::Release);
-        assert_eq!(
-            wait_for_expired_revisions(&history, &retired),
-            (0..RETIRED)
-                .map(|index| 0x1000 + index * 8)
-                .collect::<Vec<_>>(),
-            "the pre-publication unpark token must expire every queued revision exactly once"
-        );
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while retired.load().0 != RevisionState::Expired {
+            assert!(
+                Instant::now() < timeout,
+                "the pre-publication unpark token was lost at park"
+            );
+            thread::yield_now();
+        }
         history.shutdown();
     }
 
     #[test]
-    fn enqueues_after_wake_publication_share_one_unpark_across_park() {
-        const RETIRED: usize = 4;
-
+    fn enqueue_after_wake_publication_before_park_preserves_unpark_token() {
         let history = HistoryIndex::new(0);
         history
             .pause_after_wake_publication
@@ -1879,32 +1743,29 @@ mod tests {
             "published-wake pre-park",
         );
         history.worker_wakes.store(0, Ordering::Release);
-        assert!(
-            !history.notification_pending.load(Ordering::Acquire),
-            "the worker must clear the prior notification before publishing its wake"
-        );
 
-        let retired = retire_independent_revisions(&history, RETIRED);
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(100, RevisionState::CommittedPresent, 0x1000);
+        chain.push_front(retired.clone());
+        chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+        assert!(history.retire(&chain, &retired));
         assert_eq!(
             history.worker_wakes.load(Ordering::Acquire),
             1,
-            "pre-park enqueues need one actual unpark token"
-        );
-        assert!(
-            history.notification_pending.load(Ordering::Acquire),
-            "the pre-park notification must remain pending until the next scan"
+            "an earlier deadline must unpark a worker between publication and park"
         );
 
         history
             .pause_after_wake_publication
             .store(false, Ordering::Release);
-        assert_eq!(
-            wait_for_expired_revisions(&history, &retired),
-            (0..RETIRED)
-                .map(|index| 0x1000 + index * 8)
-                .collect::<Vec<_>>(),
-            "the post-publication unpark token must cross park and expire every revision once"
-        );
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while retired.load().0 != RevisionState::Expired {
+            assert!(
+                Instant::now() < timeout,
+                "the post-publication unpark token was lost at park"
+            );
+            thread::yield_now();
+        }
         history.shutdown();
     }
 
