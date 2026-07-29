@@ -572,10 +572,21 @@ pub struct HistoryIndex {
     expiration_sequence: AtomicU64,
     #[cfg(test)]
     expiration_checks: AtomicUsize,
+    #[cfg(test)]
+    worker_wakes: AtomicUsize,
+    #[cfg(test)]
+    pause_after_worker_scan: AtomicBool,
+    #[cfg(test)]
+    worker_paused_after_scan: AtomicBool,
+    #[cfg(test)]
+    pause_after_wake_publication: AtomicBool,
+    #[cfg(test)]
+    worker_paused_after_wake_publication: AtomicBool,
     dead: LinkedRingBufferList<Option<DeadRevision>, 64>,
     retention_ms: u64,
     recovery_floor: AtomicU64,
     stopped: AtomicBool,
+    published_worker_wake_ms: AtomicU64,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -599,10 +610,21 @@ impl HistoryIndex {
             expiration_sequence: AtomicU64::new(0),
             #[cfg(test)]
             expiration_checks: AtomicUsize::new(0),
+            #[cfg(test)]
+            worker_wakes: AtomicUsize::new(0),
+            #[cfg(test)]
+            pause_after_worker_scan: AtomicBool::new(false),
+            #[cfg(test)]
+            worker_paused_after_scan: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_after_wake_publication: AtomicBool::new(false),
+            #[cfg(test)]
+            worker_paused_after_wake_publication: AtomicBool::new(false),
             dead: LinkedRingBufferList::new(),
             retention_ms,
             recovery_floor: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
+            published_worker_wake_ms: AtomicU64::new(0),
             worker: Mutex::new(None),
         });
         Self::start_worker(&history, chunk_id);
@@ -624,13 +646,29 @@ impl HistoryIndex {
                     let Some(history) = weak_history.upgrade() else {
                         break;
                     };
+                    // Zero means the worker is active. Producers that enqueue
+                    // while no wake is published must leave an unpark token for
+                    // the scan-to-park race.
+                    history.published_worker_wake_ms.store(0, Ordering::Release);
                     if history.stopped.load(Ordering::Acquire) {
                         break;
                     }
                     let park_ms = history.expire_due_until(monotonic_ms(), &|| {
                         history.stopped.load(Ordering::Acquire)
                     });
+                    debug_assert!((1..=WORKER_MAX_PARK_MS).contains(&park_ms));
+                    #[cfg(test)]
+                    history.pause_after_worker_scan_for_test();
                     if history.stopped.load(Ordering::Acquire) {
+                        break;
+                    }
+                    history
+                        .published_worker_wake_ms
+                        .store(monotonic_ms().saturating_add(park_ms), Ordering::Release);
+                    #[cfg(test)]
+                    history.pause_after_wake_publication_for_test();
+                    if history.stopped.load(Ordering::Acquire) {
+                        history.published_worker_wake_ms.store(0, Ordering::Release);
                         break;
                     }
                     drop(history);
@@ -783,7 +821,7 @@ impl HistoryIndex {
             node: node.clone(),
             deadline_ms,
         });
-        self.wake_worker();
+        self.wake_worker_for_deadline(deadline_ms, monotonic_ms());
         true
     }
 
@@ -968,8 +1006,34 @@ impl HistoryIndex {
 
     fn wake_worker(&self) {
         if let Some(handle) = self.worker.lock().as_ref() {
+            #[cfg(test)]
+            self.worker_wakes.fetch_add(1, Ordering::AcqRel);
             handle.thread().unpark();
         }
+    }
+
+    fn wake_worker_for_deadline(&self, deadline_ms: u64, now_ms: u64) {
+        // The expiration record is fully queued before this acquire. A zero or
+        // stale publication means the worker is active or already due, so an
+        // unpark token closes the scan-to-park race. An earlier deadline must
+        // also move the worker's wake forward. Equal and later work is covered
+        // by the already-published wake.
+        let published_wake_ms = self.published_worker_wake_ms.load(Ordering::Acquire);
+        if published_wake_ms == 0 || published_wake_ms <= now_ms || deadline_ms < published_wake_ms
+        {
+            self.wake_worker();
+        }
+    }
+
+    #[cfg(test)]
+    fn schedule_expiration_and_notify_at_for_test(
+        &self,
+        expiration: ExpirationRecord,
+        now_ms: u64,
+    ) {
+        let deadline_ms = expiration.deadline_ms;
+        self.schedule_expiration(expiration);
+        self.wake_worker_for_deadline(deadline_ms, now_ms);
     }
 
     pub(crate) fn shutdown(&self) {
@@ -996,6 +1060,48 @@ impl HistoryIndex {
     #[cfg(test)]
     fn take_expiration_checks_for_test(&self) -> usize {
         self.expiration_checks.swap(0, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    fn pause_after_worker_scan_for_test(&self) {
+        Self::pause_worker_for_test(
+            &self.pause_after_worker_scan,
+            &self.worker_paused_after_scan,
+            &self.stopped,
+        );
+    }
+
+    #[cfg(test)]
+    fn pause_after_wake_publication_for_test(&self) {
+        Self::pause_worker_for_test(
+            &self.pause_after_wake_publication,
+            &self.worker_paused_after_wake_publication,
+            &self.stopped,
+        );
+    }
+
+    #[cfg(test)]
+    fn pause_worker_for_test(pause: &AtomicBool, paused: &AtomicBool, stopped: &AtomicBool) {
+        if !pause.load(Ordering::Acquire) {
+            return;
+        }
+        paused.store(true, Ordering::Release);
+        while pause.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        paused.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn wait_for_worker_pause_for_test(&self, paused: &AtomicBool, boundary: &str) {
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while !paused.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < timeout,
+                "history worker did not reach its {boundary} boundary"
+            );
+            thread::yield_now();
+        }
     }
 
     #[cfg(test)]
@@ -1054,6 +1160,22 @@ mod tests {
 
     fn node(revision_ts: u64, state: RevisionState, location: usize) -> Arc<RevisionNode> {
         Arc::new(RevisionNode::new(revision_ts, state, location, 64))
+    }
+
+    fn expiration(
+        chain: &Arc<RevisionChain>,
+        revision_ts: u64,
+        deadline_ms: u64,
+    ) -> ExpirationRecord {
+        ExpirationRecord {
+            chain: chain.clone(),
+            node: node(
+                revision_ts,
+                RevisionState::CommittedPresent,
+                0x1000 + revision_ts as usize * 8,
+            ),
+            deadline_ms,
+        }
     }
 
     fn wait_for_worker_count(expected: usize) {
@@ -1360,6 +1482,432 @@ mod tests {
         assert!(
             checks <= EXPIRATION_WORK_BUDGET * 2,
             "one pass inspected {checks} due expirations instead of yielding after bounded work"
+        );
+    }
+
+    #[test]
+    fn equal_and_later_deadlines_do_not_wake_worker_parked_until_earlier_deadline() {
+        const NOW_MS: u64 = 10_000;
+        const PUBLISHED_WAKE_MS: u64 = 20_000;
+
+        let history = HistoryIndex::new(300_000);
+        history
+            .pause_after_wake_publication
+            .store(true, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_wake_publication,
+            "published-wake pre-park",
+        );
+        history
+            .published_worker_wake_ms
+            .store(PUBLISHED_WAKE_MS, Ordering::Release);
+        history.worker_wakes.store(0, Ordering::Release);
+
+        let chain = Arc::new(RevisionChain::new());
+        let current = node(300, RevisionState::CommittedPresent, 0x3000);
+        chain.push_front(current);
+        for (revision_ts, deadline_ms) in [(100, PUBLISHED_WAKE_MS), (200, PUBLISHED_WAKE_MS + 1)] {
+            history.schedule_expiration_and_notify_at_for_test(
+                ExpirationRecord {
+                    chain: chain.clone(),
+                    node: node(
+                        revision_ts,
+                        RevisionState::CommittedPresent,
+                        0x1000 + revision_ts as usize * 8,
+                    ),
+                    deadline_ms,
+                },
+                NOW_MS,
+            );
+        }
+
+        assert_eq!(
+            history.worker_wakes.load(Ordering::Acquire),
+            0,
+            "equal and later deadlines are already covered by the worker's published wake"
+        );
+        assert_eq!(
+            history
+                .expiration_ingress
+                .pop_back()
+                .flatten()
+                .expect("equal-deadline record must be queued")
+                .expiration
+                .deadline_ms,
+            PUBLISHED_WAKE_MS
+        );
+        assert_eq!(
+            history
+                .expiration_ingress
+                .pop_back()
+                .flatten()
+                .expect("later-deadline record must be queued")
+                .expiration
+                .deadline_ms,
+            PUBLISHED_WAKE_MS + 1
+        );
+        history.shutdown();
+    }
+
+    #[test]
+    fn earlier_stale_and_active_worker_publications_request_a_wake() {
+        const NOW_MS: u64 = 10_000;
+        const PUBLISHED_WAKE_MS: u64 = 20_000;
+
+        let history = HistoryIndex::new(300_000);
+        history
+            .pause_after_wake_publication
+            .store(true, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_wake_publication,
+            "published-wake pre-park",
+        );
+        history.worker_wakes.store(0, Ordering::Release);
+        let chain = Arc::new(RevisionChain::new());
+        chain.push_front(node(400, RevisionState::CommittedPresent, 0x4000));
+
+        history
+            .published_worker_wake_ms
+            .store(PUBLISHED_WAKE_MS, Ordering::Release);
+        history.schedule_expiration_and_notify_at_for_test(
+            expiration(&chain, 100, PUBLISHED_WAKE_MS - 1),
+            NOW_MS,
+        );
+
+        history
+            .published_worker_wake_ms
+            .store(NOW_MS, Ordering::Release);
+        history.schedule_expiration_and_notify_at_for_test(
+            expiration(&chain, 200, PUBLISHED_WAKE_MS + 1),
+            NOW_MS,
+        );
+
+        history.published_worker_wake_ms.store(0, Ordering::Release);
+        history.schedule_expiration_and_notify_at_for_test(
+            expiration(&chain, 300, PUBLISHED_WAKE_MS + 1),
+            NOW_MS,
+        );
+
+        assert_eq!(
+            history.worker_wakes.load(Ordering::Acquire),
+            3,
+            "an earlier deadline, stale publication, and active worker each require a wake"
+        );
+        history.shutdown();
+    }
+
+    #[test]
+    fn suppressed_equal_deadline_is_ingested_at_the_published_wake() {
+        let history = HistoryIndex::new(300_000);
+        history
+            .pause_after_wake_publication
+            .store(true, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_wake_publication,
+            "published-wake pre-park",
+        );
+        let published_wake_ms = monotonic_ms().saturating_add(WORKER_MAX_PARK_MS);
+        history
+            .published_worker_wake_ms
+            .store(published_wake_ms, Ordering::Release);
+        history.worker_wakes.store(0, Ordering::Release);
+
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(100, RevisionState::CommittedPresent, 0x1000);
+        chain.push_front(retired.clone());
+        chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+        assert!(retired.schedule_retirement(published_wake_ms));
+        history.schedule_expiration_and_notify_at_for_test(
+            ExpirationRecord {
+                chain,
+                node: retired.clone(),
+                deadline_ms: published_wake_ms,
+            },
+            published_wake_ms - 1,
+        );
+        assert_eq!(
+            history.worker_wakes.load(Ordering::Acquire),
+            0,
+            "an equal deadline must not add a redundant wake"
+        );
+
+        history
+            .pause_after_wake_publication
+            .store(false, Ordering::Release);
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while retired.load().0 != RevisionState::Expired {
+            assert!(
+                Instant::now() < timeout,
+                "the worker did not ingest the suppressed record at its published wake"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            history.pop_dead(),
+            Some(DeadRevision {
+                location: 0x1000,
+                entry_size: 64,
+            })
+        );
+        history.shutdown();
+    }
+
+    #[test]
+    fn enqueue_after_scan_before_wake_publication_preserves_unpark_token() {
+        let history = HistoryIndex::new(0);
+        history
+            .pause_after_worker_scan
+            .store(true, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_scan,
+            "post-scan pre-publication",
+        );
+        history.worker_wakes.store(0, Ordering::Release);
+
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(100, RevisionState::CommittedPresent, 0x1000);
+        chain.push_front(retired.clone());
+        chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+        assert!(history.retire(&chain, &retired));
+        assert_eq!(
+            history.worker_wakes.load(Ordering::Acquire),
+            1,
+            "an active worker must receive an unpark token before it publishes a deadline"
+        );
+
+        history
+            .pause_after_worker_scan
+            .store(false, Ordering::Release);
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while retired.load().0 != RevisionState::Expired {
+            assert!(
+                Instant::now() < timeout,
+                "the pre-publication unpark token was lost at park"
+            );
+            thread::yield_now();
+        }
+        history.shutdown();
+    }
+
+    #[test]
+    fn enqueue_after_wake_publication_before_park_preserves_unpark_token() {
+        let history = HistoryIndex::new(0);
+        history
+            .pause_after_wake_publication
+            .store(true, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_wake_publication,
+            "published-wake pre-park",
+        );
+        history.worker_wakes.store(0, Ordering::Release);
+
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(100, RevisionState::CommittedPresent, 0x1000);
+        chain.push_front(retired.clone());
+        chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+        assert!(history.retire(&chain, &retired));
+        assert_eq!(
+            history.worker_wakes.load(Ordering::Acquire),
+            1,
+            "an earlier deadline must unpark a worker between publication and park"
+        );
+
+        history
+            .pause_after_wake_publication
+            .store(false, Ordering::Release);
+        let timeout = Instant::now() + Duration::from_secs(2);
+        while retired.load().0 != RevisionState::Expired {
+            assert!(
+                Instant::now() < timeout,
+                "the post-publication unpark token was lost at park"
+            );
+            thread::yield_now();
+        }
+        history.shutdown();
+    }
+
+    #[test]
+    fn early_wake_clears_publication_before_the_next_scan() {
+        let history = HistoryIndex::new(0);
+        history
+            .pause_after_wake_publication
+            .store(true, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_wake_publication,
+            "published-wake pre-park",
+        );
+        history
+            .pause_after_worker_scan
+            .store(true, Ordering::Release);
+
+        let chain = Arc::new(RevisionChain::new());
+        let retired = node(100, RevisionState::CommittedPresent, 0x1000);
+        chain.push_front(retired.clone());
+        chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+        assert!(history.retire(&chain, &retired));
+        history
+            .pause_after_wake_publication
+            .store(false, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_scan,
+            "post-early-wake scan",
+        );
+
+        assert_eq!(
+            history.published_worker_wake_ms.load(Ordering::Acquire),
+            0,
+            "a worker must stop advertising an obsolete wake while it is active"
+        );
+        assert_eq!(retired.load().0, RevisionState::Expired);
+        history.shutdown();
+    }
+
+    #[test]
+    fn shutdown_joins_promptly_from_worker_pause_boundaries_and_with_backlog() {
+        const BACKLOG: usize = 10_000;
+
+        let history = HistoryIndex::new(300_000);
+        history
+            .pause_after_worker_scan
+            .store(true, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_scan,
+            "post-scan pre-publication",
+        );
+        let started = Instant::now();
+        history.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown waited at the scan-to-publication boundary"
+        );
+        assert_eq!(
+            history.published_worker_wake_ms.load(Ordering::Acquire),
+            0,
+            "a stopped worker must clear its published wake"
+        );
+
+        let history = HistoryIndex::new(300_000);
+        history
+            .pause_after_wake_publication
+            .store(true, Ordering::Release);
+        history.wait_for_worker_pause_for_test(
+            &history.worker_paused_after_wake_publication,
+            "published-wake pre-park",
+        );
+        let chain = Arc::new(RevisionChain::new());
+        chain.push_front(node(
+            BACKLOG as u64 + 1,
+            RevisionState::CommittedPresent,
+            0x2000,
+        ));
+        for revision_ts in 0..BACKLOG as u64 {
+            history.schedule_expiration(ExpirationRecord {
+                chain: chain.clone(),
+                node: node(revision_ts, RevisionState::CommittedPresent, 0x1000),
+                deadline_ms: u64::MAX,
+            });
+        }
+        let started = Instant::now();
+        history.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "shutdown drained or waited behind the pending retirement backlog"
+        );
+        assert_eq!(
+            history.published_worker_wake_ms.load(Ordering::Acquire),
+            0,
+            "a stopped worker must clear its published wake"
+        );
+    }
+
+    #[test]
+    fn retirement_records_keep_original_deadlines_and_expire_once_due() {
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let mut retired = Vec::new();
+
+        for index in 0..3 {
+            let chain = Arc::new(RevisionChain::new());
+            let revision = node(
+                100 + index,
+                RevisionState::CommittedPresent,
+                0x1000 + index as usize * 8,
+            );
+            chain.push_front(revision.clone());
+            chain.push_front(node(
+                200 + index,
+                RevisionState::CommittedPresent,
+                0x2000 + index as usize * 8,
+            ));
+            assert!(history.retire(&chain, &revision));
+            retired.push(revision);
+        }
+
+        let deadlines: Vec<_> = retired
+            .iter()
+            .map(|revision| revision.retire_deadline_ms.load(Ordering::Acquire))
+            .collect();
+        let earliest = *deadlines.iter().min().expect("retirement deadline");
+        history.expire_due_for_test(earliest - 1);
+        assert!(
+            retired
+                .iter()
+                .all(|revision| revision.load().0 == RevisionState::CommittedPresent),
+            "no revision may expire before its authoritative deadline"
+        );
+        assert!(history.pop_dead().is_none());
+
+        history.expire_due_for_test(*deadlines.iter().max().unwrap());
+        assert!(
+            retired
+                .iter()
+                .all(|revision| revision.load().0 == RevisionState::Expired),
+            "every queued retirement record must be processed"
+        );
+        let mut dead_locations = Vec::new();
+        while let Some(dead) = history.pop_dead() {
+            dead_locations.push(dead.location);
+        }
+        dead_locations.sort_unstable();
+        assert_eq!(dead_locations, vec![0x1000, 0x1008, 0x1010]);
+        assert_eq!(
+            retired
+                .iter()
+                .map(|revision| revision.retire_deadline_ms.load(Ordering::Acquire))
+                .collect::<Vec<_>>(),
+            deadlines,
+            "processing must not rewrite the node's authoritative original deadline"
+        );
+    }
+
+    #[test]
+    fn blocked_scheduler_retry_moves_without_rewriting_original_deadline() {
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        chain.push_front(node(100, RevisionState::CommittedPresent, 0x1000));
+        let blocked = node(200, RevisionState::CommittedPresent, 0x2000);
+        chain.push_front(blocked.clone());
+        chain.push_front(node(300, RevisionState::CommittedPresent, 0x3000));
+        assert!(blocked.schedule_retirement(1));
+        history.schedule_expiration(ExpirationRecord {
+            chain,
+            node: blocked.clone(),
+            deadline_ms: 1,
+        });
+
+        assert_eq!(history.expire_due(1), 1);
+        assert_eq!(blocked.retire_deadline_ms.load(Ordering::Acquire), 1);
+        assert_eq!(
+            history
+                .expirations
+                .lock()
+                .peek()
+                .expect("blocked expiration must remain scheduled")
+                .expiration
+                .deadline_ms,
+            2,
+            "blocked work must yield until now + 1 for suffix fairness"
         );
     }
 
