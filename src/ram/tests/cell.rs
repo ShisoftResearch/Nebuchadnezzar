@@ -212,6 +212,54 @@ fn snapshot_reads_old_address_after_current_update() {
 }
 
 #[test]
+fn assigned_update_converts_a_direct_head_and_retains_its_predecessor() {
+    let chunks = test_chunks();
+    let id = Id::new(1, 113);
+    let mut direct = test_cell(id, 10);
+    chunks.write_cell(&mut direct).unwrap();
+    let direct_revision = direct.header.revision_ts;
+    let chunk = &chunks.list[0];
+    let raw_before = chunk
+        .cell_index
+        .get_from_mutex(&(id.lower as usize))
+        .unwrap();
+
+    let SnapshotRead::Present(snapshot) =
+        chunks.read_cell_snapshot(&id, direct_revision + 1).unwrap()
+    else {
+        panic!("transaction snapshot must convert the direct head");
+    };
+    assert_eq!(snapshot.header.revision_ts, direct_revision);
+
+    let raw_after_snapshot = chunk
+        .cell_index
+        .get_from_mutex(&(id.lower as usize))
+        .unwrap();
+    assert_eq!(raw_after_snapshot, raw_before);
+    assert_eq!(chunk.history.revision_count_for_test(&id), 1);
+
+    let assigned_revision = direct_revision + 100;
+    let mut assigned = test_cell(id, 20);
+    let installed = chunks
+        .update_cell_at_revision(&mut assigned, RevisionWrite::committed(assigned_revision))
+        .unwrap();
+    let raw_after_update = chunk
+        .cell_index
+        .get_from_mutex(&(id.lower as usize))
+        .unwrap();
+    assert_eq!(raw_after_update, installed.node.load().1);
+    assert_eq!(chunk.history.revision_count_for_test(&id), 2);
+    assert_eq!(
+        chunks.history_location(&id, direct_revision),
+        Some(raw_before)
+    );
+    assert_eq!(
+        chunks.history_location(&id, assigned_revision),
+        Some(raw_after_update)
+    );
+}
+
+#[test]
 fn direct_snapshot_rejects_colliding_full_id() {
     let chunks = test_chunks();
     let id = Id::new(1, 105);

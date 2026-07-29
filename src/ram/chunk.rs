@@ -1194,22 +1194,20 @@ impl Chunk {
             Ok(mut guard) => {
                 let location = guard.get_ptr();
                 let header = guard.head_cell()?;
-                if Id::from_header(&header) == *id && header.revision_ts < snapshot_ts {
-                    match self.history.current(id) {
-                        Some(current) => {
-                            let (state, node_location) = current.load();
-                            if current.revision_ts == header.revision_ts
-                                && state == RevisionState::CommittedPresent
-                                && node_location == location
-                            {
-                                return materialize(location, current.entry_size)
-                                    .map(SnapshotRead::Present);
-                            }
-                        }
-                        None => {
-                            return materialize(location, self.entry_size_at(location))
-                                .map(SnapshotRead::Present);
-                        }
+                if Id::from_header(&header) == *id {
+                    let current =
+                        match self.ensure_present_predecessor_with_chain(*id, &header, location) {
+                            Ok((_, current)) => Some(current),
+                            Err(_) => self.history.current(id),
+                        };
+                    if header.revision_ts < snapshot_ts
+                        && current.as_ref().is_some_and(|current| {
+                            current.revision_ts == header.revision_ts
+                                && current.load() == (RevisionState::CommittedPresent, location)
+                        })
+                    {
+                        return materialize(location, current.unwrap().entry_size)
+                            .map(SnapshotRead::Present);
                     }
                 }
             }
