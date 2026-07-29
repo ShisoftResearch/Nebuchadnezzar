@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 const STATE_MASK: usize = 0b111;
 const LOCATION_MASK: usize = !STATE_MASK;
 const WORKER_MAX_PARK_MS: u64 = 50;
-const EXPIRATION_WORK_BUDGET: usize = 256;
+const EXPIRATION_WORK_BUDGET: usize = 1_024;
 const CHAIN_CANCELLATION_CHECK_INTERVAL: usize = 64;
 const HISTORY_MAP_INITIAL_CAPACITY: usize = 4_096;
 
@@ -549,6 +549,34 @@ impl Ord for ScheduledExpiration {
     }
 }
 
+struct ExpirationScratch {
+    ingested: Vec<ScheduledExpiration>,
+    due: Vec<ScheduledExpiration>,
+    blocked: Vec<ScheduledExpiration>,
+    deferred: Vec<ScheduledExpiration>,
+}
+
+impl ExpirationScratch {
+    fn new() -> Self {
+        Self {
+            ingested: Vec::with_capacity(EXPIRATION_WORK_BUDGET),
+            due: Vec::with_capacity(EXPIRATION_WORK_BUDGET),
+            blocked: Vec::new(),
+            deferred: Vec::new(),
+        }
+    }
+
+    fn assert_empty(&self) {
+        assert!(
+            self.ingested.is_empty()
+                && self.due.is_empty()
+                && self.blocked.is_empty()
+                && self.deferred.is_empty(),
+            "expiration scratch must be empty between passes"
+        );
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeadRevision {
     pub location: usize,
@@ -641,6 +669,7 @@ impl HistoryIndex {
             .spawn(move || {
                 #[cfg(test)]
                 let _worker_count = ActiveWorkerGuard::new();
+                let mut expiration_scratch = ExpirationScratch::new();
 
                 loop {
                     let Some(history) = weak_history.upgrade() else {
@@ -653,9 +682,11 @@ impl HistoryIndex {
                     if history.stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    let park_ms = history.expire_due_until(monotonic_ms(), &|| {
-                        history.stopped.load(Ordering::Acquire)
-                    });
+                    let park_ms = history.expire_due_until_with_scratch(
+                        monotonic_ms(),
+                        &|| history.stopped.load(Ordering::Acquire),
+                        &mut expiration_scratch,
+                    );
                     debug_assert!((1..=WORKER_MAX_PARK_MS).contains(&park_ms));
                     #[cfg(test)]
                     history.pause_after_worker_scan_for_test();
@@ -842,12 +873,25 @@ impl HistoryIndex {
     where
         F: Fn() -> bool,
     {
+        let mut scratch = ExpirationScratch::new();
+        self.expire_due_until_with_scratch(now_ms, should_cancel, &mut scratch)
+    }
+
+    fn expire_due_until_with_scratch<F>(
+        &self,
+        now_ms: u64,
+        should_cancel: &F,
+        scratch: &mut ExpirationScratch,
+    ) -> u64
+    where
+        F: Fn() -> bool,
+    {
         // Producers stay on the lock-free ingress path. The worker bounds both
         // ingestion and due work so a shutdown join never waits for the whole
-        // retirement backlog.
-        let mut ingested = Vec::with_capacity(EXPIRATION_WORK_BUDGET);
+        // retirement backlog. The worker reuses this scratch across passes.
+        scratch.assert_empty();
         let mut pass_cancelled = false;
-        while ingested.len() < EXPIRATION_WORK_BUDGET {
+        while scratch.ingested.len() < EXPIRATION_WORK_BUDGET {
             if should_cancel() {
                 pass_cancelled = true;
                 break;
@@ -860,15 +904,14 @@ impl HistoryIndex {
             };
             #[cfg(test)]
             self.expiration_checks.fetch_add(1, Ordering::Relaxed);
-            ingested.push(scheduled);
+            scratch.ingested.push(scheduled);
         }
         let ingress_pending = self.expiration_ingress.peek_back().is_some();
 
-        let mut due = Vec::with_capacity(EXPIRATION_WORK_BUDGET);
         {
             let mut expirations = self.expirations.lock();
-            expirations.extend(ingested);
-            while due.len() < EXPIRATION_WORK_BUDGET {
+            expirations.extend(scratch.ingested.drain(..));
+            while scratch.due.len() < EXPIRATION_WORK_BUDGET {
                 if should_cancel() {
                     pass_cancelled = true;
                     break;
@@ -879,7 +922,7 @@ impl HistoryIndex {
                 if next.expiration.deadline_ms > now_ms {
                     break;
                 }
-                due.push(
+                scratch.due.push(
                     expirations
                         .pop()
                         .expect("peeked expiration must remain queued"),
@@ -887,41 +930,48 @@ impl HistoryIndex {
             }
         }
 
-        let due_budget_exhausted = due.len() == EXPIRATION_WORK_BUDGET;
-        let mut blocked = Vec::new();
-        let mut deferred = Vec::new();
-        let mut due = due.into_iter();
-        while let Some(mut scheduled) = due.next() {
-            if should_cancel() {
-                pass_cancelled = true;
-                deferred.push(scheduled);
-                deferred.extend(due);
-                break;
-            }
-            #[cfg(test)]
-            self.expiration_checks.fetch_add(1, Ordering::Relaxed);
-            match self.expire_record_until(&scheduled.expiration, should_cancel) {
-                ExpirationAttempt::Completed => {}
-                ExpirationAttempt::Blocked => {
-                    // A blocked middle revision must yield to later heap entries;
-                    // one of those can be the older suffix record that unblocks it.
-                    scheduled.expiration.deadline_ms = now_ms.saturating_add(1).max(1);
-                    scheduled.sequence = self.expiration_sequence.fetch_add(1, Ordering::Relaxed);
-                    blocked.push(scheduled);
-                }
-                ExpirationAttempt::Cancelled => {
+        let due_budget_exhausted = scratch.due.len() == EXPIRATION_WORK_BUDGET;
+        {
+            let ExpirationScratch {
+                due,
+                blocked,
+                deferred,
+                ..
+            } = scratch;
+            let mut due = due.drain(..);
+            while let Some(mut scheduled) = due.next() {
+                if should_cancel() {
                     pass_cancelled = true;
                     deferred.push(scheduled);
                     deferred.extend(due);
                     break;
                 }
+                #[cfg(test)]
+                self.expiration_checks.fetch_add(1, Ordering::Relaxed);
+                match self.expire_record_until(&scheduled.expiration, should_cancel) {
+                    ExpirationAttempt::Completed => {}
+                    ExpirationAttempt::Blocked => {
+                        // A blocked middle revision must yield to later heap entries;
+                        // one of those can be the older suffix record that unblocks it.
+                        scheduled.expiration.deadline_ms = now_ms.saturating_add(1).max(1);
+                        scheduled.sequence =
+                            self.expiration_sequence.fetch_add(1, Ordering::Relaxed);
+                        blocked.push(scheduled);
+                    }
+                    ExpirationAttempt::Cancelled => {
+                        pass_cancelled = true;
+                        deferred.push(scheduled);
+                        deferred.extend(due);
+                        break;
+                    }
+                }
             }
         }
 
-        let blocked_pending = !blocked.is_empty();
+        let blocked_pending = !scratch.blocked.is_empty();
         let mut expirations = self.expirations.lock();
-        expirations.extend(blocked);
-        expirations.extend(deferred);
+        expirations.extend(scratch.blocked.drain(..));
+        expirations.extend(scratch.deferred.drain(..));
         if pass_cancelled || ingress_pending || due_budget_exhausted || blocked_pending {
             return 1;
         }
@@ -1457,6 +1507,305 @@ mod tests {
         assert!(
             history.take_expiration_checks_for_test() <= EXPIRATION_WORK_BUDGET,
             "a future-only pass must bound ingress scheduling work"
+        );
+    }
+
+    #[test]
+    fn expiration_pass_ingests_literal_1024_future_record_batch() {
+        const FUTURE_EXPIRATIONS: usize = 1_024;
+
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        chain.push_front(node(2_000, RevisionState::CommittedPresent, 0x2000));
+        for revision_ts in 0..FUTURE_EXPIRATIONS as u64 {
+            history.schedule_expiration(ExpirationRecord {
+                chain: chain.clone(),
+                node: node(revision_ts, RevisionState::CommittedPresent, 0x1000),
+                deadline_ms: 100_000,
+            });
+        }
+
+        assert_eq!(history.expire_due(1), WORKER_MAX_PARK_MS);
+        assert!(history.expiration_ingress.peek_back().is_none());
+        assert_eq!(history.expirations.lock().len(), FUTURE_EXPIRATIONS);
+        assert_eq!(
+            history.take_expiration_checks_for_test(),
+            FUTURE_EXPIRATIONS
+        );
+    }
+
+    #[test]
+    fn expiration_scratch_allocations_are_reused_across_two_passes() {
+        fn layout(scratch: &ExpirationScratch) -> [(usize, usize); 4] {
+            [
+                (
+                    scratch.ingested.as_ptr() as usize,
+                    scratch.ingested.capacity(),
+                ),
+                (scratch.due.as_ptr() as usize, scratch.due.capacity()),
+                (
+                    scratch.blocked.as_ptr() as usize,
+                    scratch.blocked.capacity(),
+                ),
+                (
+                    scratch.deferred.as_ptr() as usize,
+                    scratch.deferred.capacity(),
+                ),
+            ]
+        }
+
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        chain.push_front(node(3_000, RevisionState::CommittedPresent, 0x3000));
+        let mut scratch = ExpirationScratch::new();
+        let original_layout = layout(&scratch);
+        assert_eq!(
+            original_layout[0].1, EXPIRATION_WORK_BUDGET,
+            "hot ingress scratch must be pre-sized to the full pass budget"
+        );
+        assert_eq!(
+            original_layout[1].1, EXPIRATION_WORK_BUDGET,
+            "hot due scratch must be pre-sized to the full pass budget"
+        );
+
+        for pass in 0..2 {
+            for offset in 0..EXPIRATION_WORK_BUDGET {
+                let revision_ts = (pass * EXPIRATION_WORK_BUDGET + offset) as u64;
+                history.schedule_expiration(ExpirationRecord {
+                    chain: chain.clone(),
+                    node: node(revision_ts, RevisionState::CommittedPresent, 0x1000),
+                    deadline_ms: 100_000,
+                });
+            }
+
+            assert_eq!(
+                history.expire_due_until_with_scratch(1, &|| false, &mut scratch),
+                WORKER_MAX_PARK_MS
+            );
+            assert_eq!(
+                layout(&scratch),
+                original_layout,
+                "all scratch allocations must survive pass {pass}"
+            );
+            assert!(scratch.ingested.is_empty());
+            assert!(scratch.due.is_empty());
+            assert!(scratch.blocked.is_empty());
+            assert!(scratch.deferred.is_empty());
+        }
+    }
+
+    #[test]
+    fn expiration_scratch_retains_lazy_capacity_after_block_and_cancel() {
+        fn layout(scratch: &ExpirationScratch) -> [(usize, usize); 4] {
+            [
+                (
+                    scratch.ingested.as_ptr() as usize,
+                    scratch.ingested.capacity(),
+                ),
+                (scratch.due.as_ptr() as usize, scratch.due.capacity()),
+                (
+                    scratch.blocked.as_ptr() as usize,
+                    scratch.blocked.capacity(),
+                ),
+                (
+                    scratch.deferred.as_ptr() as usize,
+                    scratch.deferred.capacity(),
+                ),
+            ]
+        }
+
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let mut scratch = ExpirationScratch::new();
+        let initial_layout = layout(&scratch);
+
+        let blocked_chain = Arc::new(RevisionChain::new());
+        let blocked = node(200, RevisionState::CommittedPresent, 0x2000);
+        blocked_chain.push_front(blocked.clone());
+        history.schedule_expiration(ExpirationRecord {
+            chain: blocked_chain,
+            node: blocked.clone(),
+            deadline_ms: 1,
+        });
+
+        assert_eq!(
+            history.expire_due_until_with_scratch(1, &|| false, &mut scratch),
+            1
+        );
+        let after_block = layout(&scratch);
+        assert_eq!(after_block[..2], initial_layout[..2]);
+        assert!(after_block[2].1 > 0, "blocked scratch must grow lazily");
+        assert!(scratch.ingested.is_empty());
+        assert!(scratch.due.is_empty());
+        assert!(scratch.blocked.is_empty());
+        assert!(scratch.deferred.is_empty());
+        assert_eq!(
+            history
+                .expirations
+                .lock()
+                .peek()
+                .expect("blocked expiration must be requeued")
+                .expiration
+                .deadline_ms,
+            2,
+            "only a blocked retry may receive a new deadline"
+        );
+
+        let cancelled_chain = Arc::new(RevisionChain::new());
+        let cancelled = node(100, RevisionState::CommittedPresent, 0x1000);
+        cancelled_chain.push_front(cancelled.clone());
+        cancelled_chain.push_front(node(200, RevisionState::CommittedPresent, 0x2000));
+        history.schedule_expiration(ExpirationRecord {
+            chain: cancelled_chain,
+            node: cancelled.clone(),
+            deadline_ms: 1,
+        });
+        let cancellation_checks = std::cell::Cell::new(0);
+        let should_cancel = || {
+            let checks = cancellation_checks.get() + 1;
+            cancellation_checks.set(checks);
+            checks >= 4
+        };
+
+        assert_eq!(
+            history.expire_due_until_with_scratch(1, &should_cancel, &mut scratch),
+            1
+        );
+        let after_cancel = layout(&scratch);
+        assert_eq!(after_cancel[..3], after_block[..3]);
+        assert!(after_cancel[3].1 > 0, "deferred scratch must grow lazily");
+        assert!(scratch.ingested.is_empty());
+        assert!(scratch.due.is_empty());
+        assert!(scratch.blocked.is_empty());
+        assert!(scratch.deferred.is_empty());
+        assert!(
+            history.expirations.lock().iter().any(|scheduled| {
+                Arc::ptr_eq(&scheduled.expiration.node, &cancelled)
+                    && scheduled.expiration.deadline_ms == 1
+            }),
+            "cancellation must conserve the record and its original deadline"
+        );
+
+        assert_eq!(
+            history.expire_due_until_with_scratch(0, &|| false, &mut scratch),
+            1
+        );
+        assert_eq!(
+            layout(&scratch),
+            after_cancel,
+            "all grown scratch allocations must survive the next pass"
+        );
+    }
+
+    #[test]
+    fn cancellation_requeues_current_and_entire_due_drain_suffix() {
+        const DUE_RECORDS: usize = 4;
+        const ORIGINAL_DEADLINE_MS: u64 = 7;
+        const NOW_MS: u64 = 10;
+        const PROCESSING_ENTRY_CHECK: usize = DUE_RECORDS * 2 + 3;
+
+        let history = HistoryIndex::new(300_000);
+        history.shutdown();
+        let chain = Arc::new(RevisionChain::new());
+        let due_nodes: Vec<_> = (0..DUE_RECORDS)
+            .map(|index| {
+                node(
+                    100 + index as u64,
+                    RevisionState::CommittedPresent,
+                    0x1000 + index * 8,
+                )
+            })
+            .collect();
+        for due_node in &due_nodes {
+            chain.push_front(due_node.clone());
+        }
+        chain.push_front(node(
+            100 + DUE_RECORDS as u64,
+            RevisionState::CommittedPresent,
+            0x2000,
+        ));
+        for due_node in &due_nodes {
+            history.schedule_expiration(ExpirationRecord {
+                chain: chain.clone(),
+                node: due_node.clone(),
+                deadline_ms: ORIGINAL_DEADLINE_MS,
+            });
+        }
+
+        let mut scratch = ExpirationScratch::new();
+        let cancellation_checks = std::cell::Cell::new(0);
+        let should_cancel = || {
+            let checks = cancellation_checks.get() + 1;
+            cancellation_checks.set(checks);
+            checks >= PROCESSING_ENTRY_CHECK
+        };
+        assert_eq!(
+            history.expire_due_until_with_scratch(NOW_MS, &should_cancel, &mut scratch),
+            1
+        );
+        assert_eq!(
+            cancellation_checks.get(),
+            PROCESSING_ENTRY_CHECK,
+            "cancellation must trigger on the first due-processing item"
+        );
+
+        {
+            let expirations = history.expirations.lock();
+            assert_eq!(
+                expirations.len(),
+                DUE_RECORDS,
+                "the current due item and entire drain suffix must be requeued"
+            );
+            for expected_node in &due_nodes {
+                let matches = expirations
+                    .iter()
+                    .filter(|scheduled| {
+                        Arc::ptr_eq(&scheduled.expiration.node, expected_node)
+                            && scheduled.expiration.deadline_ms == ORIGINAL_DEADLINE_MS
+                    })
+                    .count();
+                assert_eq!(
+                    matches, 1,
+                    "each original Arc and deadline must remain queued exactly once"
+                );
+            }
+        }
+        assert!(scratch.ingested.is_empty());
+        assert!(scratch.due.is_empty());
+        assert!(scratch.blocked.is_empty());
+        assert!(scratch.deferred.is_empty());
+        assert!(history.pop_dead().is_none());
+
+        assert_eq!(
+            history.expire_due_until_with_scratch(NOW_MS, &|| false, &mut scratch),
+            WORKER_MAX_PARK_MS
+        );
+        assert!(history.expirations.lock().is_empty());
+        assert!(scratch.ingested.is_empty());
+        assert!(scratch.due.is_empty());
+        assert!(scratch.blocked.is_empty());
+        assert!(scratch.deferred.is_empty());
+        for due_node in &due_nodes {
+            assert_eq!(due_node.load().0, RevisionState::Expired);
+        }
+
+        let mut actual_dead = Vec::new();
+        while let Some(dead) = history.pop_dead() {
+            actual_dead.push(dead);
+        }
+        actual_dead.sort_by_key(|dead| dead.location);
+        let expected_dead: Vec<_> = due_nodes
+            .iter()
+            .map(|node| DeadRevision {
+                location: node.load().1,
+                entry_size: node.entry_size,
+            })
+            .collect();
+        assert_eq!(
+            actual_dead, expected_dead,
+            "the later pass must expire and account for every record exactly once"
         );
     }
 
