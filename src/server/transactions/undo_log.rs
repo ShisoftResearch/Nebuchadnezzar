@@ -6255,6 +6255,150 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tiered_restart_compensates_cold_delete_and_stays_restored() {
+        use crate::ram::schema::{Field, Schema};
+        use crate::ram::segs::SEGMENT_SIZE;
+        use crate::ram::tiered::{manager::TieredMemoryManager, SharedMemoryPool, TieredConfig};
+        use dovahkiin::types::Type;
+
+        let temp_dir = TempDir::new().unwrap();
+        let backup_dir = temp_dir.path().join("backup");
+        let wal_dir = temp_dir.path().join("wal");
+        let undo_dir = temp_dir.path().join("undo");
+        let raft_dir = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_dir).unwrap();
+        let schema = Schema::new(
+            "tiered_restart_delete_compensation",
+            None,
+            Field::new_schema(vec![
+                Field::new_unindexed("id", Type::I32),
+                Field::new_unindexed("value", Type::String),
+            ]),
+            false,
+            false,
+        );
+        let schemas = crate::ram::schema::LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let meta = Arc::new(crate::server::ServerMeta { schemas });
+        let id = Id::new(0, 704);
+        let tid = test_hlc(25, 1);
+        let installed_revision_ts;
+        let original_data;
+        let undo_entry;
+
+        {
+            let chunks = Chunks::new(
+                1,
+                SEGMENT_SIZE * 4,
+                meta.clone(),
+                None,
+                Some(backup_dir.to_string_lossy().into_owned()),
+                Some(wal_dir.to_string_lossy().into_owned()),
+                None,
+            );
+            let mut original = OwnedCell::new_with_id(
+                schema.id,
+                &id,
+                data_map_value!(id: 1i32, value: "cold-owned-prior".to_string()),
+            );
+            chunks.write_cell(&mut original).unwrap();
+            original_data = original.data.clone();
+            installed_revision_ts = chunks
+                .next_revision_ts(original.header.revision_ts)
+                .unwrap();
+            let installed = chunks
+                .remove_cell_at_revision(
+                    &id,
+                    crate::ram::cell::RevisionWrite::committed(installed_revision_ts),
+                )
+                .unwrap();
+            chunks.force_sync_installed_revisions([&installed]).unwrap();
+            undo_entry = UndoLogEntry::new_restore(
+                tid,
+                id,
+                UndoOpType::Remove,
+                installed_revision_ts,
+                original,
+            );
+            let undo = UndoLogger::new(undo_dir.to_string_lossy().into_owned()).unwrap();
+            undo.write_undo_entry(undo_entry.clone()).unwrap();
+            chunks.archive_all();
+        }
+
+        let new_tiered_manager = || {
+            Arc::new(TieredMemoryManager::new(SharedMemoryPool::new(
+                &TieredConfig {
+                    threshold: 0.95,
+                    lower_watermark: 0.8,
+                    physical_memory_limit: 0,
+                    promotion_cooldown_ms: 0,
+                },
+            )))
+        };
+        let recover = || {
+            Chunks::recover_with_clock(
+                1,
+                SEGMENT_SIZE * 4,
+                meta.clone(),
+                None,
+                Some(backup_dir.to_string_lossy().into_owned()),
+                Some(wal_dir.to_string_lossy().into_owned()),
+                Some(new_tiered_manager()),
+                Some(raft_dir.to_string_lossy().into_owned()),
+                Arc::new(bifrost::hlc::HlcSource::new(0)),
+                300_000,
+            )
+            .unwrap()
+        };
+
+        let (chunks, recovery) = recover();
+        chunks
+            .revision_clock()
+            .try_observe(test_hlc(recovery.max_revision_ts, 0))
+            .unwrap();
+        let winning_delete_segment = chunks.list[0]
+            .segments()
+            .into_iter()
+            .find(|segment| segment.tombstones.load(Ordering::Acquire) > 0)
+            .expect("recovery must retain the physical winning delete");
+        assert!(
+            winning_delete_segment.is_cold(),
+            "the winning delete must exercise cold-tier recovery"
+        );
+        assert!(chunks.read_cell(&id).is_err());
+        assert_eq!(chunks.list[0].history.revision_count_for_test(&id), 0);
+        assert_eq!(chunks.current_revision_ts(&id), Some(installed_revision_ts));
+        assert_eq!(chunks.list[0].history.revision_count_for_test(&id), 0);
+        drop(winning_delete_segment);
+
+        let undo = UndoLogger::new(undo_dir.to_string_lossy().into_owned()).unwrap();
+        undo.rollback_incomplete_transactions(undo.recover().unwrap(), &chunks)
+            .unwrap();
+        let restored = chunks.read_cell(&id).unwrap().to_owned();
+        assert_eq!(restored.data, original_data);
+        assert!(restored.header.revision_ts > installed_revision_ts);
+        let compensation_ts = restored.header.revision_ts;
+        drop(undo);
+        drop(chunks);
+
+        let (restarted, recovery) = recover();
+        restarted
+            .revision_clock()
+            .try_observe(test_hlc(recovery.max_revision_ts, 0))
+            .unwrap();
+        let undo = UndoLogger::new(undo_dir.to_string_lossy().into_owned()).unwrap();
+        assert!(
+            undo.recover().unwrap().is_empty(),
+            "durable compensation and abort marker must suppress completed restart work"
+        );
+        undo.rollback_incomplete_transactions(HashMap::from([(tid, vec![undo_entry])]), &restarted)
+            .unwrap();
+        let still_restored = restarted.read_cell(&id).unwrap().to_owned();
+        assert_eq!(still_restored.data, original_data);
+        assert_eq!(still_restored.header.revision_ts, compensation_ts);
+    }
+
     // =====================================================================
     // E2E Tests with Real Transactions
     // =====================================================================

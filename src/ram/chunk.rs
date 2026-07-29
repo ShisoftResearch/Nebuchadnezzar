@@ -1889,10 +1889,45 @@ impl Chunk {
         self.segs.iter_front_values().collect()
     }
 
+    fn make_segment_readable_for_physical_diagnostic(&self, segment: &Segment) {
+        if !segment.is_cold() {
+            return;
+        }
+
+        if let Some(manager) = &self.tiered_manager {
+            // Ordinary cold reads promote after the second access. This
+            // recovery-only diagnostic cannot defer materialization: a false
+            // negative would make startup undo mark an uncompensated delete
+            // complete. Reuse the manager path so any required eviction and
+            // hot-segment accounting stay centralized.
+            for _ in 0..2 {
+                if !segment.is_cold() {
+                    break;
+                }
+                manager.promote(self, segment).unwrap_or_else(|error| {
+                    panic!(
+                        "cannot materialize cold segment {} for recovery diagnostic: {}",
+                        segment.id, error
+                    )
+                });
+            }
+        } else {
+            crate::ram::tiered::promotion::promote_segment(segment);
+        }
+
+        assert!(
+            segment.is_hot(),
+            "cold segment {} remained unreadable for recovery diagnostic",
+            segment.id
+        );
+    }
+
     fn latest_physical_tombstone(&self, id: &Id) -> Option<(usize, Tombstone)> {
         self.segments()
             .into_iter()
+            .filter(|segment| segment.tombstones.load(Ordering::Acquire) > 0)
             .flat_map(|segment| {
+                self.make_segment_readable_for_physical_diagnostic(&segment);
                 let segment_seq_id = segment.seq_id;
                 segment.entry_iter().filter_map(move |entry| {
                     if entry.entry_header.entry_type != EntryType::TOMBSTONE {
