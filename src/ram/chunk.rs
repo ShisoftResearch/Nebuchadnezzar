@@ -184,6 +184,12 @@ pub struct Chunk {
     pub index_builder: Option<Arc<IndexBuilder>>,
     pub statistics: ChunkStatistics,
     pub revision_clock: Arc<HlcSource>,
+    pub revision_allocator: crate::ram::revision::RevisionAllocator,
+    /// Greatest assigned (transactional/recovery) revision installed in this
+    /// chunk. Direct inserts must exceed it or recovery's greatest-revision
+    /// rule could prefer an older transactional tombstone over a durable
+    /// direct insert stamped from a stale lease.
+    pub max_assigned_revision_ts: AtomicU64,
     pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
     pub history_retention_ms: u64,
     pub history: Arc<HistoryIndex>,
@@ -370,6 +376,10 @@ impl Chunk {
             blob_head_seg_id: AtomicU64::new(HEAD_SEG_ID_EMPTY),
             gc_lock: Mutex::new(()),
             statistics: ChunkStatistics::new(),
+            revision_allocator: crate::ram::revision::RevisionAllocator::new(
+                revision_clock.clone(),
+            ),
+            max_assigned_revision_ts: AtomicU64::new(0),
             revision_clock,
             cleaner_wake,
             history_retention_ms,
@@ -818,15 +828,9 @@ impl Chunk {
     }
 
     fn next_revision_ts(&self, previous: u64) -> Result<u64, WriteError> {
-        let next = self
-            .revision_clock
-            .try_now()
-            .map_err(|_| WriteError::RevisionClockExhausted)?
-            .ts;
-        if next <= previous {
-            return Err(WriteError::RevisionClockExhausted);
-        }
-        Ok(next)
+        self.revision_allocator
+            .take(previous)
+            .map_err(|_| WriteError::RevisionClockExhausted)
     }
 
     fn ensure_indices(&self, new_cell: &OwnedCell, old_cell: Option<&SharedCell>, schema: &Schema) {
@@ -1040,6 +1044,8 @@ impl Chunk {
         write: RevisionWrite,
     ) -> Result<InstalledRevision, WriteError> {
         Self::validate_assigned_revision(write)?;
+        self.max_assigned_revision_ts
+            .fetch_max(write.revision_ts, Ordering::Relaxed);
         let id = cell.id();
         let hash = id.lower;
         let mut guard =
@@ -1139,6 +1145,8 @@ impl Chunk {
         write: RevisionWrite,
     ) -> Result<InstalledRevision, WriteError> {
         Self::validate_assigned_revision(write)?;
+        self.max_assigned_revision_ts
+            .fetch_max(write.revision_ts, Ordering::Relaxed);
         let hash = id.lower;
         let guard = CellGuard::for_write(hash, true, self).ok_or(WriteError::CellDoesNotExisted)?;
         self.remove_cell_with_guard_at_revision(guard, id, write)
@@ -1544,7 +1552,8 @@ impl Chunk {
         if cell.header.hash != guard.hash {
             return Err(WriteError::CellRevisionMismatch);
         }
-        let revision_ts = self.next_revision_ts(0)?;
+        let revision_ts =
+            self.next_revision_ts(self.max_assigned_revision_ts.load(Ordering::Relaxed))?;
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
         let write_result =
@@ -1594,6 +1603,8 @@ impl Chunk {
         write: RevisionWrite,
     ) -> Result<InstalledRevision, WriteError> {
         Self::validate_assigned_revision(write)?;
+        self.max_assigned_revision_ts
+            .fetch_max(write.revision_ts, Ordering::Relaxed);
         let hash = cell.header.hash;
         let mut guard = self.lock_or_insert_cell(hash);
         if guard.is_unassigned() {

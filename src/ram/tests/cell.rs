@@ -1304,3 +1304,39 @@ pub fn dynamic() {
         assert!(stored_cell.data["major"].string().is_none());
     }
 }
+
+#[test]
+fn direct_insert_after_assigned_delete_outranks_the_tombstone() {
+    // A direct insert stamped from a stale lease below a transactional
+    // tombstone would lose to it at recovery (greatest revision_ts per id).
+    // The assigned-revision watermark must force the insert above it.
+    let chunks = test_chunks();
+    let chunk = &chunks.list[0];
+    let id = Id::new(1, 95);
+    let mut first = test_cell(id, 10);
+    chunks
+        .write_cell_at_revision(&mut first, RevisionWrite::committed(100))
+        .unwrap();
+    let high = chunk
+        .revision_clock
+        .try_now()
+        .unwrap()
+        .ts
+        .checked_add(1 << 30)
+        .unwrap();
+    chunks
+        .remove_cell_at_revision(&id, RevisionWrite::committed(high))
+        .unwrap();
+
+    // Simulate a lease minted before the delete was observed.
+    chunk.revision_allocator.set_lease_for_test(1_000, 2_000);
+
+    let mut recreated = test_cell(id, 20);
+    chunks.write_cell(&mut recreated).unwrap();
+    assert!(
+        recreated.header.revision_ts > high,
+        "direct insert at {} must outrank the assigned tombstone at {}",
+        recreated.header.revision_ts,
+        high
+    );
+}

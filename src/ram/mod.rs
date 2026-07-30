@@ -11,6 +11,7 @@ pub mod file_manager;
 pub mod history;
 pub mod io;
 pub mod recovery;
+pub mod revision;
 pub mod schema;
 pub mod segment_list;
 pub mod segs;
