@@ -1584,37 +1584,29 @@ pub async fn run_non_transactional_upsert_batch(
     ids: Arc<Vec<Id>>,
     operations: u64,
 ) -> TimedBatch {
-    let count = required_operation_count(ids.as_ref(), operations, "non-transactional upsert");
-    let mut cells = ids
-        .iter()
-        .take(count)
-        .copied()
-        .map(|id| counter_cell(fixture.schema.id, id, 0, 0))
-        .collect::<Vec<_>>();
+    validate_unique_ids(ids.as_ref(), "non-transactional upsert");
     let mut metrics = BatchMetrics::default();
-    let started = Instant::now();
-    for cell in &mut cells {
-        let id = cell.id();
+    let mut elapsed = Duration::ZERO;
+    for logical_index in 0..operations {
+        let id = cyclic_id(ids.as_ref(), logical_index);
+        let mut cell = counter_cell(fixture.schema.id, id, 0, 0);
         let operation_started = Instant::now();
         let result = fixture.servers[0]
             .chunks()
-            .upsert_cell(cell)
+            .upsert_cell(&mut cell)
             .map(|_| ())
             .map_err(|error| format!("upsert: {error:?}"));
+        let operation_elapsed = operation_started.elapsed();
+        elapsed += operation_elapsed;
         record_direct_attempt(
             &mut metrics,
-            operation_started.elapsed(),
+            operation_elapsed,
             result,
             "non-transactional upsert",
             id,
         );
     }
-    finalize_sequential_fixed_success(
-        metrics,
-        started.elapsed(),
-        operations,
-        "non-transactional upsert",
-    )
+    finalize_sequential_fixed_success(metrics, elapsed, operations, "non-transactional upsert")
 }
 
 #[cfg(feature = "mvcc_revision_api")]

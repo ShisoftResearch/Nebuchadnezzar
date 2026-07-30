@@ -735,6 +735,34 @@ async fn direct_mutation_workloads_account_every_requested_operation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn non_transactional_upsert_cycles_a_bounded_id_pool() {
+    const OPERATIONS: u64 = 3;
+
+    let fixture = Arc::new(
+        fixture::OccFixture::single_with_history_retention(
+            "127.0.0.1:54556",
+            "occ_bench_bounded_upsert",
+            1,
+        )
+        .await,
+    );
+    let server_id = fixture.servers[0].server_id;
+    let ids = Arc::new(fixture.ids_for_server(server_id, 1, 54_556));
+
+    let batch = run_non_transactional_upsert_batch(fixture.clone(), ids, OPERATIONS).await;
+    let summary = batch.metrics.summary(batch.elapsed);
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("bounded upsert test retained fixture owners"));
+    fixture.shutdown().await;
+
+    assert_eq!(summary.attempts, OPERATIONS);
+    assert_eq!(summary.committed, OPERATIONS);
+    assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+    assert!(summary.invariants_passed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cleaner_relocates_retained_history_while_reader_is_active() {
     let fixture = Arc::new(
         fixture::OccFixture::single_with_history_retention(
