@@ -3367,7 +3367,10 @@ mod tests {
         let first_revision_ts = runtime.chunks().write_cell(&mut first).unwrap().revision_ts;
         let tid = manager.hlc.now();
         let mut second = counter_cell(schema.id, cell_id, 400, "B");
-        runtime.chunks().update_cell(&mut second).unwrap();
+        runtime
+            .chunks()
+            .update_cell_at_revision(&mut second, RevisionWrite::committed(manager.hlc.now().ts))
+            .unwrap();
 
         let head = <DataManager as Service>::head(&manager, 43, tid, tid, cell_id)
             .await
