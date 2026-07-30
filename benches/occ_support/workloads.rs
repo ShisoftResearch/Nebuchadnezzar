@@ -1650,22 +1650,26 @@ pub async fn run_non_transactional_conditional_update_batch(
 ) -> TimedBatch {
     validate_unique_ids(ids.as_ref(), "non-transactional conditional update");
     let mut metrics = BatchMetrics::default();
-    let started = Instant::now();
+    let mut elapsed = Duration::ZERO;
     for logical_index in 0..operations {
         let id = cyclic_id(ids.as_ref(), logical_index);
-        let operation_started = Instant::now();
-        let result = async {
-            let mut cell = incremented_cell(&fixture, id)?;
-            let token = comparison_token(&cell.header);
-            compare_and_update(&fixture, &id, token, &mut cell)
-                .await
-                .map_err(|error| format!("conditional update: {error:?}"))?;
-            Ok::<(), String>(())
-        }
-        .await;
+        let prepared =
+            incremented_cell(&fixture, id).map(|cell| (comparison_token(&cell.header), cell));
+        let (operation_elapsed, result) = match prepared {
+            Ok((token, mut cell)) => {
+                let operation_started = Instant::now();
+                let result = compare_and_update(&fixture, &id, token, &mut cell)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("conditional update: {error:?}"));
+                (operation_started.elapsed(), result)
+            }
+            Err(error) => (Duration::ZERO, Err(error)),
+        };
+        elapsed += operation_elapsed;
         record_direct_attempt(
             &mut metrics,
-            operation_started.elapsed(),
+            operation_elapsed,
             result,
             "non-transactional conditional update",
             id,
@@ -1673,7 +1677,7 @@ pub async fn run_non_transactional_conditional_update_batch(
     }
     finalize_sequential_fixed_success(
         metrics,
-        started.elapsed(),
+        elapsed,
         operations,
         "non-transactional conditional update",
     )

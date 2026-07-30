@@ -763,6 +763,41 @@ async fn non_transactional_upsert_cycles_a_bounded_id_pool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn conditional_update_excludes_failed_payload_preparation_from_elapsed() {
+    let fixture = Arc::new(
+        fixture::OccFixture::single_with_history_retention(
+            "127.0.0.1:54557",
+            "occ_bench_conditional_setup_timing",
+            1,
+        )
+        .await,
+    );
+    let server_id = fixture.servers[0].server_id;
+    let id = fixture.ids_for_server(server_id, 1, 54_557)[0];
+    fixture.seed_counter(id, u64::MAX).await;
+
+    let batch =
+        run_non_transactional_conditional_update_batch(fixture.clone(), Arc::new(vec![id]), 1)
+            .await;
+    let summary = batch.metrics.summary(batch.elapsed);
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("conditional timing test retained fixture owners"));
+    fixture.shutdown().await;
+
+    assert_eq!(batch.elapsed, Duration::ZERO);
+    assert_eq!(summary.attempts, 1);
+    assert_eq!(summary.committed, 0);
+    assert_eq!(summary.p99_ns, 0);
+    assert_eq!(summary.unexpected.len(), 2);
+    assert!(summary
+        .unexpected
+        .iter()
+        .any(|message| message.contains("score overflow")));
+    assert!(!summary.invariants_passed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cleaner_relocates_retained_history_while_reader_is_active() {
     let fixture = Arc::new(
         fixture::OccFixture::single_with_history_retention(
