@@ -2,7 +2,10 @@ mod occ_support;
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+    },
     time::Duration,
 };
 
@@ -21,10 +24,13 @@ use occ_support::{
         build_history_chain, hold_old_snapshot_across_newer_writes, run_blind_remove_batch,
         run_blind_update_batch, run_expired_snapshot_read_batch, run_fixed_success_rmw,
         run_fresh_cleaner_reader_contention_batch, run_fresh_cleaner_relocation_batch,
-        run_held_snapshot_read_batch, run_hlc_allocation_batch, run_non_transactional_read_batch,
-        run_projected_read_batch, run_read_only_current_batch,
+        run_held_snapshot_read_batch, run_hlc_allocation_batch,
+        run_non_transactional_conditional_update_batch,
+        run_non_transactional_delete_recreate_batch, run_non_transactional_read_batch,
+        run_non_transactional_remove_batch, run_non_transactional_upsert_batch,
+        run_non_transactional_write_batch, run_projected_read_batch, run_read_only_current_batch,
         run_storage_bounded_non_transactional_update_batch, run_visible_history_read_batch,
-        BatchSpec, ProjectionMode, TimedBatch,
+        seed_history_counter, BatchSpec, ProjectionMode, TimedBatch,
     },
 };
 
@@ -32,10 +38,16 @@ const OCC_SAMPLE_SIZE: usize = 10;
 const OCC_WARMUP_SECONDS: u64 = 3;
 const OCC_MEASUREMENT_SECONDS: u64 = 10;
 const CLEANER_SAMPLE_BOUND_NANOS: u64 = 1;
+const DIRECT_FRESH_ID_STRIDE: u64 = 4_096;
 
 const REQUIRED_MVCC_SCENARIOS: &[&str] = &[
+    "mvcc/non_transactional_write",
     "mvcc/non_transactional_read",
     "mvcc/non_transactional_update",
+    "mvcc/non_transactional_upsert",
+    "mvcc/non_transactional_conditional_update",
+    "mvcc/non_transactional_remove",
+    "mvcc/non_transactional_delete_recreate",
     "mvcc/read_only_current",
     "mvcc/rmw_one_cell",
     "mvcc/rmw_multi_cell",
@@ -163,6 +175,14 @@ fn seed(runtime: &Runtime, fixture: &OccFixture, ids: &[Id], payload_bytes: usiz
     });
 }
 
+fn seed_history(runtime: &Runtime, fixture: &OccFixture, ids: &[Id], payload_bytes: usize) {
+    runtime.block_on(async {
+        for id in ids {
+            seed_history_counter(fixture, *id, 0, payload_bytes).await;
+        }
+    });
+}
+
 fn seed_cleaner_ids(
     runtime: &Runtime,
     fixture: Arc<OccFixture>,
@@ -173,15 +193,7 @@ fn seed_cleaner_ids(
     let sacrificial_ids = Arc::new(ids.iter().skip(1).step_by(2).copied().collect::<Vec<_>>());
     for (target, sacrificial) in target_ids.iter().zip(sacrificial_ids.iter()) {
         for id in [target, sacrificial] {
-            runtime
-                .block_on(fixture.client.write_cell(counter_cell(
-                    fixture.schema.id,
-                    *id,
-                    0,
-                    512 * 1024,
-                )))
-                .expect("seed cleaner benchmark counter RPC")
-                .expect("seed cleaner benchmark counter");
+            runtime.block_on(seed_history_counter(&fixture, *id, 0, 512 * 1024));
         }
     }
     (target_ids, sacrificial_ids)
@@ -477,6 +489,40 @@ fn registered_mvcc_scenarios() -> &'static [&'static str] {
     REQUIRED_MVCC_SCENARIOS
 }
 
+fn fresh_direct_ids(fixture: &OccFixture, id_cursor: &AtomicU64, operations: u64) -> Arc<Vec<Id>> {
+    let count = usize::try_from(operations.max(1))
+        .expect("direct benchmark iteration count must fit in usize");
+    let span = operations
+        .max(1)
+        .checked_mul(DIRECT_FRESH_ID_STRIDE)
+        .expect("direct benchmark id span overflow");
+    let start = id_cursor.fetch_add(span, Ordering::Relaxed);
+    assert!(
+        start.checked_add(span).is_some(),
+        "direct benchmark fresh id allocation overflow"
+    );
+    Arc::new(fixture.ids_for_server(fixture.servers[0].server_id, count, start))
+}
+
+fn write_direct_counters(fixture: &OccFixture, ids: &[Id]) {
+    for id in ids {
+        let mut cell = counter_cell(fixture.schema.id, *id, 0, 0);
+        fixture.servers[0]
+            .chunks()
+            .write_cell(&mut cell)
+            .unwrap_or_else(|error| panic!("seed direct benchmark cell {id:?}: {error:?}"));
+    }
+}
+
+fn remove_direct_counters(fixture: &OccFixture, ids: &[Id]) {
+    for id in ids {
+        fixture.servers[0]
+            .chunks()
+            .remove_cell(id)
+            .unwrap_or_else(|error| panic!("reset direct benchmark cell {id:?}: {error:?}"));
+    }
+}
+
 fn mvcc_portfolio(criterion: &mut Criterion) {
     let runtime = Runtime::new().expect("create MVCC benchmark runtime");
     let plan = PortPlan::new(occ_support::base_port());
@@ -485,7 +531,7 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
     let ids = Arc::new(fixture.ids_for_server(server_id, 256, 8_000_000));
     // Direct updates retain every revision for the normal five-minute window;
     // keep this dedicated portfolio's counter payload minimal.
-    seed(&runtime, &fixture, ids.as_ref(), 0);
+    seed_history(&runtime, &fixture, ids.as_ref(), 0);
     let remove_ids = Arc::new(fixture.ids_for_server(server_id, 256, 8_300_000));
 
     let direct_fixture = Arc::new(runtime.block_on(OccFixture::single_with_history_retention(
@@ -496,6 +542,7 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
     let direct_server_id = direct_fixture.servers[0].server_id;
     let direct_ids = Arc::new(direct_fixture.ids_for_server(direct_server_id, 256, 8_400_000));
     seed(&runtime, &direct_fixture, direct_ids.as_ref(), 0);
+    let direct_id_cursor = Arc::new(AtomicU64::new(8_600_000));
 
     let retained_fixture = Arc::new(runtime.block_on(OccFixture::single_with_history_retention(
         plan.single(11),
@@ -504,7 +551,7 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
     )));
     let retained_server_id = retained_fixture.servers[0].server_id;
     let retained_ids = Arc::new(retained_fixture.ids_for_server(retained_server_id, 8, 8_500_000));
-    seed(&runtime, &retained_fixture, retained_ids.as_ref(), 0);
+    seed_history(&runtime, &retained_fixture, retained_ids.as_ref(), 0);
 
     // These scenarios deliberately measure reads of a fixed history state.  Build
     // that state before Criterion starts its timer, and report the exact retained
@@ -563,6 +610,7 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
         let remove_ids = remove_ids.clone();
         let direct_fixture = direct_fixture.clone();
         let direct_ids = direct_ids.clone();
+        let direct_id_cursor = direct_id_cursor.clone();
         let retained_fixture = retained_fixture.clone();
         let cluster_fixture = cluster_fixture.clone();
         let cluster_ids = cluster_ids.clone();
@@ -608,6 +656,7 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
                 let remove_ids = remove_ids.clone();
                 let direct_fixture = direct_fixture.clone();
                 let direct_ids = direct_ids.clone();
+                let direct_id_cursor = direct_id_cursor.clone();
                 let retained_fixture = retained_fixture.clone();
                 let cluster_fixture = cluster_fixture.clone();
                 let cluster_ids = cluster_ids.clone();
@@ -627,6 +676,22 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
                     let (batch, telemetry_fixture, retained_revisions) =
                         runtime_ref.block_on(async {
                             match scenario.as_str() {
+                                "mvcc/non_transactional_write" => {
+                                    let write_ids = fresh_direct_ids(
+                                        &direct_fixture,
+                                        &direct_id_cursor,
+                                        operations,
+                                    );
+                                    let batch = run_non_transactional_write_batch(
+                                        direct_fixture.clone(),
+                                        write_ids.clone(),
+                                        operations,
+                                    )
+                                    .await;
+                                    remove_direct_counters(&direct_fixture, write_ids.as_ref());
+                                    direct_fixture.expire_retained_revisions_and_clean().await;
+                                    (batch, direct_fixture.clone(), Vec::new())
+                                }
                                 "mvcc/non_transactional_read" => (
                                     run_non_transactional_read_batch(
                                         direct_fixture.clone(),
@@ -647,6 +712,54 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
                                     direct_fixture.clone(),
                                     Vec::new(),
                                 ),
+                                "mvcc/non_transactional_upsert" => {
+                                    let batch = run_non_transactional_upsert_batch(
+                                        direct_fixture.clone(),
+                                        direct_ids.clone(),
+                                        operations,
+                                    )
+                                    .await;
+                                    direct_fixture.expire_retained_revisions_and_clean().await;
+                                    (batch, direct_fixture.clone(), Vec::new())
+                                }
+                                "mvcc/non_transactional_conditional_update" => {
+                                    let batch = run_non_transactional_conditional_update_batch(
+                                        direct_fixture.clone(),
+                                        direct_ids.clone(),
+                                        operations,
+                                    )
+                                    .await;
+                                    direct_fixture.expire_retained_revisions_and_clean().await;
+                                    (batch, direct_fixture.clone(), Vec::new())
+                                }
+                                "mvcc/non_transactional_remove" => {
+                                    let remove_ids = fresh_direct_ids(
+                                        &direct_fixture,
+                                        &direct_id_cursor,
+                                        operations,
+                                    );
+                                    write_direct_counters(&direct_fixture, remove_ids.as_ref());
+                                    let batch = run_non_transactional_remove_batch(
+                                        direct_fixture.clone(),
+                                        remove_ids.clone(),
+                                        operations,
+                                    )
+                                    .await;
+                                    write_direct_counters(&direct_fixture, remove_ids.as_ref());
+                                    remove_direct_counters(&direct_fixture, remove_ids.as_ref());
+                                    direct_fixture.expire_retained_revisions_and_clean().await;
+                                    (batch, direct_fixture.clone(), Vec::new())
+                                }
+                                "mvcc/non_transactional_delete_recreate" => {
+                                    let batch = run_non_transactional_delete_recreate_batch(
+                                        direct_fixture.clone(),
+                                        direct_ids.clone(),
+                                        operations,
+                                    )
+                                    .await;
+                                    direct_fixture.expire_retained_revisions_and_clean().await;
+                                    (batch, direct_fixture.clone(), Vec::new())
+                                }
                                 "mvcc/read_only_current" => (
                                     run_read_only_current_batch(
                                         fixture.clone(),

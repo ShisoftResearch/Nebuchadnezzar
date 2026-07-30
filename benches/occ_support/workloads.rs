@@ -12,7 +12,7 @@ use bifrost::hlc::{Hlc, HlcSource};
 use dovahkiin::types::{Map as _, Value as _};
 use neb::{
     ram::{
-        cell::{OwnedCell, ReadError, SnapshotRead},
+        cell::{CellHeader, OwnedCell, ReadError, SnapshotRead, WriteError},
         types::{Id, OwnedValue},
     },
     server::transactions::{
@@ -517,6 +517,29 @@ async fn read_modify_write_once(fixture: &OccFixture, ids: &[Id]) -> AttemptOutc
     }
 
     finish_once(fixture, tid).await
+}
+
+pub async fn seed_history_counter(fixture: &OccFixture, id: Id, score: u64, payload_bytes: usize) {
+    let tid = begin_transaction(fixture)
+        .await
+        .unwrap_or_else(|outcome| panic!("begin history fixture seed: {outcome:?}"));
+    let write = fixture
+        .txn
+        .write(
+            tid.clone(),
+            counter_cell(fixture.schema.id, id, score, payload_bytes),
+        )
+        .await;
+    if !matches!(write, Ok(Ok(TxnExecResult::Accepted(())))) {
+        let _ = fixture.txn.abort(tid.clone()).await;
+        panic!("write history fixture seed {id:?}: {write:?}");
+    }
+    let outcome = finish_once(fixture, tid).await;
+    assert_eq!(
+        outcome,
+        AttemptOutcome::Committed,
+        "commit history fixture seed {id:?}: {outcome:?}"
+    );
 }
 
 fn validate_unique_ids(ids: &[Id], workload_name: &str) {
@@ -1469,6 +1492,270 @@ async fn run_non_transactional_update_batch_inner(
     }
 }
 
+fn record_direct_attempt(
+    metrics: &mut BatchMetrics,
+    elapsed: Duration,
+    result: Result<(), String>,
+    workload_name: &str,
+    id: Id,
+) {
+    match result {
+        Ok(()) => metrics.record_success(elapsed, 1, 0),
+        Err(error) => {
+            metrics.attempts += 1;
+            metrics.record_unexpected(format!("{workload_name} {id:?}: {error}"));
+        }
+    }
+}
+
+fn required_operation_count(ids: &[Id], operations: u64, workload_name: &str) -> usize {
+    validate_unique_ids(ids, workload_name);
+    let count = usize::try_from(operations)
+        .unwrap_or_else(|_| panic!("{workload_name} operation count must fit in usize"));
+    assert!(
+        ids.len() >= count,
+        "{workload_name} requires one fresh id per requested operation"
+    );
+    count
+}
+
+fn incremented_cell(fixture: &OccFixture, id: Id) -> Result<OwnedCell, String> {
+    let mut cell = fixture.servers[0]
+        .chunks()
+        .read_cell(&id)
+        .map(|cell| cell.to_owned())
+        .map_err(|error| format!("read: {error:?}"))?;
+    let score = cell.data["score"]
+        .u64()
+        .copied()
+        .ok_or_else(|| "score was not u64".to_string())?;
+    let next = score
+        .checked_add(1)
+        .ok_or_else(|| "score overflow".to_string())?;
+    let mut map = match &cell.data {
+        OwnedValue::Map(map) => map.owned(),
+        _ => return Err("cell data was not a map".to_string()),
+    };
+    replace_score_value(&mut map, next);
+    cell.data = OwnedValue::Map(map);
+    Ok(cell)
+}
+
+pub async fn run_non_transactional_write_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    let count = required_operation_count(ids.as_ref(), operations, "non-transactional write");
+    let mut cells = ids
+        .iter()
+        .take(count)
+        .copied()
+        .map(|id| counter_cell(fixture.schema.id, id, 0, 0))
+        .collect::<Vec<_>>();
+    let mut metrics = BatchMetrics::default();
+    let started = Instant::now();
+    for cell in &mut cells {
+        let id = cell.id();
+        let operation_started = Instant::now();
+        let result = fixture.servers[0]
+            .chunks()
+            .write_cell(cell)
+            .map(|_| ())
+            .map_err(|error| format!("write: {error:?}"));
+        record_direct_attempt(
+            &mut metrics,
+            operation_started.elapsed(),
+            result,
+            "non-transactional write",
+            id,
+        );
+    }
+    finalize_sequential_fixed_success(
+        metrics,
+        started.elapsed(),
+        operations,
+        "non-transactional write",
+    )
+}
+
+pub async fn run_non_transactional_upsert_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    let count = required_operation_count(ids.as_ref(), operations, "non-transactional upsert");
+    let mut cells = ids
+        .iter()
+        .take(count)
+        .copied()
+        .map(|id| counter_cell(fixture.schema.id, id, 0, 0))
+        .collect::<Vec<_>>();
+    let mut metrics = BatchMetrics::default();
+    let started = Instant::now();
+    for cell in &mut cells {
+        let id = cell.id();
+        let operation_started = Instant::now();
+        let result = fixture.servers[0]
+            .chunks()
+            .upsert_cell(cell)
+            .map(|_| ())
+            .map_err(|error| format!("upsert: {error:?}"));
+        record_direct_attempt(
+            &mut metrics,
+            operation_started.elapsed(),
+            result,
+            "non-transactional upsert",
+            id,
+        );
+    }
+    finalize_sequential_fixed_success(
+        metrics,
+        started.elapsed(),
+        operations,
+        "non-transactional upsert",
+    )
+}
+
+#[cfg(feature = "mvcc_revision_api")]
+async fn compare_and_update(
+    fixture: &OccFixture,
+    id: &Id,
+    token: u64,
+    cell: &mut OwnedCell,
+) -> Result<CellHeader, WriteError> {
+    fixture.servers[0]
+        .chunks()
+        .compare_revision_and_update_cell(id, token, cell)
+}
+
+#[cfg(not(feature = "mvcc_revision_api"))]
+async fn compare_and_update(
+    fixture: &OccFixture,
+    id: &Id,
+    token: u64,
+    cell: &mut OwnedCell,
+) -> Result<CellHeader, WriteError> {
+    fixture.servers[0]
+        .chunks()
+        .compare_version_and_update_cell(id, token, cell)
+}
+
+#[cfg(feature = "mvcc_revision_api")]
+fn comparison_token(header: &CellHeader) -> u64 {
+    header.revision_ts
+}
+
+#[cfg(not(feature = "mvcc_revision_api"))]
+fn comparison_token(header: &CellHeader) -> u64 {
+    header.version
+}
+
+pub async fn run_non_transactional_conditional_update_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    validate_unique_ids(ids.as_ref(), "non-transactional conditional update");
+    let mut metrics = BatchMetrics::default();
+    let started = Instant::now();
+    for logical_index in 0..operations {
+        let id = cyclic_id(ids.as_ref(), logical_index);
+        let operation_started = Instant::now();
+        let result = async {
+            let mut cell = incremented_cell(&fixture, id)?;
+            let token = comparison_token(&cell.header);
+            compare_and_update(&fixture, &id, token, &mut cell)
+                .await
+                .map_err(|error| format!("conditional update: {error:?}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        record_direct_attempt(
+            &mut metrics,
+            operation_started.elapsed(),
+            result,
+            "non-transactional conditional update",
+            id,
+        );
+    }
+    finalize_sequential_fixed_success(
+        metrics,
+        started.elapsed(),
+        operations,
+        "non-transactional conditional update",
+    )
+}
+
+pub async fn run_non_transactional_remove_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    let count = required_operation_count(ids.as_ref(), operations, "non-transactional remove");
+    let mut metrics = BatchMetrics::default();
+    let started = Instant::now();
+    for id in ids.iter().take(count).copied() {
+        let operation_started = Instant::now();
+        let result = fixture.servers[0]
+            .chunks()
+            .remove_cell(&id)
+            .map_err(|error| format!("remove: {error:?}"));
+        record_direct_attempt(
+            &mut metrics,
+            operation_started.elapsed(),
+            result,
+            "non-transactional remove",
+            id,
+        );
+    }
+    finalize_sequential_fixed_success(
+        metrics,
+        started.elapsed(),
+        operations,
+        "non-transactional remove",
+    )
+}
+
+pub async fn run_non_transactional_delete_recreate_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+) -> TimedBatch {
+    validate_unique_ids(ids.as_ref(), "non-transactional delete/recreate");
+    let mut metrics = BatchMetrics::default();
+    let started = Instant::now();
+    for logical_index in 0..operations {
+        let id = cyclic_id(ids.as_ref(), logical_index);
+        let operation_started = Instant::now();
+        let result = (|| {
+            fixture.servers[0]
+                .chunks()
+                .remove_cell(&id)
+                .map_err(|error| format!("remove: {error:?}"))?;
+            let mut cell = counter_cell(fixture.schema.id, id, 0, 0);
+            fixture.servers[0]
+                .chunks()
+                .write_cell(&mut cell)
+                .map_err(|error| format!("recreate write: {error:?}"))?;
+            Ok::<(), String>(())
+        })();
+        record_direct_attempt(
+            &mut metrics,
+            operation_started.elapsed(),
+            result,
+            "non-transactional delete/recreate",
+            id,
+        );
+    }
+    finalize_sequential_fixed_success(
+        metrics,
+        started.elapsed(),
+        operations,
+        "non-transactional delete/recreate",
+    )
+}
+
 pub async fn build_history_chain(
     fixture: Arc<OccFixture>,
     id: Id,
@@ -1481,7 +1768,7 @@ pub async fn build_history_chain(
     let mut predecessors = Vec::with_capacity(predecessor_count);
     let mut oldest_score = None;
     for _ in 0..predecessor_count {
-        let mut cell = fixture
+        let cell = fixture
             .client
             .read_cell(id)
             .await
@@ -1495,22 +1782,12 @@ pub async fn build_history_chain(
             id,
             revision_ts: cell.header.revision_ts,
         });
-        let next = score
-            .checked_add(1)
-            .expect("history fixture score overflow");
-        let map = match &cell.data {
-            OwnedValue::Map(map) => map.owned(),
-            _ => panic!("history fixture cell data must be a map"),
-        };
-        let mut map = map;
-        replace_score_value(&mut map, next);
-        cell.data = OwnedValue::Map(map);
-        fixture
-            .client
-            .update_cell(cell)
-            .await
-            .expect("update history fixture cell RPC")
-            .expect("update history fixture cell");
+        let outcome = read_modify_write_once(&fixture, &[id]).await;
+        assert_eq!(
+            outcome,
+            AttemptOutcome::Committed,
+            "update history fixture cell transaction: {outcome:?}"
+        );
     }
 
     let current = fixture
@@ -1681,18 +1958,15 @@ pub async fn build_cleaner_history(
     // Put the next target and sacrificial current cells in the same source
     // segments. This makes the setup repeatable across Criterion callbacks:
     // the sacrificial half can expire while the target half stays current.
+    // These cells will feed retained-history chains, so keep their complete
+    // mutation lifecycle transactional from the initial fixture insert onward.
     for (target_id, sacrificial_id) in target_ids.iter().zip(sacrificial_ids.iter()) {
         for id in [target_id, sacrificial_id] {
-            let batch =
-                run_non_transactional_update_batch(fixture.clone(), Arc::new(vec![*id]), 1).await;
+            let outcome = read_modify_write_once(&fixture, &[*id]).await;
             assert_eq!(
-                batch.metrics.committed, 1,
-                "cleaner source-layout update must commit"
-            );
-            assert!(
-                batch.metrics.unexpected.is_empty(),
-                "cleaner source-layout update failed: {:?}",
-                batch.metrics.unexpected
+                outcome,
+                AttemptOutcome::Committed,
+                "cleaner source-layout update {id:?}: {outcome:?}"
             );
         }
     }

@@ -24,9 +24,12 @@ use metrics::{BatchMetrics, RunReport, ScenarioSummary};
 use workloads::{
     build_history_chain, hold_old_snapshot_across_newer_writes, run_expired_snapshot_read_batch,
     run_fixed_success_rmw, run_fresh_cleaner_reader_contention_batch, run_held_snapshot_read_batch,
-    run_hlc_allocation_batch, run_projected_read_batch, run_read_only_current_batch,
+    run_hlc_allocation_batch, run_non_transactional_conditional_update_batch,
+    run_non_transactional_delete_recreate_batch, run_non_transactional_read_batch,
+    run_non_transactional_remove_batch, run_non_transactional_upsert_batch,
+    run_non_transactional_write_batch, run_projected_read_batch, run_read_only_current_batch,
     run_storage_bounded_non_transactional_update_batch, run_visible_history_read_batch,
-    AttemptOutcome, AttemptTally, BatchSpec, ProjectionMode,
+    seed_history_counter, AttemptOutcome, AttemptTally, BatchSpec, ProjectionMode,
 };
 
 #[test]
@@ -556,7 +559,7 @@ async fn deterministic_history_chain_reports_real_retained_state() {
         Arc::new(fixture::OccFixture::single("127.0.0.1:54520", "occ_bench_history_chain").await);
     let server_id = fixture.servers[0].server_id;
     let id = fixture.ids_for_server(server_id, 1, 54_520)[0];
-    fixture.seed_counter(id, 0).await;
+    seed_history_counter(&fixture, id, 0, 0).await;
 
     let chain = build_history_chain(fixture.clone(), id, 8).await;
     let telemetry = fixture.retention_telemetry(&chain.predecessors);
@@ -581,7 +584,7 @@ async fn held_transaction_snapshot_reads_old_revision_after_newer_writes() {
         Arc::new(fixture::OccFixture::single("127.0.0.1:54530", "occ_bench_old_snapshot").await);
     let server_id = fixture.servers[0].server_id;
     let id = fixture.ids_for_server(server_id, 1, 54_530)[0];
-    fixture.seed_counter(id, 0).await;
+    seed_history_counter(&fixture, id, 0, 0).await;
 
     let held = hold_old_snapshot_across_newer_writes(fixture.clone(), id, 8).await;
     let batch = run_held_snapshot_read_batch(fixture.clone(), held.clone(), 3).await;
@@ -609,7 +612,7 @@ async fn expired_history_is_reported_after_retention_window() {
     );
     let server_id = fixture.servers[0].server_id;
     let id = fixture.ids_for_server(server_id, 1, 54_540)[0];
-    fixture.seed_counter(id, 0).await;
+    seed_history_counter(&fixture, id, 0, 0).await;
 
     let chain = build_history_chain(fixture.clone(), id, 8).await;
     fixture.wait_for_history_expiration(&chain).await;
@@ -662,6 +665,76 @@ async fn bounded_direct_update_maintenance_is_excluded_from_measured_elapsed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn direct_mutation_workloads_account_every_requested_operation() {
+    const OPERATIONS: u64 = 3;
+
+    let fixture = Arc::new(
+        fixture::OccFixture::single_with_history_retention(
+            "127.0.0.1:54555",
+            "occ_bench_direct_mutations",
+            1,
+        )
+        .await,
+    );
+    let server_id = fixture.servers[0].server_id;
+    let ids = Arc::new(fixture.ids_for_server(server_id, OPERATIONS as usize, 54_555));
+    let remove_ids = Arc::new(fixture.ids_for_server(server_id, OPERATIONS as usize, 55_555));
+    let delete_recreate_ids =
+        Arc::new(fixture.ids_for_server(server_id, OPERATIONS as usize, 56_555));
+
+    let write = run_non_transactional_write_batch(fixture.clone(), ids.clone(), OPERATIONS).await;
+    let read = run_non_transactional_read_batch(fixture.clone(), ids.clone(), OPERATIONS).await;
+    let update = run_storage_bounded_non_transactional_update_batch(
+        fixture.clone(),
+        ids.clone(),
+        OPERATIONS,
+    )
+    .await;
+    let upsert = run_non_transactional_upsert_batch(fixture.clone(), ids.clone(), OPERATIONS).await;
+    let conditional =
+        run_non_transactional_conditional_update_batch(fixture.clone(), ids.clone(), OPERATIONS)
+            .await;
+
+    for id in remove_ids.iter() {
+        fixture.seed_counter(*id, 0).await;
+    }
+    let remove =
+        run_non_transactional_remove_batch(fixture.clone(), remove_ids.clone(), OPERATIONS).await;
+    for id in remove_ids.iter() {
+        fixture.seed_counter(*id, 0).await;
+    }
+    for id in delete_recreate_ids.iter() {
+        fixture.seed_counter(*id, 0).await;
+    }
+    let delete_recreate = run_non_transactional_delete_recreate_batch(
+        fixture.clone(),
+        delete_recreate_ids,
+        OPERATIONS,
+    )
+    .await;
+
+    let fixture = Arc::try_unwrap(fixture)
+        .unwrap_or_else(|_| panic!("direct mutation test retained fixture owners"));
+    fixture.shutdown().await;
+
+    for batch in [
+        write,
+        read,
+        update,
+        upsert,
+        conditional,
+        remove,
+        delete_recreate,
+    ] {
+        let summary = batch.metrics.summary(batch.elapsed);
+        assert_eq!(summary.attempts, OPERATIONS);
+        assert_eq!(summary.committed, OPERATIONS);
+        assert!(summary.unexpected.is_empty(), "{:?}", summary.unexpected);
+        assert!(summary.invariants_passed);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cleaner_relocates_retained_history_while_reader_is_active() {
     let fixture = Arc::new(
         fixture::OccFixture::single_with_history_retention(
@@ -693,12 +766,7 @@ async fn cleaner_relocates_retained_history_while_reader_is_active() {
     assert_eq!(sacrificial_ids.len(), 24);
     for (target, sacrificial) in target_ids.iter().zip(sacrificial_ids.iter()) {
         for id in [target, sacrificial] {
-            fixture
-                .client
-                .write_cell(fixture::counter_cell(fixture.schema.id, *id, 0, 512 * 1024))
-                .await
-                .expect("seed cleaner history RPC")
-                .expect("seed cleaner history");
+            seed_history_counter(&fixture, *id, 0, 512 * 1024).await;
         }
     }
 
