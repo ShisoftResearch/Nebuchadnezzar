@@ -6316,7 +6316,14 @@ mod tests {
         assert_eq!(prepare, DMPrepareResult::Success);
 
         let mut external = counter_cell(schema.id, cell_id, 7, "counter_commit_external");
-        let external_header = runtime.chunks().update_cell(&mut external).unwrap();
+        runtime
+            .chunks()
+            .update_cell_at_revision(
+                &mut external,
+                RevisionWrite::committed(manager.hlc.now().ts),
+            )
+            .unwrap();
+        let external_header = external.header;
         assert!(external_header.revision_ts > initial_revision_ts);
 
         let commit = commit_ops_local(
@@ -6373,7 +6380,14 @@ mod tests {
         assert_eq!(prepare, DMPrepareResult::Success);
 
         let mut external = counter_cell(schema.id, cell_id, 8, "counter_remove_external");
-        let external_header = runtime.chunks().update_cell(&mut external).unwrap();
+        runtime
+            .chunks()
+            .update_cell_at_revision(
+                &mut external,
+                RevisionWrite::committed(manager.hlc.now().ts),
+            )
+            .unwrap();
+        let external_header = external.header;
         assert!(external_header.revision_ts > initial_revision_ts);
 
         let commit = commit_ops_local(&manager, &tid, vec![CommitOp::Remove(cell_id)]).await;
@@ -6421,8 +6435,8 @@ mod tests {
 
         runtime
             .chunks()
-            .remove_cell_by(&cell_id, |_| true)
-            .expect("external direct removal should succeed");
+            .remove_cell_at_revision(&cell_id, RevisionWrite::committed(manager.hlc.now().ts))
+            .expect("external committed removal should succeed");
 
         let commit = commit_ops_local(
             &manager,
@@ -6480,7 +6494,14 @@ mod tests {
         assert_eq!(prepare, DMPrepareResult::Success);
 
         let mut external = counter_cell(schema.id, cell_id, 5, "counter_write_external");
-        let external_header = runtime.chunks().write_cell(&mut external).unwrap();
+        runtime
+            .chunks()
+            .write_cell_at_revision(
+                &mut external,
+                RevisionWrite::committed(manager.hlc.now().ts),
+            )
+            .unwrap();
+        let external_header = external.header;
 
         let commit = commit_ops_local(
             &manager,
@@ -6614,7 +6635,14 @@ mod tests {
         let before_b = runtime.chunks().read_cell(&cell_b).unwrap().to_owned();
 
         let mut external_b = counter_cell(schema.id, cell_b, 26, "counter_prevalidate_external_b");
-        let external_b_header = runtime.chunks().update_cell(&mut external_b).unwrap();
+        runtime
+            .chunks()
+            .update_cell_at_revision(
+                &mut external_b,
+                RevisionWrite::committed(manager.hlc.now().ts),
+            )
+            .unwrap();
+        let external_b_header = external_b.header;
         assert!(external_b_header.revision_ts > version_b);
 
         let commit = commit_ops_local(
@@ -6751,7 +6779,10 @@ mod tests {
         let colliding_id = Id::new(1, deleted_id.lower);
 
         let deleted_revision = seed_cell_revision(&runtime, schema.id, deleted_id, 1, 0);
-        runtime.chunks().remove_cell(&deleted_id).unwrap();
+        runtime
+            .chunks()
+            .remove_cell_at_revision(&deleted_id, RevisionWrite::committed(manager.hlc.now().ts))
+            .unwrap();
         let tombstone_revision = match manager.current_expectation(&deleted_id).unwrap() {
             CellExpectation::Absent(Some(revision_ts)) => revision_ts,
             other => panic!("expected exact tombstone, got {other:?}"),
@@ -6843,7 +6874,13 @@ mod tests {
         );
 
         let mut external = counter_cell(schema.id, read_id, 7, "partial-cert-external");
-        runtime.chunks().update_cell(&mut external).unwrap();
+        runtime
+            .chunks()
+            .update_cell_at_revision(
+                &mut external,
+                RevisionWrite::committed(manager.hlc.now().ts),
+            )
+            .unwrap();
 
         let prepare = prepare_ops_local(
             &manager,
