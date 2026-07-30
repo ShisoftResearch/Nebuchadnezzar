@@ -237,9 +237,19 @@ impl CombinedCleaner {
             .map(|segment| segment.seq_id)
             .min();
 
-        for entry in segments.iter().flat_map(|segment| segment.entry_iter()) {
+        for (segment, entry) in segments
+            .iter()
+            .flat_map(|segment| segment.entry_iter().map(move |entry| (segment, entry)))
+        {
             let (key, kind, direct_tombstone_live) = match entry.entry_header.entry_type {
                 EntryType::CELL => {
+                    // Dead entries are known exactly at mark time; one bit test
+                    // replaces the per-entry index and history probes that made
+                    // collection cost scale with backlog and close the
+                    // slow-cleaning feedback loop.
+                    if segment.is_dead_at(entry.entry_pos) {
+                        continue;
+                    }
                     let header = cell::cell_header_from_entry_content_addr(entry.body_pos);
                     (
                         RevisionKey {
@@ -252,14 +262,50 @@ impl CombinedCleaner {
                 }
                 EntryType::TOMBSTONE => {
                     let tombstone = Tombstone::read_from_entry_content_addr(entry.body_pos);
+                    let id = Id::new(tombstone.partition, tombstone.hash);
+                    // A tombstone is obsolete once its cell exists again with a
+                    // newer revision: recovery selects the greatest revision_ts
+                    // per id, and a current direct cell is durably finished
+                    // before publication, so the recreated cell always outranks
+                    // this tombstone. Without this, delete/recreate churn keeps
+                    // every tombstone watermark-live (predecessor seqs track
+                    // the newest segments) and they accumulate without bound.
+                    let superseded = chunk
+                        .cell_index
+                        .get_from_mutex(&(id.lower as usize))
+                        .is_some_and(|location| {
+                            // Deref only under a segment lease and revalidate
+                            // the mirror: a concurrent relocation otherwise
+                            // makes this a use-after-free. Failing the lease
+                            // conservatively keeps the tombstone.
+                            let Some(segment) = chunk.locate_segment(location) else {
+                                return false;
+                            };
+                            let Some(_lease) =
+                                crate::ram::segs::SegmentReferenceGuard::try_new(segment)
+                            else {
+                                return false;
+                            };
+                            if chunk.cell_index.get_from_mutex(&(id.lower as usize))
+                                != Some(location)
+                            {
+                                return false;
+                            }
+                            cell::cell_header_from_entry_content_addr(
+                                crate::ram::entry::Entry::content_pos(location),
+                            )
+                            .revision_ts
+                                > tombstone.revision_ts
+                        });
                     (
                         RevisionKey {
-                            id: Id::new(tombstone.partition, tombstone.hash),
+                            id,
                             revision_ts: tombstone.revision_ts,
                         },
                         RevisionKind::Tombstone,
-                        oldest_resident_seq
-                            .is_some_and(|oldest| oldest <= tombstone.segment_seq_id),
+                        !superseded
+                            && oldest_resident_seq
+                                .is_some_and(|oldest| oldest <= tombstone.segment_seq_id),
                     )
                 }
                 EntryType::UNDECIDED => continue,
@@ -267,7 +313,11 @@ impl CombinedCleaner {
             let history_live = chunk
                 .history
                 .is_live_at(key.id, key.revision_ts, entry.entry_pos);
+            // The bit test has already excluded dead entries, so this probe
+            // now runs only for live survivors: cost scales with live data,
+            // not backlog, while classification stays exact.
             let current_index_target = kind == RevisionKind::Cell
+                && !history_live
                 && chunk.cell_index.get_from_mutex(&(key.id.lower as usize))
                     == Some(entry.entry_pos);
             if !history_live && !current_index_target && !direct_tombstone_live {
@@ -572,16 +622,77 @@ impl CombinedCleaner {
         Ok((segments, safe_to_reclaim.load(Ordering::Acquire)))
     }
 
+    /// Destination-free reclamation for allocation emergencies: free segments
+    /// whose every byte is dead and which hold no tombstones (watermark-live
+    /// direct tombstones must survive until their predecessors expire). Needs
+    /// no new segment, so it cannot fail for lack of headroom.
+    pub fn reclaim_dead_segments(chunk: &Chunk) -> usize {
+        let mut freed = 0;
+        for seg in chunk.segments() {
+            if chunk.is_active_head(seg.id)
+                || seg.living_space() != 0
+                || seg.tombstones.load(Ordering::Relaxed) != 0
+            {
+                continue;
+            }
+            let Some(candidate) = SegmentCandidate::new(&seg) else {
+                continue;
+            };
+            if !candidate.try_seal_for_reclaim() {
+                continue;
+            }
+            match chunk.remove_segment(candidate.id) {
+                Ok(true) => {
+                    candidate.mem_drop(chunk);
+                    freed += 1;
+                }
+                _ => candidate.unseal_after_failed_remove(),
+            }
+        }
+        freed
+    }
+
     fn cleanup_segments(chunk: &Chunk, segments: &[SegmentCandidate]) -> io::Result<()> {
-        debug!("Released references for {} source segments", segments.len());
+        let mut retained = 0usize;
         for old_seg in segments {
-            if !chunk.remove_segment(old_seg.id)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("cleaner source segment {} disappeared", old_seg.id),
-                ));
+            // Exclusive ownership is required only at this instant: freeing
+            // the memory. Every entry has already been relocated or is dead,
+            // so no new reference routes here; stragglers drain in
+            // microseconds. A segment whose references do not drain is
+            // retained for a later pass rather than freed unsafely.
+            if !old_seg.try_seal_for_reclaim() {
+                // Every entry in this source has been relocated or is dead,
+                // but relocation does not touch source dead-space counters.
+                // Without this the remnant reads as fully live, utilization
+                // filtering never reselects it, and it pins the direct
+                // tombstone watermark forever. Account it all dead so the
+                // next pass reselects and frees it once references drain.
+                old_seg.account_fully_dead();
+                retained += 1;
+                continue;
+            }
+            match chunk.remove_segment(old_seg.id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    old_seg.unseal_after_failed_remove();
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("cleaner source segment {} disappeared", old_seg.id),
+                    ));
+                }
+                Err(error) => {
+                    old_seg.unseal_after_failed_remove();
+                    return Err(error);
+                }
             }
             old_seg.mem_drop(chunk);
+        }
+        if retained > 0 {
+            debug!(
+                "Cleaner retained {} of {} source segments with undrained references",
+                retained,
+                segments.len()
+            );
         }
         Ok(())
     }

@@ -100,6 +100,11 @@ pub struct Segment {
     /// Marker used by cleaners to skip segments that were cleaned without reclaiming space
     last_no_progress_clean_generation: AtomicU64,
     references: AtomicUsize,
+    /// Dead-entry bitmap, one bit per 8 aligned bytes: set at
+    /// mark_dead_entry time so cleaner collection can skip dead entries with
+    /// one bit test instead of index and history probes (the PostgreSQL
+    /// visibility-map idea inverted).
+    dead_bits: Vec<AtomicU64>,
     pub file_state: parking_lot::Mutex<SegmentFileState>,
     pub dropped: AtomicBool,
     // Tiered memory fields
@@ -190,6 +195,9 @@ impl Segment {
             chunk_id, id, seq_id, size, buffer_ptr
         );
         let tiered_lock = if hot { HOT_SEGMENT } else { COLD_SEGMENT };
+        let dead_bits = (0..SEGMENT_SIZE / 8 / 64)
+            .map(|_| AtomicU64::new(0))
+            .collect();
         Segment {
             addr: buffer_ptr,
             id,
@@ -203,6 +211,7 @@ impl Segment {
             dead_bytes_generation: AtomicU64::new(0),
             last_no_progress_clean_generation: AtomicU64::new(0),
             references: AtomicUsize::new(0),
+            dead_bits,
             file_state: parking_lot::Mutex::new(SegmentFileState {
                 manager: file_manager,
                 wal: wal_file_opt,
@@ -331,6 +340,18 @@ impl Segment {
         }
     }
 
+    #[inline]
+    pub fn mark_dead_bit(&self, addr: usize) {
+        let offset = (addr - self.addr) / 8;
+        self.dead_bits[offset / 64].fetch_or(1u64 << (offset % 64), Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_dead_at(&self, addr: usize) -> bool {
+        let offset = (addr - self.addr) / 8;
+        self.dead_bits[offset / 64].load(Ordering::Acquire) & (1u64 << (offset % 64)) != 0
+    }
+
     pub fn dead_space(&self) -> u32 {
         self.dead_space.load(Ordering::Relaxed)
     }
@@ -355,6 +376,21 @@ impl Segment {
         }
     }
 
+    /// Account every entry in this segment as dead. Used when the cleaner has
+    /// relocated all live entries out but must retain the segment because
+    /// straggling references have not drained: without this the remnant reads
+    /// as fully live and utilization filtering never reselects it. Tombstone
+    /// space is already counted by `total_dead_space`, so it is excluded here
+    /// to keep `living_space` exactly zero.
+    pub fn account_fully_dead(&self) {
+        let used = self.used_spaces();
+        let tombstone_space =
+            self.tombstones.load(Ordering::Relaxed) * (TOMBSTONE_SIZE_U32 + ENTRY_HEAD_SIZE as u32);
+        self.dead_space
+            .store(used.saturating_sub(tombstone_space), Ordering::Release);
+        self.note_dead_bytes_change();
+    }
+
     /// Clear the "no progress" marker so the cleaner can reconsider this segment.
     #[inline]
     pub fn clear_clean_no_progress(&self) {
@@ -376,7 +412,8 @@ impl Segment {
     // dead space plus tombstone spaces
     pub fn total_dead_space(&self) -> u32 {
         // We count tombstone space becasue we want to actively clean them out when they are obsolete
-        let tombstones_space = self.tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
+        let tombstones_space =
+            self.tombstones.load(Ordering::Relaxed) * (TOMBSTONE_SIZE_U32 + ENTRY_HEAD_SIZE as u32);
         let dead_cells_space = self.dead_space();
         return tombstones_space + dead_cells_space;
     }

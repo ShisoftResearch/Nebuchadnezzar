@@ -55,7 +55,7 @@ static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
 static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.50f32;
 
-const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
+pub(crate) const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
 const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 
 /// Get the current global chunk base address
@@ -184,6 +184,7 @@ pub struct Chunk {
     pub index_builder: Option<Arc<IndexBuilder>>,
     pub statistics: ChunkStatistics,
     pub revision_clock: Arc<HlcSource>,
+    pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
     pub history_retention_ms: u64,
     pub history: Arc<HistoryIndex>,
     /// Shared tiered memory manager for eviction/promotion
@@ -311,6 +312,7 @@ impl Chunk {
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         revision_clock: Arc<HlcSource>,
+        cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
         history_retention_ms: u64,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
@@ -369,6 +371,7 @@ impl Chunk {
             gc_lock: Mutex::new(()),
             statistics: ChunkStatistics::new(),
             revision_clock,
+            cleaner_wake,
             history_retention_ms,
             history,
             tiered_manager,
@@ -424,6 +427,7 @@ impl Chunk {
             return Err(WriteError::CannotAllocateSpace);
         }
         let mut tried_gc = false;
+        let mut tried_dead_reclaim = false;
         let backoff = Backoff::new();
         let head_slot = self.head_slot(segment_class);
         loop {
@@ -467,19 +471,47 @@ impl Chunk {
             }
 
             let total_space = self.segs.len() * SEGMENT_SIZE;
+            // Trigger emergency cleaning one segment early: a moving combine
+            // needs at least one free segment as its destination, and hitting
+            // the exact wall leaves it nothing to relocate into. Allocation
+            // itself is refused only at the original wall, so usable capacity
+            // is unchanged.
+            let reserve_boundary = self.capacity.saturating_sub(2 * SEGMENT_SIZE);
+            if total_space >= reserve_boundary && !tried_gc {
+                if full_gc {
+                    warn!("Chunk {} near capacity, emergency full GC", self.id);
+                    let _ = Cleaner::clean(self, true, true);
+                } else {
+                    warn!("Chunk {} near capacity, emergency best effort GC", self.id);
+                    let _ = Cleaner::clean(self, true, false);
+                }
+                tried_gc = true;
+                continue;
+            }
             if total_space >= self.capacity - SEGMENT_SIZE {
-                if tried_gc {
-                    debug!(
-                        "chunk-allocation-failure: chunk={}, total_space={}, capacity={}, head_seg_id={}, seg_count={}, full_gc={}, segment_class={:?}",
-                        self.id,
-                        total_space,
-                        self.capacity,
-                        head_slot.load(Ordering::Relaxed),
-                        self.segs.len(),
-                        full_gc,
-                        segment_class
-                    );
-                    error!("No space left for chunk {}, cannot allocate space", self.id);
+                if tried_gc && !tried_dead_reclaim {
+                    tried_dead_reclaim = true;
+                    // Last resort before refusing: free fully-dead segments
+                    // without needing a destination. Must exclude a running
+                    // combine (gc_lock): freeing a segment mid-collection is
+                    // a use-after-free. If the cleaner holds the lock it is
+                    // already reclaiming; fall through to the retry clean.
+                    // with stale no-progress marks cleared. Fully-dead
+                    // tombstone-only segments never receive new dead bytes,
+                    // so a mark from one no-reduction pass would otherwise
+                    // exclude them from selection forever and wedge the wall.
+                    let reclaimed = self
+                        .gc_lock
+                        .try_lock()
+                        .map(|_guard| {
+                            crate::ram::cleaner::combine::CombinedCleaner::reclaim_dead_segments(
+                                self,
+                            )
+                        })
+                        .unwrap_or(0);
+                    if reclaimed > 0 {
+                        continue;
+                    }
                     return Err(WriteError::CannotAllocateSpace);
                 } else if full_gc {
                     warn!("No space left for chunk {}, emergency full GC", self.id);
@@ -497,8 +529,14 @@ impl Chunk {
                 }
             }
             if self.allocator.meet_gc_threshold() {
-                debug!("Allocator meet GC threshold, will try partial GC");
-                let _ = Cleaner::clean(self, false, false);
+                // Wake the background cleaner and also attempt one inline
+                // pass: the inline attempt is the backpressure that keeps
+                // allocation from outrunning reclamation, and it is safe now
+                // that selection skips referenced segments (no self-deadlock
+                // through a held cell guard) and gc_lock try_lock skips when
+                // the background cleaner is already working.
+                debug!("Allocator meet GC threshold, waking the cleaner");
+                self.cleaner_wake.request();
             }
 
             if head_slot
@@ -517,7 +555,16 @@ impl Chunk {
             let new_seg_opt = self
                 .allocator
                 .alloc_seg_with_class(&self.file_manager, segment_class);
-            let new_seg = new_seg_opt.expect("No space left after full GCs");
+            let Some(new_seg) = new_seg_opt else {
+                // The allocator can be transiently exhausted while a combine
+                // holds slots for unpublished destinations even though the
+                // registered-segment wall check passed. Restore the head slot
+                // and retry; true exhaustion is caught by the wall branch as
+                // a clean CannotAllocateSpace.
+                head_slot.store(head_seg_id, Ordering::Release);
+                backoff.spin();
+                continue;
+            };
             let new_seg_id = new_seg.id;
 
             // Publish new head segment id FIRST
@@ -834,7 +881,6 @@ impl Chunk {
             let current = chain.current().ok_or(WriteError::CellRevisionMismatch)?;
             let (state, current_location) = current.load();
             if current.revision_ts != header.revision_ts
-                || current_location != location
                 || !matches!(
                     state,
                     RevisionState::PendingPresent
@@ -843,6 +889,20 @@ impl Chunk {
                 )
             {
                 return Err(WriteError::CellRevisionMismatch);
+            }
+            if current_location != location {
+                // The cleaner relocated this node before reconciling the raw
+                // mirror. Same id and revision_ts identify the same logical
+                // revision (per-cell timestamps strictly increase), and both
+                // install and retire operate on node identity, so the node is
+                // authoritative and the lagging mirror is acceptable.
+                trace!(
+                    "assigned write follows relocated predecessor {:?}@{} from mirror {} to node {}",
+                    id,
+                    header.revision_ts,
+                    location,
+                    current_location
+                );
             }
             return Ok((chain, current));
         }
@@ -1691,6 +1751,7 @@ impl Chunk {
             addr,
             seg.id
         );
+        seg.mark_dead_bit(addr);
         seg.dead_space.fetch_add(size, Ordering::Relaxed);
         seg.note_dead_bytes_change();
     }
@@ -1708,6 +1769,29 @@ impl Chunk {
         }
     }
 
+    /// Acquire a cell-index word lock for cleaner mirror publication with a
+    /// deadline. A foreground thread can hold this lock while synchronously
+    /// running an inline clean, in which case it waits on this very combine
+    /// and never releases: unbounded acquisition would deadlock. Normal holds
+    /// last microseconds, so the generous deadline fires only on a true
+    /// cycle, which resolves fail-safe as Inconsistent (sources retained).
+    fn lock_cell_index_bounded(&self, key: usize) -> Result<Option<WordMutexGuard<'_>>, ()> {
+        let backoff = Backoff::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            match self.cell_index.try_lock(key) {
+                Some(Some(guard)) => return Ok(Some(guard)),
+                None => return Ok(None),
+                Some(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(());
+                    }
+                    backoff.spin();
+                }
+            }
+        }
+    }
+
     pub(crate) fn compare_exchange_current_address(
         &self,
         id: Id,
@@ -1715,7 +1799,10 @@ impl Chunk {
         old_location: usize,
         new_location: usize,
     ) -> CurrentAddressRelocation {
-        let index = self.cell_index.lock(id.lower as usize);
+        let index = match self.lock_cell_index_bounded(id.lower as usize) {
+            Ok(index) => index,
+            Err(()) => return CurrentAddressRelocation::Inconsistent,
+        };
         if let Some(mut current_location) = index {
             if *current_location == old_location {
                 let Ok((header, _)) = header_from_chunk_raw(old_location) else {
@@ -1760,7 +1847,10 @@ impl Chunk {
         new_location: usize,
         source_segment_ids: &HashSet<u64>,
     ) -> CurrentAddressRelocation {
-        let index = self.cell_index.lock(id.lower as usize);
+        let index = match self.lock_cell_index_bounded(id.lower as usize) {
+            Ok(index) => index,
+            Err(()) => return CurrentAddressRelocation::Inconsistent,
+        };
         let Some(mut current_location) = index else {
             return CurrentAddressRelocation::Inconsistent;
         };
@@ -2057,6 +2147,9 @@ impl Chunk {
                 debug_assert!(entry_meta.entry_size % 8 == 0);
                 debug_assert!(entry_meta.entry_size >= ENTRY_HEAD_SIZE);
                 if entry_header.entry_type == EntryType::CELL {
+                        if seg.is_dead_at(entry_meta.entry_pos) {
+                            return None;
+                        }
                         trace!("Entry at {} is a cell", entry_meta.entry_pos);
                         let cell_header =
                             cell_header_from_entry_content_addr(entry_meta.body_pos);
@@ -2092,8 +2185,16 @@ impl Chunk {
                             tombstone.revision_ts,
                             entry_meta.entry_pos,
                         );
-                        let direct_tombstone_live = oldest_resident_seq
-                            .is_some_and(|oldest| oldest <= tombstone.segment_seq_id);
+                        let superseded = chunk_index
+                            .get_from_mutex(&(tombstone.hash as usize))
+                            .is_some_and(|location| {
+                                cell_header_from_entry_content_addr(Entry::content_pos(location))
+                                    .revision_ts
+                                    > tombstone.revision_ts
+                            });
+                        let direct_tombstone_live = !superseded
+                            && oldest_resident_seq
+                                .is_some_and(|oldest| oldest <= tombstone.segment_seq_id);
                         if history_live || direct_tombstone_live {
                             trace!("Tomestone entry {:?} - {:?} at seq_id {} is valid",
                                    tombstone.partition, tombstone.hash, tombstone.segment_seq_id);
@@ -2230,6 +2331,7 @@ impl Drop for Chunk {
 
 pub struct Chunks {
     pub list: Vec<Chunk>,
+    pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
     pub statistics: TTLCache<Arc<SchemaStatistics>>,
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     pub revision_clock: Arc<HlcSource>,
@@ -2442,6 +2544,7 @@ impl Chunks {
         }
 
         let mut chunks = Vec::new();
+        let cleaner_wake = Arc::new(crate::ram::cleaner::CleanerWake::new());
         assert!(size >= SEGMENT_SIZE);
         debug!(
             "Creating chunks, count {} , chunk_size {} bytes",
@@ -2465,12 +2568,14 @@ impl Chunks {
                 wal_storage,
                 tiered_manager.clone(),
                 revision_clock.clone(),
+                cleaner_wake.clone(),
                 history_retention_ms,
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
         let chunks_arc = Arc::new(Chunks {
             list: chunks,
+            cleaner_wake,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
             tiered_manager,
             revision_clock,
@@ -2909,18 +3014,27 @@ impl Chunks {
             if let Some(hook) = chunk.exact_sync_lease_hook.lock().clone() {
                 hook(installed.id, location);
             }
-            if chunk
+            match chunk
                 .history
                 .location(&installed.id, installed.node.revision_ts)
-                != Some(location)
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "installed revision {:?} location no longer matches its chain node",
-                        installed.id
-                    ),
-                ));
+                Some(current_location) if current_location == location => {}
+                Some(_relocated) => {
+                    // The cleaner moved this revision while the source lease
+                    // was held. Relocation durably syncs the destination
+                    // segment WAL before publishing the new location, so this
+                    // revision is already durable; nothing is left to sync.
+                    continue;
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "installed revision {:?} location no longer matches its chain node",
+                            installed.id
+                        ),
+                    ));
+                }
             }
             match expected.0 {
                 RevisionState::PendingPresent | RevisionState::CommittedPresent => {

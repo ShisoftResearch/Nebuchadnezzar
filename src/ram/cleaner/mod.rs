@@ -12,6 +12,49 @@ pub mod combine;
 #[cfg(test)]
 mod tests;
 
+/// Foreground-to-cleaner wake signal. Allocation-pressure paths request a
+/// cleaning pass instead of running one synchronously: under MVCC the
+/// combine's collection phase probes revision chains per entry, which is far
+/// too expensive to execute inline on a mutation path (and doing so while
+/// holding a cell guard is what starved the bounded mirror locks).
+pub struct CleanerWake {
+    thread: parking_lot::Mutex<Option<thread::Thread>>,
+    pending: AtomicBool,
+}
+
+impl CleanerWake {
+    pub fn new() -> Self {
+        Self {
+            thread: parking_lot::Mutex::new(None),
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    /// Ask the cleaner to run soon. Cheap and wait-free on the fast path.
+    pub fn request(&self) {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(thread) = self.thread.lock().as_ref() {
+            thread.unpark();
+        }
+    }
+
+    fn register(&self, thread: thread::Thread) {
+        *self.thread.lock() = Some(thread);
+    }
+
+    fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Default for CleanerWake {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 #[allow(dead_code)]
 pub struct Cleaner {
@@ -105,15 +148,40 @@ impl Cleaner {
                             });
                         }
 
+                        // Pressure-proportional pacing: while any chunk is
+                        // more than three-quarters full, run passes back to
+                        // back so reclamation tracks the fill rate instead of
+                        // a fixed poll interval.
+                        let pressured = checks_ref_clone.list.iter().any(|chunk| {
+                            let used = chunk.segs.len() * crate::ram::segs::SEGMENT_SIZE;
+                            used.saturating_mul(8) >= chunk.capacity.saturating_mul(7)
+                        });
+                        if pressured {
+                            // Cost-based pacing in the PostgreSQL autovacuum
+                            // sense: stay responsive under pressure but yield
+                            // a slice between passes so continuous cleaning
+                            // cannot monopolize the machine against the
+                            // foreground workload.
+                            idle_rounds = 0;
+                            thread::park_timeout(Duration::from_millis(10));
+                            continue;
+                        }
+                        if checks_ref_clone.cleaner_wake.take_pending() {
+                            // A mutation path is under allocation pressure:
+                            // run the next pass immediately.
+                            idle_rounds = 0;
+                            continue;
+                        }
                         if progress.load(Ordering::Relaxed) {
                             idle_rounds = 0;
-                            thread::sleep(Duration::from_millis(sleep_interval_ms));
+                            thread::park_timeout(Duration::from_millis(sleep_interval_ms));
                         } else {
-                            // Back off when no work is done to avoid spinning
+                            // Back off when no work is done to avoid spinning;
+                            // a wake request cuts the backoff short.
                             idle_rounds = (idle_rounds + 1).min(50);
                             let backoff_ms =
                                 sleep_interval_ms.saturating_mul((idle_rounds + 1) as u64);
-                            thread::sleep(Duration::from_millis(backoff_ms.min(5_000)));
+                            thread::park_timeout(Duration::from_millis(backoff_ms.min(5_000)));
                         }
                     }
                     warn!("Cleaner main thread stopped");
@@ -126,6 +194,7 @@ impl Cleaner {
             })
             .unwrap();
 
+        chunks.cleaner_wake.register(handle.thread().clone());
         let cleaner = Cleaner {
             chunks: chunks.clone(),
             stopped: stop_tag.clone(),
@@ -254,29 +323,97 @@ impl Drop for Cleaner {
     }
 }
 
+/// How long the cleaner waits for straggling shared references to drain
+/// before giving up on reclaiming a fully-relocated source segment. Reader
+/// references are held only while bytes are materialized, so this is
+/// generous; on timeout the segment is retained for a later pass.
+const RECLAIM_DRAIN_LIMIT: Duration = Duration::from_millis(2);
+
 pub struct SegmentCandidate {
     segment: lightning::aarc::Arc<Segment>,
+    sealed: AtomicBool,
 }
 
 impl SegmentCandidate {
+    /// Hold the segment with a shared reference through collection, copy, and
+    /// relocation, exactly as foreground readers do. Exclusivity is taken only
+    /// at the reclamation instant by `try_seal_for_reclaim`; holding it across
+    /// the whole combine livelocks against foreground guards, which take the
+    /// cell word lock first and a segment reference second.
     pub fn new(segment: &lightning::aarc::Arc<Segment>) -> Option<Self> {
-        if !segment.obtain_exclusive_references() {
+        if !segment.incr_references() {
             return None;
         }
         if !segment.lock_hot() {
-            segment.release_exclusive_references();
+            segment.decr_references();
             return None;
         }
         Some(Self {
             segment: segment.clone(),
+            sealed: AtomicBool::new(false),
         })
+    }
+
+    /// Trade this candidate's shared reference for permanent exclusive
+    /// ownership so the segment memory can be freed. Succeeds only when every
+    /// straggling reader reference has drained. The exclusivity is never
+    /// released: the segment is about to leave the segment map and be freed,
+    /// and a permanently-exclusive reference word forces any reader still
+    /// holding the segment handle to retry through the current cell index or
+    /// relocated revision node instead of touching freed memory.
+    ///
+    /// On timeout the shared reference is retaken and the segment must be
+    /// retained; its entries are already relocated or dead, so a later cleaner
+    /// pass reclaims it.
+    pub fn try_seal_for_reclaim(&self) -> bool {
+        self.try_seal_for_reclaim_inner()
+    }
+
+    /// Roll a successful seal back after a failed removal so the segment is
+    /// not stranded with permanent exclusivity: readers and later cleaner
+    /// passes must be able to reference it again.
+    pub fn unseal_after_failed_remove(&self) {
+        if !self.sealed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.segment.release_exclusive_references();
+        while !self.segment.incr_references() {
+            std::hint::spin_loop();
+        }
+    }
+
+    fn try_seal_for_reclaim_inner(&self) -> bool {
+        if self.sealed.load(Ordering::Acquire) {
+            return true;
+        }
+        self.segment.decr_references();
+        let deadline = std::time::Instant::now() + RECLAIM_DRAIN_LIMIT;
+        loop {
+            if self.segment.obtain_exclusive_references() {
+                self.sealed.store(true, Ordering::Release);
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        // Drain timed out: retake our shared reference so Drop bookkeeping
+        // stays balanced. Eviction cannot hold exclusivity here because this
+        // candidate still holds the hot lock, so this loop terminates.
+        while !self.segment.incr_references() {
+            std::hint::spin_loop();
+        }
+        false
     }
 }
 
 impl Drop for SegmentCandidate {
     fn drop(&mut self) {
         self.segment.set_hot();
-        self.segment.release_exclusive_references();
+        if !self.sealed.load(Ordering::Acquire) {
+            self.segment.decr_references();
+        }
     }
 }
 

@@ -228,6 +228,10 @@ pub(crate) fn take_revision_node_allocations_for_test() -> usize {
 
 pub struct RevisionChain {
     revisions: LinkedRingBufferList<Option<Arc<RevisionNode>>, 32>,
+    /// Greatest revision_ts ever installed, maintained with fetch_max BEFORE
+    /// the node is published. A probe above this ceiling is exactly absent,
+    /// letting hot cleaner liveness probes skip the list walk entirely.
+    newest_ts: AtomicU64,
     truncated_before_ts: AtomicU64,
     #[cfg(test)]
     expiration_scan_steps: AtomicUsize,
@@ -255,6 +259,7 @@ impl RevisionChain {
     pub fn new() -> Self {
         Self {
             revisions: LinkedRingBufferList::new(),
+            newest_ts: AtomicU64::new(0),
             truncated_before_ts: AtomicU64::new(0),
             #[cfg(test)]
             expiration_scan_steps: AtomicUsize::new(0),
@@ -332,17 +337,30 @@ impl RevisionChain {
         if !predecessor_matches {
             return Err(());
         }
+        // Raise the ceiling before publication so a concurrent probe that
+        // reads a stale ceiling only over-approximates (does the full walk).
+        self.newest_ts.fetch_max(node.revision_ts, Ordering::AcqRel);
         self.push_front(node);
         Ok(predecessor)
     }
 
     fn find(&self, revision_ts: u64) -> Option<Arc<RevisionNode>> {
-        self.revisions.iter_front().find_map(|revision_ref| {
-            revision_ref
-                .deref()
-                .flatten()
-                .filter(|node| node.revision_ts == revision_ts)
-        })
+        // install() rejects any node whose revision_ts is not strictly greater
+        // than the current head, and pruning removes only the oldest suffix,
+        // so front-to-back order is strictly decreasing: the first node older
+        // than the probe proves absence.
+        for revision_ref in self.revisions.iter_front() {
+            let Some(node) = revision_ref.deref().flatten() else {
+                continue;
+            };
+            if node.revision_ts == revision_ts {
+                return Some(node);
+            }
+            if node.revision_ts < revision_ts {
+                return None;
+            }
+        }
+        None
     }
 
     fn is_current(&self, node: &Arc<RevisionNode>) -> bool {
@@ -572,8 +590,16 @@ pub(crate) enum RelocateResult {
     LostRace,
 }
 
+const CHAIN_FILTER_WORDS: usize = 16;
+
 pub struct HistoryIndex {
     chains: PtrHashMap<Id, Arc<RevisionChain>>,
+    /// Append-only Bloom filter over ids that have ever had a chain. Chains
+    /// are never removed and bits are set before the chain is inserted, so a
+    /// negative proves no chain exists: hot cleaner probes skip the chain-map
+    /// lookup (and its epoch pin) for direct-only ids. False positives only
+    /// cost the ordinary lookup.
+    chain_filter: [AtomicU64; CHAIN_FILTER_WORDS],
     #[cfg(test)]
     chain_map_resolutions: AtomicUsize,
     #[cfg(test)]
@@ -605,6 +631,7 @@ impl HistoryIndex {
     fn new_named(chunk_id: Option<usize>, retention_ms: u64) -> Arc<Self> {
         let history = Arc::new(Self {
             chains: PtrHashMap::with_capacity(HISTORY_MAP_INITIAL_CAPACITY),
+            chain_filter: Default::default(),
             #[cfg(test)]
             chain_map_resolutions: AtomicUsize::new(0),
             #[cfg(test)]
@@ -663,6 +690,32 @@ impl HistoryIndex {
         self.retention_ms
     }
 
+    #[inline]
+    fn chain_filter_slots(id: &Id) -> (usize, u64, usize, u64) {
+        let mixed = (id.lower ^ id.higher.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let first = (mixed >> 6) as usize % (CHAIN_FILTER_WORDS * 64);
+        let second = (mixed >> 32) as usize % (CHAIN_FILTER_WORDS * 64);
+        (
+            first / 64,
+            1u64 << (first % 64),
+            second / 64,
+            1u64 << (second % 64),
+        )
+    }
+
+    #[inline]
+    fn chain_possible(&self, id: &Id) -> bool {
+        let (w1, b1, w2, b2) = Self::chain_filter_slots(id);
+        self.chain_filter[w1].load(Ordering::Acquire) & b1 != 0
+            && self.chain_filter[w2].load(Ordering::Acquire) & b2 != 0
+    }
+
+    fn note_chain_created(&self, id: &Id) {
+        let (w1, b1, w2, b2) = Self::chain_filter_slots(id);
+        self.chain_filter[w1].fetch_or(b1, Ordering::AcqRel);
+        self.chain_filter[w2].fetch_or(b2, Ordering::AcqRel);
+    }
+
     fn lookup_chain(&self, id: &Id) -> Option<Arc<RevisionChain>> {
         #[cfg(test)]
         self.chain_map_resolutions.fetch_add(1, Ordering::Relaxed);
@@ -691,6 +744,9 @@ impl HistoryIndex {
         }
 
         let chain = create();
+        // Publish the filter bits before the chain becomes reachable so a
+        // negative probe can never miss an existing chain.
+        self.note_chain_created(&id);
         let replaced = self.chains.insert(id, chain.clone());
         debug_assert!(
             replaced.is_none(),
@@ -744,12 +800,23 @@ impl HistoryIndex {
     }
 
     pub(crate) fn is_live_at(&self, id: Id, revision_ts: u64, location: usize) -> bool {
-        self.chain(&id)
-            .and_then(|chain| chain.find(revision_ts))
-            .is_some_and(|node| {
-                let (state, actual_location) = node.load();
-                state != RevisionState::Expired && actual_location == location
-            })
+        // Cleaner collection probes every physical entry; direct-only ids
+        // (the overwhelming majority under direct churn) short-circuit on the
+        // filter without touching the chain map, and probes above a chain's
+        // ceiling skip the list walk.
+        if !self.chain_possible(&id) {
+            return false;
+        }
+        let Some(chain) = self.chain(&id) else {
+            return false;
+        };
+        if revision_ts > chain.newest_ts.load(Ordering::Acquire) {
+            return false;
+        }
+        chain.find(revision_ts).is_some_and(|node| {
+            let (state, actual_location) = node.load();
+            state != RevisionState::Expired && actual_location == location
+        })
     }
 
     pub(crate) fn relocate(

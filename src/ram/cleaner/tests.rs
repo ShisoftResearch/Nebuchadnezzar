@@ -879,7 +879,7 @@ fn combine_relocates_current_and_historical_revisions_for_one_id() {
 }
 
 #[test]
-fn combine_skips_a_source_with_an_active_shared_lease() {
+fn combine_retains_a_source_with_an_active_shared_lease() {
     let (chunks, schema) = retained_revision_chunks(5);
     let chunk = &chunks.list[0];
     let first_id = Id::new(72, 9_101);
@@ -906,13 +906,24 @@ fn combine_skips_a_source_with_an_active_shared_lease() {
     let lease = SegmentReferenceGuard::try_new(leased_source.clone()).expect("shared source lease");
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
 
-    assert_eq!(
-        combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap(),
-        (0, 0)
-    );
+    combine::CombinedCleaner::combine_segments(chunk, &selected)
+        .expect("combine proceeds under shared references");
     assert!(
         chunk.contains_seg(leased_source.id),
         "a shared reader lease must prevent source reclamation"
+    );
+    assert_eq!(
+        leased_source.living_space(),
+        0,
+        "the retained source must account its relocated entries dead"
+    );
+    assert_eq!(
+        chunks.read_cell(&first_id).unwrap().to_owned().data["id"].i32(),
+        Some(&10)
+    );
+    assert_eq!(
+        chunks.read_cell(&second_id).unwrap().to_owned().data["id"].i32(),
+        Some(&20)
     );
 
     drop(lease);
@@ -1001,12 +1012,12 @@ fn exact_output_sync_short_lease_blocks_cleaner_relocation_only_until_sync_finis
         .expect("exact sync must acquire its short source lease");
 
     chunk.head_seg_id.store(u64::MAX - 7, Ordering::Release);
-    assert_eq!(
-        combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap(),
-        (0, 0),
-        "cleaner must skip an exact output source while its sync lease is held"
+    combine::CombinedCleaner::combine_segments(chunk, &selected)
+        .expect("combine proceeds under shared references");
+    assert!(
+        chunk.contains_seg(source.id),
+        "the sync-leased source must be retained until its lease drains"
     );
-    assert!(chunk.contains_seg(source.id));
 
     release_tx.send(()).unwrap();
     sync.join().unwrap().unwrap();
@@ -1696,7 +1707,7 @@ fn unreconciled_current_mirror_keeps_source_and_retires_destination_copy() {
 }
 
 #[test]
-fn historical_reader_retries_from_exclusive_source_to_relocated_destination() {
+fn historical_reader_materializes_across_concurrent_relocation() {
     let (chunks, schema) = retained_revision_chunks(5);
     let chunk = &chunks.list[0];
     let id = Id::new(76, 9_401);
@@ -1734,6 +1745,7 @@ fn historical_reader_retries_from_exclusive_source_to_relocated_destination() {
             .unwrap();
     });
     let hook_started = AtomicBool::new(false);
+    let reader_view = chunks.clone();
 
     let (_, reduced) = combine::CombinedCleaner::combine_segments_with_relocation_hook(
         chunk,
@@ -1742,14 +1754,19 @@ fn historical_reader_retries_from_exclusive_source_to_relocated_destination() {
             if revision_id == id && revision_ts == 100 && !hook_started.swap(true, Ordering::AcqRel)
             {
                 begin_read.wait();
-                assert_eq!(
-                    lease_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(2))
-                        .expect("reader must attempt its source lease"),
-                    (first_source, false),
-                    "cleaner exclusivity must reject the source lease before relocation"
+                let (lease_location, lease_acquired) = lease_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("reader must attempt its source lease");
+                assert!(
+                    lease_acquired,
+                    "shared-reference combining must let the reader lease its source"
+                );
+                assert!(
+                    lease_location == first_source
+                        || Some(lease_location) == reader_view.history_location(&id, 100),
+                    "the lease must target the revision's current physical location"
                 );
             }
         },
@@ -1766,23 +1783,11 @@ fn historical_reader_retries_from_exclusive_source_to_relocated_destination() {
     };
     assert_eq!(read.header.revision_ts, 100);
     assert_eq!(read.data["id"].i32(), Some(&10));
-    let relocated = chunks.history_location(&id, 100).unwrap();
-    let destination_lease = loop {
-        let event = lease_rx
-            .lock()
-            .unwrap()
-            .recv_timeout(Duration::from_secs(2))
-            .expect("reader must retry its destination lease");
-        if event.1 {
-            break event;
-        }
-        assert_eq!(
-            event,
-            (first_source, false),
-            "failed retries must remain pinned to the exclusive source"
-        );
-    };
-    assert_eq!(destination_lease, (relocated, true));
+    assert_ne!(
+        chunks.history_location(&id, 100),
+        Some(first_source),
+        "relocation must have moved the historical revision"
+    );
     reader.join().unwrap();
     chunk.set_snapshot_read_lease_hook_for_test(None);
 }
@@ -1834,11 +1839,8 @@ fn historical_reader_lease_prevents_source_reclamation() {
     });
     lease_acquired.wait();
 
-    assert_eq!(
-        combine::CombinedCleaner::combine_segments(chunk, &selected).unwrap(),
-        (0, 0),
-        "normal snapshot reader lease must reject cleaner exclusivity"
-    );
+    combine::CombinedCleaner::combine_segments(chunk, &selected)
+        .expect("combine proceeds under shared references");
     assert!(
         chunk.locate_segment(first_source).is_some(),
         "leased source must remain registered until materialization"
@@ -1859,7 +1861,7 @@ fn historical_reader_lease_prevents_source_reclamation() {
 }
 
 #[test]
-fn assigned_writer_retries_after_history_relocation_and_wins_current() {
+fn assigned_writer_publishes_concurrently_with_relocation_and_wins_current() {
     let (chunks, schema) = retained_revision_chunks(7);
     let chunk = &chunks.list[0];
     let id = Id::new(84, 9_601);
@@ -1880,40 +1882,32 @@ fn assigned_writer_retries_after_history_relocation_and_wins_current() {
     let selected_ids: HashSet<_> = selected.iter().map(|segment| segment.id).collect();
     assert_eq!(selected.len(), 2);
 
-    // Allocate an unselected active head for the writer's successor. Cleaner
-    // exclusivity prevents the writer from retaining or reading either source;
-    // its normal CellGuard acquisition must fail and retry until the mirror is
-    // reconciled to the destination.
+    // Allocate an unselected active head for the writer's successor. Under
+    // shared-reference combining the writer publishes concurrently with
+    // relocation; the cleaner's later mirror publication must recognize the
+    // newer current head and leave it untouched.
     let writer_head_id = Id::new(84, 9_602);
     write_physical_cell(&chunks, schema.id, &writer_head_id, 250, 25);
 
     let begin_writer = Arc::new(Barrier::new(2));
-    let writer_retry_sent = Arc::new(AtomicBool::new(false));
-    let (writer_retry_tx, writer_retry_rx) = mpsc::channel();
-    let writer_retry_rx = StdMutex::new(writer_retry_rx);
-    let retry_sent = writer_retry_sent.clone();
-    chunk.set_cell_guard_retry_hook_for_test(Some(Arc::new(move |hash| {
-        if hash == id.lower && !retry_sent.swap(true, Ordering::AcqRel) {
-            writer_retry_tx.send(hash).unwrap();
-        }
-    })));
+    let writer_published = Arc::new(AtomicBool::new(false));
 
     let writer_chunks = chunks.clone();
     let writer_begin = begin_writer.clone();
+    let writer_flag = writer_published.clone();
     let (writer_result_tx, writer_result_rx) = mpsc::channel();
     let writer = thread::spawn(move || {
         writer_begin.wait();
         let mut successor = revision_cell(schema.id, &id, 30);
-        writer_result_tx
-            .send(
-                writer_chunks
-                    .update_cell_at_revision(&mut successor, RevisionWrite::committed(300))
-                    .map(|installed| (installed, successor)),
-            )
-            .unwrap();
+        let result = writer_chunks
+            .update_cell_at_revision(&mut successor, RevisionWrite::committed(300))
+            .map(|installed| (installed, successor));
+        writer_flag.store(true, Ordering::Release);
+        writer_result_tx.send(result).unwrap();
     });
 
     let after_history = AtomicBool::new(false);
+    let hook_published = writer_published.clone();
     let (_, reduced) = combine::CombinedCleaner::combine_segments_with_relocation_hooks(
         chunk,
         &selected,
@@ -1924,14 +1918,14 @@ fn assigned_writer_retries_after_history_relocation_and_wins_current() {
                 && !after_history.swap(true, Ordering::AcqRel)
             {
                 begin_writer.wait();
-                assert_eq!(
-                    writer_retry_rx
-                        .lock()
-                        .unwrap()
-                        .recv_timeout(Duration::from_secs(2))
-                        .expect("writer must fail its exclusive-source CellGuard attempt"),
-                    id.lower
-                );
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !hook_published.load(Ordering::Acquire) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "writer must publish concurrently with an active combine"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
         },
     )
@@ -1939,13 +1933,11 @@ fn assigned_writer_retries_after_history_relocation_and_wins_current() {
 
     assert_eq!(reduced, 1);
     assert!(after_history.load(Ordering::Acquire));
-    assert!(writer_retry_sent.load(Ordering::Acquire));
     let (_, successor) = writer_result_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("writer must finish after cleaner reconciliation")
-        .expect("assigned update must retry and publish its successor");
+        .expect("writer must finish alongside cleaner reconciliation")
+        .expect("assigned update must publish its successor");
     writer.join().unwrap();
-    chunk.set_cell_guard_retry_hook_for_test(None);
 
     assert_eq!(successor.header.revision_ts, 300);
     assert_eq!(
@@ -2118,4 +2110,179 @@ fn test_shrink_larger_than_segment_size() {
 
     let used_size = segment.append_header.load(Ordering::Relaxed) - segment.addr;
     assert_eq!(used_size, 0, "Segment should still be empty");
+}
+
+#[test]
+fn foreground_mutation_proceeds_while_combine_holds_source_segments() {
+    // Regression for the combine/foreground livelock: the cleaner must hold
+    // only shared references during copy and relocation, so a direct mutation
+    // of a cell whose head lives in a source segment can take its segment
+    // reference and complete while the combine is mid-flight.
+    let (chunks, schema) = retained_revision_chunks(5);
+    let chunk = &chunks.list[0];
+    let id = Id::new(70, 9_301);
+    install_current_only_cell(&chunks, schema.id, &id, 100, 10);
+    force_next_write_to_new_segment(chunk);
+    let filler = Id::new(70, 9_302);
+    install_current_only_cell(&chunks, schema.id, &filler, 110, 11);
+    force_next_write_to_new_segment(chunk);
+
+    let selected = chunk.segments();
+    assert_eq!(selected.len(), 2);
+    // An empty head keeps both source segments selectable while letting the
+    // foreground update allocate a fresh head segment mid-combine.
+    chunk
+        .head_seg_id
+        .store(crate::ram::chunk::HEAD_SEG_ID_EMPTY, Ordering::Release);
+
+    let foreground_done = AtomicBool::new(false);
+    let hook_timed_out = AtomicBool::new(false);
+    let combine_entered = AtomicBool::new(false);
+
+    let combine_result = thread::scope(|scope| {
+        let combine = scope.spawn(|| {
+            combine::CombinedCleaner::combine_segments_with_relocation_hook(
+                chunk,
+                &selected,
+                |_, _, _, _| {
+                    combine_entered.store(true, Ordering::Release);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    while !foreground_done.load(Ordering::Acquire) {
+                        if std::time::Instant::now() >= deadline {
+                            hook_timed_out.store(true, Ordering::Release);
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                },
+            )
+        });
+
+        let entry_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !combine_entered.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < entry_deadline,
+                "combine must reach its relocation phase"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The combine is mid-relocation and holds its source segments. A
+        // direct update of a source-resident head must complete now.
+        let mut replacement = revision_cell(schema.id, &id, 42);
+        chunks
+            .update_cell(&mut replacement)
+            .expect("direct update must proceed during an active combine");
+        foreground_done.store(true, Ordering::Release);
+        combine.join().expect("combine thread")
+    });
+
+    combine_result.expect("combine must complete");
+    assert!(
+        !hook_timed_out.load(Ordering::Acquire),
+        "foreground mutation stalled against the combine: livelock regressed"
+    );
+    assert_eq!(
+        chunks.read_cell(&id).unwrap().to_owned().data["id"].i32(),
+        Some(&42),
+        "the foreground update published during the combine must win"
+    );
+}
+
+#[test]
+fn combine_retains_referenced_source_segment_until_references_drain() {
+    // Reclamation is the only exclusive step: a source segment with a
+    // straggling shared reference must be retained, not freed, and a later
+    // pass reclaims it after the reference drains.
+    let (chunks, schema) = retained_revision_chunks(6);
+    let chunk = &chunks.list[0];
+    let id = Id::new(70, 9_311);
+    install_current_only_cell(&chunks, schema.id, &id, 100, 10);
+    force_next_write_to_new_segment(chunk);
+    let filler = Id::new(70, 9_312);
+    install_current_only_cell(&chunks, schema.id, &filler, 110, 11);
+    force_next_write_to_new_segment(chunk);
+
+    let selected = chunk.segments();
+    assert_eq!(selected.len(), 2);
+    let straggler = selected[0].clone();
+    let straggler_id = straggler.id;
+    chunk
+        .head_seg_id
+        .store(crate::ram::chunk::HEAD_SEG_ID_EMPTY, Ordering::Release);
+
+    // The straggling reference arrives after selection, while the combine is
+    // already relocating: exactly the case seal-time retention exists for.
+    let straggler_ref = straggler.clone();
+    let referenced = AtomicBool::new(false);
+    combine::CombinedCleaner::combine_segments_with_relocation_hook(
+        chunk,
+        &selected,
+        move |_, _, _, _| {
+            if !referenced.swap(true, Ordering::AcqRel) {
+                assert!(
+                    straggler_ref.incr_references(),
+                    "mid-combine straggler reference must hold"
+                );
+            }
+        },
+    )
+    .expect("combine with an undrained source reference must not fail");
+
+    assert!(
+        chunk.segs.get(&(straggler_id as usize)).is_some(),
+        "a source segment with live references must be retained, not freed"
+    );
+    assert_eq!(
+        chunks.read_cell(&id).unwrap().to_owned().data["id"].i32(),
+        Some(&10),
+        "relocated data must remain readable while the source is retained"
+    );
+    // The remnant's entries were all relocated; it must read as reclaimable
+    // to utilization-based selection or it would leak space and pin the
+    // direct-tombstone watermark forever.
+    assert_eq!(
+        chunk
+            .segs
+            .get(&(straggler_id as usize))
+            .expect("retained remnant")
+            .living_space(),
+        0,
+        "a retained remnant must account all of its space as dead"
+    );
+    assert!(
+        chunk
+            .segs_for_combine_cleaner()
+            .into_iter()
+            .any(|(seg, _)| seg.id == straggler_id),
+        "a retained remnant must remain visible to utilization-based selection"
+    );
+
+    straggler.decr_references();
+
+    // Another pass over the drained remnant and fresh segments reclaims it.
+    let destination_segment = chunk
+        .locate_segment(chunks.address_of(&id))
+        .expect("relocated destination segment");
+    chunk
+        .head_seg_id
+        .store(destination_segment.id, Ordering::Release);
+    force_next_write_to_new_segment(chunk);
+    let filler2 = Id::new(70, 9_313);
+    install_current_only_cell(&chunks, schema.id, &filler2, 120, 12);
+    force_next_write_to_new_segment(chunk);
+
+    let reselected = chunk.segments();
+    chunk
+        .head_seg_id
+        .store(crate::ram::chunk::HEAD_SEG_ID_EMPTY, Ordering::Release);
+    combine::CombinedCleaner::combine_segments(chunk, &reselected)
+        .expect("reclaim pass must succeed");
+    assert!(
+        chunk.segs.get(&(straggler_id as usize)).is_none(),
+        "the drained source segment must be reclaimed on a later pass"
+    );
+    assert_eq!(
+        chunks.read_cell(&id).unwrap().to_owned().data["id"].i32(),
+        Some(&10)
+    );
 }
