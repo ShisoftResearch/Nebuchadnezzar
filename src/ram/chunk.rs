@@ -40,6 +40,9 @@ static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
 static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.50f32;
+/// Victim bar while the chunk has ample free space: only combine segments
+/// that are at least three-quarters dead.
+static DEAD_RATE_FOR_COMBINE_CLEANER_RELAXED: f32 = 0.25f32;
 
 const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
 const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
@@ -1263,9 +1266,21 @@ impl Chunk {
             .filter(|(seg, utilization)| {
                 // Always require some dead space (utilization < 100%)
                 // For full GC, accept any segment with dead space
-                // For partial GC, only consider high-dead segments
+                // For partial GC, only consider high-dead segments. The bar
+                // adapts to space pressure: with plenty of room, wait until a
+                // segment is three-quarters dead — under churn it will get
+                // there on its own, and combining it later halves the live
+                // cells relocated (and the foreground conflicts relocation
+                // causes). Under pressure, fall back to the eager bar.
+                let fill_x8 = (self.segs.len() * SEGMENT_SIZE).saturating_mul(8)
+                    / self.capacity.max(1);
+                let dead_bar = if fill_x8 >= 6 {
+                    DEAD_RATE_FOR_COMBINE_CLEANER
+                } else {
+                    DEAD_RATE_FOR_COMBINE_CLEANER_RELAXED
+                };
                 *utilization < 1.0
-                    && (full || *utilization < DEAD_RATE_FOR_COMBINE_CLEANER)
+                    && (full || *utilization < dead_bar)
                     && !self.is_active_head(seg.id)
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
