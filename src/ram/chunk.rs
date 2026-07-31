@@ -1355,6 +1355,17 @@ impl Chunk {
                 let location = guard.get_ptr();
                 let header = guard.head_cell()?;
                 if Id::from_header(&header) == *id {
+                    // Mirror fast path: one atomic proves the current node is
+                    // this exact committed-present revision, so the raw mirror
+                    // can be served without touching the revision list.
+                    if header.revision_ts < snapshot_ts {
+                        if let Some(chain) = self.history.chain(id) {
+                            if chain.committed_current_ts() == header.revision_ts {
+                                return materialize(location, chain.committed_current_size())
+                                    .map(SnapshotRead::Present);
+                            }
+                        }
+                    }
                     let current =
                         match self.ensure_present_predecessor_with_chain(*id, &header, location) {
                             Ok((_, current)) => Some(current),
@@ -1461,6 +1472,8 @@ impl Chunk {
             .is_some_and(|current| Arc::ptr_eq(&current, &installed.node))
             && installed.node.promote()
         {
+            self.history
+                .note_committed_current(&installed.id, installed.node.revision_ts);
             Ok(())
         } else {
             Err(WriteError::CellRevisionMismatch)
@@ -1468,6 +1481,8 @@ impl Chunk {
     }
 
     fn abort_revision(&self, installed: &InstalledRevision) -> Result<(), WriteError> {
+        // Clear the mirror fast path before the node becomes unreadable.
+        self.history.note_uncommitted_current(&installed.id);
         if self
             .history
             .current(&installed.id)

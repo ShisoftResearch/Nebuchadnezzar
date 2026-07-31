@@ -228,6 +228,17 @@ pub(crate) fn take_revision_node_allocations_for_test() -> usize {
 
 pub struct RevisionChain {
     revisions: LinkedRingBufferList<Option<Arc<RevisionNode>>, 32>,
+    /// revision_ts of the current node while it is CommittedPresent, else 0.
+    /// Maintained clear-before-publish on every transition to a non-readable
+    /// current (pending install, delete install, abort) and set only after a
+    /// committed-present node is current, so the current-head read fast path
+    /// can serve the raw mirror on one load: staleness only ever falls back
+    /// to the slow path, never leads it.
+    current_committed_ts: AtomicU64,
+    /// Entry size of the committed current node, published with the same
+    /// discipline as `current_committed_ts` so the fast path never decodes
+    /// the entry header just to learn its size.
+    current_committed_size: AtomicU64,
     /// Greatest revision_ts ever installed, maintained with fetch_max BEFORE
     /// the node is published. A probe above this ceiling is exactly absent,
     /// letting hot cleaner liveness probes skip the list walk entirely.
@@ -259,6 +270,8 @@ impl RevisionChain {
     pub fn new() -> Self {
         Self {
             revisions: LinkedRingBufferList::new(),
+            current_committed_ts: AtomicU64::new(0),
+            current_committed_size: AtomicU64::new(0),
             newest_ts: AtomicU64::new(0),
             truncated_before_ts: AtomicU64::new(0),
             #[cfg(test)]
@@ -278,6 +291,22 @@ impl RevisionChain {
 
     fn push_front(&self, node: Arc<RevisionNode>) {
         self.revisions.push_front(Some(node));
+    }
+
+    fn revisions_front_ts(&self) -> u64 {
+        self.current()
+            .map(|node| node.revision_ts)
+            .unwrap_or_default()
+    }
+
+    #[inline]
+    pub(crate) fn committed_current_ts(&self) -> u64 {
+        self.current_committed_ts.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn committed_current_size(&self) -> u32 {
+        self.current_committed_size.load(Ordering::Acquire) as u32
     }
 
     pub fn resolve(&self, snapshot_ts: u64) -> SnapshotRevision {
@@ -340,7 +369,22 @@ impl RevisionChain {
         // Raise the ceiling before publication so a concurrent probe that
         // reads a stale ceiling only over-approximates (does the full walk).
         self.newest_ts.fetch_max(node.revision_ts, Ordering::AcqRel);
-        self.push_front(node);
+        let (state, _) = node.load();
+        if state == RevisionState::CommittedPresent {
+            let entry_size = node.entry_size;
+            let ts = node.revision_ts;
+            // Close the fast path before publishing the successor so a reader
+            // can never pair the predecessor's timestamp with the successor's
+            // size; the window falls through to the slow path.
+            self.current_committed_ts.store(0, Ordering::Release);
+            self.push_front(node);
+            self.current_committed_size
+                .store(entry_size as u64, Ordering::Release);
+            self.current_committed_ts.store(ts, Ordering::Release);
+        } else {
+            self.current_committed_ts.store(0, Ordering::Release);
+            self.push_front(node);
+        }
         Ok(predecessor)
     }
 
@@ -850,6 +894,32 @@ impl HistoryIndex {
             RelocateResult::CurrentPresentMoved
         } else {
             RelocateResult::HistoricalMoved
+        }
+    }
+
+    /// Record that the current node for `id` became CommittedPresent at
+    /// `revision_ts` (commit promotion), enabling the mirror fast path.
+    pub(crate) fn note_committed_current(&self, id: &Id, revision_ts: u64) {
+        if let Some(chain) = self.chain(id) {
+            chain.current_committed_ts.store(0, Ordering::Release);
+            if let Some(node) = chain.current() {
+                if node.revision_ts == revision_ts {
+                    chain
+                        .current_committed_size
+                        .store(node.entry_size as u64, Ordering::Release);
+                    chain
+                        .current_committed_ts
+                        .store(revision_ts, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Clear the mirror fast path for `id` BEFORE its current node becomes
+    /// unreadable (abort); staleness must fail safe into the slow path.
+    pub(crate) fn note_uncommitted_current(&self, id: &Id) {
+        if let Some(chain) = self.chain(id) {
+            chain.current_committed_ts.store(0, Ordering::Release);
         }
     }
 
