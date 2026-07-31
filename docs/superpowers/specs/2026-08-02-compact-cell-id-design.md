@@ -44,7 +44,11 @@ hashed:     [ tag=1 : 1 ][ hash                                     : 63 ]
 - **locality** (allocated only) — the placement affinity key; 32k
   routing buckets. Free-form with respect to uniqueness.
 - **origin** — an allocator identity (a consumable lease slot, not a
-  permanent server identity); 4096 slots.
+  permanent server identity); 4096 slots **per database**. Id spaces
+  are database-scoped: cell namespaces (chunks, scoped services) are
+  already disjoint per database, so the same numeric id may exist in
+  two databases without conflict, and each database gets the full slot
+  pool and keyed-cell hash domains of its own.
 - **sequence** — per-origin counter; 2^36 ≈ 68.7B ids per slot.
 
 Lifetime allocated-id budget: 2^48 ≈ 281T ids (locality excluded from
@@ -56,11 +60,14 @@ all-zero and all-one ids are reserved and never issued (today's
 
 ## Generation modes
 
-**Explicit affinity.** A creator that wants co-location copies the
-locality bits of the anchor id: `new_id.locality = anchor.locality`.
+**Explicit affinity — `Id::new_with(&anchor)`.** A creator that wants
+co-location allocates through `Id::new_with`, which copies the locality
+bits of the anchor id onto a freshly allocated `(origin, sequence)`.
 This reproduces the current "same hi bits, same partition" idiom
-(vertex + satellite cells) with a 15-bit affinity key. Uniqueness is
-untouched because it rests entirely on `(origin, sequence)`.
+(vertex + satellite cells) with a 15-bit affinity key. Affinity is
+fixed at id-creation time only — placement never mutates afterwards.
+Uniqueness is untouched because it rests entirely on
+`(origin, sequence)`.
 
 **Default (uniform).** Unaffiliated cells derive locality from a
 multiply-xor-shift mixer over `(origin << 36) | sequence`, taking the
@@ -73,16 +80,26 @@ clumping in forked workers.
 `(schema, key)`. Routing uses the full id; hashed ids carry no
 locality bits — anything needing both a key and affinity takes an
 allocated id plus a key-index entry. The class exists because some
-consumers must derive an address from a key with no resolution hop:
-the primary retained consumer is the **hash index's dual mode**
-(key→bucket addressing computed client-side), and keyed application
-cells. Collision budget: p ≈ n²/2^64 per domain — ~5·10^-6 at 10^7
-ids, ~5·10^-4 at 10^8 — combined with key-comparison detection on
-access (Uniqueness §2) so residual collisions surface as loud errors,
-never silent merges. Remaining `from_obj` consumers must be
-inventoried against this budget; populations that exceed it and do not
-need hop-free addressing (the full-text term/segment ids) move to
-allocated internal ids with their own resolution.
+consumers must derive an address from a key with no resolution hop.
+Two sub-populations with different collision rules:
+
+- *Hash-index dual mode (collision-tolerant, budget-exempt).* Verified
+  in code: the query path re-reads every bucket member and re-verifies
+  the predicate against the actual cell
+  (`values_semantically_equal` in `index::hash::query`), so a bucket-id
+  collision merges member lists and queries filter the foreign members
+  downstream — wasted candidate reads, never wrong results. Bucket
+  populations may scale without a correctness bound.
+- *Keyed application cells (budgeted, detected).* Collision domain is
+  per schema (the hash covers `(schema, key)`). Budget: p ≈ n²/2^64 —
+  ~5·10^-6 at 10^7 keys per schema — **accepted as a documented
+  product limit**, backstopped by key-comparison detection on access
+  (Uniqueness §2) so residual collisions surface as loud errors, never
+  silent merges.
+
+Populations that exceed the budget and do not need hop-free addressing
+(the full-text term/segment ids) move to allocated internal ids with
+their own resolution.
 
 ## Uniqueness
 
@@ -160,25 +177,30 @@ become single-participant (the case the parked fused commit+end
 optimization on `feature/point-cell-mvcc` serves), and sequential
 allocation clusters ranged-index inserts.
 
-## API and migration
+## API and adoption
 
-`Id` is a public 128-bit type across Dovahkiin, Nebuchadnezzar, and
-Morpheus. Two strategies:
+**No backward compatibility** (decided 2026-08-02): existing stored
+data is not carried forward; there is no old→new id mapping, no
+transitional dual-width mode, and no reload tooling obligation. The
+change is a clean big-bang: new 64-bit `Id` in Dovahkiin, mechanical
+propagation through Nebuchadnezzar and Morpheus, new storage format.
+This dissolves the hardest open problem of earlier drafts (rewriting
+old ids embedded inside cell values).
 
-- **(a) Big-bang type change (recommended).** New 64-bit `Id` in
-  Dovahkiin, mechanical propagation through both dependents, new
-  storage format version, offline reload for existing data. Right for
-  the project's current stage; avoids carrying two representations.
-- **(b) Transitional embedding.** Encode the new id in `lower` with
-  `higher = 0` to stage application-level changes before the format
-  flip. Only worth it if (a) must be split across releases; none of
-  the density wins land until the format changes.
+Allocation API:
 
-Prerequisites either way: inventory and migrate every `Id::from_obj`
-call site (keyed cells → hashed class with collision detection;
-full-text and hash-index internals → allocated ids); replace
-`is_greater_than` uses with plain `Ord` (the current implementation is
-a broken partial order and must not survive the migration).
+- `Id::new_with(&anchor)` — allocate co-located with `anchor` (copies
+  its locality bits; affinity fixed at creation).
+- Plain allocation — locality from the default mixer (uniform).
+- `get_hash_id`-family — the hashed class, unchanged call shape.
+- `ORIGIN_WELL_KNOWN`-style constants are not part of this design's
+  two-class layout; bootstrap cells continue to use fixed hashed ids.
+
+Adoption prerequisites: inventory every `Id::from_obj` call site
+(keyed cells → hashed class per-schema budget; full-text internals →
+allocated ids; hash-index dual mode stays hashed, collision-tolerant);
+replace `is_greater_than` uses with plain `Ord` (the current
+implementation is a broken partial order and must not survive).
 
 ## Testing plan
 
@@ -200,12 +222,22 @@ a broken partial order and must not survive the migration).
   under the campaign rules — 5-run populations for any claim under 5%,
   fresh interleaved baselines both sides.
 
+## Decided (2026-08-02)
+
+- Two-class tag layout affirmed; single-class-with-reserved-origins
+  rejected (dual mode needs full-width hop-free addressing).
+- Hash-index dual mode verified collision-tolerant in code (query
+  re-verifies candidates); budget-exempt.
+- Keyed-cell per-schema budget accepted as a documented product limit.
+- No backward compatibility; clean big-bang format change.
+- Id spaces are per-database (full origin pool per database).
+- Affinity API: `Id::new_with(&anchor)`, creation-time only.
+
 ## Open questions
 
 1. Final bit split (15/12/36 proposed) — decide against Morpheus's
    projected group counts and per-origin allocation rates.
-2. Complete `from_obj` consumer inventory and per-consumer migration
-   assignments (hashed-with-budget vs allocated-with-index).
+2. Complete `from_obj` consumer inventory (mostly mechanical now that
+   the class rules are fixed).
 3. Morpheus adjacency encoding on top of 64-bit ids (delta/varint over
    sorted co-located neighbors could compound the win) — separate doc.
-4. Migration mode (a) vs (b) and the reload tooling story.
