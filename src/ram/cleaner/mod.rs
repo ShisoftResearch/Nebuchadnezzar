@@ -12,6 +12,49 @@ pub mod combine;
 #[cfg(test)]
 mod tests;
 
+/// Foreground-to-cleaner wake signal. Allocation-pressure paths request a
+/// cleaning pass instead of running one synchronously: an inline combine on
+/// the mutation path stalls the writer for a whole collection cycle, so
+/// backpressure comes from waking the background thread and, near capacity,
+/// from its pressure-proportional pacing.
+pub struct CleanerWake {
+    thread: parking_lot::Mutex<Option<thread::Thread>>,
+    pending: AtomicBool,
+}
+
+impl CleanerWake {
+    pub fn new() -> Self {
+        Self {
+            thread: parking_lot::Mutex::new(None),
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    /// Ask the cleaner to run soon. Cheap and wait-free on the fast path.
+    pub fn request(&self) {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(thread) = self.thread.lock().as_ref() {
+            thread.unpark();
+        }
+    }
+
+    fn register(&self, thread: thread::Thread) {
+        *self.thread.lock() = Some(thread);
+    }
+
+    fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Default for CleanerWake {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 #[allow(dead_code)]
 pub struct Cleaner {
@@ -105,15 +148,58 @@ impl Cleaner {
                             });
                         }
 
+                        // Pressure-proportional pacing: without an inline
+                        // clean on the mutation path this is what stands
+                        // between a full-rate insert workload and the
+                        // capacity wall. Two tiers keep it honest both ways:
+                        // above 7/8 full run passes back to back with a short
+                        // yield; above 3/4 keep passes coming but with a
+                        // longer yield so continuous cleaning cannot tax
+                        // workloads that are merely warm.
+                        let fill_ratio_x8 = checks_ref_clone
+                            .list
+                            .iter()
+                            .map(|chunk| {
+                                let used = chunk.segs.len() * crate::ram::segs::SEGMENT_SIZE;
+                                used.saturating_mul(8) / chunk.capacity.max(1)
+                            })
+                            .max()
+                            .unwrap_or(0);
+                        // Progress-gated: a chunk can sit near capacity with
+                        // nothing reclaimable (static working set), and
+                        // spinning passes against it is pure CPU tax on the
+                        // foreground. Pressure pacing therefore holds only
+                        // while passes keep reclaiming; allocation-threshold
+                        // wakes and the reserve-boundary emergency cover the
+                        // moment new garbage appears.
+                        if progress.load(Ordering::Relaxed) {
+                            if fill_ratio_x8 >= 7 {
+                                idle_rounds = 0;
+                                thread::park_timeout(Duration::from_millis(10));
+                                continue;
+                            }
+                            if fill_ratio_x8 >= 6 {
+                                idle_rounds = 0;
+                                thread::park_timeout(Duration::from_millis(50));
+                                continue;
+                            }
+                        }
+                        if checks_ref_clone.cleaner_wake.take_pending() {
+                            // A mutation path is under allocation pressure:
+                            // run the next pass immediately.
+                            idle_rounds = 0;
+                            continue;
+                        }
                         if progress.load(Ordering::Relaxed) {
                             idle_rounds = 0;
-                            thread::sleep(Duration::from_millis(sleep_interval_ms));
+                            thread::park_timeout(Duration::from_millis(sleep_interval_ms));
                         } else {
-                            // Back off when no work is done to avoid spinning
+                            // Back off when no work is done to avoid spinning;
+                            // a wake request cuts the backoff short.
                             idle_rounds = (idle_rounds + 1).min(50);
                             let backoff_ms =
                                 sleep_interval_ms.saturating_mul((idle_rounds + 1) as u64);
-                            thread::sleep(Duration::from_millis(backoff_ms.min(5_000)));
+                            thread::park_timeout(Duration::from_millis(backoff_ms.min(5_000)));
                         }
                     }
                     warn!("Cleaner main thread stopped");
@@ -125,6 +211,7 @@ impl Cleaner {
                 }
             })
             .unwrap();
+        chunks.cleaner_wake.register(handle.thread().clone());
 
         let cleaner = Cleaner {
             chunks: chunks.clone(),

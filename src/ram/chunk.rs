@@ -40,6 +40,9 @@ static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
 static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.50f32;
+/// Victim bar while the chunk has ample free space: only combine segments
+/// that are at least three-quarters dead.
+static DEAD_RATE_FOR_COMBINE_CLEANER_RELAXED: f32 = 0.25f32;
 
 const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
 const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
@@ -171,6 +174,9 @@ pub struct Chunk {
     pub statistics: ChunkStatistics,
     /// Shared tiered memory manager for eviction/promotion
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+    /// Shared wake signal to the background cleaner; allocation-pressure
+    /// paths request a pass instead of cleaning inline.
+    pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
 }
 
 impl Chunk {
@@ -282,6 +288,7 @@ impl Chunk {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
     ) -> Chunk {
         // Call new_with_base with base_addr=0 to use old allocation behavior
         Self::new_with_base(
@@ -293,6 +300,7 @@ impl Chunk {
             backup_storage,
             wal_storage,
             tiered_manager,
+            cleaner_wake,
         )
     }
 
@@ -305,6 +313,7 @@ impl Chunk {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -361,6 +370,7 @@ impl Chunk {
             gc_lock: Mutex::new(()),
             statistics: ChunkStatistics::new(),
             tiered_manager,
+            cleaner_wake,
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -442,6 +452,23 @@ impl Chunk {
             }
 
             let total_space = self.segs.len() * SEGMENT_SIZE;
+            // Trigger emergency cleaning one segment early: a moving combine
+            // needs at least one free segment as its destination, and hitting
+            // the exact wall leaves it nothing to relocate into. Allocation
+            // itself is refused only at the original wall, so usable capacity
+            // is unchanged.
+            let reserve_boundary = self.capacity.saturating_sub(2 * SEGMENT_SIZE);
+            if total_space >= reserve_boundary && !tried_gc {
+                if full_gc {
+                    warn!("Chunk {} near capacity, emergency full GC", self.id);
+                    let _ = Cleaner::clean(self, true, true);
+                } else {
+                    warn!("Chunk {} near capacity, emergency best effort GC", self.id);
+                    let _ = Cleaner::clean(self, true, false);
+                }
+                tried_gc = true;
+                continue;
+            }
             if total_space >= self.capacity - SEGMENT_SIZE {
                 if tried_gc {
                     debug!(
@@ -472,8 +499,12 @@ impl Chunk {
                 }
             }
             if self.allocator.meet_gc_threshold() {
-                debug!("Allocator meet GC threshold, will try partial GC");
-                let _ = Cleaner::clean(self, false, false);
+                // Wake the background cleaner instead of running a partial GC
+                // inline: a synchronous combine stalls this writer for a full
+                // collection cycle, and the cleaner's pressure pacing keeps
+                // reclamation tracking the fill rate once woken.
+                debug!("Allocator meet GC threshold, waking the cleaner");
+                self.cleaner_wake.request();
             }
 
             if head_slot
@@ -1139,6 +1170,7 @@ impl Chunk {
             seg.id
         );
         seg.dead_space.fetch_add(size, Ordering::Relaxed);
+        seg.mark_dead_bit(addr);
         seg.note_dead_bytes_change();
     }
 
@@ -1234,9 +1266,21 @@ impl Chunk {
             .filter(|(seg, utilization)| {
                 // Always require some dead space (utilization < 100%)
                 // For full GC, accept any segment with dead space
-                // For partial GC, only consider high-dead segments
+                // For partial GC, only consider high-dead segments. The bar
+                // adapts to space pressure: with plenty of room, wait until a
+                // segment is three-quarters dead — under churn it will get
+                // there on its own, and combining it later halves the live
+                // cells relocated (and the foreground conflicts relocation
+                // causes). Under pressure, fall back to the eager bar.
+                let fill_x8 = (self.segs.len() * SEGMENT_SIZE).saturating_mul(8)
+                    / self.capacity.max(1);
+                let dead_bar = if fill_x8 >= 6 {
+                    DEAD_RATE_FOR_COMBINE_CLEANER
+                } else {
+                    DEAD_RATE_FOR_COMBINE_CLEANER_RELAXED
+                };
                 *utilization < 1.0
-                    && (full || *utilization < DEAD_RATE_FOR_COMBINE_CLEANER)
+                    && (full || *utilization < dead_bar)
                     && !self.is_active_head(seg.id)
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
@@ -1291,6 +1335,13 @@ impl Chunk {
                 debug_assert!(entry_meta.entry_size % 8 == 0);
                 debug_assert!(entry_meta.entry_size >= ENTRY_HEAD_SIZE);
                 if entry_header.entry_type == EntryType::CELL {
+                        // Entries marked dead at mark_dead time need no header
+                        // read or index probe; this keeps collection cost
+                        // proportional to live entries instead of the whole
+                        // backlog.
+                        if seg.is_dead_at(entry_meta.entry_pos) {
+                            return None;
+                        }
                         trace!("Entry at {} is a cell", entry_meta.entry_pos);
                         let cell_header =
                             cell_header_from_entry_content_addr(entry_meta.body_pos);
@@ -1429,6 +1480,8 @@ pub struct Chunks {
     pub list: Vec<Chunk>,
     pub statistics: TTLCache<Arc<SchemaStatistics>>,
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+    /// Shared wake signal registered by the background cleaner thread.
+    pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
 }
 
 impl Chunks {
@@ -1528,6 +1581,7 @@ impl Chunks {
             "Creating chunks, count {} , chunk_size {} bytes",
             count, size
         );
+        let cleaner_wake = Arc::new(crate::ram::cleaner::CleanerWake::new());
         for i in 0..count {
             let chunk_base = global_base_addr + (i * chunk_size);
             let backup_storage = backup_storage
@@ -1545,6 +1599,7 @@ impl Chunks {
                 backup_storage,
                 wal_storage,
                 tiered_manager.clone(),
+                cleaner_wake.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
@@ -1552,6 +1607,7 @@ impl Chunks {
             list: chunks,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
             tiered_manager,
+            cleaner_wake,
         });
 
         if let Some(ref manager) = chunks_arc.tiered_manager {
