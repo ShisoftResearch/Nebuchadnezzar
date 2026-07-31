@@ -317,8 +317,11 @@ pub trait AnyNode: Any + Send + Sync + 'static {
     // and serialize the page to a cell — all under the node's write latch.
     // Returns None for a node with nothing to persist (empty/tombstone). The
     // caller batches the returned cells into one upsert_all_cells RPC.
-    fn build_cell(&self, node_ref: &NodeCellRef, deletion: &DeletionSet)
-        -> Option<crate::ram::cell::OwnedCell>;
+    fn build_cell(
+        &self,
+        node_ref: &NodeCellRef,
+        deletion: &DeletionSet,
+    ) -> Option<crate::ram::cell::OwnedCell>;
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef>;
 }
 

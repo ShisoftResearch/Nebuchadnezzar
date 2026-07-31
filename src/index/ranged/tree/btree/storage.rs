@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-
 // Write-back state is scoped per server instance, keyed by the identity of
 // the server's AsyncClient. Sharing one process-wide queue meant two servers
 // in one process waited on each other's progress and a dead fleet poisoned

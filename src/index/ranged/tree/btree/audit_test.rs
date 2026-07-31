@@ -159,7 +159,8 @@ fn concurrent_scan_does_not_skip_keys() {
         w.join().unwrap();
     }
     assert_eq!(
-        min_count, NUM as usize,
+        min_count,
+        NUM as usize,
         "a concurrent scan skipped {} key(s)",
         NUM as usize - min_count
     );
@@ -194,9 +195,7 @@ fn tombstone_compaction_reclaims_set() {
     while !page_ref.is_default() {
         let mut guard = write_node::<TinyKeySlice, TinyPtrSlice>(&page_ref);
         let next = guard.extnode_mut_no_persist().next.clone();
-        guard
-            .extnode_mut_no_persist()
-            .remove_contains(&deletion);
+        guard.extnode_mut_no_persist().remove_contains(&deletion);
         drop(guard);
         page_ref = next;
     }
@@ -333,7 +332,11 @@ fn structural_split_off_partitions_exactly() {
             let mut all: Vec<_> = src_keys.into_iter().chain(moved_keys).collect();
             all.sort();
             let expected: Vec<_> = (0..n).map(|i| key_of(i * 2)).collect();
-            assert_eq!(all, expected, "union != original (n={}, pivot={})", n, pivot_n);
+            assert_eq!(
+                all, expected,
+                "union != original (n={}, pivot={})",
+                n, pivot_n
+            );
         }
     }
 }
@@ -372,7 +375,13 @@ fn structural_split_off_randomized() {
         assert!(verification::is_tree_in_order(&tree, 0), "src not in order");
         let mut moved: Vec<u64> = vec![];
         if let Some(so) = res {
-            let nt = TinyTree::from_root(so.new_root, so.new_head_id, so.moved_len, so.new_height, &deletion);
+            let nt = TinyTree::from_root(
+                so.new_root,
+                so.new_head_id,
+                so.moved_len,
+                so.new_height,
+                &deletion,
+            );
             assert!(verification::is_tree_in_order(&nt, 0), "moved not in order");
             let mut c = nt.seek(&min_entry_key(), Ordering::Forward);
             while let Some(k) = c.next() {
@@ -380,10 +389,26 @@ fn structural_split_off_randomized() {
             }
             assert_eq!(moved.len(), so.moved_len, "moved_len");
         }
-        let exp_src: Vec<u64> = model.iter().cloned().filter(|&k| key_of(k) < pivot).collect();
-        let exp_moved: Vec<u64> = model.iter().cloned().filter(|&k| key_of(k) >= pivot).collect();
-        assert_eq!(src, exp_src, "source partition wrong (n={}, pivot={})", n, pivot_v);
-        assert_eq!(moved, exp_moved, "moved partition wrong (n={}, pivot={})", n, pivot_v);
+        let exp_src: Vec<u64> = model
+            .iter()
+            .cloned()
+            .filter(|&k| key_of(k) < pivot)
+            .collect();
+        let exp_moved: Vec<u64> = model
+            .iter()
+            .cloned()
+            .filter(|&k| key_of(k) >= pivot)
+            .collect();
+        assert_eq!(
+            src, exp_src,
+            "source partition wrong (n={}, pivot={})",
+            n, pivot_v
+        );
+        assert_eq!(
+            moved, exp_moved,
+            "moved partition wrong (n={}, pivot={})",
+            n, pivot_v
+        );
     }
 }
 
@@ -417,21 +442,59 @@ fn spine_split_matches_split_off() {
         while let Some(k) = c.next() {
             src.push(k.id().lower);
         }
-        assert!(verification::is_tree_in_order(&tree, 0), "spine src not in order (n={}, pivot={})", n, pivot_v);
+        assert!(
+            verification::is_tree_in_order(&tree, 0),
+            "spine src not in order (n={}, pivot={})",
+            n,
+            pivot_v
+        );
         let mut moved: Vec<u64> = vec![];
         if let Some(so) = res {
-            let nt = TinyTree::from_root(so.new_root, so.new_head_id, so.moved_len, so.new_height, &deletion);
-            assert!(verification::is_tree_in_order(&nt, 0), "spine moved not in order (n={}, pivot={})", n, pivot_v);
+            let nt = TinyTree::from_root(
+                so.new_root,
+                so.new_head_id,
+                so.moved_len,
+                so.new_height,
+                &deletion,
+            );
+            assert!(
+                verification::is_tree_in_order(&nt, 0),
+                "spine moved not in order (n={}, pivot={})",
+                n,
+                pivot_v
+            );
             let mut c = nt.seek(&min_entry_key(), Ordering::Forward);
             while let Some(k) = c.next() {
                 moved.push(k.id().lower);
             }
-            assert_eq!(moved.len(), so.moved_len, "spine moved_len (n={}, pivot={})", n, pivot_v);
+            assert_eq!(
+                moved.len(),
+                so.moved_len,
+                "spine moved_len (n={}, pivot={})",
+                n,
+                pivot_v
+            );
         }
-        let exp_src: Vec<u64> = model.iter().cloned().filter(|&k| key_of(k) < pivot).collect();
-        let exp_moved: Vec<u64> = model.iter().cloned().filter(|&k| key_of(k) >= pivot).collect();
-        assert_eq!(src, exp_src, "spine source partition (n={}, pivot={})", n, pivot_v);
-        assert_eq!(moved, exp_moved, "spine moved partition (n={}, pivot={})", n, pivot_v);
+        let exp_src: Vec<u64> = model
+            .iter()
+            .cloned()
+            .filter(|&k| key_of(k) < pivot)
+            .collect();
+        let exp_moved: Vec<u64> = model
+            .iter()
+            .cloned()
+            .filter(|&k| key_of(k) >= pivot)
+            .collect();
+        assert_eq!(
+            src, exp_src,
+            "spine source partition (n={}, pivot={})",
+            n, pivot_v
+        );
+        assert_eq!(
+            moved, exp_moved,
+            "spine moved partition (n={}, pivot={})",
+            n, pivot_v
+        );
     }
 }
 
@@ -478,19 +541,25 @@ fn spine_split_no_balance_regression() {
 
         let d1 = deletion_set();
         let spine_tree = TinyTree::new(&d1);
-        for k in &keys { spine_tree.insert(&key_of(*k)); }
+        for k in &keys {
+            spine_tree.insert(&key_of(*k));
+        }
         let spine_moved = split_off_spine(&spine_tree, &key_of(pivot_v));
 
         let d2 = deletion_set();
         let leaf_tree = TinyTree::new(&d2);
-        for k in &keys { leaf_tree.insert(&key_of(*k)); }
+        for k in &keys {
+            leaf_tree.insert(&key_of(*k));
+        }
         let _leaf_moved = split_off(&leaf_tree, &key_of(pivot_v));
 
         // (a) spine's moved tree is always balanced.
         if let Some(so) = &spine_moved {
             assert!(
                 all_leaves_same_depth(&so.new_root),
-                "spine moved unbalanced (n={}, pivot={})", n, pivot_v
+                "spine moved unbalanced (n={}, pivot={})",
+                n,
+                pivot_v
             );
         }
         // (b) source balance is no worse than the leaf-rebuild baseline.
@@ -499,7 +568,8 @@ fn spine_split_no_balance_regression() {
         assert!(
             spine_src_bal || !leaf_src_bal,
             "spine source unbalanced where leaf-rebuild stayed balanced (n={}, pivot={})",
-            n, pivot_v
+            n,
+            pivot_v
         );
     }
 }
@@ -517,15 +587,26 @@ fn leaf_rebuild_split_off_balance_baseline() {
         let deletion = deletion_set();
         let tree = TinyTree::new(&deletion);
         let mut keys = std::collections::BTreeSet::new();
-        while (keys.len() as u64) < n { keys.insert(rng.random_range(0..2000u64)); }
-        for k in &keys { tree.insert(&key_of(*k)); }
+        while (keys.len() as u64) < n {
+            keys.insert(rng.random_range(0..2000u64));
+        }
+        for k in &keys {
+            tree.insert(&key_of(*k));
+        }
         let pivot_v = rng.random_range(0..2001u64);
         if let Some(so) = split_off(&tree, &key_of(pivot_v)) {
-            if !all_leaves_same_depth(&so.new_root) { moved_unbal += 1; }
+            if !all_leaves_same_depth(&so.new_root) {
+                moved_unbal += 1;
+            }
         }
-        if !all_leaves_same_depth(&tree.get_root()) { src_unbal += 1; }
+        if !all_leaves_same_depth(&tree.get_root()) {
+            src_unbal += 1;
+        }
     }
-    println!("LEAF_REBUILD baseline: src_unbal={} moved_unbal={}", src_unbal, moved_unbal);
+    println!(
+        "LEAF_REBUILD baseline: src_unbal={} moved_unbal={}",
+        src_unbal, moved_unbal
+    );
 }
 
 // The balancer never splits at an arbitrary key — it uses tree.mid_key(), a
@@ -545,23 +626,47 @@ fn split_at_mid_key_is_balanced_both_methods() {
         let deletion = deletion_set();
         let tree = TinyTree::new(&deletion);
         let mut keys = std::collections::BTreeSet::new();
-        while (keys.len() as u64) < n { keys.insert(rng.random_range(0..4000u64)); }
-        for k in &keys { tree.insert(&key_of(*k)); }
-        let Some(pivot) = tree.mid_key() else { continue };
+        while (keys.len() as u64) < n {
+            keys.insert(rng.random_range(0..4000u64));
+        }
+        for k in &keys {
+            tree.insert(&key_of(*k));
+        }
+        let Some(pivot) = tree.mid_key() else {
+            continue;
+        };
         // clone the same key set into a second tree for the leaf-rebuild method
         let deletion2 = deletion_set();
         let tree2 = TinyTree::new(&deletion2);
-        for k in &keys { tree2.insert(&key_of(*k)); }
+        for k in &keys {
+            tree2.insert(&key_of(*k));
+        }
         let pivot2 = tree2.mid_key().unwrap();
 
         if let Some(so) = split_off_spine(&tree, &pivot) {
-            assert!(all_leaves_same_depth(&so.new_root), "spine mid_key moved unbalanced (n={})", n);
+            assert!(
+                all_leaves_same_depth(&so.new_root),
+                "spine mid_key moved unbalanced (n={})",
+                n
+            );
         }
-        assert!(all_leaves_same_depth(&tree.get_root()), "spine mid_key source unbalanced (n={})", n);
+        assert!(
+            all_leaves_same_depth(&tree.get_root()),
+            "spine mid_key source unbalanced (n={})",
+            n
+        );
         if let Some(so) = split_off(&tree2, &pivot2) {
-            assert!(all_leaves_same_depth(&so.new_root), "leaf-rebuild mid_key moved unbalanced (n={})", n);
+            assert!(
+                all_leaves_same_depth(&so.new_root),
+                "leaf-rebuild mid_key moved unbalanced (n={})",
+                n
+            );
         }
-        assert!(all_leaves_same_depth(&tree2.get_root()), "leaf-rebuild mid_key source unbalanced (n={})", n);
+        assert!(
+            all_leaves_same_depth(&tree2.get_root()),
+            "leaf-rebuild mid_key source unbalanced (n={})",
+            n
+        );
         checked += 1;
     }
     println!("MID_KEY balance: checked {} splits, all balanced", checked);

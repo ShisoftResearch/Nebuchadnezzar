@@ -1132,7 +1132,10 @@ impl TreeService {
                             dist_prop.migration = None;
                         }
                         if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
-                            warn!("Failed to publish split source tree {:?}: {:?}", dist_tree.id, e);
+                            warn!(
+                                "Failed to publish split source tree {:?}: {:?}",
+                                dist_tree.id, e
+                            );
                         }
                         pending_migrations.remove(&migration_target_id);
                         debug!(

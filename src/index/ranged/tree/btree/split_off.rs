@@ -59,7 +59,8 @@ where
     }
     let new_root = ctx.constructor.root();
     let new_height = ctx.constructor.levels();
-    tree.len.fetch_sub(ctx.moved_len, std::sync::atomic::Ordering::Release);
+    tree.len
+        .fetch_sub(ctx.moved_len, std::sync::atomic::Ordering::Release);
     Some(SplitOff {
         new_root,
         new_height,
@@ -206,12 +207,8 @@ where
         }
         &NodeData::Internal(ref n) => {
             let index = n.search(pivot);
-            let child_kept = split_off_by_node::<KS, PS>(
-                tree,
-                &n.ptrs.as_slice_immute()[index],
-                pivot,
-                ctx,
-            );
+            let child_kept =
+                split_off_by_node::<KS, PS>(tree, &n.ptrs.as_slice_immute()[index], pivot, ctx);
             if index >= n.len && child_kept {
                 // pivot is past this node's separators and the covering child
                 // kept everything — nothing to truncate here.
@@ -312,7 +309,11 @@ where
                 n.next = NodeCellRef::default();
                 drop(node);
                 external::make_changed(node_ref, tree);
-                NodeSplitResult { kept: true, right: None, right_first_leaf: None }
+                NodeSplitResult {
+                    kept: true,
+                    right: None,
+                    right_first_leaf: None,
+                }
             } else if key_index == 0 {
                 // Whole leaf moves; it heads the moved chain.
                 let prev_ref = n.prev.clone();
@@ -396,7 +397,11 @@ where
             } else if right_ptrs.len() == 1 {
                 Some(right_ptrs.pop().unwrap())
             } else {
-                Some(build_internal::<KS, PS>(right_ptrs, right_keys, orig_right_bound))
+                Some(build_internal::<KS, PS>(
+                    right_ptrs,
+                    right_keys,
+                    orig_right_bound,
+                ))
             };
 
             // Kept side: ptrs[0..index] ++ (child kept ? ptrs[index] : none).
@@ -408,7 +413,11 @@ where
                 kept_keys = keys[..index].to_vec();
             } else {
                 // index ptrs, separators keys[0..index-1]
-                kept_keys = if index >= 1 { keys[..index - 1].to_vec() } else { vec![] };
+                kept_keys = if index >= 1 {
+                    keys[..index - 1].to_vec()
+                } else {
+                    vec![]
+                };
             }
 
             let mut node = write_node::<KS, PS>(node_ref);
@@ -437,10 +446,18 @@ where
                 true
             };
             drop(node);
-            NodeSplitResult { kept, right, right_first_leaf: child_res.right_first_leaf }
+            NodeSplitResult {
+                kept,
+                right,
+                right_first_leaf: child_res.right_first_leaf,
+            }
         }
         &NodeData::Empty(ref n) => split_node_spine::<KS, PS>(tree, &n.right, pivot),
-        &NodeData::None => NodeSplitResult { kept: true, right: None, right_first_leaf: None },
+        &NodeData::None => NodeSplitResult {
+            kept: true,
+            right: None,
+            right_first_leaf: None,
+        },
     }
 }
 
@@ -509,11 +526,26 @@ where
         &NodeData::External(ref n) => {
             let ki = n.search(pivot);
             Some(if ki >= n.len {
-                SplitSim { full: 0, moved_h: None, kept_h: Some(0), kept: true }
+                SplitSim {
+                    full: 0,
+                    moved_h: None,
+                    kept_h: Some(0),
+                    kept: true,
+                }
             } else if ki == 0 {
-                SplitSim { full: 0, moved_h: Some(0), kept_h: None, kept: false }
+                SplitSim {
+                    full: 0,
+                    moved_h: Some(0),
+                    kept_h: None,
+                    kept: false,
+                }
             } else {
-                SplitSim { full: 0, moved_h: Some(0), kept_h: Some(0), kept: true }
+                SplitSim {
+                    full: 0,
+                    moved_h: Some(0),
+                    kept_h: Some(0),
+                    kept: true,
+                }
             })
         }
         &NodeData::Internal(ref n) => {
@@ -527,7 +559,11 @@ where
             let moved_h = if num_moved == 0 {
                 None
             } else if num_moved == 1 {
-                if child.moved_h.is_some() { child.moved_h } else { Some(och) }
+                if child.moved_h.is_some() {
+                    child.moved_h
+                } else {
+                    Some(och)
+                }
             } else {
                 if let Some(c) = child.moved_h {
                     if c != och {
@@ -541,7 +577,11 @@ where
             let kept_h = if num_kept == 0 {
                 None
             } else if num_kept == 1 {
-                if child.kept { child.kept_h } else { Some(och) }
+                if child.kept {
+                    child.kept_h
+                } else {
+                    Some(och)
+                }
             } else {
                 if child.kept {
                     if child.kept_h != Some(och) {
@@ -551,12 +591,20 @@ where
                 Some(och + 1)
             };
 
-            Some(SplitSim { full, moved_h, kept_h, kept: num_kept > 0 })
+            Some(SplitSim {
+                full,
+                moved_h,
+                kept_h,
+                kept: num_kept > 0,
+            })
         }
         &NodeData::Empty(ref n) => simulate_spine_split::<KS, PS>(&n.right, pivot),
-        &NodeData::None => {
-            Some(SplitSim { full: 0, moved_h: None, kept_h: None, kept: false })
-        }
+        &NodeData::None => Some(SplitSim {
+            full: 0,
+            moved_h: None,
+            kept_h: None,
+            kept: false,
+        }),
     }
 }
 
@@ -610,6 +658,12 @@ where
             }
         }
     }
-    tree.len.fetch_sub(moved_len, std::sync::atomic::Ordering::Release);
-    Some(SplitOff { new_root, new_height, moved_len, new_head_id })
+    tree.len
+        .fetch_sub(moved_len, std::sync::atomic::Ordering::Release);
+    Some(SplitOff {
+        new_root,
+        new_height,
+        moved_len,
+        new_head_id,
+    })
 }

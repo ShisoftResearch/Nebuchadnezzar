@@ -209,7 +209,9 @@ fn bench_split_methods() {
 
     // leaf-rebuild split
     let tree = BenchTree::new(&deletion_set());
-    for i in 0..n { tree.insert(&key_of(i)); }
+    for i in 0..n {
+        tree.insert(&key_of(i));
+    }
     let start = Instant::now();
     let r = split_off(&tree, &mid);
     let e1 = start.elapsed();
@@ -217,7 +219,9 @@ fn bench_split_methods() {
 
     // spine split
     let tree2 = BenchTree::new(&deletion_set());
-    for i in 0..n { tree2.insert(&key_of(i)); }
+    for i in 0..n {
+        tree2.insert(&key_of(i));
+    }
     let start = Instant::now();
     let r2 = split_off_spine(&tree2, &mid);
     let e2 = start.elapsed();
@@ -225,7 +229,11 @@ fn bench_split_methods() {
 
     println!(
         "BENCH split: n={} leaf_rebuild={:.3}ms (moved {}) spine={:.3}ms (moved {})",
-        n, e1.as_secs_f64() * 1000.0, moved1, e2.as_secs_f64() * 1000.0, moved2
+        n,
+        e1.as_secs_f64() * 1000.0,
+        moved1,
+        e2.as_secs_f64() * 1000.0,
+        moved2
     );
     assert_eq!(moved1, moved2);
 }
