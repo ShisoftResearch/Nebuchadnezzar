@@ -368,8 +368,13 @@ impl Segment {
 
     // dead space plus tombstone spaces
     pub fn total_dead_space(&self) -> u32 {
-        // We count tombstone space becasue we want to actively clean them out when they are obsolete
-        let tombstones_space = self.tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
+        // We count tombstone space becasue we want to actively clean them out when they are obsolete.
+        // A tombstone entry physically occupies its payload plus the entry
+        // head; counting the payload alone under-reports each tombstone by
+        // ENTRY_HEAD_SIZE, which starves utilization-driven segment selection
+        // on tombstone-heavy segments.
+        let tombstones_space = self.tombstones.load(Ordering::Relaxed)
+            * (TOMBSTONE_SIZE_U32 + ENTRY_HEAD_SIZE as u32);
         let dead_cells_space = self.dead_space();
         return tombstones_space + dead_cells_space;
     }
