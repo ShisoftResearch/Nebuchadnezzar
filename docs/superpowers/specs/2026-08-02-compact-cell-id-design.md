@@ -25,8 +25,10 @@ built, broke, fixed, and validated for revision timestamps.
 
 - No change to transaction, MVCC-history, or cleaner semantics.
 - No dual-width runtime: one id format per store generation.
-- No preservation of hash-derived addressing for large populations
-  (full-text terms, hash-index buckets); those migrate to allocated ids.
+- No preservation of hash-derived addressing for populations that
+  exceed the hashed-class collision budget and do not require hop-free
+  addressing (full-text terms); those migrate to allocated ids. The
+  hash index's dual mode is explicitly preserved on hashed ids.
 
 ## Id layout
 
@@ -67,14 +69,20 @@ allocation order → same ids → reproducible tests and benchmarks), no
 RNG state in the allocation hot path, and immune to cloned-seed
 clumping in forked workers.
 
-**Hashed (restricted).** Keyed singletons may use `tag=1` with a 63-bit
-hash of `(schema, key)`. Routing uses the full id; hashed ids carry no
+**Hashed.** Keyed cells may use `tag=1` with a 63-bit hash of
+`(schema, key)`. Routing uses the full id; hashed ids carry no
 locality bits — anything needing both a key and affinity takes an
-allocated id plus a key-index entry. Population budget: ≤ ~10^7 ids per
-collision domain (p ≈ n²/2^64; 10^7 → ~5·10^-6). Current `from_obj`
-consumers must be inventoried; the full-text term/segment ids and
-hash-index buckets exceed the budget and must move to allocated
-internal ids with their own term→bucket resolution.
+allocated id plus a key-index entry. The class exists because some
+consumers must derive an address from a key with no resolution hop:
+the primary retained consumer is the **hash index's dual mode**
+(key→bucket addressing computed client-side), and keyed application
+cells. Collision budget: p ≈ n²/2^64 per domain — ~5·10^-6 at 10^7
+ids, ~5·10^-4 at 10^8 — combined with key-comparison detection on
+access (Uniqueness §2) so residual collisions surface as loud errors,
+never silent merges. Remaining `from_obj` consumers must be
+inventoried against this budget; populations that exceed it and do not
+need hop-free addressing (the full-text term/segment ids) move to
+allocated internal ids with their own resolution.
 
 ## Uniqueness
 
