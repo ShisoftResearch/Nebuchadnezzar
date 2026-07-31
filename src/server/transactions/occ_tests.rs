@@ -1500,12 +1500,15 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     );
 
     let mut external_fail = counter_cell(schema.id, fail_id, 12, "counter_fail_external");
-    let external_header = fail_server
+    fail_server
         .current_database()
         .chunks()
-        .update_cell(&mut external_fail)
+        .update_cell_at_revision(
+            &mut external_fail,
+            crate::ram::cell::RevisionWrite::committed(fail_first.header.revision_ts + 1_000),
+        )
         .unwrap();
-    assert!(external_header.revision_ts > fail_first.header.revision_ts);
+    assert!(external_fail.header.revision_ts > fail_first.header.revision_ts);
 
     let slow_prepare =
         transactions::data_site::install_prepare_delay_for_cell(tid.clone(), slow_id);
@@ -3019,9 +3022,17 @@ async fn transaction_reads_revision_older_than_current_head() {
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
+    // Leased direct revisions may lag the transaction boundary by design, so
+    // advance the head with an assigned revision strictly above the snapshot.
     let mut current = counter_cell(schema.id, cell_id, 2, "fixed-snapshot-current");
-    let current_header = runtime.chunks().update_cell(&mut current).unwrap();
-    assert!(current_header.revision_ts >= tid.ts);
+    runtime
+        .chunks()
+        .update_cell_at_revision(
+            &mut current,
+            crate::ram::cell::RevisionWrite::committed(tid.ts + 1_000),
+        )
+        .unwrap();
+    assert!(current.header.revision_ts >= tid.ts);
 
     let snapshot = accepted_cell(txn.read(tid, cell_id).await.unwrap().unwrap());
     assert!(
@@ -3044,9 +3055,21 @@ async fn deleted_snapshot_carries_exact_tombstone_revision() {
     let schema = install_occ_schema(&runtime);
     let cell_id = Id::new(0, 90137);
 
+    // Revision-aware absence is a transactional guarantee: only assigned
+    // (transaction-domain) revisions build the chain that certifies the exact
+    // tombstone. Direct removes are unindexed recovery records by design.
     let mut initial = counter_cell(schema.id, cell_id, 1, "deleted-snapshot-initial");
-    runtime.chunks().write_cell(&mut initial).unwrap();
-    runtime.chunks().remove_cell(&cell_id).unwrap();
+    runtime
+        .chunks()
+        .write_cell_at_revision(
+            &mut initial,
+            crate::ram::cell::RevisionWrite::committed(100),
+        )
+        .unwrap();
+    runtime
+        .chunks()
+        .remove_cell_at_revision(&cell_id, crate::ram::cell::RevisionWrite::committed(200))
+        .unwrap();
     let delete_revision_ts = match runtime
         .chunks()
         .read_cell_snapshot(&cell_id, u64::MAX)
@@ -3055,12 +3078,19 @@ async fn deleted_snapshot_carries_exact_tombstone_revision() {
         crate::ram::cell::SnapshotRead::Absent(Some(revision_ts)) => revision_ts,
         other => panic!("expected current tombstone, got {:?}", other),
     };
+    assert_eq!(delete_revision_ts, 200);
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
     let mut recreated = counter_cell(schema.id, cell_id, 2, "deleted-snapshot-recreated");
-    runtime.chunks().write_cell(&mut recreated).unwrap();
+    runtime
+        .chunks()
+        .write_cell_at_revision(
+            &mut recreated,
+            crate::ram::cell::RevisionWrite::committed(tid.ts + 1_000),
+        )
+        .unwrap();
     assert!(recreated.header.revision_ts >= tid.ts);
 
     assert_missing(txn.read(tid.clone(), cell_id).await.unwrap().unwrap());
@@ -3120,7 +3150,13 @@ async fn mixed_point_read_shapes_resolve_one_fixed_snapshot_revision() {
     let tid = txn.begin().await.unwrap().unwrap();
 
     let mut current = counter_cell(schema.id, cell_id, 20, "mixed-shapes-current");
-    runtime.chunks().update_cell(&mut current).unwrap();
+    runtime
+        .chunks()
+        .update_cell_at_revision(
+            &mut current,
+            crate::ram::cell::RevisionWrite::committed(tid.ts + 1_000),
+        )
+        .unwrap();
 
     let selected = accepted_cell(
         txn.read_selected(tid.clone(), cell_id, vec![hash_str("score")])
@@ -4056,10 +4092,18 @@ async fn head_read_certifies_snapshot_revision_and_aborts_on_conflict() {
         TxnExecResult::Accepted(())
     );
 
-    // A concurrent writer advances the header-read cell past the observed revision_ts.
+    // A concurrent transactional writer advances the header-read cell past
+    // the observed revision_ts (direct writes carry no certification
+    // guarantee under the isolation contract).
     let mut conflicting = counter_cell(schema.id, read_id, 7, "counter_certify_conflict");
-    let conflicting_header = runtime.chunks().update_cell(&mut conflicting).unwrap();
-    assert!(conflicting_header.revision_ts > head.revision_ts);
+    runtime
+        .chunks()
+        .update_cell_at_revision(
+            &mut conflicting,
+            crate::ram::cell::RevisionWrite::committed(head.revision_ts + 1_000),
+        )
+        .unwrap();
+    assert!(conflicting.header.revision_ts > head.revision_ts);
 
     // Certification must abort the transaction: the header-only read's recorded
     // revision_ts no longer matches the current stored revision_ts.
@@ -4115,7 +4159,13 @@ async fn selected_read_certifies_snapshot_revision_and_aborts_on_conflict() {
     );
 
     let mut external = counter_cell(schema.id, read_id, 7, "selected-cert-external");
-    runtime.chunks().update_cell(&mut external).unwrap();
+    runtime
+        .chunks()
+        .update_cell_at_revision(
+            &mut external,
+            crate::ram::cell::RevisionWrite::committed(selected.header.revision_ts + 1_000),
+        )
+        .unwrap();
     assert_eq!(
         txn.prepare(tid).await.unwrap().unwrap(),
         TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
@@ -4129,7 +4179,7 @@ async fn selected_read_certifies_snapshot_revision_and_aborts_on_conflict() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn snapshot_read_survives_concurrent_non_transactional_overwrite() {
+async fn snapshot_read_survives_concurrent_assigned_overwrite() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5382";
     let group = "txn_occ_history_survives_overwrite";
@@ -4150,10 +4200,19 @@ async fn snapshot_read_survives_concurrent_non_transactional_overwrite() {
     let head_a = accepted_head(txn.head(tid.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(head_a.revision_ts, revision_a_ts);
 
-    // Overwrite the cell NON-transactionally: this writes a NEW revision_ts B and
-    // only marks revision_ts A dead (copy-on-write) rather than mutating it in place.
+    // Overwrite the cell with an assigned revision above the first
+    // transaction's snapshot: revision A is retained in the chain
+    // (copy-on-write) while B becomes current. Direct overwrites make no
+    // snapshot promise under the isolation contract.
     let mut revision_b = counter_cell(schema.id, cell_id, 200, "counter_overwrite_b");
-    let revision_b_header = runtime.chunks().update_cell(&mut revision_b).unwrap();
+    runtime
+        .chunks()
+        .update_cell_at_revision(
+            &mut revision_b,
+            crate::ram::cell::RevisionWrite::committed(tid.ts + 1),
+        )
+        .unwrap();
+    let revision_b_header = revision_b.header;
     assert!(revision_b_header.revision_ts > head_a.revision_ts);
 
     // Force a deterministic storage cleaner pass between the overwrite and the
@@ -4186,6 +4245,7 @@ async fn snapshot_read_survives_concurrent_non_transactional_overwrite() {
 
     // A different, fresh transaction sees the current revision_ts B.
     let tid2 = txn.begin().await.unwrap().unwrap();
+    assert!(tid2.ts > revision_b_header.revision_ts);
     let full_b = accepted_cell(txn.read(tid2.clone(), cell_id).await.unwrap().unwrap());
     assert_eq!(full_b.header.revision_ts, revision_b_header.revision_ts);
     assert_eq!(score_of(&full_b), 200);
