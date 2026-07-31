@@ -85,8 +85,13 @@ impl RevisionAllocator {
         // Kill the old lease before moving `next` so a concurrent take cannot
         // pair an old-lease candidate with the new end; candidates consumed
         // between these stores are discarded, wasting at most a few values.
+        //
+        // `next` must only move forward: spinning takers overshoot the old
+        // lease end, and a taker that loads the new `end` can accept such an
+        // overshoot candidate. A plain store of `range.start` below the
+        // overshoot would rewind the counter and reissue those values.
         self.end.store(0, Ordering::Release);
-        self.next.store(range.start, Ordering::Relaxed);
+        self.next.fetch_max(range.start, Ordering::Relaxed);
         self.end.store(range.end, Ordering::Release);
         Ok(())
     }
