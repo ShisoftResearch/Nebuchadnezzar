@@ -33,6 +33,12 @@ pub enum CellExpectation {
     Present(u64),
     Absent(Option<u64>),
     UnobservedAbsent,
+    /// A blind write recorded without observing the current head. Prepare
+    /// resolves it against the head under the cell guards: certification
+    /// stores the observed `Present(revision_ts)`, so commit-side validation
+    /// never sees this variant. Absence surfaces at prepare as NotRealizable
+    /// instead of at the write call.
+    UnobservedPresent,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

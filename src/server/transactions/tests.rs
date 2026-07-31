@@ -398,12 +398,15 @@ pub async fn multi_transaction() {
     );
     let cell_1 =
         OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
+    // Blind updates defer head observation to prepare: the call is accepted
+    // and the absent cell would surface as NotRealizable at prepare. This
+    // transaction is aborted below without preparing.
     assert_eq!(
         txn.update(txn_1_id.to_owned(), cell_1.to_owned())
             .await
             .unwrap()
             .unwrap(),
-        TxnExecResult::Error(WriteError::CellDoesNotExisted)
+        TxnExecResult::Accepted(())
     );
     let data_map_2 = data_map_1.clone();
     data_map_1.insert(&String::from("score"), OwnedValue::U64(90));

@@ -3503,7 +3503,7 @@ async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repeatable_blind_remove_missing_errors_immediately() {
+async fn blind_remove_of_missing_cell_fails_at_prepare() {
     let _ = env_logger::try_init();
     let address = "127.0.0.1:5340";
     let group = "txn_occ_repeatable_blind_remove_missing";
@@ -3515,20 +3515,34 @@ async fn repeatable_blind_remove_missing_errors_immediately() {
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
 
+    // Blind removes defer head observation: the call is accepted and the
+    // absence surfaces when prepare fails to resolve the unobserved head.
     assert_eq!(
         txn.remove(tid.clone(), missing_id).await.unwrap().unwrap(),
-        TxnExecResult::Error(WriteError::CellDoesNotExisted)
-    );
-
-    let created = counter_cell(schema.id, missing_id, 8, "counter_blind_remove_missing");
-    assert_eq!(
-        txn.write(tid.clone(), created).await.unwrap().unwrap(),
         TxnExecResult::Accepted(())
     );
-    let written = accepted_cell(txn.read(tid.clone(), missing_id).await.unwrap().unwrap());
+    assert_eq!(
+        txn.prepare(tid.clone()).await.unwrap().unwrap(),
+        TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable)
+    );
+
+    // The failed prepare aborts the transaction; a fresh one can still
+    // create the cell.
+    let create_tid = txn.begin().await.unwrap().unwrap();
+    let created = counter_cell(schema.id, missing_id, 8, "counter_blind_remove_missing");
+    assert_eq!(
+        txn.write(create_tid.clone(), created).await.unwrap().unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    let written = accepted_cell(
+        txn.read(create_tid.clone(), missing_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
     assert_eq!(score_of(&written), 8);
 
-    abort_txn(&txn, tid).await;
+    abort_txn(&txn, create_tid).await;
     server.shutdown().await;
 }
 

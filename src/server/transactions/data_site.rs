@@ -1866,6 +1866,10 @@ impl DataManager {
                 matches!(current, CellExpectation::Absent(_))
             }
             (CellExpectation::UnobservedAbsent, _) => false,
+            (CellExpectation::UnobservedPresent, PrepareIntent::Write) => {
+                matches!(current, CellExpectation::Present(_))
+            }
+            (CellExpectation::UnobservedPresent, _) => false,
             (expected, _) => expected == current,
         }
     }
@@ -1873,6 +1877,25 @@ impl DataManager {
     fn prepare_expectation_matches(&self, op: &PrepareOp) -> bool {
         self.current_expectation(&op.id)
             .is_ok_and(|current| Self::expectation_matches(op, &current))
+    }
+
+    /// A stored certification satisfies a retried prepare when it is either
+    /// identical or the resolved form of an unobserved expectation in the
+    /// retry (prepare rewrites `UnobservedPresent` to the observed
+    /// `Present(ts)` before storing it).
+    fn certified_satisfies_request(
+        certified: &BTreeMap<Id, PrepareOp>,
+        requested: &BTreeMap<Id, PrepareOp>,
+    ) -> bool {
+        certified.len() == requested.len()
+            && requested.iter().all(|(id, req)| {
+                certified.get(id).is_some_and(|cert| {
+                    cert.intent == req.intent
+                        && (cert.expectation == req.expectation
+                            || (matches!(req.expectation, CellExpectation::UnobservedPresent)
+                                && matches!(cert.expectation, CellExpectation::Present(_))))
+                })
+            })
     }
 
     #[inline]
@@ -2662,7 +2685,11 @@ impl DataManager {
                 let certified_revision = match op.expectation {
                     CellExpectation::Present(revision_ts)
                     | CellExpectation::Absent(Some(revision_ts)) => Some(revision_ts),
-                    CellExpectation::Absent(None) | CellExpectation::UnobservedAbsent => None,
+                    // Prepare resolves UnobservedPresent to Present before
+                    // certification; an unresolved value cannot reach commit.
+                    CellExpectation::Absent(None)
+                    | CellExpectation::UnobservedAbsent
+                    | CellExpectation::UnobservedPresent => None,
                 };
                 certified_revision.is_some_and(|revision_ts| commit_hlc.ts <= revision_ts)
             })
@@ -8567,7 +8594,10 @@ impl Service for DataManager {
                         TxnState::Started => None,
                         TxnState::Prepared
                             if txn.coordinator_id == Some(coordinator_id)
-                                && txn.certified == prepared_ops_by_id =>
+                                && Self::certified_satisfies_request(
+                                    &txn.certified,
+                                    &prepared_ops_by_id,
+                                ) =>
                         {
                             None
                         }
@@ -8643,7 +8673,10 @@ impl Service for DataManager {
                         TxnState::Started => {}
                         TxnState::Prepared => {
                             if txn.coordinator_id != Some(coordinator_id)
-                                || txn.certified != prepared_ops_by_id
+                                || !Self::certified_satisfies_request(
+                                    &txn.certified,
+                                    &prepared_ops_by_id,
+                                )
                             {
                                 break 'result DMPrepareResult::StateError(TxnState::Prepared);
                             }
@@ -8714,8 +8747,13 @@ impl Service for DataManager {
                         }
                         owner_index.add(&requester, newly_acquired);
 
+                        let mut certified_ops = prepared_ops_by_id.clone();
                         for op in &prepared_ops {
-                            if !self.prepare_expectation_matches(op) {
+                            let current = self.current_expectation(&op.id);
+                            let matches = current
+                                .as_ref()
+                                .is_ok_and(|current| Self::expectation_matches(op, current));
+                            if !matches {
                                 debug!(
                                     "PREPARE expectation mismatch for {:?} on cell {:?}: {:?}",
                                     requester, op.id, op
@@ -8731,9 +8769,19 @@ impl Service for DataManager {
                                 owner_index.remove(&requester, released);
                                 break 'result DMPrepareResult::NotRealizable;
                             }
+                            // Certify the observed head for blind writes so
+                            // commit-side validation sees a concrete revision.
+                            if matches!(op.expectation, CellExpectation::UnobservedPresent) {
+                                if let Ok(current @ CellExpectation::Present(_)) = current {
+                                    certified_ops
+                                        .get_mut(&op.id)
+                                        .expect("canonical prepare ops cover every op id")
+                                        .expectation = current;
+                                }
+                            }
                         }
 
-                        txn.certified = prepared_ops_by_id;
+                        txn.certified = certified_ops;
                         txn.affected_cells = txn.certified.keys().copied().collect();
                         txn.coordinator_id = Some(coordinator_id);
                         txn.state = TxnState::Prepared;

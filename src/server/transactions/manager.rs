@@ -1793,37 +1793,16 @@ impl Service for TransactionManager {
                         data_obj.cell = Some(cell);
                         data_obj.changed = true;
                     } else {
-                        let server = self
-                            .get_data_site(server_id)
-                            .await
-                            .map_err(|_| TMError::CannotLocateCellServer)?;
-                        let expectation = match self
-                            .observe_revision(&server, &tid, id.clone())
-                            .await?
-                        {
-                            TxnExecResult::Accepted(revision_ts) => {
-                                CellExpectation::Present(revision_ts)
-                            }
-                            TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
-                                return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
-                            }
-                            TxnExecResult::Error(error) => {
-                                return Ok(TxnExecResult::Error(WriteError::ReadError(error)));
-                            }
-                            TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
-                            TxnExecResult::StateError(state) => {
-                                return Ok(TxnExecResult::StateError(state));
-                            }
-                            TxnExecResult::Wait => {
-                                unreachable!("observe_revision retries waits before returning")
-                            }
-                        };
+                        // Blind write: prepare observes and certifies the
+                        // head under the cell guards, so no read round trip
+                        // is needed here. A missing cell surfaces at prepare
+                        // as NotRealizable instead of failing this call.
                         txn.data.insert(
                             id,
                             DataObject {
                                 server: server_id,
                                 cell: Some(cell),
-                                expectation,
+                                expectation: CellExpectation::UnobservedPresent,
                                 new: false,
                                 changed: true,
                                 point_cache: PointReadCache::default(),
@@ -1866,37 +1845,14 @@ impl Service for TransactionManager {
                             txn.data.remove(&id);
                         }
                     } else {
-                        let server = self
-                            .get_data_site(server_id)
-                            .await
-                            .map_err(|_| TMError::CannotLocateCellServer)?;
-                        let expectation = match self
-                            .observe_revision(&server, &tid, id.clone())
-                            .await?
-                        {
-                            TxnExecResult::Accepted(revision_ts) => {
-                                CellExpectation::Present(revision_ts)
-                            }
-                            TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
-                                return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
-                            }
-                            TxnExecResult::Error(error) => {
-                                return Ok(TxnExecResult::Error(WriteError::ReadError(error)));
-                            }
-                            TxnExecResult::Rejected => return Ok(TxnExecResult::Rejected),
-                            TxnExecResult::StateError(state) => {
-                                return Ok(TxnExecResult::StateError(state));
-                            }
-                            TxnExecResult::Wait => {
-                                unreachable!("observe_revision retries waits before returning")
-                            }
-                        };
+                        // Blind remove: same deferred observation as blind
+                        // update above.
                         txn.data.insert(
                             id,
                             DataObject {
                                 server: server_id,
                                 cell: None,
-                                expectation,
+                                expectation: CellExpectation::UnobservedPresent,
                                 new: false,
                                 changed: true,
                                 point_cache: PointReadCache::default(),
@@ -5035,10 +4991,7 @@ mod tests {
             .data
             .get(&cell_id)
             .expect("blind update should cache the target cell");
-        assert_eq!(
-            data_obj.expectation,
-            CellExpectation::Present(original.header.revision_ts)
-        );
+        assert_eq!(data_obj.expectation, CellExpectation::UnobservedPresent);
         assert!(data_obj.changed);
 
         drop(txn_state);
@@ -5079,10 +5032,7 @@ mod tests {
             .data
             .get(&cell_id)
             .expect("blind remove should cache the target cell");
-        assert_eq!(
-            data_obj.expectation,
-            CellExpectation::Present(original.header.revision_ts)
-        );
+        assert_eq!(data_obj.expectation, CellExpectation::UnobservedPresent);
         assert!(data_obj.changed);
 
         drop(txn_state);
