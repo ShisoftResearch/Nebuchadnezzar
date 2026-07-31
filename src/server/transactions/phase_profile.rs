@@ -20,9 +20,13 @@ pub enum Phase {
     ParticipantCommit,
     ParticipantAbort,
     ParticipantEnd,
+    CommitStorageValidate,
+    CommitOldCellRead,
+    CommitInstall,
+    EndPromotion,
 }
 
-pub const PHASE_COUNT: usize = 13;
+pub const PHASE_COUNT: usize = 17;
 
 pub const PHASES: [Phase; PHASE_COUNT] = [
     Phase::ReadSiteRpc,
@@ -38,6 +42,10 @@ pub const PHASES: [Phase; PHASE_COUNT] = [
     Phase::ParticipantCommit,
     Phase::ParticipantAbort,
     Phase::ParticipantEnd,
+    Phase::CommitStorageValidate,
+    Phase::CommitOldCellRead,
+    Phase::CommitInstall,
+    Phase::EndPromotion,
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -86,6 +94,10 @@ impl Phase {
             Phase::ParticipantCommit => "participant_commit",
             Phase::ParticipantAbort => "participant_abort",
             Phase::ParticipantEnd => "participant_end",
+            Phase::CommitStorageValidate => "commit_storage_validate",
+            Phase::CommitOldCellRead => "commit_old_cell_read",
+            Phase::CommitInstall => "commit_install",
+            Phase::EndPromotion => "end_promotion",
         }
     }
 }
@@ -93,36 +105,8 @@ impl Phase {
 impl Registry {
     const fn new() -> Self {
         Self {
-            totals_ns: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
-            counts: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
+            totals_ns: [const { AtomicU64::new(0) }; PHASE_COUNT],
+            counts: [const { AtomicU64::new(0) }; PHASE_COUNT],
             active_guards: AtomicUsize::new(0),
         }
     }
@@ -235,6 +219,10 @@ mod tests {
             "participant_commit",
             "participant_abort",
             "participant_end",
+            "commit_storage_validate",
+            "commit_old_cell_read",
+            "commit_install",
+            "end_promotion",
         ];
 
         let actual = PHASES.map(Phase::as_str);

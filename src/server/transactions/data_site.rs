@@ -897,15 +897,37 @@ struct Transaction {
     history: CommitHistory,
 }
 
+enum PriorCell {
+    /// No predecessor existed (fresh write); compensation removes the cell.
+    Absent,
+    /// Eagerly captured copy; durable deployments keep it because the undo
+    /// log entry consumes the same read.
+    Owned(OwnedCellRef),
+    /// The committed predecessor stays pinned in the revision chain while the
+    /// installed head is pending (expiration readiness requires a newer
+    /// committed revision), so aborts materialize it on demand.
+    InChain,
+}
+
 struct CellHistory {
-    cell: Option<OwnedCellRef>,
+    prior: PriorCell,
     compensation: Option<InstalledRevision>,
 }
 
 impl CellHistory {
     pub fn new(cell: Option<OwnedCellRef>) -> CellHistory {
         CellHistory {
-            cell,
+            prior: match cell {
+                Some(cell) => PriorCell::Owned(cell),
+                None => PriorCell::Absent,
+            },
+            compensation: None,
+        }
+    }
+
+    pub fn prior_in_chain() -> CellHistory {
+        CellHistory {
+            prior: PriorCell::InChain,
             compensation: None,
         }
     }
@@ -1882,10 +1904,17 @@ impl DataManager {
                     .get(id)
                     .ok_or(WriteError::CellRevisionMismatch)
                     .and_then(|installed| {
-                        self.chunks().compensate(
-                            installed,
-                            history.cell.as_ref().map(|cell| cell.clone_referred()),
-                        )
+                        let prior = match &history.prior {
+                            PriorCell::Absent => None,
+                            PriorCell::Owned(cell) => Some(cell.clone_referred()),
+                            PriorCell::InChain => {
+                                match self.materialize_chain_prior(id, installed) {
+                                    Ok(prior) => prior,
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                        };
+                        self.chunks().compensate(installed, prior)
                     })
                     .map(|compensation| {
                         history.compensation = Some(compensation);
@@ -1909,6 +1938,37 @@ impl DataManager {
         }
         failures
     }
+    /// Materializes the committed predecessor of a pending installed revision
+    /// from the version chain. The predecessor cannot expire while the
+    /// installed head is pending — expiration readiness requires a newer
+    /// committed revision — so a snapshot read strictly below the installed
+    /// timestamp resolves to exactly that predecessor.
+    fn materialize_chain_prior(
+        &self,
+        id: &Id,
+        installed: &InstalledRevision,
+    ) -> Result<Option<OwnedCell>, WriteError> {
+        let mut attempts = 0u32;
+        loop {
+            match self
+                .chunks()
+                .read_cell_snapshot(id, installed.node.revision_ts)
+            {
+                Ok(SnapshotRead::Present(cell)) => return Ok(Some(cell)),
+                Ok(SnapshotRead::Absent(_)) => return Ok(None),
+                Ok(SnapshotRead::Wait) => {
+                    attempts += 1;
+                    if attempts > 1000 {
+                        return Err(WriteError::ReadError(ReadError::NotMatch));
+                    }
+                    std::thread::yield_now();
+                }
+                Err(ReadError::CellDoesNotExisted) => return Ok(None),
+                Err(error) => return Err(WriteError::ReadError(error)),
+            }
+        }
+    }
+
     #[inline]
     fn guarded_txn_cell_ids(txn: &Transaction) -> Vec<Id> {
         txn.affected_cells
@@ -2346,8 +2406,13 @@ impl DataManager {
         {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
-        if let Err(result) = self.validate_commit_storage_state(&txn, &cells) {
-            return result;
+        {
+            #[cfg(feature = "occ_phase_profile")]
+            let _phase_guard =
+                super::phase_profile::guard(super::phase_profile::Phase::CommitStorageValidate);
+            if let Err(result) = self.validate_commit_storage_state(&txn, &cells) {
+                return result;
+            }
         }
 
         txn.commit_hlc = Some(commit_hlc);
@@ -2386,10 +2451,16 @@ impl DataManager {
                             #[cfg(test)]
                             pause_before_storage_mutation(tid, &cell_id);
                         }
-                        match self.chunks().write_cell_at_revision(
-                            &mut cell,
-                            RevisionWrite::pending(commit_hlc.ts),
-                        ) {
+                        match {
+                            #[cfg(feature = "occ_phase_profile")]
+                            let _phase_guard = super::phase_profile::guard(
+                                super::phase_profile::Phase::CommitInstall,
+                            );
+                            self.chunks().write_cell_at_revision(
+                                &mut cell,
+                                RevisionWrite::pending(commit_hlc.ts),
+                            )
+                        } {
                             Ok(installed) => {
                                 txn.history.insert(cell_id, CellHistory::new(None));
                                 txn.installed.insert(cell_id, installed);
@@ -2406,23 +2477,32 @@ impl DataManager {
                             .certified_present_revision_ts(cell_id)
                             .expect("commit payload validation requires present certification");
 
-                        let old_cell = {
-                            let shared_cell = match self.chunks().read_cell(cell_id) {
-                                Ok(cell) => cell,
-                                Err(read_error) => {
+                        // The revision-expectation recheck lives in
+                        // validate_commit_storage_state, which ran under these
+                        // same cell guards; the eager copy is only needed to
+                        // feed the undo log. Volatile deployments materialize
+                        // the prior from the pinned chain predecessor on abort.
+                        let history_entry = if let Some(undo_log) = self.undo_log() {
+                            let old_cell = {
+                                #[cfg(feature = "occ_phase_profile")]
+                                let _phase_guard = super::phase_profile::guard(
+                                    super::phase_profile::Phase::CommitOldCellRead,
+                                );
+                                let shared_cell = match self.chunks().read_cell(cell_id) {
+                                    Ok(cell) => cell,
+                                    Err(read_error) => {
+                                        write_error =
+                                            Some((*cell_id, WriteError::ReadError(read_error)));
+                                        break;
+                                    }
+                                };
+                                if shared_cell.header.revision_ts != expected_revision_ts {
                                     write_error =
-                                        Some((*cell_id, WriteError::ReadError(read_error)));
+                                        Some((*cell_id, WriteError::CellRevisionMismatch));
                                     break;
                                 }
+                                shared_cell.to_owned()
                             };
-                            if shared_cell.header.revision_ts != expected_revision_ts {
-                                write_error = Some((*cell_id, WriteError::CellRevisionMismatch));
-                                break;
-                            }
-                            shared_cell.to_owned()
-                        };
-
-                        if let Some(undo_log) = self.undo_log() {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 *cell_id,
@@ -2438,15 +2518,22 @@ impl DataManager {
                             }
                             #[cfg(test)]
                             pause_before_storage_mutation(tid, cell_id);
-                        }
+                            CellHistory::new(Some(old_cell.into_ref()))
+                        } else {
+                            let _ = expected_revision_ts;
+                            CellHistory::prior_in_chain()
+                        };
 
-                        match self
-                            .chunks()
-                            .remove_cell_at_revision(cell_id, RevisionWrite::pending(commit_hlc.ts))
-                        {
+                        match {
+                            #[cfg(feature = "occ_phase_profile")]
+                            let _phase_guard = super::phase_profile::guard(
+                                super::phase_profile::Phase::CommitInstall,
+                            );
+                            self.chunks()
+                                .remove_cell_at_revision(cell_id, RevisionWrite::pending(commit_hlc.ts))
+                        } {
                             Ok(installed) => {
-                                txn.history
-                                    .insert(*cell_id, CellHistory::new(Some(old_cell.into_ref())));
+                                txn.history.insert(*cell_id, history_entry);
                                 txn.installed.insert(*cell_id, installed);
                                 meta.write = commit_hlc;
                             }
@@ -2462,23 +2549,30 @@ impl DataManager {
                             .certified_present_revision_ts(&cell_id)
                             .expect("commit payload validation requires present certification");
 
-                        let old_cell = {
-                            let shared_cell = match self.chunks().read_cell(&cell_id) {
-                                Ok(cell) => cell,
-                                Err(read_error) => {
+                        // Same volatile-path contract as Remove above: the
+                        // expectation recheck is subsumed by
+                        // validate_commit_storage_state under these guards.
+                        let history_entry = if let Some(undo_log) = self.undo_log() {
+                            let old_cell = {
+                                #[cfg(feature = "occ_phase_profile")]
+                                let _phase_guard = super::phase_profile::guard(
+                                    super::phase_profile::Phase::CommitOldCellRead,
+                                );
+                                let shared_cell = match self.chunks().read_cell(&cell_id) {
+                                    Ok(cell) => cell,
+                                    Err(read_error) => {
+                                        write_error =
+                                            Some((cell_id, WriteError::ReadError(read_error)));
+                                        break;
+                                    }
+                                };
+                                if shared_cell.header.revision_ts != expected_revision_ts {
                                     write_error =
-                                        Some((cell_id, WriteError::ReadError(read_error)));
+                                        Some((cell_id, WriteError::CellRevisionMismatch));
                                     break;
                                 }
+                                shared_cell.to_owned()
                             };
-                            if shared_cell.header.revision_ts != expected_revision_ts {
-                                write_error = Some((cell_id, WriteError::CellRevisionMismatch));
-                                break;
-                            }
-                            shared_cell.to_owned()
-                        };
-
-                        if let Some(undo_log) = self.undo_log() {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 cell_id,
@@ -2494,14 +2588,23 @@ impl DataManager {
                             }
                             #[cfg(test)]
                             pause_before_storage_mutation(tid, &cell_id);
-                        }
-                        match self.chunks().update_cell_at_revision(
-                            &mut cell,
-                            RevisionWrite::pending(commit_hlc.ts),
-                        ) {
+                            CellHistory::new(Some(old_cell.into_ref()))
+                        } else {
+                            let _ = expected_revision_ts;
+                            CellHistory::prior_in_chain()
+                        };
+                        match {
+                            #[cfg(feature = "occ_phase_profile")]
+                            let _phase_guard = super::phase_profile::guard(
+                                super::phase_profile::Phase::CommitInstall,
+                            );
+                            self.chunks().update_cell_at_revision(
+                                &mut cell,
+                                RevisionWrite::pending(commit_hlc.ts),
+                            )
+                        } {
                             Ok(installed) => {
-                                txn.history
-                                    .insert(cell_id, CellHistory::new(Some(old_cell.into_ref())));
+                                txn.history.insert(cell_id, history_entry);
                                 txn.installed.insert(cell_id, installed);
                                 meta.write = commit_hlc;
                             }
@@ -8870,6 +8973,9 @@ impl Service for DataManager {
             }
 
             if txn.state == TxnState::Committed {
+                #[cfg(feature = "occ_phase_profile")]
+                let _promotion_guard =
+                    super::phase_profile::guard(super::phase_profile::Phase::EndPromotion);
                 let mut promoted = Vec::new();
                 let mut promotion_failed = false;
                 for installed in txn.installed.values() {
