@@ -2974,6 +2974,12 @@ impl Chunks {
         &self,
         installed_revisions: impl IntoIterator<Item = &'a InstalledRevision>,
     ) -> io::Result<()> {
+        if !self.durable_storage_configured() {
+            // No chunk has WAL or backup storage, so no segment holds a WAL
+            // file and every sync below would no-op; the traversal exists only
+            // to pin the exact bytes a durable sync would cover.
+            return Ok(());
+        }
         let mut segment_keys = HashSet::new();
         let mut guarded_segments = Vec::new();
         for installed in installed_revisions {

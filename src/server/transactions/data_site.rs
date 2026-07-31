@@ -2355,11 +2355,13 @@ impl DataManager {
         crate::ram::chunk::set_transaction_context(true);
         let mut write_error: Option<(Id, WriteError)> = None;
         let mut commit_failure: Option<DMCommitResult> = None;
+        let mut reused_prior_install = false;
         {
             for cell_op in cells {
                 let cell_id = Self::commit_op_cell_id(&cell_op)
                     .expect("commit payload validation rejects non-mutation ops");
                 if txn.installed.contains_key(&cell_id) {
+                    reused_prior_install = true;
                     continue;
                 }
 
@@ -2524,7 +2526,10 @@ impl DataManager {
         if let Some((id, error)) = write_error {
             return Self::map_commit_write_error(&txn, id, error);
         }
-        if !self.installed_revisions_agree(&txn) {
+        // Freshly installed revisions are the chain heads their installers
+        // just published under the cell guards held across this loop; only
+        // installs reused from an earlier commit attempt need re-verification.
+        if reused_prior_install && !self.installed_revisions_agree(&txn) {
             return DMCommitResult::CheckFailed(CheckError::CannotEnd);
         }
         if let Err(error) = self
@@ -8892,7 +8897,11 @@ impl Service for DataManager {
                         ),
                     }
                 }
-                if promotion_failed || !self.installed_revisions_agree(&txn) {
+                // The pre-promotion agreement check ran under these same cell
+                // guards with no await in between, and promotion itself only
+                // CASes node states, so a second full agreement walk here can
+                // only repeat that verdict.
+                if promotion_failed {
                     for (node, pending, committed) in promoted.into_iter().rev() {
                         if !node.compare_exchange_state(committed, pending) {
                             error!("Could not restore pending promotion barrier for {:?}", tid);
