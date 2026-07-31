@@ -3119,6 +3119,17 @@ impl TransactionManager {
         txn: &mut Transaction,
         resolution: TxnResolution,
     ) -> io::Result<undo_log::CoordinatorCompletionRecord> {
+        // The replay lock serializes completion against undo-log replay for
+        // the same tid. Without an undo log replay can never run, and an
+        // aborted transaction that never dispatched to a participant has no
+        // record replay could visit, so those finishes skip the lock.
+        let skip_replay_lock = self.deps.database_runtime.undo_log().is_none()
+            && matches!(resolution, TxnResolution::Abort)
+            && txn.completed_participants.is_empty()
+            && txn.dispatch_participants.is_empty();
+        if skip_replay_lock {
+            return self.finish_transaction_guarded_with_replay_lock(tid, txn_lock, txn, resolution);
+        }
         let replay_lock = self.replay_lock(tid);
         let _replay_guard = replay_lock.lock().await;
         self.finish_transaction_guarded_with_replay_lock(tid, txn_lock, txn, resolution)
