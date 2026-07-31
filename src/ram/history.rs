@@ -607,6 +607,10 @@ pub struct HistoryIndex {
     #[cfg(test)]
     worker_wakes: AtomicUsize,
     chain_creation: Mutex<()>,
+    /// Coalesces worker wakes: retire() runs on the assigned-write hot path,
+    /// and with the worker parking at most WORKER_MAX_PARK_MS the unpark is
+    /// only needed once per worker pass, not once per retirement.
+    wake_pending: AtomicBool,
     expiration_ingress: LinkedRingBufferList<Option<ScheduledExpiration>, 64>,
     expirations: Mutex<BinaryHeap<ScheduledExpiration>>,
     expiration_sequence: AtomicU64,
@@ -639,6 +643,7 @@ impl HistoryIndex {
             #[cfg(test)]
             worker_wakes: AtomicUsize::new(0),
             chain_creation: Mutex::new(()),
+            wake_pending: AtomicBool::new(false),
             expiration_ingress: LinkedRingBufferList::new(),
             expirations: Mutex::new(BinaryHeap::new()),
             expiration_sequence: AtomicU64::new(0),
@@ -672,6 +677,7 @@ impl HistoryIndex {
                     if history.stopped.load(Ordering::Acquire) {
                         break;
                     }
+                    history.wake_pending.store(false, Ordering::Release);
                     let park_ms = history.expire_due_until(monotonic_ms(), &|| {
                         history.stopped.load(Ordering::Acquire)
                     });
@@ -1056,6 +1062,11 @@ impl HistoryIndex {
     fn wake_worker(&self) {
         #[cfg(test)]
         self.worker_wakes.fetch_add(1, Ordering::Relaxed);
+        if self.wake_pending.swap(true, Ordering::AcqRel) {
+            // A wake is already pending; the worker clears the flag at the
+            // top of its next pass.
+            return;
+        }
         if let Some(handle) = self.worker.lock().as_ref() {
             handle.thread().unpark();
         }
