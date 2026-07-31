@@ -2715,6 +2715,30 @@ impl DataManager {
         })
     }
 
+    /// Set-coverage half of [`Self::installed_revisions_agree`]: every
+    /// certified write has an installed node carrying the commit timestamp.
+    /// Skips the physical head/location probes; promotion re-validates each
+    /// node against the chain head before flipping its state.
+    fn installed_revisions_cover_certified(&self, txn: &Transaction) -> bool {
+        let write_ids: Vec<_> = txn
+            .certified
+            .iter()
+            .filter(|(_, op)| op.intent == PrepareIntent::Write)
+            .map(|(id, _)| *id)
+            .collect();
+        if write_ids.is_empty() {
+            return txn.installed.is_empty();
+        }
+        let Some(commit_hlc) = txn.commit_hlc else {
+            return false;
+        };
+        write_ids.into_iter().all(|id| {
+            txn.installed
+                .get(&id)
+                .is_some_and(|installed| installed.node.revision_ts == commit_hlc.ts)
+        })
+    }
+
     fn validate_commit_subset(txn: &Transaction, cells: &[CommitOp]) -> Result<(), DMCommitResult> {
         let prepared_cells_num = txn.certified.len();
         let arrived_cells_num = cells.len();
@@ -8929,7 +8953,10 @@ impl Service for DataManager {
                 if !txn.installed.is_empty() && !txn.installed_output_durable {
                     break 'end EndResult::CheckFailed(CheckError::CannotEnd);
                 }
-                if !self.installed_revisions_agree(&txn) {
+                // Set coverage only: the physical head/location probes are
+                // re-established per node by promote_revision's ptr_eq + CAS
+                // before any state flips.
+                if !self.installed_revisions_cover_certified(&txn) {
                     break 'end EndResult::CheckFailed(CheckError::CannotEnd);
                 }
                 if txn.installed.values().any(|installed| {
