@@ -22,7 +22,8 @@ use occ_support::{
     metrics::RunReport,
     workloads::{
         build_history_chain, hold_old_snapshot_across_newer_writes, run_blind_remove_batch,
-        run_blind_update_batch, run_expired_snapshot_read_batch, run_fixed_success_rmw,
+        run_blind_update_batch, run_contended_read_batch, run_expired_snapshot_read_batch,
+        run_fixed_success_rmw,
         run_fresh_cleaner_reader_contention_batch, run_fresh_cleaner_relocation_batch,
         run_held_snapshot_read_batch, run_hlc_allocation_batch,
         run_non_transactional_conditional_update_batch,
@@ -49,6 +50,7 @@ const REQUIRED_MVCC_SCENARIOS: &[&str] = &[
     "mvcc/non_transactional_remove",
     "mvcc/non_transactional_delete_recreate",
     "mvcc/read_only_current",
+    "mvcc/contended_read",
     "mvcc/rmw_one_cell",
     "mvcc/rmw_multi_cell",
     "mvcc/multi_participant",
@@ -533,6 +535,9 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
     // keep this dedicated portfolio's counter payload minimal.
     seed_history(&runtime, &fixture, ids.as_ref(), 0);
     let remove_ids = Arc::new(fixture.ids_for_server(server_id, 256, 8_300_000));
+    // Small pool so paced writers keep every cell under continuous pressure.
+    let contended_ids = Arc::new(fixture.ids_for_server(server_id, 8, 9_100_000));
+    seed_history(&runtime, &fixture, contended_ids.as_ref(), 0);
 
     let direct_fixture = Arc::new(runtime.block_on(OccFixture::single_with_history_retention(
         plan.single(14),
@@ -608,6 +613,7 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
         let fixture = fixture.clone();
         let ids = ids.clone();
         let remove_ids = remove_ids.clone();
+        let contended_ids = contended_ids.clone();
         let direct_fixture = direct_fixture.clone();
         let direct_ids = direct_ids.clone();
         let direct_id_cursor = direct_id_cursor.clone();
@@ -654,6 +660,7 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
                 let fixture = fixture.clone();
                 let ids = ids.clone();
                 let remove_ids = remove_ids.clone();
+                let contended_ids = contended_ids.clone();
                 let direct_fixture = direct_fixture.clone();
                 let direct_ids = direct_ids.clone();
                 let direct_id_cursor = direct_id_cursor.clone();
@@ -765,6 +772,19 @@ fn mvcc_portfolio(criterion: &mut Criterion) {
                                         fixture.clone(),
                                         ids.clone(),
                                         operations,
+                                    )
+                                    .await,
+                                    fixture.clone(),
+                                    Vec::new(),
+                                ),
+                                "mvcc/contended_read" => (
+                                    run_contended_read_batch(
+                                        fixture.clone(),
+                                        contended_ids.clone(),
+                                        operations,
+                                        4,
+                                        4,
+                                        Duration::from_micros(500),
                                     )
                                     .await,
                                     fixture.clone(),

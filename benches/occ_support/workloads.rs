@@ -2438,6 +2438,152 @@ pub async fn run_read_only_current_batch(
     .await
 }
 
+/// Read-only transactions measured while rate-paced writer transactions
+/// keep the same id pool under continuous write pressure. The writer pace is
+/// a fixed wall-clock interval so both product branches face identical
+/// contention regardless of their own write throughput. Reader throughput
+/// and latency are the reported quantities; writer commits feed the score
+/// invariant only.
+pub async fn run_contended_read_batch(
+    fixture: Arc<OccFixture>,
+    ids: Arc<Vec<Id>>,
+    operations: u64,
+    reader_concurrency: usize,
+    writer_concurrency: usize,
+    writer_interval: Duration,
+) -> TimedBatch {
+    validate_unique_ids(ids.as_ref(), "contended read");
+    assert!(reader_concurrency > 0, "contended read requires readers");
+    assert!(writer_concurrency > 0, "contended read requires writers");
+    if operations == 0 {
+        return TimedBatch {
+            metrics: BatchMetrics::default(),
+            elapsed: Duration::ZERO,
+        };
+    }
+
+    let score_before = fixture.sum_scores(ids.as_ref()).await;
+    let stop_writers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_commits = Arc::new(AtomicU64::new(0));
+    let writer_failures = Arc::new(AtomicU64::new(0));
+    let mut writers = Vec::with_capacity(writer_concurrency);
+    for writer_index in 0..writer_concurrency {
+        let fixture = fixture.clone();
+        let ids = ids.clone();
+        let stop = stop_writers.clone();
+        let commits = writer_commits.clone();
+        let failures = writer_failures.clone();
+        writers.push(tokio::spawn(async move {
+            let mut cursor = writer_index as u64;
+            let mut ticker = tokio::time::interval(writer_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            while !stop.load(Ordering::Acquire) {
+                ticker.tick().await;
+                let logical_ids = ids_for_logical_operation(ids.as_ref(), cursor, 1);
+                cursor = cursor.wrapping_add(writer_concurrency as u64);
+                match read_modify_write_once(&fixture, &logical_ids).await.disposition {
+                    AttemptDisposition::Committed => {
+                        commits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Write-write conflicts between paced writers are an
+                    // expected part of the pressure, not a failure.
+                    AttemptDisposition::Retryable => {}
+                    AttemptDisposition::Unexpected(_) => {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+
+    let next = Arc::new(AtomicU64::new(0));
+    let started = Instant::now();
+    let mut readers = Vec::with_capacity(reader_concurrency);
+    for _ in 0..reader_concurrency {
+        let fixture = fixture.clone();
+        let ids = ids.clone();
+        let next = next.clone();
+        readers.push(tokio::spawn(async move {
+            let mut metrics = BatchMetrics::default();
+            loop {
+                let logical_index = next.fetch_add(1, Ordering::Relaxed);
+                if logical_index >= operations {
+                    break;
+                }
+                let id = ids[usize::try_from(logical_index % ids.len() as u64)
+                    .expect("contended read index must fit in usize")];
+                let logical_started = Instant::now();
+                let mut attempts = 0u64;
+                let mut retries = 0u64;
+                loop {
+                    attempts += 1;
+                    if attempts > MAX_ATTEMPTS_PER_LOGICAL_OPERATION {
+                        metrics.attempts += attempts - 1;
+                        metrics.logical_retries += retries;
+                        metrics.record_unexpected(format!(
+                            "contended read {} exceeded max attempts {}",
+                            logical_index, MAX_ATTEMPTS_PER_LOGICAL_OPERATION
+                        ));
+                        return metrics;
+                    }
+                    let outcome = read_only_current_once(&fixture, id).await;
+                    match account_attempt_outcome(&mut metrics, outcome) {
+                        AttemptDisposition::Committed => {
+                            metrics.record_success(logical_started.elapsed(), attempts, retries);
+                            break;
+                        }
+                        AttemptDisposition::Retryable => {
+                            retries += 1;
+                            metrics.record_retryable();
+                        }
+                        AttemptDisposition::Unexpected(message) => {
+                            metrics.attempts += attempts;
+                            metrics.logical_retries += retries;
+                            metrics.record_unexpected(message);
+                            return metrics;
+                        }
+                    }
+                }
+            }
+            metrics
+        }));
+    }
+
+    let mut metrics = BatchMetrics::default();
+    for reader in readers {
+        match reader.await {
+            Ok(reader_metrics) => metrics.merge(reader_metrics),
+            Err(err) => metrics.record_unexpected(format!("contended reader join failed: {err:?}")),
+        }
+    }
+    let elapsed = started.elapsed();
+    stop_writers.store(true, Ordering::Release);
+    for writer in writers {
+        if let Err(err) = writer.await {
+            metrics.record_unexpected(format!("contended writer join failed: {err:?}"));
+        }
+    }
+
+    let commits = writer_commits.load(Ordering::Relaxed);
+    if commits == 0 {
+        metrics.record_unexpected("contended read completed without any concurrent writer commit");
+    }
+    let failures = writer_failures.load(Ordering::Relaxed);
+    if failures != 0 {
+        metrics.record_unexpected(format!(
+            "contended writers hit {failures} unexpected outcomes"
+        ));
+    }
+    let score_after = fixture.sum_scores(ids.as_ref()).await;
+    if score_after.checked_sub(score_before) != Some(commits) {
+        metrics.record_unexpected(format!(
+            "contended writer score invariant failed: before {score_before}, after {score_after}, commits {commits}"
+        ));
+    }
+
+    TimedBatch { metrics, elapsed }
+}
+
 fn validate_batch_spec(ids: &[Id], spec: BatchSpec) -> u64 {
     assert!(
         !ids.is_empty(),
