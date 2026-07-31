@@ -171,6 +171,9 @@ pub struct Chunk {
     pub statistics: ChunkStatistics,
     /// Shared tiered memory manager for eviction/promotion
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+    /// Shared wake signal to the background cleaner; allocation-pressure
+    /// paths request a pass instead of cleaning inline.
+    pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
 }
 
 impl Chunk {
@@ -282,6 +285,7 @@ impl Chunk {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
     ) -> Chunk {
         // Call new_with_base with base_addr=0 to use old allocation behavior
         Self::new_with_base(
@@ -293,6 +297,7 @@ impl Chunk {
             backup_storage,
             wal_storage,
             tiered_manager,
+            cleaner_wake,
         )
     }
 
@@ -305,6 +310,7 @@ impl Chunk {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+        cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -361,6 +367,7 @@ impl Chunk {
             gc_lock: Mutex::new(()),
             statistics: ChunkStatistics::new(),
             tiered_manager,
+            cleaner_wake,
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -442,6 +449,23 @@ impl Chunk {
             }
 
             let total_space = self.segs.len() * SEGMENT_SIZE;
+            // Trigger emergency cleaning one segment early: a moving combine
+            // needs at least one free segment as its destination, and hitting
+            // the exact wall leaves it nothing to relocate into. Allocation
+            // itself is refused only at the original wall, so usable capacity
+            // is unchanged.
+            let reserve_boundary = self.capacity.saturating_sub(2 * SEGMENT_SIZE);
+            if total_space >= reserve_boundary && !tried_gc {
+                if full_gc {
+                    warn!("Chunk {} near capacity, emergency full GC", self.id);
+                    let _ = Cleaner::clean(self, true, true);
+                } else {
+                    warn!("Chunk {} near capacity, emergency best effort GC", self.id);
+                    let _ = Cleaner::clean(self, true, false);
+                }
+                tried_gc = true;
+                continue;
+            }
             if total_space >= self.capacity - SEGMENT_SIZE {
                 if tried_gc {
                     debug!(
@@ -472,8 +496,12 @@ impl Chunk {
                 }
             }
             if self.allocator.meet_gc_threshold() {
-                debug!("Allocator meet GC threshold, will try partial GC");
-                let _ = Cleaner::clean(self, false, false);
+                // Wake the background cleaner instead of running a partial GC
+                // inline: a synchronous combine stalls this writer for a full
+                // collection cycle, and the cleaner's pressure pacing keeps
+                // reclamation tracking the fill rate once woken.
+                debug!("Allocator meet GC threshold, waking the cleaner");
+                self.cleaner_wake.request();
             }
 
             if head_slot
@@ -1437,6 +1465,8 @@ pub struct Chunks {
     pub list: Vec<Chunk>,
     pub statistics: TTLCache<Arc<SchemaStatistics>>,
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
+    /// Shared wake signal registered by the background cleaner thread.
+    pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
 }
 
 impl Chunks {
@@ -1536,6 +1566,7 @@ impl Chunks {
             "Creating chunks, count {} , chunk_size {} bytes",
             count, size
         );
+        let cleaner_wake = Arc::new(crate::ram::cleaner::CleanerWake::new());
         for i in 0..count {
             let chunk_base = global_base_addr + (i * chunk_size);
             let backup_storage = backup_storage
@@ -1553,6 +1584,7 @@ impl Chunks {
                 backup_storage,
                 wal_storage,
                 tiered_manager.clone(),
+                cleaner_wake.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
@@ -1560,6 +1592,7 @@ impl Chunks {
             list: chunks,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
             tiered_manager,
+            cleaner_wake,
         });
 
         if let Some(ref manager) = chunks_arc.tiered_manager {
