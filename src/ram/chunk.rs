@@ -1139,6 +1139,7 @@ impl Chunk {
             seg.id
         );
         seg.dead_space.fetch_add(size, Ordering::Relaxed);
+        seg.mark_dead_bit(addr);
         seg.note_dead_bytes_change();
     }
 
@@ -1291,6 +1292,13 @@ impl Chunk {
                 debug_assert!(entry_meta.entry_size % 8 == 0);
                 debug_assert!(entry_meta.entry_size >= ENTRY_HEAD_SIZE);
                 if entry_header.entry_type == EntryType::CELL {
+                        // Entries marked dead at mark_dead time need no header
+                        // read or index probe; this keeps collection cost
+                        // proportional to live entries instead of the whole
+                        // backlog.
+                        if seg.is_dead_at(entry_meta.entry_pos) {
+                            return None;
+                        }
                         trace!("Entry at {} is a cell", entry_meta.entry_pos);
                         let cell_header =
                             cell_header_from_entry_content_addr(entry_meta.body_pos);

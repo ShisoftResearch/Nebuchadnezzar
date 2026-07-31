@@ -96,6 +96,10 @@ pub struct Segment {
     pub append_header: AtomicUsize,
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
+    /// One bit per 8 bytes of segment space, set when the entry starting at
+    /// that offset dies. Collection consults the bitmap before probing the
+    /// cell index, so scan cost tracks live entries instead of backlog.
+    dead_bits: Vec<AtomicU64>,
     /// Generation counter for changes that introduce dead space (dead cells or tombstones)
     dead_bytes_generation: AtomicU64,
     /// Marker used by cleaners to skip segments that were cleaned without reclaiming space
@@ -197,6 +201,9 @@ impl Segment {
             append_header: AtomicUsize::new(buffer_ptr),
             dead_space: AtomicU32::new(0),
             tombstones: AtomicU32::new(0),
+            dead_bits: (0..SEGMENT_SIZE / 8 / 64)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
             dead_bytes_generation: AtomicU64::new(0),
             last_no_progress_clean_generation: AtomicU64::new(0),
             references: AtomicUsize::new(0),
@@ -322,6 +329,20 @@ impl Segment {
             bound: self.append_header(),
             cursor: self.addr,
         }
+    }
+
+    /// Marks the entry starting at `addr` dead in the per-segment bitmap.
+    #[inline]
+    pub fn mark_dead_bit(&self, addr: usize) {
+        let offset = (addr - self.addr) / 8;
+        self.dead_bits[offset / 64].fetch_or(1u64 << (offset % 64), Ordering::Release);
+    }
+
+    /// True when the entry starting at `addr` was marked dead.
+    #[inline]
+    pub fn is_dead_at(&self, addr: usize) -> bool {
+        let offset = (addr - self.addr) / 8;
+        self.dead_bits[offset / 64].load(Ordering::Acquire) & (1u64 << (offset % 64)) != 0
     }
 
     pub fn dead_space(&self) -> u32 {
