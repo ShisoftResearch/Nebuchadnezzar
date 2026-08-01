@@ -165,7 +165,7 @@ impl AsyncClient {
         if id.is_unit_id() {
             return Ok(0);
         }
-        match self.conshash.get_server_id(id.higher) {
+        match self.conshash.get_server_id(id.locality() as u64) {
             Some(n) => Ok(n),
             None => Err(RPCError::IOError(io::Error::new(
                 io::ErrorKind::NotFound,

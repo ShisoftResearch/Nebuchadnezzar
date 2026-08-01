@@ -112,7 +112,7 @@ fn install_occ_schema_with_dynamic(runtime: &Arc<DatabaseRuntime>, dynamic: bool
 
 fn counter_cell(schema_id: u32, id: Id, score: u64, name: &str) -> OwnedCell {
     let mut data = OwnedMap::new();
-    data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+    data.insert(&String::from("id"), OwnedValue::I64(id.bits() as i64));
     data.insert(&String::from("score"), OwnedValue::U64(score));
     data.insert(&String::from("name"), OwnedValue::String(name.to_string()));
     OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
@@ -121,7 +121,7 @@ fn counter_cell(schema_id: u32, id: Id, score: u64, name: &str) -> OwnedCell {
 fn ids_on_distinct_servers(server: &Arc<NebServer>) -> ((Id, u64), (Id, u64)) {
     let mut first = None;
     for partition in 1..8192u64 {
-        let id = Id::new(partition, 90_000 + partition);
+        let id = Id::from_parts(partition, 90_000 + partition);
         let server_id = server
             .get_server_id_by_id(&id)
             .expect("cluster should route every partition");
@@ -500,7 +500,7 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90114);
+    let cell_id = Id::from_parts(0, 90114);
 
     let mut initial = counter_cell(schema.id, cell_id, 1, "counter_cancel_success_seed");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -579,7 +579,7 @@ async fn abort_queued_behind_commit_reports_already_cleanup() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90115);
+    let cell_id = Id::from_parts(0, 90115);
 
     let mut initial = counter_cell(schema.id, cell_id, 1, "commit-abort-seed");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -757,7 +757,7 @@ async fn repeatable_full_read_uses_first_snapshot() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90101);
+    let cell_id = Id::from_parts(0, 90101);
 
     let mut initial = counter_cell(schema.id, cell_id, 0, "counter_full_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -788,7 +788,7 @@ async fn repeatable_missing_read_caches_absence() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let missing_id = Id::new(0, 90102);
+    let missing_id = Id::from_parts(0, 90102);
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
@@ -812,7 +812,7 @@ async fn repeatable_selected_and_head_share_full_snapshot() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90103);
+    let cell_id = Id::from_parts(0, 90103);
 
     let mut initial = counter_cell(schema.id, cell_id, 0, "counter_select_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -851,7 +851,7 @@ async fn repeatable_selected_empty_fields_return_full_cached_snapshot() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90104);
+    let cell_id = Id::from_parts(0, 90104);
 
     let mut initial = counter_cell(schema.id, cell_id, 0, "counter_select_all_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -888,7 +888,7 @@ async fn repeatable_selected_dynamic_fields_fall_back_to_map_lookup() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema_with_dynamic(&runtime, true);
-    let cell_id = Id::new(0, 90105);
+    let cell_id = Id::from_parts(0, 90105);
     let dynamic_field = hash_str("bonus");
     let missing_field = hash_str("bonus_missing");
 
@@ -927,7 +927,7 @@ async fn repeatable_absence_rejects_update_and_preserves_create_path() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let missing_id = Id::new(0, 90106);
+    let missing_id = Id::from_parts(0, 90106);
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
@@ -966,7 +966,7 @@ async fn repeatable_remove_then_write_replaces_existing_cell() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90107);
+    let cell_id = Id::from_parts(0, 90107);
 
     let mut initial = counter_cell(schema.id, cell_id, 1, "counter_replace_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -1011,7 +1011,7 @@ async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90108);
+    let cell_id = Id::from_parts(0, 90108);
 
     let mut initial = counter_cell(schema.id, cell_id, 2, "counter_blind_replace_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -1053,7 +1053,7 @@ async fn repeatable_blind_remove_missing_errors_immediately() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let missing_id = Id::new(0, 90109);
+    let missing_id = Id::from_parts(0, 90109);
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();
@@ -1083,8 +1083,8 @@ async fn occ_mixed_read_write_prepare_commit_updates_only_changed_cell() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let read_id = Id::new(0, 90110);
-    let write_id = Id::new(0, 90111);
+    let read_id = Id::from_parts(0, 90110);
+    let write_id = Id::from_parts(0, 90111);
 
     let mut read_seed = counter_cell(schema.id, read_id, 3, "counter_mixed_read_seed");
     runtime.chunks().write_cell(&mut read_seed).unwrap();
@@ -1133,7 +1133,7 @@ async fn repeatable_blind_update_after_clock_advance_uses_transaction_observatio
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90112);
+    let cell_id = Id::from_parts(0, 90112);
 
     let mut initial = counter_cell(schema.id, cell_id, 4, "counter_blind_clock_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -1175,7 +1175,7 @@ async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90113);
+    let cell_id = Id::from_parts(0, 90113);
 
     let mut initial = counter_cell(schema.id, cell_id, 0, "counter_lost_update_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -1257,7 +1257,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90130);
+    let cell_id = Id::from_parts(0, 90130);
 
     let mut initial = counter_cell(schema.id, cell_id, 0, "counter_shape_gated_initial");
     runtime.chunks().write_cell(&mut initial).unwrap();
@@ -1339,8 +1339,8 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let read_id = Id::new(0, 90131);
-    let write_id = Id::new(0, 90132);
+    let read_id = Id::from_parts(0, 90131);
+    let write_id = Id::from_parts(0, 90132);
 
     let mut read_seed = counter_cell(schema.id, read_id, 0, "counter_certify_read_seed");
     runtime.chunks().write_cell(&mut read_seed).unwrap();
@@ -1399,7 +1399,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90133);
+    let cell_id = Id::from_parts(0, 90133);
 
     // Seed version A.
     let mut version_a = counter_cell(schema.id, cell_id, 100, "counter_overwrite_a");
@@ -1469,7 +1469,7 @@ async fn head_pin_survives_concurrent_transactional_remove() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let cell_id = Id::new(0, 90134);
+    let cell_id = Id::from_parts(0, 90134);
 
     // Seed version A.
     let mut version_a = counter_cell(schema.id, cell_id, 42, "counter_remove_pin_seed");
@@ -1526,7 +1526,7 @@ async fn head_pin_caches_absence_across_concurrent_transactional_insert() {
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
     let schema = install_occ_schema(&runtime);
-    let missing_id = Id::new(0, 90135);
+    let missing_id = Id::from_parts(0, 90135);
 
     let txn = scoped_txn_client_for_database(address, group, group).await;
     let tid = txn.begin().await.unwrap().unwrap();

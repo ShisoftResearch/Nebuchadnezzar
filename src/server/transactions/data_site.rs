@@ -723,7 +723,7 @@ impl DataManager {
         // lives, defeating the point of pinning partial reads. The index guard
         // is released inside the call, before we take the transaction lock.
         let (addr, version) = self.chunks().cell_location_and_version(id).ok()?;
-        let chunk = self.chunks().locate_chunk_by_partition(id.higher);
+        let chunk = self.chunks().locate_chunk_by_partition(id.locality() as u64);
         let chunk_idx = chunk.id;
         let (segment_id, _seq_id) = chunk.get_cell_segment_info(addr);
 
@@ -1001,7 +1001,7 @@ impl DataManager {
                             let cell_ref = shared_cell.to_owned().into_ref();
                             (addr, cell_ref)
                         };
-                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
+                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.locality() as u64);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
                         let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
@@ -1083,7 +1083,7 @@ impl DataManager {
                             }
                             shared_cell.cell_guard().get_ptr()
                         };
-                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.higher);
+                        let chunk = self.chunks().locate_chunk_by_partition(cell_id.locality() as u64);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
                         let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
@@ -1384,16 +1384,16 @@ mod tests {
     fn pinned_read_set_records_and_returns_entry() {
         let mut set = PinnedReadSet::default();
         set.insert(
-            Id::new(0, 42),
+            Id::allocated(0, 0, 42),
             PinnedRead {
                 location: 0x1000,
                 version: 7,
             },
             None,
         );
-        assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.version), Some(7));
-        assert_eq!(set.get(&Id::new(0, 42)).map(|p| p.location), Some(0x1000));
-        assert!(set.get(&Id::new(0, 99)).is_none());
+        assert_eq!(set.get(&Id::allocated(0, 0, 42)).map(|p| p.version), Some(7));
+        assert_eq!(set.get(&Id::allocated(0, 0, 42)).map(|p| p.location), Some(0x1000));
+        assert!(set.get(&Id::allocated(0, 0, 99)).is_none());
         assert!(!set.is_empty());
         set.drain();
         assert!(set.is_empty());
@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn dropped_prepare_delay_handle_removes_its_registration() {
-        let id = Id::new(0, 99012);
+        let id = Id::allocated(0, 0, 99012);
         let tid = test_hlc(12, 31);
         let key = (tid.clone(), id);
         {
@@ -1536,7 +1536,7 @@ mod tests {
 
     fn counter_cell(schema_id: u32, id: Id, score: u64, name: &str) -> OwnedCell {
         let mut data = OwnedMap::new();
-        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("id"), OwnedValue::I64(id.bits() as i64));
         data.insert(&String::from("score"), OwnedValue::U64(score));
         data.insert(&String::from("name"), OwnedValue::String(name.to_string()));
         OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
@@ -1547,7 +1547,7 @@ mod tests {
     // version; `score` is a small, distinct marker used to tell versions apart.
     fn large_cell(schema_id: u32, id: Id, score: u64, marker: &str) -> OwnedCell {
         let mut data = OwnedMap::new();
-        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("id"), OwnedValue::I64(id.bits() as i64));
         data.insert(&String::from("score"), OwnedValue::U64(score));
         let payload = format!("{}-{}", marker, "x".repeat(8192));
         data.insert(&String::from("name"), OwnedValue::String(payload));
@@ -1651,7 +1651,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
-        let cell_id = Id::new(0, 99001);
+        let cell_id = Id::allocated(0, 0, 99001);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 3, 0);
         let tid = test_hlc(1, 11);
 
@@ -1683,7 +1683,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99021);
+        let cell_id = Id::allocated(0, 0, 99021);
 
         // Seed version A. Size no longer matters: a partial read (head with
         // pin=true) pins the read version regardless of cell size, so a small
@@ -1770,7 +1770,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99023);
+        let cell_id = Id::allocated(0, 0, 99023);
 
         // Seed a version, then pin it with a partial read (head with pin=true),
         // which creates a participant transaction holding a segment guard.
@@ -1838,7 +1838,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99022);
+        let cell_id = Id::allocated(0, 0, 99022);
 
         // Seed version A.
         let score_a: u64 = 300;
@@ -1902,7 +1902,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
-        let cell_id = Id::new(0, 99002);
+        let cell_id = Id::allocated(0, 0, 99002);
         seed_cell_version(&runtime, schema.id, cell_id, 4, 0);
         let tid = test_hlc(1, 12);
 
@@ -1934,7 +1934,7 @@ mod tests {
         let runtime = server.current_database();
         install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99003);
+        let cell_id = Id::allocated(0, 0, 99003);
         let tid = test_hlc(1, 13);
 
         let result = <DataManager as Service>::prepare(
@@ -1973,7 +1973,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99004);
+        let cell_id = Id::allocated(0, 0, 99004);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 5, 0);
         let tid = test_hlc(1, 14);
         let op = PrepareOp {
@@ -2029,8 +2029,8 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_a = Id::new(0, 99006);
-        let cell_b = Id::new(0, 99007);
+        let cell_a = Id::allocated(0, 0, 99006);
+        let cell_b = Id::allocated(0, 0, 99007);
         let version_a = seed_cell_version(&runtime, schema.id, cell_a, 7, 0);
         let version_b = seed_cell_version(&runtime, schema.id, cell_b, 8, 0);
         let tid = test_hlc(1, 15);
@@ -2113,7 +2113,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99008);
+        let cell_id = Id::allocated(0, 0, 99008);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 9, 0);
         let tid = test_hlc(1, 16);
         let original_coordinator = 16;
@@ -2182,8 +2182,8 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_a = Id::new(0, 99009);
-        let cell_b = Id::new(0, 99010);
+        let cell_a = Id::allocated(0, 0, 99009);
+        let cell_b = Id::allocated(0, 0, 99010);
         let version_a = seed_cell_version(&runtime, schema.id, cell_a, 10, 0);
         let version_b = seed_cell_version(&runtime, schema.id, cell_b, 11, 0);
         let tid = test_hlc(1, 17);
@@ -2271,7 +2271,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99011);
+        let cell_id = Id::allocated(0, 0, 99011);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 12, 0);
         let tid = test_hlc(1, 18);
         let coordinator_id = 18;
@@ -2355,7 +2355,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let client = data_site_client_for_database(address, group, group).await;
-        let cell_id = Id::new(0, 99005);
+        let cell_id = Id::allocated(0, 0, 99005);
         let version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
         let older_tid = test_hlc(1, 11);
         let younger_tid = test_hlc(1, 22);
@@ -2421,7 +2421,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 99011);
+        let cell_id = Id::allocated(0, 0, 99011);
         seed_cell_version(&runtime, schema.id, cell_id, 7, 0);
         let tid = test_hlc(1, 31);
 
@@ -2584,7 +2584,7 @@ mod tests {
         let group = "txn_data_site_commit_variant_validation";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
-        let affected_id = Id::new(0, 8101);
+        let affected_id = Id::allocated(0, 0, 8101);
 
         for ops in [vec![CommitOp::Read(affected_id, 1)], vec![CommitOp::None]] {
             let tid = manager.hlc.now();
@@ -2614,10 +2614,10 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let write_id = Id::new(0, 8201);
-        let read_id = Id::new(0, 8202);
-        let read_only_id = Id::new(0, 8203);
-        let unprepared = Id::new(0, 8204);
+        let write_id = Id::allocated(0, 0, 8201);
+        let read_id = Id::allocated(0, 0, 8202);
+        let read_only_id = Id::allocated(0, 0, 8203);
+        let unprepared = Id::allocated(0, 0, 8204);
         let write_version = seed_cell_version(&runtime, schema.id, write_id, 7, 0);
         let read_version = seed_cell_version(&runtime, schema.id, read_id, 9, 0);
         let read_only_version = seed_cell_version(&runtime, schema.id, read_only_id, 11, 0);
@@ -2835,7 +2835,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8204);
+        let cell_id = Id::allocated(0, 0, 8204);
         let initial_score = 13;
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
         let tid = manager.hlc.now();
@@ -2914,7 +2914,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8205);
+        let cell_id = Id::allocated(0, 0, 8205);
         let initial_score = 21;
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
         let t1 = test_hlc(1, 21);
@@ -3024,7 +3024,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8206);
+        let cell_id = Id::allocated(0, 0, 8206);
         let initial_score = 41;
         let committed_score = 55;
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
@@ -3116,7 +3116,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8207);
+        let cell_id = Id::allocated(0, 0, 8207);
         let initial_score = 61;
         let committed_score = 77;
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, initial_score, 0);
@@ -3244,7 +3244,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8210);
+        let cell_id = Id::allocated(0, 0, 8210);
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 0, 0);
         let t1 = test_hlc(1, 11);
         let t2 = test_hlc(1, 22);
@@ -3299,7 +3299,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8211);
+        let cell_id = Id::allocated(0, 0, 8211);
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 1, 0);
         let tid = test_hlc(1, 31);
 
@@ -3356,7 +3356,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8212);
+        let cell_id = Id::allocated(0, 0, 8212);
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 2, 0);
         let tid = test_hlc(1, 32);
 
@@ -3403,7 +3403,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8216);
+        let cell_id = Id::allocated(0, 0, 8216);
         let initial_version = seed_cell_version(&runtime, schema.id, cell_id, 6, 0);
         let tid = test_hlc(1, 35);
 
@@ -3464,7 +3464,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_id = Id::new(0, 8213);
+        let cell_id = Id::allocated(0, 0, 8213);
         let tid = test_hlc(1, 33);
 
         let prepare = prepare_ops_local(
@@ -3519,8 +3519,8 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_a = Id::new(0, 8214);
-        let cell_b = Id::new(0, 8215);
+        let cell_a = Id::allocated(0, 0, 8214);
+        let cell_b = Id::allocated(0, 0, 8215);
         let version_a = seed_cell_version(&runtime, schema.id, cell_a, 3, 0);
         let version_b = seed_cell_version(&runtime, schema.id, cell_b, 4, 0);
         let tid = test_hlc(1, 34);
@@ -3585,8 +3585,8 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_prepare_test_schema(&runtime);
         let manager = data_manager_for_database(&server, address, group).await;
-        let cell_a = Id::new(0, 8217);
-        let cell_b = Id::new(0, 8218);
+        let cell_a = Id::allocated(0, 0, 8217);
+        let cell_b = Id::allocated(0, 0, 8218);
         let version_a = seed_cell_version(&runtime, schema.id, cell_a, 15, 0);
         let version_b = seed_cell_version(&runtime, schema.id, cell_b, 25, 0);
         let tid = test_hlc(1, 36);
@@ -3695,7 +3695,7 @@ mod tests {
         let _txn = manager.get_or_create_transaction(&insert_tid);
 
         // Model prepare mid-flight: the meta exists (owner not yet acquired).
-        let insert_id = Id::new(0, 90501);
+        let insert_id = Id::allocated(0, 0, 90501);
         let meta_in_prepare = manager.cell_meta_mutex(&insert_id);
         assert!(
             manager.cells.get(&insert_id).is_some(),

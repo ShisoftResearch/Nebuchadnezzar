@@ -405,7 +405,7 @@ mod tests {
 
     fn make_key(n: u64) -> EntryKey {
         let feature = make_feature(n);
-        EntryKey::from_props(&Id::new(1, n), &feature, 100, 1)
+        EntryKey::from_props(&Id::from_parts(1, n), &feature, 100, 1)
     }
 
     fn make_scan_key(schema_id: u32, id: Id) -> EntryKey {
@@ -703,23 +703,23 @@ mod tests {
 
         storage::start_external_nodes_write_back(&client);
 
-        let tree_id = Id::new(901, 901);
+        let tree_id = Id::from_parts(901, 901);
         let schema_id = 1;
         let field = 777;
         let tree = RangedTree::create(&client, &tree_id).await;
 
         for value in 10..=12 {
-            assert!(tree.insert(&make_field_key(schema_id, field, value, Id::new(5, value))));
+            assert!(tree.insert(&make_field_key(schema_id, field, value, Id::from_parts(5, value))));
         }
         assert_eq!(tree.count(), 3);
 
-        let deleted = make_field_key(schema_id, field, 11, Id::new(5, 11));
+        let deleted = make_field_key(schema_id, field, 11, Id::from_parts(5, 11));
         assert!(tree.delete(&deleted));
         assert_eq!(tree.count(), 2);
 
         let start_key = EntryKey::for_schema_field_feature(schema_id, field, &make_feature(10));
         let end_key = EntryKey::from_props(
-            &Id::new(u64::MAX, u64::MAX),
+            &Id::from_parts(u64::MAX, u64::MAX),
             &make_feature(12),
             field,
             schema_id,
@@ -804,7 +804,7 @@ mod tests {
 
         storage::start_external_nodes_write_back(&client);
 
-        let tree_id = Id::new(902, 902);
+        let tree_id = Id::from_parts(902, 902);
         let tree = RangedTree::create(&client, &tree_id).await;
         let head_id = tree.head_id();
 
@@ -827,7 +827,7 @@ mod tests {
         let n = 1_024u64;
 
         for i in 0..n {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             assert!(tree.insert(&make_scan_key(schema_id, id)));
             assert!(tree.insert(&make_field_key(schema_id, field_id, i, id)));
         }
@@ -850,7 +850,7 @@ mod tests {
             }
         }
 
-        let expected: Vec<_> = (0..n).map(|i| Id::new(1, i)).collect();
+        let expected: Vec<_> = (0..n).map(|i| Id::from_parts(1, i)).collect();
         assert_eq!(seen, expected);
     }
 
@@ -863,13 +863,13 @@ mod tests {
         let n = 1_024u64;
 
         for i in 0..n {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             assert!(tree.insert(&make_scan_key(schema_1, id)));
             assert!(tree.insert(&make_field_key(schema_1, field_id, i, id)));
         }
 
         for i in 0..n {
-            let id = Id::new(2, i);
+            let id = Id::from_parts(2, i);
             assert!(tree.insert(&make_scan_key(schema_2, id)));
             assert!(tree.insert(&make_field_key(schema_2, field_id, i, id)));
         }
@@ -893,7 +893,7 @@ mod tests {
                 }
             }
 
-            let expected: Vec<_> = (0..n).map(|i| Id::new(higher, i)).collect();
+            let expected: Vec<_> = (0..n).map(|i| Id::from_parts(higher, i)).collect();
             assert_eq!(seen, expected, "schema {}", schema_id);
         }
     }

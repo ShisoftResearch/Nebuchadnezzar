@@ -94,7 +94,7 @@ fn test_write_throughput_with_wal_and_backup() {
             for i in start_id..end_id {
                 // Use thread_id as partition to distribute across chunks
                 let partition = (thread_id % CHUNK_COUNT) as u64;
-                let cell_id = Id::new(partition, i as u64);
+                let cell_id = Id::allocated(partition as u16, 0, i as u64);
 
                 // Create cell data
                 let mut data_map = OwnedMap::new();

@@ -44,7 +44,7 @@ fn test_string_array_basic() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
 
-    let id1 = Id::new(1, 1);
+    let id1 = Id::allocated(1, 0, 1);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -94,7 +94,7 @@ fn test_string_array_utf8() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
 
-    let id1 = Id::new(2, 2);
+    let id1 = Id::allocated(2, 0, 2);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -135,7 +135,7 @@ fn test_string_array_empty() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(empty_strings))
     );
 
-    let id1 = Id::new(3, 3);
+    let id1 = Id::allocated(3, 0, 3);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -182,7 +182,7 @@ fn test_string_array_long_strings() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
 
-    let id1 = Id::new(4, 4);
+    let id1 = Id::allocated(4, 0, 4);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -234,7 +234,7 @@ fn test_string_array_mixed() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
 
-    let id1 = Id::new(5, 5);
+    let id1 = Id::allocated(5, 0, 5);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -284,7 +284,7 @@ fn test_string_array_with_other_fields() {
         count: OwnedValue::U64(999)
     );
 
-    let id1 = Id::new(10, 10);
+    let id1 = Id::allocated(10, 0, 10);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -332,7 +332,7 @@ fn test_string_array_vector_size() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
 
-    let id1 = Id::new(11, 11);
+    let id1 = Id::allocated(11, 0, 11);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -373,7 +373,7 @@ fn test_string_array_single_element() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
 
-    let id1 = Id::new(12, 12);
+    let id1 = Id::allocated(12, 0, 12);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -422,7 +422,7 @@ fn test_string_array_with_empty_strings() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
 
-    let id1 = Id::new(13, 13);
+    let id1 = Id::allocated(13, 0, 13);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -483,7 +483,7 @@ fn test_string_array_in_nested_map() {
         ]))
     );
 
-    let id1 = Id::new(20, 20);
+    let id1 = Id::allocated(20, 0, 20);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
@@ -524,7 +524,7 @@ fn test_string_array_large_size() {
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
 
-    let id1 = Id::new(30, 30);
+    let id1 = Id::allocated(30, 0, 30);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,

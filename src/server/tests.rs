@@ -14,7 +14,7 @@ use tokio_stream::StreamExt;
 #[bench]
 fn cell_construct(b: &mut Bencher) {
     b.iter(|| {
-        let id = Id::new(0, 1);
+        let id = Id::from_parts(0, 1);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value["DATA"] = OwnedValue::U64(2);
         OwnedCell::new_with_id(1, &id, value);
@@ -23,7 +23,7 @@ fn cell_construct(b: &mut Bencher) {
 
 #[bench]
 fn cell_clone(b: &mut Bencher) {
-    let id = Id::new(0, 1);
+    let id = Id::from_parts(0, 1);
     let mut value = OwnedValue::Map(OwnedMap::new());
     value["DATA"] = OwnedValue::U64(2);
     let cell = OwnedCell::new_with_id(1, &id, value);
@@ -539,7 +539,7 @@ pub async fn smoke_test() {
 
     for i in 0..num {
         // intense upsert, half delete
-        let id = Id::new(1, i / 2);
+        let id = Id::from_parts(1, i / 2);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA] = OwnedValue::U64(i);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -555,7 +555,7 @@ pub async fn smoke_test() {
     }
 
     for i in 0..num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA] = OwnedValue::U64(i * 2);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -632,7 +632,7 @@ pub async fn smoke_test_parallel() {
         let client_clone = client.clone();
         info!("Schduling test task {}", i);
         tasks.push(tokio::spawn(async move {
-            let id = Id::new(1, i as u64);
+            let id = Id::from_parts(1, i as u64);
             let mut rng = SmallRng::from_rng(&mut rand::rng());
             for j in 0..num {
                 debug!("Smoke test i {}, j {}", i, j);
@@ -725,7 +725,7 @@ pub async fn txn() {
     for _ in 0..num {
         client
             .transaction(|txn| async move {
-                let id = Id::new(0, 1);
+                let id = Id::from_parts(0, 1);
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value[DATA] = OwnedValue::U64(2);
                 let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -798,7 +798,7 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
         let client_clone = client.clone();
         tasks.push(tokio::spawn(async move {
             for seq in 0..writes_per_task {
-                let id = Id::new(worker + 1, seq + 1);
+                let id = Id::from_parts(worker + 1, seq + 1);
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value[CONTENT] = OwnedValue::String(format!(
                     "shared-term worker-{worker} sequence-{seq} shared-term"
@@ -820,7 +820,7 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
         "concurrent indexed RPC writes should finish without stalling on unrelated index backlog",
     );
 
-    let sample = client.read_cell(Id::new(1, 1)).await.unwrap().unwrap();
+    let sample = client.read_cell(Id::from_parts(1, 1)).await.unwrap().unwrap();
     let content = sample.data[CONTENT].string().unwrap();
     assert!(content.contains("shared-term"));
 

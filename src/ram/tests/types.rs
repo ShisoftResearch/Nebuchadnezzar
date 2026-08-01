@@ -207,10 +207,7 @@ mod uuid {
     use crate::ram::types::Id;
     #[test]
     fn test() {
-        let test_data = vec![Id {
-            higher: 1,
-            lower: 2,
-        }];
+        let test_data = vec![Id::from_parts(1, 2)];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::id_io::type_size() as usize;
         let chunk_addr = chunk.segments()[0].addr;

@@ -189,7 +189,7 @@ pub struct TransactionManagerDeps {
 
 impl TransactionManagerDeps {
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
-        self.consh.get_server_id(id.higher)
+        self.consh.get_server_id(id.locality() as u64)
     }
 
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<RPCClient>> {
@@ -2062,7 +2062,7 @@ mod tests {
         score: u64,
     ) {
         let mut data = OwnedMap::new();
-        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("id"), OwnedValue::I64(id.bits() as i64));
         data.insert(&String::from("score"), OwnedValue::U64(score));
         data.insert(
             &String::from("name"),
@@ -2075,7 +2075,7 @@ mod tests {
 
     fn counter_cell(schema_id: u32, id: Id, score: u64) -> OwnedCell {
         let mut data = OwnedMap::new();
-        data.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+        data.insert(&String::from("id"), OwnedValue::I64(id.bits() as i64));
         data.insert(&String::from("score"), OwnedValue::U64(score));
         data.insert(
             &String::from("name"),
@@ -2086,7 +2086,7 @@ mod tests {
 
     #[test]
     fn changed_existing_replacement_builds_update_commit_op() {
-        let id = Id::new(0, 7001);
+        let id = Id::allocated(0, 0, 7001);
         let cell = counter_cell(1, id, 9);
         let commit_op = TransactionManager::commit_op_for_changed_data_obj(
             id,
@@ -2176,8 +2176,8 @@ mod tests {
         let group = "txn_manager_affected_objs_rw";
         let server = start_manager_test_server(address, group).await;
         let manager = server.current_database().txn_manager().unwrap().clone();
-        let read_id = Id::new(0, 7101);
-        let write_id = Id::new(0, 7102);
+        let read_id = Id::allocated(0, 0, 7101);
+        let write_id = Id::allocated(0, 0, 7102);
         let txn_mutex = Mutex::new(Transaction {
             data: HashMap::from([
                 (
@@ -2235,7 +2235,7 @@ mod tests {
         let group = "txn_manager_affected_objs_ro";
         let server = start_manager_test_server(address, group).await;
         let manager = server.current_database().txn_manager().unwrap().clone();
-        let read_id = Id::new(0, 7201);
+        let read_id = Id::allocated(0, 0, 7201);
         let txn_mutex = Mutex::new(Transaction {
             data: HashMap::from([(
                 read_id,
@@ -2278,7 +2278,7 @@ mod tests {
         let server = start_manager_test_server(address, group).await;
         let runtime = server.current_database();
         let schema = install_basic_schema(&runtime);
-        let cell_id = Id::new(0, 7301);
+        let cell_id = Id::allocated(0, 0, 7301);
 
         let mut seeded = counter_cell(schema.id, cell_id, 2);
         runtime.chunks().write_cell(&mut seeded).unwrap();
@@ -2326,7 +2326,7 @@ mod tests {
         let server = start_manager_test_server(address, group).await;
         let runtime = server.current_database();
         let schema = install_basic_schema(&runtime);
-        let cell_id = Id::new(0, 7302);
+        let cell_id = Id::allocated(0, 0, 7302);
 
         let mut seeded = counter_cell(schema.id, cell_id, 4);
         runtime.chunks().write_cell(&mut seeded).unwrap();
@@ -2371,7 +2371,7 @@ mod tests {
         let runtime = server.current_database();
         let schema = install_basic_schema(&runtime);
         let cell_ids = (0..8)
-            .map(|index| Id::new(0, (index + 1) as u64))
+            .map(|index| Id::allocated(0, 0, (index + 1) as u64))
             .collect::<Vec<_>>();
 
         for (index, cell_id) in cell_ids.iter().enumerate() {
@@ -2446,8 +2446,8 @@ mod tests {
         let default_runtime = server.current_database();
         let default_schema = install_basic_schema(&default_runtime);
         let analytics_schema = install_basic_schema(&analytics_runtime);
-        let default_cell = Id::new(0, 1001);
-        let analytics_cell = Id::new(0, 2001);
+        let default_cell = Id::allocated(0, 0, 1001);
+        let analytics_cell = Id::allocated(0, 0, 2001);
 
         seed_counter_cell(&default_runtime, default_schema.id, default_cell, 1).await;
         seed_counter_cell(&analytics_runtime, analytics_schema.id, analytics_cell, 1).await;
@@ -2539,7 +2539,7 @@ mod tests {
         let server = start_manager_test_server(address, group).await;
         let runtime = server.current_database();
         let schema = install_basic_schema(&runtime);
-        let hot_cell = Id::new(0, 3001);
+        let hot_cell = Id::allocated(0, 0, 3001);
         seed_counter_cell(&runtime, schema.id, hot_cell, 1).await;
 
         let txn_client = scoped_txn_client_for_database(address, group, group).await;
@@ -2558,7 +2558,7 @@ mod tests {
             }
 
             let mut data = OwnedMap::new();
-            data.insert(&String::from("id"), OwnedValue::I64(hot_cell.lower as i64));
+            data.insert(&String::from("id"), OwnedValue::I64(hot_cell.bits() as i64));
             data.insert(
                 &String::from("score"),
                 OwnedValue::U64((iteration + 2) as u64),
@@ -2632,7 +2632,7 @@ mod tests {
         let default_schema = install_basic_schema(&default_runtime);
         let analytics_schema = install_basic_schema(&analytics_runtime);
         for index in 0..24 {
-            let cell = Id::new(0, 4001 + index);
+            let cell = Id::allocated(0, 0, 4001 + index);
             seed_counter_cell(&default_runtime, default_schema.id, cell, 1).await;
             seed_counter_cell(&analytics_runtime, analytics_schema.id, cell, 1).await;
         }
@@ -2650,7 +2650,7 @@ mod tests {
                 // older writer's prepare failure. Using the same IDs in both databases
                 // exercises service scoping without introducing unrelated intra-database
                 // lock contention between pairs.
-                let hot_cell = Id::new(0, 4001 + (iteration / 2) as u64);
+                let hot_cell = Id::allocated(0, 0, 4001 + (iteration / 2) as u64);
                 let txn_client =
                     scoped_txn_client_for_database(&address, &group, &database_name).await;
                 let writer_tid = txn_client.begin().await.unwrap().unwrap();
@@ -2667,7 +2667,7 @@ mod tests {
                 }
 
                 let mut data = OwnedMap::new();
-                data.insert(&String::from("id"), OwnedValue::I64(hot_cell.lower as i64));
+                data.insert(&String::from("id"), OwnedValue::I64(hot_cell.bits() as i64));
                 data.insert(
                     &String::from("score"),
                     OwnedValue::U64((iteration + 10) as u64),

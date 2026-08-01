@@ -48,12 +48,12 @@ fn written_segment_class(chunks: &Chunks, id: &Id) -> SegmentClass {
         let loc = chunks.location_for_read(id).unwrap();
         *loc
     };
-    let chunk = chunks.locate_chunk_by_partition(id.higher);
+    let chunk = chunks.locate_chunk_by_partition(id.locality() as u64);
     chunk.locate_segment(addr).unwrap().segment_class()
 }
 
 fn written_segment_id(chunks: &Chunks, id: &Id) -> u64 {
-    let chunk = chunks.locate_chunk_by_partition(id.higher);
+    let chunk = chunks.locate_chunk_by_partition(id.locality() as u64);
     chunk.locate_segment(chunks.address_of(id)).unwrap().id
 }
 
@@ -133,11 +133,11 @@ fn blob_schema_regular_schema_accepts_exact_one_mib_boundary_and_rejects_next_ed
     );
     assert!(rejected_size > MAX_CELL_SIZE as usize);
 
-    let accepted = bytes_cell(schema.id, Id::new(42, 1), accepted_payload_len);
+    let accepted = bytes_cell(schema.id, Id::allocated(42, 0, 1), accepted_payload_len);
     let accepted_plan = accepted.plan_write(chunk).unwrap();
     assert_eq!(accepted_plan.total_size() as usize, MAX_CELL_SIZE as usize);
 
-    let rejected = bytes_cell(schema.id, Id::new(42, 2), rejected_payload_len);
+    let rejected = bytes_cell(schema.id, Id::allocated(42, 0, 2), rejected_payload_len);
 
     assert!(matches!(
         rejected.plan_write(chunk),
@@ -169,14 +169,14 @@ fn blob_schema_blob_schema_accepts_exact_two_mib_boundary_and_rejects_next_edge(
     );
     assert!(rejected_size > MAX_BLOB_CELL_SIZE as usize);
 
-    let accepted = bytes_cell(schema.id, Id::new(43, 1), accepted_payload_len);
+    let accepted = bytes_cell(schema.id, Id::allocated(43, 0, 1), accepted_payload_len);
     let accepted_plan = accepted.plan_write(chunk).unwrap();
     assert_eq!(
         accepted_plan.total_size() as usize,
         MAX_BLOB_CELL_SIZE as usize
     );
 
-    let rejected = bytes_cell(schema.id, Id::new(43, 2), rejected_payload_len);
+    let rejected = bytes_cell(schema.id, Id::allocated(43, 0, 2), rejected_payload_len);
     assert!(matches!(
         rejected.plan_write(chunk),
         Err(WriteError::CellIsTooLarge(actual_size)) if actual_size == rejected_size
@@ -198,8 +198,8 @@ fn blob_schema_blob_and_regular_cells_land_in_different_segment_classes() {
         .schemas
         .debug_only_new_schema(blob_schema.clone());
 
-    let regular_id = Id::new(44, 1);
-    let blob_id = Id::new(44, 2);
+    let regular_id = Id::allocated(44, 0, 1);
+    let blob_id = Id::allocated(44, 0, 2);
     let mut regular_cell = bytes_cell(regular_schema.id, regular_id, 1024);
     let mut blob_cell = bytes_cell(blob_schema.id, blob_id, 1024);
 
@@ -232,13 +232,13 @@ fn blob_schema_chunk_keeps_independent_blob_and_regular_heads() {
     assert_eq!(chunk.get_head_seg_id(), initial_regular_head);
     assert_eq!(initial_blob_head, None);
 
-    let regular_id = Id::new(46, 1);
+    let regular_id = Id::allocated(46, 0, 1);
     let mut regular_cell = bytes_cell(regular_schema.id, regular_id, 128);
     chunks.write_cell(&mut regular_cell).unwrap();
 
     assert_eq!(chunk.head_seg_ids_for_test(), (initial_regular_head, None));
 
-    let blob_id = Id::new(46, 2);
+    let blob_id = Id::allocated(46, 0, 2);
     let mut blob_cell = bytes_cell(blob_schema.id, blob_id, 128);
     chunks.write_cell(&mut blob_cell).unwrap();
 
@@ -265,7 +265,7 @@ fn blob_schema_active_blob_head_is_excluded_from_cleaner_candidates() {
         .schemas
         .debug_only_new_schema(blob_schema.clone());
 
-    let id = Id::new(48, 1);
+    let id = Id::allocated(48, 0, 1);
     let mut original = bytes_cell(blob_schema.id, id, 256 * 1024);
     chunks.write_cell(&mut original).unwrap();
 
@@ -306,7 +306,7 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
     let mut regular_segments = BTreeSet::new();
     let mut regular_cells = Vec::new();
     for index in 0..64_u64 {
-        let id = Id::new(4_900, 10_000 + index);
+        let id = Id::from_parts(4_900, 10_000 + index);
         let mut cell = bytes_cell(regular_schema.id, id, 512 * 1024);
         chunks.write_cell(&mut cell).unwrap();
 
@@ -343,7 +343,7 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
     let mut blob_segments = BTreeSet::new();
     let mut blob_cells = Vec::new();
     for index in 0..64_u64 {
-        let id = Id::new(5_000, 20_000 + index);
+        let id = Id::from_parts(5_000, 20_000 + index);
         let mut cell = bytes_cell(blob_schema.id, id, payload_len);
         chunks.write_cell(&mut cell).unwrap();
 
@@ -420,7 +420,7 @@ fn blob_schema_combine_preserves_blob_segment_class() {
     let mut blob_cells = Vec::new();
 
     for index in 0..32_u64 {
-        let id = Id::new(51, index);
+        let id = Id::allocated(51, 0, index);
         let mut cell = bytes_cell(blob_schema.id, id, payload_len);
         chunks.write_cell(&mut cell).unwrap();
 

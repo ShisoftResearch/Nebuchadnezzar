@@ -930,7 +930,7 @@ mod tests {
         data.insert("body", OwnedValue::String("world".to_string()));
         let cell = crate::ram::cell::OwnedCell::new_with_id(
             schema.id,
-            &Id::new(1, 1),
+            &Id::from_parts(1, 1),
             OwnedValue::Map(data),
         );
 
@@ -969,7 +969,7 @@ mod tests {
         data.insert("body", OwnedValue::String("world".to_string()));
         let cell = crate::ram::cell::OwnedCell::new_with_id(
             schema.id,
-            &Id::new(1, 2),
+            &Id::from_parts(1, 2),
             OwnedValue::Map(data),
         );
 

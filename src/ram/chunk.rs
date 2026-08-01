@@ -760,18 +760,18 @@ impl Chunk {
             debug_assert!(
                 self.validate_cell_location(
                     cell_loc,
-                    &format!("write_cell(hash={})", cell.header.hash)
+                    &format!("write_cell(hash={})", cell.header.id.bits())
                 ),
                 "Attempting to store invalid cell location 0x{:x} in cell index for hash {}",
                 cell_loc,
-                cell.header.hash
+                cell.header.id.bits()
             );
         }
 
-        match self.cell_index.try_insert_locked(cell.header.hash as usize) {
+        match self.cell_index.try_insert_locked(cell.header.id.bits() as usize) {
             Some(mut guard) => {
                 #[cfg(debug_assertions)]
-                self.assert_address_aligned_for_write(cell_loc, "write_cell", cell.header.hash);
+                self.assert_address_aligned_for_write(cell_loc, "write_cell", cell.header.id.bits());
 
                 *guard = cell_loc;
                 drop(guard);
@@ -786,7 +786,7 @@ impl Chunk {
     }
 
     fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let hash = cell.header.hash;
+        let hash = cell.header.id.bits();
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
         if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
@@ -826,7 +826,7 @@ impl Chunk {
     }
 
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let hash = cell.header.hash;
+        let hash = cell.header.id.bits();
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
         loop {
@@ -1121,8 +1121,7 @@ impl Chunk {
             pending_entry.addr,
             cell_seg.seq_id,
             cell_header.version,
-            cell_header.partition,
-            cell_header.hash,
+            cell_header.id,
         );
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
         pending_entry.seg.note_dead_bytes_change();
@@ -1347,7 +1346,7 @@ impl Chunk {
                             cell_header_from_entry_content_addr(entry_meta.body_pos);
                         trace!("Cell header read, id is {:?}", cell_header.id());
                         let expect = Some(entry_meta.entry_pos);
-                        let actual = chunk_index.get_from_mutex(&(cell_header.hash as usize));
+                        let actual = chunk_index.get_from_mutex(&(cell_header.id.bits() as usize));
                         if expect == actual {
                             trace!(
                                 "Cell entry {:?} is valid", cell_header.id()
@@ -1368,8 +1367,8 @@ impl Chunk {
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
                         let contains_seg = chunk_segs.contains_seq_id(tombstone.segment_seq_id);
                         if contains_seg {
-                            trace!("Tomestone entry {:?} - {:?} at seq_id {} is valid",
-                                   tombstone.partition, tombstone.hash, tombstone.segment_seq_id);
+                            trace!("Tomestone entry {:?} at seq_id {} is valid",
+                                   tombstone.id.bits(), tombstone.segment_seq_id);
                             return Some(Entry {
                                 meta: entry_meta,
                                 content: EntryContent::Tombstone(tombstone)
@@ -1722,7 +1721,7 @@ impl Chunks {
         return &self.list[chunk_id];
     }
     fn locate_chunk_by_key(&self, key: &Id) -> (&Chunk, u64) {
-        return (self.locate_chunk_by_partition(key.higher), key.lower);
+        return (self.locate_chunk_by_partition(key.locality() as u64), key.bits());
     }
     pub fn read_cell(&self, key: &Id) -> Result<SharedCell<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
@@ -1753,7 +1752,7 @@ impl Chunks {
         location: usize,
         fields: &[u64],
     ) -> Result<OwnedCell, ReadError> {
-        let chunk = self.locate_chunk_by_partition(key.higher);
+        let chunk = self.locate_chunk_by_partition(key.locality() as u64);
         return chunk.read_selected_at(location, fields, true);
     }
     pub fn read_partial_raw(
@@ -1772,7 +1771,7 @@ impl Chunks {
     // By-address header read: same as `head_cell` but pinned to `location`
     // instead of resolving through the cell index.
     pub fn head_at(&self, key: &Id, location: usize) -> Result<CellHeader, ReadError> {
-        let chunk = self.locate_chunk_by_partition(key.higher);
+        let chunk = self.locate_chunk_by_partition(key.locality() as u64);
         return chunk.head_at(location);
     }
     // Cheap capture of the current cell's raw address and version (index lookup
@@ -1786,11 +1785,11 @@ impl Chunks {
         chunk.location_for_read(hash)
     }
     pub fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let chunk = self.locate_chunk_by_partition(cell.header.partition);
+        let chunk = self.locate_chunk_by_partition(cell.header.id.locality() as u64);
         return chunk.write_cell(cell);
     }
     pub fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let chunk = self.locate_chunk_by_partition(cell.header.partition);
+        let chunk = self.locate_chunk_by_partition(cell.header.id.locality() as u64);
         return chunk.update_cell(cell);
     }
     pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<OwnedCell, WriteError>
@@ -1801,7 +1800,7 @@ impl Chunks {
         return chunk.update_cell_by(hash, update);
     }
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
-        let chunk = self.locate_chunk_by_partition(cell.header.partition);
+        let chunk = self.locate_chunk_by_partition(cell.header.id.locality() as u64);
         return chunk.upsert_cell(cell);
     }
     pub fn remove_cell(&self, key: &Id) -> Result<(), WriteError> {
@@ -2182,10 +2181,10 @@ mod tests {
     }
 
     fn payload_cell(schema_id: u32, id: &Id, payload_len: usize) -> OwnedCell {
-        let data: Vec<u8> = std::iter::repeat(id.lower as u8).take(payload_len).collect();
+        let data: Vec<u8> = std::iter::repeat(id.bits() as u8).take(payload_len).collect();
         OwnedCell {
             header: CellHeader::new(schema_id, id),
-            data: data_map_value!(id: id.lower as i32, data: data),
+            data: data_map_value!(id: id.bits() as i32, data: data),
         }
     }
 
@@ -2194,7 +2193,7 @@ mod tests {
         let _ = env_logger::try_init();
         let (chunks, schema) = setup_test_chunks();
 
-        let id = Id::new(1, 42);
+        let id = Id::allocated(1, 0, 42);
         let mut cell = payload_cell(schema.id, &id, 16);
         chunks.write_cell(&mut cell).unwrap();
 

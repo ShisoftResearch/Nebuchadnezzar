@@ -1680,7 +1680,7 @@ impl NebServer {
         &self,
     ) -> Result<Arc<ranged::tree::service::AsyncServiceClient>, bifrost::rpc::RPCError> {
         // Use a dummy ID to locate the local LSM tree service via consistent hashing
-        let dummy_id = Id::new(0, 1);
+        let dummy_id = Id::allocated(0, 0, 1);
         ranged::tree::service::locate_tree_server_from_conshash(
             &dummy_id,
             &self.consh,
@@ -2004,7 +2004,7 @@ impl NebServer {
     }
 
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
-        self.consh.get_server_id(id.higher)
+        self.consh.get_server_id(id.locality() as u64)
     }
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
         self.member_pool
@@ -2049,7 +2049,7 @@ pub async fn rpc_client_by_id(
     id: &Id,
     conshash: &Arc<ConsistentHashing>,
 ) -> Result<Arc<RPCClient>, RPCError> {
-    let server_id = conshash.get_server_id(id.higher).unwrap();
+    let server_id = conshash.get_server_id(id.locality() as u64).unwrap();
     let conshash = conshash.clone();
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |sid| conshash.to_server_name(sid))

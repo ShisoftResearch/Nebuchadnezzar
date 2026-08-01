@@ -550,10 +550,10 @@ mod tests {
         let mut shard1_docs = Vec::new();
         let mut shard2_docs = Vec::new();
         for i in 0..1000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if shard1
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == shard1.server_id)
                 .unwrap_or(false)
                 && shard1_docs.len() < 2
@@ -562,7 +562,7 @@ mod tests {
             }
             if shard2
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == shard2.server_id)
                 .unwrap_or(false)
                 && shard2_docs.len() < 2
@@ -680,15 +680,15 @@ mod tests {
         // Test 3: Verify merge_hits logic works correctly
         // Create hits with explicitly different IDs to test aggregation
         let test_hit1 = BM25Hit {
-            id: Id::new(1000, 1),
+            id: Id::from_parts(1000, 1),
             score: 1.5,
         };
         let test_hit2 = BM25Hit {
-            id: Id::new(1000, 2),
+            id: Id::from_parts(1000, 2),
             score: 2.0,
         };
         let test_hit3 = BM25Hit {
-            id: Id::new(1000, 1), // Duplicate of hit1
+            id: Id::from_parts(1000, 1), // Duplicate of hit1
             score: 0.5,
         };
         let combined_hits = vec![test_hit1, test_hit2, test_hit3];
@@ -699,7 +699,7 @@ mod tests {
             "Merged results should have 2 unique documents"
         );
         // Score for id (1000,1) should be 1.5 + 0.5 = 2.0
-        let hit_1_1 = merged.iter().find(|h| h.id == Id::new(1000, 1)).unwrap();
+        let hit_1_1 = merged.iter().find(|h| h.id == Id::from_parts(1000, 1)).unwrap();
         assert!(
             (hit_1_1.score - 2.0).abs() < 0.001,
             "Scores should be aggregated"
@@ -798,10 +798,10 @@ mod tests {
         // Find owned document
         let mut doc_id = None;
         for i in 0..1000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {

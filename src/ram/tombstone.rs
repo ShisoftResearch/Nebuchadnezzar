@@ -1,6 +1,7 @@
 use super::mem_cursor::*;
 use crate::ram::entry::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use dovahkiin::types::Id;
 use std::{
     io::{Cursor, Write},
     mem,
@@ -10,11 +11,10 @@ use std::{
 pub struct Tombstone {
     pub segment_seq_id: u64,
     pub version: u64,
-    pub partition: u64,
-    pub hash: u64,
+    pub id: Id,
 }
 
-pub const TOMBSTONE_SIZE: usize = 4 * mem::size_of::<u64>();
+pub const TOMBSTONE_SIZE: usize = 3 * mem::size_of::<u64>();
 pub const TOMBSTONE_SIZE_U32: u32 = TOMBSTONE_SIZE as u32;
 pub const TOMBSTONE_ENTRY_SIZE: usize = TOMBSTONE_SIZE + ENTRY_HEAD_SIZE;
 
@@ -34,8 +34,7 @@ impl Tombstone {
             {
                 write_u64(&mut cursor, self.segment_seq_id);
                 write_u64(&mut cursor, self.version);
-                write_u64(&mut cursor, self.partition);
-                write_u64(&mut cursor, self.hash);
+                write_u64(&mut cursor, self.id.bits());
             }
             release_cursor(cursor);
         })
@@ -46,8 +45,7 @@ impl Tombstone {
         let tombstone = Tombstone {
             segment_seq_id: cursor.read_u64::<Endian>().unwrap(),
             version: cursor.read_u64::<Endian>().unwrap(),
-            partition: cursor.read_u64::<Endian>().unwrap(),
-            hash: cursor.read_u64::<Endian>().unwrap(),
+            id: Id::from_bits(cursor.read_u64::<Endian>().unwrap()),
         };
         release_cursor(cursor);
         return tombstone;
@@ -65,18 +63,11 @@ impl Tombstone {
         .1
     }
 
-    pub fn put(
-        tombstone_addr: usize,
-        segment_seq_id: u64,
-        version: u64,
-        partition: u64,
-        hash: u64,
-    ) {
+    pub fn put(tombstone_addr: usize, segment_seq_id: u64, version: u64, id: Id) {
         Tombstone {
             segment_seq_id,
             version,
-            partition,
-            hash,
+            id,
         }
         .write(tombstone_addr)
     }

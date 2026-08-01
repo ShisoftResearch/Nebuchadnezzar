@@ -158,12 +158,11 @@ impl UndoLogEntry {
         let txn_id_len = txn_id_bytes.len() as u32;
 
         // Removed seg_id field (8 bytes)
-        let mut bytes = Vec::with_capacity(1 + 4 + txn_id_bytes.len() + 16 + 1 + 8 + 8 + 8 + 8);
+        let mut bytes = Vec::with_capacity(1 + 4 + txn_id_bytes.len() + 8 + 1 + 8 + 8 + 8 + 8);
         bytes.push(ENTRY_TYPE_UNDO);
         bytes.extend_from_slice(&txn_id_len.to_le_bytes());
         bytes.extend_from_slice(&txn_id_bytes);
-        bytes.extend_from_slice(&self.cell_id.higher.to_le_bytes());
-        bytes.extend_from_slice(&self.cell_id.lower.to_le_bytes());
+        bytes.extend_from_slice(&self.cell_id.bits().to_le_bytes());
         bytes.push(self.op_type as u8);
         bytes.extend_from_slice(&self.version.to_le_bytes());
         bytes.extend_from_slice(&self.chunk_id.to_le_bytes());
@@ -191,8 +190,8 @@ impl UndoLogEntry {
         }
 
         let txn_id_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        // Removed seg_id field: +1 for op_type, +8 for version, +8 for chunk_id, +8 for seq_id, +8 for cell_offset = 33 + 16 (cell_id) = 49
-        if bytes.len() < 5 + txn_id_len + 49 {
+        // Removed seg_id field: +1 for op_type, +8 for version, +8 for chunk_id, +8 for seq_id, +8 for cell_offset = 33 + 8 (cell_id) = 41
+        if bytes.len() < 5 + txn_id_len + 41 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Not enough bytes for full entry",
@@ -202,19 +201,7 @@ impl UndoLogEntry {
         let txn_id: TxnId = decode_txn_id(&bytes[5..5 + txn_id_len])?;
 
         let mut offset = 5 + txn_id_len;
-        let cell_id_higher = u64::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]);
-        offset += 8;
-
-        let cell_id_lower = u64::from_le_bytes([
+        let cell_id_bits = u64::from_le_bytes([
             bytes[offset],
             bytes[offset + 1],
             bytes[offset + 2],
@@ -284,10 +271,7 @@ impl UndoLogEntry {
         Ok((
             Self {
                 txn_id,
-                cell_id: Id {
-                    higher: cell_id_higher,
-                    lower: cell_id_lower,
-                },
+                cell_id: Id::from_bits(cell_id_bits),
                 op_type,
                 version,
                 chunk_id,
@@ -527,10 +511,10 @@ impl UndoLogger {
         );
 
         // Locate the chunk for this cell
-        let chunk = chunks.locate_chunk_by_partition(entry.cell_id.higher);
+        let chunk = chunks.locate_chunk_by_partition(entry.cell_id.locality() as u64);
 
         // Check if cell exists in cell_index
-        let hash = entry.cell_id.lower;
+        let hash = entry.cell_id.bits();
         if let Some(guard) = chunk.cell_index.lock(hash as usize) {
             let entry_addr = *guard; // This is the Entry address, not content address
             drop(guard); // Release lock early
@@ -694,7 +678,7 @@ impl UndoLogger {
         let cell_header = cell_header_from_entry_content_addr(content_addr);
 
         // Check if segment has been cleaned (hash=0 indicates freed/cleaned segment)
-        if cell_header.hash == 0 {
+        if cell_header.id.is_unit_id() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Cell at offset {} has been cleaned (hash=0)", cell_addr),
@@ -703,12 +687,12 @@ impl UndoLogger {
 
         // Verify cell identity if requested (skip for Remove operations)
         if verify {
-            if cell_header.hash != cell_id.lower {
+            if cell_header.id != *cell_id {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "Cell hash mismatch at offset: expected {}, found {}",
-                        cell_id.lower, cell_header.hash
+                        cell_id.bits(), cell_header.id.bits()
                     ),
                 ));
             }
@@ -726,7 +710,7 @@ impl UndoLogger {
 
         debug!(
             "Reading cell from offset: hash={}, version={}, schema={}, verify={}",
-            cell_header.hash, cell_header.version, cell_header.schema, verify
+            cell_header.id.bits(), cell_header.version, cell_header.schema, verify
         );
 
         // Get schema to deserialize data
@@ -953,19 +937,13 @@ mod tests {
     fn random_id() -> Id {
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        Id {
-            higher: now.as_secs(),
-            lower: now.subsec_nanos() as u64,
-        }
+        Id::allocated(0, 0, now.as_secs() * 1_000_000_000 + now.subsec_nanos() as u64)
     }
 
     #[test]
     fn test_undo_entry_serialization() {
         let txn_id = TxnId::default();
-        let cell_id = Id {
-            higher: 1,
-            lower: 2,
-        };
+        let cell_id = Id::allocated(1, 0, 2);
         // Removed seg_id parameter (was 100)
         let entry = UndoLogEntry::new(txn_id, cell_id, UndoOpType::Update, 5, 0, 1000, 50);
 
@@ -988,10 +966,7 @@ mod tests {
         let undo_log = UndoLogger::new(log_dir).unwrap();
 
         let txn_id = TxnId::default();
-        let cell_id = Id {
-            higher: 1,
-            lower: 2,
-        };
+        let cell_id = Id::allocated(1, 0, 2);
         // Removed seg_id parameter (was 100)
         let entry = UndoLogEntry::new(txn_id.clone(), cell_id, UndoOpType::Update, 3, 0, 1000, 50);
 
@@ -1015,10 +990,7 @@ mod tests {
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
         let txn_id = TxnId::default();
-        let cell_id = Id {
-            higher: 1,
-            lower: 2,
-        };
+        let cell_id = Id::allocated(1, 0, 2);
         // Removed seg_id parameter (was 100)
         let entry = UndoLogEntry::new(txn_id.clone(), cell_id, UndoOpType::Remove, 2, 0, 1000, 50);
 
@@ -1045,14 +1017,8 @@ mod tests {
         let undo_log = UndoLogger::new(log_dir).unwrap();
 
         let txn_id = TxnId::default();
-        let cell_id1 = Id {
-            higher: 1,
-            lower: 2,
-        };
-        let cell_id2 = Id {
-            higher: 3,
-            lower: 4,
-        };
+        let cell_id1 = Id::allocated(1, 0, 2);
+        let cell_id2 = Id::allocated(3, 0, 4);
 
         // Removed seg_id parameters
         let entry1 = UndoLogEntry::new(txn_id.clone(), cell_id1, UndoOpType::Write, 1, 0, 0, 0);
@@ -1087,10 +1053,7 @@ mod tests {
 
         // Transaction 1: Write a new cell
         let txn1 = TxnId::default();
-        let cell_id1 = Id {
-            higher: 100,
-            lower: 1,
-        };
+        let cell_id1 = Id::allocated(100, 0, 1);
         let entry1 = UndoLogEntry::new_write(txn1.clone(), cell_id1, 1);
         undo_log.write_undo_entry(entry1).unwrap();
 
@@ -1134,14 +1097,8 @@ mod tests {
 
         // Transaction that will be aborted
         let txn = TxnId::default();
-        let cell_id1 = Id {
-            higher: 200,
-            lower: 1,
-        };
-        let cell_id2 = Id {
-            higher: 200,
-            lower: 2,
-        };
+        let cell_id1 = Id::allocated(200, 0, 1);
+        let cell_id2 = Id::allocated(200, 0, 2);
 
         // Write, Update, and Remove operations
         let entry1 = UndoLogEntry::new_write(txn.clone(), cell_id1, 1);
@@ -1187,18 +1144,9 @@ mod tests {
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
         let txn_incomplete = TxnId::default();
-        let cell_id1 = Id {
-            higher: 300,
-            lower: 1,
-        };
-        let cell_id2 = Id {
-            higher: 300,
-            lower: 2,
-        };
-        let cell_id3 = Id {
-            higher: 300,
-            lower: 3,
-        };
+        let cell_id1 = Id::allocated(300, 0, 1);
+        let cell_id2 = Id::allocated(300, 0, 2);
+        let cell_id3 = Id::allocated(300, 0, 3);
 
         {
             // Simulate a transaction that didn't finish
@@ -1325,15 +1273,14 @@ mod tests {
 
         // Hand-assemble one undo entry, framed exactly like
         // UndoLogEntry::to_bytes() frames a new one:
-        // [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id.higher: u64]
-        // [cell_id.lower: u64][op_type: u8][version: u64][chunk_id: u64]
+        // [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: u64]
+        // [op_type: u8][version: u64][chunk_id: u64]
         // [seq_id: u64][cell_offset: u64]
         let mut bytes = Vec::new();
         bytes.push(ENTRY_TYPE_UNDO);
         bytes.extend_from_slice(&(old_txn_id_bytes.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&old_txn_id_bytes);
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // cell_id.higher
-        bytes.extend_from_slice(&2u64.to_le_bytes()); // cell_id.lower
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // cell_id
         bytes.push(UndoOpType::Write as u8);
         bytes.extend_from_slice(&1u64.to_le_bytes()); // version
         bytes.extend_from_slice(&0u64.to_le_bytes()); // chunk_id
@@ -1379,10 +1326,7 @@ mod tests {
             let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
             let entry = UndoLogEntry::new_write(
                 txn.clone(),
-                Id {
-                    higher: 1,
-                    lower: 1,
-                },
+                Id::allocated(1, 0, 1),
                 1,
             );
             undo_log.write_undo_entry(entry).unwrap();
@@ -1444,7 +1388,7 @@ mod tests {
 
                 // Skip to next entry (approximate)
                 match entry_type {
-                    1 => offset += 5 + txn_id_len + 49, // UNDO entry
+                    1 => offset += 5 + txn_id_len + 41, // UNDO entry
                     2 | 3 => offset += 5 + txn_id_len,  // COMMIT/ABORT marker
                     _ => break,
                 }
@@ -1485,10 +1429,7 @@ mod tests {
             // Transaction 1: Will be committed
             let entry1 = UndoLogEntry::new_write(
                 txn_committed.clone(),
-                Id {
-                    higher: 1,
-                    lower: 1,
-                },
+                Id::allocated(1, 0, 1),
                 1,
             );
             undo_log.write_undo_entry(entry1).unwrap();
@@ -1518,10 +1459,7 @@ mod tests {
             // Transaction 2: Will be aborted
             let entry2 = UndoLogEntry::new_write(
                 txn_aborted.clone(),
-                Id {
-                    higher: 2,
-                    lower: 1,
-                },
+                Id::allocated(2, 0, 1),
                 2,
             );
             undo_log.write_undo_entry(entry2).unwrap();
@@ -1540,10 +1478,7 @@ mod tests {
             // Transaction 3: Incomplete (crash)
             let entry3 = UndoLogEntry::new_write(
                 txn_incomplete.clone(),
-                Id {
-                    higher: 3,
-                    lower: 1,
-                },
+                Id::allocated(3, 0, 1),
                 3,
             );
             undo_log.write_undo_entry(entry3).unwrap();
@@ -1598,10 +1533,7 @@ mod tests {
             let txn = TxnId::default();
             let entry = UndoLogEntry::new_write(
                 txn.clone(),
-                Id {
-                    higher: i,
-                    lower: 1,
-                },
+                Id::from_parts(i, 1),
                 i,
             );
             undo_log.write_undo_entry(entry).unwrap();
@@ -1613,10 +1545,7 @@ mod tests {
             let txn = TxnId::default();
             let entry = UndoLogEntry::new_write(
                 txn.clone(),
-                Id {
-                    higher: i,
-                    lower: 1,
-                },
+                Id::from_parts(i, 1),
                 i,
             );
             undo_log.write_undo_entry(entry).unwrap();
@@ -1685,10 +1614,7 @@ mod tests {
                 let txn = TxnId::default();
                 let entry = UndoLogEntry::new_write(
                     txn.clone(),
-                    Id {
-                        higher: i,
-                        lower: 1,
-                    },
+                    Id::from_parts(i, 1),
                     i,
                 );
                 undo_log.write_undo_entry(entry).unwrap();
@@ -1698,10 +1624,7 @@ mod tests {
             // Write an incomplete transaction
             let entry_incomplete = UndoLogEntry::new_write(
                 txn_incomplete.clone(),
-                Id {
-                    higher: 999,
-                    lower: 1,
-                },
+                Id::allocated(999, 0, 1),
                 999,
             );
             undo_log.write_undo_entry(entry_incomplete).unwrap();
@@ -1748,10 +1671,7 @@ mod tests {
         // Write operation: version is the new cell's version
         let write_entry = UndoLogEntry::new_write(
             txn.clone(),
-            Id {
-                higher: 1,
-                lower: 1,
-            },
+            Id::allocated(1, 0, 1),
             10,
         );
         undo_log.write_undo_entry(write_entry).unwrap();
@@ -1760,10 +1680,7 @@ mod tests {
         // Removed seg_id parameter
         let update_entry = UndoLogEntry::new_restore(
             txn.clone(),
-            Id {
-                higher: 1,
-                lower: 2,
-            },
+            Id::allocated(1, 0, 2),
             UndoOpType::Update,
             20,   // old version
             0,    // chunk_id
@@ -1776,10 +1693,7 @@ mod tests {
         // Removed seg_id parameter
         let remove_entry = UndoLogEntry::new_restore(
             txn.clone(),
-            Id {
-                higher: 1,
-                lower: 3,
-            },
+            Id::allocated(1, 0, 3),
             UndoOpType::Remove,
             30,   // old version
             1,    // chunk_id
@@ -1844,10 +1758,7 @@ mod tests {
         schemas.debug_only_new_schema(schema);
         let meta = Arc::new(crate::server::ServerMeta { schemas });
 
-        let cell_id = Id {
-            higher: 1,
-            lower: 100,
-        };
+        let cell_id = Id::allocated(1, 0, 100);
 
         // Phase 1: Create cell and log it as incomplete transaction
         {
@@ -1959,10 +1870,7 @@ mod tests {
 
         println!("=== Step 1: Create initial cell ===");
         // Create a cell with initial version
-        let cell_id = Id {
-            higher: 1,
-            lower: 100,
-        };
+        let cell_id = Id::allocated(1, 0, 100);
         let mut cell = OwnedCell::new_with_id(
             0,
             &cell_id,
@@ -1973,10 +1881,10 @@ mod tests {
         println!("Created cell with version {}", initial_version);
 
         // Get cell location for undo log
-        let chunk = chunks.locate_chunk_by_partition(cell_id.higher);
+        let chunk = chunks.locate_chunk_by_partition(cell_id.locality() as u64);
         let (_cell_addr, seg_id, seq_id, cell_offset) = {
             // Scope the guard so it's dropped immediately after we extract the info
-            let guard = chunk.location_for_read(cell_id.lower).unwrap();
+            let guard = chunk.location_for_read(cell_id.bits()).unwrap();
             let addr = *guard;
             drop(guard); // Explicitly drop to release lock
 

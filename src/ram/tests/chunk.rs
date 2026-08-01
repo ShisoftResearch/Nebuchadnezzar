@@ -29,8 +29,8 @@ pub fn round_robin_segment() {
 pub fn cell_rw() {
     let _ = env_logger::try_init();
     info!("START");
-    let id1 = Id::new(1, 1);
-    let id2 = Id::new(1, 2);
+    let id1 = Id::allocated(1, 0, 1);
+    let id2 = Id::allocated(1, 0, 2);
     let fields = default_fields();
     let schema = Schema::new("dummy", None, fields, false, false);
     let mut data_map = OwnedMap::new();
@@ -159,7 +159,7 @@ pub fn cell_rw() {
 #[test]
 pub fn simple_cell_rw() {
     let _ = env_logger::try_init();
-    let id1 = Id::new(1, 1);
+    let id1 = Id::allocated(1, 0, 1);
     let fields = simple_fields();
     let schema = Schema::new("simple", None, fields, false, true);
     let data = OwnedValue::U64(128);
@@ -188,7 +188,7 @@ pub fn simple_cell_rw() {
 #[test]
 pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
     let _ = env_logger::try_init();
-    let tree_id = Id::new(11, 7);
+    let tree_id = Id::allocated(11, 0, 7);
     let schemas = LocalSchemasCache::new_local("");
     schemas.debug_only_new_schema(RANGED_TREE_SCHEMA.clone());
     let chunks = Chunks::new(
@@ -202,7 +202,7 @@ pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
     );
 
     let mut first_map = OwnedMap::new();
-    first_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::new(100, 1)));
+    first_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::allocated(100, 0, 1)));
     first_map.insert_key_id(*RANGED_TREE_MIGRATION_HASH, OwnedValue::Null);
     let mut tree_cell =
         OwnedCell::new_with_id(*RANGED_TREE_SCHEMA_ID, &tree_id, OwnedValue::Map(first_map));
@@ -214,7 +214,7 @@ pub fn ranged_tree_metadata_updates_do_not_refresh_chunk_statistics() {
     );
 
     let mut update_map = OwnedMap::new();
-    update_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::new(100, 2)));
+    update_map.insert_key_id(*RANGED_TREE_HEAD_HASH, OwnedValue::Id(Id::allocated(100, 0, 2)));
     update_map.insert_key_id(*RANGED_TREE_MIGRATION_HASH, OwnedValue::Null);
     let mut updated_tree_cell = OwnedCell::new_with_id(
         *RANGED_TREE_SCHEMA_ID,
@@ -253,7 +253,7 @@ pub fn ranged_btree_page_cells_do_not_build_chunk_statistics_when_forced() {
         &String::from("keys"),
         vec![SmallBytes::from_vec(vec![1u8; 32])].value(),
     );
-    let page_id = Id::new(12, 1);
+    let page_id = Id::allocated(12, 0, 1);
     let mut page_cell = OwnedCell::new_with_id(page_schema_id, &page_id, OwnedValue::Map(page_map));
     chunks.write_cell(&mut page_cell).unwrap();
 
@@ -288,7 +288,7 @@ pub fn sparse_sidecar_system_updates_do_not_refresh_chunk_statistics() {
         None,
     );
 
-    let cell_id = Id::new(100, 1);
+    let cell_id = Id::allocated(100, 0, 1);
     let mut sidecar_cell = create_test_cell(sidecar_schema_id, &cell_id, "fragment", 1);
     chunks.write_cell(&mut sidecar_cell).unwrap();
     assert_eq!(
@@ -330,7 +330,7 @@ pub fn sparse_sidecar_system_cells_do_not_build_chunk_statistics_when_forced() {
     );
 
     for offset in 0..16 {
-        let cell_id = Id::new(100, 1 + offset);
+        let cell_id = Id::from_parts(100, 1 + offset);
         let mut sidecar_cell =
             create_test_cell(sidecar_schema_id, &cell_id, "fragment", offset as u64);
         chunks.write_cell(&mut sidecar_cell).unwrap();
@@ -347,7 +347,7 @@ pub fn sparse_sidecar_system_cells_do_not_build_chunk_statistics_when_forced() {
 #[test]
 pub fn array_dyn_map() {
     let _ = env_logger::try_init();
-    let id1 = Id::new(1, 1);
+    let id1 = Id::allocated(1, 0, 1);
     let fields = Field::new_schema(vec![
         Field::new_unindexed("fixed", Type::U32),
         dyn_map_field("dynamic"),
@@ -382,7 +382,7 @@ pub fn array_dyn_map() {
 #[test]
 pub fn complex_cell_sel_read() {
     let _ = env_logger::try_init();
-    let id1 = Id::new(1, 1);
+    let id1 = Id::allocated(1, 0, 1);
     let fields = complex_fields();
     let schema = Schema::new("complex", None, fields, false, true);
     let schemas = LocalSchemasCache::new_local("");
@@ -747,7 +747,7 @@ fn test_wal_cleanup_after_archive() {
     );
 
     // Create a cell to write to the segment
-    let cell_id = Id::new(1, 1);
+    let cell_id = Id::allocated(1, 0, 1);
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(50));
@@ -858,7 +858,7 @@ fn test_wal_file_handle_properly_closed() {
     );
 
     // Write some data
-    let cell_id = Id::new(1, 1);
+    let cell_id = Id::allocated(1, 0, 1);
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(200));
     data_map.insert(&String::from("score"), OwnedValue::U64(60));
@@ -945,7 +945,7 @@ fn test_multiple_segments_wal_cleanup() {
     // Create enough data to fill multiple segments
     let mut cell_ids = Vec::new();
     for i in 0..100 {
-        let cell_id = Id::new(1, i);
+        let cell_id = Id::allocated(1, 0, i);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("score"), OwnedValue::U64(i));
@@ -1080,7 +1080,7 @@ fn test_archive_idempotency() {
     );
 
     // Write data
-    let cell_id = Id::new(1, 1);
+    let cell_id = Id::allocated(1, 0, 1);
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(300));
     data_map.insert(&String::from("score"), OwnedValue::U64(70));
@@ -1181,7 +1181,7 @@ fn test_multiple_segments_in_chunk() {
 
         let handle = thread::spawn(move || {
             for i in 0..cells_per_thread {
-                let cell_id = Id::new(1, thread_id * cells_per_thread + i);
+                let cell_id = Id::from_parts(1, thread_id * cells_per_thread + i);
                 let mut data_map = OwnedMap::new();
                 data_map.insert(
                     &String::from("id"),
@@ -1316,7 +1316,7 @@ fn test_concurrent_segment_allocation_and_cleanup() {
 
         let handle = thread::spawn(move || {
             for i in 0..cells_per_thread {
-                let cell_id = Id::new(1, thread_id * cells_per_thread + i);
+                let cell_id = Id::from_parts(1, thread_id * cells_per_thread + i);
                 let mut data_map = OwnedMap::new();
                 data_map.insert(
                     &String::from("id"),
@@ -1337,7 +1337,7 @@ fn test_concurrent_segment_allocation_and_cleanup() {
 
                         // Occasionally delete old cells to create dead space for cleaner
                         if i > 10 && i % 5 == 0 {
-                            let old_cell_id = Id::new(1, thread_id * cells_per_thread + (i - 10));
+                            let old_cell_id = Id::from_parts(1, thread_id * cells_per_thread + (i - 10));
                             let _ = chunks_clone.remove_cell(&old_cell_id);
                             trace!("Thread {} deleted cell {}", thread_id, i - 10);
                         }
@@ -1432,7 +1432,7 @@ fn create_test_cell(schema_id: u32, id: &Id, name: &str, score: u64) -> OwnedCel
 pub fn test_compare_version_and_update_cell_success() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
@@ -1465,7 +1465,7 @@ pub fn test_compare_version_and_update_cell_success() {
 pub fn test_compare_version_and_update_cell_version_mismatch() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
@@ -1490,7 +1490,7 @@ pub fn test_compare_version_and_update_cell_version_mismatch() {
 pub fn test_compare_version_and_update_cell_stale_version() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
@@ -1520,7 +1520,7 @@ pub fn test_compare_version_and_update_cell_stale_version() {
 pub fn test_compare_version_and_set_field_success() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
@@ -1559,7 +1559,7 @@ pub fn test_compare_version_and_set_field_success() {
 pub fn test_compare_version_sequential_updates() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "v1", 10);
@@ -1590,7 +1590,7 @@ pub fn test_compare_version_sequential_updates() {
 pub fn test_compare_version_optimistic_retry_pattern() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell with score=100
     let mut cell = create_test_cell(schema.id, &id, "Player", 100);
@@ -1637,7 +1637,7 @@ pub fn test_compare_version_optimistic_retry_pattern() {
 pub fn test_compare_version_and_set_field_version_mismatch() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Alice", 70);
@@ -1678,7 +1678,7 @@ pub fn test_compare_version_and_update_cell_concurrent_atomicity() {
     use std::thread;
 
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Initial", 0);
@@ -1762,7 +1762,7 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
     use std::thread;
 
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 1);
+    let id = Id::allocated(1, 0, 1);
 
     // Write initial cell
     let mut cell = create_test_cell(schema.id, &id, "Initial", 0);
@@ -1844,7 +1844,7 @@ pub fn test_compare_version_and_set_field_concurrent_atomicity() {
 pub fn test_compare_version_and_update_cell_nonexistent_cell() {
     let _ = env_logger::try_init();
     let (chunks, schema) = setup_test_chunks();
-    let id = Id::new(1, 999); // Non-existent cell
+    let id = Id::allocated(1, 0, 999); // Non-existent cell
 
     let mut cell = create_test_cell(schema.id, &id, "Test", 70);
     let result = chunks.compare_version_and_update_cell(&id, 1, &mut cell);
@@ -1860,7 +1860,7 @@ pub fn test_compare_version_and_update_cell_nonexistent_cell() {
 pub fn test_compare_version_and_set_field_nonexistent_cell() {
     let _ = env_logger::try_init();
     let (chunks, _schema) = setup_test_chunks();
-    let id = Id::new(1, 999); // Non-existent cell
+    let id = Id::allocated(1, 0, 999); // Non-existent cell
 
     let score_hash = hash_str("score");
     let result = chunks.compare_version_and_set_field(&id, 1, score_hash, OwnedValue::U64(100));

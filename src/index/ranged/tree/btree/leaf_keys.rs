@@ -147,10 +147,7 @@ impl PackedKeys {
             let sfx = &self.suffixes[index * self.width..(index + 1) * self.width];
             id_bytes[..].copy_from_slice(&sfx[off..off + ID_SIZE]);
         }
-        Id {
-            higher: u64::from_be_bytes(id_bytes[..8].try_into().unwrap()),
-            lower: u64::from_be_bytes(id_bytes[8..].try_into().unwrap()),
-        }
+        Id::from_bits(u64::from_be_bytes(id_bytes))
     }
 }
 
@@ -411,7 +408,7 @@ mod tests {
     use rand::prelude::*;
 
     fn key_of(h: u64, l: u64) -> EntryKey {
-        EntryKey::from_id(&Id::new(h, l))
+        EntryKey::from_id(&Id::allocated(h as u16, 0, l))
     }
 
     #[test]

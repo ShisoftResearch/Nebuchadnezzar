@@ -706,8 +706,8 @@ fn materialize_sqlite_dataset(rows: &[AlignRow]) -> Connection {
     for row in rows {
         insert
             .execute(params![
-                row.id.higher as i64,
-                row.id.lower as i64,
+                row.id.locality() as u64 as i64,
+                row.id.bits() as i64,
                 row.range_a as i64,
                 row.range_b as i64,
                 row.hash_value as i64,
@@ -904,7 +904,7 @@ fn run_sqlite_query(sqlite: &Connection, sql_plan: &SqlPlan) -> Vec<Id> {
     let mut stmt = sqlite.prepare(&sql_plan.sql).unwrap();
     let rows = stmt
         .query_map([], |row| {
-            Ok(Id::new(
+            Ok(Id::from_parts(
                 row.get::<_, i64>(0)? as u64,
                 row.get::<_, i64>(1)? as u64,
             ))
@@ -921,7 +921,7 @@ fn run_sqlite_projection_query(
     let mut stmt = sqlite.prepare(&sql_plan.sql).unwrap();
     let rows = stmt
         .query_map([], |row| {
-            let id = Id::new(row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64);
+            let id = Id::from_parts(row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64);
             let columns = query
                 .projection
                 .iter()
@@ -1223,7 +1223,7 @@ fn edge_case_dataset() -> AlignDataset {
         name: "fixed_edge_cases".to_string(),
         rows: vec![
             AlignRow {
-                id: Id::new(7, 1),
+                id: Id::from_parts(7, 1),
                 range_a: 1,
                 range_b: 7,
                 hash_value: 10,
@@ -1231,7 +1231,7 @@ fn edge_case_dataset() -> AlignDataset {
                 nullable_value: None,
             },
             AlignRow {
-                id: Id::new(7, 2),
+                id: Id::from_parts(7, 2),
                 range_a: 1,
                 range_b: 4,
                 hash_value: 10,
@@ -1239,7 +1239,7 @@ fn edge_case_dataset() -> AlignDataset {
                 nullable_value: Some(8),
             },
             AlignRow {
-                id: Id::new(7, 3),
+                id: Id::from_parts(7, 3),
                 range_a: 2,
                 range_b: 9,
                 hash_value: 11,
@@ -1247,7 +1247,7 @@ fn edge_case_dataset() -> AlignDataset {
                 nullable_value: Some(1),
             },
             AlignRow {
-                id: Id::new(7, 4),
+                id: Id::from_parts(7, 4),
                 range_a: 5,
                 range_b: 2,
                 hash_value: 12,
@@ -1255,7 +1255,7 @@ fn edge_case_dataset() -> AlignDataset {
                 nullable_value: None,
             },
             AlignRow {
-                id: Id::new(7, 5),
+                id: Id::from_parts(7, 5),
                 range_a: 5,
                 range_b: 2,
                 hash_value: 13,
@@ -1263,7 +1263,7 @@ fn edge_case_dataset() -> AlignDataset {
                 nullable_value: Some(5),
             },
             AlignRow {
-                id: Id::new(7, 6),
+                id: Id::from_parts(7, 6),
                 range_a: 8,
                 range_b: 8,
                 hash_value: 13,
@@ -1271,7 +1271,7 @@ fn edge_case_dataset() -> AlignDataset {
                 nullable_value: Some(13),
             },
             AlignRow {
-                id: Id::new(7, 7),
+                id: Id::from_parts(7, 7),
                 range_a: 9,
                 range_b: 3,
                 hash_value: 14,
@@ -1279,7 +1279,7 @@ fn edge_case_dataset() -> AlignDataset {
                 nullable_value: None,
             },
             AlignRow {
-                id: Id::new(7, 8),
+                id: Id::from_parts(7, 8),
                 range_a: 9,
                 range_b: 5,
                 hash_value: 15,
@@ -1295,7 +1295,7 @@ fn duplicate_heavy_dataset() -> AlignDataset {
         name: "fixed_duplicate_heavy".to_string(),
         rows: vec![
             AlignRow {
-                id: Id::new(8, 10),
+                id: Id::from_parts(8, 10),
                 range_a: 3,
                 range_b: 4,
                 hash_value: 20,
@@ -1303,7 +1303,7 @@ fn duplicate_heavy_dataset() -> AlignDataset {
                 nullable_value: None,
             },
             AlignRow {
-                id: Id::new(8, 11),
+                id: Id::from_parts(8, 11),
                 range_a: 3,
                 range_b: 4,
                 hash_value: 20,
@@ -1311,7 +1311,7 @@ fn duplicate_heavy_dataset() -> AlignDataset {
                 nullable_value: Some(7),
             },
             AlignRow {
-                id: Id::new(8, 12),
+                id: Id::from_parts(8, 12),
                 range_a: 3,
                 range_b: 4,
                 hash_value: 21,
@@ -1319,7 +1319,7 @@ fn duplicate_heavy_dataset() -> AlignDataset {
                 nullable_value: None,
             },
             AlignRow {
-                id: Id::new(8, 13),
+                id: Id::from_parts(8, 13),
                 range_a: 6,
                 range_b: 4,
                 hash_value: 22,
@@ -1327,7 +1327,7 @@ fn duplicate_heavy_dataset() -> AlignDataset {
                 nullable_value: Some(9),
             },
             AlignRow {
-                id: Id::new(8, 14),
+                id: Id::from_parts(8, 14),
                 range_a: 6,
                 range_b: 7,
                 hash_value: 23,
@@ -1335,7 +1335,7 @@ fn duplicate_heavy_dataset() -> AlignDataset {
                 nullable_value: None,
             },
             AlignRow {
-                id: Id::new(8, 15),
+                id: Id::from_parts(8, 15),
                 range_a: 6,
                 range_b: 7,
                 hash_value: 23,
@@ -1343,7 +1343,7 @@ fn duplicate_heavy_dataset() -> AlignDataset {
                 nullable_value: Some(3),
             },
             AlignRow {
-                id: Id::new(8, 16),
+                id: Id::from_parts(8, 16),
                 range_a: 8,
                 range_b: 9,
                 hash_value: 24,
@@ -1357,7 +1357,7 @@ fn duplicate_heavy_dataset() -> AlignDataset {
 fn interior_range_dataset() -> AlignDataset {
     let rows = (0..96u64)
         .map(|i| AlignRow {
-            id: Id::new(9, i),
+            id: Id::from_parts(9, i),
             range_a: i,
             range_b: (i * 7) % 23,
             hash_value: (i % 9) + 1,
@@ -1375,7 +1375,7 @@ fn generated_dataset(seed: u64, row_count: usize) -> AlignDataset {
     let mut rng = SmallRng::seed_from_u64(seed);
     let rows = (0..row_count)
         .map(|i| AlignRow {
-            id: Id::new(seed, i as u64),
+            id: Id::from_parts(seed, i as u64),
             range_a: rng.gen_range(0..24),
             range_b: rng.gen_range(0..32),
             hash_value: rng.gen_range(1..13),

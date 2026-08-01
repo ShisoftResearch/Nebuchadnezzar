@@ -14,7 +14,7 @@ use std::slice::Iter;
 use std::slice::SliceIndex;
 
 type InnerSlice = [u8; KEY_SIZE];
-pub const ID_SIZE: usize = 16;
+pub const ID_SIZE: usize = 8;
 pub const MIN_FEATURE: Feature = [0; FEATURE_SIZE];
 pub const MAX_FEATURE: Feature = [!0; FEATURE_SIZE];
 
@@ -30,8 +30,7 @@ impl EntryKey {
         cursor.write_u32::<BigEndian>(schema_id).unwrap();
         cursor.write_u32::<BigEndian>(field as u32).unwrap();
         cursor.write(feature).unwrap();
-        cursor.write_u64::<BigEndian>(id.higher).unwrap();
-        cursor.write_u64::<BigEndian>(id.lower).unwrap();
+        cursor.write_u64::<BigEndian>(id.bits()).unwrap();
         key
     }
 
@@ -86,7 +85,7 @@ impl EntryKey {
     }
     pub fn id(&self) -> Id {
         let mut id_cursor = Cursor::new(&self.slice[KEY_SIZE - ID_SIZE..]);
-        let id = Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
+        let id = Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 64 bits
         if cfg!(debug_assertions) && id.is_unit_id() {
             warn!("id is unit id from key {:?}", self.slice)
         }

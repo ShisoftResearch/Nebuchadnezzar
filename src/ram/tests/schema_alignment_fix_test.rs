@@ -8,12 +8,12 @@ fn test_schema_alignment_fix() {
 
     // Create the problematic wikidata_link schema (44 bytes of fields)
     let fields = Field::new_schema(vec![
-        Field::new_unindexed("_inbound", Type::Id),  // 16 bytes
-        Field::new_unindexed("_outbound", Type::Id), // 16 bytes
+        Field::new_unindexed("_inbound", Type::Id),  // 8 bytes
+        Field::new_unindexed("_outbound", Type::Id), // 8 bytes
         Field::new_unindexed("statement_id", Type::String), // 4 bytes (u32 ptr)
         Field::new_unindexed("property_id", Type::String), // 4 bytes (u32 ptr)
         Field::new_unindexed("literal_id", Type::String), // 4 bytes (u32 ptr)
-                                                     // Total: 44 bytes
+                                                     // Total: 28 bytes
     ]);
 
     let schema = Schema::new("wikidata_link", None, fields, false, false);
@@ -25,10 +25,10 @@ fn test_schema_alignment_fix() {
         schema.static_bound % 8
     );
 
-    // CRITICAL: Must be 48 (aligned), not 44 (misaligned)
+    // CRITICAL: Must be 32 (aligned), not 28 (misaligned)
     assert_eq!(
-        schema.static_bound, 48,
-        "Schema static_bound should be 48 (aligned from 44), got {}",
+        schema.static_bound, 32,
+        "Schema static_bound should be 32 (aligned from 28), got {}",
         schema.static_bound
     );
 
@@ -39,7 +39,7 @@ fn test_schema_alignment_fix() {
     );
 
     println!("✓ Schema is properly 8-byte aligned");
-    println!("✓ Fix confirmed: 44 → 48 bytes");
+    println!("✓ Fix confirmed: 28 → 32 bytes");
 }
 
 #[test]
@@ -47,9 +47,9 @@ fn test_id_list_schema_alignment() {
     println!("\n=== Testing _NEB_ID_LIST Schema Alignment ===");
 
     let fields = Field::new_schema(vec![
-        Field::new_unindexed("_next", Type::Id), // 16 bytes
+        Field::new_unindexed("_next", Type::Id), // 8 bytes
         Field::new_unindexed_array("_list", Type::Id), // 4 bytes (u32 ptr)
-                                                 // Total: 20 bytes
+                                                 // Total: 12 bytes
     ]);
 
     let schema = Schema::new("_NEB_ID_LIST", None, fields, false, false);
@@ -61,11 +61,11 @@ fn test_id_list_schema_alignment() {
         schema.static_bound % 8
     );
 
-    // Should be 24 (aligned), not 20 (misaligned)
-    assert_eq!(schema.static_bound, 24);
+    // Should be 16 (aligned), not 12 (misaligned)
+    assert_eq!(schema.static_bound, 16);
     assert_eq!(schema.static_bound % 8, 0);
 
-    println!("✓ ID_LIST schema properly aligned: 20 → 24 bytes");
+    println!("✓ ID_LIST schema properly aligned: 12 → 16 bytes");
 }
 
 #[test]
