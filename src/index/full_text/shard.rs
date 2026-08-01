@@ -170,12 +170,25 @@ struct SegmentedPostingList {
 }
 
 
-/// Phase-1 interim id composition for full-text internals: a hashed-class
-/// id whose locality bits carry the document partition so posting lists
-/// stay chunk-co-located with their documents across recovery.
-/// TODO(compact-id phase 2): migrate to allocated internal ids per
-/// docs/superpowers/specs/2026-08-02-compact-cell-id-design.md — this
-/// population exceeds the hashed-class collision budget.
+/// Hashed-class id composition for full-text internals: the locality
+/// bits carry the document partition so posting lists stay
+/// chunk-co-located with their documents across recovery.
+///
+/// Assessment (compact-id phase 3): the two populations differ.
+/// - Head segment ids are content-addressed — `iterate` recomputes
+///   them from (schema, field, term, 0) with no stored pointer — so
+///   they MUST stay hashed-class; an allocated id would need a
+///   term->id lookup table that itself needs deterministic ids.
+/// - Overflow segment ids are only ever reached through the stored
+///   `next` chain, so they are eligible for allocated-class ids, which
+///   would remove the 48-bit birthday-collision exposure of
+///   `random_segment_id` on very large indexes. Blocked on: `append`
+///   is synchronous under a chunk cell lock and `IdAllocator` (async
+///   refill, lives on DatabaseRuntime) is not reachable from
+///   chunk-level code. Migration needs a sync `try_take_*` fast path
+///   (plain fetch_add against the warm block) plumbed into the shard,
+///   with fallback to the current hashed composition when the block is
+///   exhausted.
 fn compose_partitioned_hash_id(partition: u64, hash: u64) -> Id {
     use dovahkiin::types::custom_types::id::{ID_LOCALITY_MASK, ID_LOCALITY_SHIFT};
     let tag = 1u64 << 63;
