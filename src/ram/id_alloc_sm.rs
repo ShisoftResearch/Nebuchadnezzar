@@ -73,6 +73,20 @@ raft_state_machine! {
 
 impl StateMachineCmds for IdAllocSM {
     fn claim_origin(&mut self, holder: u64) -> BoxFuture<'_, Result<(u16, u64), String>> {
+        // Idempotent per holder: a restarting server re-claims the slot it
+        // already owns (epoch bump fences its previous incarnation) instead
+        // of burning a fresh slot every boot — 4096 restarts must not
+        // exhaust the origin space.
+        if let Some((&slot, _)) = self
+            .state
+            .origins
+            .iter()
+            .find(|(_, entry)| entry.holder == holder && !entry.retired && entry.epoch > 0)
+        {
+            let entry = self.state.origins.get_mut(&slot).expect("slot just found");
+            entry.epoch += 1;
+            return future::ready(Ok((slot, entry.epoch))).boxed();
+        }
         let result = loop {
             let slot = self.state.next_slot;
             if slot as u64 > ID_ORIGIN_MASK {
@@ -214,6 +228,24 @@ mod tests {
         let (a, _) = block_on(sm.claim_origin(1)).unwrap();
         let (b, _) = block_on(sm.claim_origin(2)).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn reclaim_by_same_holder_reuses_slot_with_epoch_bump() {
+        let mut sm = IdAllocSM::new(5);
+        let (slot, epoch) = block_on(sm.claim_origin(77)).unwrap();
+        // A restart claims again with the same holder id: same slot, higher
+        // epoch (fencing the previous incarnation), no slot burn.
+        let (slot2, epoch2) = block_on(sm.claim_origin(77)).unwrap();
+        assert_eq!(slot, slot2);
+        assert!(epoch2 > epoch);
+        // Leases continue above the prior lease end.
+        let lease = block_on(sm.lease_block(slot, epoch2, 0, 1 << 20)).unwrap();
+        assert_eq!(lease.start, 0);
+        let (slot3, epoch3) = block_on(sm.claim_origin(77)).unwrap();
+        assert_eq!(slot, slot3);
+        let lease2 = block_on(sm.lease_block(slot, epoch3, 0, 1 << 20)).unwrap();
+        assert_eq!(lease2.start, 1 << 20);
     }
 
     #[test]

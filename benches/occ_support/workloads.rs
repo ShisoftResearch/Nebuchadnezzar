@@ -1312,7 +1312,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "globally unique ids")]
     fn duplicate_input_ids_are_rejected_before_timing() {
-        let id = Id::new(1, 1);
+        let id = Id::from_parts(1, 1);
         let spec = BatchSpec {
             successes: 1,
             concurrency: 1,
@@ -1331,7 +1331,7 @@ mod tests {
             cells_per_txn: 2,
         };
 
-        let _ = validate_batch_spec(&[Id::new(1, 1), Id::new(2, 2)], spec);
+        let _ = validate_batch_spec(&[Id::from_parts(1, 1), Id::from_parts(2, 2)], spec);
     }
 
     #[test]

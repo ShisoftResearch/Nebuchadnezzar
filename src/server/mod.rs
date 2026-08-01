@@ -863,10 +863,17 @@ impl DatabaseRuntime {
                         )
                     })?;
                 let store = Arc::new(crate::ram::id_alloc::RaftLeaseStore::new(sm));
-                // TODO(compact-id): feed the recovery scan's max observed
-                // sequence for this origin as the belt-and-suspenders floor.
-                let allocator =
-                    crate::ram::id_alloc::IdAllocator::recover(store, origin, epoch, 0).await?;
+                // The recovery scan's max observed sequence for this origin is
+                // the belt-and-suspenders floor: even if the durable lease
+                // record was lost, no sequence that reached disk is reissued.
+                let scanned_floor = self.chunks().recovered_origin_floor(origin);
+                let allocator = crate::ram::id_alloc::IdAllocator::recover(
+                    store,
+                    origin,
+                    epoch,
+                    scanned_floor,
+                )
+                .await?;
                 Ok(Arc::new(allocator))
             })
             .await

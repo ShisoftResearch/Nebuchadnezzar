@@ -1481,9 +1481,30 @@ pub struct Chunks {
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     /// Shared wake signal registered by the background cleaner thread.
     pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
+    /// Max allocated-class sequence observed per origin during recovery.
+    /// The id allocator's belt-and-suspenders floor: even if the durable
+    /// lease record was lost, no recovered cell's sequence is ever reissued.
+    pub recovered_origin_floors: Arc<Vec<std::sync::atomic::AtomicU64>>,
 }
 
 impl Chunks {
+    /// Max sequence observed during recovery for `origin` (0 if none).
+    pub fn recovered_origin_floor(&self, origin: u16) -> u64 {
+        self.recovered_origin_floors
+            .get(origin as usize)
+            .map(|floor| floor.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Records an allocated-class id observed during recovery.
+    pub fn note_recovered_id(&self, id: &Id) {
+        if !id.is_hashed() {
+            if let Some(floor) = self.recovered_origin_floors.get(id.origin() as usize) {
+                floor.fetch_max(id.sequence(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn new(
         count: usize,
         size: usize,
@@ -1607,6 +1628,11 @@ impl Chunks {
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
             tiered_manager,
             cleaner_wake,
+            recovered_origin_floors: Arc::new(
+                (0..4096)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            ),
         });
 
         if let Some(ref manager) = chunks_arc.tiered_manager {
@@ -1632,6 +1658,7 @@ impl Chunks {
                 &wal_storage,
                 &raft_storage,
                 &chunks_arc.list,
+                &chunks_arc.recovered_origin_floors,
             ) {
                 Ok(()) => {
                     info!("Recovery completed successfully");

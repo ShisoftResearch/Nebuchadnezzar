@@ -56,7 +56,7 @@ async fn lazy_hydration_recovers_missing_active_tree() {
     ));
     let local_service = TreeService::new(&client, &sm_client);
 
-    let entry = EntryKey::for_scannable(&Id::new(7, 7), 0x12_34_56_78);
+    let entry = EntryKey::for_scannable(&Id::from_parts(7, 7), 0x12_34_56_78);
     let (_lower, placement, _upper) = sm_client.locate_key(&entry).await.unwrap();
 
     let insert_result =
@@ -136,7 +136,7 @@ async fn mark_migration_recreates_missing_metadata_cell() {
 
     storage::start_external_nodes_write_back(&client);
 
-    let tree_id = Id::new(902, 902);
+    let tree_id = Id::from_parts(902, 902);
     let tree = RangedTree::create(&client, &tree_id).await;
     let head_id = tree.head_id();
 

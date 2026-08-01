@@ -4,6 +4,7 @@ use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
 use super::segs::{Segment, SegmentClass, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
+use crate::ram::types::Id;
 use lightning::aarc::Arc as AArc;
 use lightning::map::WordMap;
 use parking_lot::Mutex;
@@ -518,6 +519,7 @@ fn scan_segment_from_data(
     segment_base: usize,
     data: &[u8],
     version_map: &WordMap,
+    origin_floors: &[std::sync::atomic::AtomicU64],
 ) -> io::Result<RecoveryScanResult> {
     use byteorder::{LittleEndian, ReadBytesExt};
     use std::io::Cursor;
@@ -659,6 +661,17 @@ fn scan_segment_from_data(
             )?;
             let hash = cell_header.id.bits();
             let new_version = cell_header.version;
+            // Any recovered allocated-class id raises its origin's floor so
+            // the allocator can never reissue a sequence that reached disk,
+            // even if the durable lease record was lost with it.
+            if !cell_header.id.is_hashed() {
+                if let Some(floor) = origin_floors.get(cell_header.id.origin() as usize) {
+                    floor.fetch_max(
+                        cell_header.id.sequence(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            }
 
             // Use version_map to check existing version (concurrent-safe)
             let mut version_guard = version_map.lock_or_insert(hash as usize, new_version as usize);
@@ -819,7 +832,11 @@ fn merge_stashed_tombstones(all_stashed: Vec<Vec<StashedTombstone>>) -> Vec<Stas
 }
 
 /// Apply stashed tombstones to cell indices
-fn apply_stashed_tombstones(stashed: &[StashedTombstone], chunks: &[Chunk]) {
+fn apply_stashed_tombstones(
+    stashed: &[StashedTombstone],
+    chunks: &[Chunk],
+    origin_floors: &[std::sync::atomic::AtomicU64],
+) {
     info!("Applying {} stashed tombstones...", stashed.len());
 
     let mut applied_count = 0;
@@ -836,6 +853,15 @@ fn apply_stashed_tombstones(stashed: &[StashedTombstone], chunks: &[Chunk]) {
                 cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
 
             if tombstone.version >= cell_header.version {
+                let removed = Id::from_bits(tombstone.hash);
+                if !removed.is_hashed() {
+                    if let Some(floor) = origin_floors.get(removed.origin() as usize) {
+                        floor.fetch_max(
+                            removed.sequence(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
                 *guard = 0; // Delete cell
                 if let Some(seg) = chunk.locate_segment(existing_addr) {
                     let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
@@ -867,6 +893,7 @@ pub fn recover_chunks(
     wal_storage: &Option<String>,
     raft_storage: &Option<String>,
     chunks: &[Chunk],
+    origin_floors: &[std::sync::atomic::AtomicU64],
 ) -> io::Result<()> {
     info!("=== Starting streamlined recovery from storage directories ===");
 
@@ -992,6 +1019,7 @@ pub fn recover_chunks(
                         segment_base,
                         &file_data,
                         version_map,
+                        origin_floors,
                     )?;
                     let segment_class = scan_result.segment_class;
 
@@ -1091,7 +1119,7 @@ pub fn recover_chunks(
     // Merge and apply stashed tombstones
     let stashed = all_stashed_tombstones.into_inner();
     let merged_tombstones = merge_stashed_tombstones(vec![stashed]);
-    apply_stashed_tombstones(&merged_tombstones, chunks);
+    apply_stashed_tombstones(&merged_tombstones, chunks, origin_floors);
 
     // Count recovered cells
     let total_cells = count_recovered_cells(chunks);
@@ -1133,11 +1161,11 @@ mod tests {
     use super::*;
     use crate::dovahkiin::types::Map;
     use crate::ram::cell::*;
+use crate::ram::types::Id;
     use crate::ram::chunk::Chunks;
     use crate::ram::schema::{Field, LocalSchemasCache, Schema};
     use crate::ram::segs::{SegmentClass, SEGMENT_SIZE};
     use crate::ram::tiered::{manager::TieredMemoryManager, SharedMemoryPool, TieredConfig};
-    use crate::ram::types::Id;
     use crate::server::ServerMeta;
     use dovahkiin::types::Type;
     use lightning::map::WordMap;
@@ -1258,7 +1286,9 @@ mod tests {
         data: &[u8],
     ) -> io::Result<RecoveryScanResult> {
         let version_map = WordMap::with_capacity(128);
-        scan_segment_from_data(chunk, 1, chunk.allocator.addr_by_id(1), data, &version_map)
+        let floors: Vec<std::sync::atomic::AtomicU64> =
+            (0..4096).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        scan_segment_from_data(chunk, 1, chunk.allocator.addr_by_id(1), data, &version_map, &floors)
     }
 
     // Purpose: Validate parsing of segment filenames `{chunk}-{seg}-{seq}.{nlog|nbackup}`
