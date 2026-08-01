@@ -200,6 +200,13 @@ impl IdAllocator {
         Ok(Id::allocated_near(anchor, self.origin, sequence))
     }
 
+    /// Allocates an id at an explicit locality (placement affinity
+    /// chosen by the caller, e.g. a partitioner key).
+    pub async fn take_at(&self, locality: u16) -> io::Result<Id> {
+        let sequence = self.take_sequence().await?;
+        Ok(Id::allocated(locality, self.origin, sequence))
+    }
+
     /// Allocates an id with mixer-derived uniform locality.
     pub async fn take_uniform(&self) -> io::Result<Id> {
         let sequence = self.take_sequence().await?;
