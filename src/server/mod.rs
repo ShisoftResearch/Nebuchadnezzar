@@ -478,6 +478,11 @@ async fn register_schema_state_machine_on_plane(
     );
     plane
         .register_state_machine(Box::new(schema_state_machine))
+        .await?;
+    // The compact-id lease authority lives on the same per-database plane.
+    let alloc_sm_id = crate::ram::id_alloc_sm::generate_scoped_sm_id(group_name, database_name);
+    plane
+        .register_state_machine(Box::new(crate::ram::id_alloc_sm::IdAllocSM::new(alloc_sm_id)))
         .await
 }
 
@@ -779,6 +784,9 @@ pub struct DatabaseRuntime {
     pub membership: Arc<ObserverClient>,
     pub raft_client: Arc<RaftClient>,
     pub neb_client: Arc<AsyncClient>,
+    /// Lazily-initialized compact-id allocator: first use claims an
+    /// origin slot from the database's lease authority.
+    id_allocator: tokio::sync::OnceCell<Arc<crate::ram::id_alloc::IdAllocator>>,
 }
 
 impl DatabaseRuntime {
@@ -814,7 +822,54 @@ impl DatabaseRuntime {
             membership,
             raft_client,
             neb_client,
+            id_allocator: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The database's compact-id allocator. First call claims an origin
+    /// slot (with a fresh fencing epoch) from the consensus lease
+    /// authority and recovers the allocation floor from its durable
+    /// lease record.
+    pub async fn id_allocator(
+        &self,
+    ) -> std::io::Result<&Arc<crate::ram::id_alloc::IdAllocator>> {
+        self.id_allocator
+            .get_or_try_init(|| async {
+                let plane_client = self
+                    .raft_client
+                    .plane(database_meta_plane_id(&self.group_name, &self.database_name));
+                let sm_id = crate::ram::id_alloc_sm::generate_scoped_sm_id(
+                    &self.group_name,
+                    &self.database_name,
+                );
+                let sm = Arc::new(crate::ram::id_alloc_sm::client::SMClient::new(
+                    sm_id,
+                    &plane_client,
+                ));
+                let holder = self.rpc.server_id;
+                let (origin, epoch) = sm
+                    .claim_origin(&holder)
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("origin claim consensus round failed: {e:?}"),
+                        )
+                    })?
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("origin claim refused: {e}"),
+                        )
+                    })?;
+                let store = Arc::new(crate::ram::id_alloc::RaftLeaseStore::new(sm));
+                // TODO(compact-id): feed the recovery scan's max observed
+                // sequence for this origin as the belt-and-suspenders floor.
+                let allocator =
+                    crate::ram::id_alloc::IdAllocator::recover(store, origin, epoch, 0).await?;
+                Ok(Arc::new(allocator))
+            })
+            .await
     }
 
     pub fn group_name(&self) -> &str {
@@ -1680,7 +1735,7 @@ impl NebServer {
         &self,
     ) -> Result<Arc<ranged::tree::service::AsyncServiceClient>, bifrost::rpc::RPCError> {
         // Use a dummy ID to locate the local LSM tree service via consistent hashing
-        let dummy_id = Id::new(0, 1);
+        let dummy_id = Id::allocated(0, 0, 1);
         ranged::tree::service::locate_tree_server_from_conshash(
             &dummy_id,
             &self.consh,
@@ -2004,7 +2059,7 @@ impl NebServer {
     }
 
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
-        self.consh.get_server_id(id.higher)
+        self.consh.get_server_id(id.locality() as u64)
     }
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
         self.member_pool
@@ -2049,7 +2104,7 @@ pub async fn rpc_client_by_id(
     id: &Id,
     conshash: &Arc<ConsistentHashing>,
 ) -> Result<Arc<RPCClient>, RPCError> {
-    let server_id = conshash.get_server_id(id.higher).unwrap();
+    let server_id = conshash.get_server_id(id.locality() as u64).unwrap();
     let conshash = conshash.clone();
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
@@ -2192,6 +2247,79 @@ pub async fn init_ranged_indexer_service<C>(
         .await
         .unwrap();
     meta_plane.recover_after_register().await.unwrap();
+
+    // Establish the genesis placement through consensus, but only when the
+    // replicated placement map is empty: proposing a command while startup
+    // recovery is replaying the plane log destabilizes recovery, and on any
+    // restart the placements already exist. Each proposer prepares a
+    // candidate tree it owns and persists the root cell BEFORE proposing,
+    // so no replica can ever observe a placement whose root cell is not yet
+    // readable. The raft command picks exactly one winner; losers drop
+    // their orphan candidate cell.
+    if matches!(sm_client.has_placements().await, Ok(false)) {
+    let genesis_id = ranged::sm::MasterTreeSM::select_genesis_tree_id(
+        cons_hash,
+        rpc_server.server_id,
+    );
+    let _candidate = ranged::tree::tree::RangedTree::create(neb_client, &genesis_id).await;
+    match sm_client.try_init_genesis(&genesis_id).await {
+        Ok(true) => {
+            info!(
+                "Won ranged-index genesis election with tree {:?} for {}/{}",
+                genesis_id, group_name, database_name
+            );
+            let owner_client = match cons_hash.get_server_id_by(&genesis_id) {
+                Some(server_id) => bifrost::rpc::DEFAULT_CLIENT_POOL
+                    .get_by_id(server_id, |sid| cons_hash.to_server_name(sid))
+                    .await
+                    .map(|rpc| {
+                        ranged::tree::service::AsyncServiceClient::new_with_service_id(
+                            ranged::tree::service::generate_scoped_service_id(
+                                group_name,
+                                database_name,
+                            ),
+                            &rpc,
+                        )
+                    })
+                    .ok(),
+                None => None,
+            };
+            match owner_client {
+                Some(client) => {
+                    // The root cell already exists, so this loads the tree we
+                    // just persisted into the owning service.
+                    if let Err(e) = client
+                        .crate_tree(
+                            genesis_id,
+                            ranged::tree::service::Boundary::new(
+                                ranged::trees::min_entry_key(),
+                                ranged::trees::max_entry_key(),
+                            ),
+                            ranged::tree::tree::INITIAL_TREE_EPOCH,
+                        )
+                        .await
+                    {
+                        error!("Failed to load genesis ranged tree: {:?}", e);
+                    }
+                }
+                None => error!(
+                    "Cannot locate owner for genesis ranged tree {:?}",
+                    genesis_id
+                ),
+            }
+        }
+        Ok(false) => {
+            let _ = neb_client.remove_cell(genesis_id).await;
+        }
+        Err(e) => {
+            error!(
+                "Ranged-index genesis election failed for {}/{}: {:?}",
+                group_name, database_name, e
+            );
+            let _ = neb_client.remove_cell(genesis_id).await;
+        }
+    }
+    }
 }
 
 fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {

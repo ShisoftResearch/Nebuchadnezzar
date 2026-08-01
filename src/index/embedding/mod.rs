@@ -441,7 +441,7 @@ mod tests {
             async move {
                 self.queries.lock().unwrap().push(query.clone());
                 Ok(vec![EmbeddingHit {
-                    id: Id::new(0, query.len() as u64),
+                    id: Id::from_parts(0, query.len() as u64),
                     score: query.len() as f32,
                 }])
             }

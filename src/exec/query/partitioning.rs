@@ -27,6 +27,6 @@ pub fn get_hash_partitioner(env: &mut Environment) -> Result<Option<Box<dyn Part
 
 pub fn get_id_partition(data_ptr: *mut (), partitioner: &Box<dyn Partitioner>) -> Option<u64> {
     let id = unsafe { &*(data_ptr as *mut Id) };
-    let key = id.higher;
+    let key = id.locality() as u64;
     partitioner.partition(key)
 }

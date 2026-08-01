@@ -60,6 +60,8 @@ raft_state_machine! {
     def qry locate_key(entry: EntryKey) -> (EntryKey, TreePlacement, EntryKey);
     def qry next_tree(tree_lower: EntryKey, ordering: Ordering) -> Option<TreeInfo>;
     def cmd split(src_tree: Id, new_tree: Id, pivot: EntryKey);
+    def cmd try_init_genesis(tree_id: Id) -> bool;
+    def qry has_placements() -> bool;
     // No subscription for clients
 }
 
@@ -156,6 +158,35 @@ impl StateMachineCmds for MasterTreeSM {
         }
         .boxed()
     }
+
+    fn has_placements(&self) -> BoxFuture<'_, bool> {
+        future::ready(!self.tree.is_empty()).boxed()
+    }
+
+    fn try_init_genesis(&mut self, tree_id: Id) -> BoxFuture<'_, bool> {
+        // Genesis placement must be established through consensus: seeding it
+        // into a member-local instance before registration leaves each member
+        // with a different placement map (split-brain trees). The command is
+        // idempotent — the first proposer wins, later proposers see data.
+        async move {
+            if !self.tree.is_empty() {
+                return false;
+            }
+            info!(
+                "[RANGED INDEX] Initializing genesis placement with tree {:?} on sm {} server {}",
+                tree_id,
+                self.sm_id,
+                self.raft_svr.get_server_id()
+            );
+            self.tree
+                .insert(min_entry_key(), TreePlacement::new(tree_id));
+            if let Err(e) = self.persist_tree() {
+                error!("Failed to persist genesis placement: {:?}", e);
+            }
+            true
+        }
+        .boxed()
+    }
 }
 
 impl StateMachineCtl for MasterTreeSM {
@@ -173,7 +204,19 @@ impl StateMachineCtl for MasterTreeSM {
     }
 
     fn recoverable(&self) -> bool {
-        false
+        // Replicas must converge on the placement map: a member that
+        // registers after the genesis command committed has to pull the
+        // snapshot, otherwise each member ends up with its own genesis
+        // tree and index entries strand per-member.
+        true
+    }
+
+    fn accept_buffered_replay(&self) -> bool {
+        // The placement map recovers from its own persistence file; buffered
+        // plane entries replayed on top of that state double-apply (splits
+        // bump epochs non-idempotently). Only a genuinely fresh instance —
+        // e.g. a member joining an established plane — wants the replay.
+        self.tree.is_empty()
     }
 }
 
@@ -275,39 +318,25 @@ impl MasterTreeSM {
             return true;
         }
 
-        let Some(genesis_id) = self.local_tree_id() else {
-            error!(
-                "Failed to select local genesis ranged tree id for server {} after {} attempts; conshash server_count={}",
-                self.raft_svr.get_server_id(),
-                LOCAL_TREE_ID_SELECTION_MAX_ATTEMPTS,
-                self.conshash.server_count()
-            );
-            return false;
-        };
-        self.tree
-            .insert(min_entry_key(), TreePlacement::new(genesis_id));
+        // No local data: genesis is established via the try_init_genesis raft
+        // command after this state machine registers on the plane. Seeding it
+        // here would give every cluster member a different member-local
+        // placement map — the split-brain that strands index entries.
+        info!(
+            "[RANGED INDEX LOAD] MasterTreeSM has no persisted data; genesis deferred to consensus"
+        );
+        false
+    }
 
-        if let Err(e) = self
-            .locate_tree_server(&genesis_id)
-            .await
-            .unwrap()
-            .crate_tree(
-                genesis_id,
-                Boundary::new(min_entry_key(), max_entry_key()),
-                INITIAL_TREE_EPOCH,
-            )
-            .await
-        {
-            error!("Failed to create genesis tree: {:?}", e);
-            return false;
+    /// Selects a candidate genesis tree id preferring local ownership.
+    pub fn select_genesis_tree_id(conshash: &ConsistentHashing, local_server_id: u64) -> Id {
+        for _ in 0..LOCAL_TREE_ID_SELECTION_MAX_ATTEMPTS {
+            let id = Id::rand();
+            if conshash.get_server_id_by(&id) == Some(local_server_id) {
+                return id;
+            }
         }
-
-        // Persist the initial tree state
-        if let Err(e) = self.persist_tree() {
-            error!("Failed to persist initial tree: {:?}", e);
-        }
-
-        true
+        Id::rand()
     }
 
     fn persist_tree(&self) -> io::Result<()> {
@@ -403,16 +432,6 @@ impl MasterTreeSM {
         Ok(())
     }
 
-    fn local_tree_id(&self) -> Option<Id> {
-        let local_server_id = self.raft_svr.get_server_id();
-        for _ in 0..LOCAL_TREE_ID_SELECTION_MAX_ATTEMPTS {
-            let id = Id::rand();
-            if self.conshash.get_server_id_by(&id) == Some(local_server_id) {
-                return Some(id);
-            }
-        }
-        None
-    }
 
     async fn load_sub_tree(&mut self, id: Id, lower: &EntryKey, upper: &EntryKey, epoch: u64) {
         if self.is_plane_leader().await {

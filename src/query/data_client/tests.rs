@@ -260,7 +260,7 @@ async fn scan_all() {
     client.new_schema_with_id(schema_2).await.unwrap().unwrap();
     let num = 1024;
     for i in 0..num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -282,7 +282,7 @@ async fn scan_all() {
             .await
             .unwrap();
         for i in 0..num {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(
                 id,
@@ -301,7 +301,7 @@ async fn scan_all() {
         }
     }
     for i in 0..num {
-        let id = Id::new(2, i);
+        let id = Id::from_parts(2, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 3) as u32);
@@ -322,7 +322,7 @@ async fn scan_all() {
             .await
             .unwrap();
         for i in 0..num {
-            let id = Id::new(2, i);
+            let id = Id::from_parts(2, i);
             let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
@@ -346,7 +346,7 @@ async fn scan_all() {
             .await
             .unwrap();
         for i in 0..num {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
         }
@@ -367,7 +367,7 @@ async fn scan_all() {
             .unwrap();
         // Start from 10 to 100 due to the selection expression
         for i in 10..100 {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
@@ -395,7 +395,7 @@ async fn scan_all() {
             .unwrap();
         // 100 and 1000 due to the selection expression
         for i in vec![100, 1000] {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
@@ -421,7 +421,7 @@ async fn scan_all() {
             .await
             .unwrap();
         for i in 0..num {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
             assert_eq!(*cell.data.u64().unwrap(), i + (i * 2));
@@ -479,7 +479,7 @@ async fn range_query_scan() {
     client.new_schema_with_id(schema_1).await.unwrap().unwrap();
     let num = 1024;
     for i in 0..num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -505,7 +505,7 @@ async fn range_query_scan() {
         .await
         .unwrap();
     for i in 5..=515 {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let cell = cursor.next().await.unwrap().expect(&format!("at {}", i));
         assert_eq!(id, cell.id());
         assert_eq!(*cell[DATA_1].u64().unwrap(), i);
@@ -571,7 +571,7 @@ async fn range_query_scan_inclusive_exclusive() {
     // Insert data from 0 to 100
     let num = 100;
     for i in 0..=num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -602,7 +602,7 @@ async fn range_query_scan_inclusive_exclusive() {
         .unwrap();
 
     for i in 10..=50 {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let cell = cursor
             .next()
             .await
@@ -713,7 +713,7 @@ async fn range_query_scan_open_ranges() {
     // Insert data from 1 to 201 (ID 0,0 is reserved as unit_id)
     let num = 201;
     for i in 1..=num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -796,7 +796,7 @@ async fn range_query_scan_open_ranges() {
         .unwrap();
 
     for i in 151..=num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let cell = cursor
             .next()
             .await
@@ -829,7 +829,7 @@ async fn range_query_scan_open_ranges() {
         .unwrap();
 
     for i in 1..=num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let cell = cursor
             .next()
             .await
@@ -867,7 +867,7 @@ async fn range_query_scan_backward_ordering() {
     // Insert data from 0 to 100
     let num = 100;
     for i in 0..=num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -897,7 +897,7 @@ async fn range_query_scan_backward_ordering() {
         .unwrap();
 
     for (idx, i) in (20..=80).rev().enumerate() {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let cell = cursor
             .next()
             .await
@@ -935,7 +935,7 @@ async fn range_query_scan_edge_cases() {
     // Insert data from 1 to 51 (ID 0,0 is reserved as unit_id and not valid for data)
     let num = 51;
     for i in 1..=num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -965,7 +965,7 @@ async fn range_query_scan_edge_cases() {
         .unwrap();
 
     let cell = cursor.next().await.unwrap().expect("Should have one cell");
-    assert_eq!(cell.id(), Id::new(1, 25));
+    assert_eq!(cell.id(), Id::from_parts(1, 25));
     assert_eq!(*cell[DATA_1].u64().unwrap(), 25);
     assert!(
         cursor.next().await.unwrap().is_none(),
@@ -1093,7 +1093,7 @@ async fn range_query_scan_large_dataset() {
     // Insert large dataset: 0 to 5000
     let num = 5000;
     for i in 0..=num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -1124,7 +1124,7 @@ async fn range_query_scan_large_dataset() {
 
     let mut count = 0;
     for i in 1000..=2000 {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let cell = cursor
             .next()
             .await
@@ -1168,7 +1168,7 @@ async fn range_query_scan_with_selection() {
     // Insert data from 0 to 100
     let num = 100;
     for i in 0..=num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -1248,7 +1248,7 @@ async fn range_query_scan_sparse_data() {
 
     // Insert sparse data: only multiples of 10
     for i in (0..=100).step_by(10) {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -1279,7 +1279,7 @@ async fn range_query_scan_sparse_data() {
 
     let expected_values = vec![20, 30, 40, 50, 60, 70];
     for (idx, &expected_val) in expected_values.iter().enumerate() {
-        let id = Id::new(1, expected_val);
+        let id = Id::from_parts(1, expected_val);
         let cell = cursor.next().await.unwrap().expect(&format!(
             "Expected cell at {} (position {})",
             expected_val, idx
@@ -1314,7 +1314,7 @@ async fn scan_all_auto_uses_ranged_clause_from_selection() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=100u64 {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -1367,7 +1367,7 @@ async fn scan_all_auto_uses_hashed_equality_clause_from_selection() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..100u64 {
-        let id = Id::new(2, i);
+        let id = Id::from_parts(2, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(if i % 10 == 0 { 42 } else { i });
         value[DATA_2] = OwnedValue::U32((i * 3) as u32);
@@ -1424,7 +1424,7 @@ async fn scan_by_expr_supports_single_ranged_clause() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=100u64 {
-        let id = Id::new(3, i);
+        let id = Id::from_parts(3, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 4) as u32);
@@ -1477,7 +1477,7 @@ async fn scan_by_expr_supports_reversed_comparison_operands() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=25u64 {
-        let id = Id::new(4, i);
+        let id = Id::from_parts(4, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 5) as u32);
@@ -1531,7 +1531,7 @@ async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=20u64 {
-        let id = Id::new(5, i);
+        let id = Id::from_parts(5, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U32((i * 2) as u32);
@@ -1589,7 +1589,7 @@ async fn scan_by_expr_intersects_hashed_and_ranged_indexed_clauses() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=120u64 {
-        let id = Id::new(6, i);
+        let id = Id::from_parts(6, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U64(i % 4);
@@ -1654,7 +1654,7 @@ async fn scan_by_expr_multi_index_intersection_can_be_empty() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=40u64 {
-        let id = Id::new(7, i);
+        let id = Id::from_parts(7, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         value[DATA_2] = OwnedValue::U64(9);
@@ -1701,7 +1701,7 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=20u64 {
-        let id = Id::new(8, i);
+        let id = Id::from_parts(8, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i % 3);
@@ -1724,7 +1724,7 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
 
     assert_eq!(
         values,
-        vec![Id::new(8, 19), Id::new(8, 13), Id::new(8, 7), Id::new(8, 1)]
+        vec![Id::from_parts(8, 19), Id::from_parts(8, 13), Id::from_parts(8, 7), Id::from_parts(8, 1)]
     );
 }
 
@@ -1754,7 +1754,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=9u64 {
-        let id = Id::new(18, i);
+        let id = Id::from_parts(18, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
@@ -1786,7 +1786,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
     while let Some(row) = cursor.next().await.unwrap() {
         ids.push(row.id.unwrap());
     }
-    assert_eq!(ids, vec![Id::new(18, 9), Id::new(18, 7), Id::new(18, 5)]);
+    assert_eq!(ids, vec![Id::from_parts(18, 9), Id::from_parts(18, 7), Id::from_parts(18, 5)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1815,7 +1815,7 @@ async fn scan_by_expr_with_options_supports_non_indexed_order_by_field() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=4u64 {
-        let id = Id::new(19, i);
+        let id = Id::from_parts(19, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
@@ -1848,7 +1848,7 @@ async fn scan_by_expr_with_options_supports_non_indexed_order_by_field() {
         ids.push(row.id.unwrap());
     }
 
-    assert_eq!(ids, vec![Id::new(19, 1), Id::new(19, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(19, 1), Id::from_parts(19, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1877,7 +1877,7 @@ async fn scan_by_expr_plan_exposes_optimizer_trace() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=8u64 {
-        let id = Id::new(22, i);
+        let id = Id::from_parts(22, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
@@ -2001,7 +2001,7 @@ async fn scan_by_expr_detects_contradictory_hashed_predicates() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=5u64 {
-        let id = Id::new(20, i);
+        let id = Id::from_parts(20, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -2044,7 +2044,7 @@ async fn scan_by_expr_detects_contradictory_ranged_predicates() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=10u64 {
-        let id = Id::new(21, i);
+        let id = Id::from_parts(21, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -2087,7 +2087,7 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=20u64 {
-        let id = Id::new(11, i);
+        let id = Id::from_parts(11, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i % 3);
@@ -2110,10 +2110,10 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     assert_eq!(
         ids,
         vec![
-            Id::new(11, 19),
-            Id::new(11, 13),
-            Id::new(11, 7),
-            Id::new(11, 1)
+            Id::from_parts(11, 19),
+            Id::from_parts(11, 13),
+            Id::from_parts(11, 7),
+            Id::from_parts(11, 1)
         ]
     );
 }
@@ -2144,7 +2144,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=9u64 {
-        let id = Id::new(14, i);
+        let id = Id::from_parts(14, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
@@ -2175,7 +2175,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
     while let Some(id) = cursor.next().await.unwrap() {
         ids.push(id);
     }
-    assert_eq!(ids, vec![Id::new(14, 9), Id::new(14, 7), Id::new(14, 5)]);
+    assert_eq!(ids, vec![Id::from_parts(14, 9), Id::from_parts(14, 7), Id::from_parts(14, 5)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2204,7 +2204,7 @@ async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=9u64 {
-        let id = Id::new(18, i);
+        let id = Id::from_parts(18, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
@@ -2235,7 +2235,7 @@ async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
     while let Some(id) = cursor.next().await.unwrap() {
         ids.push(id);
     }
-    assert_eq!(ids, vec![Id::new(18, 7), Id::new(18, 5)]);
+    assert_eq!(ids, vec![Id::from_parts(18, 7), Id::from_parts(18, 5)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2264,7 +2264,7 @@ async fn scan_by_expr_with_options_supports_offset_and_limit() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=9u64 {
-        let id = Id::new(19, i);
+        let id = Id::from_parts(19, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
@@ -2296,7 +2296,7 @@ async fn scan_by_expr_with_options_supports_offset_and_limit() {
     while let Some(row) = cursor.next().await.unwrap() {
         ids.push(row.id.unwrap());
     }
-    assert_eq!(ids, vec![Id::new(19, 7), Id::new(19, 5)]);
+    assert_eq!(ids, vec![Id::from_parts(19, 7), Id::from_parts(19, 5)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2325,7 +2325,7 @@ async fn scan_by_expr_ids_with_options_offset_beyond_result_returns_empty() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=5u64 {
-        let id = Id::new(20, i);
+        let id = Id::from_parts(20, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(1);
         value[DATA_2] = OwnedValue::U64(i);
@@ -2381,7 +2381,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=9u64 {
-        let id = Id::new(16, i);
+        let id = Id::from_parts(16, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(10 - i);
@@ -2412,7 +2412,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
     while let Some(id) = cursor.next().await.unwrap() {
         ids.push(id);
     }
-    assert_eq!(ids, vec![Id::new(16, 1), Id::new(16, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(16, 1), Id::from_parts(16, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2441,7 +2441,7 @@ async fn scan_by_expr_ids_with_inferred_ranged_order_applies_post_sort_before_li
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=9u64 {
-        let id = Id::new(31, i);
+        let id = Id::from_parts(31, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -2467,7 +2467,7 @@ async fn scan_by_expr_ids_with_inferred_ranged_order_applies_post_sort_before_li
     while let Some(id) = cursor.next().await.unwrap() {
         ids.push(id);
     }
-    assert_eq!(ids, vec![Id::new(31, 9), Id::new(31, 8)]);
+    assert_eq!(ids, vec![Id::from_parts(31, 9), Id::from_parts(31, 8)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2496,7 +2496,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=6u64 {
-        let id = Id::new(17, i);
+        let id = Id::from_parts(17, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
@@ -2552,7 +2552,7 @@ async fn scan_by_expr_ids_with_options_supports_non_indexed_order_by_field() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=4u64 {
-        let id = Id::new(15, i);
+        let id = Id::from_parts(15, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
@@ -2584,7 +2584,7 @@ async fn scan_by_expr_ids_with_options_supports_non_indexed_order_by_field() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(15, 1), Id::new(15, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(15, 1), Id::from_parts(15, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2613,7 +2613,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..96u64 {
-        let id = Id::new(9, i);
+        let id = Id::from_parts(9, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[RANGE_FIELD] = OwnedValue::U64(i);
         value[ORDER_FIELD] = OwnedValue::U64((i * 3) % 11);
@@ -2638,7 +2638,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
         )
         .await
         .unwrap();
-    assert_eq!(equality_cursor.next().await.unwrap(), Some(Id::new(9, 0)));
+    assert_eq!(equality_cursor.next().await.unwrap(), Some(Id::from_parts(9, 0)));
     assert!(equality_cursor.next().await.unwrap().is_none());
 
     let mut plain_cursor = idx_data_client
@@ -2657,7 +2657,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
     while let Some(id) = plain_cursor.next().await.unwrap() {
         plain_ids.push(id);
     }
-    assert_eq!(plain_ids.first().copied(), Some(Id::new(9, 0)));
+    assert_eq!(plain_ids.first().copied(), Some(Id::from_parts(9, 0)));
 
     let mut ordered_cursor = idx_data_client
         .query_ids_with_options(
@@ -2679,14 +2679,14 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
     assert_eq!(
         ordered_ids,
         vec![
-            Id::new(9, 0),
-            Id::new(9, 11),
-            Id::new(9, 22),
-            Id::new(9, 33),
-            Id::new(9, 44),
-            Id::new(9, 55),
-            Id::new(9, 66),
-            Id::new(9, 77),
+            Id::from_parts(9, 0),
+            Id::from_parts(9, 11),
+            Id::from_parts(9, 22),
+            Id::from_parts(9, 33),
+            Id::from_parts(9, 44),
+            Id::from_parts(9, 55),
+            Id::from_parts(9, 66),
+            Id::from_parts(9, 77),
         ]
     );
 }
@@ -2724,7 +2724,7 @@ async fn query_ids_with_options_supports_distinct_fields() {
         (4, 3, 60),
         (5, 3, 50),
     ] {
-        let id = Id::new(32, id_low);
+        let id = Id::from_parts(32, id_low);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[GROUP_FIELD] = OwnedValue::U64(group);
         value[SCORE_FIELD] = OwnedValue::U64(score);
@@ -2755,7 +2755,7 @@ async fn query_ids_with_options_supports_distinct_fields() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(32, 1), Id::new(32, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(32, 1), Id::from_parts(32, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2784,7 +2784,7 @@ async fn query_ids_supports_not_with_schema_scan_fallback() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=5u64 {
-        let id = Id::new(34, i);
+        let id = Id::from_parts(34, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 2);
         value[DATA_2] = OwnedValue::U64(i);
@@ -2807,7 +2807,7 @@ async fn query_ids_supports_not_with_schema_scan_fallback() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(34, 0), Id::new(34, 2), Id::new(34, 4)]);
+    assert_eq!(ids, vec![Id::from_parts(34, 0), Id::from_parts(34, 2), Id::from_parts(34, 4)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2843,7 +2843,7 @@ async fn query_ids_supports_not_as_residual_on_indexed_plan() {
         (4, 1, 5),
         (5, 0, 6),
     ] {
-        let id = Id::new(35, id_low);
+        let id = Id::from_parts(35, id_low);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[TAG] = OwnedValue::U64(tag);
         value[SCORE] = OwnedValue::U64(score);
@@ -2867,7 +2867,7 @@ async fn query_ids_supports_not_as_residual_on_indexed_plan() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(35, 1), Id::new(35, 3), Id::new(35, 5)]);
+    assert_eq!(ids, vec![Id::from_parts(35, 1), Id::from_parts(35, 3), Id::from_parts(35, 5)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2896,7 +2896,7 @@ async fn query_ids_optimizes_not_equals_on_ranged_field_without_schema_scan() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for score in 0..=5u64 {
-        let id = Id::new(36, score);
+        let id = Id::from_parts(36, score);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[SCORE] = OwnedValue::U64(score);
         client
@@ -2921,11 +2921,11 @@ async fn query_ids_optimizes_not_equals_on_ranged_field_without_schema_scan() {
     assert_eq!(
         ids,
         vec![
-            Id::new(36, 0),
-            Id::new(36, 1),
-            Id::new(36, 2),
-            Id::new(36, 4),
-            Id::new(36, 5),
+            Id::from_parts(36, 0),
+            Id::from_parts(36, 1),
+            Id::from_parts(36, 2),
+            Id::from_parts(36, 4),
+            Id::from_parts(36, 5),
         ]
     );
 }
@@ -2956,7 +2956,7 @@ async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for tag in 0..=5u64 {
-        let id = Id::new(37, tag);
+        let id = Id::from_parts(37, tag);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[TAG] = OwnedValue::U64(tag);
         client
@@ -2978,7 +2978,7 @@ async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(37, 1), Id::new(37, 3), Id::new(37, 5)]);
+    assert_eq!(ids, vec![Id::from_parts(37, 1), Id::from_parts(37, 3), Id::from_parts(37, 5)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3007,7 +3007,7 @@ async fn query_ids_optimizes_between_on_ranged_field_without_schema_scan() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for score in 0..=7u64 {
-        let id = Id::new(38, score);
+        let id = Id::from_parts(38, score);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[SCORE] = OwnedValue::U64(score);
         client
@@ -3032,10 +3032,10 @@ async fn query_ids_optimizes_between_on_ranged_field_without_schema_scan() {
     assert_eq!(
         ids,
         vec![
-            Id::new(38, 2),
-            Id::new(38, 3),
-            Id::new(38, 4),
-            Id::new(38, 5)
+            Id::from_parts(38, 2),
+            Id::from_parts(38, 3),
+            Id::from_parts(38, 4),
+            Id::from_parts(38, 5)
         ]
     );
 }
@@ -3065,7 +3065,7 @@ async fn query_ids_supports_is_null_with_schema_scan_fallback() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for (id_low, score) in [(0u64, Some(10u64)), (1, None), (2, Some(20)), (3, None)] {
-        let id = Id::new(39, id_low);
+        let id = Id::from_parts(39, id_low);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
         client
@@ -3087,7 +3087,7 @@ async fn query_ids_supports_is_null_with_schema_scan_fallback() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(39, 1), Id::new(39, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(39, 1), Id::from_parts(39, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3116,7 +3116,7 @@ async fn query_ids_optimizes_is_null_with_null_index_without_schema_scan() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for (id_low, score) in [(0u64, Some(10u64)), (1, None), (2, Some(20)), (3, None)] {
-        let id = Id::new(42, id_low);
+        let id = Id::from_parts(42, id_low);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
         client
@@ -3138,7 +3138,7 @@ async fn query_ids_optimizes_is_null_with_null_index_without_schema_scan() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(42, 1), Id::new(42, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(42, 1), Id::from_parts(42, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3173,7 +3173,7 @@ async fn query_ids_optimizes_is_not_null_on_nullable_ranged_field_without_schema
         (3, None),
         (4, Some(30)),
     ] {
-        let id = Id::new(40, id_low);
+        let id = Id::from_parts(40, id_low);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[OPTIONAL_SCORE] = score.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
         client
@@ -3195,7 +3195,7 @@ async fn query_ids_optimizes_is_not_null_on_nullable_ranged_field_without_schema
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(40, 0), Id::new(40, 2), Id::new(40, 4)]);
+    assert_eq!(ids, vec![Id::from_parts(40, 0), Id::from_parts(40, 2), Id::from_parts(40, 4)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3224,7 +3224,7 @@ async fn query_ids_optimizes_is_null_on_non_nullable_field_to_empty() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for score in 0..=3u64 {
-        let id = Id::new(41, score);
+        let id = Id::from_parts(41, score);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[SCORE] = OwnedValue::U64(score);
         client
@@ -3277,7 +3277,7 @@ async fn scan_by_expr_with_options_applies_distinct_before_offset_and_limit() {
         (4, 3, 60),
         (5, 3, 50),
     ] {
-        let id = Id::new(33, id_low);
+        let id = Id::from_parts(33, id_low);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[GROUP_FIELD] = OwnedValue::U64(group);
         value[SCORE_FIELD] = OwnedValue::U64(score);
@@ -3309,7 +3309,7 @@ async fn scan_by_expr_with_options_applies_distinct_before_offset_and_limit() {
         ids.push(row.id.unwrap());
     }
 
-    assert_eq!(ids, vec![Id::new(33, 2)]);
+    assert_eq!(ids, vec![Id::from_parts(33, 2)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3338,7 +3338,7 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=12u64 {
-        let id = Id::new(12, i);
+        let id = Id::from_parts(12, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 3);
         value[DATA_2] = OwnedValue::U32(i as u32);
@@ -3359,14 +3359,14 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
     }
 
     let expected = vec![
-        Id::new(12, 11),
-        Id::new(12, 10),
-        Id::new(12, 8),
-        Id::new(12, 7),
-        Id::new(12, 5),
-        Id::new(12, 4),
-        Id::new(12, 2),
-        Id::new(12, 1),
+        Id::from_parts(12, 11),
+        Id::from_parts(12, 10),
+        Id::from_parts(12, 8),
+        Id::from_parts(12, 7),
+        Id::from_parts(12, 5),
+        Id::from_parts(12, 4),
+        Id::from_parts(12, 2),
+        Id::from_parts(12, 1),
     ];
     assert_eq!(ids, expected);
 }
@@ -3397,7 +3397,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=12u64 {
-        let id = Id::new(23, i);
+        let id = Id::from_parts(23, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 3);
         value[DATA_2] = OwnedValue::U32(i as u32);
@@ -3424,7 +3424,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
     while let Some(id) = cursor.next().await.unwrap() {
         ids.push(id);
     }
-    assert_eq!(ids, vec![Id::new(23, 11), Id::new(23, 10), Id::new(23, 8)]);
+    assert_eq!(ids, vec![Id::from_parts(23, 11), Id::from_parts(23, 10), Id::from_parts(23, 8)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3453,7 +3453,7 @@ async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=10u64 {
-        let id = Id::new(13, i);
+        let id = Id::from_parts(13, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 4);
         value[DATA_2] = OwnedValue::U32((i % 5) as u32);
@@ -3476,11 +3476,11 @@ async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
     assert_eq!(
         ids,
         vec![
-            Id::new(13, 1),
-            Id::new(13, 3),
-            Id::new(13, 5),
-            Id::new(13, 8),
-            Id::new(13, 9),
+            Id::from_parts(13, 1),
+            Id::from_parts(13, 3),
+            Id::from_parts(13, 5),
+            Id::from_parts(13, 8),
+            Id::from_parts(13, 9),
         ]
     );
 }
@@ -3511,7 +3511,7 @@ async fn scan_by_expr_ranged_clause_with_no_hits_returns_empty() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..=10u64 {
-        let id = Id::new(10, i);
+        let id = Id::from_parts(10, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -3584,7 +3584,7 @@ async fn hashed_query_test() {
     let mut expected_ids = vec![];
 
     // Start with a single cell
-    let single_case_id = Id::new(88888, 99999);
+    let single_case_id = Id::from_parts(88888, 99999);
     let mut value = OwnedValue::Map(OwnedMap::new());
     value[DATA_1] = OwnedValue::U64(target_value);
     value[DATA_2] = OwnedValue::U32(0);
@@ -3618,7 +3618,7 @@ async fn hashed_query_test() {
 
     // Insert test data
     for i in 0..num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         // Use target_value for some records and other values for others
         let data1_value = if i % 10 == 0 { target_value } else { i };
@@ -3704,7 +3704,7 @@ async fn hashed_query_test() {
 
     // Insert string data
     for i in 0..50 {
-        let id = Id::new(2, i);
+        let id = Id::from_parts(2, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         let string_value = if i % 5 == 0 {
             target_string.clone()
@@ -3805,10 +3805,10 @@ async fn hashed_query_supports_array_values() {
         Expr::Value(query_array.clone()),
     ]);
 
-    let contains_both = Id::new(3, 1);
-    let contains_thirteen = Id::new(3, 2);
-    let contains_eleven = Id::new(3, 3);
-    let non_match = Id::new(3, 4);
+    let contains_both = Id::from_parts(3, 1);
+    let contains_thirteen = Id::from_parts(3, 2);
+    let contains_eleven = Id::from_parts(3, 3);
+    let non_match = Id::from_parts(3, 4);
 
     let mut array_cell = OwnedValue::Map(OwnedMap::new());
     array_cell[TAGS] = OwnedValue::Array(vec![OwnedValue::U64(7), OwnedValue::U64(11)]);
@@ -3954,10 +3954,10 @@ async fn ranged_query_supports_array_values() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     let values = [
-        (Id::new(4, 1), vec![3u64, 5u64]),
-        (Id::new(4, 2), vec![8u64]),
-        (Id::new(4, 3), vec![13u64]),
-        (Id::new(4, 4), vec![21u64]),
+        (Id::from_parts(4, 1), vec![3u64, 5u64]),
+        (Id::from_parts(4, 2), vec![8u64]),
+        (Id::from_parts(4, 3), vec![13u64]),
+        (Id::from_parts(4, 4), vec![21u64]),
     ];
 
     for (id, tags) in values {
@@ -3992,8 +3992,8 @@ async fn ranged_query_supports_array_values() {
     }
 
     assert_eq!(matched_ids.len(), 2);
-    assert!(matched_ids.contains(&Id::new(4, 1)));
-    assert!(matched_ids.contains(&Id::new(4, 4)));
+    assert!(matched_ids.contains(&Id::from_parts(4, 1)));
+    assert!(matched_ids.contains(&Id::from_parts(4, 4)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4121,18 +4121,18 @@ async fn bm25_search_returns_ranked_results() {
 
     let docs = vec![
         (
-            Id::new(5, 1),
+            Id::from_parts(5, 1),
             "modern database storage engine with ranking support",
         ),
         (
-            Id::new(5, 2),
+            Id::from_parts(5, 2),
             "distributed transactions and consensus protocols",
         ),
         (
-            Id::new(5, 3),
+            Id::from_parts(5, 3),
             "ranking algorithms for search and bm25 scoring",
         ),
-        (Id::new(5, 4), "cooking recipes and kitchen tips"),
+        (Id::from_parts(5, 4), "cooking recipes and kitchen tips"),
     ];
 
     for (id, text) in &docs {
@@ -4235,16 +4235,16 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
 
     let rows = vec![
         (
-            Id::new(6, 1),
+            Id::from_parts(6, 1),
             "modern database storage engine with ranking support",
             "infra",
         ),
         (
-            Id::new(6, 2),
+            Id::from_parts(6, 2),
             "ranking algorithms for search and bm25 scoring",
             "search",
         ),
-        (Id::new(6, 3), "kitchen recipes and baking tips", "infra"),
+        (Id::from_parts(6, 3), "kitchen recipes and baking tips", "infra"),
     ];
 
     for (id, body, tag) in &rows {
@@ -4286,7 +4286,7 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(6, 1)]);
+    assert_eq!(ids, vec![Id::from_parts(6, 1)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4343,13 +4343,13 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
 
     let rows = vec![
         (
-            Id::new(7, 1),
+            Id::from_parts(7, 1),
             "modern database storage engine with ranking support",
             "docs",
         ),
-        (Id::new(7, 2), "kitchen recipes and baking tips", "infra"),
+        (Id::from_parts(7, 2), "kitchen recipes and baking tips", "infra"),
         (
-            Id::new(7, 3),
+            Id::from_parts(7, 3),
             "ranking algorithms for search and bm25 scoring",
             "search",
         ),
@@ -4394,7 +4394,7 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(7, 1), Id::new(7, 2), Id::new(7, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(7, 1), Id::from_parts(7, 2), Id::from_parts(7, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4451,13 +4451,13 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
 
     let rows = vec![
         (
-            Id::new(8, 1),
+            Id::from_parts(8, 1),
             "distributed database ranking pipeline",
             30u64,
         ),
-        (Id::new(8, 2), "database ranking for analysts", 10u64),
-        (Id::new(8, 3), "ranking reports and database metrics", 20u64),
-        (Id::new(8, 4), "kitchen recipes and baking", 5u64),
+        (Id::from_parts(8, 2), "database ranking for analysts", 10u64),
+        (Id::from_parts(8, 3), "ranking reports and database metrics", 20u64),
+        (Id::from_parts(8, 4), "kitchen recipes and baking", 5u64),
     ];
 
     for (id, body, score) in &rows {
@@ -4499,7 +4499,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(8, 2), Id::new(8, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(8, 2), Id::from_parts(8, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4554,10 +4554,10 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
         .unwrap();
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
-    let exact_match_id = Id::new(10, 3);
+    let exact_match_id = Id::from_parts(10, 3);
     let rows = vec![
-        (Id::new(10, 1), "The Bill"),
-        (Id::new(10, 2), "Gate 7"),
+        (Id::from_parts(10, 1), "The Bill"),
+        (Id::from_parts(10, 2), "Gate 7"),
         (exact_match_id, "Bill Gates"),
     ];
 
@@ -4656,28 +4656,28 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
 
     let rows = vec![
         (
-            Id::new(9, 1),
+            Id::from_parts(9, 1),
             "database ranking and scoring",
             "infra",
             "active",
             "keep",
         ),
-        (Id::new(9, 2), "kitchen recipes", "ops", "active", "keep"),
+        (Id::from_parts(9, 2), "kitchen recipes", "ops", "active", "keep"),
         (
-            Id::new(9, 3),
+            Id::from_parts(9, 3),
             "database ranking handbook",
             "infra",
             "inactive",
             "keep",
         ),
         (
-            Id::new(9, 4),
+            Id::from_parts(9, 4),
             "distributed systems",
             "ops",
             "active",
             "drop",
         ),
-        (Id::new(9, 5), "travel notes", "docs", "active", "keep"),
+        (Id::from_parts(9, 5), "travel notes", "docs", "active", "keep"),
     ];
 
     for (id, body, tag, state, note) in &rows {
@@ -4734,7 +4734,7 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(9, 1), Id::new(9, 2)]);
+    assert_eq!(ids, vec![Id::from_parts(9, 1), Id::from_parts(9, 2)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4792,11 +4792,11 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     let rows = vec![
-        (Id::new(10, 1), "database ranking deep dive", "infra", 30u64),
-        (Id::new(10, 2), "ranking notes", "infra", 10u64),
-        (Id::new(10, 3), "operations handbook", "ops", 20u64),
-        (Id::new(10, 4), "ops runbook", "ops", 5u64),
-        (Id::new(10, 5), "travel guide", "docs", 50u64),
+        (Id::from_parts(10, 1), "database ranking deep dive", "infra", 30u64),
+        (Id::from_parts(10, 2), "ranking notes", "infra", 10u64),
+        (Id::from_parts(10, 3), "operations handbook", "ops", 20u64),
+        (Id::from_parts(10, 4), "ops runbook", "ops", 5u64),
+        (Id::from_parts(10, 5), "travel guide", "docs", 50u64),
     ];
 
     for (id, body, tag, score) in &rows {
@@ -4863,7 +4863,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(10, 4), Id::new(10, 2), Id::new(10, 3)]);
+    assert_eq!(ids, vec![Id::from_parts(10, 4), Id::from_parts(10, 2), Id::from_parts(10, 3)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4906,11 +4906,11 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
         (schema_id, embedding_field_id),
         vec![
             EmbeddingHit {
-                id: Id::new(11, 1),
+                id: Id::from_parts(11, 1),
                 score: 0.98,
             },
             EmbeddingHit {
-                id: Id::new(11, 2),
+                id: Id::from_parts(11, 2),
                 score: 0.90,
             },
         ],
@@ -4947,9 +4947,9 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for (id, tag) in &[
-        (Id::new(11, 1), "infra"),
-        (Id::new(11, 2), "ops"),
-        (Id::new(11, 3), "infra"),
+        (Id::from_parts(11, 1), "infra"),
+        (Id::from_parts(11, 2), "ops"),
+        (Id::from_parts(11, 3), "infra"),
     ] {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[EMB_FIELD] = OwnedValue::String("placeholder".to_string());
@@ -4992,7 +4992,7 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(11, 1)]);
+    assert_eq!(ids, vec![Id::from_parts(11, 1)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5036,11 +5036,11 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
         (schema_id, embedding_field_id),
         vec![
             EmbeddingHit {
-                id: Id::new(12, 1),
+                id: Id::from_parts(12, 1),
                 score: 0.97,
             },
             EmbeddingHit {
-                id: Id::new(12, 3),
+                id: Id::from_parts(12, 3),
                 score: 0.86,
             },
         ],
@@ -5078,10 +5078,10 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     let rows = vec![
-        (Id::new(12, 1), "infra", "keep"),
-        (Id::new(12, 2), "ops", "keep"),
-        (Id::new(12, 3), "infra", "drop"),
-        (Id::new(12, 4), "docs", "keep"),
+        (Id::from_parts(12, 1), "infra", "keep"),
+        (Id::from_parts(12, 2), "ops", "keep"),
+        (Id::from_parts(12, 3), "infra", "drop"),
+        (Id::from_parts(12, 4), "docs", "keep"),
     ];
     for (id, tag, note) in &rows {
         let mut value = OwnedValue::Map(OwnedMap::new());
@@ -5134,7 +5134,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
         ids.push(id);
     }
 
-    assert_eq!(ids, vec![Id::new(12, 1), Id::new(12, 2)]);
+    assert_eq!(ids, vec![Id::from_parts(12, 1), Id::from_parts(12, 2)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5201,7 +5201,7 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
     let mut value = OwnedValue::Map(OwnedMap::new());
     value[EMB_FIELD] = OwnedValue::String("placeholder".to_string());
     client
-        .write_cell(OwnedCell::new_with_id(schema_id, &Id::new(13, 1), value))
+        .write_cell(OwnedCell::new_with_id(schema_id, &Id::from_parts(13, 1), value))
         .await
         .unwrap()
         .unwrap();
@@ -5256,7 +5256,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..120_000u64 {
-        let id = Id::new(24, i);
+        let id = Id::from_parts(24, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 5);
         value[DATA_2] = OwnedValue::U64(i % 120_000);
@@ -5385,7 +5385,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..35_000u64 {
-        let id = Id::new(25, i);
+        let id = Id::from_parts(25, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA_1] = OwnedValue::U64(i % 17);
         value[DATA_2] = OwnedValue::U32((i % 9) as u32);
@@ -5535,7 +5535,7 @@ async fn aggregate_groups_and_computes_builtins() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[REGION] = OwnedValue::String(region.to_string());
         value[LATENCY] = latency.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
-        let cell = OwnedCell::new_with_id(schema_id, &Id::new(1, raw_id), value);
+        let cell = OwnedCell::new_with_id(schema_id, &Id::from_parts(1, raw_id), value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -5700,7 +5700,7 @@ async fn query_shapes_selected_fields() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[NAME] = OwnedValue::String(name.to_string());
         value[SCORE] = OwnedValue::U64(score);
-        let cell = OwnedCell::new_with_id(schema_id, &Id::new(3, raw_id), value);
+        let cell = OwnedCell::new_with_id(schema_id, &Id::from_parts(3, raw_id), value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -5728,7 +5728,7 @@ async fn query_shapes_selected_fields() {
     .await;
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].id, Some(Id::new(3, 0)));
+    assert_eq!(rows[0].id, Some(Id::from_parts(3, 0)));
     assert_eq!(
         rows[0].columns,
         vec![
@@ -5736,7 +5736,7 @@ async fn query_shapes_selected_fields() {
             ("score".to_string(), OwnedValue::U64(10)),
         ]
     );
-    assert_eq!(rows[1].id, Some(Id::new(3, 1)));
+    assert_eq!(rows[1].id, Some(Id::from_parts(3, 1)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5771,7 +5771,7 @@ async fn aggregate_shapes_group_and_aggregate_columns() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[REGION] = OwnedValue::String(region.to_string());
         value[LATENCY] = latency.map(OwnedValue::U64).unwrap_or(OwnedValue::Null);
-        let cell = OwnedCell::new_with_id(schema_id, &Id::new(4, raw_id), value);
+        let cell = OwnedCell::new_with_id(schema_id, &Id::from_parts(4, raw_id), value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 
@@ -5866,7 +5866,7 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[REGION] = OwnedValue::String(region.to_string());
         value[SCORE] = OwnedValue::U64(score);
-        let cell = OwnedCell::new_with_id(schema_id, &Id::new(1, raw_id), value);
+        let cell = OwnedCell::new_with_id(schema_id, &Id::from_parts(1, raw_id), value);
         client.write_cell(cell).await.unwrap().unwrap();
     }
 

@@ -163,7 +163,7 @@ impl CombinedCleaner {
                     let is_pointing_to_combined_seg = tombstone_seg_id
                         .map_or(false, |seg_id| segment_ids_to_combine.contains(&seg_id));
                     return !is_pointing_to_combined_seg // Tombstone is not pointing to a segment we are about to combine
-                        && !chunk.cell_index.contains_key(&(tombstone.hash as usize));
+                        && !chunk.cell_index.contains_key(&(tombstone.id.bits() as usize));
                     // Tombstone is not pointing to a cell that is already in the chunk;
                 }
                 return true;
@@ -180,7 +180,7 @@ impl CombinedCleaner {
                 size: entry_size,
                 addr: entry_addr,
                 timestamp: cell_header.map(|h| h.timestamp).unwrap_or(0),
-                cell_hash: cell_header.map(|h| h.hash),
+                cell_hash: cell_header.map(|h| h.id.bits()),
                 cell_ver: cell_header.map(|h| h.version).unwrap_or(0),
             };
 

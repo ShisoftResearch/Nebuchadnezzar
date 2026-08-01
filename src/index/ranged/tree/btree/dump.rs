@@ -58,7 +58,7 @@ where
                 .iter()
                 .map(|key| {
                     let id = key.id();
-                    format!("{}\t{:?}", id.lower, key)
+                    format!("{}\t{:?}", id.bits(), key)
                 })
                 .collect();
             return DebugNode {

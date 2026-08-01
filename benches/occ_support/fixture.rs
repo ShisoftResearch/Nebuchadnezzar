@@ -212,7 +212,7 @@ impl OccFixture {
                     self.group, server_id, count, start, max_probes
                 )
             });
-            let id = Id::new(candidate, candidate.rotate_left(17));
+            let id = Id::from_parts(candidate, candidate.rotate_left(17));
             if self
                 .client
                 .locate_server_id(&id)
@@ -247,7 +247,7 @@ pub fn counter_cell(schema: u32, id: Id, score: u64, payload_bytes: usize) -> Ow
     let mut data = OwnedMap::new();
     data.insert(
         &String::from("id"),
-        OwnedValue::I64(i64::try_from(id.lower).expect("counter cell id must fit in i64")),
+        OwnedValue::I64(i64::try_from(id.bits() & ((1 << 48) - 1)).expect("counter cell id must fit in i64")),
     );
     data.insert(&String::from("score"), OwnedValue::U64(score));
     data.insert(

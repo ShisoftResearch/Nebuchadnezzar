@@ -169,6 +169,21 @@ struct SegmentedPostingList {
     term_hash: u64,
 }
 
+
+/// Phase-1 interim id composition for full-text internals: a hashed-class
+/// id whose locality bits carry the document partition so posting lists
+/// stay chunk-co-located with their documents across recovery.
+/// TODO(compact-id phase 2): migrate to allocated internal ids per
+/// docs/superpowers/specs/2026-08-02-compact-cell-id-design.md — this
+/// population exceeds the hashed-class collision budget.
+fn compose_partitioned_hash_id(partition: u64, hash: u64) -> Id {
+    use dovahkiin::types::custom_types::id::{ID_LOCALITY_MASK, ID_LOCALITY_SHIFT};
+    let tag = 1u64 << 63;
+    let locality = (partition & ID_LOCALITY_MASK) << ID_LOCALITY_SHIFT;
+    let low = hash & ((1u64 << ID_LOCALITY_SHIFT) - 1);
+    Id::from_bits(tag | locality | low)
+}
+
 impl SegmentedPostingList {
     const MAX_SEGMENT_SIZE: usize = 1000;
 
@@ -183,11 +198,12 @@ impl SegmentedPostingList {
     /// Generate segment ID with the same partition as documents in this chunk
     /// This ensures posting lists are recovered to the same chunk after restart
     fn segment_id(&self, partition: u64, segment_idx: u32) -> Id {
-        // higher = partition (matches document partition for proper recovery)
-        // lower = hash of (schema_id, field_id, term_hash, segment_idx)
-        let lower =
-            Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, segment_idx)).lower;
-        Id::new(partition, lower)
+        // locality carries the partition (matches document partition for
+        // proper recovery); low bits hash (schema_id, field_id, term_hash,
+        // segment_idx).
+        let hash = Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, segment_idx))
+            .bits();
+        compose_partitioned_hash_id(partition, hash)
     }
 
     fn head_segment_id(&self, partition: u64) -> Id {
@@ -207,7 +223,7 @@ impl SegmentedPostingList {
         doc_len: u32,
     ) -> Result<(), IndexError> {
         let head_id = self.head_segment_id(partition);
-        let head_hash = head_id.lower;
+        let head_hash = head_id.bits();
 
         // Try to read existing head segment from this Chunk
         let mut head_guard = chunk.lock_or_insert_cell(head_hash);
@@ -263,15 +279,15 @@ impl SegmentedPostingList {
             .as_nanos() as u64;
         // Combine with term hash and a random component for uniqueness
         let random_component: u64 = rand::random();
-        let lower = Id::from_obj(&(
+        let hash = Id::from_obj(&(
             self.schema_id,
             self.field_id,
             self.term_hash,
             timestamp,
             random_component,
         ))
-        .lower;
-        Id::new(partition, lower)
+        .bits();
+        compose_partitioned_hash_id(partition, hash)
     }
 
     /// Iterate through all postings in this Chunk's posting list for this term
@@ -286,7 +302,7 @@ impl SegmentedPostingList {
         let mut current_id = Some(self.head_segment_id(chunk_index));
 
         while let Some(seg_id) = current_id {
-            match chunk.read_cell(seg_id.lower) {
+            match chunk.read_cell(seg_id.bits()) {
                 Ok(cell) => {
                     let owned_cell = OwnedCell {
                         header: cell.header().clone(),
@@ -512,12 +528,12 @@ impl InvertedIndexer {
 
     /// Hash key for field_stats: (schema_id, field_id) -> u64
     pub fn stats_key(schema_id: u32, field_id: u64) -> u64 {
-        Id::from_obj(&(schema_id, field_id)).lower
+        Id::from_obj(&(schema_id, field_id)).bits()
     }
 
     /// Hash key for doc_metadata: (schema_id, field_id, doc_id) -> u64
     pub fn doc_meta_key(schema_id: u32, field_id: u64, doc_id: &Id) -> u64 {
-        Id::from_obj(&(schema_id, field_id, doc_id.higher, doc_id.lower)).lower
+        Id::from_obj(&(schema_id, field_id, doc_id.bits())).bits()
     }
 
     pub fn try_overall_schema_statistics(&self, schema_id: u32) -> Option<Arc<SchemaStatistics>> {
@@ -535,7 +551,7 @@ impl InvertedIndexer {
     }
 
     fn doc_meta_cell_id(schema_id: u32, field_id: u64, doc_id: &Id) -> Id {
-        Id::from_obj(&(schema_id, field_id, doc_id.higher, doc_id.lower))
+        Id::from_obj(&(schema_id, field_id, doc_id.bits()))
     }
 
     fn mark_field_stats_dirty(&self, schema_id: u32, field_id: u64) -> u64 {
@@ -560,7 +576,7 @@ impl InvertedIndexer {
     /// This ensures data locality - document and its term postings are co-located.
     pub fn add_document(&self, meta: &FullTextIndexMeta) -> Result<(), IndexError> {
         // Get the Chunk for this document based on its partition
-        let partition = meta.cell_id.higher;
+        let partition = meta.cell_id.locality() as u64;
         let chunk_index = (partition as usize) % self.chunks.list.len();
 
         let chunk = &self.chunks.list[chunk_index];
@@ -1071,7 +1087,7 @@ impl InvertedIndexer {
 
         for (chunk_index, chunk) in self.chunks.list.iter().enumerate() {
             let head_id = seg_list.head_segment_id(chunk_index as u64);
-            let mut head_guard = match chunk.lock_cell_for_write(head_id.lower, true) {
+            let mut head_guard = match chunk.lock_cell_for_write(head_id.bits(), true) {
                 Ok(guard) => guard,
                 Err(_) => continue,
             };
@@ -1090,7 +1106,7 @@ impl InvertedIndexer {
                             total_scanned += 1;
 
                             // Check if this entry's version matches current cell version
-                            match chunk.head_cell(doc_id.lower) {
+                            match chunk.head_cell(doc_id.bits()) {
                                 Ok(doc_header) => {
                                     if doc_header.version == version {
                                         // Version matches, keep this entry
@@ -1348,10 +1364,10 @@ mod tests {
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
         for i in 0..1000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -1471,10 +1487,10 @@ mod tests {
         // Find many owned document IDs for concurrent testing
         let mut owned_doc_ids = Vec::new();
         for i in 0..10000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -1638,10 +1654,10 @@ mod tests {
         // SEGMENT_SIZE is 1000, so we need > 1000 docs with the same term
         let mut owned_doc_ids = Vec::new();
         for i in 0..100000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -1755,8 +1771,8 @@ mod tests {
         let field_id = hash_str("content") as u64;
 
         // Create test documents with text
-        let doc1_id = Id::new(1, 1);
-        let doc2_id = Id::new(1, 2);
+        let doc1_id = Id::from_parts(1, 1);
+        let doc2_id = Id::from_parts(1, 2);
 
         // Create metadata
         let meta1 = create_test_meta(schema_id, field_id, doc1_id, "hello world test");
@@ -1838,10 +1854,10 @@ mod tests {
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
         for i in 0..10000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -1983,10 +1999,10 @@ mod tests {
         let mut doc1_id = None;
         let mut doc2_id = None;
         for i in 0..100 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -2091,10 +2107,10 @@ mod tests {
         // Find an owned document ID
         let mut doc_id = None;
         for i in 0..100 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -2201,10 +2217,10 @@ mod tests {
         // Find owned document IDs
         let mut doc_ids = Vec::new();
         for i in 0..100 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -2285,8 +2301,8 @@ mod tests {
         let field_id = hash_str("content") as u64;
 
         // Create documents that will go to different chunks based on partition
-        let doc1_id = Id::new(0, 1); // Partition 0 -> Chunk 0
-        let doc2_id = Id::new(1, 2); // Partition 1 -> Chunk 1
+        let doc1_id = Id::from_parts(0, 1); // Partition 0 -> Chunk 0
+        let doc2_id = Id::from_parts(1, 2); // Partition 1 -> Chunk 1
 
         let meta1 = create_test_meta(schema_id, field_id, doc1_id, "hello world test");
         let meta2 = create_test_meta(schema_id, field_id, doc2_id, "hello universe test");
@@ -2376,16 +2392,16 @@ mod tests {
         server.meta().schemas.debug_only_new_schema(schema.clone());
 
         // Create test documents with text content
-        let doc1_id = Id::new(1, 1);
-        let doc2_id = Id::new(1, 2);
-        let doc3_id = Id::new(1, 3);
+        let doc1_id = Id::from_parts(1, 1);
+        let doc2_id = Id::from_parts(1, 2);
+        let doc3_id = Id::from_parts(1, 3);
 
         // Ensure these IDs are owned by our server
         let mut owned_doc_ids = Vec::new();
         for test_id in [doc1_id, doc2_id, doc3_id] {
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -2396,10 +2412,10 @@ mod tests {
         // If none are owned, try to find some that are
         if owned_doc_ids.is_empty() {
             for i in 0..1000 {
-                let test_id = Id::new(i, i);
+                let test_id = Id::from_parts(i, i);
                 if server
                     .consh
-                    .get_server_id(test_id.higher)
+                    .get_server_id(test_id.locality() as u64)
                     .map(|sid| sid == server.server_id)
                     .unwrap_or(false)
                 {
@@ -2597,12 +2613,12 @@ mod tests {
 
         // Find an owned document ID
         info!("Finding owned document ID...");
-        let mut doc_id = Id::new(1, 1);
+        let mut doc_id = Id::from_parts(1, 1);
         for i in 0..1000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -2823,14 +2839,14 @@ mod tests {
         let mut owned_doc_ids = Vec::new();
         let unit_id = Id::unit_id();
         for i in 0..1000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             // Skip unit ID
             if test_id == unit_id {
                 continue;
             }
             if server1
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server1.server_id)
                 .unwrap_or(false)
             {
@@ -2989,7 +3005,7 @@ mod tests {
         info!("Stats cell ID to recover: {:?}", stats_id);
         info!(
             "Stats cell partition: {}, hash: {}",
-            stats_id.higher, stats_id.lower
+            stats_id.locality() as u64, stats_id.bits()
         );
 
         // Try to read stats cell before archiving to verify it exists
@@ -2997,7 +3013,7 @@ mod tests {
         match server1.chunks().read_cell(&stats_id) {
             Ok(cell) => {
                 info!("SUCCESS: Stats cell readable before archiving! partition={}, hash={}, version={}", 
-                      cell.header().partition, cell.header().hash, cell.header().version);
+                      cell.header().id.locality(), cell.header().id.bits(), cell.header().version);
             }
             Err(e) => {
                 error!("PROBLEM: Stats cell NOT readable before archiving: {:?}", e);
@@ -3315,10 +3331,10 @@ mod tests {
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
         for i in 0..1000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server1
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server1.server_id)
                 .unwrap_or(false)
             {
@@ -3424,10 +3440,10 @@ mod tests {
         // Add new documents after recovery
         let mut new_doc_ids = Vec::new();
         for i in 1000..2000 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server2
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server2.server_id)
                 .unwrap_or(false)
             {
@@ -3539,10 +3555,10 @@ mod tests {
         // Find owned document IDs
         let mut owned_doc_ids = Vec::new();
         for i in 1000..1100 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {
@@ -3700,10 +3716,10 @@ mod tests {
 
         let mut owned_doc_ids = Vec::new();
         for i in 1100..1200 {
-            let test_id = Id::new(i, i);
+            let test_id = Id::from_parts(i, i);
             if server
                 .consh
-                .get_server_id(test_id.higher)
+                .get_server_id(test_id.locality() as u64)
                 .map(|sid| sid == server.server_id)
                 .unwrap_or(false)
             {

@@ -33,8 +33,7 @@ pub struct CellHeader {
     pub version: u64,
     pub timestamp: u32,
     pub schema: u32,
-    pub partition: u64,
-    pub hash: u64,
+    pub id: Id,
 }
 
 pub struct WriteToChunkResult {
@@ -79,20 +78,15 @@ impl CellHeader {
             version: 1,
             schema,
             timestamp: now,
-            partition: id.higher,
-            hash: id.lower,
+            id: *id,
         }
     }
 
     pub fn id(&self) -> Id {
-        Id {
-            higher: self.partition,
-            lower: self.hash,
-        }
+        self.id
     }
     pub fn set_id(&mut self, id: &Id) {
-        self.partition = id.higher;
-        self.hash = id.lower;
+        self.id = *id;
     }
 }
 
@@ -222,8 +216,7 @@ impl OwnedCell {
                 cursor.write_u64::<Endian>(new_version).unwrap();
                 cursor.write_u32::<Endian>(new_timestamp).unwrap();
                 cursor.write_u32::<Endian>(header.schema).unwrap();
-                cursor.write_u64::<Endian>(header.partition).unwrap();
-                cursor.write_u64::<Endian>(header.hash).unwrap();
+                cursor.write_u64::<Endian>(header.id.bits()).unwrap();
                 release_cursor(cursor);
                 let data_base_addr = content_addr + CELL_HEADER_SIZE;
                 debug_assert_eq!(
@@ -346,6 +339,16 @@ impl<'v> SharedCellData<'v> {
         chunk: &Chunk,
     ) -> Result<(Self, SchemaRef), ReadError> {
         let (header, data_ptr) = header_from_chunk_raw(ptr)?;
+        if header.id.bits() != hash {
+            // Stale pointer: the entry at this address no longer belongs to
+            // the requested cell (relocated or replaced). Parsing it would
+            // misinterpret another cell's bytes.
+            warn!(
+                "stale cell read: requested id bits {} found {:?} at {:#x}",
+                hash, header.id, ptr
+            );
+            return Err(ReadError::CellDoesNotExisted);
+        }
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             let compression_plan = if schema.compression_plan.is_empty() {
@@ -686,8 +689,10 @@ impl<'v> Cell for SharedCellData<'v> {
 }
 
 pub fn cell_hash_from_entry_content_addr(addr: usize) -> u64 {
+    // The cell-index key is the full id bits, stored at offset 16
+    // (version u64 + timestamp u32 + schema u32).
     let mut cursor = addr_to_header_cursor(addr);
-    cursor.seek(std::io::SeekFrom::Start(24)).unwrap();
+    cursor.seek(std::io::SeekFrom::Start(16)).unwrap();
     let hash = cursor.read_u64::<Endian>().unwrap();
     release_cursor(cursor);
     hash
@@ -699,8 +704,7 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
         version: cursor.read_u64::<Endian>().unwrap(),
         timestamp: cursor.read_u32::<Endian>().unwrap(),
         schema: cursor.read_u32::<Endian>().unwrap(),
-        partition: cursor.read_u64::<Endian>().unwrap(),
-        hash: cursor.read_u64::<Endian>().unwrap(),
+        id: Id::from_bits(cursor.read_u64::<Endian>().unwrap()),
     };
     release_cursor(cursor);
     return header;

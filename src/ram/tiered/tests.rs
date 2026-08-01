@@ -61,7 +61,7 @@ fn write_cells_for_partition(
 ) {
     for i in 0..count {
         let logical_idx = start_idx + i;
-        let id = Id::new(partition, logical_idx as u64);
+        let id = Id::allocated(partition as u16, 0, logical_idx as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(logical_idx as i64));
         data_map.insert(
@@ -82,10 +82,10 @@ fn write_cells_for_partition(
 
 fn large_string_cell(schema_id: u32, id: Id, payload_len: usize, prefix: &str) -> OwnedCell {
     let mut data_map = OwnedMap::new();
-    data_map.insert(&String::from("id"), OwnedValue::I64(id.lower as i64));
+    data_map.insert(&String::from("id"), OwnedValue::I64(id.bits() as i64));
     data_map.insert(
         &String::from("name"),
-        OwnedValue::String(format!("{}_{}", prefix, id.lower)),
+        OwnedValue::String(format!("{}_{}", prefix, id.bits())),
     );
     data_map.insert(
         &String::from("data"),
@@ -98,7 +98,7 @@ fn large_string_cell(schema_id: u32, id: Id, payload_len: usize, prefix: &str) -
 }
 
 fn segment_id_for_cell(chunks: &Arc<Chunks>, id: &Id) -> u64 {
-    let chunk = chunks.locate_chunk_by_partition(id.higher);
+    let chunk = chunks.locate_chunk_by_partition(id.locality() as u64);
     chunk.locate_segment(chunks.address_of(id)).unwrap().id
 }
 
@@ -267,7 +267,7 @@ fn test_eviction_on_memory_overflow() {
     info!("Filling with {} cells to exceed 3-segment limit", num_cells);
 
     for i in 0..num_cells {
-        let id = Id::new(schema.id as u64, i as u64);
+        let id = Id::from_parts(schema.id as u64, i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(
@@ -369,7 +369,7 @@ fn test_eviction_on_memory_overflow() {
     // Test that we can still read data from cold segments (promotion)
     // Read a few cells to trigger promotion
     for i in 0..(num_cells.min(10)) {
-        let id = Id::new(schema.id as u64, i as u64);
+        let id = Id::from_parts(schema.id as u64, i as u64);
         match chunks.read_cell(&id) {
             Ok(cell) => {
                 assert_eq!(cell.data["id"].i64().unwrap(), &(i as i64));
@@ -440,7 +440,7 @@ fn test_cold_segment_promotion() {
 
     let mut written_ids = Vec::new();
     for i in 0..num_cells {
-        let id = Id::new(schema.id as u64, 1000 + i as u64);
+        let id = Id::from_parts(schema.id as u64, 1000 + i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(1000 + i as i64));
         data_map.insert(
@@ -576,7 +576,7 @@ fn test_metrics_and_churn_counters() {
     let num_cells = cells_per_segment * 3;
 
     for i in 0..num_cells {
-        let id = Id::new(schema.id as u64, i as u64);
+        let id = Id::from_parts(schema.id as u64, i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(
@@ -779,7 +779,7 @@ fn test_blob_segments_evict_before_regular_segments() {
 
     let mut regular_segments = BTreeSet::new();
     for index in 0..64_u64 {
-        let id = Id::new(9_100, 10_000 + index);
+        let id = Id::from_parts(9_100, 10_000 + index);
         let mut cell = large_string_cell(regular.id, id, 512_000, "regular-evict");
         chunks.write_cell(&mut cell).unwrap();
         regular_segments.insert(segment_id_for_cell(&chunks, &id));
@@ -790,7 +790,7 @@ fn test_blob_segments_evict_before_regular_segments() {
 
     let mut blob_segments = BTreeSet::new();
     for index in 0..64_u64 {
-        let id = Id::new(9_200, 20_000 + index);
+        let id = Id::from_parts(9_200, 20_000 + index);
         let mut cell = large_string_cell(blob.id, id, 1_500_000, "blob-evict");
         chunks.write_cell(&mut cell).unwrap();
         blob_segments.insert(segment_id_for_cell(&chunks, &id));
@@ -922,7 +922,7 @@ fn test_blob_segments_promote_on_read_after_eviction() {
     let mut blob_cells = Vec::new();
     let mut blob_segments = BTreeSet::new();
     for index in 0..64_u64 {
-        let id = Id::new(93, index);
+        let id = Id::allocated(93, 0, index);
         let mut cell = large_string_cell(blob.id, id, 1_500_000, "blob-promote");
         chunks.write_cell(&mut cell).unwrap();
         let segment_id = segment_id_for_cell(&chunks, &id);
@@ -958,7 +958,7 @@ fn test_blob_segments_promote_on_read_after_eviction() {
     let read_back = chunks.read_cell(&cold_target_id).unwrap();
     assert_eq!(
         read_back.data["id"].i64(),
-        Some(&(cold_target_id.lower as i64))
+        Some(&(cold_target_id.bits() as i64))
     );
     drop(read_back);
 
@@ -1430,7 +1430,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
             &payload,
         );
 
-        let read_id = Id::new((round % 2) as u64, 0);
+        let read_id = Id::from_parts((round % 2) as u64, 0);
         let _ = server.chunks().read_cell(&read_id);
         let _ = analytics.chunks().read_cell(&read_id);
 
@@ -2228,7 +2228,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         let end_idx = ((batch_idx + 1) * batch_size).min(num_cells);
 
         for i in start_idx..end_idx {
-            let id = Id::new(schema.id as u64, i as u64 + 1);
+            let id = Id::from_parts(schema.id as u64, i as u64 + 1);
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(
@@ -2561,7 +2561,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     for batch in 0..(num_keys / batch_size) {
         let tx = client.begin().await.unwrap().unwrap();
         for i in (batch * batch_size)..((batch + 1) * batch_size) {
-            let id = Id::new(schema.id as u64, i as u64 + 1);
+            let id = Id::from_parts(schema.id as u64, i as u64 + 1);
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(
@@ -2773,7 +2773,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
     let batch_size = 500;
     for batch in 0..(num_keys / batch_size) {
         for i in (batch * batch_size)..((batch + 1) * batch_size) {
-            let id = Id::new(0, i as u64); // Use partition 0, unique lower values
+            let id = Id::allocated(0, 0, i as u64); // Use partition 0, unique lower values
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(
@@ -3063,7 +3063,7 @@ async fn test_direct_writes_with_tiered_memory() {
     let batch_size = 500;
     for batch in 0..(num_keys / batch_size) {
         for i in (batch * batch_size)..((batch + 1) * batch_size) {
-            let id = Id::new(0, i as u64); // Use partition 0, unique lower values
+            let id = Id::allocated(0, 0, i as u64); // Use partition 0, unique lower values
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(

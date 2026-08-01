@@ -41,7 +41,7 @@ fn compressed_string_roundtrip_to_owned() {
     );
 
     let chunks = new_chunks_with_schema(schema.clone());
-    let id = Id::new(1, 101);
+    let id = Id::allocated(1, 0, 101);
     let content = "lz4-content-".repeat(256);
 
     let mut map = OwnedMap::new();
@@ -80,7 +80,7 @@ fn compressed_bytes_roundtrip_to_owned() {
     );
 
     let chunks = new_chunks_with_schema(schema.clone());
-    let id = Id::new(1, 202);
+    let id = Id::allocated(1, 0, 202);
     let payload: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
 
     let mut map = OwnedMap::new();
@@ -154,7 +154,7 @@ fn shared_helpers_work_for_uncompressed_fields() {
     );
 
     let chunks = new_chunks_with_schema(schema.clone());
-    let id = Id::new(1, 303);
+    let id = Id::allocated(1, 0, 303);
     let plain_str = "plain-runtime-string".to_string();
     let plain_bytes = vec![1_u8, 2, 3, 4, 5, 8, 13, 21];
 

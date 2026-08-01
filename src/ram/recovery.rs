@@ -657,7 +657,7 @@ fn scan_segment_from_data(
                 &mut missing_schema_entries,
                 &mut first_missing_schema_id,
             )?;
-            let hash = cell_header.hash;
+            let hash = cell_header.id.bits();
             let new_version = cell_header.version;
 
             // Use version_map to check existing version (concurrent-safe)
@@ -704,7 +704,7 @@ fn scan_segment_from_data(
         } else if entry_header.entry_type == EntryType::TOMBSTONE {
             let content_addr = Entry::content_pos(cursor);
             let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
-            let hash = tombstone.hash;
+            let hash = tombstone.id.bits();
             tombstone_count += 1;
 
             // Use lock_or_insert to handle case where no version exists yet
@@ -1150,10 +1150,10 @@ mod tests {
     const DATA_SIZE: usize = 1024; // 1KB per cell
 
     fn default_cell(id: &Id) -> OwnedCell {
-        let data: Vec<_> = std::iter::repeat(id.lower as u8).take(DATA_SIZE).collect();
+        let data: Vec<_> = std::iter::repeat(id.bits() as u8).take(DATA_SIZE).collect();
         OwnedCell {
             header: CellHeader::new(0, id),
-            data: data_map_value!(id: id.lower as i32, data: data),
+            data: data_map_value!(id: id.bits() as i32, data: data),
         }
     }
 
@@ -1203,7 +1203,7 @@ mod tests {
 
     fn tombstone_only_segment_bytes() -> Vec<u8> {
         let mut segment = empty_segment_bytes();
-        Tombstone::put(segment.as_mut_ptr() as usize, 41, 7, 3, 9_999);
+        Tombstone::put(segment.as_mut_ptr() as usize, 41, 7, Id::from_parts(3, 9_999));
         segment
     }
 
@@ -1247,7 +1247,7 @@ mod tests {
     fn write_until_segment_count(chunks: &Arc<Chunks>, partition: u64, target_segments: usize) {
         let mut next_id = 0_u64;
         while chunks.list[0].segments().len() < target_segments {
-            let mut cell = default_cell(&Id::new(partition, next_id));
+            let mut cell = default_cell(&Id::allocated(partition as u16, 0, next_id));
             chunks.write_cell(&mut cell).unwrap();
             next_id += 1;
         }
@@ -1306,8 +1306,8 @@ mod tests {
             .schemas
             .debug_only_new_schema(blob_schema.clone());
 
-        let regular_id = Id::new(10, 1);
-        let blob_id = Id::new(10, 2);
+        let regular_id = Id::allocated(10, 0, 1);
+        let blob_id = Id::allocated(10, 0, 2);
         let mut regular_cell = OwnedCell {
             header: CellHeader::new(regular_schema.id, &regular_id),
             data: data_map_value!(id: 1_i32, data: vec![0x11_u8; DATA_SIZE]),
@@ -1362,8 +1362,8 @@ mod tests {
             .schemas
             .debug_only_new_schema(blob_schema.clone());
 
-        let first_id = Id::new(12, 1);
-        let second_id = Id::new(12, 2);
+        let first_id = Id::allocated(12, 0, 1);
+        let second_id = Id::allocated(12, 0, 2);
         let mut first_cell = OwnedCell {
             header: CellHeader::new(blob_schema.id, &first_id),
             data: data_map_value!(id: 1_i32, data: vec![0x55_u8; DATA_SIZE]),
@@ -1396,7 +1396,7 @@ mod tests {
             .schemas
             .debug_only_new_schema(regular_schema.clone());
 
-        let cell_id = Id::new(13, 1);
+        let cell_id = Id::allocated(13, 0, 1);
         let mut cell = OwnedCell {
             header: CellHeader::new(regular_schema.id, &cell_id),
             data: data_map_value!(id: 3_i32, data: vec![0x99_u8; DATA_SIZE]),
@@ -1513,7 +1513,7 @@ mod tests {
         let (_raft_dir, raft_path) = temp_raft_dir();
 
         let regular_schema = schema_with_id(113, "recovery_late_schema_registration", false);
-        let cell_id = Id::new(13, 7);
+        let cell_id = Id::allocated(13, 0, 7);
 
         {
             let schemas = LocalSchemasCache::new_local("");
@@ -1578,8 +1578,8 @@ mod tests {
 
         let regular_schema = schema_with_id(110, "recovery_regular_lane", false);
         let blob_schema = schema_with_id(111, "recovery_blob_lane", true);
-        let regular_id = Id::new(11, 1);
-        let blob_id = Id::new(11, 2);
+        let regular_id = Id::allocated(11, 0, 1);
+        let blob_id = Id::allocated(11, 0, 2);
 
         {
             let schemas = LocalSchemasCache::new_local("");
@@ -1695,8 +1695,8 @@ mod tests {
         let (_raft_dir, raft_path) = temp_raft_dir();
 
         let blob_schema = schema_with_id(112, "recovery_blob_wal_only", true);
-        let first_id = Id::new(12, 1);
-        let second_id = Id::new(12, 2);
+        let first_id = Id::allocated(12, 0, 1);
+        let second_id = Id::allocated(12, 0, 2);
         let wal_path: String;
         let backup_path: String;
         let truncated_wal: Vec<u8>;
@@ -1906,7 +1906,7 @@ mod tests {
         let (_raft_dir, raft_path) = temp_raft_dir();
 
         let recovered_seq_id = 77_u64;
-        let cell_id = Id::new(0, 1);
+        let cell_id = Id::allocated(0, 0, 1);
 
         {
             let schemas = setup_test_schema();
@@ -1991,7 +1991,7 @@ mod tests {
         let (_raft_dir, raft_path) = temp_raft_dir();
 
         // Phase 1: Create chunks, write data, and let it persist
-        let cell_ids: Vec<Id> = (0..10).map(|i| Id::new(0, i)).collect();
+        let cell_ids: Vec<Id> = (0..10).map(|i| Id::allocated(0, 0, i)).collect();
         {
             let schemas = setup_test_schema();
             let chunks = Chunks::new_with_recovery(
@@ -2058,7 +2058,7 @@ mod tests {
         let backup_dir = TempDir::new().unwrap();
         let (_raft_dir, raft_path) = temp_raft_dir();
 
-        let cell_id = Id::new(0, 42);
+        let cell_id = Id::allocated(0, 0, 42);
 
         println!("=== Phase 1: Write initial data ===");
         // Phase 1: Write initial data
@@ -2146,8 +2146,7 @@ mod tests {
                     version: 2,
                     timestamp: 200,
                     schema: 0,
-                    partition: 0,
-                    hash: cell_id.lower,
+                    id: cell_id,
                 },
                 data: data_map_value!(id: 999 as i32, data: updated_data),
             };
@@ -2225,7 +2224,7 @@ mod tests {
             );
             println!(
                 "Trying to read cell with id {:?}, hash {}",
-                cell_id, cell_id.lower
+                cell_id, cell_id.bits()
             );
 
             println!("Reading cell...");
@@ -2258,7 +2257,7 @@ mod tests {
                     if entry_header.entry_type == EntryType::CELL {
                         let content_addr = Entry::content_pos(cursor);
                         let header = cell_header_from_entry_content_addr(content_addr);
-                        if header.hash == hash {
+                        if header.id.bits() == hash {
                             versions.push((seg.id, header.version));
                         }
                     }
@@ -2292,7 +2291,7 @@ mod tests {
             let initial_head = chunk.get_head_seg_id();
             let mut attempts = 0;
             while chunk.get_head_seg_id() == initial_head {
-                let filler_id = Id::new(0, *filler_counter as u64);
+                let filler_id = Id::allocated(0, 0, *filler_counter as u64);
                 let mut filler = OwnedCell {
                     header: CellHeader::new(0, &filler_id),
                     data: data_map_value!(id: *filler_counter, data: vec![0xEEu8; payload_size]),
@@ -2308,7 +2307,7 @@ mod tests {
             }
         }
 
-        let cell_id = Id::new(0, 7);
+        let cell_id = Id::allocated(0, 0, 7);
         let payload_size = 128 * 1024; // 128KB payload to rotate segments with moderate writes
         let latest_version: u64;
         let latest_marker: i32;
@@ -2360,7 +2359,7 @@ mod tests {
             let v3_header = chunks.update_cell(&mut v3_cell).unwrap();
             latest_marker = 303;
 
-            let versions = collect_versions_for_hash(chunk, cell_id.lower);
+            let versions = collect_versions_for_hash(chunk, cell_id.bits());
             println!("Written versions: {:?}", versions);
             assert_eq!(versions.len(), 3, "expected three stored versions");
             let version_set: HashSet<u64> = versions.iter().map(|(_, v)| *v).collect();
@@ -2416,7 +2415,7 @@ mod tests {
             );
 
             let recovered = chunks.read_cell(&cell_id).unwrap().to_owned();
-            let recovered_versions = collect_versions_for_hash(&chunks.list[0], cell_id.lower);
+            let recovered_versions = collect_versions_for_hash(&chunks.list[0], cell_id.bits());
             println!("Recovered versions: {:?}", recovered_versions);
             assert_eq!(
                 recovered.header.version, latest_version,
@@ -2443,7 +2442,7 @@ mod tests {
         let backup_dir = TempDir::new().unwrap();
         let (_raft_dir, raft_path) = temp_raft_dir();
 
-        let cell_ids: Vec<Id> = (0..5).map(|i| Id::new(0, i)).collect();
+        let cell_ids: Vec<Id> = (0..5).map(|i| Id::allocated(0, 0, i)).collect();
 
         // Phase 1: Write cells
         {
@@ -2560,7 +2559,7 @@ mod tests {
 
             // Write enough cells to allocate multiple segments
             for i in 0..20 {
-                let mut cell = default_cell(&Id::new(0, i));
+                let mut cell = default_cell(&Id::allocated(0, 0, i));
                 chunks.write_cell(&mut cell).unwrap();
             }
 
@@ -2658,7 +2657,7 @@ mod tests {
 
             // Write a few cells
             for i in 0..5 {
-                let mut cell = default_cell(&Id::new(0, i));
+                let mut cell = default_cell(&Id::allocated(0, 0, i));
                 chunks.write_cell(&mut cell).unwrap();
             }
 
@@ -2745,7 +2744,7 @@ mod tests {
                 Some(raft_path.clone()),
             );
 
-            let mut cell = default_cell(&Id::new(0, 1));
+            let mut cell = default_cell(&Id::allocated(0, 0, 1));
             chunks.write_cell(&mut cell).unwrap();
 
             let seg = &chunks.list[0].segments()[0];
@@ -2768,7 +2767,7 @@ mod tests {
             );
 
             // Verify data integrity
-            let cell = chunks.read_cell(&Id::new(0, 1));
+            let cell = chunks.read_cell(&Id::allocated(0, 0, 1));
             assert!(cell.is_ok());
         }
     }
@@ -2815,7 +2814,7 @@ mod tests {
 
             // Write cells 0-9
             for i in 0..10 {
-                let mut cell = default_cell(&Id::new(0, i));
+                let mut cell = default_cell(&Id::allocated(0, 0, i));
                 chunks.write_cell(&mut cell).unwrap();
             }
 
@@ -2847,12 +2846,12 @@ mod tests {
             // Verify cells from cycle 1
             assert_eq!(chunks.list[0].cell_count(), 10);
             for i in 0..10 {
-                assert!(chunks.read_cell(&Id::new(0, i)).is_ok());
+                assert!(chunks.read_cell(&Id::allocated(0, 0, i)).is_ok());
             }
 
             // Write cells 10-19
             for i in 10..20 {
-                let mut cell = default_cell(&Id::new(0, i));
+                let mut cell = default_cell(&Id::allocated(0, 0, i));
                 chunks.write_cell(&mut cell).unwrap();
             }
 
@@ -2884,12 +2883,12 @@ mod tests {
             // Verify all cells from cycles 1 and 2
             assert_eq!(chunks.list[0].cell_count(), 20);
             for i in 0..20 {
-                assert!(chunks.read_cell(&Id::new(0, i)).is_ok());
+                assert!(chunks.read_cell(&Id::allocated(0, 0, i)).is_ok());
             }
 
             // Write cells 20-29
             for i in 20..30 {
-                let mut cell = default_cell(&Id::new(0, i));
+                let mut cell = default_cell(&Id::allocated(0, 0, i));
                 chunks.write_cell(&mut cell).unwrap();
             }
 
@@ -2921,8 +2920,8 @@ mod tests {
             // Verify all 30 cells from all cycles survived
             assert_eq!(chunks.list[0].cell_count(), 30);
             for i in 0..30 {
-                let cell = chunks.read_cell(&Id::new(0, i)).unwrap();
-                let expected = default_cell(&Id::new(0, i));
+                let cell = chunks.read_cell(&Id::allocated(0, 0, i)).unwrap();
+                let expected = default_cell(&Id::allocated(0, 0, i));
                 assert_eq!(cell.to_owned().data, expected.data);
             }
         }
@@ -2937,7 +2936,7 @@ mod tests {
         let backup_dir = TempDir::new().unwrap();
         let (_raft_dir, raft_path) = temp_raft_dir();
 
-        let cell_id = Id::new(0, 42);
+        let cell_id = Id::allocated(0, 0, 42);
 
         // Cycle 1: Write initial version
         {
@@ -2986,8 +2985,7 @@ mod tests {
                     version: 2,
                     timestamp: 200,
                     schema: 0,
-                    partition: 0,
-                    hash: cell_id.lower,
+                    id: cell_id,
                 },
                 data: data_map_value!(id: 42 as i32, data: updated_data),
             };
@@ -3022,8 +3020,7 @@ mod tests {
                     version: 3,
                     timestamp: 300,
                     schema: 0,
-                    partition: 0,
-                    hash: cell_id.lower,
+                    id: cell_id,
                 },
                 data: data_map_value!(id: 999 as i32, data: updated_data),
             };
@@ -3076,7 +3073,7 @@ mod tests {
         let backup_dir = TempDir::new().unwrap();
         let (_raft_dir, raft_path) = temp_raft_dir();
 
-        let cell_ids: Vec<Id> = (0..10).map(|i| Id::new(0, i)).collect();
+        let cell_ids: Vec<Id> = (0..10).map(|i| Id::allocated(0, 0, i)).collect();
 
         // Cycle 1: Write all cells
         {
@@ -3195,7 +3192,7 @@ mod tests {
 
             // Write data to different chunks
             for i in 0..30 {
-                let mut cell = default_cell(&Id::new(0, i));
+                let mut cell = default_cell(&Id::allocated(0, 0, i));
                 chunks.write_cell(&mut cell).unwrap();
             }
 
@@ -3232,7 +3229,7 @@ mod tests {
 
             // Verify all cells are accessible
             for i in 0..30 {
-                let cell = chunks.read_cell(&Id::new(0, i));
+                let cell = chunks.read_cell(&Id::allocated(0, 0, i));
                 assert!(cell.is_ok(), "Cell {} should exist", i);
             }
         }

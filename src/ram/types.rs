@@ -19,7 +19,7 @@ pub trait RandValue {
 
 impl RandValue for Id {
     fn rand() -> Self {
-        with_rand(|rng| Id::new(rng.next_u64(), rng.next_u64()))
+        with_rand(|rng| Id::hashed(rng.next_u64()))
     }
 }
 
@@ -29,7 +29,7 @@ pub trait RandId: RandValue {
 
 impl RandId for Id {
     fn rand_lower() -> Self {
-        with_rand(|rng| Id::new(0, rng.next_u64()))
+        with_rand(|rng| Id::allocated(0, 0, rng.next_u64()))
     }
 }
 
@@ -39,10 +39,7 @@ pub trait FromHeader {
 
 impl FromHeader for Id {
     fn from_header(header: &CellHeader) -> Id {
-        Id {
-            higher: header.partition,
-            lower: header.hash,
-        }
+        header.id
     }
 }
 

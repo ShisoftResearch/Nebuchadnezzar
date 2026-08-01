@@ -23,9 +23,9 @@ mod test {
         let field = 100;
 
         // Create keys with same feature value but different IDs
-        let key1 = create_entry_key(schema_id, field, 50, Id::new(1, 10));
-        let key2 = create_entry_key(schema_id, field, 50, Id::new(1, 20));
-        let key3 = create_entry_key(schema_id, field, 50, Id::new(u64::MAX, u64::MAX));
+        let key1 = create_entry_key(schema_id, field, 50, Id::from_parts(1, 10));
+        let key2 = create_entry_key(schema_id, field, 50, Id::from_parts(1, 20));
+        let key3 = create_entry_key(schema_id, field, 50, Id::from_parts(u64::MAX, u64::MAX));
 
         // Prefixes should be equal (same schema, field, feature)
         assert_eq!(key1.cmp_prefix(&key2), std::cmp::Ordering::Equal);
@@ -34,14 +34,14 @@ mod test {
         assert!(!key1.prefix_gt(&key3));
 
         // Create key with different feature value
-        let key4 = create_entry_key(schema_id, field, 51, Id::new(1, 10));
+        let key4 = create_entry_key(schema_id, field, 51, Id::from_parts(1, 10));
 
         // key4 should have greater prefix than key1
         assert!(key4.prefix_gt(&key1));
         assert!(!key1.prefix_gt(&key4));
 
         // Create key with smaller feature value
-        let key5 = create_entry_key(schema_id, field, 49, Id::new(1, 10));
+        let key5 = create_entry_key(schema_id, field, 49, Id::from_parts(1, 10));
 
         // key5 should have smaller prefix than key1
         assert!(key1.prefix_gt(&key5));
@@ -56,12 +56,12 @@ mod test {
         let feature = u64_to_feature(feature_value);
 
         // Create inclusive end key (as done in ValueRange::to_key_range)
-        let max_id = Id::new(u64::MAX, u64::MAX);
+        let max_id = Id::from_parts(u64::MAX, u64::MAX);
         let end_key = EntryKey::from_props(&max_id, &feature, field, schema_id);
 
         // Create data keys with same feature value but different IDs
-        let data_key1 = create_entry_key(schema_id, field, feature_value, Id::new(1, 10));
-        let data_key2 = create_entry_key(schema_id, field, feature_value, Id::new(1, 50));
+        let data_key1 = create_entry_key(schema_id, field, feature_value, Id::from_parts(1, 10));
+        let data_key2 = create_entry_key(schema_id, field, feature_value, Id::from_parts(1, 50));
         let data_key3 = create_entry_key(schema_id, field, feature_value, max_id);
 
         // All should have equal prefixes (should be included in inclusive range)
@@ -84,14 +84,14 @@ mod test {
         );
 
         // Create key with feature value 51 (should be excluded)
-        let data_key4 = create_entry_key(schema_id, field, 51, Id::new(1, 10));
+        let data_key4 = create_entry_key(schema_id, field, 51, Id::from_parts(1, 10));
         assert!(
             data_key4.prefix_gt(&end_key),
             "data_key4 should be > end_key"
         );
 
         // Create key with feature value 49 (should be included)
-        let data_key5 = create_entry_key(schema_id, field, 49, Id::new(1, 10));
+        let data_key5 = create_entry_key(schema_id, field, 49, Id::from_parts(1, 10));
         assert!(
             !data_key5.prefix_gt(&end_key),
             "data_key5 should not be > end_key"
@@ -109,9 +109,9 @@ mod test {
         let start_key = EntryKey::for_schema_field_feature(schema_id, field, &feature);
 
         // Create data keys
-        let data_key1 = create_entry_key(schema_id, field, 9, Id::new(1, 10));
-        let data_key2 = create_entry_key(schema_id, field, 10, Id::new(1, 10));
-        let data_key3 = create_entry_key(schema_id, field, 11, Id::new(1, 10));
+        let data_key1 = create_entry_key(schema_id, field, 9, Id::from_parts(1, 10));
+        let data_key2 = create_entry_key(schema_id, field, 10, Id::from_parts(1, 10));
+        let data_key3 = create_entry_key(schema_id, field, 11, Id::from_parts(1, 10));
 
         // data_key1 should have smaller prefix (should be skipped)
         assert!(
@@ -138,7 +138,7 @@ mod test {
         // Simulate the range query logic for [0, 50] inclusive
         let schema_id = 1;
         let field = 100;
-        let max_id = Id::new(u64::MAX, u64::MAX);
+        let max_id = Id::from_parts(u64::MAX, u64::MAX);
 
         // Create range: [0, 50] inclusive
         let start_key = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(0));
@@ -147,7 +147,7 @@ mod test {
         // Simulate iterating through values 0 to 51
         let mut included = Vec::new();
         for i in 0..=51 {
-            let data_key = create_entry_key(schema_id, field, i, Id::new(1, i));
+            let data_key = create_entry_key(schema_id, field, i, Id::from_parts(1, i));
 
             // Check start condition (inclusive)
             let skip_start = data_key.prefix_lt(&start_key);
@@ -181,20 +181,20 @@ mod test {
         // Test the specific boundary condition that's failing
         let schema_id = 1;
         let field = 100;
-        let max_id = Id::new(u64::MAX, u64::MAX);
+        let max_id = Id::from_parts(u64::MAX, u64::MAX);
 
         // Create end key for value 50 (inclusive)
         let end_key = EntryKey::from_props(&max_id, &u64_to_feature(50), field, schema_id);
 
         // Test value 49 (should be included)
-        let key49 = create_entry_key(schema_id, field, 49, Id::new(1, 49));
+        let key49 = create_entry_key(schema_id, field, 49, Id::from_parts(1, 49));
         assert!(
             !key49.prefix_gt(&end_key),
             "Value 49 should not be > end_key (should be included)"
         );
 
         // Test value 50 (should be included - this is the boundary case)
-        let key50 = create_entry_key(schema_id, field, 50, Id::new(1, 50));
+        let key50 = create_entry_key(schema_id, field, 50, Id::from_parts(1, 50));
         assert_eq!(
             key50.cmp_prefix(&end_key),
             std::cmp::Ordering::Equal,
@@ -206,7 +206,7 @@ mod test {
         );
 
         // Test value 51 (should be excluded)
-        let key51 = create_entry_key(schema_id, field, 51, Id::new(1, 51));
+        let key51 = create_entry_key(schema_id, field, 51, Id::from_parts(1, 51));
         assert!(
             key51.prefix_gt(&end_key),
             "Value 51 should be > end_key (should be excluded)"
@@ -232,7 +232,7 @@ mod test {
 
         // Insert keys with values 0 to 50
         for i in 0..=50 {
-            let key = create_entry_key(schema_id, field, i, Id::new(1, i));
+            let key = create_entry_key(schema_id, field, i, Id::from_parts(1, i));
             let inserted = tree.insert(&key);
             if i == 50 {
                 println!("Inserting value 50: inserted={}", inserted);
@@ -312,7 +312,7 @@ mod test {
         }
 
         // Also check what keys are actually in the tree around value 50
-        let key50_full = create_entry_key(schema_id, field, 50, Id::new(1, 50));
+        let key50_full = create_entry_key(schema_id, field, 50, Id::from_parts(1, 50));
         let cursor50_full = tree.seek(&key50_full, Ordering::Forward);
         if let Some(k) = cursor50_full.current() {
             let mut bytes = [0u8; 8];
@@ -333,7 +333,7 @@ mod test {
 
         // Try to understand why cursor stops at 49
         // Check if value 50 is in a separate page that's not being reached
-        let key49 = create_entry_key(schema_id, field, 49, Id::new(1, 49));
+        let key49 = create_entry_key(schema_id, field, 49, Id::from_parts(1, 49));
         let mut cursor_at_49 = tree.seek(&key49, Ordering::Forward);
         println!(
             "Cursor at 49, current: {:?}",
@@ -385,7 +385,7 @@ mod test {
 
         // Create range [0, 50] inclusive
         let start_key = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(0));
-        let max_id = Id::new(u64::MAX, u64::MAX);
+        let max_id = Id::from_parts(u64::MAX, u64::MAX);
         let end_key = EntryKey::from_props(&max_id, &u64_to_feature(50), field, schema_id);
 
         let range = Range {
@@ -465,7 +465,7 @@ mod test {
                     break;
                 }
 
-                collected.push(key.id().lower);
+                collected.push(key.id().bits() & ((1u64 << 48) - 1));
                 println!("Collected value {}", feature_value);
             } else {
                 println!("Cursor returned None");
@@ -557,7 +557,7 @@ mod test {
         use crate::index::ranged::tree::btree::storage;
         storage::start_external_nodes_write_back(&client);
 
-        let lsm_tree_id = Id::new(999, 999);
+        let lsm_tree_id = Id::from_parts(999, 999);
         let schema_id = 1;
         let field = 200;
 
@@ -566,7 +566,7 @@ mod test {
 
         // Insert keys with feature values 10..=100
         for i in 10..=100 {
-            let key = create_entry_key(schema_id, field, i, Id::new(2, i));
+            let key = create_entry_key(schema_id, field, i, Id::from_parts(2, i));
             tree.insert(&key);
         }
 
@@ -579,7 +579,7 @@ mod test {
         let collect_range = |tree: &RangedTree, start: u64, end: u64| -> Vec<u64> {
             let start_key =
                 EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(start));
-            let max_id = Id::new(u64::MAX, u64::MAX);
+            let max_id = Id::from_parts(u64::MAX, u64::MAX);
             let end_key = EntryKey::from_props(&max_id, &u64_to_feature(end), field, schema_id);
 
             let range = Range {
@@ -816,7 +816,7 @@ mod test {
         use crate::index::ranged::tree::btree::storage;
         storage::start_external_nodes_write_back(&client);
 
-        let lsm_tree_id = Id::new(888, 888);
+        let lsm_tree_id = Id::from_parts(888, 888);
         let schema_id = 1;
         let field = 300;
 
@@ -825,7 +825,7 @@ mod test {
 
         // Insert keys with feature values 10..=100 (91 items to ensure oversized mem tree)
         for i in 10..=100 {
-            let key = create_entry_key(schema_id, field, i, Id::new(3, i));
+            let key = create_entry_key(schema_id, field, i, Id::from_parts(3, i));
             tree.insert(&key);
         }
 
@@ -837,7 +837,7 @@ mod test {
         let collect_range_backward = |tree: &RangedTree, start: u64, end: u64| -> Vec<u64> {
             let start_key =
                 EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(start));
-            let max_id = Id::new(u64::MAX, u64::MAX);
+            let max_id = Id::from_parts(u64::MAX, u64::MAX);
             let end_key = EntryKey::from_props(&max_id, &u64_to_feature(end), field, schema_id);
 
             let range = Range {
@@ -1036,7 +1036,7 @@ mod test {
         println!("=== Inserting test data ===");
         // Insert products with prices ranging from 10 to 100
         for _i in 10..=100 {
-            let id = Id::new(2, _i);
+            let id = Id::from_parts(2, _i);
             let mut value = OwnedValue::Map(OwnedMap::new());
             value[PRICE_FIELD] = OwnedValue::U64(_i);
             value[NAME_FIELD] = OwnedValue::String(format!("Product {}", _i));
@@ -1344,19 +1344,19 @@ mod test {
 
         storage::start_external_nodes_write_back(&client);
 
-        let source_tree_id = Id::new(777, 777);
-        let target_tree_id = Id::new(778, 778);
+        let source_tree_id = Id::from_parts(777, 777);
+        let target_tree_id = Id::from_parts(778, 778);
         let schema_id = 1;
         let field = 400;
         let source_tree = RangedTree::create(&client, &source_tree_id).await;
         let target_tree = RangedTree::create(&client, &target_tree_id).await;
 
         for i in 10..=100 {
-            let key = create_entry_key(schema_id, field, i, Id::new(4, i));
+            let key = create_entry_key(schema_id, field, i, Id::from_parts(4, i));
             source_tree.insert(&key);
         }
 
-        let pivot = create_entry_key(schema_id, field, 60, Id::new(0, 0));
+        let pivot = create_entry_key(schema_id, field, 60, Id::from_parts(0, 0));
         let mut cursor = source_tree.seek(&pivot, Ordering::Forward);
         let mut moved_keys = Vec::new();
         while let Some(entry) = cursor.next() {
@@ -1460,7 +1460,7 @@ mod test {
         for value in shuffled {
             let ranged_client = ranged_client.clone();
             writers.push(tokio::time::timeout(Duration::from_secs(240), async move {
-                let id = Id::new(1, value as u64);
+                let id = Id::from_parts(1, value as u64);
                 let key = EntryKey::from_id(&id);
                 ranged_client.insert(&key).await
             }));
@@ -1476,7 +1476,7 @@ mod test {
 
         storage::wait_until_updated().await;
 
-        let start_id = Id::new(1, 0);
+        let start_id = Id::from_parts(1, 0);
         let mut cursor = RangedIndexerClient::seek(
             &ranged_client,
             Range::new_inclusive_opened(EntryKey::from_id(&start_id), Ordering::Forward),
@@ -1489,7 +1489,7 @@ mod test {
         assert_eq!(cursor.current(), Some(&start_id));
 
         for value in 0..expected_total {
-            let expected_id = Id::new(1, value as u64);
+            let expected_id = Id::from_parts(1, value as u64);
             let current = cursor
                 .current()
                 .expect("scan should cover every inserted key");
@@ -1587,7 +1587,7 @@ mod test {
                     let mut value = OwnedValue::Map(OwnedMap::new());
                     value[SCORE_FIELD] = OwnedValue::U64(ordinal as u64);
                     value[PAYLOAD_FIELD] = OwnedValue::U32(worker as u32);
-                    let cell = OwnedCell::new_with_id(302, &Id::new(1, ordinal as u64), value);
+                    let cell = OwnedCell::new_with_id(302, &Id::from_parts(1, ordinal as u64), value);
                     client.upsert_cell(cell).await.unwrap().unwrap();
                     if offset % 128 == 0 {
                         tokio::task::yield_now().await;

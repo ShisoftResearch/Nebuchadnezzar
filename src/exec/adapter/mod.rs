@@ -33,7 +33,7 @@ pub fn shared_with_header<'a>(
     header: &'a CellHeader,
     mut value: SharedValue<'a>,
 ) -> SharedValue<'a> {
-    let id_ptr = &header.partition as *const _ as usize as *const Id;
+    let id_ptr = &header.id as *const Id;
     unsafe {
         match &mut value {
             SharedValue::Map(m) => {

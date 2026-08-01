@@ -97,7 +97,7 @@ mod tests {
 
         for i in 0..20 {
             let indexer_clone = indexer_arc.clone();
-            let doc_id = Id::new(i, i);
+            let doc_id = Id::from_parts(i, i);
 
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
@@ -159,7 +159,7 @@ mod tests {
 
         for i in 0..num_docs {
             let indexer_clone = indexer_arc.clone();
-            let doc_id = Id::new(i, i);
+            let doc_id = Id::from_parts(i, i);
 
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
@@ -216,7 +216,7 @@ mod tests {
         // Add documents with different versions
         let versions = vec![1u64, 5u64, 10u64, 15u64, 20u64];
         for (i, &version) in versions.iter().enumerate() {
-            let doc_id = Id::new(i as u64, i as u64);
+            let doc_id = Id::from_parts(i as u64, i as u64);
             let meta = FullTextIndexMeta {
                 cell_id: doc_id,
                 version,
@@ -268,7 +268,7 @@ mod tests {
 
         for i in 0..num_docs {
             let indexer_clone = indexer.clone();
-            let doc_id = Id::new(i, i);
+            let doc_id = Id::from_parts(i, i);
 
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
@@ -324,7 +324,7 @@ mod tests {
 
         let schema_id = 104u32;
         let field_id = hash_str("content");
-        let doc_id = Id::new(1, 1);
+        let doc_id = Id::from_parts(1, 1);
         let term_hash = hash_str("updated");
 
         // Add document with version 1
@@ -400,7 +400,7 @@ mod tests {
         let mut handles = JoinSet::new();
         for i in 0..30 {
             let indexer_clone = indexer.clone();
-            let doc_id = Id::new(i, i);
+            let doc_id = Id::from_parts(i, i);
 
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
@@ -431,7 +431,7 @@ mod tests {
         // Remove first 10
         for i in 0..10 {
             let indexer_clone = indexer.clone();
-            let doc_id = Id::new(i, i);
+            let doc_id = Id::from_parts(i, i);
 
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
@@ -454,7 +454,7 @@ mod tests {
         // Add 10 new ones
         for i in 30..40 {
             let indexer_clone = indexer.clone();
-            let doc_id = Id::new(i, i);
+            let doc_id = Id::from_parts(i, i);
 
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
@@ -511,7 +511,7 @@ mod tests {
 
         for i in 0..num_ops {
             let indexer_clone = indexer.clone();
-            let doc_id = Id::new(i, i);
+            let doc_id = Id::from_parts(i, i);
 
             handles.spawn(async move {
                 let meta = FullTextIndexMeta {
@@ -567,7 +567,7 @@ mod tests {
 
         let schema_id = 107u32;
         let field_id = hash_str("content");
-        let doc_id = Id::new(1, 1);
+        let doc_id = Id::from_parts(1, 1);
 
         // Add document
         let meta1 = FullTextIndexMeta {

@@ -41,7 +41,7 @@ fn should_trace_cursor(key: &EntryKey, pattern: Option<&[u8]>) -> bool {
 
 fn cursor_trace_gap(ids: &[Id]) -> Option<(Id, Id)> {
     ids.windows(2)
-        .find(|pair| pair[0].higher == pair[1].higher && pair[1].lower != pair[0].lower + 1)
+        .find(|pair| pair[1].bits() != pair[0].bits() + 1)
         .map(|pair| (pair[0], pair[1]))
 }
 

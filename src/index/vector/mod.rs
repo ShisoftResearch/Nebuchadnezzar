@@ -623,7 +623,7 @@ mod tests {
                     .push(query_vector.clone());
 
                 Ok(vec![VectorHit {
-                    id: Id::new(0, query_vector[0] as u64),
+                    id: Id::from_parts(0, query_vector[0] as u64),
                     score: query_vector[0],
                 }])
             })
@@ -678,7 +678,7 @@ mod tests {
                     .push(query_vector.clone());
 
                 Ok(vec![VectorHit {
-                    id: Id::new(0, query_vector[0] as u64),
+                    id: Id::from_parts(0, query_vector[0] as u64),
                     score: query_vector[0],
                 }])
             })
@@ -754,7 +754,7 @@ mod tests {
         );
 
         let request = VectorPayloadInsert {
-            cell_id: Id::new(11, 12),
+            cell_id: Id::from_parts(11, 12),
             schema_id: 13,
             field_id: 14,
             metric: MetricEncoding::Chebyshev,
@@ -780,7 +780,7 @@ mod tests {
         assert_eq!(
             calls,
             vec![RecordedInsertCall {
-                cell_id: Id::new(11, 12),
+                cell_id: Id::from_parts(11, 12),
                 schema_id: 13,
                 field_id: 14,
                 metric: MetricEncoding::Chebyshev,
@@ -901,7 +901,7 @@ mod tests {
     #[test]
     fn vector_payload_insert_round_trips_through_serde() {
         let request = VectorPayloadInsert {
-            cell_id: Id::new(1, 2),
+            cell_id: Id::from_parts(1, 2),
             schema_id: 3,
             field_id: 4,
             metric: MetricEncoding::L2,

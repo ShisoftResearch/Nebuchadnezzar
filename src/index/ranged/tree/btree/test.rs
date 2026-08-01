@@ -67,7 +67,7 @@ fn deletion_set() -> Arc<DeletionSet> {
 fn init() {
     let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new(&deletion_set());
-    let id = Id::new(1, 2);
+    let id = Id::from_parts(1, 2);
     let key = EntryKey::from_id(&id);
     info!("test insertion");
     let entry_key = key.clone();
@@ -116,7 +116,7 @@ fn crd() {
         file.write_all(json.as_bytes()).unwrap();
         let mut i = 0;
         for n in nums {
-            let id = Id::new(1, n);
+            let id = Id::from_parts(1, n);
             let key = EntryKey::from_id(&id);
             debug!("{}. insert id: {}", i, n);
             tree.insert(&key);
@@ -135,7 +135,7 @@ fn crd() {
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         for i in 0..num {
             let id = cursor.current().unwrap().id();
-            let unmatched = i != id.lower;
+            let unmatched = i != id.bits();
             let check_msg = if unmatched {
                 "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-="
             } else {
@@ -146,7 +146,7 @@ fn crd() {
                 debug!(
                     "Expecting index {} encoded {:?}",
                     i,
-                    Id::new(1, i).to_binary()
+                    Id::from_parts(1, i).to_binary()
                 );
             }
             // next() returns current and advances
@@ -162,7 +162,7 @@ fn crd() {
         debug!("Forward scanning for sequence verification");
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         for i in 0..num {
-            let expected = Id::new(1, i);
+            let expected = Id::from_parts(1, i);
             debug!("Expecting id {:?}", expected);
             let id = cursor.current().unwrap().id();
             assert_eq!(id, expected);
@@ -181,10 +181,10 @@ fn crd() {
     {
         debug!("Backward scanning for sequence verification");
         // search backward required max possible id
-        let entry_key = EntryKey::from_id(&Id::new(::std::u64::MAX, ::std::u64::MAX));
+        let entry_key = EntryKey::from_id(&Id::from_parts(::std::u64::MAX, ::std::u64::MAX));
         let mut cursor = tree.seek(&entry_key, Ordering::Backward);
         for i in (0..num).rev() {
-            let expected = Id::new(1, i);
+            let expected = Id::from_parts(1, i);
             debug!("Expecting id {:?}", expected);
             let id = cursor.current().unwrap().id();
             assert_eq!(id, expected, "{}", i);
@@ -203,7 +203,7 @@ fn crd() {
     {
         debug!("point search");
         for i in 0..num {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             let key = EntryKey::from_id(&id);
             assert_eq!(
                 tree.seek(&key, Ordering::default()).current().unwrap().id(),
@@ -227,7 +227,7 @@ pub fn alternative_insertion_pattern() {
         .unwrap();
 
     for i in 0..num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let key = EntryKey::from_id(&id);
         debug!("insert {:?}", key);
         tree.insert(&key);
@@ -239,7 +239,7 @@ pub fn alternative_insertion_pattern() {
     let die_range = Uniform::new_inclusive(1, 6).unwrap();
     let mut roll_die = rng.sample_iter(&die_range);
     for i in 0..num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let key = EntryKey::from_id(&id);
         if roll_die.next().unwrap() != 6 {
             continue;
@@ -247,7 +247,7 @@ pub fn alternative_insertion_pattern() {
         debug!("checking {:?}", &key);
         let mut cursor = tree.seek(&key, Ordering::Forward);
         for j in i..num {
-            let id = Id::new(1, j);
+            let id = Id::from_parts(1, j);
             let key = EntryKey::from_id(&id);
             assert_eq!(cursor.current(), Some(&key));
             // next() returns current and advances, so it's always Some for valid positions
@@ -292,7 +292,7 @@ fn parallel() {
     nums.as_mut_slice().shuffle(&mut rng);
     nums.par_iter().for_each(|i| {
         let i = *i;
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let key = EntryKey::from_id(&id);
         tree.insert(&key);
     });
@@ -307,7 +307,7 @@ fn parallel() {
     let mut roll_die = rng.sample_iter(&die_range);
     (0..num).collect::<Vec<_>>().iter().for_each(|i| {
         let i = *i;
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let key = EntryKey::from_id(&id);
         debug!("checking: {}", i);
         {
@@ -316,7 +316,7 @@ fn parallel() {
             if roll_die.next().unwrap() == 6 {
                 debug!("Scanning {}", num);
                 for j in i..num {
-                    let id = Id::new(1, j);
+                    let id = Id::from_parts(1, j);
                     let key = EntryKey::from_id(&id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     // next() returns current and advances
@@ -341,7 +341,7 @@ fn parallel() {
             if roll_die.next().unwrap() == 6 {
                 debug!("Scanning {}", num);
                 for j in (0..=i).rev() {
-                    let id = Id::new(1, j);
+                    let id = Id::from_parts(1, j);
                     let key = EntryKey::from_id(&id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     // next() returns current and advances
@@ -368,7 +368,7 @@ fn parallel() {
     //    nums.par_iter().for_each(|i| {
     //        debug!("Deleting {}", i);
     //        let i = *i;
-    //        let id = Id::new(0, i);
+    //        let id = Id::from_parts(0, i);
     //        let key_slice = u64_to_slice(i);
     //        let mut key = SmallVec::from_slice(&key_slice);
     //        key_with_id(&mut key, &id);
@@ -392,7 +392,7 @@ async fn level_merge() {
     let tree_2 = Arc::new(LevelBPlusTree::new(&deletion));
     for i in 0..range {
         let n = i * 2;
-        let id = Id::new(1, n);
+        let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
         debug!("insert id: {}", n);
         let entry_key = key.clone();
@@ -401,7 +401,7 @@ async fn level_merge() {
 
     for i in 0..range {
         let n = i * 2 + 1;
-        let id = Id::new(1, n);
+        let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
         debug!("insert id: {}", n);
         tree_2.insert(&key);
@@ -425,12 +425,12 @@ async fn level_merge() {
 
     for i in 0..range {
         let n2 = i * 2 + 1;
-        let id2 = Id::new(1, n2);
+        let id2 = Id::from_parts(1, n2);
         let key2 = EntryKey::from_id(&id2);
         let key2_cur = tree_2.seek(&key2, Ordering::Forward);
         if (i as usize) < merged {
             let n1 = i * 2;
-            let id1 = Id::new(1, n1);
+            let id1 = Id::from_parts(1, n1);
             let key1 = EntryKey::from_id(&id1);
             let mut key1_cur = tree_2.seek(&key1, Ordering::Forward);
             assert_eq!(key1_cur.current().unwrap(), &key1);
@@ -465,7 +465,7 @@ fn level_merge_insertion() {
         .collect_vec();
     for i in tree_nums {
         let n = i as u64;
-        let id = Id::new(1, n);
+        let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
         assert!(tree.insert(&key));
     }
@@ -477,7 +477,7 @@ fn level_merge_insertion() {
     let th1 = thread::spawn(move || {
         insert_nums.into_par_iter().for_each(|i| {
             let n = i as u64;
-            let id = Id::new(1, n);
+            let id = Id::from_parts(1, n);
             let key = EntryKey::from_id(&id);
             assert!(tree_2.insert(&key));
         });
@@ -488,7 +488,7 @@ fn level_merge_insertion() {
         .into_iter()
         .map(|i| {
             let n = i as u64;
-            let id = Id::new(1, n);
+            let id = Id::from_parts(1, n);
             let entry_key = EntryKey::from_id(&id);
             entry_key
         })
@@ -506,7 +506,7 @@ fn level_merge_insertion() {
     numbers.sort();
     for num in numbers {
         let n = num as u64;
-        let id = Id::new(1, n);
+        let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
         let cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(&key, cursor.current().unwrap());
@@ -529,7 +529,7 @@ fn reconstruct() {
         let mut nodes = vec![];
         let mut last_node = new_node();
         for i in 0..num {
-            let id = Id::new(1, i);
+            let id = Id::from_parts(1, i);
             let key = EntryKey::from_id(&id);
             if last_node.len == TINY_PAGE_SIZE {
                 last_node.right_bound = key.clone();
@@ -576,7 +576,7 @@ fn reconstruct() {
     };
     dump_tree(&tree, "reconstruct_first_run_dump.json");
     for n in 0..num {
-        let id = Id::new(1, n);
+        let id = Id::from_parts(1, n);
         let key = EntryKey::from_id(&id);
         let cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(&key, cursor.current().unwrap());

@@ -86,7 +86,7 @@ mod tests {
         for i in shuffled_inserts {
             let index_client = index_client.clone();
             futs.push(tokio::time::timeout(Duration::from_secs(240), async move {
-                let id = Id::new(1, i as u64);
+                let id = Id::from_parts(1, i as u64);
                 let key = EntryKey::from_id(&id);
                 index_client.insert(&key).await
             }));
@@ -99,7 +99,7 @@ mod tests {
         for (i, num) in shuffled_checks.into_iter().enumerate() {
             let index_client = index_client.clone();
             futs.push(tokio::spawn(async move {
-                let id = Id::new(1, num as u64);
+                let id = Id::from_parts(1, num as u64);
                 let key = EntryKey::from_id(&id);
                 let rt_cursor = client::RangedIndexerClient::seek(
                     &index_client,
@@ -118,7 +118,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(5)).await;
         storage::wait_until_updated().await;
 
-        let start_id = Id::new(1, 0);
+        let start_id = Id::from_parts(1, 0);
         let mut rt_cursor = client::RangedIndexerClient::seek(
             &index_client,
             Range::new_inclusive_opened(EntryKey::from_id(&start_id), Ordering::Forward),
@@ -130,7 +130,7 @@ mod tests {
         .unwrap();
         assert_eq!(rt_cursor.current(), Some(&start_id));
         for (i, num) in nums.iter().enumerate() {
-            let id = Id::new(1, *num as u64);
+            let id = Id::from_parts(1, *num as u64);
             let current = rt_cursor.current().expect(&format!("Checking {}", num));
             assert_eq!(
                 &id, current,
@@ -219,7 +219,7 @@ mod tests {
                     if remaining.is_zero() {
                         break;
                     }
-                    let id = Id::new((worker as u64) + 1, seq);
+                    let id = Id::from_parts((worker as u64) + 1, seq);
                     let key = EntryKey::from_id(&id);
                     let inserted =
                         timeout(per_insert_timeout.min(remaining), index_client.insert(&key))
@@ -257,7 +257,7 @@ mod tests {
         for worker in 0..workers {
             let last_seq = last_successful_seq[worker].load(AtomicOrdering::Acquire);
             assert_ne!(last_seq, u64::MAX, "worker {} inserted no keys", worker);
-            let id = Id::new((worker as u64) + 1, last_seq);
+            let id = Id::from_parts((worker as u64) + 1, last_seq);
             let key = EntryKey::from_id(&id);
             let cursor = client::RangedIndexerClient::seek(
                 &index_client,

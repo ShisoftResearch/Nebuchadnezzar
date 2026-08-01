@@ -19,7 +19,7 @@ fn deletion_set() -> Arc<DeletionSet> {
 }
 
 fn key_of(n: u64) -> EntryKey {
-    EntryKey::from_id(&Id::new(1, n))
+    EntryKey::from_id(&Id::from_parts(1, n))
 }
 
 // A backward seek on an empty tree must yield an empty cursor, not a
@@ -103,8 +103,8 @@ fn backward_seek_before_min_is_empty() {
     for n in 0..50u64 {
         assert!(tree.insert(&key_of(n)));
     }
-    // key_of uses Id::new(1, n); an id with higher=0 sorts before all of them.
-    let before_min = EntryKey::from_id(&Id::new(0, 42));
+    // key_of uses Id::from_parts(1, n); an id with higher=0 sorts before all of them.
+    let before_min = EntryKey::from_id(&Id::from_parts(0, 42));
     let cursor = tree.seek(&before_min, Ordering::Backward);
     assert_eq!(
         cursor.current(),
@@ -367,7 +367,7 @@ fn structural_split_off_randomized() {
         let mut src: Vec<u64> = vec![];
         let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
         while let Some(k) = c.next() {
-            src.push(k.id().lower);
+            src.push(k.id().bits() & ((1u64 << 48) - 1));
         }
         assert!(verification::is_tree_in_order(&tree, 0), "src not in order");
         let mut moved: Vec<u64> = vec![];
@@ -376,7 +376,7 @@ fn structural_split_off_randomized() {
             assert!(verification::is_tree_in_order(&nt, 0), "moved not in order");
             let mut c = nt.seek(&min_entry_key(), Ordering::Forward);
             while let Some(k) = c.next() {
-                moved.push(k.id().lower);
+                moved.push(k.id().bits() & ((1u64 << 48) - 1));
             }
             assert_eq!(moved.len(), so.moved_len, "moved_len");
         }
@@ -415,7 +415,7 @@ fn spine_split_matches_split_off() {
         let mut src: Vec<u64> = vec![];
         let mut c = tree.seek(&min_entry_key(), Ordering::Forward);
         while let Some(k) = c.next() {
-            src.push(k.id().lower);
+            src.push(k.id().bits() & ((1u64 << 48) - 1));
         }
         assert!(verification::is_tree_in_order(&tree, 0), "spine src not in order (n={}, pivot={})", n, pivot_v);
         let mut moved: Vec<u64> = vec![];
@@ -424,7 +424,7 @@ fn spine_split_matches_split_off() {
             assert!(verification::is_tree_in_order(&nt, 0), "spine moved not in order (n={}, pivot={})", n, pivot_v);
             let mut c = nt.seek(&min_entry_key(), Ordering::Forward);
             while let Some(k) = c.next() {
-                moved.push(k.id().lower);
+                moved.push(k.id().bits() & ((1u64 << 48) - 1));
             }
             assert_eq!(moved.len(), so.moved_len, "spine moved_len (n={}, pivot={})", n, pivot_v);
         }

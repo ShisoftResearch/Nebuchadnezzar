@@ -19,10 +19,10 @@ pub const DATA_SIZE: usize = 1000 * 1024; // nearly 1MB
 const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 fn default_cell(id: &Id) -> OwnedCell {
-    let data: Vec<_> = std::iter::repeat(id.lower as u8).take(DATA_SIZE).collect();
+    let data: Vec<_> = std::iter::repeat(id.bits() as u8).take(DATA_SIZE).collect();
     OwnedCell {
         header: CellHeader::new(0, id),
-        data: data_map_value!(id: id.lower as i32, data: data),
+        data: data_map_value!(id: id.bits() as i32, data: data),
     }
 }
 
@@ -56,7 +56,7 @@ pub fn full_clean_cycle_without_compact() {
 
         // put 16 cells to fill up all of those segments allocated
         for i in 0..16 {
-            let mut cell = default_cell(&Id::new(0, i));
+            let mut cell = default_cell(&Id::allocated(0, 0, i));
             chunks.write_cell(&mut cell).unwrap();
         }
 
@@ -65,7 +65,7 @@ pub fn full_clean_cycle_without_compact() {
 
         // delete half the cells to create tombstones and fragmentation
         for i in 0..8 {
-            chunks.remove_cell(&Id::new(0, i * 2)).unwrap();
+            chunks.remove_cell(&Id::allocated(0, 0, i * 2)).unwrap();
         }
 
         assert_eq!(chunk.segments().len(), 2);
@@ -95,7 +95,7 @@ pub fn full_clean_cycle_without_compact() {
             .map(|entry| {
                 assert_eq!(entry.meta.entry_header.entry_type, EntryType::CELL);
                 if let EntryContent::Cell(ref header) = entry.content {
-                    return header.hash;
+                    return header.id.bits();
                 } else {
                     panic!()
                 }
@@ -111,7 +111,7 @@ pub fn full_clean_cycle_without_compact() {
 
     // validate cells
     (0..8).map(|n| n * 2 + 1).for_each(|id| {
-        let id = Id::new(0, id);
+        let id = Id::allocated(0, 0, id);
         let cell = chunks.read_cell(&id).unwrap();
         assert_eq!(cell.to_owned().data, default_cell(&id).data);
     });

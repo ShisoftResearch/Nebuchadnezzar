@@ -443,19 +443,18 @@ mod test {
         let mut counter = 0;
         let mut all_keys = vec![];
         for i in 1..=cell_limit {
-            let new_id = Id::new(i, i);
+            let new_id = Id::from_parts(i, i);
             let mut value = OwnedValue::Map(OwnedMap::new());
             value[*PREV_PAGE_KEY_HASH] = OwnedValue::Id(last_id);
             value[*NEXT_PAGE_KEY_HASH] = if i < cell_limit {
-                OwnedValue::Id(Id::new(i + 1, i + 1))
+                OwnedValue::Id(Id::from_parts(i + 1, i + 1))
             } else {
                 OwnedValue::Id(Id::unit_id())
             };
             value[*KEYS_KEY_HASH] = (0..PAGE_SIZE)
                 .map(|_| {
                     counter += 1;
-                    let mut id = new_id;
-                    id.lower = counter;
+                    let id = Id::from_parts(new_id.locality() as u64, counter);
                     let key = EntryKey::from_id(&id);
                     all_keys.push(key.clone());
                     SmallBytes::from_vec(key.as_slice().to_vec())
@@ -471,7 +470,7 @@ mod test {
         }
         let deletion = Arc::new(HashSet::with_capacity(8));
         let tree = Arc::new(
-            LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion, 0)
+            LevelBPlusTree::from_head_id(&Id::from_parts(1, 1), &client, &deletion, 0)
                 .await
                 .expect("reconstruct from head id should succeed"),
         );
@@ -504,7 +503,7 @@ mod test {
 
     #[test]
     fn extnode_from_cell_rejects_missing_page_links() {
-        let page_id = Id::new(42, 42);
+        let page_id = Id::from_parts(42, 42);
         let mut value = OwnedValue::Map(OwnedMap::new());
         let key = EntryKey::from_id(&page_id);
         value[*KEYS_KEY_HASH] = vec![SmallBytes::from_vec(key.as_slice().to_vec())].value();

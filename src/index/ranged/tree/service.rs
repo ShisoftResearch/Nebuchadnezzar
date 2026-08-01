@@ -151,7 +151,7 @@ fn should_trace_range_seek(key: &EntryKey, pattern: Option<&[u8]>) -> bool {
 
 fn trace_id_gap(ids: &[Id]) -> Option<(Id, Id)> {
     ids.windows(2)
-        .find(|pair| pair[0].higher == pair[1].higher && pair[1].lower != pair[0].lower + 1)
+        .find(|pair| pair[1].bits() != pair[0].bits() + 1)
         .map(|pair| (pair[0], pair[1]))
 }
 
@@ -200,11 +200,11 @@ fn trace_seek_progress(tree_id: Id, entry: &EntryKey, progress: &[String]) {
 }
 
 fn trace_probe_missing_key(tree_id: Id, tree: &RangedTree, schema_id: u32, gap: (Id, Id)) {
-    if gap.1.lower != gap.0.lower + 2 || gap.0.higher != gap.1.higher {
+    if gap.1.bits() != gap.0.bits() + 2 {
         return;
     }
 
-    let missing_id = Id::new(gap.0.higher, gap.0.lower + 1);
+    let missing_id = Id::from_bits(gap.0.bits() + 1);
     let probe_key = EntryKey::for_scannable(&missing_id, schema_id);
     let mut cursor = tree.seek(&probe_key, Ordering::Forward);
     let mut seen = Vec::new();

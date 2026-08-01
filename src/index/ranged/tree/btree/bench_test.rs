@@ -23,7 +23,7 @@ fn deletion_set() -> Arc<DeletionSet> {
 }
 
 fn key_of(n: u64) -> EntryKey {
-    EntryKey::from_id(&Id::new(1, n))
+    EntryKey::from_id(&Id::from_parts(1, n))
 }
 
 fn bench_n() -> u64 {
@@ -191,7 +191,7 @@ fn bench_scan_ids() {
         let mut count = 0u64;
         let mut sum = 0u64;
         while let Some(id) = cursor.next_id() {
-            sum = sum.wrapping_add(id.lower);
+            sum = sum.wrapping_add(id.bits());
             count += 1;
         }
         assert_eq!(count, n);

@@ -11,8 +11,8 @@ pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 #[test]
 pub fn cell_rw() {
     let fields = default_fields();
-    let id1 = Id::new(1, 1);
-    let id2 = Id::new(1, 2);
+    let id1 = Id::allocated(1, 0, 1);
+    let id2 = Id::allocated(1, 0, 2);
     let schema = Schema::new_with_id(1, &String::from("dummy"), None, fields, false, false);
     let mut data = data_map_value! {
         id: 100 as i64,
@@ -33,7 +33,7 @@ pub fn cell_rw() {
     let cell_1_ptr = write_result.addr;
     {
         let (stored_cell, _) =
-            SharedCellData::from_chunk_raw(id1.lower, cell_1_ptr, &chunk).unwrap();
+            SharedCellData::from_chunk_raw(id1.bits(), cell_1_ptr, &chunk).unwrap();
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
@@ -54,7 +54,7 @@ pub fn cell_rw() {
         .unwrap();
     let cell_2_ptr = write_result.addr;
     {
-        let stored_cell = SharedCellData::from_chunk_raw(id2.lower, cell_2_ptr, &chunk)
+        let stored_cell = SharedCellData::from_chunk_raw(id2.bits(), cell_2_ptr, &chunk)
             .unwrap()
             .0;
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
@@ -62,7 +62,7 @@ pub fn cell_rw() {
         assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
     }
     {
-        let stored_cell = SharedCellData::from_chunk_raw(id1.lower, cell_1_ptr, &chunk)
+        let stored_cell = SharedCellData::from_chunk_raw(id1.bits(), cell_1_ptr, &chunk)
             .unwrap()
             .0;
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
@@ -75,8 +75,8 @@ pub fn cell_rw() {
 #[test]
 pub fn dynamic() {
     let fields = default_fields();
-    let id1 = Id::new(1, 1);
-    let id2 = Id::new(1, 2);
+    let id1 = Id::allocated(1, 0, 1);
+    let id2 = Id::allocated(1, 0, 2);
     let schema = Schema::new_with_id(1, &String::from("dummy"), None, fields, true, true);
     let mut data_map = types::OwnedMap::new();
     data_map.insert("id", OwnedValue::I64(100));

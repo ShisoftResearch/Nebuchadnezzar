@@ -14,7 +14,7 @@ use tokio_stream::StreamExt;
 #[bench]
 fn cell_construct(b: &mut Bencher) {
     b.iter(|| {
-        let id = Id::new(0, 1);
+        let id = Id::from_parts(0, 1);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value["DATA"] = OwnedValue::U64(2);
         OwnedCell::new_with_id(1, &id, value);
@@ -23,7 +23,7 @@ fn cell_construct(b: &mut Bencher) {
 
 #[bench]
 fn cell_clone(b: &mut Bencher) {
-    let id = Id::new(0, 1);
+    let id = Id::from_parts(0, 1);
     let mut value = OwnedValue::Map(OwnedMap::new());
     value["DATA"] = OwnedValue::U64(2);
     let cell = OwnedCell::new_with_id(1, &id, value);
@@ -539,7 +539,7 @@ pub async fn smoke_test() {
 
     for i in 0..num {
         // intense upsert, half delete
-        let id = Id::new(1, i / 2);
+        let id = Id::from_parts(1, i / 2);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA] = OwnedValue::U64(i);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -555,7 +555,7 @@ pub async fn smoke_test() {
     }
 
     for i in 0..num {
-        let id = Id::new(1, i);
+        let id = Id::from_parts(1, i);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA] = OwnedValue::U64(i * 2);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -632,7 +632,7 @@ pub async fn smoke_test_parallel() {
         let client_clone = client.clone();
         info!("Schduling test task {}", i);
         tasks.push(tokio::spawn(async move {
-            let id = Id::new(1, i as u64);
+            let id = Id::from_parts(1, i as u64);
             let mut rng = SmallRng::from_rng(&mut rand::rng());
             for j in 0..num {
                 debug!("Smoke test i {}, j {}", i, j);
@@ -725,7 +725,7 @@ pub async fn txn() {
     for _ in 0..num {
         client
             .transaction(|txn| async move {
-                let id = Id::new(0, 1);
+                let id = Id::from_parts(0, 1);
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value[DATA] = OwnedValue::U64(2);
                 let cell = OwnedCell::new_with_id(schema_id, &id, value);
@@ -798,7 +798,7 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
         let client_clone = client.clone();
         tasks.push(tokio::spawn(async move {
             for seq in 0..writes_per_task {
-                let id = Id::new(worker + 1, seq + 1);
+                let id = Id::from_parts(worker + 1, seq + 1);
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value[CONTENT] = OwnedValue::String(format!(
                     "shared-term worker-{worker} sequence-{seq} shared-term"
@@ -820,7 +820,7 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
         "concurrent indexed RPC writes should finish without stalling on unrelated index backlog",
     );
 
-    let sample = client.read_cell(Id::new(1, 1)).await.unwrap().unwrap();
+    let sample = client.read_cell(Id::from_parts(1, 1)).await.unwrap().unwrap();
     let content = sample.data[CONTENT].string().unwrap();
     assert!(content.contains("shared-term"));
 
@@ -1521,4 +1521,150 @@ pub async fn memory_status_test() {
     );
 
     info!("Memory status test completed successfully");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn compact_id_allocator_end_to_end() {
+    let _ = env_logger::try_init();
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &String::from("127.0.0.1:5108"),
+        "compact_id_alloc_group",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let runtime = server.current_database();
+    let allocator = runtime
+        .id_allocator()
+        .await
+        .expect("allocator claims an origin through the lease authority");
+
+    // Uniform ids: allocated class, distinct, spread over localities.
+    let mut seen = std::collections::HashSet::new();
+    let mut localities = std::collections::HashSet::new();
+    for _ in 0..1000 {
+        let id = allocator.take_uniform().await.unwrap();
+        assert!(!id.is_hashed());
+        assert_eq!(id.origin(), allocator.origin());
+        assert!(seen.insert(id), "allocator issued a duplicate id");
+        localities.insert(id.locality());
+    }
+    assert!(localities.len() > 500, "uniform locality clumped");
+
+    // Affinity ids: co-located with the anchor, still unique.
+    let anchor = allocator.take_uniform().await.unwrap();
+    for _ in 0..100 {
+        let id = allocator.take_near(&anchor).await.unwrap();
+        assert_eq!(id.locality(), anchor.locality());
+        assert!(seen.insert(id), "affinity id collided");
+    }
+
+    // A second database claims a distinct origin under its own authority.
+    let analytics = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("analytics runtime");
+    let analytics_alloc = analytics
+        .id_allocator()
+        .await
+        .expect("second database allocator");
+    let a_id = analytics_alloc.take_uniform().await.unwrap();
+    assert!(!a_id.is_hashed());
+
+    server.shutdown().await;
+}
+
+/// Round-trips a dynamic-schema cell whose static part carries an id array
+/// of every small length. The dynamic tail begins where the array data
+/// ends, so any writer/reader disagreement about the walk corrupts the
+/// type-tagged dynamic fields (regression: invalid-UTF-8 panics reading
+/// graph id-list cells under the 8-byte id layout).
+#[tokio::test(flavor = "multi_thread")]
+pub async fn dynamic_tail_layout_roundtrip_across_array_lengths() {
+    let _ = env_logger::try_init();
+    let server_addr = String::from("127.0.0.1:5219");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+            undo_log_storage: None,
+            raft_storage: None,
+        },
+        &server_addr,
+        "test",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed("next", Type::Id),
+        Field::new_unindexed_array("list", Type::Id),
+    ]);
+    let schema = Schema::new_with_id(91, &String::from("dyn_layout"), None, fields, true, false);
+    server.meta().schemas.debug_only_new_schema(schema.clone());
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            "test",
+        )
+        .await
+        .unwrap(),
+    );
+
+    for len in 0..12usize {
+        let list_ids: Vec<Id> = (0..len).map(|_| Id::rand()).collect();
+        let mut map = OwnedMap::new();
+        map.insert("next", OwnedValue::Id(Id::rand()));
+        map.insert(
+            "list",
+            OwnedValue::PrimArray(OwnedPrimArray::Id(list_ids.clone())),
+        );
+        map.insert("extra_note", OwnedValue::String(format!("note-{len}")));
+        map.insert("extra_num", OwnedValue::U64(len as u64));
+        // A dynamic entry inserted by key id only has no name: the writer
+        // cannot persist it, but its presence must not desynchronize the
+        // serialized entry count from the payload (regression: readers
+        // overran into adjacent memory and decoded garbage strings).
+        map.insert_key_id(0xdead_beef_dead_beef, OwnedValue::U64(42));
+        let id = Id::rand();
+        let cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(map));
+        client.write_cell(cell).await.unwrap().unwrap();
+        let read = client.read_cell(id).await.unwrap().unwrap();
+        assert_eq!(
+            read.data["extra_note"].string().unwrap(),
+            &format!("note-{len}"),
+            "dynamic string corrupted at list len {len}"
+        );
+        assert_eq!(read.data["extra_num"].u64().unwrap(), &(len as u64));
+        match &read.data["list"] {
+            OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => {
+                assert_eq!(ids, &list_ids, "list mismatch at len {len}")
+            }
+            other => panic!("unexpected list value at len {len}: {:?}", other),
+        }
+    }
 }
