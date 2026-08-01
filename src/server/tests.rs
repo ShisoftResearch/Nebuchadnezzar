@@ -1522,3 +1522,69 @@ pub async fn memory_status_test() {
 
     info!("Memory status test completed successfully");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+pub async fn compact_id_allocator_end_to_end() {
+    let _ = env_logger::try_init();
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 64 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &String::from("127.0.0.1:5108"),
+        "compact_id_alloc_group",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let runtime = server.current_database();
+    let allocator = runtime
+        .id_allocator()
+        .await
+        .expect("allocator claims an origin through the lease authority");
+
+    // Uniform ids: allocated class, distinct, spread over localities.
+    let mut seen = std::collections::HashSet::new();
+    let mut localities = std::collections::HashSet::new();
+    for _ in 0..1000 {
+        let id = allocator.take_uniform().await.unwrap();
+        assert!(!id.is_hashed());
+        assert_eq!(id.origin(), allocator.origin());
+        assert!(seen.insert(id), "allocator issued a duplicate id");
+        localities.insert(id.locality());
+    }
+    assert!(localities.len() > 500, "uniform locality clumped");
+
+    // Affinity ids: co-located with the anchor, still unique.
+    let anchor = allocator.take_uniform().await.unwrap();
+    for _ in 0..100 {
+        let id = allocator.take_near(&anchor).await.unwrap();
+        assert_eq!(id.locality(), anchor.locality());
+        assert!(seen.insert(id), "affinity id collided");
+    }
+
+    // A second database claims a distinct origin under its own authority.
+    let analytics = server
+        .ensure_database_runtime("analytics")
+        .await
+        .expect("analytics runtime");
+    let analytics_alloc = analytics
+        .id_allocator()
+        .await
+        .expect("second database allocator");
+    let a_id = analytics_alloc.take_uniform().await.unwrap();
+    assert!(!a_id.is_hashed());
+
+    server.shutdown().await;
+}

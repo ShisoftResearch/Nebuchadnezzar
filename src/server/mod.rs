@@ -478,6 +478,11 @@ async fn register_schema_state_machine_on_plane(
     );
     plane
         .register_state_machine(Box::new(schema_state_machine))
+        .await?;
+    // The compact-id lease authority lives on the same per-database plane.
+    let alloc_sm_id = crate::ram::id_alloc_sm::generate_scoped_sm_id(group_name, database_name);
+    plane
+        .register_state_machine(Box::new(crate::ram::id_alloc_sm::IdAllocSM::new(alloc_sm_id)))
         .await
 }
 
@@ -779,6 +784,9 @@ pub struct DatabaseRuntime {
     pub membership: Arc<ObserverClient>,
     pub raft_client: Arc<RaftClient>,
     pub neb_client: Arc<AsyncClient>,
+    /// Lazily-initialized compact-id allocator: first use claims an
+    /// origin slot from the database's lease authority.
+    id_allocator: tokio::sync::OnceCell<Arc<crate::ram::id_alloc::IdAllocator>>,
 }
 
 impl DatabaseRuntime {
@@ -814,7 +822,54 @@ impl DatabaseRuntime {
             membership,
             raft_client,
             neb_client,
+            id_allocator: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The database's compact-id allocator. First call claims an origin
+    /// slot (with a fresh fencing epoch) from the consensus lease
+    /// authority and recovers the allocation floor from its durable
+    /// lease record.
+    pub async fn id_allocator(
+        &self,
+    ) -> std::io::Result<&Arc<crate::ram::id_alloc::IdAllocator>> {
+        self.id_allocator
+            .get_or_try_init(|| async {
+                let plane_client = self
+                    .raft_client
+                    .plane(database_meta_plane_id(&self.group_name, &self.database_name));
+                let sm_id = crate::ram::id_alloc_sm::generate_scoped_sm_id(
+                    &self.group_name,
+                    &self.database_name,
+                );
+                let sm = Arc::new(crate::ram::id_alloc_sm::client::SMClient::new(
+                    sm_id,
+                    &plane_client,
+                ));
+                let holder = self.rpc.server_id;
+                let (origin, epoch) = sm
+                    .claim_origin(&holder)
+                    .await
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("origin claim consensus round failed: {e:?}"),
+                        )
+                    })?
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("origin claim refused: {e}"),
+                        )
+                    })?;
+                let store = Arc::new(crate::ram::id_alloc::RaftLeaseStore::new(sm));
+                // TODO(compact-id): feed the recovery scan's max observed
+                // sequence for this origin as the belt-and-suspenders floor.
+                let allocator =
+                    crate::ram::id_alloc::IdAllocator::recover(store, origin, epoch, 0).await?;
+                Ok(Arc::new(allocator))
+            })
+            .await
     }
 
     pub fn group_name(&self) -> &str {
