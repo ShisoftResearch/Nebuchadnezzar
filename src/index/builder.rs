@@ -469,34 +469,13 @@ impl IndexBuilder {
             schema_id
         );
         let pattern = Some(key.as_slice()[..16].to_vec());
-        // A failed insert permanently loses the index entry, so transient
-        // RPC failures (e.g. tree service still electing a leader during
-        // cluster bring-up) must be retried, not dropped.
-        let mut inserted = false;
-        let mut insert_result = None;
-        for attempt in 0..30 {
-            match indexers.ranged_client.insert(&key).await {
-                Ok(value) => {
-                    inserted = value;
-                    insert_result = Some(Ok(()));
-                    break;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "ensure_scannable: insert failed for cell_id={:?} (attempt {}): {:?}",
-                        cell_id,
-                        attempt + 1,
-                        e
-                    );
-                    insert_result = Some(Err(IndexError::RPCError(e)));
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
+        let inserted = match indexers.ranged_client.insert(&key).await {
+            Ok(inserted) => inserted,
+            Err(e) => {
+                log::error!("ensure_scannable: Failed to insert key: {:?}", e);
+                return Err(IndexError::RPCError(e));
             }
-        }
-        if let Some(Err(e)) = insert_result {
-            log::error!("ensure_scannable: Failed to insert key: {:?}", e);
-            return Err(e);
-        }
+        };
 
         for attempt in 0..32 {
             let range = crate::index::ranged::tree::service::Range::new_inclusive_opened(

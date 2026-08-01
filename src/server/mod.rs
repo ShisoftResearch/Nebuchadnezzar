@@ -1393,27 +1393,14 @@ impl NebServer {
                     .await
                 }
                 Service::RangedIndexer => {
-                    // Bounded wait: during a coordinated clusterwide load the
-                    // peers' scoped cell services come up concurrently and this
-                    // converges. A purely local ensure (e.g. reload after a
-                    // clusterwide unload) has no such coordination — peers may
-                    // legitimately not host the database yet, and the tree
-                    // loader already degrades to a fresh tree when the root's
-                    // owner is unreachable. So exhaustion is not fatal.
-                    if let Err(error) = wait_for_scoped_cell_rpc_services(
+                    wait_for_scoped_cell_rpc_services(
                         server_addr,
                         meta_members,
                         conshasing,
                         group_name,
                         database_name,
                     )
-                    .await
-                    {
-                        warn!(
-                            "proceeding with ranged indexer init before all peers are ready: {:?}",
-                            error
-                        );
-                    }
+                    .await?;
                     let tree_path = effective_opts
                         .raft_storage
                         .as_ref()
@@ -2260,6 +2247,74 @@ pub async fn init_ranged_indexer_service<C>(
         .await
         .unwrap();
     meta_plane.recover_after_register().await.unwrap();
+
+    // Establish the genesis placement through consensus. Each member
+    // prepares a candidate tree it owns and persists the root cell BEFORE
+    // proposing, so no replica can ever observe a placement whose root cell
+    // is not yet readable. The raft command picks exactly one winner; losers
+    // drop their orphan candidate cell.
+    let genesis_id = ranged::sm::MasterTreeSM::select_genesis_tree_id(
+        cons_hash,
+        rpc_server.server_id,
+    );
+    let _candidate = ranged::tree::tree::RangedTree::create(neb_client, &genesis_id).await;
+    match sm_client.try_init_genesis(&genesis_id).await {
+        Ok(true) => {
+            info!(
+                "Won ranged-index genesis election with tree {:?} for {}/{}",
+                genesis_id, group_name, database_name
+            );
+            let owner_client = match cons_hash.get_server_id_by(&genesis_id) {
+                Some(server_id) => bifrost::rpc::DEFAULT_CLIENT_POOL
+                    .get_by_id(server_id, |sid| cons_hash.to_server_name(sid))
+                    .await
+                    .map(|rpc| {
+                        ranged::tree::service::AsyncServiceClient::new_with_service_id(
+                            ranged::tree::service::generate_scoped_service_id(
+                                group_name,
+                                database_name,
+                            ),
+                            &rpc,
+                        )
+                    })
+                    .ok(),
+                None => None,
+            };
+            match owner_client {
+                Some(client) => {
+                    // The root cell already exists, so this loads the tree we
+                    // just persisted into the owning service.
+                    if let Err(e) = client
+                        .crate_tree(
+                            genesis_id,
+                            ranged::tree::service::Boundary::new(
+                                ranged::trees::min_entry_key(),
+                                ranged::trees::max_entry_key(),
+                            ),
+                            ranged::tree::tree::INITIAL_TREE_EPOCH,
+                        )
+                        .await
+                    {
+                        error!("Failed to load genesis ranged tree: {:?}", e);
+                    }
+                }
+                None => error!(
+                    "Cannot locate owner for genesis ranged tree {:?}",
+                    genesis_id
+                ),
+            }
+        }
+        Ok(false) => {
+            let _ = neb_client.remove_cell(genesis_id).await;
+        }
+        Err(e) => {
+            error!(
+                "Ranged-index genesis election failed for {}/{}: {:?}",
+                group_name, database_name, e
+            );
+            let _ = neb_client.remove_cell(genesis_id).await;
+        }
+    }
 }
 
 fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
