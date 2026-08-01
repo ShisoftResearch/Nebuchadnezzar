@@ -44,6 +44,7 @@ mod tests {
 
     /// Helper to create a mock AsyncClient (dummy for tests that don't need it)
     async fn create_mock_client() -> Arc<AsyncClient> {
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
                 chunk_size: 128 * 1024 * 1024,
@@ -58,7 +59,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29500",
+            &server_addr,
             "mock_test",
             async |_| {},
         )
@@ -69,7 +70,7 @@ mod tests {
             AsyncClient::new(
                 &server.rpc,
                 &server.membership,
-                &vec!["127.0.0.1:29500".to_string()],
+                &vec![server_addr.clone()],
                 "mock_test",
             )
             .await

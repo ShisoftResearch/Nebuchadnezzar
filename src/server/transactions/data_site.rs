@@ -1645,7 +1645,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_rejects_a_stale_present_version() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5323";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_stale_present";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -1677,7 +1677,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn partial_read_pins_and_is_repeatable_across_an_update() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5361";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_pinned_partial_read";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -1764,7 +1764,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn release_read_pins_drains_pins_and_wipes_pin_only_transaction() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5359";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_release_read_pins";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -1832,7 +1832,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn head_without_pin_does_not_snapshot_the_read() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5362";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_head_no_pin";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -1896,7 +1896,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_rejects_a_present_cell_when_absence_was_observed() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5324";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_present_vs_absent";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -1928,7 +1928,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_rejects_present_expectation_when_cell_is_missing_without_publishing_owner() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5326";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_missing_present";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -1967,7 +1967,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_rejects_duplicate_prepare_ops_without_publishing_owner() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5327";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_duplicate_ops";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2001,7 +2001,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_rejects_empty_prepare_ops_without_creating_transaction_state() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5345";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_empty_ops";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
@@ -2023,7 +2023,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_retry_rejects_different_ops_without_overwriting_original_prepare() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5328";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_retry_ops_mismatch";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2107,7 +2107,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_retry_rejects_different_coordinator_without_state_or_owner_change() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5329";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_retry_coordinator_mismatch";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2176,7 +2176,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_retry_accepts_exact_same_payload_and_reacquires_missing_owner() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5343";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_retry_idempotent";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2265,7 +2265,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_retry_exact_payload_does_not_blindly_succeed_with_foreign_owner() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5344";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_retry_foreign_owner";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2349,7 +2349,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_clock_wait_die_has_one_younger_requester() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5325";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_prepare_wait_die_clock";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2384,7 +2384,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_get_transaction_returns_single_shared_entry_per_tid() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5290";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_same_tid";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
@@ -2415,7 +2415,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn read_only_transaction_creates_no_data_site_transaction() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5358";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_read_only_stateless";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2441,7 +2441,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn end_cleans_up_many_active_transactions_without_leaking_bookkeeping() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5291";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_cleanup";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
@@ -2478,7 +2478,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn ending_one_database_transaction_does_not_wipe_same_tid_in_another_database() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5292";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_multidb";
         let server = start_transaction_test_server(address, group).await;
         let default_manager = data_manager_for_database(&server, address, group).await;
@@ -2528,7 +2528,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_end_calls_on_same_transaction_cleanup_idempotently() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5297";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_end_race";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
@@ -2580,7 +2580,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_validation_rejects_non_mutation_ops_without_panicking() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5299";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_commit_variant_validation";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;
@@ -2608,7 +2608,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_validation_requires_certified_writes_and_allows_read_only_empty_commits() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5287";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_commit_subset_validation";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2829,7 +2829,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_validation_rejects_missing_coordinator_without_mutating_storage() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5347";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_commit_missing_coordinator";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2908,7 +2908,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_validation_rejects_stale_prepared_owner_before_storage_mutation() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5346";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_commit_stale_owner";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3018,7 +3018,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn abort_validation_rejects_missing_coordinator_without_rollback() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5348";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_abort_missing_coordinator";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3110,7 +3110,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn abort_validation_rejects_stale_committed_owner_before_rollback() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5349";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_abort_stale_owner";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3238,7 +3238,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_vector_clock_stale_update_rejected_after_committed_peer_changes_version() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5351";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_concurrent_stale_update";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3293,7 +3293,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_rejects_change_after_certification() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5352";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_commit_rechecks_certified_version";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3350,7 +3350,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_remove_rejects_change_after_certification() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5353";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_remove_rechecks_certified_version";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3397,7 +3397,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_update_rejects_missing_after_certification() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5356";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_update_rechecks_missing_certification";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3458,7 +3458,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_write_rejects_insert_after_absent_certification() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5354";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_write_rechecks_absent_certification";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3513,7 +3513,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_prevalidates_full_payload_before_any_storage_mutation() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5355";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_commit_prevalidation";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3579,7 +3579,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commit_prevalidates_current_storage_state_before_partial_write() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5357";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_data_site_commit_storage_prevalidation";
         let server = start_transaction_test_server(address, group).await;
         let runtime = server.current_database();
@@ -3681,7 +3681,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cell_meta_cleanup_must_not_orphan_a_lock_being_acquired_by_insert_prepare() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5372";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_ds_cleanup_insert_race";
         let server = start_transaction_test_server(address, group).await;
         let manager = data_manager_for_database(&server, address, group).await;

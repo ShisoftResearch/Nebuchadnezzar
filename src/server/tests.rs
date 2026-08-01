@@ -49,7 +49,7 @@ pub async fn init() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5100"),
+        &crate::utils::test_port::unique_localhost_addr(),
         &String::from("test"),
         async |_| {},
     )
@@ -82,7 +82,7 @@ pub async fn explicit_database_binding_scopes_storage_roots() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5101"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "storage_scope_group",
         database_name,
         async |_| {},
@@ -130,7 +130,7 @@ pub async fn resolves_bound_database_runtime_by_name() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5102"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "database_runtime_lookup_group",
         database_name,
         async |_| {},
@@ -153,7 +153,7 @@ pub async fn resolves_bound_database_runtime_by_name() {
         "database_runtime_lookup_group"
     );
     let _ = looked_up_runtime
-        .data_client(&vec![String::from("127.0.0.1:5102")])
+        .data_client(&vec![server.rpc.address.clone()])
         .await
         .expect("database runtime should create a bound async client");
     let _ = looked_up_runtime.indexed_data_client();
@@ -183,7 +183,7 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5103"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "dynamic_database_runtime_group",
         async |_| {},
     )
@@ -229,7 +229,7 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
     assert!(names.iter().any(|name| name == "analytics"));
 
     let analytics_client = analytics_runtime
-        .data_client(&vec![String::from("127.0.0.1:5103")])
+        .data_client(&vec![server.rpc.address.clone()])
         .await
         .expect("new database runtime should create a bound client");
     assert_eq!(analytics_client.database_name(), "analytics");
@@ -261,7 +261,7 @@ pub async fn unload_database_runtime_evicts_non_default_runtime() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5104"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "runtime_unload_group",
         async |_| {},
     )
@@ -322,7 +322,7 @@ pub async fn delete_database_storage_removes_scoped_paths() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5105"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "runtime_delete_storage_group",
         "runtime_delete_storage_group",
         async |_| {},
@@ -382,7 +382,7 @@ pub async fn unload_database_runtime_unchecked_allows_default() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5106"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "runtime_unchecked_unload_group",
         async |_| {},
     )
@@ -440,7 +440,7 @@ pub async fn delete_database_storage_unchecked_allows_default() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5107"),
+        &crate::utils::test_port::unique_localhost_addr(),
         group,
         group,
         async |_| {},
@@ -493,7 +493,7 @@ pub async fn smoke_test() {
         .unwrap_or("1000".to_string())
         .parse::<u64>()
         .unwrap();
-    let server_addr = String::from("127.0.0.1:5500");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("smoke_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -576,7 +576,7 @@ pub async fn smoke_test_parallel() {
         .unwrap_or("256".to_string())
         .parse::<u64>()
         .unwrap();
-    let server_addr = String::from("127.0.0.1:5301");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("smoke_parallel_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -678,7 +678,7 @@ pub async fn txn() {
         .unwrap_or("2000".to_string())
         .parse::<u64>()
         .unwrap();
-    let server_addr = String::from("127.0.0.1:5303");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("bench_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -740,7 +740,7 @@ pub async fn txn() {
 pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier() {
     let _ = env_logger::try_init();
     const CONTENT: &'static str = "content";
-    let server_addr = String::from("127.0.0.1:5311");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("indexed_parallel_rpc_test");
 
     let server = NebServer::new_from_opts(
@@ -839,7 +839,7 @@ pub async fn schema_wal_recovery_test() {
     info!("Using raft storage path: {}", raft_path_str);
     info!("Testing WAL log replay recovery (NO snapshot)");
 
-    let server_addr = String::from("127.0.0.1:18900");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("wal_test");
 
     // === PHASE 1: Create server and add schemas (< 1000 to avoid snapshot) ===
@@ -1047,7 +1047,7 @@ pub async fn schema_snapshot_recovery_test() {
     info!("Using raft storage path: {}", raft_path_str);
 
     // Use unique port to avoid conflicts with other tests
-    let server_addr = String::from("127.0.0.1:18800");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("persistence_test");
 
     // === PHASE 1: Create server and add schemas ===
@@ -1300,8 +1300,8 @@ pub async fn schema_persistence_multiple_restarts() {
     for restart_num in 1..=3 {
         info!("=== RESTART CYCLE {} ===", restart_num);
 
-        // Use unique port for each cycle to avoid "Address already in use" errors
-        let server_addr = format!("127.0.0.1:{}", 19000 + restart_num);
+        // Use a unique port for each cycle to avoid "Address already in use" errors
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
 
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -1373,7 +1373,7 @@ pub async fn schema_persistence_multiple_restarts() {
     // Final verification: restart one more time and check all schemas exist
     info!("=== FINAL VERIFICATION ===");
     {
-        let server_addr = String::from("127.0.0.1:19004"); // Unique port for final verification
+        let server_addr = crate::utils::test_port::unique_localhost_addr(); // Unique port for final verification
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -1445,7 +1445,7 @@ pub async fn memory_status_test() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        "127.0.0.1:5400",
+        &crate::utils::test_port::unique_localhost_addr(),
         "memory_status_test",
         async |_| {},
     )
@@ -1541,7 +1541,7 @@ pub async fn compact_id_allocator_end_to_end() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5108"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "compact_id_alloc_group",
         async |_| {},
     )
@@ -1597,7 +1597,7 @@ pub async fn compact_id_allocator_end_to_end() {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn dynamic_tail_layout_roundtrip_across_array_lengths() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5219");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,

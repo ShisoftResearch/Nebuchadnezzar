@@ -402,7 +402,7 @@ mod test {
     async fn tree_reconstruct_from_head() {
         let _ = env_logger::try_init();
         let server_group = "btree-reconstruct";
-        let server_addr = String::from("127.0.0.1:5600");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 16 * 12024 * 1024,

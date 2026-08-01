@@ -206,7 +206,11 @@ async fn wait_for_transaction_count(
 #[tokio::test(flavor = "multi_thread")]
 async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     let _ = env_logger::try_init();
-    let addresses = ["127.0.0.1:5360", "127.0.0.1:5361"];
+    let address_strings = [
+        crate::utils::test_port::unique_localhost_addr(),
+        crate::utils::test_port::unique_localhost_addr(),
+    ];
+    let addresses = [address_strings[0].as_str(), address_strings[1].as_str()];
     let group = "txn_occ_prepare_settle_cleanup";
     let servers = start_occ_test_cluster(&addresses, group).await;
     let schema = install_occ_schema_on_servers(&servers);
@@ -350,7 +354,11 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_background() {
     let _ = env_logger::try_init();
-    let addresses = ["127.0.0.1:5362", "127.0.0.1:5363"];
+    let address_strings = [
+        crate::utils::test_port::unique_localhost_addr(),
+        crate::utils::test_port::unique_localhost_addr(),
+    ];
+    let addresses = [address_strings[0].as_str(), address_strings[1].as_str()];
     let group = "txn_occ_prepare_cancellation_cleanup";
     let servers = start_occ_test_cluster(&addresses, group).await;
     let schema = install_occ_schema_on_servers(&servers);
@@ -495,7 +503,7 @@ async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_backgroun
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5364";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_prepare_success_cancellation_cleanup";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -574,7 +582,7 @@ async fn cancelled_successful_prepare_rolls_back_when_response_is_not_delivered(
 #[tokio::test(flavor = "multi_thread")]
 async fn abort_queued_behind_commit_reports_already_cleanup() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5365";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_commit_abort_cleanup_race";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -625,7 +633,11 @@ async fn abort_queued_behind_commit_reports_already_cleanup() {
 #[tokio::test(flavor = "multi_thread")]
 async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
     let _ = env_logger::try_init();
-    let addresses = ["127.0.0.1:5366", "127.0.0.1:5367"];
+    let address_strings = [
+        crate::utils::test_port::unique_localhost_addr(),
+        crate::utils::test_port::unique_localhost_addr(),
+    ];
+    let addresses = [address_strings[0].as_str(), address_strings[1].as_str()];
     let group = "txn_occ_partial_abort_retry";
     let servers = start_occ_test_cluster(&addresses, group).await;
     let schema = install_occ_schema_on_servers(&servers);
@@ -752,7 +764,7 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_full_read_uses_first_snapshot() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5330";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_full";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -783,7 +795,7 @@ async fn repeatable_full_read_uses_first_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_missing_read_caches_absence() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5331";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_missing";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -807,7 +819,7 @@ async fn repeatable_missing_read_caches_absence() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_selected_and_head_share_full_snapshot() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5332";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_select_head";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -846,7 +858,7 @@ async fn repeatable_selected_and_head_share_full_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_selected_empty_fields_return_full_cached_snapshot() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5333";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_select_all";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -883,7 +895,7 @@ async fn repeatable_selected_empty_fields_return_full_cached_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_selected_dynamic_fields_fall_back_to_map_lookup() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5334";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_select_dynamic";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -922,7 +934,7 @@ async fn repeatable_selected_dynamic_fields_fall_back_to_map_lookup() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_absence_rejects_update_and_preserves_create_path() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5335";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_absence_update";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -961,7 +973,7 @@ async fn repeatable_absence_rejects_update_and_preserves_create_path() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_remove_then_write_replaces_existing_cell() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5336";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_replace_after_remove";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1006,7 +1018,7 @@ async fn repeatable_remove_then_write_replaces_existing_cell() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5337";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_blind_replace_after_remove";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1048,7 +1060,7 @@ async fn repeatable_blind_remove_then_write_replaces_existing_cell() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_blind_remove_missing_errors_immediately() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5340";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_blind_remove_missing";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1078,7 +1090,7 @@ async fn repeatable_blind_remove_missing_errors_immediately() {
 #[tokio::test(flavor = "multi_thread")]
 async fn occ_mixed_read_write_prepare_commit_updates_only_changed_cell() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5341";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_mixed_read_write_commit";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1128,7 +1140,7 @@ async fn occ_mixed_read_write_prepare_commit_updates_only_changed_cell() {
 #[tokio::test(flavor = "multi_thread")]
 async fn repeatable_blind_update_after_clock_advance_uses_transaction_observation_clock() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5342";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_repeatable_blind_update_clock";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1170,7 +1182,7 @@ async fn repeatable_blind_update_after_clock_advance_uses_transaction_observatio
 #[tokio::test(flavor = "multi_thread")]
 async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5350";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_lost_update_retry";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1252,7 +1264,7 @@ async fn lost_update_prepare_rejects_stale_retry_and_fresh_retry_succeeds() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shape_gated_reads_defer_full_cell_fetch() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5380";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_shape_gated_defer";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1334,7 +1346,7 @@ async fn shape_gated_reads_defer_full_cell_fetch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5381";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_shape_gated_certify";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1394,7 +1406,7 @@ async fn head_read_certifies_pinned_version_and_aborts_on_conflict() {
 #[tokio::test(flavor = "multi_thread")]
 async fn head_pin_survives_concurrent_non_transactional_overwrite() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5382";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_pin_survives_overwrite";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1464,7 +1476,7 @@ async fn head_pin_survives_concurrent_non_transactional_overwrite() {
 #[tokio::test(flavor = "multi_thread")]
 async fn head_pin_survives_concurrent_transactional_remove() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5383";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_pin_survives_remove";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();
@@ -1521,7 +1533,7 @@ async fn head_pin_survives_concurrent_transactional_remove() {
 #[tokio::test(flavor = "multi_thread")]
 async fn head_pin_caches_absence_across_concurrent_transactional_insert() {
     let _ = env_logger::try_init();
-    let address = "127.0.0.1:5384";
+    let address = &crate::utils::test_port::unique_localhost_addr();
     let group = "txn_occ_pin_absence_insert";
     let server = start_occ_test_server(address, group).await;
     let runtime = server.current_database();

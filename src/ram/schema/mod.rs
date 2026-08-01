@@ -1018,8 +1018,8 @@ mod tests {
         }
     }
 
-    async fn post_schema_hook_server(server_group: &str, port: u16) -> Arc<NebServer> {
-        let server_addr = format!("127.0.0.1:{port}");
+    async fn post_schema_hook_server(server_group: &str, _port: u16) -> Arc<NebServer> {
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         NebServer::new_from_opts(
             &post_schema_hook_server_options(),
             &server_addr,

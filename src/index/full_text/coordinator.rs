@@ -491,7 +491,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29511",
+            &crate::utils::test_port::unique_localhost_addr(),
             "shard1_group",
             async |_| {},
         )
@@ -513,7 +513,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29512",
+            &crate::utils::test_port::unique_localhost_addr(),
             "shard2_group",
             async |_| {},
         )
@@ -766,7 +766,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29503",
+            &crate::utils::test_port::unique_localhost_addr(),
             "single_shard_test",
             async |_| {},
         )
@@ -866,7 +866,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29504",
+            &crate::utils::test_port::unique_localhost_addr(),
             "empty_query_test",
             async |_| {},
         )

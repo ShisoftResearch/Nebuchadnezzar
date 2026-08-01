@@ -2155,7 +2155,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn stale_cleanup_preserves_abort_decisions_for_retry() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5370";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_manager_stale_abort_retry";
         let server = start_manager_test_server(address, group).await;
         let manager = server.current_database().txn_manager().unwrap().clone();
@@ -2180,7 +2180,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn affected_objs_retains_read_dependencies_for_rw_transaction() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5288";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_manager_affected_objs_rw";
         let server = start_manager_test_server(address, group).await;
         let manager = server.current_database().txn_manager().unwrap().clone();
@@ -2239,7 +2239,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn affected_objs_read_only_transaction_clears_cached_data_locally() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5298";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_manager_affected_objs_ro";
         let server = start_manager_test_server(address, group).await;
         let manager = server.current_database().txn_manager().unwrap().clone();
@@ -2281,7 +2281,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn blind_mutation_records_update_version() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5338";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_occ_blind_update_version";
         let server = start_manager_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2329,7 +2329,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn blind_mutation_records_remove_version() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5339";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_occ_blind_remove_version";
         let server = start_manager_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2373,7 +2373,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_transaction_commits_leave_manager_empty() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5293";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_manager_cleanup_single_db";
         let server = start_manager_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2447,7 +2447,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn multi_database_transaction_cleanup_stays_database_local() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5294";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_manager_cleanup_multi_db";
         let server = start_manager_test_server(address, group).await;
         let analytics_runtime = server.ensure_database_runtime("analytics").await.unwrap();
@@ -2542,7 +2542,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prepare_failure_racing_with_explicit_abort_leaves_manager_empty() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5295";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_manager_prepare_abort_race";
         let server = start_manager_test_server(address, group).await;
         let runtime = server.current_database();
@@ -2632,7 +2632,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn multi_database_prepare_abort_races_stay_isolated() {
         let _ = env_logger::try_init();
-        let address = "127.0.0.1:5296";
+        let address = &crate::utils::test_port::unique_localhost_addr();
         let group = "txn_manager_prepare_abort_multi_db";
         let server = start_manager_test_server(address, group).await;
         let analytics_runtime = server.ensure_database_runtime("analytics").await.unwrap();

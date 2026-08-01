@@ -393,7 +393,7 @@ mod tests {
     /// Helper function to create a test server
     async fn create_test_server(name: &str) -> (Arc<NebServer>, Arc<AsyncClient>) {
         let _ = env_logger::try_init();
-        let server_addr = format!("127.0.0.1:{}", 5500 + rand::random::<u16>() % 1000);
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server_group = format!("hash_index_test_{}", name);
 
         let server = NebServer::new_from_opts(

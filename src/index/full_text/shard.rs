@@ -1344,7 +1344,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29399",
+            &crate::utils::test_port::unique_localhost_addr(),
             "basic_test",
             async |_| {},
         )
@@ -1451,7 +1451,7 @@ mod tests {
         let _ = env_logger::try_init();
         info!("Starting concurrent indexing test");
 
-        let server_addr = "127.0.0.1:5710";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "concurrent_test_group";
 
         let server = crate::server::NebServer::new_from_opts(
@@ -1617,7 +1617,7 @@ mod tests {
         let _ = env_logger::try_init();
         info!("Starting concurrent indexing with segment overflow test");
 
-        let server_addr = "127.0.0.1:5711";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "overflow_test_group";
 
         let server = crate::server::NebServer::new_from_opts(
@@ -1818,7 +1818,7 @@ mod tests {
         let _ = env_logger::try_init();
         info!("Starting multi-term ranking test");
 
-        let server_addr = "127.0.0.1:5720";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "multi_term_test_group";
 
         let server = crate::server::NebServer::new_from_opts(
@@ -1991,7 +1991,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29300",
+            &crate::utils::test_port::unique_localhost_addr(),
             "hybrid_index_test",
             async |_| {},
         )
@@ -2101,7 +2101,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29301",
+            &crate::utils::test_port::unique_localhost_addr(),
             "hybrid_index_remove_test",
             async |_| {},
         )
@@ -2211,7 +2211,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29302",
+            &crate::utils::test_port::unique_localhost_addr(),
             "hybrid_index_flush_test",
             async |_| {},
         )
@@ -2297,7 +2297,7 @@ mod tests {
                 enable_recovery: false,
                 disable_storage_locks: true,
             },
-            "127.0.0.1:29303",
+            &crate::utils::test_port::unique_localhost_addr(),
             "per_chunk_index_test",
             async |_| {},
         )
@@ -2357,7 +2357,7 @@ mod tests {
         let _ = env_logger::try_init();
 
         // Set up a full NebServer with indexing enabled
-        let server_addr = "127.0.0.1:29304";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "e2e_indexing_test";
         let server = crate::server::NebServer::new_from_opts(
             &crate::server::ServerOptions {
@@ -2564,7 +2564,7 @@ mod tests {
 
         // Set up a full NebServer with indexing enabled
         // Use a unique port to avoid conflicts
-        let server_addr = "127.0.0.1:29306";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "e2e_update_remove_test";
         info!("Creating server at {}...", server_addr);
         let server_result = tokio::time::timeout(
@@ -2786,7 +2786,7 @@ mod tests {
         );
 
         // Phase 1: Create server, write cells, index them, and flush
-        let server_addr = "127.0.0.1:29307";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "recovery_test";
 
         info!("Phase 1: Creating initial server...");
@@ -3280,7 +3280,7 @@ mod tests {
         let backup_path = backup_dir.path().to_str().unwrap().to_string();
         let raft_path = raft_dir.path().join("raft").to_str().unwrap().to_string();
 
-        let server_addr = "127.0.0.1:29308";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "recovery_new_docs_test";
 
         // Phase 1: Create server, index some documents
@@ -3519,7 +3519,7 @@ mod tests {
         let _ = env_logger::try_init();
         info!("Starting phrase re-ranking test");
 
-        let server_addr = "127.0.0.1:5730";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "phrase_test_group";
 
         let server = crate::server::NebServer::new_from_opts(
@@ -3680,7 +3680,7 @@ mod tests {
     async fn test_phrase_reranking_scans_string_arrays_inside_map_cells() {
         let _ = env_logger::try_init();
 
-        let server_addr = "127.0.0.1:5731";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "phrase_array_test_group";
 
         let server = crate::server::NebServer::new_from_opts(

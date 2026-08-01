@@ -25,7 +25,7 @@ async fn scoped_txn_client(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_rapid_concurrent_updates_same_cell() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5300");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
@@ -138,7 +138,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_varying_size_concurrent_updates() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5301");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
@@ -239,7 +239,7 @@ async fn test_varying_size_concurrent_updates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_multi_cell_concurrent_transactions() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5302");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 128 * 1024 * 1024,
@@ -343,7 +343,7 @@ async fn test_multi_cell_concurrent_transactions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_rapid_commit_sequence() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5303");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
@@ -431,7 +431,7 @@ async fn test_rapid_commit_sequence() {
 #[ignore]
 async fn test_interleaved_prepare_commit() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5304");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
@@ -535,7 +535,7 @@ async fn test_interleaved_prepare_commit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn test_maximum_concurrency_stress() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5305");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 128 * 1024 * 1024,
@@ -647,7 +647,7 @@ async fn test_maximum_concurrency_stress() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 64)]
 async fn test_wikidata_import_scenario() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5306");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 128 * 1024 * 1024, // Multiple chunks like production
@@ -772,7 +772,7 @@ async fn test_wikidata_import_scenario() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_update_cell_by_stress() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5307");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     // Use unique group name to avoid conflicts with other tests
     let group_name = "test_update_cell_by_stress";
     let server = NebServer::new_from_opts(

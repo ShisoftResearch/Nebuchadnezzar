@@ -606,7 +606,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let raft_path = temp_dir.path().join("raft");
-        let server_addr = "127.0.0.1:29200";
+        let server_addr = &crate::utils::test_port::unique_localhost_addr();
         let group_name = "tree_no_persist_test";
 
         info!("=== Testing MasterTreeSM without persistence ===");

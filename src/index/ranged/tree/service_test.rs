@@ -509,7 +509,7 @@ mod test {
 
         let _ = env_logger::try_init();
         let server_group = "lsm-range-recovery";
-        let server_addr = String::from("127.0.0.1:5610");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -768,7 +768,7 @@ mod test {
 
         let _ = env_logger::try_init();
         let server_group = "lsm-range-backward-recovery";
-        let server_addr = String::from("127.0.0.1:5611");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: 64 * 1024 * 1024,
@@ -965,7 +965,7 @@ mod test {
 
         let _ = env_logger::try_init();
         let server_group = "e2e-range-recovery";
-        let server_addr = String::from("127.0.0.1:5620");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
 
         const PRICE_FIELD: &'static str = "price";
         const NAME_FIELD: &'static str = "name";
@@ -1298,7 +1298,7 @@ mod test {
 
         let _ = env_logger::try_init();
 
-        let server_addr = String::from("127.0.0.1:6727");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server_group = "split_target_publish_test";
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -1404,7 +1404,7 @@ mod test {
 
         let _ = env_logger::try_init();
 
-        let server_addr = String::from("127.0.0.1:6728");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server_group = "split_concurrent_write_stress";
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -1531,7 +1531,7 @@ mod test {
 
         let _ = env_logger::try_init();
 
-        let server_addr = String::from("127.0.0.1:6729");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server_group = "split_cell_query_stress";
         let server = NebServer::new_from_opts(
             &ServerOptions {

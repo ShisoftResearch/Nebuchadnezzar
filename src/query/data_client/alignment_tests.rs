@@ -491,7 +491,7 @@ async fn run_alignment_suite(
     schema_mode: AlignSchemaMode,
     generated: bool,
 ) {
-    let server_addr = format!("127.0.0.1:{port}");
+    let server_addr = server.rpc.address.clone();
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     let idx_client = server.indexed_data_client();
 
@@ -530,7 +530,7 @@ async fn run_projection_alignment_suite(
     schema_mode: AlignSchemaMode,
     generated: bool,
 ) {
-    let server_addr = format!("127.0.0.1:{port}");
+    let server_addr = server.rpc.address.clone();
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     let idx_client = server.indexed_data_client();
 
@@ -570,7 +570,7 @@ async fn run_aggregate_alignment_suite(
     schema_mode: AlignSchemaMode,
     generated: bool,
 ) {
-    let server_addr = format!("127.0.0.1:{port}");
+    let server_addr = server.rpc.address.clone();
     let client = server.data_client(&vec![server_addr]).await.unwrap();
     let idx_client = server.indexed_data_client();
     let trace_aggregate = log::log_enabled!(log::Level::Debug);
@@ -2090,8 +2090,10 @@ fn generated_scan_queries(dataset: &AlignDataset) -> Vec<AlignQuery> {
     ]
 }
 
+// `port` only discriminates the group name; the bind address is
+// allocated process-unique — read it back via `server.rpc.address`.
 async fn create_alignment_test_server(port: u16) -> Arc<NebServer> {
-    let server_addr = format!("127.0.0.1:{port}");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = format!("sqlite_alignment_test_{port}");
     NebServer::new_from_opts(
         &ServerOptions {

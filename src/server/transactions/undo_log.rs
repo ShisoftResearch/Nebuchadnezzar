@@ -1960,7 +1960,7 @@ mod tests {
         std::fs::create_dir_all(&raft_path).unwrap();
         let raft_path_str = raft_path.to_str().unwrap().to_string();
 
-        let server_addr = String::from("127.0.0.1:5310"); // Unique port for this test
+        let server_addr = crate::utils::test_port::unique_localhost_addr(); // Unique port for this test
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_size: SEGMENT_SIZE * 4,
@@ -2102,7 +2102,7 @@ mod tests {
         let raft_path = temp_dir.path().join("raft");
         std::fs::create_dir_all(&raft_path).unwrap();
 
-        let server_addr = String::from("127.0.0.1:5311"); // Unique port for this test
+        let server_addr = crate::utils::test_port::unique_localhost_addr(); // Unique port for this test
 
         let schema = crate::ram::schema::Schema::new_with_id(
             1,
@@ -2273,7 +2273,7 @@ mod tests {
         let wal_path = temp_dir.path().join("wal");
         let raft_path = temp_dir.path().join("raft");
 
-        let server_addr = String::from("127.0.0.1:5312"); // Unique port for this test
+        let server_addr = crate::utils::test_port::unique_localhost_addr(); // Unique port for this test
 
         let schema = crate::ram::schema::Schema::new_with_id(
             1,
@@ -2429,7 +2429,7 @@ mod tests {
         std::fs::create_dir_all(&raft_path).unwrap();
         let raft_path_str = raft_path.to_str().unwrap().to_string();
 
-        let server_addr = String::from("127.0.0.1:5320"); // Unique port for this test
+        let server_addr = crate::utils::test_port::unique_localhost_addr(); // Unique port for this test
                                                           // Use unique group name to avoid conflicts with other tests
         let group_name = "test_e2e_txn_committed_no_rollback";
         let server = NebServer::new_from_opts(

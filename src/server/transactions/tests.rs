@@ -21,7 +21,7 @@ async fn scoped_txn_client(
 #[tokio::test(flavor = "multi_thread")]
 pub async fn workspace_wr() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5200");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: SEGMENT_SIZE,
@@ -166,7 +166,7 @@ pub async fn workspace_wr() {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn data_site_wr() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5201");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
@@ -268,7 +268,7 @@ pub async fn data_site_wr() {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn data_site_commit_waits_for_hashed_indices() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5208");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = "txn_hash_commit";
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -352,7 +352,7 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn multi_transaction() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5202");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
@@ -476,7 +476,7 @@ pub async fn smoke_rw() {
     let _ = env_logger::try_init();
     // this test is likely to have unrealizable transactions and
     // should not cause any deadlock even if they failed
-    let server_addr = String::from("127.0.0.1:5203");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
@@ -560,7 +560,7 @@ pub async fn smoke_rw() {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn head_then_remove_commits() {
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:5209");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,

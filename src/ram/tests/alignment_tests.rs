@@ -65,7 +65,7 @@ fn test_alignment_validation_function() {
 async fn test_cell_location_alignment_after_write() {
     let _ = env_logger::try_init();
 
-    let server_addr = String::from("127.0.0.1:6000");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: SEGMENT_SIZE,
@@ -140,7 +140,7 @@ async fn test_cell_location_alignment_after_write() {
 async fn test_cell_location_alignment_after_update() {
     let _ = env_logger::try_init();
 
-    let server_addr = String::from("127.0.0.1:6001");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: SEGMENT_SIZE * 4,
@@ -238,7 +238,7 @@ async fn test_cell_location_alignment_after_update() {
 async fn test_varying_size_alignment() {
     let _ = env_logger::try_init();
 
-    let server_addr = String::from("127.0.0.1:6002");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: SEGMENT_SIZE * 8,
@@ -424,7 +424,7 @@ fn test_detect_misaligned_addresses() {
 async fn test_alignment_after_multiple_segments() {
     let _ = env_logger::try_init();
 
-    let server_addr = String::from("127.0.0.1:6003");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: SEGMENT_SIZE * 4,

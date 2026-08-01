@@ -656,7 +656,7 @@ mod tests {
 
         let _ = env_logger::try_init();
 
-        let server_addr = String::from("127.0.0.1:6730");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server_group = "ranged_tree_delete_recovery";
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -757,7 +757,7 @@ mod tests {
 
         let _ = env_logger::try_init();
 
-        let server_addr = String::from("127.0.0.1:6732");
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
         let server_group = "ranged_tree_mark_migration_repair";
         let server = NebServer::new_from_opts(
             &ServerOptions {

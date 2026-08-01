@@ -1287,7 +1287,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn()
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5412"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "tiered_single_db_cleaner_drift",
         async |_| {},
     )
@@ -1366,7 +1366,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5413"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "tiered_multi_db_cleaner_drift",
         async |_| {},
     )
@@ -1491,7 +1491,7 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
             enable_recovery: true,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5414"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "tiered_unload_reload_drift",
         async |_| {},
     )
@@ -1640,7 +1640,7 @@ async fn test_global_eviction_across_multiple_databases() {
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5410"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "tiered_multi_db_global",
         async |_| {},
     )
@@ -1784,7 +1784,7 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
             enable_recovery: false,
             disable_storage_locks: true,
         },
-        &String::from("127.0.0.1:5411"),
+        &crate::utils::test_port::unique_localhost_addr(),
         "tiered_multi_db_threshold_gate",
         async |_| {},
     )
@@ -2167,7 +2167,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     );
 
     // Start server
-    let server_addr = String::from("127.0.0.1:5400");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -2512,7 +2512,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
         &format!("{}", 16 * 1024 * 1024),
     );
 
-    let server_addr = String::from("127.0.0.1:5401");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let backup_dir = "/tmp/neb_stress_test_bk";
     let wal_dir = "/tmp/neb_stress_test_wal";
     let _ = std::fs::remove_dir_all(backup_dir);
@@ -2723,7 +2723,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
     let chunk_capacity = 16 * SEGMENT_SIZE; // 128MB
     let schema_id = 7777;
     let schema_name = "direct_schema";
-    let server_addr = String::from("127.0.0.1:5201");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let backup_dir = "/tmp/neb_direct_bk";
     let wal_dir = "/tmp/neb_direct_wal";
 
@@ -3008,7 +3008,7 @@ async fn test_direct_writes_with_tiered_memory() {
     let chunk_capacity = 512 * 1024 * 1024; // 512MB virtual capacity (more space for updates)
     let schema_id = 8888;
     let schema_name = "tiered_direct_schema";
-    let server_addr = String::from("127.0.0.1:5202");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let backup_dir = "/tmp/neb_tiered_direct_bk";
     let wal_dir = "/tmp/neb_tiered_direct_wal";
 

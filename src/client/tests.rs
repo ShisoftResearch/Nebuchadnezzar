@@ -16,7 +16,7 @@ use super::*;
 pub async fn database_catalog() {
     let _ = env_logger::try_init();
     let server_group = "database_catalog_test";
-    let server_addr = String::from("127.0.0.1:5399");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let database_name = "testdb_database_catalog";
     let server = NebServer::new_from_opts_in_database(
         &ServerOptions {
@@ -83,7 +83,7 @@ pub async fn database_catalog() {
 pub async fn general() {
     let _ = env_logger::try_init();
     let server_group = "general_test";
-    let server_addr = String::from("127.0.0.1:5400");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     debug!("Creating new neb server");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -237,7 +237,7 @@ pub async fn general() {
 pub async fn multi_cell_update() {
     let _ = env_logger::try_init();
     let server_group = "multi_cell_update_test";
-    let server_addr = String::from("127.0.0.1:5401");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
@@ -427,9 +427,9 @@ fn schema_validation_server_options() -> ServerOptions {
 
 async fn schema_validation_context(
     server_group: &str,
-    port: u16,
+    _port: u16,
 ) -> (Arc<NebServer>, Arc<client::AsyncClient>) {
-    let server_addr = format!("127.0.0.1:{port}");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &schema_validation_server_options(),
         &server_addr,
@@ -766,7 +766,7 @@ pub async fn rejects_non_embedding_compound_index_before_state_machine() {
 pub async fn write_skew() {
     let _ = env_logger::try_init();
     let server_group = "write_skew_test";
-    let server_addr = String::from("127.0.0.1:5402");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 16 * 1024 * 1024,
@@ -866,8 +866,8 @@ pub async fn server_isolation() {
     let _ = env_logger::try_init();
     let server_1_group = "server_isolation_test_1";
     let server_2_group = "server_isolation_test_2";
-    let server_address_1 = "127.0.0.1:5403";
-    let server_address_2 = "127.0.0.1:5404";
+    let server_address_1 = &crate::utils::test_port::unique_localhost_addr();
+    let server_address_2 = &crate::utils::test_port::unique_localhost_addr();
 
     let server_1 = NebServer::new_from_opts(
         &ServerOptions {

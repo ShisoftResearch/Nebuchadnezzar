@@ -210,7 +210,7 @@ async fn scan_all() {
     const DATA_1: &'static str = "DATA_1";
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:6701");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("indexed_scan_all_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -439,7 +439,7 @@ async fn range_query_scan() {
     const DATA_1: &'static str = "DATA_1";
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:6702");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("indexed_scan_all_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -520,9 +520,11 @@ async fn range_query_scan() {
     server.shutdown().await;
 }
 
-// Helper function to create a test server for ranged query tests
+// Helper function to create a test server for ranged query tests.
+// `port` only discriminates the group name; the bind address is
+// allocated process-unique — read it back via `server.rpc.address`.
 async fn create_test_server(port: u16) -> Arc<NebServer> {
-    let server_addr = format!("127.0.0.1:{}", port);
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = format!("ranged_query_test_{}", port);
     NebServer::new_from_opts(
         &ServerOptions {
@@ -556,7 +558,7 @@ async fn range_query_scan_inclusive_exclusive() {
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6704).await;
-    let server_addr = String::from("127.0.0.1:6704");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -698,7 +700,7 @@ async fn range_query_scan_open_ranges() {
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6705).await;
-    let server_addr = String::from("127.0.0.1:6705");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -852,7 +854,7 @@ async fn range_query_scan_backward_ordering() {
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6706).await;
-    let server_addr = String::from("127.0.0.1:6706");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -920,7 +922,7 @@ async fn range_query_scan_edge_cases() {
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6707).await;
-    let server_addr = String::from("127.0.0.1:6707");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1078,7 +1080,7 @@ async fn range_query_scan_large_dataset() {
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6708).await;
-    let server_addr = String::from("127.0.0.1:6708");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1153,7 +1155,7 @@ async fn range_query_scan_with_selection() {
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6709).await;
-    let server_addr = String::from("127.0.0.1:6709");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1234,7 +1236,7 @@ async fn range_query_scan_sparse_data() {
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6710).await;
-    let server_addr = String::from("127.0.0.1:6710");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1301,7 +1303,7 @@ async fn scan_all_auto_uses_ranged_clause_from_selection() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6711).await;
-    let server_addr = String::from("127.0.0.1:6711");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1354,7 +1356,7 @@ async fn scan_all_auto_uses_hashed_equality_clause_from_selection() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6712).await;
-    let server_addr = String::from("127.0.0.1:6712");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -1404,7 +1406,7 @@ async fn scan_by_expr_supports_single_ranged_clause() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6713).await;
-    let server_addr = String::from("127.0.0.1:6713");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1457,7 +1459,7 @@ async fn scan_by_expr_supports_reversed_comparison_operands() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6714).await;
-    let server_addr = String::from("127.0.0.1:6714");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1511,7 +1513,7 @@ async fn scan_by_expr_falls_back_to_schema_scan_for_non_indexed_clause() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6715).await;
-    let server_addr = String::from("127.0.0.1:6715");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_unindexed(DATA_1, Type::U64),
@@ -1568,7 +1570,7 @@ async fn scan_by_expr_intersects_hashed_and_ranged_indexed_clauses() {
     const DATA_3: &str = "DATA_3";
     let _ = env_logger::try_init();
     let server = create_test_server(6716).await;
-    let server_addr = String::from("127.0.0.1:6716");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1634,7 +1636,7 @@ async fn scan_by_expr_multi_index_intersection_can_be_empty() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6717).await;
-    let server_addr = String::from("127.0.0.1:6717");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
@@ -1681,7 +1683,7 @@ async fn scan_by_expr_hashed_only_intersection_respects_backward_ordering() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6718).await;
-    let server_addr = String::from("127.0.0.1:6718");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -1734,7 +1736,7 @@ async fn scan_by_expr_with_options_supports_order_by_field_and_limit() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6728).await;
-    let server_addr = String::from("127.0.0.1:6728");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -1795,7 +1797,7 @@ async fn scan_by_expr_with_options_supports_non_indexed_order_by_field() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6729).await;
-    let server_addr = String::from("127.0.0.1:6729");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -1857,7 +1859,7 @@ async fn scan_by_expr_plan_exposes_optimizer_trace() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6732).await;
-    let server_addr = String::from("127.0.0.1:6732");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -1907,7 +1909,7 @@ async fn scan_by_expr_plan_reports_heuristic_when_stats_missing() {
     const DATA_1: &str = "DATA_1";
     let _ = env_logger::try_init();
     let server = create_test_server(6733).await;
-    let server_addr = String::from("127.0.0.1:6733");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         DATA_1,
@@ -1943,7 +1945,7 @@ async fn scan_by_expr_plan_reports_or_heuristic_when_stats_missing() {
     const DATA_1: &str = "DATA_1";
     let _ = env_logger::try_init();
     let server = create_test_server(6734).await;
-    let server_addr = String::from("127.0.0.1:6734");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         DATA_1,
@@ -1980,7 +1982,7 @@ async fn scan_by_expr_detects_contradictory_hashed_predicates() {
     const DATA_1: &str = "DATA_1";
     let _ = env_logger::try_init();
     let server = create_test_server(6730).await;
-    let server_addr = String::from("127.0.0.1:6730");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         DATA_1,
@@ -2023,7 +2025,7 @@ async fn scan_by_expr_detects_contradictory_ranged_predicates() {
     const DATA_1: &str = "DATA_1";
     let _ = env_logger::try_init();
     let server = create_test_server(6731).await;
-    let server_addr = String::from("127.0.0.1:6731");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         DATA_1,
@@ -2067,7 +2069,7 @@ async fn scan_by_expr_ids_returns_ids_only_cursor() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6721).await;
-    let server_addr = String::from("127.0.0.1:6721");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2124,7 +2126,7 @@ async fn scan_by_expr_ids_with_options_supports_order_by_field_and_limit() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6724).await;
-    let server_addr = String::from("127.0.0.1:6724");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2184,7 +2186,7 @@ async fn scan_by_expr_ids_with_options_supports_offset_and_limit() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6748).await;
-    let server_addr = String::from("127.0.0.1:6748");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2244,7 +2246,7 @@ async fn scan_by_expr_with_options_supports_offset_and_limit() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6749).await;
-    let server_addr = String::from("127.0.0.1:6749");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2305,7 +2307,7 @@ async fn scan_by_expr_ids_with_options_offset_beyond_result_returns_empty() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6750).await;
-    let server_addr = String::from("127.0.0.1:6750");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2361,7 +2363,7 @@ async fn scan_by_expr_ids_with_options_supports_backward_order_by_field() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6726).await;
-    let server_addr = String::from("127.0.0.1:6726");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2420,7 +2422,7 @@ async fn scan_by_expr_ids_with_inferred_ranged_order_applies_post_sort_before_li
     const DATA_1: &str = "DATA_1";
     let _ = env_logger::try_init();
     let server = create_test_server(6761).await;
-    let server_addr = String::from("127.0.0.1:6761");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         DATA_1,
@@ -2476,7 +2478,7 @@ async fn scan_by_expr_ids_with_options_limit_zero_returns_empty() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6727).await;
-    let server_addr = String::from("127.0.0.1:6727");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2532,7 +2534,7 @@ async fn scan_by_expr_ids_with_options_supports_non_indexed_order_by_field() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6725).await;
-    let server_addr = String::from("127.0.0.1:6725");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2593,7 +2595,7 @@ async fn query_ids_with_options_preserves_min_ranged_row_before_explicit_order_b
     const ORDER_FIELD: &str = "ORDER_FIELD";
     let _ = env_logger::try_init();
     let server = create_test_server(6762).await;
-    let server_addr = String::from("127.0.0.1:6762");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(RANGE_FIELD, Type::U64, vec![IndexType::Ranged]),
@@ -2697,7 +2699,7 @@ async fn query_ids_with_options_supports_distinct_fields() {
     const SCORE_FIELD: &str = "SCORE_FIELD";
     let _ = env_logger::try_init();
     let server = create_test_server(6763).await;
-    let server_addr = String::from("127.0.0.1:6763");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_unindexed(GROUP_FIELD, Type::U64),
@@ -2764,7 +2766,7 @@ async fn query_ids_supports_not_with_schema_scan_fallback() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6765).await;
-    let server_addr = String::from("127.0.0.1:6765");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -2816,7 +2818,7 @@ async fn query_ids_supports_not_as_residual_on_indexed_plan() {
     const SCORE: &str = "SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6766).await;
-    let server_addr = String::from("127.0.0.1:6766");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(TAG, Type::U64, vec![IndexType::Hashed]),
@@ -2875,7 +2877,7 @@ async fn query_ids_optimizes_not_equals_on_ranged_field_without_schema_scan() {
     const SCORE: &str = "SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6767).await;
-    let server_addr = String::from("127.0.0.1:6767");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         SCORE,
@@ -2935,7 +2937,7 @@ async fn query_ids_optimizes_in_on_hashed_field_without_schema_scan() {
     const TAG: &str = "TAG";
     let _ = env_logger::try_init();
     let server = create_test_server(6768).await;
-    let server_addr = String::from("127.0.0.1:6768");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         TAG,
@@ -2986,7 +2988,7 @@ async fn query_ids_optimizes_between_on_ranged_field_without_schema_scan() {
     const SCORE: &str = "SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6769).await;
-    let server_addr = String::from("127.0.0.1:6769");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         SCORE,
@@ -3045,7 +3047,7 @@ async fn query_ids_supports_is_null_with_schema_scan_fallback() {
     const OPTIONAL_SCORE: &str = "OPTIONAL_SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6770).await;
-    let server_addr = String::from("127.0.0.1:6770");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_unindexed_nullable(
         OPTIONAL_SCORE,
@@ -3095,7 +3097,7 @@ async fn query_ids_optimizes_is_null_with_null_index_without_schema_scan() {
     const OPTIONAL_SCORE: &str = "OPTIONAL_SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6773).await;
-    let server_addr = String::from("127.0.0.1:6773");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed_nullable(
         OPTIONAL_SCORE,
@@ -3146,7 +3148,7 @@ async fn query_ids_optimizes_is_not_null_on_nullable_ranged_field_without_schema
     const OPTIONAL_SCORE: &str = "OPTIONAL_SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6771).await;
-    let server_addr = String::from("127.0.0.1:6771");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed_nullable(
         OPTIONAL_SCORE,
@@ -3203,7 +3205,7 @@ async fn query_ids_optimizes_is_null_on_non_nullable_field_to_empty() {
     const SCORE: &str = "SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6772).await;
-    let server_addr = String::from("127.0.0.1:6772");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         SCORE,
@@ -3250,7 +3252,7 @@ async fn scan_by_expr_with_options_applies_distinct_before_offset_and_limit() {
     const SCORE_FIELD: &str = "SCORE_FIELD";
     let _ = env_logger::try_init();
     let server = create_test_server(6764).await;
-    let server_addr = String::from("127.0.0.1:6764");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_unindexed(GROUP_FIELD, Type::U64),
@@ -3318,7 +3320,7 @@ async fn scan_by_expr_ids_supports_indexed_or_union() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6722).await;
-    let server_addr = String::from("127.0.0.1:6722");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -3377,7 +3379,7 @@ async fn scan_by_expr_ids_or_union_respects_limit() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6735).await;
-    let server_addr = String::from("127.0.0.1:6735");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -3433,7 +3435,7 @@ async fn scan_by_expr_or_with_non_indexed_branch_stays_correct() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6723).await;
-    let server_addr = String::from("127.0.0.1:6723");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -3490,7 +3492,7 @@ async fn scan_by_expr_ranged_clause_with_no_hits_returns_empty() {
     const DATA_1: &str = "DATA_1";
     let _ = env_logger::try_init();
     let server = create_test_server(6720).await;
-    let server_addr = String::from("127.0.0.1:6720");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![Field::new_indexed(
         DATA_1,
@@ -3533,7 +3535,7 @@ async fn hashed_query_test() {
     const DATA_1: &'static str = "DATA_1";
     const DATA_2: &'static str = "DATA_2";
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:6703");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("hashed_query_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -3747,7 +3749,7 @@ async fn hashed_query_test() {
 async fn hashed_query_supports_array_values() {
     const TAGS: &'static str = "TAGS";
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:6714");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("hashed_query_supports_array_values");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -3912,7 +3914,7 @@ async fn hashed_query_supports_array_values() {
 async fn ranged_query_supports_array_values() {
     const TAGS: &'static str = "TAGS";
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:6715");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("ranged_query_supports_array_values");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4000,7 +4002,7 @@ async fn ranged_query_supports_array_values() {
 async fn hashed_query_rejects_map_values() {
     const DATA_1: &'static str = "DATA_1";
     let _ = env_logger::try_init();
-    let server_addr = String::from("127.0.0.1:6713");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("hashed_query_rejects_map_values");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4078,7 +4080,7 @@ async fn hashed_query_rejects_map_values() {
 async fn bm25_search_returns_ranked_results() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";
-    let server_addr = String::from("127.0.0.1:6704");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("bm25_search_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4186,7 +4188,7 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";
     const TAG_FIELD: &str = "TAG";
-    let server_addr = String::from("127.0.0.1:6740");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_text_match_operator_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4294,7 +4296,7 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";
     const TAG_FIELD: &str = "TAG";
-    let server_addr = String::from("127.0.0.1:6741");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_text_match_or_predicate_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4402,7 +4404,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";
     const SCORE_FIELD: &str = "SCORE";
-    let server_addr = String::from("127.0.0.1:6742");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_text_match_order_by_field_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4506,7 +4508,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
 async fn query_ids_preserves_bm25_order_for_plain_text_match() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";
-    let server_addr = String::from("127.0.0.1:17425");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_text_match_bm25_order_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4605,7 +4607,7 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
     const TAG_FIELD: &str = "TAG";
     const STATE_FIELD: &str = "STATE";
     const NOTE_FIELD: &str = "NOTE";
-    let server_addr = String::from("127.0.0.1:6743");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_nested_and_or_text_match_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4743,7 +4745,7 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
     const TEXT_FIELD: &str = "BODY";
     const TAG_FIELD: &str = "TAG";
     const SCORE_FIELD: &str = "SCORE";
-    let server_addr = String::from("127.0.0.1:6744");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_nested_or_and_order_limit_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -4872,7 +4874,7 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
     const EMB_FIELD: &str = "EMB";
     const TAG_FIELD: &str = "TAG";
     let schema_id = 783;
-    let server_addr = String::from("127.0.0.1:6745");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_embedding_similarity_and_filter_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -5002,7 +5004,7 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
     const TAG_FIELD: &str = "TAG";
     const NOTE_FIELD: &str = "NOTE";
     let schema_id = 784;
-    let server_addr = String::from("127.0.0.1:6746");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_embedding_similarity_nested_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -5142,7 +5144,7 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
     let _ = env_logger::try_init();
     const EMB_FIELD: &str = "EMB";
     let schema_id = 785;
-    let server_addr = String::from("127.0.0.1:6747");
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
     let server_group = String::from("query_embedding_similarity_failure_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -5236,7 +5238,7 @@ async fn bench_scan_by_expr_vs_scan_all_and() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6736).await;
-    let server_addr = String::from("127.0.0.1:6736");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -5365,7 +5367,7 @@ async fn bench_scan_by_expr_ids_or_limit_vs_scan_all() {
     const DATA_2: &str = "DATA_2";
     let _ = env_logger::try_init();
     let server = create_test_server(6737).await;
-    let server_addr = String::from("127.0.0.1:6737");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
@@ -5514,7 +5516,7 @@ async fn aggregate_groups_and_computes_builtins() {
     const LATENCY: &str = "LATENCY";
     let _ = env_logger::try_init();
     let server = create_test_server(6774).await;
-    let server_addr = String::from("127.0.0.1:6774");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_unindexed(REGION, Type::String),
@@ -5685,7 +5687,7 @@ async fn query_shapes_selected_fields() {
     const SCORE: &str = "SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6776).await;
-    let server_addr = String::from("127.0.0.1:6776");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_unindexed(NAME, Type::String),
@@ -5745,7 +5747,7 @@ async fn aggregate_shapes_group_and_aggregate_columns() {
     const LATENCY: &str = "LATENCY";
     let _ = env_logger::try_init();
     let server = create_test_server(6777).await;
-    let server_addr = String::from("127.0.0.1:6777");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_unindexed(REGION, Type::String),
@@ -5837,7 +5839,7 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
     const SCORE: &str = "SCORE";
     let _ = env_logger::try_init();
     let server = create_test_server(6775).await;
-    let server_addr = String::from("127.0.0.1:6775");
+    let server_addr = server.rpc.address.clone();
 
     let fields = Field::new_schema(vec![
         Field::new_unindexed(REGION, Type::String),
