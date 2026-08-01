@@ -4506,7 +4506,7 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
 async fn query_ids_preserves_bm25_order_for_plain_text_match() {
     let _ = env_logger::try_init();
     const TEXT_FIELD: &str = "BODY";
-    let server_addr = String::from("127.0.0.1:67425");
+    let server_addr = String::from("127.0.0.1:17425");
     let server_group = String::from("query_text_match_bm25_order_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
