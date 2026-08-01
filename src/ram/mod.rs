@@ -3,6 +3,7 @@ pub mod mem_cursor;
 
 pub mod cell;
 pub mod id_alloc;
+pub mod id_alloc_sm;
 pub mod chunk;
 pub mod cleaner;
 pub mod compression;
