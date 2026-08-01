@@ -61,6 +61,7 @@ raft_state_machine! {
     def qry next_tree(tree_lower: EntryKey, ordering: Ordering) -> Option<TreeInfo>;
     def cmd split(src_tree: Id, new_tree: Id, pivot: EntryKey);
     def cmd try_init_genesis(tree_id: Id) -> bool;
+    def qry has_placements() -> bool;
     // No subscription for clients
 }
 
@@ -158,6 +159,10 @@ impl StateMachineCmds for MasterTreeSM {
         .boxed()
     }
 
+    fn has_placements(&self) -> BoxFuture<'_, bool> {
+        future::ready(!self.tree.is_empty()).boxed()
+    }
+
     fn try_init_genesis(&mut self, tree_id: Id) -> BoxFuture<'_, bool> {
         // Genesis placement must be established through consensus: seeding it
         // into a member-local instance before registration leaves each member
@@ -204,6 +209,14 @@ impl StateMachineCtl for MasterTreeSM {
         // snapshot, otherwise each member ends up with its own genesis
         // tree and index entries strand per-member.
         true
+    }
+
+    fn accept_buffered_replay(&self) -> bool {
+        // The placement map recovers from its own persistence file; buffered
+        // plane entries replayed on top of that state double-apply (splits
+        // bump epochs non-idempotently). Only a genuinely fresh instance —
+        // e.g. a member joining an established plane — wants the replay.
+        self.tree.is_empty()
     }
 }
 

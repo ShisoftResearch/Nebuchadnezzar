@@ -128,12 +128,6 @@ impl Service for NebRPCService {
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            log::warn!(
-                "IDPROBE cell_rpc write_cell schema={} id={:?} db={}",
-                cell.header.schema,
-                cell.id(),
-                self.database_runtime.database_name()
-            );
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().write_cell(&mut cell))
                 .await;

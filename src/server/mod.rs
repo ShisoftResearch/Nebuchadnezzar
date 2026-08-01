@@ -2248,11 +2248,15 @@ pub async fn init_ranged_indexer_service<C>(
         .unwrap();
     meta_plane.recover_after_register().await.unwrap();
 
-    // Establish the genesis placement through consensus. Each member
-    // prepares a candidate tree it owns and persists the root cell BEFORE
-    // proposing, so no replica can ever observe a placement whose root cell
-    // is not yet readable. The raft command picks exactly one winner; losers
-    // drop their orphan candidate cell.
+    // Establish the genesis placement through consensus, but only when the
+    // replicated placement map is empty: proposing a command while startup
+    // recovery is replaying the plane log destabilizes recovery, and on any
+    // restart the placements already exist. Each proposer prepares a
+    // candidate tree it owns and persists the root cell BEFORE proposing,
+    // so no replica can ever observe a placement whose root cell is not yet
+    // readable. The raft command picks exactly one winner; losers drop
+    // their orphan candidate cell.
+    if matches!(sm_client.has_placements().await, Ok(false)) {
     let genesis_id = ranged::sm::MasterTreeSM::select_genesis_tree_id(
         cons_hash,
         rpc_server.server_id,
@@ -2314,6 +2318,7 @@ pub async fn init_ranged_indexer_service<C>(
             );
             let _ = neb_client.remove_cell(genesis_id).await;
         }
+    }
     }
 }
 

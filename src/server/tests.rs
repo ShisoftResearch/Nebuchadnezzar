@@ -1588,3 +1588,78 @@ pub async fn compact_id_allocator_end_to_end() {
 
     server.shutdown().await;
 }
+
+/// Round-trips a dynamic-schema cell whose static part carries an id array
+/// of every small length. The dynamic tail begins where the array data
+/// ends, so any writer/reader disagreement about the walk corrupts the
+/// type-tagged dynamic fields (regression: invalid-UTF-8 panics reading
+/// graph id-list cells under the 8-byte id layout).
+#[tokio::test(flavor = "multi_thread")]
+pub async fn dynamic_tail_layout_roundtrip_across_array_lengths() {
+    let _ = env_logger::try_init();
+    let server_addr = String::from("127.0.0.1:5219");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+            undo_log_storage: None,
+            raft_storage: None,
+        },
+        &server_addr,
+        "test",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed("next", Type::Id),
+        Field::new_unindexed_array("list", Type::Id),
+    ]);
+    let schema = Schema::new_with_id(91, &String::from("dyn_layout"), None, fields, true, false);
+    server.meta().schemas.debug_only_new_schema(schema.clone());
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            "test",
+        )
+        .await
+        .unwrap(),
+    );
+
+    for len in 0..12usize {
+        let list_ids: Vec<Id> = (0..len).map(|_| Id::rand()).collect();
+        let mut map = OwnedMap::new();
+        map.insert("next", OwnedValue::Id(Id::rand()));
+        map.insert(
+            "list",
+            OwnedValue::PrimArray(OwnedPrimArray::Id(list_ids.clone())),
+        );
+        map.insert("extra_note", OwnedValue::String(format!("note-{len}")));
+        map.insert("extra_num", OwnedValue::U64(len as u64));
+        let id = Id::rand();
+        let cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(map));
+        client.write_cell(cell).await.unwrap().unwrap();
+        let read = client.read_cell(id).await.unwrap().unwrap();
+        assert_eq!(
+            read.data["extra_note"].string().unwrap(),
+            &format!("note-{len}"),
+            "dynamic string corrupted at list len {len}"
+        );
+        assert_eq!(read.data["extra_num"].u64().unwrap(), &(len as u64));
+        match &read.data["list"] {
+            OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) => {
+                assert_eq!(ids, &list_ids, "list mismatch at len {len}")
+            }
+            other => panic!("unexpected list value at len {len}: {:?}", other),
+        }
+    }
+}
