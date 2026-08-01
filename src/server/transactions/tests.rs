@@ -553,3 +553,102 @@ pub async fn smoke_rw() {
         f.await.unwrap();
     }
 }
+
+/// A pinned head-only read must not make a later same-txn remove report
+/// `CellDoesNotExisted` — the head observation certifies the cell present
+/// (regression: remove treated any `cell: None` entry as already removed).
+#[tokio::test(flavor = "multi_thread")]
+pub async fn head_then_remove_commits() {
+    let _ = env_logger::try_init();
+    let server_addr = String::from("127.0.0.1:5209");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell, Service::Transaction],
+            enable_recovery: false,
+            disable_storage_locks: true,
+            undo_log_storage: None,
+            raft_storage: None,
+        },
+        &server_addr,
+        "test",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    server.meta().schemas.debug_only_new_schema(schema.clone());
+    let txn = scoped_txn_client(&server_addr, "test").await;
+
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map.insert(&String::from("score"), OwnedValue::U64(70));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
+    let cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
+    let cell_id = cell.id();
+
+    let setup_txn = txn.begin().await.unwrap().unwrap();
+    txn.write(setup_txn.to_owned(), cell.to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        txn.prepare(setup_txn.to_owned()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(setup_txn.to_owned()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let remove_txn = txn.begin().await.unwrap().unwrap();
+    match txn
+        .head(remove_txn.to_owned(), cell_id.to_owned())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        TxnExecResult::Accepted(header) => assert_eq!(header.id(), cell_id),
+        other => panic!("head should observe the cell: {:?}", other),
+    }
+    assert_eq!(
+        txn.remove(remove_txn.to_owned(), cell_id.to_owned())
+            .await
+            .unwrap()
+            .unwrap(),
+        TxnExecResult::Accepted(())
+    );
+    assert_eq!(
+        txn.prepare(remove_txn.to_owned()).await.unwrap().unwrap(),
+        TMPrepareResult::Success
+    );
+    assert_eq!(
+        txn.commit(remove_txn.to_owned()).await.unwrap().unwrap(),
+        EndResult::Success
+    );
+
+    let verify_txn = txn.begin().await.unwrap().unwrap();
+    assert!(matches!(
+        txn.read(verify_txn.to_owned(), cell_id).await.unwrap().unwrap(),
+        TxnExecResult::Error(ReadError::CellDoesNotExisted)
+    ));
+    assert!(matches!(
+        txn.abort(verify_txn.to_owned()).await.unwrap().unwrap(),
+        AbortResult::Success(_)
+    ));
+}

@@ -753,7 +753,15 @@ impl Service for TransactionManager {
                         let mut new_obj = false;
                         {
                             let data_obj = txn.data.get_mut(&id).unwrap();
-                            if data_obj.cell.is_none() {
+                            // `cell: None` alone is not "does not exist": a
+                            // pinned head-only read caches a present cell
+                            // without materializing it. Only a prior in-txn
+                            // removal (changed) or a certified-absent cell
+                            // rejects the remove.
+                            if data_obj.cell.is_none()
+                                && (data_obj.changed
+                                    || matches!(data_obj.expectation, CellExpectation::Absent))
+                            {
                                 return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
                             }
                             if data_obj.new {
