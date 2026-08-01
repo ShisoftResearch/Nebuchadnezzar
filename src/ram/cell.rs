@@ -339,6 +339,16 @@ impl<'v> SharedCellData<'v> {
         chunk: &Chunk,
     ) -> Result<(Self, SchemaRef), ReadError> {
         let (header, data_ptr) = header_from_chunk_raw(ptr)?;
+        if header.id.bits() != hash {
+            // Stale pointer: the entry at this address no longer belongs to
+            // the requested cell (relocated or replaced). Parsing it would
+            // misinterpret another cell's bytes.
+            warn!(
+                "stale cell read: requested id bits {} found {:?} at {:#x}",
+                hash, header.id, ptr
+            );
+            return Err(ReadError::CellDoesNotExisted);
+        }
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             let compression_plan = if schema.compression_plan.is_empty() {
