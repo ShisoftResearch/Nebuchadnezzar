@@ -685,7 +685,7 @@ pub enum ServerError {
     CannotJoinClusterGroupRejected(String),
     CannotInitMemberTable,
     CannotSetServerWeight,
-    CannotInitConsistentHashTable,
+    CannotInitConsistentHashTable(String),
     CannotLoadMetaClient,
     CannotAcquireStorageLock(String),
     CannotInitializeSharedPlane(String),
@@ -711,8 +711,8 @@ impl std::fmt::Display for ServerError {
             }
             ServerError::CannotInitMemberTable => write!(f, "cannot initialize member table"),
             ServerError::CannotSetServerWeight => write!(f, "cannot set server weight"),
-            ServerError::CannotInitConsistentHashTable => {
-                write!(f, "cannot initialize consistent hash table")
+            ServerError::CannotInitConsistentHashTable(error) => {
+                write!(f, "cannot initialize consistent hash table: {error}")
             }
             ServerError::CannotLoadMetaClient => write!(f, "cannot load meta client"),
             ServerError::CannotAcquireStorageLock(error) => write!(f, "{error}"),
@@ -984,9 +984,11 @@ pub async fn init_conshash(
             }
             return Ok(ch);
         }
-        _ => {
-            error!("Cannot initialize consistent hash table");
-            return Err(ServerError::CannotInitConsistentHashTable);
+        Err(e) => {
+            error!("Cannot initialize consistent hash table: {:?}", e);
+            return Err(ServerError::CannotInitConsistentHashTable(format!(
+                "{e:?}"
+            )));
         }
     }
 }

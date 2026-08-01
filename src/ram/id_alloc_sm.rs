@@ -93,6 +93,12 @@ impl StateMachineCmds for IdAllocSM {
                 break Err("origin slot space exhausted".to_string());
             }
             self.state.next_slot += 1;
+            // Origin 0 is reserved: legacy `Id::from_parts` shim ids carry
+            // zeros in the origin bits, so an origin-0 allocation could
+            // collide with a shim-composed id (locality, seq) pair.
+            if slot == 0 {
+                continue;
+            }
             let entry = self.state.origins.entry(slot).or_default();
             if entry.retired {
                 continue;
@@ -201,6 +207,18 @@ impl IdAllocSM {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+
+    #[test]
+    fn origin_zero_is_reserved_for_the_shim_plane() {
+        // `Id::from_parts` composes ids with zero origin bits; an origin-0
+        // allocation of (locality, seq) would collide with the shim id of
+        // the same pair. The allocator must never issue slot 0.
+        let mut sm = IdAllocSM::new(1);
+        for holder in 0..8u64 {
+            let (slot, _) = block_on(sm.claim_origin(holder + 100)).unwrap();
+            assert_ne!(slot, 0, "origin 0 must stay reserved");
+        }
+    }
 
     #[test]
     fn claim_lease_fence_lifecycle() {
