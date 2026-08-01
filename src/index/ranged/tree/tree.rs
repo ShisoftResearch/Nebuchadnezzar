@@ -43,24 +43,46 @@ impl RangedTree {
         let tree = DiskTree::new_with_client(&deletion_set, neb_client);
         tree.persist_root(neb_client).await;
 
-        let tree_cell = ranged_tree_cell(&tree.head_id(), id, None);
-        match neb_client.write_cell(tree_cell).await {
-            Ok(Ok(_)) => {
-                info!("Created new ranged tree {:?}", id);
-                Self { tree }
-            }
-            Ok(Err(e)) => {
-                use crate::ram::cell::WriteError;
-                match e {
-                    WriteError::CellAlreadyExisted => {
-                        info!("Ranged tree already exists for {:?}, recovering", id);
-                        Self::recover(neb_client, id).await
+        // During cluster bring-up the routed owner of the tree cell may not
+        // have its scoped cell service registered yet (members come up
+        // concurrently); retry transient RPC failures before giving up.
+        const CREATE_MAX_ATTEMPTS: usize = 50;
+        const CREATE_RETRY_DELAY_MS: u64 = 200;
+        let mut last_rpc_error = None;
+        for attempt in 0..CREATE_MAX_ATTEMPTS {
+            let tree_cell = ranged_tree_cell(&tree.head_id(), id, None);
+            match neb_client.write_cell(tree_cell).await {
+                Ok(Ok(_)) => {
+                    info!("Created new ranged tree {:?}", id);
+                    return Self { tree };
+                }
+                Ok(Err(e)) => {
+                    use crate::ram::cell::WriteError;
+                    match e {
+                        WriteError::CellAlreadyExisted => {
+                            info!("Ranged tree already exists for {:?}, recovering", id);
+                            return Self::recover(neb_client, id).await;
+                        }
+                        _ => panic!("Failed to create ranged tree cell: {:?}", e),
                     }
-                    _ => panic!("Failed to create ranged tree cell: {:?}", e),
+                }
+                Err(e) => {
+                    warn!(
+                        "RPC error creating ranged tree cell {:?} (attempt {}): {:?}",
+                        id,
+                        attempt + 1,
+                        e
+                    );
+                    last_rpc_error = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(CREATE_RETRY_DELAY_MS))
+                        .await;
                 }
             }
-            Err(e) => panic!("RPC error creating ranged tree cell: {:?}", e),
         }
+        panic!(
+            "RPC error creating ranged tree cell after {} attempts: {:?}",
+            CREATE_MAX_ATTEMPTS, last_rpc_error
+        );
     }
 
     /// Recover a ranged tree from persistent storage

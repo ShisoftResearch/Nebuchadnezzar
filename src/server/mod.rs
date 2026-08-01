@@ -1393,14 +1393,27 @@ impl NebServer {
                     .await
                 }
                 Service::RangedIndexer => {
-                    wait_for_scoped_cell_rpc_services(
+                    // Bounded wait: during a coordinated clusterwide load the
+                    // peers' scoped cell services come up concurrently and this
+                    // converges. A purely local ensure (e.g. reload after a
+                    // clusterwide unload) has no such coordination — peers may
+                    // legitimately not host the database yet, and the tree
+                    // loader already degrades to a fresh tree when the root's
+                    // owner is unreachable. So exhaustion is not fatal.
+                    if let Err(error) = wait_for_scoped_cell_rpc_services(
                         server_addr,
                         meta_members,
                         conshasing,
                         group_name,
                         database_name,
                     )
-                    .await?;
+                    .await
+                    {
+                        warn!(
+                            "proceeding with ranged indexer init before all peers are ready: {:?}",
+                            error
+                        );
+                    }
                     let tree_path = effective_opts
                         .raft_storage
                         .as_ref()
