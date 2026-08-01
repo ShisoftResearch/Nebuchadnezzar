@@ -18,10 +18,12 @@
 //! batching self-tunes with load.
 
 use dovahkiin::types::custom_types::id::{Id, ID_ORIGIN_MASK, ID_SEQUENCE_MASK};
-use parking_lot::Mutex;
+use futures::future::BoxFuture;
+use futures::prelude::*;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// Ids handed out per durable lease. At 2^20 ids per block, a restart
 /// wastes at most one block tail — noise against the 2^36 sequence
@@ -45,13 +47,20 @@ pub struct BlockLease {
 /// reference the issued ids, and it must reject a stale epoch.
 pub trait LeaseStore: Send + Sync {
     /// Persist a lease for the next `span` sequences at or above
-    /// `floor`, returning the granted range. Rejects stale epochs.
-    fn lease_block(&self, origin: u16, epoch: u64, floor: u64, span: u64)
-        -> io::Result<BlockLease>;
+    /// `floor`, returning the granted range. Rejects stale epochs. The
+    /// production store performs a consensus round; the fast path never
+    /// reaches here (one call per ID_BLOCK_SPAN ids).
+    fn lease_block(
+        &self,
+        origin: u16,
+        epoch: u64,
+        floor: u64,
+        span: u64,
+    ) -> BoxFuture<'_, io::Result<BlockLease>>;
 
     /// Highest durably-leased end for the origin, if any. Used by
     /// recovery to establish the resume floor.
-    fn last_lease_end(&self, origin: u16) -> io::Result<Option<u64>>;
+    fn last_lease_end(&self, origin: u16) -> BoxFuture<'_, io::Result<Option<u64>>>;
 }
 
 /// In-memory lease store for tests and volatile deployments. Volatile
@@ -59,11 +68,11 @@ pub trait LeaseStore: Send + Sync {
 /// can reference me" buys nothing and would add a mode.
 #[derive(Default)]
 pub struct VolatileLeaseStore {
-    state: Mutex<std::collections::HashMap<u16, (u64, u64)>>, // origin -> (epoch, end)
+    state: parking_lot::Mutex<std::collections::HashMap<u16, (u64, u64)>>, // origin -> (epoch, end)
 }
 
-impl LeaseStore for VolatileLeaseStore {
-    fn lease_block(
+impl VolatileLeaseStore {
+    fn lease_block_sync(
         &self,
         origin: u16,
         epoch: u64,
@@ -101,8 +110,21 @@ impl LeaseStore for VolatileLeaseStore {
         })
     }
 
-    fn last_lease_end(&self, origin: u16) -> io::Result<Option<u64>> {
-        Ok(self.state.lock().get(&origin).map(|(_, end)| *end))
+}
+
+impl LeaseStore for VolatileLeaseStore {
+    fn lease_block(
+        &self,
+        origin: u16,
+        epoch: u64,
+        floor: u64,
+        span: u64,
+    ) -> BoxFuture<'_, io::Result<BlockLease>> {
+        future::ready(self.lease_block_sync(origin, epoch, floor, span)).boxed()
+    }
+
+    fn last_lease_end(&self, origin: u16) -> BoxFuture<'_, io::Result<Option<u64>>> {
+        future::ready(Ok(self.state.lock().get(&origin).map(|(_, end)| *end))).boxed()
     }
 }
 
@@ -126,14 +148,14 @@ impl IdAllocator {
     /// the floor comes from the durable record, never from scanning
     /// stored cells). `scanned_floor` is the belt-and-suspenders bound
     /// from the recovery scan; the effective floor is the max of both.
-    pub fn recover(
+    pub async fn recover(
         store: Arc<dyn LeaseStore>,
         origin: u16,
         epoch: u64,
         scanned_floor: u64,
     ) -> io::Result<Self> {
         assert_eq!(origin as u64 & !ID_ORIGIN_MASK, 0, "origin exceeds field");
-        let durable_floor = store.last_lease_end(origin)?.unwrap_or(0);
+        let durable_floor = store.last_lease_end(origin).await?.unwrap_or(0);
         let floor = durable_floor.max(scanned_floor);
         let allocator = Self {
             origin,
@@ -160,43 +182,47 @@ impl IdAllocator {
 
     /// Allocates one sequence value. The id is composed by the caller
     /// (locality policy) via [`compose`].
-    pub fn take_sequence(&self) -> io::Result<u64> {
+    pub async fn take_sequence(&self) -> io::Result<u64> {
         loop {
+            // Fast path: an uncontended fetch_add against the warm block.
             let value = self.next.fetch_add(1, Ordering::Relaxed) + 1;
             if value <= self.end.load(Ordering::Acquire) {
                 return Ok(value);
             }
-            self.refill()?;
+            self.refill().await?;
         }
     }
 
     /// Allocates an id with locality copied from `anchor`
     /// (`Id::new_with` semantics).
-    pub fn take_near(&self, anchor: &Id) -> io::Result<Id> {
-        let sequence = self.take_sequence()?;
+    pub async fn take_near(&self, anchor: &Id) -> io::Result<Id> {
+        let sequence = self.take_sequence().await?;
         Ok(Id::allocated_near(anchor, self.origin, sequence))
     }
 
     /// Allocates an id with mixer-derived uniform locality.
-    pub fn take_uniform(&self) -> io::Result<Id> {
-        let sequence = self.take_sequence()?;
+    pub async fn take_uniform(&self) -> io::Result<Id> {
+        let sequence = self.take_sequence().await?;
         Ok(compose_uniform(self.origin, sequence))
     }
 
-    fn refill(&self) -> io::Result<()> {
-        let _serialized = self.refill.lock();
+    async fn refill(&self) -> io::Result<()> {
+        let _serialized = self.refill.lock().await;
         let end = self.end.load(Ordering::Relaxed);
         let next = self.next.load(Ordering::Relaxed);
         if next < end {
             // Another taker refilled while we waited for the lock.
             return Ok(());
         }
-        let lease = self.store.lease_block(
-            self.origin,
-            self.epoch.load(Ordering::Acquire),
-            next,
-            ID_BLOCK_SPAN,
-        )?;
+        let lease = self
+            .store
+            .lease_block(
+                self.origin,
+                self.epoch.load(Ordering::Acquire),
+                next,
+                ID_BLOCK_SPAN,
+            )
+            .await?;
         // Kill the old lease before moving `next` so a concurrent take
         // cannot pair an old-lease candidate with the new end. `next`
         // must only move forward (fetch_max, never store): spinning
@@ -226,100 +252,156 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+
+/// Consensus-backed lease store: bridges the allocator to the
+/// per-database `IdAllocSM` raft authority. One consensus round per
+/// block lease; queries read the replicated state.
+pub struct RaftLeaseStore {
+    sm: Arc<crate::ram::id_alloc_sm::client::SMClient>,
+}
+
+impl RaftLeaseStore {
+    pub fn new(sm: Arc<crate::ram::id_alloc_sm::client::SMClient>) -> Self {
+        Self { sm }
+    }
+}
+
+fn sm_err(context: &str, error: impl std::fmt::Debug) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, format!("{}: {:?}", context, error))
+}
+
+impl LeaseStore for RaftLeaseStore {
+    fn lease_block(
+        &self,
+        origin: u16,
+        epoch: u64,
+        floor: u64,
+        span: u64,
+    ) -> BoxFuture<'_, io::Result<BlockLease>> {
+        async move {
+            let granted = self
+                .sm
+                .lease_block(&origin, &epoch, &floor, &span)
+                .await
+                .map_err(|e| sm_err("lease_block consensus round failed", e))?
+                .map_err(|e| sm_err("lease refused", e))?;
+            Ok(BlockLease {
+                origin: granted.origin,
+                epoch: granted.epoch,
+                start: granted.start,
+                end: granted.end,
+            })
+        }
+        .boxed()
+    }
+
+    fn last_lease_end(&self, origin: u16) -> BoxFuture<'_, io::Result<Option<u64>>> {
+        async move {
+            self.sm
+                .last_lease_end(&origin)
+                .await
+                .map_err(|e| sm_err("last_lease_end query failed", e))
+        }
+        .boxed()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn allocator(origin: u16) -> IdAllocator {
-        IdAllocator::recover(Arc::new(VolatileLeaseStore::default()), origin, 1, 0).unwrap()
+    async fn allocator(origin: u16) -> IdAllocator {
+        IdAllocator::recover(Arc::new(VolatileLeaseStore::default()), origin, 1, 0)
+            .await
+            .unwrap()
     }
 
-    #[test]
-    fn sequences_strictly_increase_across_refills() {
-        let alloc = allocator(1);
+    #[tokio::test]
+    async fn sequences_strictly_increase_across_refills() {
+        let alloc = allocator(1).await;
         let mut prev = 0;
         for _ in 0..(ID_BLOCK_SPAN * 2 + 10) {
-            let seq = alloc.take_sequence().unwrap();
+            let seq = alloc.take_sequence().await.unwrap();
             assert!(seq > prev, "sequences must strictly increase");
             prev = seq;
         }
     }
 
-    #[test]
-    fn concurrent_takers_never_collide_or_regress() {
-        let alloc = Arc::new(allocator(2));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_takers_never_collide_or_regress() {
+        let alloc = Arc::new(allocator(2).await);
         let mut handles = Vec::new();
         for _ in 0..8 {
             let alloc = alloc.clone();
-            handles.push(std::thread::spawn(move || {
+            handles.push(tokio::spawn(async move {
                 let mut values = Vec::with_capacity(4096);
                 let mut prev = 0;
                 for _ in 0..4096 {
-                    let v = alloc.take_sequence().unwrap();
-                    assert!(v > prev, "per-thread sequences must increase");
+                    let v = alloc.take_sequence().await.unwrap();
+                    assert!(v > prev, "per-task sequences must increase");
                     prev = v;
                     values.push(v);
                 }
                 values
             }));
         }
-        let mut all: Vec<u64> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect();
+        let mut all: Vec<u64> = Vec::new();
+        for h in handles {
+            all.extend(h.await.unwrap());
+        }
         let count = all.len();
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), count, "no two takers may receive the same value");
     }
 
-    #[test]
-    fn recovery_resumes_above_durable_lease_end() {
+    #[tokio::test]
+    async fn recovery_resumes_above_durable_lease_end() {
         let store = Arc::new(VolatileLeaseStore::default());
-        let first = IdAllocator::recover(store.clone(), 3, 1, 0).unwrap();
+        let first = IdAllocator::recover(store.clone(), 3, 1, 0).await.unwrap();
         let mut last = 0;
         for _ in 0..10 {
-            last = first.take_sequence().unwrap();
+            last = first.take_sequence().await.unwrap();
         }
         drop(first);
         // Simulated restart: the block tail is abandoned; the new
         // allocator resumes above the durable end, never reissuing.
-        let second = IdAllocator::recover(store, 3, 2, 0).unwrap();
-        let resumed = second.take_sequence().unwrap();
+        let second = IdAllocator::recover(store, 3, 2, 0).await.unwrap();
+        let resumed = second.take_sequence().await.unwrap();
         assert!(resumed > last);
         assert!(resumed > ID_BLOCK_SPAN, "must resume above the leased block");
     }
 
-    #[test]
-    fn scanned_floor_raises_recovery_floor() {
+    #[tokio::test]
+    async fn scanned_floor_raises_recovery_floor() {
         let store = Arc::new(VolatileLeaseStore::default());
-        let alloc = IdAllocator::recover(store, 4, 1, 5_000_000).unwrap();
-        assert!(alloc.take_sequence().unwrap() > 5_000_000);
+        let alloc = IdAllocator::recover(store, 4, 1, 5_000_000).await.unwrap();
+        assert!(alloc.take_sequence().await.unwrap() > 5_000_000);
     }
 
-    #[test]
-    fn stale_epoch_is_fenced_at_lease_time() {
+    #[tokio::test]
+    async fn stale_epoch_is_fenced_at_lease_time() {
         let store = Arc::new(VolatileLeaseStore::default());
-        let newer = IdAllocator::recover(store.clone(), 5, 7, 0).unwrap();
-        newer.take_sequence().unwrap(); // records epoch 7 in the store
-        let zombie = IdAllocator::recover(store, 5, 3, 0).unwrap();
+        let newer = IdAllocator::recover(store.clone(), 5, 7, 0).await.unwrap();
+        newer.take_sequence().await.unwrap(); // records epoch 7 in the store
+        let zombie = IdAllocator::recover(store, 5, 3, 0).await.unwrap();
         // The zombie holds no warm block, so its first take must lease —
         // and the store rejects its stale epoch.
-        assert!(zombie.take_sequence().is_err());
+        assert!(zombie.take_sequence().await.is_err());
     }
 
-    #[test]
-    fn affinity_and_uniform_composition() {
-        let alloc = allocator(6);
+    #[tokio::test]
+    async fn affinity_and_uniform_composition() {
+        let alloc = allocator(6).await;
         let anchor = Id::allocated(0x1234, 9, 42);
-        let near = alloc.take_near(&anchor).unwrap();
+        let near = alloc.take_near(&anchor).await.unwrap();
         assert_eq!(near.locality(), anchor.locality());
         assert_eq!(near.origin(), 6);
 
         let mut buckets = HashSet::new();
         for _ in 0..4096 {
-            buckets.insert(alloc.take_uniform().unwrap().locality());
+            buckets.insert(alloc.take_uniform().await.unwrap().locality());
         }
         // 4096 draws over 32k buckets: expect wide spread, no gross
         // clumping (chi-squared level checks live in the design's test
