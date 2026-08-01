@@ -605,9 +605,6 @@ fn dyn_map_value() -> OwnedValue {
 
 #[test]
 pub fn test_unified_chunk_address_space() {
-    use crate::ram::chunk::{
-        chunk_and_segment_from_addr, get_chunk_size_bits, get_global_chunk_base,
-    };
     use crate::ram::segs::SEGMENT_SIZE;
 
     let _ = env_logger::try_init();
@@ -630,13 +627,15 @@ pub fn test_unified_chunk_address_space() {
         None,
     );
 
-    // Verify global state is set
-    let base = get_global_chunk_base();
-    let size_bits = get_chunk_size_bits();
-    assert!(base != 0, "Global chunk base should be set");
+    // The instance records its own mapping; the module-level globals are
+    // last-writer-wins diagnostics and race with concurrent tests, so
+    // everything here asserts against the instance.
+    let base = chunks.base_addr;
+    let size_bits = chunks.chunk_size_bits;
+    assert!(base != 0, "Chunk base should be set");
     assert!(size_bits > 0, "Chunk size bits should be set");
 
-    info!("Global chunk base: {:#x}, size_bits: {}", base, size_bits);
+    info!("Chunk base: {:#x}, size_bits: {}", base, size_bits);
 
     // Test address calculation for each chunk
     for i in 0..chunk_count {
@@ -644,7 +643,7 @@ pub fn test_unified_chunk_address_space() {
         let segment_addr = chunk.segments()[0].addr;
 
         // Calculate chunk ID and segment ID from address
-        let result = chunk_and_segment_from_addr(segment_addr);
+        let result = chunks.chunk_and_segment_from_addr(segment_addr);
         assert!(result.is_some(), "Address should be in range");
 
         let (chunk_id, segment_id) = result.unwrap();
@@ -662,7 +661,7 @@ pub fn test_unified_chunk_address_space() {
 
         // Test an address in the middle of the segment
         let mid_addr = segment_addr + SEGMENT_SIZE / 2;
-        let result2 = chunk_and_segment_from_addr(mid_addr);
+        let result2 = chunks.chunk_and_segment_from_addr(mid_addr);
         assert!(result2.is_some(), "Mid-address should be in range");
         let (chunk_id2, segment_id2) = result2.unwrap();
         assert_eq!(chunk_id2, i, "Chunk ID should still match for mid-address");
@@ -674,20 +673,19 @@ pub fn test_unified_chunk_address_space() {
 
     // Test address outside range
     let invalid_addr = base - 1;
-    let result = chunk_and_segment_from_addr(invalid_addr);
+    let result = chunks.chunk_and_segment_from_addr(invalid_addr);
     assert!(result.is_none(), "Address before base should return None");
 
-    // Test global segment access
-    use crate::ram::chunk::get_segment_for_fault;
+    // Test segment access by decoded ids
     for i in 0..chunk_count {
-        let segment = get_segment_for_fault(i, 0);
+        let segment = chunks.segment_by_ids(i, 0);
         assert!(
             segment.is_some(),
-            "Should be able to access segment via global pointer"
+            "Should be able to access segment via decoded ids"
         );
         let seg = segment.unwrap();
         info!(
-            "Global access: chunk {} segment 0 at addr {:#x}, id {}",
+            "Instance access: chunk {} segment 0 at addr {:#x}, id {}",
             i, seg.addr, seg.id
         );
 
@@ -704,7 +702,7 @@ pub fn test_unified_chunk_address_space() {
     }
 
     // Test invalid access
-    let invalid_seg = get_segment_for_fault(chunk_count + 1, 0);
+    let invalid_seg = chunks.segment_by_ids(chunk_count + 1, 0);
     assert!(
         invalid_seg.is_none(),
         "Should return None for out-of-bounds chunk"

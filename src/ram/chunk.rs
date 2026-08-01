@@ -57,28 +57,42 @@ pub fn get_chunk_size_bits() -> usize {
     GLOBAL_CHUNK_SIZE_BITS.load(Ordering::Acquire)
 }
 
-/// Calculate chunk ID and segment ID from a fault address
-/// Returns: Some((chunk_id, segment_id)) or None if address not in range
+/// Calculate chunk ID and segment ID from a fault address against the
+/// LAST-CREATED Chunks instance. The globals are last-writer-wins, so
+/// this is best-effort diagnostics only (multi-database hosts and
+/// concurrent tests each create their own instance); for deterministic
+/// decoding use [`Chunks::chunk_and_segment_from_addr`].
 pub fn chunk_and_segment_from_addr(fault_addr: usize) -> Option<(usize, usize)> {
-    use crate::ram::segs::SEGMENT_BITS_SHIFT;
-
     let base = GLOBAL_CHUNK_BASE.load(Ordering::Acquire);
-    if base == 0 || fault_addr < base {
+    if base == 0 {
         return None;
     }
+    decode_chunk_addr(
+        fault_addr,
+        base,
+        GLOBAL_ALLOCATED_SIZE.load(Ordering::Acquire),
+        GLOBAL_CHUNK_SIZE_BITS.load(Ordering::Acquire),
+    )
+}
 
+fn decode_chunk_addr(
+    fault_addr: usize,
+    base: usize,
+    total_size: usize,
+    chunk_size_bits: usize,
+) -> Option<(usize, usize)> {
+    use crate::ram::segs::SEGMENT_BITS_SHIFT;
+
+    if fault_addr < base {
+        return None;
+    }
     let offset = fault_addr - base;
-    let total_size = GLOBAL_ALLOCATED_SIZE.load(Ordering::Acquire);
-
     if offset >= total_size {
         return None;
     }
-
-    let chunk_size_bits = GLOBAL_CHUNK_SIZE_BITS.load(Ordering::Acquire);
     let chunk_id = offset >> chunk_size_bits;
     let offset_in_chunk = offset & ((1 << chunk_size_bits) - 1);
     let segment_id = offset_in_chunk >> SEGMENT_BITS_SHIFT;
-
     Some((chunk_id, segment_id))
 }
 
@@ -1485,9 +1499,33 @@ pub struct Chunks {
     /// The id allocator's belt-and-suspenders floor: even if the durable
     /// lease record was lost, no recovered cell's sequence is ever reissued.
     pub recovered_origin_floors: Arc<Vec<std::sync::atomic::AtomicU64>>,
+    /// Base of this instance's contiguous chunk mapping.
+    pub base_addr: usize,
+    /// log2 of the per-chunk size within the mapping.
+    pub chunk_size_bits: usize,
+    /// Total mapped bytes across all chunks of this instance.
+    pub total_size: usize,
 }
 
 impl Chunks {
+    /// Decodes an address inside this instance's mapping into
+    /// `(chunk_id, segment_id)`. Deterministic per instance, unlike the
+    /// module-level last-writer-wins diagnostic helper.
+    pub fn chunk_and_segment_from_addr(&self, addr: usize) -> Option<(usize, usize)> {
+        decode_chunk_addr(addr, self.base_addr, self.total_size, self.chunk_size_bits)
+    }
+
+    /// Segment lookup by decoded ids on this instance.
+    pub fn segment_by_ids(
+        &self,
+        chunk_id: usize,
+        segment_id: usize,
+    ) -> Option<AArc<crate::ram::segs::Segment>> {
+        self.list
+            .get(chunk_id)
+            .and_then(|chunk| chunk.segs.get(&segment_id))
+    }
+
     /// Max sequence observed during recovery for `origin` (0 if none).
     pub fn recovered_origin_floor(&self, origin: u16) -> u64 {
         self.recovered_origin_floors
@@ -1633,6 +1671,9 @@ impl Chunks {
                     .map(|_| std::sync::atomic::AtomicU64::new(0))
                     .collect(),
             ),
+            base_addr: global_base_addr,
+            chunk_size_bits,
+            total_size,
         });
 
         if let Some(ref manager) = chunks_arc.tiered_manager {
