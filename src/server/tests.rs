@@ -1645,6 +1645,11 @@ pub async fn dynamic_tail_layout_roundtrip_across_array_lengths() {
         );
         map.insert("extra_note", OwnedValue::String(format!("note-{len}")));
         map.insert("extra_num", OwnedValue::U64(len as u64));
+        // A dynamic entry inserted by key id only has no name: the writer
+        // cannot persist it, but its presence must not desynchronize the
+        // serialized entry count from the payload (regression: readers
+        // overran into adjacent memory and decoded garbage strings).
+        map.insert_key_id(0xdead_beef_dead_beef, OwnedValue::U64(42));
         let id = Id::rand();
         let cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(map));
         client.write_cell(cell).await.unwrap().unwrap();

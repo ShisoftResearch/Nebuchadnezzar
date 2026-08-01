@@ -304,9 +304,21 @@ fn plan_write_dynamic_map<'a>(
     ins: &mut WriteInstructions<'a>,
 ) -> Result<(), WriteError> {
     *offset = align_address_with_ty(ARRAY_LEN_TYPE, *offset);
+    // The count must match what is actually serialized below: entries are
+    // written by iterating `fields` (the ordered names), so a map entry
+    // without a corresponding name cannot be represented. Writing map.len()
+    // while emitting fields.len() entries truncates the payload and makes
+    // readers overrun into adjacent memory.
+    if map.len() != fields.len() {
+        warn!(
+            "dynamic map has {} entries but only {} named fields; unnamed entries are not persisted",
+            map.len(),
+            fields.len()
+        );
+    }
     ins.push(Instruction {
         data_type: ARRAY_LEN_TYPE,
-        val: InstData::Val(OwnedValue::U32(map.len() as _)),
+        val: InstData::Val(OwnedValue::U32(fields.len() as _)),
         offset: *offset,
     });
     *offset += ARRAY_LEN_TYPE.size().unwrap();
