@@ -89,7 +89,7 @@ fn decode_txn_id(bytes: &[u8]) -> io::Result<TxnId> {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "undo log contains pre-HLC transaction ids; discard undo logs from before the HLC migration (serde error: {})",
+                "undo log transaction id is unreadable: the log predates the HLC migration, is corrupt, or the reader desynchronized from the record layout (serde error: {})",
                 e
             ),
         )
@@ -808,8 +808,14 @@ impl UndoLogger {
 
             match entry_type {
                 ENTRY_TYPE_UNDO => {
-                    // Skip the rest of the undo entry
-                    offset += 5 + txn_id_len + 40; // txn_id + cell_id + chunk_id + seg_id + seq_id
+                    // Advance by the size the decoder actually consumed. A
+                    // hand-maintained constant here drifted from the record
+                    // layout (it predated removing seg_id and adding op_type
+                    // and cell_offset), so every scan desynchronized after the
+                    // first undo entry and then misread arbitrary bytes as the
+                    // next transaction id.
+                    let (_, size) = UndoLogEntry::from_bytes(&buffer[offset..])?;
+                    offset += size;
                 }
                 ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
                     offset += 5 + txn_id_len;
@@ -1298,8 +1304,10 @@ mod tests {
         let entry_parse_err = UndoLogEntry::from_bytes(&bytes)
             .expect_err("parsing a pre-HLC entry must fail, not panic or succeed");
         assert!(
-            entry_parse_err.to_string().contains("pre-HLC"),
-            "expected a pre-HLC error message from UndoLogEntry::from_bytes, got: {}",
+            entry_parse_err
+                .to_string()
+                .contains("undo log transaction id is unreadable"),
+            "expected an unreadable-txn-id error from UndoLogEntry::from_bytes, got: {}",
             entry_parse_err
         );
 
@@ -1311,8 +1319,10 @@ mod tests {
             .recover()
             .expect_err("recovering a pre-HLC undo log must fail, not silently succeed");
         assert!(
-            recover_err.to_string().contains("pre-HLC"),
-            "expected a pre-HLC error message from recover(), got: {}",
+            recover_err
+                .to_string()
+                .contains("undo log transaction id is unreadable"),
+            "expected an unreadable-txn-id error from recover(), got: {}",
             recover_err
         );
     }
@@ -1739,6 +1749,63 @@ mod tests {
     /// Test end-to-end: Rollback Write operations (delete new cells)
     /// Verifies that uncommitted new cells are deleted during recovery
     #[test]
+    #[test]
+    fn undo_entry_scan_stays_aligned_across_multiple_entries() {
+        // A scan that advances by a hand-maintained size drifts as soon as the
+        // record layout changes, and the failure surfaces far away as an
+        // unreadable transaction id. Encode several entries back to back and
+        // require that walking them with the decoder's own size lands exactly
+        // on each successive entry boundary.
+        let txn_a = TxnId { ts: 7, node: 11 };
+        let txn_b = TxnId { ts: 9, node: 3 };
+
+        let entries = vec![
+            UndoLogEntry::new_write(txn_a.clone(), Id::from_parts(1, 100), 5),
+            UndoLogEntry::new_restore(
+                txn_a.clone(),
+                Id::from_parts(2, 200),
+                UndoOpType::Update,
+                9,
+                3,
+                4,
+                512,
+            ),
+            UndoLogEntry::new_restore(
+                txn_b.clone(),
+                Id::from_parts(3, 300),
+                UndoOpType::Remove,
+                2,
+                1,
+                8,
+                64,
+            ),
+        ];
+
+        let mut buffer = Vec::new();
+        for entry in &entries {
+            buffer.extend_from_slice(&entry.to_bytes().unwrap());
+        }
+
+        let mut offset = 0;
+        for expected in &entries {
+            let (decoded, size) = UndoLogEntry::from_bytes(&buffer[offset..])
+                .expect("each entry should decode at its own boundary");
+            assert_eq!(decoded.txn_id, expected.txn_id);
+            assert_eq!(decoded.cell_id, expected.cell_id);
+            assert_eq!(decoded.op_type, expected.op_type);
+            assert_eq!(decoded.version, expected.version);
+            assert_eq!(decoded.chunk_id, expected.chunk_id);
+            assert_eq!(decoded.seq_id, expected.seq_id);
+            assert_eq!(decoded.cell_offset, expected.cell_offset);
+            offset += size;
+        }
+        assert_eq!(
+            offset,
+            buffer.len(),
+            "walking entry sizes must consume the log exactly"
+        );
+    }
+
     fn test_rollback_write_operations() {
         use crate::ram::chunk::Chunks;
         use crate::ram::schema::Schema;
