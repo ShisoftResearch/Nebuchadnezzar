@@ -604,6 +604,39 @@ impl IndexBuilder {
         .boxed()
     }
 
+    /// Drains index tasks that were spawned outside any request scope.
+    ///
+    /// Request handlers only await their own tasks, so unscoped work (recovery,
+    /// background maintenance, transaction paths) needs an owner. This reaper
+    /// is that owner: it keeps the backlog bounded and surfaces failures,
+    /// without putting the backlog on any request's critical path.
+    pub fn spawn_pending_index_reaper() {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
+                    let mut guard = PENDING_INDEX_TASKS.lock();
+                    std::mem::take(&mut *guard)
+                };
+                if tasks.is_empty() {
+                    continue;
+                }
+                let results = tasks
+                    .into_iter()
+                    .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
+                    .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
+                    .await;
+                for result in results {
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => log::warn!("Background index task failed: {:?}", e),
+                        Err(e) => log::warn!("Background index task join failed: {:?}", e),
+                    }
+                }
+            }
+        });
+    }
+
     // Wait for ALL pending index tasks globally (for shutdown)
     // This ensures all index tasks from all threads are completed before shutdown
     pub async fn await_all_indices() -> Vec<Result<Result<(), IndexError>, JoinError>> {
@@ -982,8 +1015,17 @@ mod tests {
         assert_eq!(meta.model, EmbeddingModel::from("test-model"));
     }
 
+    lazy_static! {
+        /// Serializes tests that assert on the process-wide index backlog.
+        /// They mutate shared global state, so running them concurrently makes
+        /// them steal each other's task handles.
+        static ref GLOBAL_BACKLOG_TEST_GUARD: parking_lot::Mutex<()> =
+            parking_lot::Mutex::new(());
+    }
+
     #[tokio::test]
     async fn request_index_scope_does_not_wait_for_unrelated_global_tasks() {
+        let _backlog_guard = GLOBAL_BACKLOG_TEST_GUARD.lock();
         let _ = IndexBuilder::await_indices().await;
 
         new_index_task(async move {
@@ -1025,6 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_backlog_can_be_drained_before_task_completion() {
+        let _backlog_guard = GLOBAL_BACKLOG_TEST_GUARD.lock();
         let _ = IndexBuilder::await_indices().await;
 
         let completed = Arc::new(AtomicBool::new(false));

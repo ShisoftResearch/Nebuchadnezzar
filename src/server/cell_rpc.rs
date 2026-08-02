@@ -449,13 +449,15 @@ impl NebRPCService {
     {
         if self.database_runtime.indexer().is_some() {
             async move {
+                // Wait only on the index work this request generated. Draining
+                // the process-wide backlog here made every write wait for index
+                // tasks belonging to unrelated concurrent requests, so offered
+                // concurrency turned into a convoy instead of throughput.
+                // Unscoped tasks are drained by the background reaper (and by
+                // await_all_indices at shutdown).
                 let (res, request_results) = IndexBuilder::with_request_index_scope(op).await;
-                let pending_results = IndexBuilder::await_indices().await;
 
-                for result in request_results
-                    .into_iter()
-                    .chain(pending_results.into_iter())
-                {
+                for result in request_results.into_iter() {
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {

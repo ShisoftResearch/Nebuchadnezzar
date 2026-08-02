@@ -1264,7 +1264,7 @@ impl NebServer {
         }
 
         let index_builder = if effective_opts.index_enabled {
-            Some(Arc::new(
+            let builder = Arc::new(
                 IndexBuilder::new(
                     &neb_client,
                     conshasing,
@@ -1272,7 +1272,11 @@ impl NebServer {
                     rpc_server.server_id,
                 )
                 .await,
-            ))
+            );
+            // Owner for index tasks spawned outside any request scope; request
+            // handlers deliberately await only their own work.
+            IndexBuilder::spawn_pending_index_reaper();
+            Some(builder)
         } else {
             None
         };
