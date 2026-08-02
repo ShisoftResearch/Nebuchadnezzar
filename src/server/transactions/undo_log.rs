@@ -294,7 +294,7 @@ pub struct UndoLogger {
     /// Log file sequence number
     log_seq: AtomicU64,
     /// Set of active (incomplete) transaction IDs for trimming
-    active_txns: Mutex<HashSet<TxnId>>,
+    active_txns: lightning::map::HashSet<TxnId>,
     /// Maximum log file size before rotation (default 64MB)
     max_log_size: u64,
 }
@@ -309,7 +309,7 @@ impl UndoLogger {
             log_file: Mutex::new(None),
             log_file_name: Mutex::new(None),
             log_seq: AtomicU64::new(0),
-            active_txns: Mutex::new(HashSet::new()),
+            active_txns: lightning::map::HashSet::with_capacity(64),
             max_log_size: 64 * 1024 * 1024, // 64MB
         });
 
@@ -357,7 +357,7 @@ impl UndoLogger {
 
             // Track active transaction
             drop(log_file_guard);
-            self.active_txns.lock().insert(entry.txn_id.clone());
+            self.active_txns.insert(entry.txn_id.clone());
 
             // Check if we need to rotate
             let log_file_name = self.log_file_name.lock();
@@ -398,7 +398,7 @@ impl UndoLogger {
 
             // Remove from in-memory index
             drop(log_file_guard);
-            self.active_txns.lock().remove(txn_id);
+            self.active_txns.remove(txn_id);
 
             Ok(())
         } else {
@@ -428,7 +428,7 @@ impl UndoLogger {
 
             // Remove from in-memory index
             drop(log_file_guard);
-            self.active_txns.lock().remove(txn_id);
+            self.active_txns.remove(txn_id);
 
             Ok(())
         } else {
@@ -737,7 +737,7 @@ impl UndoLogger {
         let current_seq = self.log_seq.load(Ordering::SeqCst);
 
         // Get all active transactions
-        let active_txns: Vec<TxnId> = self.active_txns.lock().iter().cloned().collect();
+        let active_txns: Vec<TxnId> = self.active_txns.items().into_iter().collect();
 
         // Scan log directory for old log files
         let log_dir_path = Path::new(&self.log_dir);
@@ -902,9 +902,15 @@ impl UndoLogger {
             }
         }
 
-        // Update active transactions set for trimming
-        let active_txns_set: HashSet<TxnId> = txn_index.keys().cloned().collect();
-        *self.active_txns.lock() = active_txns_set;
+        // Update active transactions set for trimming. Recovery runs
+        // before the log accepts traffic, so clear-then-refill is not
+        // racing concurrent writers.
+        for txn_id in self.active_txns.items() {
+            self.active_txns.remove(&txn_id);
+        }
+        for txn_id in txn_index.keys() {
+            self.active_txns.insert(txn_id.clone());
+        }
 
         // Update log sequence number
         if let Some((max_seq, _)) = log_files.last() {

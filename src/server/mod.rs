@@ -941,8 +941,8 @@ impl DatabaseRuntime {
 
 pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
-    database_runtimes: RwLock<HashMap<String, Arc<DatabaseRuntime>>>,
-    registered_schema_services: RwLock<HashSet<String>>,
+    database_runtimes: lightning::map::PtrHashMap<String, Arc<DatabaseRuntime>>,
+    registered_schema_services: lightning::map::HashSet<String>,
     runtime_init_lock: tokio::sync::Mutex<()>,
     host_options: ServerOptions,
     /// Shared physical-memory budget for all databases on this server.
@@ -1449,10 +1449,7 @@ impl NebServer {
     }
 
     pub fn database(&self, database_name: &str) -> Option<Arc<DatabaseRuntime>> {
-        self.database_runtimes
-            .read()
-            .ok()
-            .and_then(|runtimes| runtimes.get(database_name).cloned())
+        lightning::map::Map::get(&self.database_runtimes, &database_name.to_string())
     }
 
     pub fn current_database(&self) -> Arc<DatabaseRuntime> {
@@ -1474,9 +1471,7 @@ impl NebServer {
 
         let needs_schema_registration = !self
             .registered_schema_services
-            .read()
-            .expect("schema service registry lock poisoned")
-            .contains(database_name);
+            .contains(&database_name.to_string());
 
         let database_runtime = Self::build_database_runtime(
             &self.host_options,
@@ -1499,15 +1494,14 @@ impl NebServer {
 
         if needs_schema_registration {
             self.registered_schema_services
-                .write()
-                .expect("schema service registry lock poisoned")
                 .insert(database_name.to_string());
         }
 
-        self.database_runtimes
-            .write()
-            .expect("database runtime registry lock poisoned")
-            .insert(database_name.to_string(), database_runtime.clone());
+        lightning::map::Map::insert(
+            &self.database_runtimes,
+            database_name.to_string(),
+            database_runtime.clone(),
+        );
 
         Ok(database_runtime)
     }
@@ -1522,11 +1516,8 @@ impl NebServer {
     /// Unload a database runtime, bypassing the default-database protection.
     /// Used when intentionally resetting the default database.
     pub async fn unload_database_runtime_unchecked(&self, database_name: &str) -> bool {
-        let runtime = self
-            .database_runtimes
-            .write()
-            .expect("database runtime registry lock poisoned")
-            .remove(database_name);
+        let runtime =
+            lightning::map::Map::remove(&self.database_runtimes, &database_name.to_string());
 
         let Some(runtime) = runtime else {
             return false;
@@ -1625,10 +1616,10 @@ impl NebServer {
     }
 
     pub fn database_names(&self) -> Vec<String> {
-        self.database_runtimes
-            .read()
-            .map(|runtimes| runtimes.keys().cloned().collect())
-            .unwrap_or_default()
+        lightning::map::Map::entries(&self.database_runtimes)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
     }
 
     pub fn database_runtime(&self) -> &DatabaseRuntime {
@@ -1819,12 +1810,18 @@ impl NebServer {
 
         let server = Arc::new(NebServer {
             database_runtime: database_runtime.clone(),
-            database_runtimes: RwLock::new(HashMap::from([(
-                database_name.to_string(),
-                database_runtime.clone(),
-            )])),
-            registered_schema_services: RwLock::new(
-                discover_databases_for_startup_schema_registration(
+            database_runtimes: {
+                let runtimes = lightning::map::PtrHashMap::with_capacity(16);
+                lightning::map::Map::insert(
+                    &runtimes,
+                    database_name.to_string(),
+                    database_runtime.clone(),
+                );
+                runtimes
+            },
+            registered_schema_services: {
+                let registered = lightning::map::HashSet::with_capacity(16);
+                for name in discover_databases_for_startup_schema_registration(
                     opts.raft_storage.as_deref(),
                     &[
                         opts.backup_storage.as_deref(),
@@ -1833,9 +1830,11 @@ impl NebServer {
                     ],
                     database_name,
                 )
-                .into_iter()
-                .collect(),
-            ),
+                {
+                    registered.insert(name);
+                }
+                registered
+            },
             runtime_init_lock: tokio::sync::Mutex::new(()),
             host_options: opts.clone(),
             shared_memory_pool,

@@ -39,7 +39,7 @@ pub struct TieredMemoryManager {
     registered_chunks: parking_lot::RwLock<Vec<Weak<Chunks>>>,
 
     /// Per-chunk reconciliation and CLOCK state keyed by chunk address.
-    chunk_states: parking_lot::RwLock<HashMap<usize, Arc<ChunkTierState>>>,
+    chunk_states: lightning::map::PtrHashMap<usize, Arc<ChunkTierState>>,
 
     /// Round-robin cursor across all registered chunks for global eviction.
     eviction_cursor: AtomicUsize,
@@ -64,7 +64,7 @@ impl TieredMemoryManager {
         TieredMemoryManager {
             shared_pool,
             registered_chunks: parking_lot::RwLock::new(Vec::new()),
-            chunk_states: parking_lot::RwLock::new(HashMap::new()),
+            chunk_states: lightning::map::PtrHashMap::with_capacity(64),
             eviction_cursor: AtomicUsize::new(0),
             enabled: true,
             disable_promotion: AtomicBool::new(false),
@@ -131,17 +131,9 @@ impl TieredMemoryManager {
 
     fn ensure_chunk_state(&self, chunk: &Chunk) -> Arc<ChunkTierState> {
         let key = Self::chunk_key(chunk);
-        if let Some(state) = self.chunk_states.read().get(&key) {
-            return state.clone();
-        }
-
-        let mut states = self.chunk_states.write();
-        states
-            .entry(key)
-            .or_insert_with(|| {
-                Arc::new(ChunkTierState::new(self.shared_pool.promotion_cooldown_ms))
-            })
-            .clone()
+        lightning::map::Map::get_or_insert(&self.chunk_states, key, || {
+            Arc::new(ChunkTierState::new(self.shared_pool.promotion_cooldown_ms))
+        })
     }
 
     pub fn register_chunks(&self, chunks: &Arc<Chunks>) {
@@ -178,10 +170,8 @@ impl TieredMemoryManager {
             });
         }
 
-        let dead_keys: Vec<usize> = chunks.list.iter().map(Self::chunk_key).collect();
-        let mut states = self.chunk_states.write();
-        for key in dead_keys {
-            states.remove(&key);
+        for key in chunks.list.iter().map(Self::chunk_key) {
+            lightning::map::Map::remove(&self.chunk_states, &key);
         }
 
         self.decrement_hot_count_by(removed_hot_segments);
@@ -192,9 +182,11 @@ impl TieredMemoryManager {
             .iter()
             .flat_map(|chunks| chunks.list.iter().map(Self::chunk_key))
             .collect();
-        self.chunk_states
-            .write()
-            .retain(|key, _| live_keys.contains(key));
+        for (key, _) in lightning::map::Map::entries(&self.chunk_states) {
+            if !live_keys.contains(&key) {
+                lightning::map::Map::remove(&self.chunk_states, &key);
+            }
+        }
     }
 
     fn collect_registered_chunk_sets(&self) -> Vec<Arc<Chunks>> {
