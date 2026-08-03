@@ -443,8 +443,8 @@ fn install_recovered_segment(chunk: &Chunk, segment: Segment) -> AArc<Segment> {
             .map(|segment| segment.is_hot())
             .unwrap_or(false);
         match (replaced_hot, new_is_hot) {
-            (false, true) => tiered_manager.increment_hot_count(),
-            (true, false) => tiered_manager.decrement_hot_count(),
+            (false, true) => tiered_manager.increment_hot_count_for(chunk),
+            (true, false) => tiered_manager.decrement_hot_count_for(chunk),
             _ => {}
         }
     }

@@ -78,15 +78,32 @@ impl SharedMemoryPool {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement the server-wide hot-segment count by `n`, saturating at zero.
+    /// Decrement the server-wide hot-segment count by `n`.
+    ///
+    /// Takes what this thread's stripe can cover and books the remainder
+    /// against the global correction. Both halves are needed: stripes are
+    /// per-thread, and the thread that evicts a segment is almost never the one
+    /// that allocated it, so its stripe is typically zero. Saturating locally
+    /// and stopping there discarded those decrements outright -- the counter
+    /// then never fell, eviction never saw itself make progress, and it kept
+    /// evicting until nothing was left.
     #[inline]
     pub fn decrement_by(&self, n: usize) {
-        self.stripes[thread_stripe()]
-            .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(n))
-            })
-            .ok();
+        if n == 0 {
+            return;
+        }
+        let mut remaining = n;
+        if let Ok(previous) = self.stripes[thread_stripe()].0.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(remaining)),
+        ) {
+            remaining -= previous.min(remaining);
+        }
+        if remaining > 0 {
+            self.correction
+                .fetch_sub(remaining as isize, Ordering::Relaxed);
+        }
     }
 
     /// Apply a signed delta globally.

@@ -3341,3 +3341,109 @@ async fn test_direct_writes_with_tiered_memory() {
 
     info!("=== Direct Write Test with Tiered Memory Complete ===");
 }
+
+/// Concurrent allocators must not collectively evict far past the lower
+/// watermark.
+///
+/// Every allocating thread calls `evict_for_allocation()`, which sizes its
+/// target from the *current* hot count. When several threads cross the
+/// threshold together they each compute a full target from the same
+/// pre-eviction reading and each evicts all of it, so hot memory lands at a
+/// fraction of the watermark instead of at it. The evicted segments are then
+/// faulted straight back in, and the cycle repeats -- observed on a 1.7TB
+/// import as hot memory oscillating between 35GB and 315GB against a 400GB
+/// limit, with throughput down 4-10x.
+///
+/// Existing eviction tests miss this because they re-check the hot count
+/// between calls, which is exactly the check production lacks.
+#[test]
+fn test_concurrent_allocation_eviction_stops_at_lower_watermark() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+
+    const HOT_SEGMENTS: usize = 18;
+    const EVICTOR_THREADS: usize = 8;
+    let physical_memory_limit = 20 * SEGMENT_SIZE;
+    let lower_watermark = 0.72_f32;
+    let watermark_segments =
+        ((physical_memory_limit as f64 * lower_watermark as f64) / SEGMENT_SIZE as f64) as usize;
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark,
+            physical_memory_limit,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("concurrent_evict_watermark", None, default_fields(), false, false);
+    let schema_dir = "/tmp/neb_concurrent_evict_schema";
+    let backup_dir = "/tmp/neb_concurrent_evict_bk";
+    let wal_dir = "/tmp/neb_concurrent_evict_wal";
+    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+
+    let schemas = LocalSchemasCache::new_local(schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        (HOT_SEGMENTS + 4) * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+        Some(manager.clone()),
+    );
+
+    let payload = "q".repeat(2048);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    write_cells_for_partition(
+        &chunks,
+        schema.id,
+        0,
+        0,
+        cells_per_segment * HOT_SEGMENTS,
+        &payload,
+    );
+
+    let hot_before = total_hot_segments(&chunks);
+    assert!(
+        hot_before > watermark_segments,
+        "test needs to start above the watermark: hot={} watermark={}",
+        hot_before,
+        watermark_segments
+    );
+
+    // Fire the evictions concurrently, as real allocating threads do.
+    let mut handles = Vec::new();
+    for _ in 0..EVICTOR_THREADS {
+        let m = manager.clone();
+        handles.push(std::thread::spawn(move || {
+            m.evict_for_allocation().expect("eviction should not error")
+        }));
+    }
+    let evicted_total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+    let hot_after = total_hot_segments(&chunks);
+
+    // Overshooting by a segment or two is fine; collapsing to a fraction of the
+    // watermark is the bug. Allow a small margin for threads already in flight.
+    let floor = watermark_segments.saturating_sub(2);
+    assert!(
+        hot_after >= floor,
+        "concurrent eviction collapsed hot memory far below the watermark: \
+         hot_before={} hot_after={} watermark={} floor={} evicted_total={} ({} threads)",
+        hot_before,
+        hot_after,
+        watermark_segments,
+        floor,
+        evicted_total,
+        EVICTOR_THREADS
+    );
+
+    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+}

@@ -1045,7 +1045,7 @@ impl Chunk {
         // and update the cache, then we'd increment again, leading to over-counting
         if is_hot {
             if let Some(ref tiered_manager) = self.tiered_manager {
-                tiered_manager.increment_hot_count();
+                tiered_manager.increment_hot_count_for(self);
             }
         }
 
@@ -1081,7 +1081,7 @@ impl Chunk {
         // Decrement cache BEFORE removing from list
         if should_decrement {
             if let Some(ref tiered_manager) = self.tiered_manager {
-                tiered_manager.decrement_hot_count();
+                tiered_manager.decrement_hot_count_for(self);
             }
         }
 

@@ -10,6 +10,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+/// How long to skip global eviction after a pass that freed nothing.
+const EVICTION_BACKOFF_MS: u64 = 50;
+
+/// Minimum spacing between "eviction could not free anything" warnings.
+const STALL_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Releases the global-eviction latch on drop, including on early return or
+/// panic, so a failed pass cannot wedge eviction off permanently.
+struct EvictionFlight<'a>(&'a AtomicBool);
+
+impl<'a> EvictionFlight<'a> {
+    fn try_acquire(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| EvictionFlight(flag))
+    }
+}
+
+impl Drop for EvictionFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 struct ChunkTierState {
     last_known_count: AtomicUsize,
     clock_policy: ClockEvictionPolicy,
@@ -44,12 +68,41 @@ pub struct TieredMemoryManager {
     /// Round-robin cursor across all registered chunks for global eviction.
     eviction_cursor: AtomicUsize,
 
+    /// Single-flight latch for global eviction.
+    ///
+    /// Every allocating thread that crosses the threshold would otherwise run
+    /// its own eviction pass concurrently, and each pass only notices the
+    /// others once it re-reads the counter — so the pool overshoots the
+    /// watermark by roughly the number of threads in flight, and that many
+    /// threads contend on eviction I/O to do redundant work. One evictor at a
+    /// time is enough; the rest proceed with their allocation, since the
+    /// threshold leaves headroom below the hard limit.
+    eviction_in_flight: AtomicBool,
+
     /// Whether tiered memory is enabled
     enabled: bool,
 
     /// Whether to disable promotion (for benchmarking cold reads)
     /// When true, cold segments remain cold even when accessed
     pub disable_promotion: AtomicBool,
+
+    /// Monotonic base for the eviction backoff clock.
+    started_at: Instant,
+
+    /// Milliseconds since `started_at` until which global eviction is skipped.
+    ///
+    /// When hot memory sits above the threshold but every candidate is pinned
+    /// by an active reference, eviction cannot free anything -- yet the next
+    /// allocation immediately retries, so a scan-heavy phase turns into a
+    /// continuous stream of failing passes. Backing off briefly lets the
+    /// references drain instead of burning CPU and log I/O rediscovering the
+    /// same answer thousands of times a second.
+    eviction_backoff_until_ms: AtomicU64,
+
+    /// Rate limiter for the "could not free anything" warning: last emission,
+    /// and how many attempts have been folded into the next one.
+    stall_warn_at: parking_lot::Mutex<Instant>,
+    stall_suppressed: AtomicU64,
 
     /// Metrics counters
     promotion_count: AtomicU64,
@@ -66,6 +119,11 @@ impl TieredMemoryManager {
             registered_chunks: parking_lot::RwLock::new(Vec::new()),
             chunk_states: lightning::map::PtrHashMap::with_capacity(64),
             eviction_cursor: AtomicUsize::new(0),
+            eviction_in_flight: AtomicBool::new(false),
+            started_at: Instant::now(),
+            eviction_backoff_until_ms: AtomicU64::new(0),
+            stall_warn_at: parking_lot::Mutex::new(Instant::now() - STALL_WARN_INTERVAL),
+            stall_suppressed: AtomicU64::new(0),
             enabled: true,
             disable_promotion: AtomicBool::new(false),
             promotion_count: AtomicU64::new(0),
@@ -323,6 +381,7 @@ impl TieredMemoryManager {
         debug!("Explicit eviction requested for {} segments", num_segments);
         let evicted = self.evict_until_target(chunk, num_segments)?;
         self.decrement_hot_count_by(evicted);
+        Self::retreat_known_count(&self.ensure_chunk_state(chunk), evicted);
         Ok(evicted)
     }
 
@@ -399,6 +458,14 @@ impl TieredMemoryManager {
     }
 
     fn evict_globally_until_target(&self, target: usize) -> Result<usize, io::Error> {
+        // Checked here rather than only at the allocation entry point: promotion
+        // reaches this through `evict_down_to_lower`, and a scan-heavy phase
+        // promotes constantly, so a check confined to allocation left most
+        // failing passes running anyway.
+        if self.in_eviction_backoff() {
+            return Ok(0);
+        }
+
         let registered = self.collect_registered_chunk_sets();
         let chunks = self.all_registered_chunks(&registered);
         if chunks.is_empty() || target == 0 {
@@ -409,7 +476,31 @@ impl TieredMemoryManager {
         let mut attempts_without_progress = 0;
         const MAX_ATTEMPTS_WITHOUT_PROGRESS: usize = 3;
 
+        // Every allocating thread sizes its own target from the hot count it
+        // observed before evicting anything. Threads that cross the threshold
+        // together therefore each carry a full target, and if each one runs its
+        // target to completion they collectively evict N times what was needed:
+        // hot memory lands at a fraction of the watermark, the segments fault
+        // straight back in, and the cycle repeats.
+        //
+        // Re-reading the shared counter each round makes concurrent evictors
+        // cooperate instead of compound -- whoever gets there first drives the
+        // pool to the watermark and the rest observe it and stop.
+        let watermark_segments = self.lower_watermark_limit() / SEGMENT_SIZE;
+
         while evicted_count < target {
+            if self.shared_pool.total_hot_segments() <= watermark_segments {
+                debug!(
+                    "Global eviction stopping at watermark: {} hot segments <= {} watermark \
+                     (evicted {}/{} of this thread's target)",
+                    self.shared_pool.total_hot_segments(),
+                    watermark_segments,
+                    evicted_count,
+                    target
+                );
+                break;
+            }
+
             let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed) % chunks.len();
             let mut made_progress = false;
 
@@ -423,6 +514,7 @@ impl TieredMemoryManager {
                 match evict_segment(&victim, chunk) {
                     Ok(()) => {
                         self.shared_pool.decrement_by(1);
+                        Self::retreat_known_count(&state, 1);
                         self.eviction_count.fetch_add(1, Ordering::Relaxed);
                         evicted_count += 1;
                         attempts_without_progress = 0;
@@ -436,7 +528,9 @@ impl TieredMemoryManager {
                         }
                     }
                     Err(e) => {
-                        warn!(
+                        // Usually just "active references" -- expected and
+                        // transient, so it must not log per occurrence.
+                        debug!(
                             "Failed to evict segment {} from chunk {}: {}",
                             victim.id, chunk.id, e
                         );
@@ -447,7 +541,7 @@ impl TieredMemoryManager {
             if !made_progress {
                 attempts_without_progress += 1;
                 if attempts_without_progress >= MAX_ATTEMPTS_WITHOUT_PROGRESS {
-                    warn!(
+                    debug!(
                         "Global eviction stalled after {} attempts without progress, evicted {}/{} segments",
                         MAX_ATTEMPTS_WITHOUT_PROGRESS, evicted_count, target
                     );
@@ -458,14 +552,7 @@ impl TieredMemoryManager {
         }
 
         if evicted_count == 0 && target > 0 {
-            let hot_segments: usize = chunks
-                .iter()
-                .map(|chunk| self.count_hot_segments(chunk))
-                .sum();
-            warn!(
-                "Failed to evict any segments globally (target was {}). Hot segments: {}, all may be protected or have active references",
-                target, hot_segments
-            );
+            self.note_eviction_made_no_progress();
         }
 
         Ok(evicted_count)
@@ -481,6 +568,16 @@ impl TieredMemoryManager {
         if !self.enabled {
             return Ok(0);
         }
+
+        if self.in_eviction_backoff() {
+            return Ok(0);
+        }
+
+        let Some(_flight) = EvictionFlight::try_acquire(&self.eviction_in_flight) else {
+            // Another thread is already evicting toward the watermark; piling on
+            // only overshoots it and duplicates the I/O.
+            return Ok(0);
+        };
 
         let hot_segments_count = self.total_hot_segments_cached();
         let max_reasonable_segments = usize::MAX / SEGMENT_SIZE;
@@ -573,7 +670,7 @@ impl TieredMemoryManager {
         promote_segment(segment);
         segment.reset_access_count();
 
-        self.shared_pool.increment();
+        self.increment_hot_count_for(chunk);
         self.promotion_count.fetch_add(1, Ordering::Relaxed);
         if churn_candidate {
             self.churn_count.fetch_add(1, Ordering::Relaxed);
@@ -621,14 +718,76 @@ impl TieredMemoryManager {
             .sum()
     }
 
-    /// Increment the server-wide hot-segment count.
-    pub fn increment_hot_count(&self) {
+    /// Increment the server-wide hot-segment count for a segment owned by
+    /// `chunk`.
+    ///
+    /// The periodic reconcile is delta-based: it applies
+    /// `actual - last_known_count` to the shared counter. That is only correct
+    /// while the counter equals the sum of every chunk's `last_known_count`, so
+    /// a mutation that moves one without the other makes the next scan re-apply
+    /// the same segments. Bumping the counter alone made the first full scan
+    /// count every live segment a second time, pinning the counter at 2x
+    /// reality -- which in turn made eviction targets exceed the number of
+    /// segments that actually existed.
+    pub fn increment_hot_count_for(&self, chunk: &Chunk) {
         self.shared_pool.increment();
+        self.ensure_chunk_state(chunk)
+            .last_known_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement the server-wide hot-segment count by 1.
-    pub fn decrement_hot_count(&self) {
-        self.decrement_hot_count_by(1);
+    /// Decrement the server-wide hot-segment count for a segment owned by
+    /// `chunk`, keeping that chunk's reconcile baseline in step.
+    pub fn decrement_hot_count_for(&self, chunk: &Chunk) {
+        self.shared_pool.decrement_by(1);
+        Self::retreat_known_count(&self.ensure_chunk_state(chunk), 1);
+    }
+
+    #[inline]
+    fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
+    }
+
+    /// Whether a recent eviction pass freed nothing and the backoff still holds.
+    #[inline]
+    fn in_eviction_backoff(&self) -> bool {
+        self.elapsed_ms() < self.eviction_backoff_until_ms.load(Ordering::Relaxed)
+    }
+
+    /// Record that a pass could not free anything: arm the backoff and fold the
+    /// event into a rate-limited warning.
+    ///
+    /// Pinned segments are an ordinary transient condition, so reporting each
+    /// occurrence at warn level put this on a hot path -- a single constrained
+    /// import emitted 1.6 million lines, around a thousand a second.
+    fn note_eviction_made_no_progress(&self) {
+        self.eviction_backoff_until_ms.store(
+            self.elapsed_ms().saturating_add(EVICTION_BACKOFF_MS),
+            Ordering::Relaxed,
+        );
+        self.stall_suppressed.fetch_add(1, Ordering::Relaxed);
+        if let Some(mut last_warn) = self.stall_warn_at.try_lock() {
+            if last_warn.elapsed() >= STALL_WARN_INTERVAL {
+                *last_warn = Instant::now();
+                let folded = self.stall_suppressed.swap(0, Ordering::Relaxed);
+                warn!(
+                    "Global eviction freed nothing on {} attempt(s) in the last {}s: hot segments \
+                     are held by active references. Hot memory stays above the threshold until \
+                     they drain.",
+                    folded,
+                    STALL_WARN_INTERVAL.as_secs()
+                );
+            }
+        }
+    }
+
+    /// Lower a chunk's reconcile baseline by `by`, saturating at zero.
+    fn retreat_known_count(state: &ChunkTierState, by: usize) {
+        let _ = state.last_known_count.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(by)),
+        );
     }
 
     /// Decrement the server-wide hot-segment count by `by`, saturating at zero.
