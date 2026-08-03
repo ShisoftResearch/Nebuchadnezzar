@@ -27,6 +27,20 @@ use std::{io, slice};
 
 use super::entry::ENTRY_HEAD_SIZE;
 
+/// Durability write accounting, for attributing disk write volume.
+///
+/// Inferring these from segment counts and directory growth proved unreliable
+/// -- backups are compressed and rewritten in place, so neither file sizes nor
+/// `du` reflect what actually reaches the device. These count it at the source.
+pub static ARCHIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static ARCHIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Archives of a segment that already had a backup file, i.e. rewrites rather
+/// than first writes. A high ratio to ARCHIVE_COUNT means segments are being
+/// re-dirtied and re-archived after they should have been sealed.
+pub static ARCHIVE_REWRITES: AtomicU64 = AtomicU64::new(0);
+pub static WAL_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
+
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
@@ -627,9 +641,15 @@ impl Segment {
                         debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
 
                         // Conditionally compress based on feature flag
+                        ARCHIVE_COUNT.fetch_add(1, Relaxed);
+                        if has_old_backup {
+                            ARCHIVE_REWRITES.fetch_add(1, Relaxed);
+                        }
+
                         #[cfg(feature = "compress_backups")]
                         {
                             let compressed_data = compression::compress(&padded_data)?;
+                            ARCHIVE_BYTES.fetch_add(compressed_data.len() as u64, Relaxed);
                             file.write_all(&compressed_data)?;
                             debug!(
                                 "Archived segment {} with compression: {} bytes -> {} bytes (ratio: {:.2}%)",
@@ -642,6 +662,7 @@ impl Segment {
 
                         #[cfg(not(feature = "compress_backups"))]
                         {
+                            ARCHIVE_BYTES.fetch_add(padded_data.len() as u64, Relaxed);
                             file.write_all(&padded_data)?;
                             debug!(
                                 "Archived segment {} without compression: {} bytes",
@@ -735,6 +756,7 @@ impl Segment {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
                 file.write_all(data_block)?; // Use write_all to ensure all bytes are written
             }
+            WAL_BYTES.fetch_add(size as u64, Relaxed);
             // Transactions control their own sync at commit time
             // For non-transactional writes, use group commit batching
             if skip_sync {
@@ -763,6 +785,7 @@ impl Segment {
 
             if should_sync {
                 // Sync data to disk
+                WAL_SYNCS.fetch_add(1, Relaxed);
                 file.sync_data()?;
 
                 // Reset counters after successful sync

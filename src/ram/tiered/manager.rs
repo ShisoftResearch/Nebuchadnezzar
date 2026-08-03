@@ -10,6 +10,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+/// Whether an eviction request should be throttled by the background pacing
+/// guards, or run immediately because a caller asked for it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pacing {
+    /// Skip if another pass is already running. For allocation, where eviction
+    /// is advisory -- the allocation proceeds either way.
+    Background,
+    /// Wait for the in-flight pass, then run. For promotion, which cannot
+    /// proceed until room actually exists: skipping lets hot memory grow past
+    /// the limit (observed: 618GB against a 400GB limit, then OOM-killed).
+    Blocking,
+    /// Run immediately, unpaced. For callers that request eviction directly and
+    /// assert on the result.
+    Immediate,
+}
+
 /// How long to skip global eviction after a pass that freed nothing.
 const EVICTION_BACKOFF_MS: u64 = 50;
 
@@ -68,7 +84,8 @@ pub struct TieredMemoryManager {
     /// Round-robin cursor across all registered chunks for global eviction.
     eviction_cursor: AtomicUsize,
 
-    /// Single-flight latch for global eviction.
+    /// Serialises global eviction. A mutex rather than a flag so promotion can
+    /// wait for room instead of proceeding without it.
     ///
     /// Every allocating thread that crosses the threshold would otherwise run
     /// its own eviction pass concurrently, and each pass only notices the
@@ -77,7 +94,7 @@ pub struct TieredMemoryManager {
     /// threads contend on eviction I/O to do redundant work. One evictor at a
     /// time is enough; the rest proceed with their allocation, since the
     /// threshold leaves headroom below the hard limit.
-    eviction_in_flight: AtomicBool,
+    eviction_lock: parking_lot::Mutex<()>,
 
     /// Whether tiered memory is enabled
     enabled: bool,
@@ -109,6 +126,10 @@ pub struct TieredMemoryManager {
     eviction_count: AtomicU64,
     churn_count: AtomicU64,
     lower_watermark_evictions: AtomicU64,
+    /// Promotions refused because the hot tier was already at the hard limit.
+    /// A rising count means reads are being served from cold to hold the limit,
+    /// which is the intended trade rather than a fault.
+    promotions_declined: AtomicU64,
 }
 
 impl TieredMemoryManager {
@@ -119,7 +140,7 @@ impl TieredMemoryManager {
             registered_chunks: parking_lot::RwLock::new(Vec::new()),
             chunk_states: lightning::map::PtrHashMap::with_capacity(64),
             eviction_cursor: AtomicUsize::new(0),
-            eviction_in_flight: AtomicBool::new(false),
+            eviction_lock: parking_lot::Mutex::new(()),
             started_at: Instant::now(),
             eviction_backoff_until_ms: AtomicU64::new(0),
             stall_warn_at: parking_lot::Mutex::new(Instant::now() - STALL_WARN_INTERVAL),
@@ -130,6 +151,7 @@ impl TieredMemoryManager {
             eviction_count: AtomicU64::new(0),
             churn_count: AtomicU64::new(0),
             lower_watermark_evictions: AtomicU64::new(0),
+            promotions_declined: AtomicU64::new(0),
         }
     }
 
@@ -364,7 +386,10 @@ impl TieredMemoryManager {
     /// Returns the number of segments evicted
     pub fn check_and_evict(&self, chunk: &Chunk) -> Result<usize, io::Error> {
         let _ = chunk;
-        self.evict_for_allocation()
+        // Immediate: a caller invoking this directly expects the pass to run and
+        // then asserts on what it returned. Background pacing would make the
+        // result depend on whether another pass happened to be in flight.
+        self.evict_for_allocation_paced(Pacing::Immediate)
     }
 
     /// Explicitly evict a specific number of segments from one chunk (test-only)
@@ -458,13 +483,48 @@ impl TieredMemoryManager {
     }
 
     fn evict_globally_until_target(&self, target: usize) -> Result<usize, io::Error> {
-        // Checked here rather than only at the allocation entry point: promotion
-        // reaches this through `evict_down_to_lower`, and a scan-heavy phase
-        // promotes constantly, so a check confined to allocation left most
-        // failing passes running anyway.
-        if self.in_eviction_backoff() {
-            return Ok(0);
-        }
+        self.evict_globally_until_target_paced(target, Pacing::Background)
+    }
+
+    /// Global eviction with explicit control over pacing.
+    ///
+    /// `Pacing::Background` applies the single-flight latch and the no-progress
+    /// backoff. Both guards live here, at the single choke point every caller
+    /// funnels through, rather than at the allocation entry point: promotion
+    /// reaches eviction via `evict_down_to_lower`, so guarding only allocation
+    /// left the promotion path unserialised, and those passes stampeded exactly
+    /// as the allocation path used to.
+    ///
+    /// `Pacing::Immediate` skips both. Callers that ask for eviction explicitly
+    /// and then assert on the result need it to actually run -- pacing is for
+    /// throttling the automatic paths, not for deciding whether a direct
+    /// request is honoured.
+    fn evict_globally_until_target_paced(
+        &self,
+        target: usize,
+        pacing: Pacing,
+    ) -> Result<usize, io::Error> {
+        let _flight = match pacing {
+            Pacing::Background => {
+                if self.in_eviction_backoff() {
+                    return Ok(0);
+                }
+                // Someone is already evicting toward the watermark; joining in
+                // only overshoots it and duplicates the I/O. Allocation does not
+                // depend on the outcome, so skipping is safe here.
+                match self.eviction_lock.try_lock() {
+                    Some(guard) => Some(guard),
+                    None => return Ok(0),
+                }
+            }
+            // Serialised like Background, but the caller waits instead of
+            // proceeding without room. Concurrent evictors would stampede past
+            // the watermark; skipping would let the caller promote anyway and
+            // blow the limit. Waiting gives backpressure, which is the correct
+            // response to memory pressure.
+            Pacing::Blocking => Some(self.eviction_lock.lock()),
+            Pacing::Immediate => None,
+        };
 
         let registered = self.collect_registered_chunk_sets();
         let chunks = self.all_registered_chunks(&registered);
@@ -565,19 +625,13 @@ impl TieredMemoryManager {
     ///
     /// Returns the number of segments evicted.
     pub fn evict_for_allocation(&self) -> Result<usize, io::Error> {
+        self.evict_for_allocation_paced(Pacing::Background)
+    }
+
+    fn evict_for_allocation_paced(&self, pacing: Pacing) -> Result<usize, io::Error> {
         if !self.enabled {
             return Ok(0);
         }
-
-        if self.in_eviction_backoff() {
-            return Ok(0);
-        }
-
-        let Some(_flight) = EvictionFlight::try_acquire(&self.eviction_in_flight) else {
-            // Another thread is already evicting toward the watermark; piling on
-            // only overshoots it and duplicates the I/O.
-            return Ok(0);
-        };
 
         let hot_segments_count = self.total_hot_segments_cached();
         let max_reasonable_segments = usize::MAX / SEGMENT_SIZE;
@@ -600,7 +654,7 @@ impl TieredMemoryManager {
                 segments_to_evict
             );
 
-            self.evict_globally_until_target(segments_to_evict)
+            self.evict_globally_until_target_paced(segments_to_evict, pacing)
         } else {
             Ok(0)
         }
@@ -661,7 +715,22 @@ impl TieredMemoryManager {
         let hot_segments_count = self.hot_count_cached(chunk);
         let after_promotion_bytes = self.hot_memory_bytes(hot_segments_count.saturating_add(1));
         if after_promotion_bytes > self.threshold_limit() {
-            let _ = self.evict_down_to_lower(hot_segments_count)?;
+            // Promotion must WAIT for room, not skip and not refuse.
+            //
+            // Refusing is not an option: a cold segment is not readable in
+            // place. `CellGuard::from_guard` drops the cell lock, calls promote,
+            // and returns None so the caller retries expecting the segment to be
+            // hot -- so a declined promotion spins that retry loop forever.
+            //
+            // Skipping is not an option either: when the eviction latch was held
+            // by someone else the promotion proceeded anyway, so hot memory grew
+            // unbounded past the configured limit (618GB against 400GB) until
+            // the process was OOM-killed.
+            //
+            // Blocking pacing serialises eviction without letting the caller
+            // continue before room exists. Under pressure that shows up as
+            // slower reads rather than a dead process.
+            self.evict_down_to_lower(hot_segments_count)?;
         }
 
         let churn_candidate =
@@ -688,7 +757,7 @@ impl TieredMemoryManager {
 
         let excess_bytes = current_bytes.saturating_sub(lower_limit);
         let target_segments = (excess_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE;
-        let evicted = self.evict_globally_until_target(target_segments)?;
+        let evicted = self.evict_globally_until_target_paced(target_segments, Pacing::Blocking)?;
         if evicted > 0 {
             self.lower_watermark_evictions
                 .fetch_add(evicted as u64, Ordering::Relaxed);
@@ -824,6 +893,22 @@ impl TieredMemoryManager {
         }
     }
 
+    /// Server-wide eviction counters, independent of any single chunk.
+    ///
+    /// `churns` is the diagnostic one: it counts promotions of a segment that
+    /// was evicted within the cooldown, i.e. eviction of data still in use.
+    /// Every churn costs a write on the way out and a read on the way back, so
+    /// a churn rate near the eviction rate means most eviction I/O is wasted.
+    pub fn global_counters(&self) -> TieredGlobalCounters {
+        TieredGlobalCounters {
+            promotions: self.promotion_count.load(Ordering::Relaxed),
+            evictions: self.eviction_count.load(Ordering::Relaxed),
+            churns: self.churn_count.load(Ordering::Relaxed),
+            lower_watermark_evictions: self.lower_watermark_evictions.load(Ordering::Relaxed),
+            promotions_declined: self.promotions_declined.load(Ordering::Relaxed),
+        }
+    }
+
     /// Access the shared server-wide memory pool.
     pub fn shared_pool(&self) -> &Arc<SharedMemoryPool> {
         &self.shared_pool
@@ -838,6 +923,16 @@ impl TieredMemoryManager {
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
+}
+
+/// Server-wide eviction counters, not scoped to a chunk.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TieredGlobalCounters {
+    pub promotions: u64,
+    pub evictions: u64,
+    pub churns: u64,
+    pub lower_watermark_evictions: u64,
+    pub promotions_declined: u64,
 }
 
 /// Statistics about tiered memory usage

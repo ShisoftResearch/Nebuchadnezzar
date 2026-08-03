@@ -31,6 +31,23 @@ pub struct ServerMemoryStatus {
     pub living_transactions: usize,
     pub physical_memory_limit_bytes: Option<usize>,
     pub tiered_memory_enabled: bool,
+    /// Server-wide eviction counters. `churns` counts promotions of segments
+    /// evicted within the cooldown -- eviction of data still in use, where each
+    /// event costs a write out and a read back.
+    pub promotions: u64,
+    pub evictions: u64,
+    pub churns: u64,
+    pub lower_watermark_evictions: u64,
+    /// Promotions refused because the hot tier was at the hard limit.
+    pub promotions_declined: u64,
+    /// Durability write accounting, counted where the writes are issued.
+    pub archive_count: u64,
+    pub archive_bytes: u64,
+    /// Archives of segments that already had a backup file -- rewrites, not
+    /// first writes.
+    pub archive_rewrites: u64,
+    pub wal_bytes: u64,
+    pub wal_syncs: u64,
 }
 
 impl ServerMemoryStatus {
@@ -211,6 +228,13 @@ impl NebServer {
             .unwrap_or(total_hot_segments);
         let hot_segment_counter_drift = shared_hot_segments as isize - total_hot_segments as isize;
 
+        let tiered_counters = self
+            .chunks()
+            .tiered_manager
+            .as_ref()
+            .map(|manager| manager.global_counters())
+            .unwrap_or_default();
+
         let living_transactions = self
             .txn_manager()
             .as_ref()
@@ -233,6 +257,16 @@ impl NebServer {
             living_transactions,
             physical_memory_limit_bytes: total_physical_limit,
             tiered_memory_enabled: tiered_enabled,
+            promotions: tiered_counters.promotions,
+            evictions: tiered_counters.evictions,
+            churns: tiered_counters.churns,
+            lower_watermark_evictions: tiered_counters.lower_watermark_evictions,
+            promotions_declined: tiered_counters.promotions_declined,
+            archive_count: crate::ram::segs::ARCHIVE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            archive_bytes: crate::ram::segs::ARCHIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            archive_rewrites: crate::ram::segs::ARCHIVE_REWRITES.load(std::sync::atomic::Ordering::Relaxed),
+            wal_bytes: crate::ram::segs::WAL_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            wal_syncs: crate::ram::segs::WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
