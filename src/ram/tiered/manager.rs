@@ -26,6 +26,10 @@ enum Pacing {
     Immediate,
 }
 
+/// How many global eviction passes may run concurrently. Bounds the stampede
+/// without serialising every reader behind a single lock.
+const EVICTION_SHARDS: usize = 16;
+
 /// How long to skip global eviction after a pass that freed nothing.
 const EVICTION_BACKOFF_MS: u64 = 50;
 
@@ -84,8 +88,16 @@ pub struct TieredMemoryManager {
     /// Round-robin cursor across all registered chunks for global eviction.
     eviction_cursor: AtomicUsize,
 
-    /// Serialises global eviction. A mutex rather than a flag so promotion can
-    /// wait for room instead of proceeding without it.
+    /// Bounds how many global eviction passes run at once.
+    ///
+    /// A single lock here throttled the whole server: promotion waits for room,
+    /// so serialising eviction serialised every reader that touched cold data.
+    /// Measured at ~893 evictions/s with 282 of 300 threads parked in
+    /// futex_do_wait, 13% CPU and 20% disk -- nothing saturated but the lock.
+    ///
+    /// Sharding restores parallelism while still capping the stampede. Eviction
+    /// re-checks the watermark after every segment, so N concurrent passes
+    /// overshoot by at most N segments (a few MB), not by N targets.
     ///
     /// Every allocating thread that crosses the threshold would otherwise run
     /// its own eviction pass concurrently, and each pass only notices the
@@ -94,7 +106,7 @@ pub struct TieredMemoryManager {
     /// threads contend on eviction I/O to do redundant work. One evictor at a
     /// time is enough; the rest proceed with their allocation, since the
     /// threshold leaves headroom below the hard limit.
-    eviction_lock: parking_lot::Mutex<()>,
+    eviction_locks: Vec<parking_lot::Mutex<()>>,
 
     /// Whether tiered memory is enabled
     enabled: bool,
@@ -140,7 +152,9 @@ impl TieredMemoryManager {
             registered_chunks: parking_lot::RwLock::new(Vec::new()),
             chunk_states: lightning::map::PtrHashMap::with_capacity(64),
             eviction_cursor: AtomicUsize::new(0),
-            eviction_lock: parking_lot::Mutex::new(()),
+            eviction_locks: (0..EVICTION_SHARDS)
+                .map(|_| parking_lot::Mutex::new(()))
+                .collect(),
             started_at: Instant::now(),
             eviction_backoff_until_ms: AtomicU64::new(0),
             stall_warn_at: parking_lot::Mutex::new(Instant::now() - STALL_WARN_INTERVAL),
@@ -504,6 +518,8 @@ impl TieredMemoryManager {
         target: usize,
         pacing: Pacing,
     ) -> Result<usize, io::Error> {
+        // Spread passes across shards so concurrent evictors rarely collide.
+        let shard = self.eviction_cursor.load(Ordering::Relaxed) % EVICTION_SHARDS;
         let _flight = match pacing {
             Pacing::Background => {
                 if self.in_eviction_backoff() {
@@ -512,7 +528,7 @@ impl TieredMemoryManager {
                 // Someone is already evicting toward the watermark; joining in
                 // only overshoots it and duplicates the I/O. Allocation does not
                 // depend on the outcome, so skipping is safe here.
-                match self.eviction_lock.try_lock() {
+                match self.eviction_locks[shard].try_lock() {
                     Some(guard) => Some(guard),
                     None => return Ok(0),
                 }
@@ -522,7 +538,7 @@ impl TieredMemoryManager {
             // the watermark; skipping would let the caller promote anyway and
             // blow the limit. Waiting gives backpressure, which is the correct
             // response to memory pressure.
-            Pacing::Blocking => Some(self.eviction_lock.lock()),
+            Pacing::Blocking => Some(self.eviction_locks[shard].lock()),
             Pacing::Immediate => None,
         };
 
@@ -852,7 +868,7 @@ impl TieredMemoryManager {
 
     /// Lower a chunk's reconcile baseline by `by`, saturating at zero.
     fn retreat_known_count(state: &ChunkTierState, by: usize) {
-        let _ = state.last_known_count.fetch_update(
+        let _ = state.last_known_count.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| Some(current.saturating_sub(by)),
