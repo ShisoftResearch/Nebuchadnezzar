@@ -1979,6 +1979,39 @@ impl<'a> CellGuard<'a> {
                 segment = chunk.locate_segment(*guard);
                 if let Some(seg) = &segment {
                     if seg.is_cold() {
+                        // Serve the read from a single backup block where we can,
+                        // rather than materialising all 8 MiB to reach one cell.
+                        // The block is decompressed back to its own offset inside
+                        // this segment's mapping, so `*guard` stays valid and the
+                        // rest of the read path is unaffected.
+                        //
+                        // Falls through to promotion when the backup predates the
+                        // block-indexed format, or when the block read fails --
+                        // promotion is slower but always works.
+                        match seg.fault_in_block_for(*guard) {
+                            Ok(true) => {
+                                if !seg.incr_references() {
+                                    return None;
+                                }
+                                seg.mark_referenced();
+                                if let Some(ref tiered) = chunk.tiered_manager {
+                                    tiered.note_cold_block_read(seg);
+                                }
+                                return Some(CellGuard {
+                                    hash,
+                                    guard: Some(guard),
+                                    chunk,
+                                    segment,
+                                    version,
+                                });
+                            }
+                            Ok(false) => {}
+                            Err(e) => debug!(
+                                "Partial read of segment {} in chunk {} failed, promoting: {}",
+                                seg.id, chunk.id, e
+                            ),
+                        }
+
                         // CRITICAL: Release the cell lock BEFORE promotion to avoid deadlock.
                         // The deadlock scenario:
                         // - Thread A holds cell lock, calls promote_segment, waits for segment exclusive access

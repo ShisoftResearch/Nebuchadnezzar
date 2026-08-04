@@ -22,6 +22,19 @@ use crate::utils::test_temp::temp_path;
 // Global mutex to prevent test interference
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Serialise tiered tests, recovering from poisoning.
+///
+/// These tests share process-wide tiered state, so they must not overlap. Using
+/// `.lock().unwrap()` meant the first genuine failure poisoned the mutex and
+/// every subsequent test failed on the lock instead of running -- one real
+/// assertion turned into eighteen `PoisonError`s, hiding which one actually
+/// broke. The lock guards ordering, not invariants, so recovering is safe and
+/// keeps the real failure legible.
+fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+
 async fn tiered_txn_client(
     address: &String,
     group_name: &str,
@@ -215,7 +228,7 @@ fn append_round_robin_until_reconciled_hot_segments(
 /// Test automatic eviction when physical memory limit is exceeded
 #[test]
 fn test_eviction_on_memory_overflow() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     // Configure tiered memory with a small physical memory limit
@@ -399,7 +412,7 @@ fn test_eviction_on_memory_overflow() {
 /// Test that reads from cold segments trigger promotion and data is still intact
 #[test]
 fn test_cold_segment_promotion() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     // Configure with tight memory limit
@@ -528,7 +541,7 @@ fn test_cold_segment_promotion() {
 /// Test churn-related metrics and promotion cooldown skip logic
 #[test]
 fn test_metrics_and_churn_counters() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
@@ -641,7 +654,7 @@ fn test_metrics_and_churn_counters() {
 
 #[test]
 fn test_active_blob_head_is_not_evicted_by_clock() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let chunks = Chunks::new_dummy(1, 3 * SEGMENT_SIZE);
@@ -673,7 +686,7 @@ fn test_active_blob_head_is_not_evicted_by_clock() {
 
 #[test]
 fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let chunks = Chunks::new_dummy(1, 4 * SEGMENT_SIZE);
@@ -739,7 +752,7 @@ fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
 
 #[test]
 fn test_blob_segments_evict_before_regular_segments() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let schema_dir = temp_path("neb_blob_priority_schema");
@@ -884,7 +897,7 @@ fn test_blob_segments_evict_before_regular_segments() {
 
 #[test]
 fn test_blob_segments_promote_on_read_after_eviction() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let schema_dir = temp_path("neb_blob_promote_schema");
@@ -963,14 +976,23 @@ fn test_blob_segments_promote_on_read_after_eviction() {
     );
     drop(read_back);
 
+    // Reading a cold segment no longer promotes it. The backup is block
+    // indexed, so the read is served by decompressing the one block holding the
+    // cell -- which for a blob large enough to own a block is exactly that blob
+    // -- and the segment stays cold. Promoting 8 MiB to reach one cell was the
+    // behaviour that turned a working set larger than the hot tier into
+    // promote/evict churn.
+    //
+    // What matters is asserted above: the cell read back intact. What follows
+    // asserts the segment was NOT materialised in full to do it.
     assert!(
-        cold_segment.is_hot(),
-        "reading a cold blob segment should promote it"
+        cold_segment.is_cold(),
+        "a cold blob read should be served from its block, not by promoting the segment"
     );
-    assert_eq!(
-        cold_segment.get_access_count(),
-        0,
-        "promotion should reset the cold access counter"
+    let (present, total) = cold_segment.block_residency_stats();
+    assert!(
+        present > 0 && present <= total,
+        "expected the read to fault in at least one block (present {present} of {total})"
     );
 
     let _ = std::fs::remove_dir_all(&schema_dir);
@@ -980,7 +1002,7 @@ fn test_blob_segments_promote_on_read_after_eviction() {
 
 #[test]
 fn test_global_eviction_across_chunks_in_single_database() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let chunk_capacity = 4 * SEGMENT_SIZE;
@@ -1067,7 +1089,7 @@ fn test_global_eviction_across_chunks_in_single_database() {
 
 #[test]
 fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let physical_memory_limit = 8 * SEGMENT_SIZE;
@@ -1174,7 +1196,7 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
 
 #[test]
 fn test_reconciled_background_eviction_ignores_stale_shared_counter_drift() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let physical_memory_limit = 8 * SEGMENT_SIZE;
@@ -1258,7 +1280,7 @@ fn test_reconciled_background_eviction_ignores_stale_shared_counter_drift() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
 
@@ -1337,7 +1359,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
 
@@ -1456,7 +1478,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
 
@@ -1612,7 +1634,7 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_global_eviction_across_multiple_databases() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let backup_dir = temp_path("neb_multi_db_global_eviction_bk");
@@ -1752,7 +1774,7 @@ async fn test_global_eviction_across_multiple_databases() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let physical_memory_limit = 8 * SEGMENT_SIZE;
@@ -1913,7 +1935,7 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
 
 #[test]
 fn test_equal_sized_databases_evict_down_to_shared_limit() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let physical_memory_limit = 6 * SEGMENT_SIZE;
@@ -2025,7 +2047,7 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
 
 #[test]
 fn test_global_eviction_ignores_unregistered_database() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
@@ -2143,7 +2165,7 @@ fn test_multi_chance_clock_api() {
 /// Tests natural eviction/promotion with serializability guarantees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn test_large_scale_transactions_with_natural_tiered_memory() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     info!("=== Starting Large-Scale Tiered Memory Transaction Test ===");
@@ -2500,7 +2522,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
 /// Comprehensive stress test: Multiple scales of load with concurrent reads and writes
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     info!("=== Starting Stress Test: Mixed Concurrent Workload ===");
@@ -2712,7 +2734,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_direct_writes_without_transactions_or_tiered_memory() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     info!("=== Starting Direct Write Test (No Transactions, No Tiered Memory) ===");
@@ -2992,7 +3014,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_direct_writes_with_tiered_memory() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     info!("=== Starting Direct Write Test WITH Tiered Memory ===");
@@ -3359,7 +3381,7 @@ async fn test_direct_writes_with_tiered_memory() {
 /// between calls, which is exactly the check production lacks.
 #[test]
 fn test_concurrent_allocation_eviction_stops_at_lower_watermark() {
-    let _guard = TEST_MUTEX.lock().unwrap();
+    let _guard = test_lock();
     let _ = env_logger::try_init();
 
     const HOT_SEGMENTS: usize = 18;
@@ -3429,9 +3451,13 @@ fn test_concurrent_allocation_eviction_stops_at_lower_watermark() {
 
     let hot_after = total_hot_segments(&chunks);
 
-    // Overshooting by a segment or two is fine; collapsing to a fraction of the
-    // watermark is the bug. Allow a small margin for threads already in flight.
-    let floor = watermark_segments.saturating_sub(2);
+    // Eviction re-checks the watermark after each segment, but a pass already
+    // past that check still evicts one before looking again -- so with N passes
+    // running concurrently the pool can dip N segments below the watermark and
+    // no further. That is the guarantee sharding preserves, and it is what this
+    // asserts: bounded overshoot, not the original collapse to a fraction of
+    // the watermark (which showed up here as hot_after=1 against a floor of 14).
+    let floor = watermark_segments.saturating_sub(EVICTOR_THREADS);
     assert!(
         hot_after >= floor,
         "concurrent eviction collapsed hot memory far below the watermark: \
@@ -3442,6 +3468,101 @@ fn test_concurrent_allocation_eviction_stops_at_lower_watermark() {
         floor,
         evicted_total,
         EVICTOR_THREADS
+    );
+
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+}
+
+/// A read of a cold cell must be served from a single backup block, leaving the
+/// segment cold.
+///
+/// This is the point of the block-indexed backup format. Before it, the only
+/// way to reach one cell in a cold segment was to decompress all 8 MiB and
+/// promote the segment -- which is why a working set larger than the hot tier
+/// degenerated into promote/evict churn at roughly one cycle per read.
+#[test]
+fn cold_cell_reads_are_served_from_one_block_without_promotion() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("cold_block_read", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_cold_block_schema");
+    let backup_dir = temp_path("neb_cold_block_bk");
+    let wal_dir = temp_path("neb_cold_block_wal");
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        8 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    // Fill a couple of segments so there is something to evict.
+    let payload = "z".repeat(2048);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment * 2, &payload);
+
+    let chunk = &chunks.list[0];
+    // Evict everything evictable so the reads below land on cold segments.
+    let evicted = manager.explicit_evict(chunk, 4).expect("evict");
+    assert!(evicted > 0, "test needs at least one cold segment");
+
+    let cold_before = chunk.segments().iter().filter(|s| s.is_cold()).count();
+    assert!(cold_before > 0, "expected cold segments after eviction");
+
+    // Read cells back. Each read should fault in one block and leave the
+    // segment cold, rather than promoting all 8 MiB.
+    let mut read_ok = 0;
+    for i in 0..(cells_per_segment / 4) {
+        let id = Id::allocated(0, 0, i as u64);
+        if chunks.read_cell(&id).is_ok() {
+            read_ok += 1;
+        }
+    }
+    assert!(read_ok > 0, "expected to read cells back");
+
+    let cold_after = chunk.segments().iter().filter(|s| s.is_cold()).count();
+    assert!(
+        cold_after > 0,
+        "every cold segment was promoted; partial reads did not engage \
+         (cold {} -> {}, reads {})",
+        cold_before,
+        cold_after,
+        read_ok
+    );
+
+    // At least one segment should be holding only part of itself: proof the
+    // read was served from a block rather than a full materialisation.
+    let partial = chunk
+        .segments()
+        .iter()
+        .filter(|s| {
+            let (present, total) = s.block_residency_stats();
+            present > 0 && total > 0 && present < total
+        })
+        .count();
+    assert!(
+        partial > 0,
+        "no segment is partially resident; reads did not use the block path"
     );
 
     let _ = std::fs::remove_dir_all(&schema_dir);

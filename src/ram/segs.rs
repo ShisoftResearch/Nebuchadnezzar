@@ -138,6 +138,67 @@ pub struct Segment {
     // WAL batch sync tracking (for group commit optimization)
     pub last_sync_time: AtomicI64, // Timestamp of last fsync in milliseconds
     pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
+
+    /// Partial residency for a cold segment: which backup blocks have been
+    /// faulted back into this segment's address range, and the block index
+    /// needed to find them.
+    ///
+    /// `MADV_DONTNEED` drops a cold segment's physical pages but leaves the
+    /// mapping intact, so a block can be decompressed straight back to its own
+    /// offset inside `addr`. Addresses therefore stay valid and readers need no
+    /// knowledge of any of this -- the segment's own address space is the cache,
+    /// which is what makes the block, rather than the whole 8 MiB segment, the
+    /// unit of residency.
+    block_residency: parking_lot::Mutex<BlockResidency>,
+}
+
+/// Per-segment state for serving reads from a cold segment without promoting it.
+#[derive(Default)]
+pub struct BlockResidency {
+    /// Header plus block index read from the backup file, kept resident so a
+    /// lookup costs no I/O after the first. ~3 KiB per segment at a 32 KiB
+    /// block target.
+    index: Option<Vec<u8>>,
+    /// One bit per block, set once that block has been written back into the
+    /// segment's memory.
+    present: Vec<u64>,
+    /// Bytes currently faulted in through this path, for memory accounting.
+    resident_bytes: usize,
+}
+
+impl BlockResidency {
+    #[inline]
+    fn is_present(&self, block: usize) -> bool {
+        self.present
+            .get(block / 64)
+            .map_or(false, |w| w & (1u64 << (block % 64)) != 0)
+    }
+
+    #[inline]
+    fn mark_present(&mut self, block: usize, bytes: usize) {
+        let word = block / 64;
+        if word >= self.present.len() {
+            self.present.resize(word + 1, 0);
+        }
+        if self.present[word] & (1u64 << (block % 64)) == 0 {
+            self.present[word] |= 1u64 << (block % 64);
+            self.resident_bytes += bytes;
+        }
+    }
+
+    /// Number of blocks currently faulted in.
+    pub fn present_count(&self) -> usize {
+        self.present.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    fn clear(&mut self) {
+        self.present.clear();
+        self.resident_bytes = 0;
+    }
 }
 
 /// File state for a segment, protected by a mutex
@@ -234,6 +295,7 @@ impl Segment {
             is_dirty: AtomicBool::new(true), // Start dirty
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
+            block_residency: parking_lot::Mutex::new(BlockResidency::default()),
         }
     }
 
@@ -332,6 +394,143 @@ impl Segment {
         unsafe {
             madvise_free(self.addr, SEGMENT_SIZE);
         }
+        // Everything faulted in through the partial path is gone with it.
+        self.block_residency.lock().clear();
+    }
+
+    /// Bytes this segment currently holds through partial block residency.
+    pub fn block_resident_bytes(&self) -> usize {
+        self.block_residency.lock().resident_bytes()
+    }
+
+    /// Blocks currently faulted in, and the total the backup holds.
+    pub fn block_residency_stats(&self) -> (usize, usize) {
+        let r = self.block_residency.lock();
+        let total = r
+            .index
+            .as_deref()
+            .and_then(crate::ram::compression::block_layout)
+            .map_or(0, |l| l.block_count);
+        (r.present_count(), total)
+    }
+
+    /// Make the bytes at `addr` readable without promoting the whole segment.
+    ///
+    /// Decompresses just the backup block containing `addr` and writes it back
+    /// to its own offset inside this segment's mapping, so the caller's address
+    /// is valid afterwards and nothing downstream needs to know the segment is
+    /// still cold.
+    ///
+    /// Returns `Ok(false)` when the backup predates the block-indexed format,
+    /// in which case there is no way to read part of it and the caller must
+    /// fall back to promoting the segment whole.
+    pub fn fault_in_block_for(&self, addr: usize) -> io::Result<bool> {
+        if addr < self.addr || addr >= self.addr + SEGMENT_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("address {:#x} outside segment {}", addr, self.id),
+            ));
+        }
+        let offset = addr - self.addr;
+
+        let mut residency = self.block_residency.lock();
+
+        if residency.index.is_none() {
+            match self.load_block_index()? {
+                Some(index) => residency.index = Some(index),
+                // Legacy whole-blob backup: partial reads are impossible.
+                None => return Ok(false),
+            }
+        }
+        let index = residency.index.as_ref().unwrap().clone();
+        let Some(layout) = crate::ram::compression::block_layout(&index) else {
+            return Ok(false);
+        };
+
+        let (block_idx, _within) = layout.locate(&index, offset)?;
+        if residency.is_present(block_idx) {
+            return Ok(true);
+        }
+
+        let (block_start, file_off, comp_len) = layout.entry(&index, block_idx)?;
+
+        // Read just this block's compressed extent.
+        let compressed = {
+            let state = self.file_state.lock();
+            let path = state
+                .manager
+                .backup_path(self.chunk_id, self.id, self.seq_id)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "no backup path for cold segment")
+                })?;
+            let file = File::open(&path)?;
+            let mut buf = vec![0u8; comp_len];
+            read_exact_at(&file, &mut buf, file_off as u64)?;
+            buf
+        };
+
+        let plain = lz4_flex::block::decompress_size_prepended(&compressed).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("block {} of segment {}: {:?}", block_idx, self.id, e),
+            )
+        })?;
+
+        if block_start + plain.len() > SEGMENT_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "block {} of segment {} overruns the segment",
+                    block_idx, self.id
+                ),
+            ));
+        }
+
+        // Write it back where it belongs. The mapping survived MADV_DONTNEED,
+        // so this restores exactly the bytes that were dropped.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                plain.as_ptr(),
+                (self.addr + block_start) as *mut u8,
+                plain.len(),
+            );
+        }
+        residency.mark_present(block_idx, plain.len());
+        Ok(true)
+    }
+
+    /// Read the header and block index from this segment's backup file.
+    ///
+    /// `Ok(None)` means the backup is not in the block-indexed format.
+    fn load_block_index(&self) -> io::Result<Option<Vec<u8>>> {
+        use crate::ram::compression;
+        let state = self.file_state.lock();
+        let Some(path) = state
+            .manager
+            .backup_path(self.chunk_id, self.id, self.seq_id)
+        else {
+            return Ok(None);
+        };
+        drop(state);
+
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        let mut header = [0u8; 16];
+        if read_exact_at(&file, &mut header, 0).is_err() {
+            return Ok(None);
+        }
+        let Some(layout) = compression::block_layout(&header) else {
+            return Ok(None);
+        };
+
+        let index_len = 16 + layout.block_count * 12;
+        let mut index = vec![0u8; index_len];
+        read_exact_at(&file, &mut index, 0)?;
+        Ok(Some(index))
     }
 
     fn append_header(&self) -> usize {
@@ -648,7 +847,18 @@ impl Segment {
 
                         #[cfg(feature = "compress_backups")]
                         {
-                            let compressed_data = compression::compress(&padded_data)?;
+                            // Break blocks on cell boundaries so a later read can
+                            // decompress just the block holding the cell it wants,
+                            // instead of the whole segment. Entry positions come
+                            // from the live segment, which is resident here
+                            // because we are archiving it.
+                            let boundaries: Vec<usize> = self
+                                .entry_iter()
+                                .map(|meta| meta.entry_pos.saturating_sub(self.addr))
+                                .take_while(|off| *off < SEGMENT_SIZE)
+                                .collect();
+                            let compressed_data =
+                                compression::compress_blocks_on_cells(&padded_data, &boundaries)?;
                             ARCHIVE_BYTES.fetch_add(compressed_data.len() as u64, Relaxed);
                             file.write_all(&compressed_data)?;
                             debug!(
@@ -1522,6 +1732,13 @@ impl SegmentAllocator {
     pub fn addr_by_id(&self, id: usize) -> usize {
         self.base + (id << SEGMENT_BITS_SHIFT)
     }
+}
+
+/// Positional read that does not disturb the file cursor, so a block fetch
+/// cannot race another reader of the same handle.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
 }
 
 pub unsafe fn madvise_free(addr: usize, size: usize) {

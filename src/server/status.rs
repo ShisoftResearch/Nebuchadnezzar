@@ -40,6 +40,8 @@ pub struct ServerMemoryStatus {
     pub lower_watermark_evictions: u64,
     /// Promotions refused because the hot tier was at the hard limit.
     pub promotions_declined: u64,
+    /// Reads served from a cold backup without promoting the segment.
+    pub cold_block_reads: u64,
     /// Durability write accounting, counted where the writes are issued.
     pub archive_count: u64,
     pub archive_bytes: u64,
@@ -262,6 +264,7 @@ impl NebServer {
             churns: tiered_counters.churns,
             lower_watermark_evictions: tiered_counters.lower_watermark_evictions,
             promotions_declined: tiered_counters.promotions_declined,
+            cold_block_reads: tiered_counters.cold_block_reads,
             archive_count: crate::ram::segs::ARCHIVE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
             archive_bytes: crate::ram::segs::ARCHIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
             archive_rewrites: crate::ram::segs::ARCHIVE_REWRITES.load(std::sync::atomic::Ordering::Relaxed),

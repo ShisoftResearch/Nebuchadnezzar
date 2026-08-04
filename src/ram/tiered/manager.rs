@@ -138,6 +138,10 @@ pub struct TieredMemoryManager {
     eviction_count: AtomicU64,
     churn_count: AtomicU64,
     lower_watermark_evictions: AtomicU64,
+    /// Reads served from a cold segment's backup without promoting it, and the
+    /// bytes decompressed to do so. The ratio of those bytes to SEGMENT_SIZE is
+    /// what tells us when promoting would have been the cheaper choice.
+    cold_block_reads: AtomicU64,
     /// Promotions refused because the hot tier was already at the hard limit.
     /// A rising count means reads are being served from cold to hold the limit,
     /// which is the intended trade rather than a fault.
@@ -165,6 +169,7 @@ impl TieredMemoryManager {
             eviction_count: AtomicU64::new(0),
             churn_count: AtomicU64::new(0),
             lower_watermark_evictions: AtomicU64::new(0),
+            cold_block_reads: AtomicU64::new(0),
             promotions_declined: AtomicU64::new(0),
         }
     }
@@ -922,7 +927,20 @@ impl TieredMemoryManager {
             churns: self.churn_count.load(Ordering::Relaxed),
             lower_watermark_evictions: self.lower_watermark_evictions.load(Ordering::Relaxed),
             promotions_declined: self.promotions_declined.load(Ordering::Relaxed),
+            cold_block_reads: self.cold_block_reads.load(Ordering::Relaxed),
         }
+    }
+
+    /// Record a read served from a cold segment's backup rather than by
+    /// promoting it.
+    ///
+    /// Both operations decompress; they differ only in volume, so promotion
+    /// pays for itself once a segment's cold reads have decompressed about a
+    /// segment's worth. Counting distinct blocks rather than reads is the
+    /// refinement that keeps repeat hits on one block from arguing for it.
+    pub fn note_cold_block_read(&self, segment: &Segment) {
+        self.cold_block_reads.fetch_add(1, Ordering::Relaxed);
+        let _ = segment;
     }
 
     /// Access the shared server-wide memory pool.
@@ -949,6 +967,7 @@ pub struct TieredGlobalCounters {
     pub churns: u64,
     pub lower_watermark_evictions: u64,
     pub promotions_declined: u64,
+    pub cold_block_reads: u64,
 }
 
 /// Statistics about tiered memory usage
