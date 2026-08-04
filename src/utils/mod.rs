@@ -2,6 +2,7 @@ use std::thread;
 
 pub mod raii_mutex_table;
 pub mod test_port;
+pub mod test_temp;
 
 pub fn upper_power_of_2(mut v: usize) -> usize {
     debug_assert!(v > 0);

@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use crate::utils::test_temp::temp_path;
 
 // Global mutex to prevent test interference
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -228,14 +229,14 @@ fn test_eviction_on_memory_overflow() {
     let chunk_capacity = 10 * SEGMENT_SIZE; // 80MB virtual capacity
     let fields = default_fields();
     let schema = Schema::new("test_overflow", None, fields, false, false);
-    let schemas = LocalSchemasCache::new_local("/tmp/neb_test_overflow_schema");
+    let schemas = LocalSchemasCache::new_local(&temp_path("neb_test_overflow_schema"));
     schemas.debug_only_new_schema(schema.clone());
 
     // Create temp directories for this test
-    let backup_dir = "/tmp/neb_test_overflow_bk";
-    let wal_dir = "/tmp/neb_test_overflow_wal";
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_test_overflow_bk");
+    let wal_dir = temp_path("neb_test_overflow_wal");
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let chunks = Chunks::new(
         1,
@@ -390,9 +391,9 @@ fn test_eviction_on_memory_overflow() {
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
 
     // Clean up test directories
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all("/tmp/neb_test_overflow_schema");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(temp_path("neb_test_overflow_schema"));
 }
 
 /// Test that reads from cold segments trigger promotion and data is still intact
@@ -412,13 +413,13 @@ fn test_cold_segment_promotion() {
     let chunk_capacity = 8 * SEGMENT_SIZE;
     let fields = default_fields();
     let schema = Schema::new("test_promotion", None, fields, false, false);
-    let schemas = LocalSchemasCache::new_local("/tmp/neb_test_promotion_schema");
+    let schemas = LocalSchemasCache::new_local(&temp_path("neb_test_promotion_schema"));
     schemas.debug_only_new_schema(schema.clone());
 
-    let backup_dir = "/tmp/neb_test_promotion_bk";
-    let wal_dir = "/tmp/neb_test_promotion_wal";
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_test_promotion_bk");
+    let wal_dir = temp_path("neb_test_promotion_wal");
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let chunks = Chunks::new(
         1,
@@ -519,9 +520,9 @@ fn test_cold_segment_promotion() {
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all("/tmp/neb_test_promotion_schema");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(temp_path("neb_test_promotion_schema"));
 }
 
 /// Test churn-related metrics and promotion cooldown skip logic
@@ -542,13 +543,13 @@ fn test_metrics_and_churn_counters() {
     let chunk_capacity = 4 * SEGMENT_SIZE;
     let fields = default_fields();
     let schema = Schema::new("test_metrics", None, fields, false, false);
-    let schemas = LocalSchemasCache::new_local("/tmp/neb_test_metrics_schema");
+    let schemas = LocalSchemasCache::new_local(&temp_path("neb_test_metrics_schema"));
     schemas.debug_only_new_schema(schema.clone());
 
-    let backup_dir = "/tmp/neb_test_metrics_bk";
-    let wal_dir = "/tmp/neb_test_metrics_wal";
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_test_metrics_bk");
+    let wal_dir = temp_path("neb_test_metrics_wal");
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let chunks = Chunks::new(
         1,
@@ -633,9 +634,9 @@ fn test_metrics_and_churn_counters() {
     std::env::remove_var("NEB_TIERED_MEMORY_LOWER_WATERMARK");
     std::env::remove_var("NEB_TIERED_PROMOTION_COOLDOWN_MS");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all("/tmp/neb_test_metrics_schema");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(temp_path("neb_test_metrics_schema"));
 }
 
 #[test]
@@ -741,19 +742,19 @@ fn test_blob_segments_evict_before_regular_segments() {
     let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
 
-    let schema_dir = "/tmp/neb_blob_priority_schema";
-    let backup_dir = "/tmp/neb_blob_priority_bk";
-    let wal_dir = "/tmp/neb_blob_priority_wal";
-    let _ = std::fs::remove_dir_all(schema_dir);
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let schema_dir = temp_path("neb_blob_priority_schema");
+    let backup_dir = temp_path("neb_blob_priority_bk");
+    let wal_dir = temp_path("neb_blob_priority_wal");
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let regular = Schema::new_with_id(910, "regular_evict", None, default_fields(), false, false);
     let blob = Schema::new_with_id(920, "blob_evict", None, default_fields(), false, false)
         .with_blobs(true);
-    let schemas = LocalSchemasCache::new_local(schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
     schemas.debug_only_new_schema(regular.clone());
     schemas.debug_only_new_schema(blob.clone());
 
@@ -876,9 +877,9 @@ fn test_blob_segments_evict_before_regular_segments() {
     assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
     assert!(chunk.segs.get(&(blob_head as usize)).unwrap().is_hot());
 
-    let _ = std::fs::remove_dir_all(schema_dir);
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 }
 
 #[test]
@@ -886,17 +887,17 @@ fn test_blob_segments_promote_on_read_after_eviction() {
     let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
 
-    let schema_dir = "/tmp/neb_blob_promote_schema";
-    let backup_dir = "/tmp/neb_blob_promote_bk";
-    let wal_dir = "/tmp/neb_blob_promote_wal";
-    let _ = std::fs::remove_dir_all(schema_dir);
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let schema_dir = temp_path("neb_blob_promote_schema");
+    let backup_dir = temp_path("neb_blob_promote_bk");
+    let wal_dir = temp_path("neb_blob_promote_wal");
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let blob = Schema::new("blob_promote", None, default_fields(), false, false).with_blobs(true);
-    let schemas = LocalSchemasCache::new_local(schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
     schemas.debug_only_new_schema(blob.clone());
 
     let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
@@ -972,9 +973,9 @@ fn test_blob_segments_promote_on_read_after_eviction() {
         "promotion should reset the cold access counter"
     );
 
-    let _ = std::fs::remove_dir_all(schema_dir);
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 }
 
 #[test]
@@ -990,15 +991,15 @@ fn test_global_eviction_across_chunks_in_single_database() {
         false,
         false,
     );
-    let schemas = LocalSchemasCache::new_local("/tmp/neb_single_db_global_eviction_schema");
+    let schemas = LocalSchemasCache::new_local(&temp_path("neb_single_db_global_eviction_schema"));
     schemas.debug_only_new_schema(schema.clone());
 
-    let backup_dir = "/tmp/neb_single_db_global_eviction_bk";
-    let wal_dir = "/tmp/neb_single_db_global_eviction_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_single_db_global_eviction_bk");
+    let wal_dir = temp_path("neb_single_db_global_eviction_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
         crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
@@ -1059,9 +1060,9 @@ fn test_global_eviction_across_chunks_in_single_database() {
         "at least one segment should be evicted when combined chunk pressure exceeds the shared limit"
     );
 
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all("/tmp/neb_single_db_global_eviction_schema");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(temp_path("neb_single_db_global_eviction_schema"));
 }
 
 #[test]
@@ -1080,15 +1081,15 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
         false,
         false,
     );
-    let schemas = LocalSchemasCache::new_local("/tmp/neb_single_db_threshold_gate_schema");
+    let schemas = LocalSchemasCache::new_local(&temp_path("neb_single_db_threshold_gate_schema"));
     schemas.debug_only_new_schema(schema.clone());
 
-    let backup_dir = "/tmp/neb_single_db_threshold_gate_bk";
-    let wal_dir = "/tmp/neb_single_db_threshold_gate_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_single_db_threshold_gate_bk");
+    let wal_dir = temp_path("neb_single_db_threshold_gate_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
         crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
@@ -1166,9 +1167,9 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
         "single-database eviction should trigger once total hot memory reaches the threshold boundary for the next allocation"
     );
 
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all("/tmp/neb_single_db_threshold_gate_schema");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(temp_path("neb_single_db_threshold_gate_schema"));
 }
 
 #[test]
@@ -1185,15 +1186,15 @@ fn test_reconciled_background_eviction_ignores_stale_shared_counter_drift() {
         false,
         false,
     );
-    let schemas = LocalSchemasCache::new_local("/tmp/neb_reconciled_threshold_gate_schema");
+    let schemas = LocalSchemasCache::new_local(&temp_path("neb_reconciled_threshold_gate_schema"));
     schemas.debug_only_new_schema(schema.clone());
 
-    let backup_dir = "/tmp/neb_reconciled_threshold_gate_bk";
-    let wal_dir = "/tmp/neb_reconciled_threshold_gate_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_reconciled_threshold_gate_bk");
+    let wal_dir = temp_path("neb_reconciled_threshold_gate_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
         crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
@@ -1250,9 +1251,9 @@ fn test_reconciled_background_eviction_ignores_stale_shared_counter_drift() {
         "forced reconciliation should pull the shared counter back to the scanned hot-segment total"
     );
 
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all("/tmp/neb_reconciled_threshold_gate_schema");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(temp_path("neb_reconciled_threshold_gate_schema"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1261,12 +1262,12 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn()
     let _ = env_logger::try_init();
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
 
-    let backup_dir = "/tmp/neb_single_db_cleaner_drift_bk";
-    let wal_dir = "/tmp/neb_single_db_cleaner_drift_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_single_db_cleaner_drift_bk");
+    let wal_dir = temp_path("neb_single_db_cleaner_drift_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -1330,8 +1331,8 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn()
     server.cleaner().stop();
     server.shutdown().await;
     std::env::remove_var("NEB_CLEANER_SLEEP_INTERVAL_MS");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1340,12 +1341,12 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
     let _ = env_logger::try_init();
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
 
-    let backup_dir = "/tmp/neb_multi_db_cleaner_drift_bk";
-    let wal_dir = "/tmp/neb_multi_db_cleaner_drift_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_multi_db_cleaner_drift_bk");
+    let wal_dir = temp_path("neb_multi_db_cleaner_drift_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -1449,8 +1450,8 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
     server.cleaner().stop();
     server.shutdown().await;
     std::env::remove_var("NEB_CLEANER_SLEEP_INTERVAL_MS");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1459,18 +1460,18 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
     let _ = env_logger::try_init();
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "10");
 
-    let backup_dir = "/tmp/neb_reload_recovery_drift_bk";
-    let wal_dir = "/tmp/neb_reload_recovery_drift_wal";
-    let undo_dir = "/tmp/neb_reload_recovery_drift_undo";
-    let raft_dir = "/tmp/neb_reload_recovery_drift_raft";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(undo_dir);
-    let _ = std::fs::remove_dir_all(raft_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(undo_dir);
-    let _ = std::fs::create_dir_all(raft_dir);
+    let backup_dir = temp_path("neb_reload_recovery_drift_bk");
+    let wal_dir = temp_path("neb_reload_recovery_drift_wal");
+    let undo_dir = temp_path("neb_reload_recovery_drift_undo");
+    let raft_dir = temp_path("neb_reload_recovery_drift_raft");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&undo_dir);
+    let _ = std::fs::remove_dir_all(&raft_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&undo_dir);
+    let _ = std::fs::create_dir_all(&raft_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -1603,10 +1604,10 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
     server.cleaner().stop();
     server.shutdown().await;
     std::env::remove_var("NEB_CLEANER_SLEEP_INTERVAL_MS");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(undo_dir);
-    let _ = std::fs::remove_dir_all(raft_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&undo_dir);
+    let _ = std::fs::remove_dir_all(&raft_dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1614,12 +1615,12 @@ async fn test_global_eviction_across_multiple_databases() {
     let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
 
-    let backup_dir = "/tmp/neb_multi_db_global_eviction_bk";
-    let wal_dir = "/tmp/neb_multi_db_global_eviction_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_multi_db_global_eviction_bk");
+    let wal_dir = temp_path("neb_multi_db_global_eviction_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -1745,8 +1746,8 @@ async fn test_global_eviction_across_multiple_databases() {
     analytics.cleaner().stop();
     server.cleaner().stop();
     server.shutdown().await;
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1758,12 +1759,12 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
     let threshold = 0.75;
     let threshold_hot_segments =
         ((physical_memory_limit as f64 * threshold as f64) / SEGMENT_SIZE as f64) as usize;
-    let backup_dir = "/tmp/neb_multi_db_threshold_gate_bk";
-    let wal_dir = "/tmp/neb_multi_db_threshold_gate_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_multi_db_threshold_gate_bk");
+    let wal_dir = temp_path("neb_multi_db_threshold_gate_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -1906,8 +1907,8 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
     analytics.cleaner().stop();
     server.cleaner().stop();
     server.shutdown().await;
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 }
 
 #[test]
@@ -1940,9 +1941,9 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
             false,
             false,
         );
-        let schema_dir = format!("/tmp/neb_equal_db_eviction_schema_{}", db_idx);
-        let backup_dir = format!("/tmp/neb_equal_db_eviction_bk_{}", db_idx);
-        let wal_dir = format!("/tmp/neb_equal_db_eviction_wal_{}", db_idx);
+        let schema_dir = temp_path(&format!("neb_equal_db_eviction_schema_{}", db_idx));
+        let backup_dir = temp_path(&format!("neb_equal_db_eviction_bk_{}", db_idx));
+        let wal_dir = temp_path(&format!("neb_equal_db_eviction_wal_{}", db_idx));
 
         let _ = std::fs::remove_dir_all(&schema_dir);
         let _ = std::fs::remove_dir_all(&backup_dir);
@@ -2016,9 +2017,9 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
     );
 
     for (_, schema_dir, backup_dir, wal_dir) in databases {
-        let _ = std::fs::remove_dir_all(schema_dir);
-        let _ = std::fs::remove_dir_all(backup_dir);
-        let _ = std::fs::remove_dir_all(wal_dir);
+        let _ = std::fs::remove_dir_all(&schema_dir);
+        let _ = std::fs::remove_dir_all(&backup_dir);
+        let _ = std::fs::remove_dir_all(&wal_dir);
     }
 }
 
@@ -2037,28 +2038,28 @@ fn test_global_eviction_ignores_unregistered_database() {
     ));
 
     let schema_a = Schema::new("db_a_eviction", None, default_fields(), false, false);
-    let schemas_a = LocalSchemasCache::new_local("/tmp/neb_db_a_eviction_schema");
+    let schemas_a = LocalSchemasCache::new_local(&temp_path("neb_db_a_eviction_schema"));
     schemas_a.debug_only_new_schema(schema_a.clone());
     let chunks_a = Chunks::new(
         1,
         4 * SEGMENT_SIZE,
         Arc::new(ServerMeta { schemas: schemas_a }),
         None,
-        Some("/tmp/neb_db_a_eviction_bk".to_string()),
-        Some("/tmp/neb_db_a_eviction_wal".to_string()),
+        Some(temp_path("neb_db_a_eviction_bk")),
+        Some(temp_path("neb_db_a_eviction_wal")),
         Some(manager.clone()),
     );
 
     let schema_b = Schema::new("db_b_eviction", None, default_fields(), false, false);
-    let schemas_b = LocalSchemasCache::new_local("/tmp/neb_db_b_eviction_schema");
+    let schemas_b = LocalSchemasCache::new_local(&temp_path("neb_db_b_eviction_schema"));
     schemas_b.debug_only_new_schema(schema_b.clone());
     let chunks_b = Chunks::new(
         1,
         4 * SEGMENT_SIZE,
         Arc::new(ServerMeta { schemas: schemas_b }),
         None,
-        Some("/tmp/neb_db_b_eviction_bk".to_string()),
-        Some("/tmp/neb_db_b_eviction_wal".to_string()),
+        Some(temp_path("neb_db_b_eviction_bk")),
+        Some(temp_path("neb_db_b_eviction_wal")),
         Some(manager.clone()),
     );
 
@@ -2096,12 +2097,12 @@ fn test_global_eviction_ignores_unregistered_database() {
         "remaining registered database should stay hot when it is below the shared limit"
     );
 
-    let _ = std::fs::remove_dir_all("/tmp/neb_db_a_eviction_bk");
-    let _ = std::fs::remove_dir_all("/tmp/neb_db_a_eviction_wal");
-    let _ = std::fs::remove_dir_all("/tmp/neb_db_a_eviction_schema");
-    let _ = std::fs::remove_dir_all("/tmp/neb_db_b_eviction_bk");
-    let _ = std::fs::remove_dir_all("/tmp/neb_db_b_eviction_wal");
-    let _ = std::fs::remove_dir_all("/tmp/neb_db_b_eviction_schema");
+    let _ = std::fs::remove_dir_all(temp_path("neb_db_a_eviction_bk"));
+    let _ = std::fs::remove_dir_all(temp_path("neb_db_a_eviction_wal"));
+    let _ = std::fs::remove_dir_all(temp_path("neb_db_a_eviction_schema"));
+    let _ = std::fs::remove_dir_all(temp_path("neb_db_b_eviction_bk"));
+    let _ = std::fs::remove_dir_all(temp_path("neb_db_b_eviction_wal"));
+    let _ = std::fs::remove_dir_all(temp_path("neb_db_b_eviction_schema"));
 }
 
 #[test]
@@ -2151,10 +2152,10 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     // Clean up old backup files from previous test runs
     // This is critical because archive() skips existing files, and our fix
     // to write full SEGMENT_SIZE won't apply to old truncated files
-    let backup_dir = "/tmp/neb_large_scale_bk";
-    let wal_dir = "/tmp/neb_large_scale_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_large_scale_bk");
+    let wal_dir = temp_path("neb_large_scale_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 
     // Configure: 64MB physical limit, 1GB virtual capacity
     let physical_limit = 64 * 1024 * 1024; // 64MB = 8 segments
@@ -2490,8 +2491,8 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Clean up files
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 
     info!("=== Large-Scale Tiered Memory Transaction Test Complete ===");
 }
@@ -2513,10 +2514,10 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     );
 
     let server_addr = crate::utils::test_port::unique_localhost_addr();
-    let backup_dir = "/tmp/neb_stress_test_bk";
-    let wal_dir = "/tmp/neb_stress_test_wal";
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let backup_dir = temp_path("neb_stress_test_bk");
+    let wal_dir = temp_path("neb_stress_test_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -2703,8 +2704,8 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 
     info!("=== Stress Test Complete ===");
 }
@@ -2724,14 +2725,14 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
     let schema_id = 7777;
     let schema_name = "direct_schema";
     let server_addr = crate::utils::test_port::unique_localhost_addr();
-    let backup_dir = "/tmp/neb_direct_bk";
-    let wal_dir = "/tmp/neb_direct_wal";
+    let backup_dir = temp_path("neb_direct_bk");
+    let wal_dir = temp_path("neb_direct_wal");
 
     // Clean up
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -2983,8 +2984,8 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
     // 3. The TEST_MUTEX ensures tests run serially, so new_with_recovery() will clean up properly
 
     // Clean up files
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 
     info!("=== Direct Write Test Complete ===");
 }
@@ -3009,14 +3010,14 @@ async fn test_direct_writes_with_tiered_memory() {
     let schema_id = 8888;
     let schema_name = "tiered_direct_schema";
     let server_addr = crate::utils::test_port::unique_localhost_addr();
-    let backup_dir = "/tmp/neb_tiered_direct_bk";
-    let wal_dir = "/tmp/neb_tiered_direct_wal";
+    let backup_dir = temp_path("neb_tiered_direct_bk");
+    let wal_dir = temp_path("neb_tiered_direct_wal");
 
     // Clean up
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::create_dir_all(backup_dir);
-    let _ = std::fs::create_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -3336,8 +3337,8 @@ async fn test_direct_writes_with_tiered_memory() {
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 
     info!("=== Direct Write Test with Tiered Memory Complete ===");
 }
@@ -3378,14 +3379,14 @@ fn test_concurrent_allocation_eviction_stops_at_lower_watermark() {
     ));
 
     let schema = Schema::new("concurrent_evict_watermark", None, default_fields(), false, false);
-    let schema_dir = "/tmp/neb_concurrent_evict_schema";
-    let backup_dir = "/tmp/neb_concurrent_evict_bk";
-    let wal_dir = "/tmp/neb_concurrent_evict_wal";
-    let _ = std::fs::remove_dir_all(schema_dir);
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let schema_dir = temp_path("neb_concurrent_evict_schema");
+    let backup_dir = temp_path("neb_concurrent_evict_bk");
+    let wal_dir = temp_path("neb_concurrent_evict_wal");
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 
-    let schemas = LocalSchemasCache::new_local(schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
     schemas.debug_only_new_schema(schema.clone());
     let chunks = Chunks::new(
         1,
@@ -3443,7 +3444,7 @@ fn test_concurrent_allocation_eviction_stops_at_lower_watermark() {
         EVICTOR_THREADS
     );
 
-    let _ = std::fs::remove_dir_all(schema_dir);
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
 }

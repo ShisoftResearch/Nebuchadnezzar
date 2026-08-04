@@ -180,6 +180,7 @@ pub fn sanitize_database_name(database_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::test_temp::temp_path;
     use super::*;
 
     fn base_opts() -> ServerOptions {
@@ -187,10 +188,10 @@ mod tests {
             chunk_size: 1024,
             db_size: 1024,
             tiered_config: None,
-            backup_storage: Some("/tmp/backup".to_string()),
-            wal_storage: Some("/tmp/wal".to_string()),
-            undo_log_storage: Some("/tmp/undo".to_string()),
-            raft_storage: Some("/tmp/raft".to_string()),
+            backup_storage: Some(temp_path("backup")),
+            wal_storage: Some(temp_path("wal")),
+            undo_log_storage: Some(temp_path("undo")),
+            raft_storage: Some(temp_path("raft")),
             services: vec![],
             index_enabled: false,
             enable_recovery: false,
@@ -216,7 +217,7 @@ mod tests {
         assert_eq!(
             layout.backup_storage,
             Some(scoped_storage_path_for_database(
-                "/tmp/backup",
+                &temp_path("backup"),
                 "analytics/db",
                 true
             ))
@@ -224,7 +225,7 @@ mod tests {
         assert_eq!(
             layout.raft_storage,
             Some(scoped_storage_path_for_database(
-                "/tmp/raft",
+                &temp_path("raft"),
                 "analytics/db",
                 true
             ))

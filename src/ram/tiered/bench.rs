@@ -17,6 +17,7 @@ use log::info;
 use rand::Rng;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use crate::utils::test_temp::temp_path;
 
 fn default_fields() -> Field {
     use dovahkiin::types::Type;
@@ -155,19 +156,19 @@ fn bench_hot_segment_reads() {
 
     info!("=== Benchmark: Hot Segment Reads (Baseline) ===");
 
-    let backup_dir = "/tmp/neb_bench_hot";
-    let wal_dir = "/tmp/neb_bench_hot_wal";
-    let schema_dir = "/tmp/neb_bench_hot_schema";
+    let backup_dir = temp_path("neb_bench_hot");
+    let wal_dir = temp_path("neb_bench_hot_wal");
+    let schema_dir = temp_path("neb_bench_hot_schema");
 
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 
     // No tiered memory - all segments stay hot
     let chunk_capacity = 20 * SEGMENT_SIZE;
     let fields = default_fields();
     let schema = Schema::new("bench_hot", None, fields, false, false);
-    let schemas = LocalSchemasCache::new_local(schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
     schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
@@ -244,9 +245,9 @@ fn bench_hot_segment_reads() {
     result.print();
 
     // Clean up
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 }
 
 /// Benchmark: Reading from cold segments (pure mmap reads, no promotion)
@@ -257,13 +258,13 @@ fn bench_cold_segment_reads() {
 
     info!("=== Benchmark: Cold Segment Reads (mmap, no promotion) ===");
 
-    let backup_dir = "/tmp/neb_bench_cold";
-    let wal_dir = "/tmp/neb_bench_cold_wal";
-    let schema_dir = "/tmp/neb_bench_cold_schema";
+    let backup_dir = temp_path("neb_bench_cold");
+    let wal_dir = temp_path("neb_bench_cold_wal");
+    let schema_dir = temp_path("neb_bench_cold_schema");
 
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 
     // Enable tiered memory with tight limit to force cold segments
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
@@ -276,7 +277,7 @@ fn bench_cold_segment_reads() {
     let chunk_capacity = 20 * SEGMENT_SIZE;
     let fields = default_fields();
     let schema = Schema::new("bench_cold", None, fields, false, false);
-    let schemas = LocalSchemasCache::new_local(schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
     schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
@@ -396,9 +397,9 @@ fn bench_cold_segment_reads() {
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 }
 
 /// Benchmark: Mixed workload with uniform distribution
@@ -409,13 +410,13 @@ fn bench_mixed_uniform() {
 
     info!("=== Benchmark: Mixed Workload (Uniform Distribution) ===");
 
-    let backup_dir = "/tmp/neb_bench_mixed_uniform";
-    let wal_dir = "/tmp/neb_bench_mixed_uniform_wal";
-    let schema_dir = "/tmp/neb_bench_mixed_uniform_schema";
+    let backup_dir = temp_path("neb_bench_mixed_uniform");
+    let wal_dir = temp_path("neb_bench_mixed_uniform_wal");
+    let schema_dir = temp_path("neb_bench_mixed_uniform_schema");
 
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 
     // Enable tiered memory with moderate limit
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
@@ -428,7 +429,7 @@ fn bench_mixed_uniform() {
     let chunk_capacity = 20 * SEGMENT_SIZE;
     let fields = default_fields();
     let schema = Schema::new("bench_mixed_uniform", None, fields, false, false);
-    let schemas = LocalSchemasCache::new_local(schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
     schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
@@ -540,9 +541,9 @@ fn bench_mixed_uniform() {
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 }
 
 /// Benchmark: Mixed workload with Zipf distribution (realistic)
@@ -553,13 +554,13 @@ fn bench_mixed_zipf() {
 
     info!("=== Benchmark: Mixed Workload (Zipf Distribution, s=0.99) ===");
 
-    let backup_dir = "/tmp/neb_bench_mixed_zipf";
-    let wal_dir = "/tmp/neb_bench_mixed_zipf_wal";
-    let schema_dir = "/tmp/neb_bench_mixed_zipf_schema";
+    let backup_dir = temp_path("neb_bench_mixed_zipf");
+    let wal_dir = temp_path("neb_bench_mixed_zipf_wal");
+    let schema_dir = temp_path("neb_bench_mixed_zipf_schema");
 
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 
     // Enable tiered memory with moderate limit
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
@@ -572,7 +573,7 @@ fn bench_mixed_zipf() {
     let chunk_capacity = 20 * SEGMENT_SIZE;
     let fields = default_fields();
     let schema = Schema::new("bench_mixed_zipf", None, fields, false, false);
-    let schemas = LocalSchemasCache::new_local(schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
     schemas.debug_only_new_schema(schema.clone());
 
     let chunks = Chunks::new(
@@ -687,9 +688,9 @@ fn bench_mixed_zipf() {
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 }
 
 /// Run all benchmarks in sequence
