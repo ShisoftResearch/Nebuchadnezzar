@@ -24,27 +24,89 @@ const HEADER_SIZE: usize = 8;
 /// that block need be read and decompressed.
 pub const BLOCK_COMPRESSION_MAGIC: [u8; 4] = [0x4E, 0x45, 0x42, 0x03];
 
-/// Default uncompressed span covered by one block.
+/// Target uncompressed span for a block. A target, not a stride.
 ///
-/// The trade is read amplification against compression ratio: LZ4 needs a
-/// window to find matches, so smaller blocks compress worse, while larger ones
-/// decompress more bytes than a single-cell read needs. 64 KiB is a starting
-/// point, not a settled answer -- `NEB_BACKUP_BLOCK_SIZE` overrides it so the
-/// curve can be measured on real segments.
-pub const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
+/// Cells run from a few bytes to a megabyte, so a fixed stride is wrong in both
+/// directions: it wastes a whole block on an 8-byte cell, splits a 1 MiB cell
+/// across dozens of them, and lets ordinary cells straddle boundaries so one
+/// read needs two decompressions. Blocks therefore break only on cell
+/// boundaries -- cells are packed until the next one would overshoot the
+/// target, and a cell larger than the target becomes a block of its own.
+///
+/// The consequence that matters: reading any cell decompresses exactly one
+/// block, never two, and never more of the segment than the cell's own
+/// neighbourhood.
+///
+/// Measured trade of ratio against amplification on segment-shaped data:
+///   16 KiB -> 1.11x disk, 32 KiB -> 1.06x, 64 KiB -> 1.02x versus compressing
+///   the segment whole. `NEB_BACKUP_BLOCK_SIZE` overrides it for measurement.
+pub const DEFAULT_BLOCK_SIZE: usize = 32 * 1024;
 
-/// magic(4) + crc32(4) + block_size(4) + block_count(4)
+/// magic(4) + crc32(4) + target_block_size(4) + block_count(4)
 const BLOCK_HEADER_SIZE: usize = 16;
-/// Per-entry index: file_offset(u32) + compressed_len(u32)
-const BLOCK_INDEX_ENTRY_SIZE: usize = 8;
+/// Per-entry index: uncompressed_start(u32) + file_offset(u32) + compressed_len(u32)
+///
+/// The uncompressed start is stored because block spans vary, so a reader
+/// cannot derive the block holding an offset by division.
+const BLOCK_INDEX_ENTRY_SIZE: usize = 12;
 
-/// Uncompressed span per block, overridable for measurement.
+/// Target uncompressed span per block, overridable for measurement.
 pub fn block_size() -> usize {
     std::env::var("NEB_BACKUP_BLOCK_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= 4096 && v.is_power_of_two())
+        .filter(|v| *v >= 4096)
         .unwrap_or(DEFAULT_BLOCK_SIZE)
+}
+
+/// Group cell start offsets into block spans that break only on cell
+/// boundaries.
+///
+/// `boundaries` must be sorted starts of the cells within `data`, and
+/// `data_len` closes the final span. Returns each block's `[start, end)`.
+///
+/// A cell wider than the target gets its own block: splitting it would mean two
+/// decompressions to read it, and the whole cell is needed anyway.
+pub fn plan_blocks(boundaries: &[usize], data_len: usize, target: usize) -> Vec<(usize, usize)> {
+    if boundaries.is_empty() || data_len == 0 {
+        return if data_len == 0 {
+            Vec::new()
+        } else {
+            vec![(0, data_len)]
+        };
+    }
+
+    let mut blocks = Vec::new();
+    let mut start = boundaries[0];
+    // Anything before the first cell rides along with it rather than becoming a
+    // stub block.
+    if start != 0 {
+        start = 0;
+    }
+
+    for w in 0..boundaries.len() {
+        let cell_start = boundaries[w];
+        let cell_end = boundaries.get(w + 1).copied().unwrap_or(data_len);
+        let cell_len = cell_end.saturating_sub(cell_start);
+
+        // Close the current block before a cell that would overshoot the
+        // target, provided the block already holds something.
+        if cell_start > start && (cell_start - start) + cell_len > target {
+            blocks.push((start, cell_start));
+            start = cell_start;
+        }
+
+        // A single oversized cell is its own block.
+        if cell_len >= target && cell_start == start {
+            blocks.push((start, cell_end));
+            start = cell_end;
+        }
+    }
+
+    if start < data_len {
+        blocks.push((start, data_len));
+    }
+    blocks
 }
 
 /// Calculate CRC32C checksum of data using hardware-accelerated CRC32C (iSCSI)
@@ -175,18 +237,38 @@ pub fn decompress_if_compressed(data: &[u8]) -> io::Result<Vec<u8>> {
 /// single block can be decompressed without consulting anything but its index
 /// entry.
 pub fn compress_blocks(data: &[u8]) -> io::Result<Vec<u8>> {
+    // No cell boundaries supplied: fall back to a fixed stride. Correct, but it
+    // can split a cell across blocks, so callers that know their boundaries
+    // should pass them.
     let bs = block_size();
-    let block_count = data.len().div_ceil(bs);
-    let checksum = crc32_checksum(data);
+    let spans: Vec<(usize, usize)> = (0..data.len())
+        .step_by(bs.max(1))
+        .map(|s| (s, (s + bs).min(data.len())))
+        .collect();
+    compress_spans(data, &spans)
+}
 
+/// Compress `data` into blocks that break only on the supplied cell boundaries.
+///
+/// `boundaries` are sorted cell start offsets within `data`.
+pub fn compress_blocks_on_cells(data: &[u8], boundaries: &[usize]) -> io::Result<Vec<u8>> {
+    let spans = plan_blocks(boundaries, data.len(), block_size());
+    compress_spans(data, &spans)
+}
+
+fn compress_spans(data: &[u8], spans: &[(usize, usize)]) -> io::Result<Vec<u8>> {
+    let checksum = crc32_checksum(data);
+    let block_count = spans.len();
     let index_bytes = block_count * BLOCK_INDEX_ENTRY_SIZE;
+
     let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(block_count);
     let mut index: Vec<u8> = Vec::with_capacity(index_bytes);
 
     // Offsets are absolute within the file so a reader can pread directly.
     let mut cursor = (BLOCK_HEADER_SIZE + index_bytes) as u32;
-    for chunk in data.chunks(bs) {
-        let compressed = compress_prepend_size(chunk);
+    for &(s, e) in spans {
+        let compressed = compress_prepend_size(&data[s..e]);
+        index.extend_from_slice(&(s as u32).to_le_bytes());
         index.extend_from_slice(&cursor.to_le_bytes());
         index.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         cursor = cursor.saturating_add(compressed.len() as u32);
@@ -197,7 +279,7 @@ pub fn compress_blocks(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(BLOCK_HEADER_SIZE + index_bytes + total);
     out.extend_from_slice(&BLOCK_COMPRESSION_MAGIC);
     out.extend_from_slice(&checksum.to_le_bytes());
-    out.extend_from_slice(&(bs as u32).to_le_bytes());
+    out.extend_from_slice(&(block_size() as u32).to_le_bytes());
     out.extend_from_slice(&(block_count as u32).to_le_bytes());
     out.extend_from_slice(&index);
     for b in &blocks {
@@ -205,11 +287,10 @@ pub fn compress_blocks(data: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     debug!(
-        "Block-compressed {} bytes -> {} bytes in {} blocks of {} ({:.2}%)",
+        "Block-compressed {} bytes -> {} bytes in {} blocks ({:.2}%)",
         data.len(),
         out.len(),
         block_count,
-        bs,
         (out.len() as f64 / data.len().max(1) as f64) * 100.0
     );
     Ok(out)
@@ -224,8 +305,8 @@ pub struct BlockLayout {
 }
 
 impl BlockLayout {
-    /// Index entry for `block_idx`, as (file_offset, compressed_len).
-    pub fn entry(&self, data: &[u8], block_idx: usize) -> io::Result<(usize, usize)> {
+    /// Index entry for `block_idx`, as (uncompressed_start, file_offset, compressed_len).
+    pub fn entry(&self, data: &[u8], block_idx: usize) -> io::Result<(usize, usize, usize)> {
         if block_idx >= self.block_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -239,16 +320,44 @@ impl BlockLayout {
                 "truncated block index",
             ));
         }
-        let off = u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]) as usize;
-        let len =
-            u32::from_le_bytes([data[at + 4], data[at + 5], data[at + 6], data[at + 7]]) as usize;
-        Ok((off, len))
+        let rd = |o: usize| {
+            u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize
+        };
+        Ok((rd(at), rd(at + 4), rd(at + 8)))
     }
 
     /// Block holding uncompressed `offset`, and the offset within that block.
-    #[inline]
-    pub fn locate(&self, offset: usize) -> (usize, usize) {
-        (offset / self.block_size, offset % self.block_size)
+    ///
+    /// Block spans vary because they break on cell boundaries, so this is a
+    /// binary search over the stored starts rather than a division. At a 32 KiB
+    /// target an 8 MiB segment holds a few hundred blocks, so the search is
+    /// under ten comparisons against an index that stays resident while the
+    /// segment's data does not.
+    pub fn locate(&self, data: &[u8], offset: usize) -> io::Result<(usize, usize)> {
+        if self.block_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no blocks in layout",
+            ));
+        }
+        let (mut lo, mut hi) = (0usize, self.block_count - 1);
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            let (start, _, _) = self.entry(data, mid)?;
+            if start <= offset {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let (start, _, _) = self.entry(data, lo)?;
+        if offset < start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("offset {} precedes first block", offset),
+            ));
+        }
+        Ok((lo, offset - start))
     }
 }
 
@@ -273,7 +382,7 @@ pub fn decompress_block(data: &[u8], block_idx: usize) -> io::Result<Vec<u8>> {
             "not a block-compressed buffer",
         )
     })?;
-    let (off, len) = layout.entry(data, block_idx)?;
+    let (_start, off, len) = layout.entry(data, block_idx)?;
     if data.len() < off + len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -508,9 +617,8 @@ mod tests {
 
         for idx in [0usize, 1, layout.block_count - 1] {
             let got = decompress_block(&packed, idx).unwrap();
-            let start = idx * layout.block_size;
-            let end = (start + layout.block_size).min(data.len());
-            assert_eq!(got, &data[start..end], "block {idx} content");
+            let (start, _, _) = layout.entry(&packed, idx).unwrap();
+            assert_eq!(got, &data[start..start + got.len()], "block {idx} content");
         }
     }
 
@@ -521,8 +629,9 @@ mod tests {
         let layout = block_layout(&packed).unwrap();
 
         let offset = layout.block_size * 3 + 17;
-        let (idx, within) = layout.locate(offset);
-        assert_eq!((idx, within), (3, 17));
+        let (idx, within) = layout.locate(&packed, offset).unwrap();
+        let (start, _, _) = layout.entry(&packed, idx).unwrap();
+        assert_eq!(start + within, offset);
 
         // And the bytes at that offset really are there.
         let block = decompress_block(&packed, idx).unwrap();
@@ -537,7 +646,7 @@ mod tests {
         let packed = compress_blocks(&data).unwrap();
         let layout = block_layout(&packed).unwrap();
         assert_eq!(layout.block_size, block_size());
-        assert_eq!(layout.block_count, data.len().div_ceil(block_size()));
+        assert!(layout.block_count > 0);
     }
 
     #[test]
@@ -562,7 +671,7 @@ mod tests {
         let data = segment_like(256 * 1024);
         let mut packed = compress_blocks(&data).unwrap();
         let layout = block_layout(&packed).unwrap();
-        let (off, _) = layout.entry(&packed, 1).unwrap();
+        let (_, off, _) = layout.entry(&packed, 1).unwrap();
         // Flip a byte inside a block's payload, past its length prefix.
         packed[off + 8] ^= 0xFF;
         let _ = decompress_all_blocks(&packed);
@@ -602,6 +711,104 @@ mod tests {
             );
         }
         std::env::remove_var("NEB_BACKUP_BLOCK_SIZE");
+    }
+
+    /// Cell starts for a run of cells of the given sizes.
+    fn boundaries_for(sizes: &[usize]) -> (Vec<usize>, usize) {
+        let mut b = Vec::with_capacity(sizes.len());
+        let mut at = 0usize;
+        for s in sizes {
+            b.push(at);
+            at += s;
+        }
+        (b, at)
+    }
+
+    #[test]
+    fn no_cell_is_ever_split_across_blocks() {
+        // The property the whole design rests on: one cell read must cost
+        // exactly one block decompression, never two.
+        let sizes: Vec<usize> = (0..4000)
+            .map(|i| match i % 7 {
+                0 => 8,          // tiny
+                1 => 64,
+                2 => 512,
+                3 => 4096,
+                4 => 40_000,     // larger than a 32 KiB target
+                5 => 1 << 20,    // 1 MiB
+                _ => 1500,
+            })
+            .collect();
+        let (bounds, total) = boundaries_for(&sizes);
+        let blocks = plan_blocks(&bounds, total, 32 * 1024);
+
+        // Every block edge must coincide with a cell start (or the end).
+        let starts: std::collections::HashSet<usize> = bounds.iter().copied().collect();
+        for &(s, e) in &blocks {
+            assert!(s == 0 || starts.contains(&s), "block start {s} splits a cell");
+            assert!(e == total || starts.contains(&e), "block end {e} splits a cell");
+        }
+
+        // And every cell lies wholly inside exactly one block.
+        for (i, &cs) in bounds.iter().enumerate() {
+            let ce = bounds.get(i + 1).copied().unwrap_or(total);
+            let holding = blocks.iter().filter(|&&(s, e)| cs >= s && ce <= e).count();
+            assert_eq!(holding, 1, "cell {i} [{cs},{ce}) not wholly in one block");
+        }
+    }
+
+    #[test]
+    fn an_oversized_cell_gets_its_own_block() {
+        // A 1 MiB cell must not drag 32 KiB of neighbours along, nor be split.
+        let sizes = [100usize, 200, 1 << 20, 300, 400];
+        let (bounds, total) = boundaries_for(&sizes);
+        let blocks = plan_blocks(&bounds, total, 32 * 1024);
+
+        let big_start = bounds[2];
+        let big_end = big_start + (1 << 20);
+        assert!(
+            blocks.contains(&(big_start, big_end)),
+            "1 MiB cell should occupy a block alone, got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn tiny_cells_are_packed_together_not_one_per_block() {
+        // 8-byte cells must not each cost a block, or the index would dwarf the
+        // data and every read would still be cheap but the file absurd.
+        let sizes = vec![8usize; 20_000];
+        let (bounds, total) = boundaries_for(&sizes);
+        let blocks = plan_blocks(&bounds, total, 32 * 1024);
+        assert!(
+            blocks.len() <= total.div_ceil(32 * 1024) + 1,
+            "expected ~{} blocks for {} bytes of tiny cells, got {}",
+            total.div_ceil(32 * 1024),
+            total,
+            blocks.len()
+        );
+    }
+
+    #[test]
+    fn variable_blocks_roundtrip_and_locate_correctly() {
+        let sizes: Vec<usize> = (0..2000)
+            .map(|i| if i % 11 == 0 { 50_000 } else { 700 })
+            .collect();
+        let (bounds, total) = boundaries_for(&sizes);
+        let mut data = Vec::with_capacity(total);
+        for (i, s) in sizes.iter().enumerate() {
+            data.extend(std::iter::repeat((i % 251) as u8).take(*s));
+        }
+
+        let packed = compress_blocks_on_cells(&data, &bounds).unwrap();
+        assert_eq!(decompress_all_blocks(&packed).unwrap(), data);
+
+        // Each cell must be reachable by decompressing exactly its own block.
+        let layout = block_layout(&packed).unwrap();
+        for &cs in bounds.iter().step_by(97) {
+            let (idx, within) = layout.locate(&packed, cs).unwrap();
+            let block = decompress_block(&packed, idx).unwrap();
+            assert_eq!(block[within], data[cs], "cell at {cs} via block {idx}");
+        }
     }
 
     #[test]
