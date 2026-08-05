@@ -605,7 +605,7 @@ impl Segment {
             }
         }
 
-        let (block_idx, block_start, file_off, comp_len) = {
+        let (block_idx, block_start, file_off, comp_len, raw_blocks) = {
             let mut residency = self.block_residency.write();
 
             if residency.index.is_none() {
@@ -641,7 +641,7 @@ impl Segment {
             COLD_BLOCK_MISSES.fetch_add(1, Ordering::Relaxed);
 
             let (block_start, file_off, comp_len) = layout.entry(index, block_idx)?;
-            (block_idx, block_start, file_off, comp_len)
+            (block_idx, block_start, file_off, comp_len, layout.raw)
         };
 
         // Read and decompress with no lock held. Two threads missing the same
@@ -657,12 +657,18 @@ impl Segment {
             buf
         };
 
-        let plain = lz4_flex::block::decompress_size_prepended(&compressed).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("block {} of segment {}: {:?}", block_idx, self.id, e),
-            )
-        })?;
+        // An uncompressed backup hands back the bytes as read; there is
+        // nothing to decode.
+        let plain = if raw_blocks {
+            compressed
+        } else {
+            lz4_flex::block::decompress_size_prepended(&compressed).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("block {} of segment {}: {:?}", block_idx, self.id, e),
+                )
+            })?
+        };
         COLD_BLOCK_PLAIN_BYTES.fetch_add(plain.len() as u64, Ordering::Relaxed);
 
         if block_start + plain.len() > SEGMENT_SIZE {

@@ -172,8 +172,13 @@ fn compress_spans(data: &[u8], spans: &[(usize, usize)]) -> io::Result<Vec<u8>> 
 
     // Offsets are absolute within the file so a reader can pread directly.
     let mut cursor = (BLOCK_HEADER_SIZE + index_bytes) as u32;
+    let raw = !compression_enabled();
     for &(s, e) in spans {
-        let compressed = compress_prepend_size(&data[s..e]);
+        let compressed = if raw {
+            data[s..e].to_vec()
+        } else {
+            compress_prepend_size(&data[s..e])
+        };
         index.extend_from_slice(&(s as u32).to_le_bytes());
         index.extend_from_slice(&cursor.to_le_bytes());
         index.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
@@ -185,7 +190,12 @@ fn compress_spans(data: &[u8], spans: &[(usize, usize)]) -> io::Result<Vec<u8>> 
     let mut out = Vec::with_capacity(BLOCK_HEADER_SIZE + index_bytes + total);
     out.extend_from_slice(&BLOCK_COMPRESSION_MAGIC);
     out.extend_from_slice(&checksum.to_le_bytes());
-    out.extend_from_slice(&(block_size() as u32).to_le_bytes());
+    let size_field = if raw {
+        block_size() as u32 | RAW_BLOCKS_FLAG
+    } else {
+        block_size() as u32
+    };
+    out.extend_from_slice(&size_field.to_le_bytes());
     out.extend_from_slice(&(block_count as u32).to_le_bytes());
     out.extend_from_slice(&index);
     for b in &blocks {
@@ -208,6 +218,30 @@ pub struct BlockLayout {
     pub block_size: usize,
     pub block_count: usize,
     pub checksum: u32,
+    /// Blocks are stored uncompressed. Reading one is then a copy rather than
+    /// a decompress, and writing skipped the compressor entirely.
+    pub raw: bool,
+}
+
+/// Marks a backup whose blocks are stored uncompressed, in the high bit of the
+/// block-size field. Block sizes are kilobytes, so the bit is free.
+const RAW_BLOCKS_FLAG: u32 = 0x8000_0000;
+
+/// Whether segment backups are compressed, via `NEB_BACKUP_COMPRESSION`.
+///
+/// Compression is not free on the write side: during an import the eviction
+/// threads spent about a third of all sampled CPU inside LZ4, and archiving as
+/// a whole was near half. It buys roughly 40% of the on-disk size. Which way
+/// that trades depends on whether the machine is short of CPU or of disk, so it
+/// is a setting rather than a constant.
+pub fn compression_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("NEB_BACKUP_COMPRESSION").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
 }
 
 impl BlockLayout {
@@ -272,10 +306,12 @@ pub fn block_layout(data: &[u8]) -> Option<BlockLayout> {
     if data.len() < BLOCK_HEADER_SIZE || data[..4] != BLOCK_COMPRESSION_MAGIC {
         return None;
     }
+    let raw_field = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
     Some(BlockLayout {
         checksum: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
-        block_size: u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize,
+        block_size: (raw_field & !RAW_BLOCKS_FLAG) as usize,
         block_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize,
+        raw: raw_field & RAW_BLOCKS_FLAG != 0,
     })
 }
 
@@ -294,6 +330,9 @@ pub fn decompress_block(data: &[u8], block_idx: usize) -> io::Result<Vec<u8>> {
             io::ErrorKind::UnexpectedEof,
             format!("block {} extends past end of buffer", block_idx),
         ));
+    }
+    if layout.raw {
+        return Ok(data[off..off + len].to_vec());
     }
     decompress_size_prepended(&data[off..off + len]).map_err(|e| {
         io::Error::new(
@@ -419,6 +458,20 @@ mod tests {
         let ratio = (compressed.len() as f64 / original.len() as f64) * 100.0;
 
         println!("Compression ratio for 8MB zeros: {:.2}%", ratio);
+
+        // With compression turned off the blocks are stored as written, so the
+        // only thing to check is that the format still round-trips and adds
+        // nothing but framing.
+        if !compression_enabled() {
+            assert!(
+                ratio >= 100.0 && ratio < 101.0,
+                "raw blocks should be the data plus framing, got {:.2}%",
+                ratio
+            );
+            let decompressed = decompress_if_compressed(&compressed).unwrap();
+            assert_eq!(original, decompressed);
+            return;
+        }
 
         // Zeros compress to nothing, so what survives is framing, not data: the
         // block index plus LZ4's per-block minimum. That floor is set by how
