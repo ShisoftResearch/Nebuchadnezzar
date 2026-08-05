@@ -198,7 +198,41 @@ fn compose_partitioned_hash_id(partition: u64, hash: u64) -> Id {
 }
 
 impl SegmentedPostingList {
-    const MAX_SEGMENT_SIZE: usize = 1000;
+    /// Postings held in one segment before a new head is started.
+    ///
+    /// Appending rewrites the whole segment -- read the cell, parse it, add one
+    /// posting, re-serialise, write it back -- so filling a segment of N costs
+    /// O(N^2) and each append copies N/2 postings on average. At 1000 that is
+    /// ~500 copies per append, and full-text indexing was the largest single
+    /// consumer of server CPU during an import at 8.6 of 48 cores.
+    ///
+    /// Smaller segments make each append cheaper and the query-time chain
+    /// longer. Measured on a 59GB import:
+    ///
+    ///   segment   us/insert   full-text cores   entities at 150s
+    ///     1000      105.7          8.48            4,566,210
+    ///      100       70.1          7.00            5,251,748
+    ///       50       62.5          6.74            5,254,241
+    ///       25       57.8          6.14            5,294,447
+    ///
+    /// Write cost keeps falling below 100, but throughput does not: full-text
+    /// stops being the constraint there, and smaller segments only lengthen the
+    /// chain a query has to walk for another 0.8%. 100 takes the write win and
+    /// leaves the read side as close to unchanged as it can be.
+    ///
+    /// The query side of this trade is not measured; if full-text reads matter
+    /// more than ingest for a workload, raise it. Overridable with
+    /// `NEB_POSTING_SEGMENT_SIZE`.
+    fn max_segment_size() -> usize {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("NEB_POSTING_SEGMENT_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v >= 8)
+                .unwrap_or(100)
+        })
+    }
 
     fn new(schema_id: u32, field_id: u64, term_hash: u64) -> Self {
         Self {
@@ -359,7 +393,7 @@ impl PostingSegment {
     }
 
     fn is_full(&self) -> bool {
-        self.doc_ids.len() >= SegmentedPostingList::MAX_SEGMENT_SIZE
+        self.doc_ids.len() >= SegmentedPostingList::max_segment_size()
     }
 
     fn add(&mut self, doc_id: Id, version: u64, tf: u32, doc_len: u32) {
