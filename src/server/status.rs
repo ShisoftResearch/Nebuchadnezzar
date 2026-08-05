@@ -101,6 +101,10 @@ pub struct ServerMemoryStatus {
     /// Per-index-type insert cost and count: ranged, hashed, vector, fulltext, embedding.
     pub idx_type_us: Vec<u64>,
     pub idx_type_count: Vec<u64>,
+    /// Hashed-index bucket sizes: the cost of read-modify-write scales with these.
+    pub hash_bucket_len_sum: u64,
+    pub hash_bucket_samples: u64,
+    pub hash_bucket_max: u64,
 }
 
 impl ServerMemoryStatus {
@@ -360,6 +364,9 @@ impl NebServer {
             idx_task_exec_us: crate::index::builder::IDX_TASK_EXEC_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
             idx_type_us: crate::index::builder::IDX_BY_TYPE_NANOS.iter().map(|v| v.load(std::sync::atomic::Ordering::Relaxed) / 1000).collect(),
             idx_type_count: crate::index::builder::IDX_BY_TYPE_COUNT.iter().map(|v| v.load(std::sync::atomic::Ordering::Relaxed)).collect(),
+            hash_bucket_len_sum: crate::index::hash::HASH_BUCKET_LEN_SUM.load(std::sync::atomic::Ordering::Relaxed),
+            hash_bucket_samples: crate::index::hash::HASH_BUCKET_SAMPLES.load(std::sync::atomic::Ordering::Relaxed),
+            hash_bucket_max: crate::index::hash::HASH_BUCKET_MAX.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }

@@ -1,4 +1,10 @@
 use crate::ram::cell::{ReadError, WriteError};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Bucket-size accounting for the hashed index.
+pub static HASH_BUCKET_LEN_SUM: AtomicU64 = AtomicU64::new(0);
+pub static HASH_BUCKET_SAMPLES: AtomicU64 = AtomicU64::new(0);
+pub static HASH_BUCKET_MAX: AtomicU64 = AtomicU64::new(0);
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use crate::{client::AsyncClient, ram::cell::OwnedCell};
@@ -56,6 +62,40 @@ impl HashIndexer {
 
         // Retry loop for compare-and-swap
         for retry in 0..MAX_CAS_RETRIES {
+            // Try to create the bucket before reading it.
+            //
+            // Buckets are overwhelmingly singletons -- measured mean length at
+            // insert was 0.0, with a single non-empty sample across 23k inserts
+            // a second, because indexed values are near-unique. Reading first
+            // therefore spent an entire round trip learning the cell does not
+            // exist, on essentially every insert. Creating first collapses the
+            // common case to one round trip; a bucket that does exist costs a
+            // rejected create and falls through to the merge below, which the
+            // measurement says is the rare path.
+            if retry == 0 {
+                let mut map = OwnedMap::new();
+                map.insert_key_id(
+                    *HASH_INDEX_FIELD_ID,
+                    OwnedValue::PrimArray(OwnedPrimArray::Id(vec![*cell_id])),
+                );
+                let cell =
+                    OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, index_id, OwnedValue::Map(map));
+                match self.neb_client.write_cell(cell).await {
+                    Ok(Ok(_)) => return Ok(()),
+                    // Bucket already there: fall through and merge into it.
+                    Ok(Err(WriteError::CellAlreadyExisted)) => {}
+                    Ok(Err(e)) if Self::retryable_write_error(&e) => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
+            }
+
             // Read the current cell
             match self.neb_client.read_cell(*index_id).await {
                 Ok(Ok(mut cell)) => {
@@ -64,6 +104,15 @@ impl HashIndexer {
                     let ids_val = &mut cell[*HASH_INDEX_FIELD_ID];
 
                     if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = ids_val {
+                        // Bucket size drives the cost of this path: it is
+                        // read, scanned, and written whole on every insert. If
+                        // buckets stay small the cost is the round trip and
+                        // segmenting them would buy nothing, so measure before
+                        // restructuring.
+                        HASH_BUCKET_LEN_SUM.fetch_add(ids.len() as u64, Ordering::Relaxed);
+                        HASH_BUCKET_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                        HASH_BUCKET_MAX.fetch_max(ids.len() as u64, Ordering::Relaxed);
+
                         // Check if cell_id is already in the array
                         if ids.contains(cell_id) {
                             debug!("Cell {:?} already in index {:?}", cell_id, index_id);
