@@ -72,7 +72,13 @@ impl HashIndexer {
 
                         // Add the cell_id to the array
                         ids.push(*cell_id);
-                        let new_value = OwnedValue::PrimArray(OwnedPrimArray::Id(ids.clone()));
+                        // Move the list out rather than copying it. The cell is
+                        // dropped as soon as the write is issued, so the clone
+                        // bought nothing and cost an allocation and a copy of
+                        // the whole bucket on every insert -- and buckets grow
+                        // without bound, so that copy grows with them.
+                        let new_value =
+                            OwnedValue::PrimArray(OwnedPrimArray::Id(std::mem::take(ids)));
 
                         // Use compare-and-swap to update the field atomically
                         match self

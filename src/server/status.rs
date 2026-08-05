@@ -86,6 +86,21 @@ pub struct ServerMemoryStatus {
     pub idx_probe_us: u64,
     pub idx_key_us: u64,
     pub idx_spawn_us: u64,
+    /// Where a vertex-create request spends its time, filled by the gateway.
+    pub vc_calls: u64,
+    pub vc_schema_us: u64,
+    pub vc_norm_us: u64,
+    pub vc_engine_us: u64,
+    pub vc_resp_us: u64,
+    /// Index work a write waits on before returning.
+    pub idx_scope_calls: u64,
+    pub idx_scope_empty: u64,
+    pub idx_scope_tasks: u64,
+    pub idx_scope_wait_us: u64,
+    pub idx_task_exec_us: u64,
+    /// Per-index-type insert cost and count: ranged, hashed, vector, fulltext, embedding.
+    pub idx_type_us: Vec<u64>,
+    pub idx_type_count: Vec<u64>,
 }
 
 impl ServerMemoryStatus {
@@ -331,6 +346,20 @@ impl NebServer {
             idx_probe_us: crate::index::builder::IDX_PROBE_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
             idx_key_us: crate::index::builder::IDX_KEY_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
             idx_spawn_us: crate::index::builder::IDX_SPAWN_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            // Gateway-level phases; neb has no view of them, so they are zero
+            // here and filled in by the caller that owns the HTTP handler.
+            vc_calls: 0,
+            vc_schema_us: 0,
+            vc_norm_us: 0,
+            vc_engine_us: 0,
+            vc_resp_us: 0,
+            idx_scope_calls: crate::index::builder::IDX_SCOPE_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            idx_scope_empty: crate::index::builder::IDX_SCOPE_EMPTY.load(std::sync::atomic::Ordering::Relaxed),
+            idx_scope_tasks: crate::index::builder::IDX_SCOPE_TASKS.load(std::sync::atomic::Ordering::Relaxed),
+            idx_scope_wait_us: crate::index::builder::IDX_SCOPE_WAIT_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            idx_task_exec_us: crate::index::builder::IDX_TASK_EXEC_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            idx_type_us: crate::index::builder::IDX_BY_TYPE_NANOS.iter().map(|v| v.load(std::sync::atomic::Ordering::Relaxed) / 1000).collect(),
+            idx_type_count: crate::index::builder::IDX_BY_TYPE_COUNT.iter().map(|v| v.load(std::sync::atomic::Ordering::Relaxed)).collect(),
         }
     }
 }

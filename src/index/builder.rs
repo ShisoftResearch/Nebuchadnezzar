@@ -225,6 +225,17 @@ impl IndexRes {
 impl IndexMeta {
     // Insert an index into the indexer clients
     async fn insert(&self, indexers: &IndexerClients) -> Result<(), IndexError> {
+        // Which index type a write waits on. One insert costs ~348us, and the
+        // types have nothing in common -- ranged goes to a B-tree over RPC,
+        // full text appends posting lists synchronously -- so the total says
+        // nothing about which to fix.
+        let _t = IndexInsertTimer::new(match self {
+            IndexMeta::Ranged(_) => 0,
+            IndexMeta::Hashed(_) | IndexMeta::Null(_) => 1,
+            IndexMeta::Vector(_) => 2,
+            IndexMeta::FullText(_) => 3,
+            IndexMeta::Embedding(_) => 4,
+        });
         match self {
             &IndexMeta::Ranged(ref meta) => {
                 indexers
@@ -373,6 +384,50 @@ pub static INDEX_TASK_LOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub static IDX_PROBE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static IDX_KEY_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static IDX_SPAWN_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How long a write waits for the index work it generated, and how much of it
+/// there was. The writing request blocks on this, so it is latency the client
+/// sees directly rather than background cost.
+pub static IDX_SCOPE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IDX_SCOPE_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IDX_SCOPE_TASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IDX_SCOPE_WAIT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The index task's own run time, against the caller's wait above.
+pub static IDX_TASK_EXEC_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Per-index-type insert cost: ranged, hashed, vector, full text, embedding.
+pub static IDX_BY_TYPE_NANOS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub static IDX_BY_TYPE_COUNT: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Records an insert's cost against its type on every exit path, including the
+/// error ones -- a type that fails fast would otherwise look cheap.
+struct IndexInsertTimer(usize, std::time::Instant);
+impl IndexInsertTimer {
+    fn new(kind: usize) -> Self {
+        Self(kind, std::time::Instant::now())
+    }
+}
+impl Drop for IndexInsertTimer {
+    fn drop(&mut self) {
+        IDX_BY_TYPE_NANOS[self.0].fetch_add(
+            self.1.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        IDX_BY_TYPE_COUNT[self.0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 pub static INDEX_TASK_GLOBAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static INDEX_GLOBAL_WAIT_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -641,19 +696,35 @@ impl IndexBuilder {
 
         async move {
             if tasks.is_empty() {
+                IDX_SCOPE_EMPTY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return (res, Vec::new());
             }
+            IDX_SCOPE_TASKS.fetch_add(tasks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            IDX_SCOPE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let t_wait = std::time::Instant::now();
             // One spawn for the whole request. The futures still run
             // concurrently with each other inside it, so index work keeps its
             // parallelism; what disappears is one scheduler injection per cell.
             let joined = tokio::spawn(async move {
-                tasks
+                // Time the task's own execution, separately from the caller's
+                // wait. If the wait far exceeds this, the cost is queueing
+                // before the task is scheduled rather than the index work
+                // itself -- which calls for a different fix entirely.
+                let t_exec = std::time::Instant::now();
+                let out = tasks
                     .into_iter()
                     .collect::<FuturesUnordered<BoxFuture<'static, Result<(), IndexError>>>>()
                     .collect::<Vec<Result<(), IndexError>>>()
-                    .await
+                    .await;
+                IDX_TASK_EXEC_NANOS.fetch_add(
+                    t_exec.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                out
             })
             .await;
+            IDX_SCOPE_WAIT_NANOS
+                .fetch_add(t_wait.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let results = match joined {
                 // Shape preserved for callers: each index result stays wrapped
                 // in the join layer it had when every future was its own task.
@@ -780,14 +851,38 @@ impl IndexBuilder {
             .into_iter()
             .partition(|meta| matches!(meta, IndexMeta::FullText(_)));
 
-        for new_index in regular_new {
-            debug!("Inserting new index: {:?}", new_index);
-            new_index.insert(&*indexers).await?;
+        // Apply the entries concurrently rather than one await at a time. A
+        // cell with several indexed fields otherwise pays the sum of every
+        // index's latency in series, and the writing request waits for the
+        // whole chain: the vertex-create handler measured 980us inside the
+        // engine call against 14us for everything else it does.
+        //
+        // The entries are disjoint -- anything present in both old and new was
+        // removed from both sets above -- so nothing here depends on the order
+        // of anything else. Inserts still complete before removals begin, which
+        // is the one ordering that was already guaranteed.
+        debug!("Inserting new indices concurrently");
+        let mut inserts = regular_new
+            .into_iter()
+            .map(|new_index| {
+                let indexers = indexers.clone();
+                async move { new_index.insert(&*indexers).await }
+            })
+            .collect::<FuturesUnordered<_>>();
+        while let Some(res) = inserts.next().await {
+            res?;
         }
+
         debug!("Removing old indices: {:?}", regular_old);
-        for old_index in regular_old {
-            debug!("Removing old index: {:?}", old_index);
-            old_index.remove(&*indexers).await?;
+        let mut removals = regular_old
+            .into_iter()
+            .map(|old_index| {
+                let indexers = indexers.clone();
+                async move { old_index.remove(&*indexers).await }
+            })
+            .collect::<FuturesUnordered<_>>();
+        while let Some(res) = removals.next().await {
+            res?;
         }
         debug!("Removing old inverted indices: {:?}", inverted_old);
         for old_index in inverted_old {
