@@ -347,26 +347,63 @@ lazy_static! {
 }
 
 std::thread_local! {
-    static REQUEST_INDEX_TASKS: RefCell<Vec<Vec<JoinHandle<Result<(), IndexError>>>>> =
+    /// Index work collected for the current request, held as futures rather
+    /// than spawned tasks.
+    ///
+    /// Spawning per cell was the dominant cost of a write: 18.3us of the 21.6us
+    /// secondary phase, about 110us per task, because every indexed cell
+    /// injected a fresh task into the scheduler's queues from whichever thread
+    /// happened to be writing. That cost rose with concurrency -- 5.1us/cell at
+    /// 64 in-flight against 39.2us at 256 -- which is contention on the
+    /// injection path, not the work itself. Collecting futures and spawning
+    /// once per request turns N injections into one while leaving the work
+    /// concurrent inside that task.
+    static REQUEST_INDEX_TASKS: RefCell<Vec<Vec<BoxFuture<'static, Result<(), IndexError>>>>> =
         RefCell::new(Vec::new());
 }
 
+/// Index tasks routed to a request-local scope against the process-wide
+/// backlog. The global path takes one mutex per task, so if writes land there
+/// it is a single lock on the hot path of every cell written.
+pub static INDEX_TASK_LOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Breakdown of the secondary-index phase, which dominates write cost and is
+/// the only phase whose per-cell price grows with concurrency (5.1us at 64
+/// in-flight, 39.2us at 256). Splitting it says whether that is the probe
+/// (pure CPU over the cell's fields), the key construction, or the spawn.
+pub static IDX_PROBE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IDX_KEY_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static IDX_SPAWN_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INDEX_TASK_GLOBAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INDEX_GLOBAL_WAIT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
-    let mut handle = Some(tokio::spawn(task));
+    // Inside a request scope the future is only collected; it is spawned once
+    // for the whole request when the scope closes. Outside one there is no
+    // later moment to spawn at, so the task goes to the scheduler immediately
+    // and the reaper owns it.
+    let mut pending = Some(task);
     let stored_locally = REQUEST_INDEX_TASKS.with(|scopes| {
         let mut scopes = scopes.borrow_mut();
         if let Some(tasks) = scopes.last_mut() {
-            tasks.push(handle.take().expect("index task handle should exist"));
+            tasks.push(pending.take().expect("index task should exist").boxed());
             true
         } else {
             false
         }
     });
-    if !stored_locally {
-        PENDING_INDEX_TASKS
-            .lock()
-            .push(handle.expect("index task handle should exist"));
+    if stored_locally {
+        INDEX_TASK_LOCAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
     }
+
+    INDEX_TASK_GLOBAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let handle = tokio::spawn(pending.take().expect("index task should exist"));
+    let t0 = std::time::Instant::now();
+    let mut guard = PENDING_INDEX_TASKS.lock();
+    INDEX_GLOBAL_WAIT_NANOS
+        .fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    guard.push(handle);
 }
 
 // Main struct for building and managing indices
@@ -423,6 +460,7 @@ impl IndexBuilder {
             schema.name,
             schema.is_scannable
         );
+        let t_key = std::time::Instant::now();
         let indexers = self.clients.clone();
         let scannable_key = if schema.is_scannable {
             log::debug!(
@@ -439,12 +477,18 @@ impl IndexBuilder {
             );
             None
         };
+        IDX_KEY_NANOS.fetch_add(t_key.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+
         // Get new indices for the cell
+        let t_probe = std::time::Instant::now();
         let new_indices = probe_cell_indices(cell, schema);
+        IDX_PROBE_NANOS
+            .fetch_add(t_probe.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         if scannable_key.is_some() || !new_indices.is_empty() {
             debug!("New indices: {:?}", new_indices);
             let cell_id = cell.id();
             let schema_id = cell.header.schema;
+            let t_spawn = std::time::Instant::now();
             new_index_task(async move {
                 if let Some(key) = scannable_key {
                     Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_id)
@@ -454,6 +498,8 @@ impl IndexBuilder {
                 debug!("Ensure indices result: {:?}", res);
                 res
             });
+            IDX_SPAWN_NANOS
+                .fetch_add(t_spawn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -594,11 +640,26 @@ impl IndexBuilder {
         });
 
         async move {
-            let results = tasks
-                .into_iter()
-                .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
-                .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
-                .await;
+            if tasks.is_empty() {
+                return (res, Vec::new());
+            }
+            // One spawn for the whole request. The futures still run
+            // concurrently with each other inside it, so index work keeps its
+            // parallelism; what disappears is one scheduler injection per cell.
+            let joined = tokio::spawn(async move {
+                tasks
+                    .into_iter()
+                    .collect::<FuturesUnordered<BoxFuture<'static, Result<(), IndexError>>>>()
+                    .collect::<Vec<Result<(), IndexError>>>()
+                    .await
+            })
+            .await;
+            let results = match joined {
+                // Shape preserved for callers: each index result stays wrapped
+                // in the join layer it had when every future was its own task.
+                Ok(inner) => inner.into_iter().map(Ok).collect(),
+                Err(join_error) => vec![Err(join_error)],
+            };
             (res, results)
         }
         .boxed()

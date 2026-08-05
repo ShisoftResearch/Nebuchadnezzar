@@ -25,6 +25,20 @@ use parking_lot::Mutex;
 use std::io;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// Per-phase cost of a cell write, in nanoseconds, against the number of cells.
+///
+/// Import throughput is flat as client concurrency rises, so latency is rising
+/// to match and something is served at a fixed rate. Aggregate CPU and blocked
+/// -thread counts cannot say which stage that is -- the stage that holds the
+/// rate is the one whose per-cell cost does not fall as load is added.
+pub static WRITE_CELLS: AtomicU64 = AtomicU64::new(0);
+pub static WRITE_PLAN_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static WRITE_ALLOC_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static WRITE_COPY_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static WRITE_INDEX_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static WRITE_SECONDARY_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static WRITE_STATS_NANOS: AtomicU64 = AtomicU64::new(0);
 use std::sync::Arc;
 
 pub type CellReadGuard<'a> = WordMutexGuard<'a>;
@@ -764,10 +778,22 @@ impl Chunk {
 
     fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
+        // Per-phase timing. Throughput here is flat against concurrency, which
+        // means latency rises to match and some phase is being served at a
+        // fixed rate. Totals alone cannot show which; a phase whose per-cell
+        // cost is invariant as load rises is the one holding the rate.
+        let t_plan = std::time::Instant::now();
         let write_plan = cell.plan_write(self)?;
+        WRITE_PLAN_NANOS.fetch_add(t_plan.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        let t_alloc = std::time::Instant::now();
         let pending_entry = write_plan.allocate(self, true)?;
+        WRITE_ALLOC_NANOS.fetch_add(t_alloc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        let t_copy = std::time::Instant::now();
         let write_result =
             self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
+        WRITE_COPY_NANOS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let cell_loc = write_result.addr;
         #[cfg(debug_assertions)]
         {
@@ -782,18 +808,26 @@ impl Chunk {
             );
         }
 
-        match self.cell_index.try_insert_locked(cell.header.id.bits() as usize) {
+        let t_index = std::time::Instant::now();
+        let insert = self.cell_index.try_insert_locked(cell.header.id.bits() as usize);
+        WRITE_INDEX_NANOS.fetch_add(t_index.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        match insert {
             Some(mut guard) => {
                 #[cfg(debug_assertions)]
                 self.assert_address_aligned_for_write(cell_loc, "write_cell", cell.header.id.bits());
 
                 *guard = cell_loc;
                 drop(guard);
+                let t_sec = std::time::Instant::now();
                 self.ensure_indices(cell, None, &*write_plan.schema);
+                WRITE_SECONDARY_NANOS.fetch_add(t_sec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let t_stats = std::time::Instant::now();
                 self.refresh_statistics_for_schema(write_plan.schema.id);
+                WRITE_STATS_NANOS.fetch_add(t_stats.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             None => return Err(WriteError::CellAlreadyExisted),
         }
+        WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
         cell.header.version = write_result.new_version;
         cell.header.timestamp = write_result.new_timestamp;
         Ok(cell.header)

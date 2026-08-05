@@ -70,6 +70,22 @@ pub struct ServerMemoryStatus {
     pub wal_lock_wait_ms: u64,
     pub wal_lock_held_ms: u64,
     pub wal_lock_contended: u64,
+    /// Per-phase cost of a cell write, microseconds per cell.
+    pub write_cells: u64,
+    pub write_plan_us: u64,
+    pub write_alloc_us: u64,
+    pub write_copy_us: u64,
+    pub write_index_us: u64,
+    pub write_secondary_us: u64,
+    pub write_stats_us: u64,
+    /// Index tasks by route, and time spent waiting for the global backlog lock.
+    pub index_task_local: u64,
+    pub index_task_global: u64,
+    pub index_global_wait_ms: u64,
+    /// Breakdown of the secondary-index phase.
+    pub idx_probe_us: u64,
+    pub idx_key_us: u64,
+    pub idx_spawn_us: u64,
 }
 
 impl ServerMemoryStatus {
@@ -302,6 +318,19 @@ impl NebServer {
             wal_lock_wait_ms: crate::ram::segs::WAL_LOCK_WAIT_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
             wal_lock_held_ms: crate::ram::segs::WAL_LOCK_HELD_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
             wal_lock_contended: crate::ram::segs::WAL_LOCK_CONTENDED.load(std::sync::atomic::Ordering::Relaxed),
+            write_cells: crate::ram::chunk::WRITE_CELLS.load(std::sync::atomic::Ordering::Relaxed),
+            write_plan_us: crate::ram::chunk::WRITE_PLAN_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            write_alloc_us: crate::ram::chunk::WRITE_ALLOC_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            write_copy_us: crate::ram::chunk::WRITE_COPY_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            write_index_us: crate::ram::chunk::WRITE_INDEX_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            write_secondary_us: crate::ram::chunk::WRITE_SECONDARY_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            write_stats_us: crate::ram::chunk::WRITE_STATS_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            index_task_local: crate::index::builder::INDEX_TASK_LOCAL.load(std::sync::atomic::Ordering::Relaxed),
+            index_task_global: crate::index::builder::INDEX_TASK_GLOBAL.load(std::sync::atomic::Ordering::Relaxed),
+            index_global_wait_ms: crate::index::builder::INDEX_GLOBAL_WAIT_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+            idx_probe_us: crate::index::builder::IDX_PROBE_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            idx_key_us: crate::index::builder::IDX_KEY_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
+            idx_spawn_us: crate::index::builder::IDX_SPAWN_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
         }
     }
 }
