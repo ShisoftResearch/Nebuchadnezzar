@@ -1991,15 +1991,17 @@ impl<'a> CellGuard<'a> {
                         // Falls through to promotion when the backup predates the
                         // block-indexed format, or when the block read fails --
                         // promotion is slower but always works.
-                        // Once residency crosses the threshold the policy asks
-                        // for a full promotion; take the branch below, which
-                        // releases the guard before promoting.
-                        let serve_from_block = !seg.wants_full_promotion();
-                        match if serve_from_block {
-                            seg.fault_in_block_for(*guard)
-                        } else {
-                            Ok(None)
-                        } {
+                        //
+                        // The block read is always attempted first and is never
+                        // skipped in favour of promotion. Promotion waits for
+                        // every reference on the segment to drain, and a block
+                        // read hands the caller a live reference to a segment
+                        // that is still cold -- so a caller holding one and then
+                        // demanding promotion of the same segment waits on
+                        // itself. That livelocked 33 threads in sched_yield for
+                        // 50 minutes during a sidecar build, which reads several
+                        // cells of one segment at a time.
+                        match seg.fault_in_block_for(*guard) {
                             Ok(Some(newly_resident)) => {
                                 if !seg.incr_references() {
                                     return None;
@@ -2007,7 +2009,7 @@ impl<'a> CellGuard<'a> {
                                 seg.mark_referenced();
                                 if let Some(ref tiered) = chunk.tiered_manager {
                                     tiered.add_cold_resident(newly_resident);
-                                    tiered.note_cold_block_read(chunk, seg);
+                                    tiered.note_cold_block_read();
                                 }
                                 return Some(CellGuard {
                                     hash,

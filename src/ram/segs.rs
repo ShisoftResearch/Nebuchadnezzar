@@ -150,11 +150,6 @@ pub struct Segment {
     /// which is what makes the block, rather than the whole 8 MiB segment, the
     /// unit of residency.
     block_residency: parking_lot::Mutex<BlockResidency>,
-    /// Set once partial residency has grown far enough that a full promotion is
-    /// worth it. Acted on by the read path's promotion branch, which releases
-    /// the cell lock first -- promoting inline self-deadlocks, because the
-    /// caller holds a reference that `promote_segment` waits to drain.
-    wants_full_promotion: AtomicBool,
 }
 
 /// Per-segment state for serving reads from a cold segment without promoting it.
@@ -200,7 +195,14 @@ impl BlockResidency {
         self.resident_bytes
     }
 
+    /// Drop everything cached about the current backup.
+    ///
+    /// The index maps offsets within one specific backup file. A segment that
+    /// is promoted, appended to and archived again gets a different block
+    /// layout, so keeping the old index across that would resolve offsets
+    /// against a file that no longer matches it.
     fn clear(&mut self) {
+        self.index = None;
         self.present.clear();
         self.resident_bytes = 0;
     }
@@ -301,7 +303,6 @@ impl Segment {
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
             block_residency: parking_lot::Mutex::new(BlockResidency::default()),
-            wants_full_promotion: AtomicBool::new(false),
         }
     }
 
@@ -411,7 +412,6 @@ impl Segment {
         let mut residency = self.block_residency.lock();
         residency.clear();
         drop(residency);
-        self.clear_full_promotion_request();
     }
 
     /// Clear partial residency and report the bytes released, so the caller --
@@ -423,23 +423,38 @@ impl Segment {
         released
     }
 
-    /// Whether partial residency has grown far enough to justify promoting.
-    #[inline]
-    pub fn wants_full_promotion(&self) -> bool {
-        self.wants_full_promotion.load(Ordering::Relaxed)
-    }
 
-    /// Request a full promotion at the next opportunity that can take one
-    /// safely -- meaning one that is not holding a reference on this segment.
-    #[inline]
-    pub fn request_full_promotion(&self) {
-        self.wants_full_promotion.store(true, Ordering::Relaxed);
-    }
+    /// Drop the blocks faulted into this cold segment, reporting the bytes
+    /// released, or `None` if the segment is busy or holds nothing.
+    ///
+    /// For a cold segment the backup file is the authority, so faulted-in
+    /// blocks are pure cache: dropping them costs a re-read and no write at
+    /// all. That makes them the first thing to give back under pressure, ahead
+    /// of evicting a hot segment, which has to be archived first.
+    ///
+    /// Requires exclusive access for the same reason eviction does -- the pages
+    /// are about to be dropped, so no reader may be inside them. The attempt is
+    /// made once and abandoned if the segment is referenced; spinning here is
+    /// what deadlocked promotion, and a sweep has other segments to try.
+    pub fn try_reclaim_resident_blocks(&self) -> Option<usize> {
+        if !self.is_cold() {
+            return None;
+        }
+        if self.block_resident_bytes() == 0 {
+            return None;
+        }
+        let _exclusive = SegmentExclusiveRefGuard::new(self)?;
 
-    /// Clear the request, once promoted or freed.
-    #[inline]
-    pub fn clear_full_promotion_request(&self) {
-        self.wants_full_promotion.store(false, Ordering::Relaxed);
+        let mut residency = self.block_residency.lock();
+        let released = residency.resident_bytes();
+        if released == 0 {
+            return None;
+        }
+        unsafe {
+            madvise_free(self.addr, SEGMENT_SIZE);
+        }
+        residency.clear();
+        Some(released)
     }
 
     /// Bytes this segment currently holds through partial block residency.

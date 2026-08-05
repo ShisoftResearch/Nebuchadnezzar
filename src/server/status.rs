@@ -42,6 +42,11 @@ pub struct ServerMemoryStatus {
     pub promotions_declined: u64,
     /// Reads served from a cold backup without promoting the segment.
     pub cold_block_reads: u64,
+    /// Cold segments whose block cache was handed back under memory pressure.
+    /// Cold residency is bounded by this and nothing else.
+    pub cold_blocks_reclaimed: u64,
+    /// Bytes faulted into cold segments, included in the pressure calculation.
+    pub cold_resident_bytes: u64,
     /// Durability write accounting, counted where the writes are issued.
     pub archive_count: u64,
     pub archive_bytes: u64,
@@ -265,6 +270,8 @@ impl NebServer {
             lower_watermark_evictions: tiered_counters.lower_watermark_evictions,
             promotions_declined: tiered_counters.promotions_declined,
             cold_block_reads: tiered_counters.cold_block_reads,
+            cold_blocks_reclaimed: tiered_counters.cold_blocks_reclaimed,
+            cold_resident_bytes: tiered_counters.cold_resident_bytes,
             archive_count: crate::ram::segs::ARCHIVE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
             archive_bytes: crate::ram::segs::ARCHIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
             archive_rewrites: crate::ram::segs::ARCHIVE_REWRITES.load(std::sync::atomic::Ordering::Relaxed),

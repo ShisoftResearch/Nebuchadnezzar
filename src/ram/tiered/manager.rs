@@ -26,13 +26,6 @@ enum Pacing {
     Immediate,
 }
 
-/// Fraction of a segment, as a percentage, that must be resident block-by-block
-/// before serving further reads piecemeal stops being worthwhile.
-///
-/// Expressed against the segment rather than as a read count so it survives a
-/// change of block size unchanged.
-const PROMOTE_RESIDENT_PERCENT: usize = 50;
-
 /// How many global eviction passes may run concurrently. Bounds the stampede
 /// without serialising every reader behind a single lock.
 const EVICTION_SHARDS: usize = 16;
@@ -149,9 +142,10 @@ pub struct TieredMemoryManager {
     /// bytes decompressed to do so. The ratio of those bytes to SEGMENT_SIZE is
     /// what tells us when promoting would have been the cheaper choice.
     cold_block_reads: AtomicU64,
+    /// Cold segments whose faulted-in blocks were handed back under pressure.
+    cold_blocks_reclaimed: AtomicU64,
     /// Promotions triggered because a segment had been faulted in piecemeal
     /// past the residency threshold.
-    cold_promotions_by_residency: AtomicU64,
     /// Bytes held by blocks faulted into cold segments to serve reads without
     /// promoting them.
     ///
@@ -189,7 +183,7 @@ impl TieredMemoryManager {
             churn_count: AtomicU64::new(0),
             lower_watermark_evictions: AtomicU64::new(0),
             cold_block_reads: AtomicU64::new(0),
-            cold_promotions_by_residency: AtomicU64::new(0),
+            cold_blocks_reclaimed: AtomicU64::new(0),
             cold_resident_bytes: AtomicUsize::new(0),
             promotions_declined: AtomicU64::new(0),
         }
@@ -580,6 +574,22 @@ impl TieredMemoryManager {
             return Ok(0);
         }
 
+        // Give back cold residency first. Those blocks count against the same
+        // limit as hot segments, but they are pure cache -- backed by a file
+        // that is already written -- so reclaiming them costs a re-read rather
+        // than an archive write. Evicting a hot segment to make room while a
+        // cold segment sits on faulted-in blocks pays a write to free memory
+        // that was free for the asking.
+        //
+        // This is also the only thing that bounds cold residency. Nothing else
+        // returns it: a cold segment that is never freed holds its blocks
+        // forever, and an import drove resident set to 91GB against a 40GB
+        // limit before this existed.
+        let reclaimed = self.reclaim_cold_residency(&chunks, target.saturating_mul(SEGMENT_SIZE));
+        if reclaimed >= target.saturating_mul(SEGMENT_SIZE) {
+            return Ok(0);
+        }
+
         let mut evicted_count = 0;
         let mut attempts_without_progress = 0;
         const MAX_ATTEMPTS_WITHOUT_PROGRESS: usize = 3;
@@ -664,6 +674,37 @@ impl TieredMemoryManager {
         }
 
         Ok(evicted_count)
+    }
+
+    /// Reclaim faulted-in blocks from cold segments until `wanted` bytes have
+    /// been given back, returning how many bytes that was.
+    ///
+    /// Sweeps from a rotating cursor so concurrent callers start at different
+    /// points instead of contending on the same segments, and abandons any
+    /// segment that is referenced rather than waiting for it -- waiting is what
+    /// deadlocked promotion, and a sweep always has somewhere else to go.
+    fn reclaim_cold_residency(&self, chunks: &[&Chunk], wanted: usize) -> usize {
+        if wanted == 0 || self.cold_resident_bytes.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+
+        let mut freed = 0usize;
+        let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed);
+
+        for i in 0..chunks.len() {
+            let chunk = chunks[(start + i) % chunks.len()];
+            for segment in chunk.segments() {
+                if let Some(bytes) = segment.try_reclaim_resident_blocks() {
+                    self.release_cold_resident(bytes);
+                    self.cold_blocks_reclaimed.fetch_add(1, Ordering::Relaxed);
+                    freed = freed.saturating_add(bytes);
+                    if freed >= wanted {
+                        return freed;
+                    }
+                }
+            }
+        }
+        freed
     }
 
     /// Check if allocating a new segment would exceed the threshold and evict globally if needed.
@@ -955,6 +996,8 @@ impl TieredMemoryManager {
             lower_watermark_evictions: self.lower_watermark_evictions.load(Ordering::Relaxed),
             promotions_declined: self.promotions_declined.load(Ordering::Relaxed),
             cold_block_reads: self.cold_block_reads.load(Ordering::Relaxed),
+            cold_blocks_reclaimed: self.cold_blocks_reclaimed.load(Ordering::Relaxed),
+            cold_resident_bytes: self.cold_resident_bytes.load(Ordering::Relaxed) as u64,
         }
     }
 
@@ -984,57 +1027,18 @@ impl TieredMemoryManager {
     pub fn cold_resident_total(&self) -> usize {
         self.cold_resident_bytes.load(Ordering::Relaxed)
     }
-
-    /// Record a read served from a cold segment's backup rather than by
-    /// promoting it.
+    /// Record a cold read served from a single block.
     ///
-    /// Both operations decompress; they differ only in volume, so promotion
-    /// pays for itself once a segment's cold reads have decompressed about a
-    /// segment's worth. Counting distinct blocks rather than reads is the
-    /// refinement that keeps repeat hits on one block from arguing for it.
-    pub fn note_cold_block_read(&self, chunk: &Chunk, segment: &Segment) {
+    /// This only counts. An earlier version promoted a segment to hot once half
+    /// its blocks were resident, on the theory that piecemeal faulting stops
+    /// paying once most of the segment is committed. That deadlocked: a block
+    /// read hands the caller a live reference to a still-cold segment, and
+    /// `promote_segment` spins until every reference drains, so a caller that
+    /// held one and then read another cell of the same segment waited on
+    /// itself. Promotion is an optimisation and the block path always works, so
+    /// the policy was removed rather than made conditional.
+    pub fn note_cold_block_read(&self) {
         self.cold_block_reads.fetch_add(1, Ordering::Relaxed);
-
-        // Decide whether this segment has earned a full promotion.
-        //
-        // Both paths decompress; they differ only in volume. Once a segment has
-        // been faulted in block by block past PROMOTE_RESIDENT_FRACTION of its
-        // size, most of its memory is already committed and the remaining
-        // blocks are cheaper to fetch in one sequential pass than as further
-        // random reads. Promoting also hands the segment back to ordinary
-        // accounting and eviction, instead of leaving memory pinned in a
-        // segment the CLOCK policy considers cold.
-        //
-        // The threshold is a fraction of the segment rather than a read count,
-        // so it does not need retuning when the block size changes, and repeat
-        // reads of one block do not argue for promotion -- only distinct blocks
-        // move it, since residency counts each block once.
-        let (present, total) = segment.block_residency_stats();
-        if total == 0 {
-            return;
-        }
-        if (present * 100) < (total * PROMOTE_RESIDENT_PERCENT) {
-            return;
-        }
-
-        // Request promotion; do not perform it here.
-        //
-        // The caller holds the cell lock and a reference it just took on this
-        // segment, and `promote_segment` waits for references to drain -- so
-        // promoting inline waits on the caller's own reference and never
-        // returns. The read path's existing promotion branch releases the guard
-        // first, which is why it is safe there and not here; the next read of
-        // this segment takes it.
-        if !segment.wants_full_promotion() {
-            segment.request_full_promotion();
-            self.cold_promotions_by_residency
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(
-                "Segment {} has {}/{} blocks resident; requesting full promotion",
-                segment.id, present, total
-            );
-        }
-        let _ = chunk;
     }
 
     /// Access the shared server-wide memory pool.
@@ -1062,6 +1066,11 @@ pub struct TieredGlobalCounters {
     pub lower_watermark_evictions: u64,
     pub promotions_declined: u64,
     pub cold_block_reads: u64,
+    /// Cold segments whose block cache was reclaimed under pressure.
+    pub cold_blocks_reclaimed: u64,
+    /// Bytes currently faulted into cold segments, which count against the hot
+    /// limit just as hot segments do.
+    pub cold_resident_bytes: u64,
 }
 
 /// Statistics about tiered memory usage

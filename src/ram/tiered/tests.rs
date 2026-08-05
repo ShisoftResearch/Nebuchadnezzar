@@ -3762,3 +3762,224 @@ fn cells_survive_archive_evict_and_cold_read_intact() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Reading a cold segment while already holding a guard on it must complete.
+///
+/// This is the shape that livelocked a 1.7TB-class import. A block read hands
+/// the caller a live reference to a segment that is still cold. The read path
+/// used to give up on the block path once half the segment was resident and
+/// demand a full promotion instead -- and `promote_segment` spins until every
+/// reference drains, so a caller holding one waited on itself. 33 threads sat
+/// in sched_yield for 50 minutes.
+///
+/// Runs on its own thread with a deadline: a regression here hangs rather than
+/// failing, and a hung test is indistinguishable from a slow one.
+#[test]
+fn reading_a_cold_segment_while_holding_a_guard_on_it_completes() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+            crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+                threshold: 0.8,
+                lower_watermark: 0.72,
+                physical_memory_limit: 64 * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            }),
+        ));
+
+        let schema = Schema::new("cold_reentrant", None, default_fields(), false, false);
+        let schema_dir = temp_path("neb_reentrant_schema");
+        let backup_dir = temp_path("neb_reentrant_bk");
+        let wal_dir = temp_path("neb_reentrant_wal");
+        for d in [&schema_dir, &backup_dir, &wal_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+
+        let schemas = LocalSchemasCache::new_local(&schema_dir);
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            16 * SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.clone()),
+            Some(wal_dir.clone()),
+            Some(manager.clone()),
+        );
+
+        // Many small cells so one segment holds a lot of them: the caller must
+        // read enough distinct blocks of the segment it is holding to push
+        // residency past the point the old policy promoted at.
+        let mut ids: Vec<Id> = Vec::new();
+        // ~32 MiB of payload: several 8 MiB segments, each holding on the order
+        // of two thousand cells, so one segment's worth of reads touches many
+        // distinct blocks of it.
+        for i in 0..8_000usize {
+            let id = Id::allocated(0, 0, 700_000 + i as u64);
+            let mut data_map = OwnedMap::new();
+            data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+            data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+            data_map.insert(
+                &String::from("data"),
+                OwnedValue::String("x".repeat(4_000)),
+            );
+            let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+            if chunks.write_cell(&mut cell).is_ok() {
+                ids.push(id);
+            }
+        }
+        assert!(ids.len() > 500, "setup wrote too few cells");
+
+        for chunk in &chunks.list {
+            let _ = manager.explicit_evict(chunk, 32);
+        }
+        let cold = chunks
+            .list
+            .iter()
+            .flat_map(|c| c.segments().into_iter())
+            .filter(|s| s.is_cold())
+            .count();
+        assert!(cold > 0, "test needs cold segments to exercise the block path");
+
+        // Hold a guard obtained through the block path, then keep reading the
+        // same segment through it.
+        let held = chunks
+            .lock_cell_for_read(&ids[0])
+            .expect("first cell must be readable while cold");
+
+        for id in ids.iter().skip(1) {
+            let _ = chunks.read_cell(id);
+        }
+        drop(held);
+
+        for d in [&schema_dir, &backup_dir, &wal_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        let _ = tx.send(());
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(()) => {
+            worker.join().expect("worker panicked after signalling");
+        }
+        // The sender is dropped on panic too, so a disconnect means the body
+        // failed for some other reason -- surface that rather than reporting it
+        // as a deadlock.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            match worker.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => panic!("worker exited without signalling"),
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "reads of a cold segment did not finish while a guard was held on it: the read path \
+             is waiting for a reference the caller itself holds"
+        ),
+    }
+}
+
+/// Cold residency must be reclaimable, or it grows without bound.
+///
+/// Faulted-in blocks count against the same limit as hot segments but were
+/// only ever released when the segment was freed. A cold segment that is never
+/// freed therefore held its blocks forever: an import reached 91GB resident
+/// against a 40GB limit, and eviction spun because the excess lived in cold
+/// segments that evicting hot ones could not free.
+#[test]
+fn cold_block_residency_is_reclaimed_under_pressure() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("cold_reclaim", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_reclaim_schema");
+    let backup_dir = temp_path("neb_reclaim_bk");
+    let wal_dir = temp_path("neb_reclaim_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        16 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    let mut ids: Vec<Id> = Vec::new();
+    for i in 0..8_000usize {
+        let id = Id::allocated(0, 0, 600_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String("y".repeat(4_000)));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            ids.push(id);
+        }
+    }
+    assert!(ids.len() > 500, "setup wrote too few cells");
+
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 32);
+    }
+
+    // Fault blocks in by reading cold cells.
+    for id in ids.iter() {
+        let _ = chunks.read_cell(id);
+    }
+    let resident = manager.cold_resident_total();
+    assert!(
+        resident > 0,
+        "reads of cold segments should have faulted blocks in"
+    );
+
+    // Reclaim, holding no guards.
+    let mut reclaimed_total = 0usize;
+    for chunk in &chunks.list {
+        for segment in chunk.segments() {
+            if let Some(bytes) = segment.try_reclaim_resident_blocks() {
+                manager.release_cold_resident(bytes);
+                reclaimed_total += bytes;
+            }
+        }
+    }
+    assert!(
+        reclaimed_total > 0,
+        "no cold residency was reclaimable ({} bytes resident)",
+        resident
+    );
+    assert_eq!(
+        manager.cold_resident_total(),
+        resident - reclaimed_total,
+        "accounting must drop by exactly what was reclaimed"
+    );
+
+    // The data must still be readable: reclaiming drops cache, not content.
+    for id in ids.iter().take(200) {
+        let cell = chunks
+            .read_cell(id)
+            .unwrap_or_else(|e| panic!("cell {:?} unreadable after reclaim: {:?}", id, e));
+        assert_eq!(cell.data["data"].string().map(|s| s.len()), Some(4_000));
+    }
+
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
