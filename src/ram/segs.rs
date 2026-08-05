@@ -128,6 +128,28 @@ pub const WAL_BUFFER_SIZE: usize = 512 * 1024; // 512KB in-memory buffer (reduce
 pub const WAL_SYNC_BATCH_SIZE: usize = 1 * 1024 * 1024; // Sync after 1MB of writes (reduces fsyncs)
 pub const WAL_SYNC_INTERVAL_MS: i64 = 10; // Sync every 10ms (10x less frequent than before)
 
+/// The group-commit time bound, overridable via `NEB_WAL_SYNC_INTERVAL_MS`.
+///
+/// Group commit batches **per segment**, so the byte threshold is only reached
+/// when one segment absorbs a whole batch on its own. Spread across the ~63
+/// segments an import writes concurrently, no segment gets there and every one
+/// falls back to this timer: measured 6,302 fsyncs/s at 92 KB each against a
+/// 1 MiB threshold, which is 63 segments x one sync per 10 ms. Threads block on
+/// those syncs, which is why the server sat at 30% CPU on 192 cores with the
+/// device answering in 0.49 ms.
+///
+/// Raising this trades a wider crash-loss window for fewer, larger syncs.
+pub fn wal_sync_interval_ms() -> i64 {
+    static V: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("NEB_WAL_SYNC_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(WAL_SYNC_INTERVAL_MS)
+    })
+}
+
 #[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment
 pub struct Segment {
     pub id: u64,
@@ -1183,7 +1205,7 @@ impl Segment {
             // 1. Enough bytes have accumulated (batch size threshold)
             // 2. Enough time has passed (time threshold)
             let should_sync =
-                bytes_written >= WAL_SYNC_BATCH_SIZE || time_since_sync >= WAL_SYNC_INTERVAL_MS;
+                bytes_written >= WAL_SYNC_BATCH_SIZE || time_since_sync >= wal_sync_interval_ms();
 
             if should_sync {
                 // Sync data to disk
