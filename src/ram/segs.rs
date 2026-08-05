@@ -40,6 +40,10 @@ pub static ARCHIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static ARCHIVE_REWRITES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
+/// Entries written to the WAL. Against the number of live cells this gives the
+/// rewrite factor: how many times the average cell's bytes are journalled,
+/// which is write amplification the tier has no part in.
+pub static WAL_WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// Cold-read amplification accounting.
 ///
@@ -1131,6 +1135,7 @@ impl Segment {
                 file.write_all(data_block)?; // Use write_all to ensure all bytes are written
             }
             WAL_BYTES.fetch_add(size as u64, Relaxed);
+            WAL_WRITES.fetch_add(1, Relaxed);
             // Transactions control their own sync at commit time
             // For non-transactional writes, use group commit batching
             if skip_sync {

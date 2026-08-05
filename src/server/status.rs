@@ -63,6 +63,8 @@ pub struct ServerMemoryStatus {
     pub archive_rewrites: u64,
     pub wal_bytes: u64,
     pub wal_syncs: u64,
+    /// Entries journalled. Divided by live cells this is the rewrite factor.
+    pub wal_writes: u64,
 }
 
 impl ServerMemoryStatus {
@@ -291,6 +293,7 @@ impl NebServer {
             archive_rewrites: crate::ram::segs::ARCHIVE_REWRITES.load(std::sync::atomic::Ordering::Relaxed),
             wal_bytes: crate::ram::segs::WAL_BYTES.load(std::sync::atomic::Ordering::Relaxed),
             wal_syncs: crate::ram::segs::WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
+            wal_writes: crate::ram::segs::WAL_WRITES.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
