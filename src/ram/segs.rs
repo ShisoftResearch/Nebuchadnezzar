@@ -178,7 +178,12 @@ pub struct Segment {
     /// knowledge of any of this -- the segment's own address space is the cache,
     /// which is what makes the block, rather than the whole 8 MiB segment, the
     /// unit of residency.
-    block_residency: parking_lot::Mutex<BlockResidency>,
+    /// Residency is read on every cold read and written only on a miss, so it
+    /// is an RwLock rather than a Mutex. Under an exclusive lock, threads
+    /// sharing a segment serialised on the hit path -- a bit test behind a
+    /// mutex -- and aggregate throughput peaked at 8 threads and then fell,
+    /// 5.7x down to 3.8x by 32 threads on a 32-core machine.
+    block_residency: parking_lot::RwLock<BlockResidency>,
 }
 
 /// Per-segment state for serving reads from a cold segment without promoting it.
@@ -339,7 +344,7 @@ impl Segment {
             is_dirty: AtomicBool::new(true), // Start dirty
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
-            block_residency: parking_lot::Mutex::new(BlockResidency::default()),
+            block_residency: parking_lot::RwLock::new(BlockResidency::default()),
         }
     }
 
@@ -446,7 +451,7 @@ impl Segment {
         }
         // Everything faulted in through the partial path is gone with it, so
         // the accounting must drop too or the limit would drift upward forever.
-        let mut residency = self.block_residency.lock();
+        let mut residency = self.block_residency.write();
         residency.clear();
         drop(residency);
     }
@@ -454,7 +459,7 @@ impl Segment {
     /// Clear partial residency and report the bytes released, so the caller --
     /// which holds the tiered manager -- can drop them from the accounting.
     pub fn take_block_resident_bytes(&self) -> usize {
-        let mut residency = self.block_residency.lock();
+        let mut residency = self.block_residency.write();
         let released = residency.resident_bytes();
         residency.clear();
         released
@@ -484,7 +489,7 @@ impl Segment {
         }
         let _exclusive = SegmentExclusiveRefGuard::new(self)?;
 
-        let mut residency = self.block_residency.lock();
+        let mut residency = self.block_residency.write();
         let released = residency.resident_bytes();
         if released == 0 {
             return None;
@@ -498,12 +503,12 @@ impl Segment {
 
     /// Bytes this segment currently holds through partial block residency.
     pub fn block_resident_bytes(&self) -> usize {
-        self.block_residency.lock().resident_bytes()
+        self.block_residency.read().resident_bytes()
     }
 
     /// Blocks currently faulted in, and the total the backup holds.
     pub fn block_residency_stats(&self) -> (usize, usize) {
-        let r = self.block_residency.lock();
+        let r = self.block_residency.read();
         let total = r
             .index
             .as_deref()
@@ -541,8 +546,26 @@ impl Segment {
         // manager made reclaim return more than was ever added.
         let mut newly_accounted = 0usize;
 
+        // Fast path first, under a shared lock: an already-resident block needs
+        // nothing but a lookup and a bit test, and that is the common case once
+        // a segment is warm. Taking the exclusive lock for it made readers of
+        // one segment serialise on each other.
+        {
+            let residency = self.block_residency.read();
+            if let Some(index) = residency.index.as_ref() {
+                if let Some(layout) = crate::ram::compression::block_layout(index) {
+                    let (block_idx, _within) = layout.locate(index, offset)?;
+                    if residency.is_present(block_idx) {
+                        COLD_BLOCK_HITS.fetch_add(1, Ordering::Relaxed);
+                        COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
+                        return Ok(Some(0));
+                    }
+                }
+            }
+        }
+
         let (block_idx, block_start, file_off, comp_len) = {
-            let mut residency = self.block_residency.lock();
+            let mut residency = self.block_residency.write();
 
             if residency.index.is_none() {
                 match self.load_block_index()? {
@@ -611,7 +634,7 @@ impl Segment {
             ));
         }
 
-        let mut residency = self.block_residency.lock();
+        let mut residency = self.block_residency.write();
         // Another thread may have landed this block while the lock was open.
         if residency.is_present(block_idx) {
             COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
@@ -640,7 +663,7 @@ impl Segment {
     /// Reads go through `read_at`, which takes its own offset and so does not
     /// disturb a file position, making one handle safe to share across threads.
     fn backup_file(&self) -> io::Result<Arc<File>> {
-        if let Some(f) = self.block_residency.lock().backup.as_ref() {
+        if let Some(f) = self.block_residency.read().backup.as_ref() {
             return Ok(f.clone());
         }
         let path = {
@@ -655,7 +678,7 @@ impl Segment {
         let file = Arc::new(File::open(&path)?);
         COLD_BLOCK_OPENS.fetch_add(1, Ordering::Relaxed);
 
-        let mut residency = self.block_residency.lock();
+        let mut residency = self.block_residency.write();
         // Another thread may have cached one while this opened; keep theirs so
         // a single handle is shared rather than one per racing reader.
         match residency.backup.as_ref() {

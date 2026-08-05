@@ -4249,3 +4249,155 @@ fn cold_read_amplification() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Concurrent cold-read scaling.
+///
+/// The residency lock is deliberately not held across the block fetch, so
+/// readers of one segment do not serialise behind a disk read and a decompress.
+/// That is a claim about contention, which a single-threaded benchmark cannot
+/// evaluate at all -- it shows up only as scaling against thread count. Ignored
+/// by default. Run with:
+///   cargo test --lib cold_read_concurrency -- --ignored --nocapture
+#[test]
+#[ignore]
+fn cold_read_concurrency() {
+    use std::sync::atomic::Ordering as O;
+
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("cold_conc", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_conc_schema");
+    let backup_dir = temp_path("neb_conc_bk");
+    let wal_dir = temp_path("neb_conc_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        16 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    const CELL_PAYLOAD: usize = 1_000;
+    let mut ids: Vec<Id> = Vec::new();
+    for i in 0..40_000usize {
+        let id = Id::allocated(0, 0, 400_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        let mut body = String::with_capacity(CELL_PAYLOAD);
+        let mut w = i as u64;
+        while body.len() < CELL_PAYLOAD {
+            w = w.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            body.push_str(&format!("{:016x}-{}-", w, i));
+        }
+        body.truncate(CELL_PAYLOAD);
+        data_map.insert(&String::from("data"), OwnedValue::String(body));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            ids.push(id);
+        }
+    }
+    assert!(ids.len() > 10_000, "setup wrote too few cells");
+
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 64);
+    }
+
+    let reclaim_all = || {
+        for chunk in &chunks.list {
+            for segment in chunk.segments() {
+                if let Some(b) = segment.try_reclaim_resident_blocks() {
+                    manager.release_cold_resident(b);
+                }
+            }
+        }
+    };
+
+    // Two access patterns, because they exercise different contention.
+    //
+    //   disjoint -- each thread owns a contiguous range, so threads mostly touch
+    //               different segments and rarely meet on one residency lock.
+    //   shared   -- every thread sweeps the SAME narrow range, so they collide
+    //               on the same segments constantly. This is the pattern that
+    //               reveals whether a fetch serialises its segment's readers,
+    //               and the disjoint pattern cannot see it at all.
+    for shared in [false, true] {
+        println!(
+            "\n=== concurrent cold reads, {} segments (reclaimed each round) ===",
+            if shared { "SHARED" } else { "disjoint" }
+        );
+        println!("{:>8}  {:>12}  {:>12}  {:>9}", "threads", "reads/s", "vs 1 thread", "misses");
+
+    let mut single = 0f64;
+    for threads in [1usize, 2, 4, 8, 16, 32] {
+        reclaim_all();
+        let before_miss = crate::ram::segs::COLD_BLOCK_MISSES.load(O::Relaxed);
+        let per = ids.len() / threads;
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let chunks = &chunks;
+                let ids = &ids;
+                s.spawn(move || {
+                    if shared {
+                        // Same narrow range for every thread, offset so they
+                        // interleave rather than march in lockstep.
+                        let window = (ids.len() / 16).max(1);
+                        let off = t * 37;
+                        for j in 0..window {
+                            let _ = chunks.read_cell(&ids[(off + j) % window]);
+                        }
+                    } else {
+                        let lo = t * per;
+                        let hi = if t == threads - 1 { ids.len() } else { lo + per };
+                        for id in &ids[lo..hi] {
+                            let _ = chunks.read_cell(id);
+                        }
+                    }
+                });
+            }
+        });
+        let elapsed = start.elapsed();
+        let misses = crate::ram::segs::COLD_BLOCK_MISSES.load(O::Relaxed) - before_miss;
+        let done = if shared {
+            (ids.len() / 16).max(1) * threads
+        } else {
+            ids.len()
+        };
+        let rate = done as f64 / elapsed.as_secs_f64().max(1e-9);
+        if threads == 1 {
+            single = rate;
+        }
+        println!(
+            "{:>8}  {:>12.0}  {:>11.2}x  {:>9}",
+            threads,
+            rate,
+            rate / single.max(1e-9),
+            misses
+        );
+    }
+    }
+    println!();
+
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
