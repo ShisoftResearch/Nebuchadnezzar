@@ -1088,6 +1088,9 @@ impl Chunk {
         // Now safe to remove and dispose
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
             // Free the segment memory
+            if let Some(ref tiered) = self.tiered_manager {
+                tiered.release_cold_resident(seg.take_block_resident_bytes());
+            }
             seg.free_memory();
             // Free the segment files
             seg.dispense();
@@ -1988,14 +1991,23 @@ impl<'a> CellGuard<'a> {
                         // Falls through to promotion when the backup predates the
                         // block-indexed format, or when the block read fails --
                         // promotion is slower but always works.
-                        match seg.fault_in_block_for(*guard) {
-                            Ok(true) => {
+                        // Once residency crosses the threshold the policy asks
+                        // for a full promotion; take the branch below, which
+                        // releases the guard before promoting.
+                        let serve_from_block = !seg.wants_full_promotion();
+                        match if serve_from_block {
+                            seg.fault_in_block_for(*guard)
+                        } else {
+                            Ok(None)
+                        } {
+                            Ok(Some(newly_resident)) => {
                                 if !seg.incr_references() {
                                     return None;
                                 }
                                 seg.mark_referenced();
                                 if let Some(ref tiered) = chunk.tiered_manager {
-                                    tiered.note_cold_block_read(seg);
+                                    tiered.add_cold_resident(newly_resident);
+                                    tiered.note_cold_block_read(chunk, seg);
                                 }
                                 return Some(CellGuard {
                                     hash,
@@ -2005,7 +2017,7 @@ impl<'a> CellGuard<'a> {
                                     version,
                                 });
                             }
-                            Ok(false) => {}
+                            Ok(None) => {}
                             Err(e) => debug!(
                                 "Partial read of segment {} in chunk {} failed, promoting: {}",
                                 seg.id, chunk.id, e

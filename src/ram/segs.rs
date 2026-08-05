@@ -150,6 +150,11 @@ pub struct Segment {
     /// which is what makes the block, rather than the whole 8 MiB segment, the
     /// unit of residency.
     block_residency: parking_lot::Mutex<BlockResidency>,
+    /// Set once partial residency has grown far enough that a full promotion is
+    /// worth it. Acted on by the read path's promotion branch, which releases
+    /// the cell lock first -- promoting inline self-deadlocks, because the
+    /// caller holds a reference that `promote_segment` waits to drain.
+    wants_full_promotion: AtomicBool,
 }
 
 /// Per-segment state for serving reads from a cold segment without promoting it.
@@ -296,6 +301,7 @@ impl Segment {
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
             block_residency: parking_lot::Mutex::new(BlockResidency::default()),
+            wants_full_promotion: AtomicBool::new(false),
         }
     }
 
@@ -390,12 +396,50 @@ impl Segment {
         }
     }
 
+    /// Drop this segment's pages.
+    ///
+    /// Callers holding a tiered manager must release the accounting first, via
+    /// `take_block_resident_bytes`, because this clears the residency: taking
+    /// afterwards reports nothing and the manager's counter would never come
+    /// back down.
     pub fn free_memory(&self) {
         unsafe {
             madvise_free(self.addr, SEGMENT_SIZE);
         }
-        // Everything faulted in through the partial path is gone with it.
-        self.block_residency.lock().clear();
+        // Everything faulted in through the partial path is gone with it, so
+        // the accounting must drop too or the limit would drift upward forever.
+        let mut residency = self.block_residency.lock();
+        residency.clear();
+        drop(residency);
+        self.clear_full_promotion_request();
+    }
+
+    /// Clear partial residency and report the bytes released, so the caller --
+    /// which holds the tiered manager -- can drop them from the accounting.
+    pub fn take_block_resident_bytes(&self) -> usize {
+        let mut residency = self.block_residency.lock();
+        let released = residency.resident_bytes();
+        residency.clear();
+        released
+    }
+
+    /// Whether partial residency has grown far enough to justify promoting.
+    #[inline]
+    pub fn wants_full_promotion(&self) -> bool {
+        self.wants_full_promotion.load(Ordering::Relaxed)
+    }
+
+    /// Request a full promotion at the next opportunity that can take one
+    /// safely -- meaning one that is not holding a reference on this segment.
+    #[inline]
+    pub fn request_full_promotion(&self) {
+        self.wants_full_promotion.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear the request, once promoted or freed.
+    #[inline]
+    pub fn clear_full_promotion_request(&self) {
+        self.wants_full_promotion.store(false, Ordering::Relaxed);
     }
 
     /// Bytes this segment currently holds through partial block residency.
@@ -424,7 +468,7 @@ impl Segment {
     /// Returns `Ok(false)` when the backup predates the block-indexed format,
     /// in which case there is no way to read part of it and the caller must
     /// fall back to promoting the segment whole.
-    pub fn fault_in_block_for(&self, addr: usize) -> io::Result<bool> {
+    pub fn fault_in_block_for(&self, addr: usize) -> io::Result<Option<usize>> {
         if addr < self.addr || addr >= self.addr + SEGMENT_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -439,17 +483,17 @@ impl Segment {
             match self.load_block_index()? {
                 Some(index) => residency.index = Some(index),
                 // Legacy whole-blob backup: partial reads are impossible.
-                None => return Ok(false),
+                None => return Ok(None),
             }
         }
         let index = residency.index.as_ref().unwrap().clone();
         let Some(layout) = crate::ram::compression::block_layout(&index) else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let (block_idx, _within) = layout.locate(&index, offset)?;
         if residency.is_present(block_idx) {
-            return Ok(true);
+            return Ok(Some(0));
         }
 
         let (block_start, file_off, comp_len) = layout.entry(&index, block_idx)?;
@@ -495,8 +539,11 @@ impl Segment {
                 plain.len(),
             );
         }
+        let before = residency.resident_bytes();
         residency.mark_present(block_idx, plain.len());
-        Ok(true)
+        // Caller does the accounting: it holds the tiered manager, and a
+        // segment has no route to one.
+        Ok(Some(residency.resident_bytes() - before))
     }
 
     /// Read the header and block index from this segment's backup file.

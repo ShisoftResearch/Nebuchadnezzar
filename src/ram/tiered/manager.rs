@@ -26,6 +26,13 @@ enum Pacing {
     Immediate,
 }
 
+/// Fraction of a segment, as a percentage, that must be resident block-by-block
+/// before serving further reads piecemeal stops being worthwhile.
+///
+/// Expressed against the segment rather than as a read count so it survives a
+/// change of block size unchanged.
+const PROMOTE_RESIDENT_PERCENT: usize = 50;
+
 /// How many global eviction passes may run concurrently. Bounds the stampede
 /// without serialising every reader behind a single lock.
 const EVICTION_SHARDS: usize = 16;
@@ -142,6 +149,18 @@ pub struct TieredMemoryManager {
     /// bytes decompressed to do so. The ratio of those bytes to SEGMENT_SIZE is
     /// what tells us when promoting would have been the cheaper choice.
     cold_block_reads: AtomicU64,
+    /// Promotions triggered because a segment had been faulted in piecemeal
+    /// past the residency threshold.
+    cold_promotions_by_residency: AtomicU64,
+    /// Bytes held by blocks faulted into cold segments to serve reads without
+    /// promoting them.
+    ///
+    /// A cold segment adds nothing to the hot-segment counter, yet a partially
+    /// resident one holds real memory, so this has to enter the pressure
+    /// calculation or the limit would bound whole segments while partial
+    /// residency grew underneath it. Owned by the manager rather than a global,
+    /// so one server's residency cannot inflate another's threshold.
+    cold_resident_bytes: AtomicUsize,
     /// Promotions refused because the hot tier was already at the hard limit.
     /// A rising count means reads are being served from cold to hold the limit,
     /// which is the intended trade rather than a fault.
@@ -170,6 +189,8 @@ impl TieredMemoryManager {
             churn_count: AtomicU64::new(0),
             lower_watermark_evictions: AtomicU64::new(0),
             cold_block_reads: AtomicU64::new(0),
+            cold_promotions_by_residency: AtomicU64::new(0),
+            cold_resident_bytes: AtomicUsize::new(0),
             promotions_declined: AtomicU64::new(0),
         }
     }
@@ -184,10 +205,16 @@ impl TieredMemoryManager {
         self.shared_pool.lower_watermark_limit()
     }
 
+    /// Memory attributable to `hot_segments_count` whole hot segments plus the
+    /// blocks faulted into cold segments.
+    ///
+    /// Both are resident, so both must count against the limit. Counting only
+    /// whole segments would let partial residency grow underneath the budget.
     #[inline]
     fn hot_memory_bytes(&self, hot_segments_count: usize) -> usize {
         hot_segments_count
             .checked_mul(SEGMENT_SIZE)
+            .map(|b| b.saturating_add(self.cold_resident_bytes.load(Ordering::Relaxed)))
             .unwrap_or_else(|| self.shared_pool.physical_memory_limit * 2)
     }
 
@@ -931,6 +958,33 @@ impl TieredMemoryManager {
         }
     }
 
+    /// Record blocks faulted into a cold segment.
+    #[inline]
+    pub fn add_cold_resident(&self, bytes: usize) {
+        if bytes > 0 {
+            self.cold_resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Release cold residency, saturating at zero.
+    #[inline]
+    pub fn release_cold_resident(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self.cold_resident_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| Some(v.saturating_sub(bytes)),
+        );
+    }
+
+    /// Bytes currently held by partially-resident cold segments.
+    #[inline]
+    pub fn cold_resident_total(&self) -> usize {
+        self.cold_resident_bytes.load(Ordering::Relaxed)
+    }
+
     /// Record a read served from a cold segment's backup rather than by
     /// promoting it.
     ///
@@ -938,9 +992,49 @@ impl TieredMemoryManager {
     /// pays for itself once a segment's cold reads have decompressed about a
     /// segment's worth. Counting distinct blocks rather than reads is the
     /// refinement that keeps repeat hits on one block from arguing for it.
-    pub fn note_cold_block_read(&self, segment: &Segment) {
+    pub fn note_cold_block_read(&self, chunk: &Chunk, segment: &Segment) {
         self.cold_block_reads.fetch_add(1, Ordering::Relaxed);
-        let _ = segment;
+
+        // Decide whether this segment has earned a full promotion.
+        //
+        // Both paths decompress; they differ only in volume. Once a segment has
+        // been faulted in block by block past PROMOTE_RESIDENT_FRACTION of its
+        // size, most of its memory is already committed and the remaining
+        // blocks are cheaper to fetch in one sequential pass than as further
+        // random reads. Promoting also hands the segment back to ordinary
+        // accounting and eviction, instead of leaving memory pinned in a
+        // segment the CLOCK policy considers cold.
+        //
+        // The threshold is a fraction of the segment rather than a read count,
+        // so it does not need retuning when the block size changes, and repeat
+        // reads of one block do not argue for promotion -- only distinct blocks
+        // move it, since residency counts each block once.
+        let (present, total) = segment.block_residency_stats();
+        if total == 0 {
+            return;
+        }
+        if (present * 100) < (total * PROMOTE_RESIDENT_PERCENT) {
+            return;
+        }
+
+        // Request promotion; do not perform it here.
+        //
+        // The caller holds the cell lock and a reference it just took on this
+        // segment, and `promote_segment` waits for references to drain -- so
+        // promoting inline waits on the caller's own reference and never
+        // returns. The read path's existing promotion branch releases the guard
+        // first, which is why it is safe there and not here; the next read of
+        // this segment takes it.
+        if !segment.wants_full_promotion() {
+            segment.request_full_promotion();
+            self.cold_promotions_by_residency
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "Segment {} has {}/{} blocks resident; requesting full promotion",
+                segment.id, present, total
+            );
+        }
+        let _ = chunk;
     }
 
     /// Access the shared server-wide memory pool.

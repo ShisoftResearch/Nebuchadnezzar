@@ -3569,3 +3569,196 @@ fn cold_cell_reads_are_served_from_one_block_without_promotion() {
     let _ = std::fs::remove_dir_all(&backup_dir);
     let _ = std::fs::remove_dir_all(&wal_dir);
 }
+
+/// Memory faulted into cold segments must count against the configured limit.
+///
+/// A cold segment contributes nothing to the hot-segment counter, but a
+/// partially resident one holds real memory. Unaccounted, the limit would bound
+/// whole segments while partial residency grew underneath it -- the same shape
+/// of unbounded growth that OOM-killed this server when promotion ignored the
+/// limit.
+#[test]
+fn blocks_faulted_into_cold_segments_are_accounted_and_released() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("cold_accounting", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_cold_acct_schema");
+    let backup_dir = temp_path("neb_cold_acct_bk");
+    let wal_dir = temp_path("neb_cold_acct_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        8 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    let payload = "y".repeat(2048);
+    let cells_per_segment = SEGMENT_SIZE / 2048;
+    write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment * 2, &payload);
+
+    let chunk = &chunks.list[0];
+    assert!(manager.explicit_evict(chunk, 4).expect("evict") > 0);
+
+    // Read a handful of cells to fault blocks into cold segments.
+    for i in 0..32 {
+        let _ = chunks.read_cell(&Id::allocated(0, 0, i as u64));
+    }
+
+    let before = 0usize;
+    let during = manager.cold_resident_total();
+    let partially_resident: usize = chunk
+        .segments()
+        .iter()
+        .map(|s| s.block_resident_bytes())
+        .sum();
+
+    if partially_resident > 0 {
+        assert!(
+            during > before,
+            "cold residency ({partially_resident} B held) is not reflected in the accounting \
+             ({before} -> {during})"
+        );
+    }
+
+    // Releasing must precede freeing: free_memory clears the segment's
+    // residency, so taking the bytes afterwards yields nothing and the counter
+    // would never come down. Production does take -> release -> free at both
+    // sites that free a segment; this mirrors it.
+    for seg in chunk.segments().iter() {
+        manager.release_cold_resident(seg.take_block_resident_bytes());
+        seg.free_memory();
+    }
+    let after = manager.cold_resident_total();
+    assert!(
+        after <= before,
+        "freeing segments did not release cold residency ({before} -> {during} -> {after})"
+    );
+
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// Every cell must survive archive -> evict -> cold read byte for byte, across
+/// a spread of sizes.
+///
+/// The block-indexed backup format changed how segments are written and how
+/// cold reads are served, so this asserts the thing that actually matters: no
+/// cell is lost, truncated, or altered by being served from a block instead of
+/// a promoted segment. Sizes straddle the block target deliberately -- cells
+/// smaller than a block, cells near it, and cells larger than it, which get
+/// blocks of their own.
+#[test]
+fn cells_survive_archive_evict_and_cold_read_intact() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("cold_integrity", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_integrity_schema");
+    let backup_dir = temp_path("neb_integrity_bk");
+    let wal_dir = temp_path("neb_integrity_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        16 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    // Sizes chosen to straddle the 32 KiB block target in both directions.
+    let sizes = [16usize, 200, 3_000, 31_000, 33_000, 70_000];
+    let mut expected: Vec<(Id, String)> = Vec::new();
+
+    for i in 0..900usize {
+        let len = sizes[i % sizes.len()];
+        // Content derived from the index so a mismatch identifies the cell.
+        let body: String = format!("cell-{}-", i)
+            .chars()
+            .cycle()
+            .take(len)
+            .collect();
+        let id = Id::allocated(0, 0, 900_000 + i as u64);
+
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String(body.clone()));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            expected.push((id, body));
+        }
+    }
+    assert!(expected.len() > 500, "setup wrote too few cells");
+
+    // Push as much as possible cold so reads take the block path.
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 32);
+    }
+    let cold = chunks
+        .list
+        .iter()
+        .flat_map(|c| c.segments().into_iter())
+        .filter(|s| s.is_cold())
+        .count();
+    assert!(cold > 0, "test needs cold segments to exercise the block path");
+
+    // Every cell must come back exactly as written.
+    let mut checked = 0usize;
+    for (id, body) in &expected {
+        let cell = chunks
+            .read_cell(id)
+            .unwrap_or_else(|e| panic!("cell {:?} unreadable after eviction: {:?}", id, e));
+        let got = cell.data["data"]
+            .string()
+            .unwrap_or_else(|| panic!("cell {:?} lost its data field", id));
+        assert_eq!(
+            got.len(),
+            body.len(),
+            "cell {:?} changed length across the cold path",
+            id
+        );
+        assert_eq!(got, body, "cell {:?} content differs after cold read", id);
+        checked += 1;
+    }
+    assert_eq!(checked, expected.len());
+
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

@@ -18,6 +18,8 @@ use std::sync::Arc;
 /// any cross-stripe contention; on systems with more CPUs a few stripes will
 /// be shared, which is still far better than a single global atomic.
 const STRIPE_COUNT: usize = 64;
+
+
 const STRIPE_MASK: usize = STRIPE_COUNT - 1;
 
 /// A cache-line-padded atomic counter.
@@ -130,6 +132,9 @@ impl SharedMemoryPool {
             .saturating_add(self.correction.load(Ordering::Relaxed))
             .max(0) as usize
     }
+
+
+
 
     #[inline]
     pub fn threshold_limit(&self) -> usize {

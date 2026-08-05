@@ -223,6 +223,9 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         "Marked segment {} as COLD (addr {:#x}), about to free physical pages",
         segment.id, segment.addr
     );
+    if let Some(ref tiered) = chunk.tiered_manager {
+        tiered.release_cold_resident(segment.take_block_resident_bytes());
+    }
     segment.free_memory();
     debug!(
         "Freed physical pages for segment {} (addr {:#x})",
