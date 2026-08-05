@@ -3983,3 +3983,263 @@ fn cold_block_residency_is_reclaimed_under_pressure() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Cold-read amplification harness.
+///
+/// Reports bytes moved per read at each layer -- disk, decompression, and the
+/// index copying the lookup does on its own account -- so a change to this
+/// machinery can be judged on measurement instead of argument. Ignored by
+/// default: it is a measurement, not an assertion. Run with:
+///   cargo test --lib cold_read_amplification -- --ignored --nocapture
+#[test]
+#[ignore]
+fn cold_read_amplification() {
+    use crate::ram::segs::{
+        COLD_BLOCK_FILE_BYTES, COLD_BLOCK_HITS, COLD_BLOCK_MISSES, COLD_BLOCK_OPENS,
+        COLD_BLOCK_PLAIN_BYTES, COLD_BLOCK_SERVES, COLD_INDEX_COPY_BYTES, COLD_INDEX_LOADS,
+    };
+    use std::sync::atomic::Ordering as O;
+
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("cold_amp", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_amp_schema");
+    let backup_dir = temp_path("neb_amp_bk");
+    let wal_dir = temp_path("neb_amp_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        16 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    // Cell payload is the denominator of every ratio below, so it is fixed and
+    // known rather than inferred.
+    const CELL_PAYLOAD: usize = 1_000;
+    const CELLS: usize = 12_000;
+
+    let mut ids: Vec<Id> = Vec::new();
+    for i in 0..CELLS {
+        let id = Id::allocated(0, 0, 500_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        // Realistic payload: structured but varying, so compression has
+        // something to find without the ratio being a fiction. A run of one
+        // repeated byte compresses to nothing and would make every on-disk
+        // number meaningless.
+        let mut body = String::with_capacity(CELL_PAYLOAD);
+        let mut w = i as u64;
+        while body.len() < CELL_PAYLOAD {
+            w = w.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            body.push_str(&format!("{:016x}-{}-", w, i));
+        }
+        body.truncate(CELL_PAYLOAD);
+        data_map.insert(&String::from("data"), OwnedValue::String(body));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            ids.push(id);
+        }
+    }
+    assert!(ids.len() > 1_000, "setup wrote too few cells");
+
+    let arch_before = crate::ram::segs::ARCHIVE_BYTES.load(O::Relaxed);
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 64);
+    }
+    let archived = crate::ram::segs::ARCHIVE_BYTES.load(O::Relaxed) - arch_before;
+    let live_payload = (ids.len() * CELL_PAYLOAD) as f64;
+    println!(
+        "\nblock target {} B | archived {:.2} MiB for {:.2} MiB payload ({:.1}% on disk)",
+        crate::ram::compression::block_size(),
+        archived as f64 / (1 << 20) as f64,
+        live_payload / (1 << 20) as f64,
+        archived as f64 / live_payload * 100.0
+    );
+
+    // Counters are process-global, so the window starts here.
+    let base = |c: &std::sync::atomic::AtomicU64| c.load(O::Relaxed);
+    let (b_serves, b_hits, b_miss, b_file, b_plain, b_opens, b_idx, b_copy) = (
+        base(&COLD_BLOCK_SERVES),
+        base(&COLD_BLOCK_HITS),
+        base(&COLD_BLOCK_MISSES),
+        base(&COLD_BLOCK_FILE_BYTES),
+        base(&COLD_BLOCK_PLAIN_BYTES),
+        base(&COLD_BLOCK_OPENS),
+        base(&COLD_INDEX_LOADS),
+        base(&COLD_INDEX_COPY_BYTES),
+    );
+
+    // Two regimes, because they stress different layers and a change can help
+    // one while hurting the other.
+    //
+    //   cold -- every block reclaimed first, so reads pay disk and
+    //           decompression. This is the dataset-far-larger-than-memory case.
+    //   warm -- blocks already resident, so nothing is paid except whatever the
+    //           lookup itself costs. Uniform access over a large dataset lands
+    //           here constantly, and it is where per-call overhead shows up
+    //           undisguised.
+    //
+    // Uniform random-ish access: stride by a value coprime with the count so
+    // every cell is visited once in an order uncorrelated with layout. This is
+    // the access pattern that has nothing worth promoting.
+    let stride = 7919usize;
+    let reclaim_all = || {
+        let mut n = 0usize;
+        for chunk in &chunks.list {
+            for segment in chunk.segments() {
+                if let Some(b) = segment.try_reclaim_resident_blocks() {
+                    manager.release_cold_resident(b);
+                    n += b;
+                }
+            }
+        }
+        n
+    };
+
+    reclaim_all();
+    let start = std::time::Instant::now();
+    let mut read = 0usize;
+    for k in 0..ids.len() {
+        let id = ids[(k * stride) % ids.len()];
+        if chunks.read_cell(&id).is_ok() {
+            read += 1;
+        }
+    }
+    let elapsed = start.elapsed();
+
+    let serves = base(&COLD_BLOCK_SERVES) - b_serves;
+    let hits = base(&COLD_BLOCK_HITS) - b_hits;
+    let misses = base(&COLD_BLOCK_MISSES) - b_miss;
+    let file_bytes = base(&COLD_BLOCK_FILE_BYTES) - b_file;
+    let plain_bytes = base(&COLD_BLOCK_PLAIN_BYTES) - b_plain;
+    let opens = base(&COLD_BLOCK_OPENS) - b_opens;
+    let idx_loads = base(&COLD_INDEX_LOADS) - b_idx;
+    let copy_bytes = base(&COLD_INDEX_COPY_BYTES) - b_copy;
+
+    let served_payload = (read * CELL_PAYLOAD) as f64;
+    let per = |n: u64| n as f64 / read.max(1) as f64;
+
+    println!("\n=== cold read amplification ===");
+    println!("cells read              : {}", read);
+    println!("wall                    : {:?} ({:.0} reads/s)", elapsed,
+             read as f64 / elapsed.as_secs_f64().max(1e-9));
+    println!("block serves            : {} (hit {} / miss {})", serves, hits, misses);
+    println!("index loads             : {}", idx_loads);
+    println!("--- bytes per cell read (payload = {} B) ---", CELL_PAYLOAD);
+    println!("disk read               : {:>10.1} B  ({:.1}x payload)",
+             per(file_bytes), file_bytes as f64 / served_payload);
+    println!("decompressed            : {:>10.1} B  ({:.1}x payload)",
+             per(plain_bytes), plain_bytes as f64 / served_payload);
+    println!("index copied in lookup  : {:>10.1} B  ({:.1}x payload)",
+             per(copy_bytes), copy_bytes as f64 / served_payload);
+    println!("file opens              : {:>10.3} per read", per(opens));
+    println!();
+
+    // Warm pass: same reads, nothing reclaimed in between.
+    let (w_serves, w_hits, w_file, w_plain, w_copy) = (
+        base(&COLD_BLOCK_SERVES),
+        base(&COLD_BLOCK_HITS),
+        base(&COLD_BLOCK_FILE_BYTES),
+        base(&COLD_BLOCK_PLAIN_BYTES),
+        base(&COLD_INDEX_COPY_BYTES),
+    );
+    let wstart = std::time::Instant::now();
+    let mut wread = 0usize;
+    for k in 0..ids.len() {
+        let id = ids[(k * stride) % ids.len()];
+        if chunks.read_cell(&id).is_ok() {
+            wread += 1;
+        }
+    }
+    let welapsed = wstart.elapsed();
+    let wserves = base(&COLD_BLOCK_SERVES) - w_serves;
+    let whits = base(&COLD_BLOCK_HITS) - w_hits;
+    let wfile = base(&COLD_BLOCK_FILE_BYTES) - w_file;
+    let wplain = base(&COLD_BLOCK_PLAIN_BYTES) - w_plain;
+    let wcopy = base(&COLD_INDEX_COPY_BYTES) - w_copy;
+    let wper = |n: u64| n as f64 / wread.max(1) as f64;
+
+    // Sparse pass: touch one cell per block, reclaiming first, so no fetch is
+    // amortised over its neighbours. This is uniform access across a dataset
+    // far larger than memory -- the case with nothing worth promoting, and the
+    // one where amplification is real rather than averaged away.
+    let cells_per_block = crate::ram::compression::block_size() / CELL_PAYLOAD;
+    let sparse_stride = (cells_per_block * 2).max(1);
+    reclaim_all();
+    let (s_serves, s_hits, s_miss, s_file, s_plain, s_copy, s_opens) = (
+        base(&COLD_BLOCK_SERVES),
+        base(&COLD_BLOCK_HITS),
+        base(&COLD_BLOCK_MISSES),
+        base(&COLD_BLOCK_FILE_BYTES),
+        base(&COLD_BLOCK_PLAIN_BYTES),
+        base(&COLD_INDEX_COPY_BYTES),
+        base(&COLD_BLOCK_OPENS),
+    );
+    let sstart = std::time::Instant::now();
+    let mut sread = 0usize;
+    let mut k = 0usize;
+    while k < ids.len() {
+        if chunks.read_cell(&ids[k]).is_ok() {
+            sread += 1;
+        }
+        k += sparse_stride;
+    }
+    let selapsed = sstart.elapsed();
+    let sserves = base(&COLD_BLOCK_SERVES) - s_serves;
+    let shits = base(&COLD_BLOCK_HITS) - s_hits;
+    let smiss = base(&COLD_BLOCK_MISSES) - s_miss;
+    let sfile = base(&COLD_BLOCK_FILE_BYTES) - s_file;
+    let splain = base(&COLD_BLOCK_PLAIN_BYTES) - s_plain;
+    let scopy = base(&COLD_INDEX_COPY_BYTES) - s_copy;
+    let sopens = base(&COLD_BLOCK_OPENS) - s_opens;
+    let sper = |n: u64| n as f64 / sread.max(1) as f64;
+    let spay = (sread * CELL_PAYLOAD) as f64;
+
+    println!("=== sparse (one cell per block, nothing amortised) ===");
+    println!("cells read              : {} (stride {})", sread, sparse_stride);
+    println!("wall                    : {:?} ({:.0} reads/s)", selapsed,
+             sread as f64 / selapsed.as_secs_f64().max(1e-9));
+    println!("block serves            : {} (hit {} / miss {})", sserves, shits, smiss);
+    println!("disk read               : {:>10.1} B  ({:.1}x payload)",
+             sper(sfile), sfile as f64 / spay);
+    println!("decompressed            : {:>10.1} B  ({:.1}x payload)",
+             sper(splain), splain as f64 / spay);
+    println!("index copied in lookup  : {:>10.1} B  ({:.1}x payload)",
+             sper(scopy), scopy as f64 / spay);
+    println!("file opens              : {:>10.3} per read", sper(sopens));
+    println!();
+
+    println!("=== warm (blocks already resident) ===");
+    println!("cells read              : {}", wread);
+    println!("wall                    : {:?} ({:.0} reads/s)", welapsed,
+             wread as f64 / welapsed.as_secs_f64().max(1e-9));
+    println!("block serves            : {} (hit {})", wserves, whits);
+    println!("disk read               : {:>10.1} B per read", wper(wfile));
+    println!("decompressed            : {:>10.1} B per read", wper(wplain));
+    println!("index copied in lookup  : {:>10.1} B per read", wper(wcopy));
+    println!();
+
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

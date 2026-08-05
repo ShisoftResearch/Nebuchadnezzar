@@ -41,6 +41,31 @@ pub static ARCHIVE_REWRITES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 
+/// Cold-read amplification accounting.
+///
+/// Read amplification here is the ratio of bytes moved to bytes wanted, and it
+/// has three distinct layers that a single counter would conflate: bytes pulled
+/// off disk, bytes materialised by decompression, and the index copying done
+/// per call regardless of whether any I/O happened at all. Optimising one can
+/// worsen another -- smaller blocks cut decompression but cost compression
+/// ratio and more index -- so they are measured separately.
+pub static COLD_BLOCK_SERVES: AtomicU64 = AtomicU64::new(0);
+/// Calls satisfied by a block already resident: no I/O, no decompression.
+pub static COLD_BLOCK_HITS: AtomicU64 = AtomicU64::new(0);
+/// Calls that had to fetch a block from the backup.
+pub static COLD_BLOCK_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Compressed bytes actually read from backup files.
+pub static COLD_BLOCK_FILE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Bytes produced by decompressing those blocks.
+pub static COLD_BLOCK_PLAIN_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Backup file opens. One per miss is a syscall per read.
+pub static COLD_BLOCK_OPENS: AtomicU64 = AtomicU64::new(0);
+/// Block indexes loaded from disk.
+pub static COLD_INDEX_LOADS: AtomicU64 = AtomicU64::new(0);
+/// Bytes spent copying the block index inside the lookup itself. Pure overhead:
+/// it buys nothing and is paid even by calls that do no I/O.
+pub static COLD_INDEX_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
@@ -164,6 +189,13 @@ pub struct BlockResidency {
     present: Vec<u64>,
     /// Bytes currently faulted in through this path, for memory accounting.
     resident_bytes: usize,
+    /// Open handle to the backup this index describes.
+    ///
+    /// One open per block fetched is a syscall and a path walk per read, and
+    /// smaller blocks mean more fetches, so the handle is held for as long as
+    /// the index that goes with it. Invalidated together with the index in
+    /// `clear`, because both describe one specific backup file.
+    backup: Option<Arc<File>>,
 }
 
 impl BlockResidency {
@@ -203,6 +235,7 @@ impl BlockResidency {
     /// against a file that no longer matches it.
     fn clear(&mut self) {
         self.index = None;
+        self.backup = None;
         self.present.clear();
         self.resident_bytes = 0;
     }
@@ -492,39 +525,49 @@ impl Segment {
         }
         let offset = addr - self.addr;
 
-        let mut residency = self.block_residency.lock();
+        // Resolve the block under the lock, then release it. The index is read
+        // in place rather than copied: cloning it cost more per call than the
+        // decompression it was guarding, and was paid even by calls that found
+        // the block already resident and did no work at all.
+        let (block_idx, block_start, file_off, comp_len) = {
+            let mut residency = self.block_residency.lock();
 
-        if residency.index.is_none() {
-            match self.load_block_index()? {
-                Some(index) => residency.index = Some(index),
-                // Legacy whole-blob backup: partial reads are impossible.
-                None => return Ok(None),
+            if residency.index.is_none() {
+                match self.load_block_index()? {
+                    Some(index) => {
+                        COLD_INDEX_LOADS.fetch_add(1, Ordering::Relaxed);
+                        residency.index = Some(index)
+                    }
+                    None => return Ok(None),
+                }
             }
-        }
-        let index = residency.index.as_ref().unwrap().clone();
-        let Some(layout) = crate::ram::compression::block_layout(&index) else {
-            return Ok(None);
+            let index = residency.index.as_ref().unwrap();
+            let Some(layout) = crate::ram::compression::block_layout(index) else {
+                return Ok(None);
+            };
+
+            let (block_idx, _within) = layout.locate(index, offset)?;
+            if residency.is_present(block_idx) {
+                COLD_BLOCK_HITS.fetch_add(1, Ordering::Relaxed);
+                COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(0));
+            }
+            COLD_BLOCK_MISSES.fetch_add(1, Ordering::Relaxed);
+
+            let (block_start, file_off, comp_len) = layout.entry(index, block_idx)?;
+            (block_idx, block_start, file_off, comp_len)
         };
 
-        let (block_idx, _within) = layout.locate(&index, offset)?;
-        if residency.is_present(block_idx) {
-            return Ok(Some(0));
-        }
-
-        let (block_start, file_off, comp_len) = layout.entry(&index, block_idx)?;
-
-        // Read just this block's compressed extent.
+        // Read and decompress with no lock held. Two threads missing the same
+        // block will both fetch it, which wastes a read but never corrupts:
+        // only one of them copies, decided under the lock below. Holding the
+        // lock across the I/O instead would serialise every reader of the
+        // segment behind a disk fetch.
         let compressed = {
-            let state = self.file_state.lock();
-            let path = state
-                .manager
-                .backup_path(self.chunk_id, self.id, self.seq_id)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "no backup path for cold segment")
-                })?;
-            let file = File::open(&path)?;
             let mut buf = vec![0u8; comp_len];
+            let file = self.backup_file()?;
             read_exact_at(&file, &mut buf, file_off as u64)?;
+            COLD_BLOCK_FILE_BYTES.fetch_add(comp_len as u64, Ordering::Relaxed);
             buf
         };
 
@@ -534,6 +577,7 @@ impl Segment {
                 format!("block {} of segment {}: {:?}", block_idx, self.id, e),
             )
         })?;
+        COLD_BLOCK_PLAIN_BYTES.fetch_add(plain.len() as u64, Ordering::Relaxed);
 
         if block_start + plain.len() > SEGMENT_SIZE {
             return Err(io::Error::new(
@@ -545,6 +589,13 @@ impl Segment {
             ));
         }
 
+        let mut residency = self.block_residency.lock();
+        // Another thread may have landed this block while the lock was open.
+        if residency.is_present(block_idx) {
+            COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(0));
+        }
+
         // Write it back where it belongs. The mapping survived MADV_DONTNEED,
         // so this restores exactly the bytes that were dropped.
         unsafe {
@@ -554,11 +605,44 @@ impl Segment {
                 plain.len(),
             );
         }
+        COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
         let before = residency.resident_bytes();
         residency.mark_present(block_idx, plain.len());
         // Caller does the accounting: it holds the tiered manager, and a
         // segment has no route to one.
         Ok(Some(residency.resident_bytes() - before))
+    }
+
+    /// This segment's backup handle, opening it if it is not already cached.
+    ///
+    /// Reads go through `read_at`, which takes its own offset and so does not
+    /// disturb a file position, making one handle safe to share across threads.
+    fn backup_file(&self) -> io::Result<Arc<File>> {
+        if let Some(f) = self.block_residency.lock().backup.as_ref() {
+            return Ok(f.clone());
+        }
+        let path = {
+            let state = self.file_state.lock();
+            state
+                .manager
+                .backup_path(self.chunk_id, self.id, self.seq_id)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "no backup path for cold segment")
+                })?
+        };
+        let file = Arc::new(File::open(&path)?);
+        COLD_BLOCK_OPENS.fetch_add(1, Ordering::Relaxed);
+
+        let mut residency = self.block_residency.lock();
+        // Another thread may have cached one while this opened; keep theirs so
+        // a single handle is shared rather than one per racing reader.
+        match residency.backup.as_ref() {
+            Some(existing) => Ok(existing.clone()),
+            None => {
+                residency.backup = Some(file.clone());
+                Ok(file)
+            }
+        }
     }
 
     /// Read the header and block index from this segment's backup file.

@@ -20,21 +20,28 @@ pub const BLOCK_COMPRESSION_MAGIC: [u8; 4] = [0x4E, 0x45, 0x42, 0x03];
 
 /// Target uncompressed span for a block. A target, not a stride.
 ///
-/// Cells run from a few bytes to a megabyte, so a fixed stride is wrong in both
-/// directions: it wastes a whole block on an 8-byte cell, splits a 1 MiB cell
-/// across dozens of them, and lets ordinary cells straddle boundaries so one
-/// read needs two decompressions. Blocks therefore break only on cell
-/// boundaries -- cells are packed until the next one would overshoot the
-/// target, and a cell larger than the target becomes a block of its own.
+/// Chosen by measurement of amplification, not compression ratio. Ratio is
+/// nearly flat across block size -- 58.2% at 64 KiB against 60.7% at 4 KiB on
+/// realistic data, 2.5 points across a 16x range -- while the bytes moved to
+/// serve one cell scale linearly with the block. For a 1 KiB cell read out of a
+/// dataset far larger than memory, which is the case the block path exists for:
 ///
-/// The consequence that matters: reading any cell decompresses exactly one
-/// block, never two, and never more of the segment than the cell's own
-/// neighbourhood.
+///   block    on disk   decompressed/read   read from disk/read   sparse reads/s
+///    4 KiB    60.7%      2.1x payload         1.8x payload           119,692
+///    8 KiB    59.7%      4.9x                 4.2x                    62,117
+///   32 KiB    58.4%     21.0x                17.6x                    14,729
+///   64 KiB    58.2%     42.6x                35.4x                     8,216
 ///
-/// Measured trade of ratio against amplification on segment-shaped data:
-///   16 KiB -> 1.11x disk, 32 KiB -> 1.06x, 64 KiB -> 1.02x versus compressing
-///   the segment whole. `NEB_BACKUP_BLOCK_SIZE` overrides it for measurement.
-pub const DEFAULT_BLOCK_SIZE: usize = 32 * 1024;
+/// A full scan is indifferent to the choice -- it decompresses every byte once
+/// either way, measured at 258-271k reads/s across the range -- so nothing is
+/// given up for the sparse gain. The cost is the resident block index, 24 KiB
+/// per segment here against 3 KiB at 32 KiB blocks, or about 4.9 GiB rather
+/// than 0.6 GiB across a 1.7 TB dataset.
+///
+/// This also equals the page size, so a block is the smallest unit the kernel
+/// can hand back, and cells larger than the target get a block to themselves --
+/// reading one of those decompresses exactly the cell and nothing else.
+pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024;
 
 /// magic(4) + crc32(4) + target_block_size(4) + block_count(4)
 const BLOCK_HEADER_SIZE: usize = 16;
@@ -412,10 +419,20 @@ mod tests {
         let ratio = (compressed.len() as f64 / original.len() as f64) * 100.0;
 
         println!("Compression ratio for 8MB zeros: {:.2}%", ratio);
-        // Zeros should compress extremely well
+
+        // Zeros compress to nothing, so what survives is framing, not data: the
+        // block index plus LZ4's per-block minimum. That floor is set by how
+        // many blocks the target implies, so the bound is derived from it
+        // rather than fixed -- a smaller target legitimately raises the floor
+        // and a fixed threshold would either fail or stop testing anything.
+        let blocks = (original.len() + block_size() - 1) / block_size();
+        let framing = BLOCK_HEADER_SIZE + blocks * (BLOCK_INDEX_ENTRY_SIZE + 16);
+        let bound = (framing as f64 / original.len() as f64) * 100.0 * 2.0;
         assert!(
-            ratio < 1.0,
-            "Expected <1% compression ratio, got {:.2}%",
+            ratio < bound,
+            "Expected <{:.2}% (framing floor for {} blocks), got {:.2}%",
+            bound,
+            blocks,
             ratio
         );
 
