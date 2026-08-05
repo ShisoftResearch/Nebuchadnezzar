@@ -33,6 +33,16 @@ const EVICTION_SHARDS: usize = 16;
 /// How long to skip global eviction after a pass that freed nothing.
 const EVICTION_BACKOFF_MS: u64 = 50;
 
+/// Bounds on one cold-residency sweep.
+///
+/// The sweep runs on every paced eviction. Unbounded, it walked every segment
+/// of every chunk before giving up -- and collecting a chunk's segments
+/// allocates a vector of all of them -- so a pass cost O(total segments) and
+/// most passes found nothing new. A bounded pass with a resuming cursor covers
+/// the same ground across successive evictions at a fixed cost each.
+const RECLAIM_SCAN_LIMIT: usize = 2048;
+const RECLAIM_CHUNKS_PER_PASS: usize = 4;
+
 /// Minimum spacing between "eviction could not free anything" warnings.
 const STALL_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -144,6 +154,8 @@ pub struct TieredMemoryManager {
     cold_block_reads: AtomicU64,
     /// Cold segments whose faulted-in blocks were handed back under pressure.
     cold_blocks_reclaimed: AtomicU64,
+    /// Where the last cold-residency sweep stopped.
+    reclaim_cursor: AtomicUsize,
     /// Promotions triggered because a segment had been faulted in piecemeal
     /// past the residency threshold.
     /// Bytes held by blocks faulted into cold segments to serve reads without
@@ -184,6 +196,7 @@ impl TieredMemoryManager {
             lower_watermark_evictions: AtomicU64::new(0),
             cold_block_reads: AtomicU64::new(0),
             cold_blocks_reclaimed: AtomicU64::new(0),
+            reclaim_cursor: AtomicUsize::new(0),
             cold_resident_bytes: AtomicUsize::new(0),
             promotions_declined: AtomicU64::new(0),
         }
@@ -689,11 +702,22 @@ impl TieredMemoryManager {
         }
 
         let mut freed = 0usize;
-        let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed);
+        let mut examined = 0usize;
+        // Resume where the last sweep stopped rather than restarting at the
+        // front, so repeated passes cover the whole set instead of rescanning
+        // its head.
+        let start = self.reclaim_cursor.fetch_add(1, Ordering::Relaxed);
 
-        for i in 0..chunks.len() {
+        for i in 0..chunks.len().min(RECLAIM_CHUNKS_PER_PASS) {
             let chunk = chunks[(start + i) % chunks.len()];
+            // Collecting a chunk's segments allocates a vector of every one of
+            // them, so the number of chunks touched per pass is bounded too,
+            // not just the number of segments looked at.
             for segment in chunk.segments() {
+                if examined >= RECLAIM_SCAN_LIMIT {
+                    return freed;
+                }
+                examined += 1;
                 if let Some(bytes) = segment.try_reclaim_resident_blocks() {
                     self.release_cold_resident(bytes);
                     self.cold_blocks_reclaimed.fetch_add(1, Ordering::Relaxed);
