@@ -473,6 +473,8 @@ impl Segment {
         if !self.is_cold() {
             return None;
         }
+        // Residency includes the index, so a segment holding only an index is
+        // still worth reclaiming.
         if self.block_resident_bytes() == 0 {
             return None;
         }
@@ -529,6 +531,12 @@ impl Segment {
         // in place rather than copied: cloning it cost more per call than the
         // decompression it was guarding, and was paid even by calls that found
         // the block already resident and did no work at all.
+        // Bytes newly charged to this segment, reported to the caller so the
+        // manager's total matches what reclamation will later hand back. The
+        // index counts here too: charging it to the segment but not to the
+        // manager made reclaim return more than was ever added.
+        let mut newly_accounted = 0usize;
+
         let (block_idx, block_start, file_off, comp_len) = {
             let mut residency = self.block_residency.lock();
 
@@ -536,7 +544,16 @@ impl Segment {
                 match self.load_block_index()? {
                     Some(index) => {
                         COLD_INDEX_LOADS.fetch_add(1, Ordering::Relaxed);
-                        residency.index = Some(index)
+                        // The index is memory a cold segment holds, so it counts
+                        // as residency. It is small per segment and invisible at
+                        // small scale, but it scales with the number of cold
+                        // segments -- about 4.9 GiB across a 1.7 TB dataset at a
+                        // 4 KiB block target -- and memory the pressure
+                        // calculation cannot see is exactly what let residency
+                        // grow unbounded before.
+                        residency.resident_bytes += index.len();
+                        newly_accounted += index.len();
+                        residency.index = Some(index);
                     }
                     None => return Ok(None),
                 }
@@ -550,7 +567,8 @@ impl Segment {
             if residency.is_present(block_idx) {
                 COLD_BLOCK_HITS.fetch_add(1, Ordering::Relaxed);
                 COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(0));
+                // Still report any index just charged on this call.
+                return Ok(Some(newly_accounted));
             }
             COLD_BLOCK_MISSES.fetch_add(1, Ordering::Relaxed);
 
@@ -593,7 +611,7 @@ impl Segment {
         // Another thread may have landed this block while the lock was open.
         if residency.is_present(block_idx) {
             COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some(0));
+            return Ok(Some(newly_accounted));
         }
 
         // Write it back where it belongs. The mapping survived MADV_DONTNEED,
@@ -610,7 +628,7 @@ impl Segment {
         residency.mark_present(block_idx, plain.len());
         // Caller does the accounting: it holds the tiered manager, and a
         // segment has no route to one.
-        Ok(Some(residency.resident_bytes() - before))
+        Ok(Some(newly_accounted + (residency.resident_bytes() - before)))
     }
 
     /// This segment's backup handle, opening it if it is not already cached.

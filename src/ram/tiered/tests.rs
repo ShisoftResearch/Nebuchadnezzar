@@ -4183,7 +4183,13 @@ fn cold_read_amplification() {
     // amortised over its neighbours. This is uniform access across a dataset
     // far larger than memory -- the case with nothing worth promoting, and the
     // one where amplification is real rather than averaged away.
-    let cells_per_block = crate::ram::compression::block_size() / CELL_PAYLOAD;
+    // Fixed sample size. Deriving the stride from block size alone made the
+    // read count vary with it -- 6,000 reads at a 1 KiB target against 188 at
+    // 32 KiB -- so throughput across sizes was comparing different amounts of
+    // work. The stride still guarantees one cell per block; the count no longer
+    // moves with it.
+    const SPARSE_READS: usize = 150;
+    let cells_per_block = (crate::ram::compression::block_size() / CELL_PAYLOAD).max(1);
     let sparse_stride = (cells_per_block * 2).max(1);
     reclaim_all();
     let (s_serves, s_hits, s_miss, s_file, s_plain, s_copy, s_opens) = (
@@ -4198,7 +4204,7 @@ fn cold_read_amplification() {
     let sstart = std::time::Instant::now();
     let mut sread = 0usize;
     let mut k = 0usize;
-    while k < ids.len() {
+    while k < ids.len() && sread < SPARSE_READS {
         if chunks.read_cell(&ids[k]).is_ok() {
             sread += 1;
         }

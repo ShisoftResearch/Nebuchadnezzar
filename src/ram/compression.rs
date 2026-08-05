@@ -56,7 +56,7 @@ pub fn block_size() -> usize {
     std::env::var("NEB_BACKUP_BLOCK_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= 4096)
+        .filter(|v| *v >= 1024)
         .unwrap_or(DEFAULT_BLOCK_SIZE)
 }
 

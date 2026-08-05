@@ -45,6 +45,14 @@ pub struct ServerMemoryStatus {
     /// Cold segments whose block cache was handed back under memory pressure.
     /// Cold residency is bounded by this and nothing else.
     pub cold_blocks_reclaimed: u64,
+    /// Cold-read amplification, as bytes moved rather than a ratio, so the
+    /// denominator can be chosen at analysis time.
+    pub cold_block_hits: u64,
+    pub cold_block_misses: u64,
+    pub cold_block_file_bytes: u64,
+    pub cold_block_plain_bytes: u64,
+    pub cold_block_opens: u64,
+    pub cold_index_loads: u64,
     /// Bytes faulted into cold segments, included in the pressure calculation.
     pub cold_resident_bytes: u64,
     /// Durability write accounting, counted where the writes are issued.
@@ -271,6 +279,12 @@ impl NebServer {
             promotions_declined: tiered_counters.promotions_declined,
             cold_block_reads: tiered_counters.cold_block_reads,
             cold_blocks_reclaimed: tiered_counters.cold_blocks_reclaimed,
+            cold_block_hits: crate::ram::segs::COLD_BLOCK_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            cold_block_misses: crate::ram::segs::COLD_BLOCK_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+            cold_block_file_bytes: crate::ram::segs::COLD_BLOCK_FILE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            cold_block_plain_bytes: crate::ram::segs::COLD_BLOCK_PLAIN_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            cold_block_opens: crate::ram::segs::COLD_BLOCK_OPENS.load(std::sync::atomic::Ordering::Relaxed),
+            cold_index_loads: crate::ram::segs::COLD_INDEX_LOADS.load(std::sync::atomic::Ordering::Relaxed),
             cold_resident_bytes: tiered_counters.cold_resident_bytes,
             archive_count: crate::ram::segs::ARCHIVE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
             archive_bytes: crate::ram::segs::ARCHIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
