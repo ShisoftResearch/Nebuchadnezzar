@@ -45,6 +45,25 @@ pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 /// which is write amplification the tier has no part in.
 pub static WAL_WRITES: AtomicU64 = AtomicU64::new(0);
 
+/// Contention accounting for the per-segment WAL lock.
+///
+/// `write_wal` holds `file_state` across both the write syscall and the fsync,
+/// so concurrent writers to one segment serialise there. Wait time far above
+/// hold time means the lock is the limit; comparable means it is not. Measuring
+/// both is the point -- a lock that is held a long time and a lock that is
+/// waited on a long time call for different fixes.
+pub static WAL_LOCK_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static WAL_LOCK_HELD_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static WAL_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+/// Records how long the WAL lock was held, on every exit path.
+struct WalHoldTimer(std::time::Instant);
+impl Drop for WalHoldTimer {
+    fn drop(&mut self) {
+        WAL_LOCK_HELD_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
 /// Cold-read amplification accounting.
 ///
 /// Read amplification here is the ratio of bytes moved to bytes wanted, and it
@@ -1166,7 +1185,21 @@ impl Segment {
     }
 
     pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {
-        let mut state = self.file_state.lock();
+        // Uncontended acquisitions cost nothing to detect; only a failed
+        // try_lock pays for the timing.
+        let acquire_start = std::time::Instant::now();
+        let mut state = match self.file_state.try_lock() {
+            Some(g) => g,
+            None => {
+                WAL_LOCK_CONTENDED.fetch_add(1, Relaxed);
+                let g = self.file_state.lock();
+                WAL_LOCK_WAIT_NANOS
+                    .fetch_add(acquire_start.elapsed().as_nanos() as u64, Relaxed);
+                g
+            }
+        };
+        let held_start = std::time::Instant::now();
+        let _hold_guard = WalHoldTimer(held_start);
         // Lazily create WAL file on first write if not already present
         if state.wal.is_none() {
             state.wal = state

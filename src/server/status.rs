@@ -65,6 +65,11 @@ pub struct ServerMemoryStatus {
     pub wal_syncs: u64,
     /// Entries journalled. Divided by live cells this is the rewrite factor.
     pub wal_writes: u64,
+    /// Per-segment WAL lock: how long writers waited for it against how long it
+    /// was held, and how often acquisition was contended.
+    pub wal_lock_wait_ms: u64,
+    pub wal_lock_held_ms: u64,
+    pub wal_lock_contended: u64,
 }
 
 impl ServerMemoryStatus {
@@ -294,6 +299,9 @@ impl NebServer {
             wal_bytes: crate::ram::segs::WAL_BYTES.load(std::sync::atomic::Ordering::Relaxed),
             wal_syncs: crate::ram::segs::WAL_SYNCS.load(std::sync::atomic::Ordering::Relaxed),
             wal_writes: crate::ram::segs::WAL_WRITES.load(std::sync::atomic::Ordering::Relaxed),
+            wal_lock_wait_ms: crate::ram::segs::WAL_LOCK_WAIT_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+            wal_lock_held_ms: crate::ram::segs::WAL_LOCK_HELD_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+            wal_lock_contended: crate::ram::segs::WAL_LOCK_CONTENDED.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 }
