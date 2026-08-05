@@ -88,6 +88,43 @@ pub static COLD_INDEX_LOADS: AtomicU64 = AtomicU64::new(0);
 /// Bytes spent copying the block index inside the lookup itself. Pure overhead:
 /// it buys nothing and is paid even by calls that do no I/O.
 pub static COLD_INDEX_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Backup handles currently held open by cold segments.
+///
+/// Caching one handle per segment is unbounded in the number of cold segments,
+/// which is unbounded in dataset size. A 1.7TB import reached 66,430 cold
+/// segments and pinned 64,860 file descriptors against a 65,535 limit, after
+/// which every write failed with EMFILE. A 59GB dataset only ever reached
+/// ~18,000 and so never showed it.
+pub static COLD_BACKUP_FDS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many backup handles may be cached at once.
+///
+/// Derived from the process limit rather than fixed, so it adapts to whatever
+/// the deployment allows, and deliberately a small fraction of it: descriptors
+/// are shared with sockets, WAL files and everything else, and exhausting them
+/// takes down writes rather than merely slowing reads. Segments past the cap
+/// still work -- they open per fetch, which is what the code did before the
+/// cache existed.
+fn cold_backup_fd_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let soft = rlimit_nofile().unwrap_or(1024);
+        (soft / 8).clamp(64, 8192)
+    })
+}
+
+fn rlimit_nofile() -> Option<usize> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills the struct; failure is reported by the return.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        Some(lim.rlim_cur as usize)
+    } else {
+        None
+    }
+}
 
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
@@ -285,7 +322,9 @@ impl BlockResidency {
     /// against a file that no longer matches it.
     fn clear(&mut self) {
         self.index = None;
-        self.backup = None;
+        if self.backup.take().is_some() {
+            COLD_BACKUP_FDS.fetch_sub(1, Ordering::Relaxed);
+        }
         self.present.clear();
         self.resident_bytes = 0;
     }
@@ -713,6 +752,9 @@ impl Segment {
         if let Some(f) = self.block_residency.read().backup.as_ref() {
             return Ok(f.clone());
         }
+        // Past the cap, serve without caching. The handle is still correct --
+        // it is simply reopened next time, as it was before caching existed.
+        let may_cache = COLD_BACKUP_FDS.load(Ordering::Relaxed) < cold_backup_fd_cap();
         let path = {
             let state = self.file_state.lock();
             state
@@ -724,6 +766,9 @@ impl Segment {
         };
         let file = Arc::new(File::open(&path)?);
         COLD_BLOCK_OPENS.fetch_add(1, Ordering::Relaxed);
+        if !may_cache {
+            return Ok(file);
+        }
 
         let mut residency = self.block_residency.write();
         // Another thread may have cached one while this opened; keep theirs so
@@ -732,6 +777,7 @@ impl Segment {
             Some(existing) => Ok(existing.clone()),
             None => {
                 residency.backup = Some(file.clone());
+                COLD_BACKUP_FDS.fetch_add(1, Ordering::Relaxed);
                 Ok(file)
             }
         }

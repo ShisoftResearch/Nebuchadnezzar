@@ -4401,3 +4401,195 @@ fn cold_read_concurrency() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Write-path phase costs, the local counterpart to `cold_read_amplification`.
+///
+/// The per-phase counters are the only thing that has reliably located a
+/// bottleneck in this engine, but until now they could only be read from a
+/// running server. This drives writes directly so the same decomposition can be
+/// iterated on in seconds instead of a twenty-minute import.
+///
+/// Ignored by default. Run with:
+///   cargo test --lib write_path_phases -- --ignored --nocapture
+#[test]
+#[ignore]
+fn write_path_phases() {
+    use crate::ram::chunk::{
+        WRITE_ALLOC_NANOS, WRITE_CELLS, WRITE_COPY_NANOS, WRITE_INDEX_NANOS, WRITE_PLAN_NANOS,
+        WRITE_SECONDARY_NANOS, WRITE_STATS_NANOS,
+    };
+    use std::sync::atomic::Ordering as O;
+
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 256 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("write_phases", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_wp_schema");
+    let backup_dir = temp_path("neb_wp_bk");
+    let wal_dir = temp_path("neb_wp_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        64 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    const CELLS: usize = 60_000;
+    let base = |c: &std::sync::atomic::AtomicU64| c.load(O::Relaxed);
+    let (b_cells, b_plan, b_alloc, b_copy, b_index, b_sec, b_stats) = (
+        base(&WRITE_CELLS),
+        base(&WRITE_PLAN_NANOS),
+        base(&WRITE_ALLOC_NANOS),
+        base(&WRITE_COPY_NANOS),
+        base(&WRITE_INDEX_NANOS),
+        base(&WRITE_SECONDARY_NANOS),
+        base(&WRITE_STATS_NANOS),
+    );
+
+    let start = std::time::Instant::now();
+    for i in 0..CELLS {
+        let id = Id::allocated(0, 0, 800_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        let mut body = String::with_capacity(600);
+        let mut w = i as u64;
+        while body.len() < 600 {
+            w = w.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            body.push_str(&format!("{:016x}-", w));
+        }
+        body.truncate(600);
+        data_map.insert(&String::from("data"), OwnedValue::String(body));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let _ = chunks.write_cell(&mut cell);
+    }
+    let elapsed = start.elapsed();
+
+    let n = (base(&WRITE_CELLS) - b_cells).max(1);
+    let us = |now: u64, before: u64| (now - before) as f64 / 1000.0 / n as f64;
+
+    println!("\n=== write path, {} cells ===", n);
+    println!("wall            : {:?} ({:.0} cells/s)", elapsed,
+             n as f64 / elapsed.as_secs_f64().max(1e-9));
+    println!("  plan          : {:7.2} us/cell", us(base(&WRITE_PLAN_NANOS), b_plan));
+    println!("  alloc         : {:7.2} us/cell", us(base(&WRITE_ALLOC_NANOS), b_alloc));
+    println!("  copy          : {:7.2} us/cell", us(base(&WRITE_COPY_NANOS), b_copy));
+    println!("  index         : {:7.2} us/cell", us(base(&WRITE_INDEX_NANOS), b_index));
+    println!("  secondary     : {:7.2} us/cell", us(base(&WRITE_SECONDARY_NANOS), b_sec));
+    println!("  stats         : {:7.2} us/cell", us(base(&WRITE_STATS_NANOS), b_stats));
+    println!();
+
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// Cached backup handles must stay bounded as cold segments accumulate.
+///
+/// One handle per cold segment is unbounded in dataset size. A 1.7TB import
+/// reached 66,430 cold segments and pinned 64,860 descriptors against a 65,535
+/// limit, after which every write failed with EMFILE. A 59GB dataset never
+/// exceeded ~18,000 and so never revealed it -- the failure only appears at a
+/// scale that takes half an hour to reach, which is exactly the kind this test
+/// exists to catch in half a second.
+#[test]
+fn cached_backup_handles_stay_bounded() {
+    use crate::ram::segs::COLD_BACKUP_FDS;
+    use std::sync::atomic::Ordering as O;
+
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("fd_bound", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_fd_schema");
+    let backup_dir = temp_path("neb_fd_bk");
+    let wal_dir = temp_path("neb_fd_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        32 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    let before = COLD_BACKUP_FDS.load(O::Relaxed);
+
+    let mut ids: Vec<Id> = Vec::new();
+    for i in 0..30_000usize {
+        let id = Id::allocated(0, 0, 900_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String("q".repeat(2_000)));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            ids.push(id);
+        }
+    }
+    assert!(ids.len() > 1_000, "setup wrote too few cells");
+
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 256);
+    }
+    // Touch every cold segment so each one would cache a handle if uncapped.
+    for id in ids.iter() {
+        let _ = chunks.read_cell(id);
+    }
+
+    let cached = COLD_BACKUP_FDS.load(O::Relaxed).saturating_sub(before);
+    let cold: usize = chunks
+        .list
+        .iter()
+        .flat_map(|c| c.segments().into_iter())
+        .filter(|s| s.is_cold())
+        .count();
+    assert!(cold > 0, "test needs cold segments");
+    // The cap derives from RLIMIT_NOFILE, so assert the property rather than a
+    // constant: caching is bounded well below the descriptor limit.
+    let soft = 1024usize.max(cached + 1);
+    assert!(
+        cached <= 8192 && cached < soft.max(8192),
+        "cached handles {} must stay bounded (cold segments {})",
+        cached,
+        cold
+    );
+
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
