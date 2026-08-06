@@ -53,6 +53,10 @@ static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
+/// Ceiling on one chunk's cell index, in slots. Only guards against a nonsense
+/// estimate; a legitimate 16 GB chunk of 8 MiB segments wants ~17 M.
+const MAX_CELL_INDEX_CAPACITY: usize = 1 << 26;
+
 static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.50f32;
 /// Victim bar while the chunk has ample free space: only combine segments
 /// that are at least three-quarters dead.
@@ -329,6 +333,7 @@ impl Chunk {
             wal_storage,
             tiered_manager,
             cleaner_wake,
+            0,
         )
     }
 
@@ -342,6 +347,7 @@ impl Chunk {
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
+        estimated_cells: usize,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -374,11 +380,18 @@ impl Chunk {
         );
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = SegmentList::new(num_segs);
-        // Recovery rebuilds this index very aggressively; starting too small causes
-        // repeated lock-free migration storms during startup.
-        let index_capacity = num_segs
-            .saturating_mul(64)
-            .clamp(4_096, 1 << 20)
+        // Sized for the cells this chunk is about to recover, because a WordMap
+        // cannot be resized afterwards and each partition that outgrows itself
+        // doubles, copies, and frees the old table into a per-thread allocator
+        // arena that never returns it. `num_segs * 64` assumes 128 KB cells; at
+        // ~770 B/cell that was 256x short, which is eight doublings per
+        // partition and several hundred GB of unreclaimable garbage at
+        // terabyte scale. Falls back to the old guess for a fresh chunk, where
+        // nothing better is known and eager sizing would allocate for a full
+        // chunk that may stay empty.
+        let index_capacity = estimated_cells
+            .max(num_segs.saturating_mul(64))
+            .clamp(4_096, MAX_CELL_INDEX_CAPACITY)
             .next_power_of_two();
         let index = WordMap::with_capacity(index_capacity);
         let chunk = Chunk {
@@ -1676,6 +1689,26 @@ impl Chunks {
             "Creating chunks, count {} , chunk_size {} bytes",
             count, size
         );
+
+        // Discover before building the chunks: a chunk's cell index is sized at
+        // construction and cannot grow afterwards, so recovery has to know its
+        // own footprint first. Empty on a fresh store, where the per-chunk
+        // directories do not exist yet and the estimate falls back to zero.
+        let recovery_files = if enable_recovery {
+            crate::ram::recovery::discover_segment_files(&backup_storage, &wal_storage)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let estimated_cells = crate::ram::recovery::estimate_cells_per_chunk(&recovery_files, count);
+        if !recovery_files.is_empty() {
+            info!(
+                "Discovered {} segment files; sizing cell indexes for ~{} cells",
+                recovery_files.len(),
+                estimated_cells.iter().sum::<usize>()
+            );
+        }
+
         let cleaner_wake = Arc::new(crate::ram::cleaner::CleanerWake::new());
         for i in 0..count {
             let chunk_base = global_base_addr + (i * chunk_size);
@@ -1695,6 +1728,7 @@ impl Chunks {
                 wal_storage,
                 tiered_manager.clone(),
                 cleaner_wake.clone(),
+                estimated_cells[i],
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
@@ -1737,6 +1771,7 @@ impl Chunks {
                 &raft_storage,
                 &chunks_arc.list,
                 &chunks_arc.recovered_origin_floors,
+                Some(recovery_files),
             ) {
                 Ok(()) => {
                     info!("Recovery completed successfully");

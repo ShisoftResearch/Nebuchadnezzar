@@ -246,6 +246,35 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
+/// Assumed average payload of one cell, used only to pre-size the cell index.
+///
+/// `WordMap` capacity is fixed at construction, so this number decides how many
+/// rounds of lock-free migration startup pays for. Each round allocates a table
+/// twice the size of the last and frees the old one, and the freed tables are
+/// retained by glibc's per-thread arenas rather than returned to the OS -- so an
+/// index that starts an order of magnitude too small costs several times the
+/// memory of the index itself, in garbage nothing will reclaim.
+///
+/// A round prior, not a measurement: no single density suits every workload, so
+/// this only has to be within a factor of a few to avoid the pathological case.
+/// Note which direction is dangerous -- set too *high* it means too few cells
+/// per segment, under-sizing the index and paying a doubling for every factor
+/// of two it is short; set too low it merely over-allocates, bounded and
+/// predictable. Workloads far from 1 KB/cell should set
+/// `NEB_ESTIMATED_CELL_BYTES` rather than have their number baked in here.
+pub const DEFAULT_ESTIMATED_CELL_BYTES: usize = 1024;
+
+/// Cells a segment is expected to hold, overridable for workloads whose cells
+/// are much larger or smaller than the default assumption.
+pub fn estimated_cells_per_segment() -> usize {
+    let cell_bytes = std::env::var("NEB_ESTIMATED_CELL_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 64)
+        .unwrap_or(DEFAULT_ESTIMATED_CELL_BYTES);
+    SEGMENT_SIZE / cell_bytes
+}
+
 pub const HOT_SEGMENT: u8 = 1;
 pub const COLD_SEGMENT: u8 = 2;
 pub const HOT_COLD_MASK: u8 = !0 << 1 >> 1;

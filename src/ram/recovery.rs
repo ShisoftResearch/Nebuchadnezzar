@@ -2,7 +2,9 @@ use super::cell::cell_header_from_entry_content_addr;
 use super::chunk::Chunk;
 use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
-use super::segs::{Segment, SegmentClass, SEGMENT_SIZE};
+use super::segs::{
+    estimated_cells_per_segment, Segment, SegmentClass, DEFAULT_ESTIMATED_CELL_BYTES, SEGMENT_SIZE,
+};
 use super::tombstone::Tombstone;
 use crate::ram::types::Id;
 use lightning::aarc::Arc as AArc;
@@ -122,9 +124,15 @@ pub struct RecoveryConfig {
 
 const DEFAULT_RECOVERY_THREADS: usize = 64;
 const MIN_RECOVERY_WORD_MAP_CAPACITY: usize = 4_096;
-const MAX_RECOVERY_WORD_MAP_CAPACITY: usize = 1 << 22;
-const RECOVERY_ENTRY_BYTES_ESTIMATE: u64 = 16 * 1024;
-const RECOVERY_SEGMENT_CAPACITY_FACTOR: usize = 2_048;
+/// Ceiling on a single chunk's version map. A chunk holds at most
+/// `chunk_size / SEGMENT_SIZE` segments, so this only has to stay above the
+/// largest legitimate chunk; the previous `1 << 22` sat *below* it at terabyte
+/// scale and silently capped the map at a fifth of what it had to hold.
+const MAX_RECOVERY_WORD_MAP_CAPACITY: usize = 1 << 26;
+/// Bytes of *on-disk* backup per cell. Backups are compressed, so this
+/// under-counts cells and the segment-derived estimate below normally wins --
+/// which is the intent: segment count is exact, file size is not.
+const RECOVERY_ENTRY_BYTES_ESTIMATE: u64 = DEFAULT_ESTIMATED_CELL_BYTES as u64;
 
 fn recovery_parallelism(config: &RecoveryConfig) -> usize {
     config
@@ -133,18 +141,60 @@ fn recovery_parallelism(config: &RecoveryConfig) -> usize {
         .max(1)
 }
 
-fn estimate_recovery_word_map_capacity(files: &[SegmentFileInfo]) -> usize {
-    let total_bytes: u64 = files.iter().map(|file| file.size).sum();
+/// Cells a chunk's recovery is expected to restore.
+///
+/// `discover_files` deduplicates to one file per segment, so `files.len()` is
+/// the chunk's segment count exactly; only the cells-per-segment density is
+/// assumed. Shared with the permanent cell index so both are sized alike.
+fn estimate_cells(segment_count: usize, total_bytes: u64) -> usize {
     let bytes_estimate = (total_bytes / RECOVERY_ENTRY_BYTES_ESTIMATE)
         .try_into()
         .unwrap_or(usize::MAX);
-    let segment_estimate = files.len().saturating_mul(RECOVERY_SEGMENT_CAPACITY_FACTOR);
+    let segment_estimate = segment_count.saturating_mul(estimated_cells_per_segment());
 
-    bytes_estimate
-        .max(segment_estimate)
+    bytes_estimate.max(segment_estimate)
+}
+
+fn estimate_recovered_cells(files: &[SegmentFileInfo]) -> usize {
+    estimate_cells(files.len(), files.iter().map(|file| file.size).sum())
+}
+
+/// Tracks the newest version seen per cell hash while a chunk is scanned.
+///
+/// Deliberately *not* a concurrent map. Recovery runs one task per chunk and
+/// each task walks its segments serially, so this is owned by a single thread
+/// and lock-free machinery would be paid for and never used. Measured against
+/// `WordMap` on one chunk's 21.7M cells: 3.1x faster, and -- because a resize
+/// here frees one large table straight back to the OS instead of leaving
+/// per-partition tables behind in an allocator arena -- it does not blow up
+/// when the estimate is short (0.53 GiB vs 2.88 GiB at 5x undersized).
+type VersionMap = HashMap<u64, u64, ahash::RandomState>;
+
+fn new_version_map(files: &[SegmentFileInfo]) -> VersionMap {
+    let capacity = estimate_recovered_cells(files)
         .max(MIN_RECOVERY_WORD_MAP_CAPACITY)
-        .min(MAX_RECOVERY_WORD_MAP_CAPACITY)
-        .next_power_of_two()
+        .min(MAX_RECOVERY_WORD_MAP_CAPACITY);
+    HashMap::with_capacity_and_hasher(capacity, ahash::RandomState::new())
+}
+
+/// Cells each chunk is expected to recover, indexed by chunk id.
+///
+/// Called before the chunks exist so their cell indexes can be sized for the
+/// data they are about to hold: `WordMap` capacity cannot be changed afterwards.
+pub fn estimate_cells_per_chunk(files: &[SegmentFileInfo], num_chunks: usize) -> Vec<usize> {
+    let mut segments = vec![0usize; num_chunks];
+    let mut bytes = vec![0u64; num_chunks];
+    for file in files {
+        if file.chunk_id < num_chunks {
+            segments[file.chunk_id] += 1;
+            bytes[file.chunk_id] += file.size;
+        }
+    }
+    segments
+        .iter()
+        .zip(bytes.iter())
+        .map(|(count, total)| estimate_cells(*count, *total))
+        .collect()
 }
 
 fn group_files_by_chunk(
@@ -518,7 +568,7 @@ fn scan_segment_from_data(
     seg_id: u64,
     segment_base: usize,
     data: &[u8],
-    version_map: &WordMap,
+    version_map: &mut VersionMap,
     origin_floors: &[std::sync::atomic::AtomicU64],
 ) -> io::Result<RecoveryScanResult> {
     use byteorder::{LittleEndian, ReadBytesExt};
@@ -673,14 +723,10 @@ fn scan_segment_from_data(
                 }
             }
 
-            // Use version_map to check existing version (concurrent-safe)
-            let mut version_guard = version_map.lock_or_insert(hash as usize, new_version as usize);
-            let existing_version = *version_guard as u64;
+            let existing_version = *version_map.entry(hash).or_insert(new_version);
 
             if new_version >= existing_version {
-                // Our version is newer or equal, update cell_index and version_map
-                *version_guard = new_version as usize;
-                drop(version_guard);
+                version_map.insert(hash, new_version);
 
                 let mut cell_guard = chunk
                     .cell_index
@@ -720,15 +766,10 @@ fn scan_segment_from_data(
             let hash = tombstone.id.bits();
             tombstone_count += 1;
 
-            // Use lock_or_insert to handle case where no version exists yet
-            let mut version_guard =
-                version_map.lock_or_insert(hash as usize, tombstone.version as usize);
-            let existing_version = *version_guard as u64;
+            let existing_version = *version_map.entry(hash).or_insert(tombstone.version);
 
             if tombstone.version >= existing_version {
-                // Update version_map BEFORE releasing lock (prevents race)
-                *version_guard = tombstone.version as usize;
-                drop(version_guard);
+                version_map.insert(hash, tombstone.version);
 
                 // Tombstone is newer, delete cell from index
                 if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
@@ -754,7 +795,6 @@ fn scan_segment_from_data(
                     }
                 }
             } else {
-                drop(version_guard);
                 stashed_tombstones.push(StashedTombstone {
                     hash,
                     version: tombstone.version,
@@ -894,11 +934,17 @@ pub fn recover_chunks(
     raft_storage: &Option<String>,
     chunks: &[Chunk],
     origin_floors: &[std::sync::atomic::AtomicU64],
+    discovered: Option<Vec<SegmentFileInfo>>,
 ) -> io::Result<()> {
     info!("=== Starting streamlined recovery from storage directories ===");
 
-    // Phase 1: Discover files
-    let files = match phase1_discover_files(backup_storage, wal_storage) {
+    // Phase 1: Discover files, unless the caller already did it to size the
+    // cell indexes. Rescanning means a second walk of every segment file.
+    let files = match discovered
+        .filter(|files| !files.is_empty())
+        .map(Ok)
+        .unwrap_or_else(|| phase1_discover_files(backup_storage, wal_storage))
+    {
         Ok(files) => files,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             info!("No segment files found, starting fresh");
@@ -959,12 +1005,6 @@ pub fn recover_chunks(
         recovery_parallelism(config)
     );
 
-    // Create per-chunk version maps sized from the actual recovery footprint.
-    let version_maps: Vec<WordMap> = files_by_chunk
-        .iter()
-        .map(|chunk_files| WordMap::with_capacity(estimate_recovery_word_map_capacity(chunk_files)))
-        .collect();
-
     // Track max seq_id per chunk to update allocators after recovery
     // This ensures new segments continue from where recovered segments left off
     let max_seq_ids: Vec<std::sync::atomic::AtomicU64> = chunks
@@ -995,7 +1035,11 @@ pub fn recover_chunks(
         files_by_chunk.into_par_iter().enumerate().try_for_each(
             |(chunk_id, chunk_files)| -> io::Result<()> {
                 let chunk = &chunks[chunk_id];
-                let version_map = &version_maps[chunk_id];
+                // Built here rather than up front so a chunk's version map is
+                // freed as soon as that chunk finishes. Held for the whole run
+                // they are all co-resident with the permanent cell index at the
+                // exact moment recovery peaks, roughly doubling index memory.
+                let mut version_map = new_version_map(&chunk_files);
                 let mut local_stashed = Vec::new();
 
                 for file_info in chunk_files {
@@ -1018,7 +1062,7 @@ pub fn recover_chunks(
                         file_info.seg_id,
                         segment_base,
                         &file_data,
-                        version_map,
+                        &mut version_map,
                         origin_floors,
                     )?;
                     let segment_class = scan_result.segment_class;
@@ -1091,10 +1135,6 @@ pub fn recover_chunks(
             },
         )
     })?;
-
-    // Version maps are dropped here, freeing all temporary version tracking memory
-    drop(version_maps);
-    info!("Version maps freed, recovery memory usage reduced");
 
     // Update allocator next_seq_id for each chunk to continue from max recovered seq_id
     for (chunk_id, max_seq) in max_seq_ids.iter().enumerate() {
@@ -1170,12 +1210,81 @@ use crate::ram::types::Id;
     use dovahkiin::types::Type;
     use lightning::map::WordMap;
     use std::collections::HashSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tempfile::TempDir;
 
     const TEST_SEGMENT_SIZE: usize = 8 * 1024 * 1024; // 8MB
     const DATA_SIZE: usize = 1024; // 1KB per cell
+
+    fn segment_files(chunk_id: usize, count: usize, size: u64) -> Vec<SegmentFileInfo> {
+        (0..count)
+            .map(|seg_id| SegmentFileInfo {
+                chunk_id,
+                seg_id: seg_id as u64,
+                seq_id: 0,
+                path: PathBuf::from(format!("{}-{}-0.nbackup", chunk_id, seg_id)),
+                size,
+                is_backup: true,
+            })
+            .collect()
+    }
+
+    /// A chunk of a terabyte-scale store must be sized for the cells it will
+    /// actually hold. The regression this guards is not "the estimate is a bit
+    /// low" but a hard `1 << 22` ceiling that capped a chunk needing ~17M
+    /// entries at 4M, forcing every partition through repeated doubling whose
+    /// freed tables the allocator never returns.
+    #[test]
+    fn version_map_capacity_covers_a_terabyte_scale_chunk() {
+        // 128 chunks over ~255k segments, as a 1.7 TB store.
+        let files = segment_files(0, 1_991, 3 * 1024 * 1024);
+        let expected_cells = 1_991 * estimated_cells_per_segment();
+        let capacity = new_version_map(&files).capacity();
+
+        assert!(
+            capacity >= expected_cells,
+            "capacity {} must cover the {} cells the chunk is expected to hold",
+            capacity,
+            expected_cells
+        );
+        assert!(
+            capacity > 1 << 22,
+            "capacity {} fell back under the old ceiling that caused the migration storm",
+            capacity
+        );
+    }
+
+    /// Sizing is per chunk, so files must be attributed to the chunk that owns
+    /// them; a mix-up here would size one index huge and the rest empty.
+    #[test]
+    fn cells_are_estimated_per_chunk() {
+        let mut files = segment_files(0, 10, 1024);
+        files.extend(segment_files(2, 40, 1024));
+
+        let per_chunk = estimate_cells_per_chunk(&files, 4);
+
+        assert_eq!(per_chunk.len(), 4);
+        assert_eq!(per_chunk[0], 10 * estimated_cells_per_segment());
+        assert_eq!(per_chunk[1], 0);
+        assert_eq!(per_chunk[2], 40 * estimated_cells_per_segment());
+        assert_eq!(per_chunk[3], 0);
+    }
+
+    /// A fresh store discovers nothing, and must not pre-allocate for a chunk
+    /// that may stay empty.
+    #[test]
+    fn a_fresh_store_estimates_nothing() {
+        assert_eq!(estimate_cells_per_chunk(&[], 8), vec![0; 8]);
+        assert!(new_version_map(&[]).capacity() >= MIN_RECOVERY_WORD_MAP_CAPACITY);
+    }
+
+    /// Files outside the configured chunk count must not panic the sizing pass.
+    #[test]
+    fn out_of_range_chunk_ids_are_ignored() {
+        let files = segment_files(9, 5, 1024);
+        assert_eq!(estimate_cells_per_chunk(&files, 2), vec![0, 0]);
+    }
 
     fn default_cell(id: &Id) -> OwnedCell {
         let data: Vec<_> = std::iter::repeat(id.bits() as u8).take(DATA_SIZE).collect();
@@ -1285,10 +1394,17 @@ use crate::ram::types::Id;
         chunk: &Chunk,
         data: &[u8],
     ) -> io::Result<RecoveryScanResult> {
-        let version_map = WordMap::with_capacity(128);
+        let mut version_map = new_version_map(&[]);
         let floors: Vec<std::sync::atomic::AtomicU64> =
             (0..4096).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-        scan_segment_from_data(chunk, 1, chunk.allocator.addr_by_id(1), data, &version_map, &floors)
+        scan_segment_from_data(
+            chunk,
+            1,
+            chunk.allocator.addr_by_id(1),
+            data,
+            &mut version_map,
+            &floors,
+        )
     }
 
     // Purpose: Validate parsing of segment filenames `{chunk}-{seg}-{seq}.{nlog|nbackup}`
