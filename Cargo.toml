@@ -49,8 +49,21 @@ rust-stemmers = "1.2"
 jieba-rs = "0.7"
 lindera = { version = "0.30", features = ["ipadic"] }
 crc-fast = "1.10.0"
+mimalloc = { version = "0.1.52", optional = true }
+tikv-jemallocator = { version = "0.7.0", features = ["profiling"], optional = true }
 
 [features]
+# Swap the global allocator. glibc's arenas degrade badly under the
+# fragmentation a large import produces: identical write-plan code measured
+# 1.01us/cell locally against 11.93us/cell on a loaded server.
+mimalloc-allocator = ["dep:mimalloc"]
+# Swap in jemalloc with its heap profiler. Answers "which call sites allocated
+# the memory that is still resident", which neither smaps nor a CPU profile can:
+# smaps sees mappings, perf sees time spent, and the question is retained bytes
+# by allocation site. Enable and run with
+#   MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof,lg_prof_interval:32
+# then read the dumps with jeprof.
+jemalloc-profiling = ["dep:tikv-jemallocator"]
 default = [
     "cleaner", "combine_cleaner", 
     "tiered_memory", "compress_backups"
@@ -71,6 +84,8 @@ debug_verify_checksums = ["tiered_memory"]
 compress_backups = []
 
 tiered_memory = []
+mimalloc = ["dep:mimalloc"]
+tikv-jemallocator = ["dep:tikv-jemallocator"]
 
 [dev-dependencies]
 env_logger = "*"

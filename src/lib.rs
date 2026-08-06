@@ -8,6 +8,11 @@
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+// Mutually exclusive with the above: both define a global allocator.
+#[cfg(all(feature = "jemalloc-profiling", not(feature = "mimalloc-allocator")))]
+#[global_allocator]
+static GLOBAL_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 extern crate static_assertions;
 #[macro_use]
 extern crate log;
