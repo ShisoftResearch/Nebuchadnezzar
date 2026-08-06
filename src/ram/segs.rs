@@ -1476,42 +1476,39 @@ impl Segment {
         }
     }
 
+    /// Current reference count, for tests and diagnostics.
+    pub fn references_count(&self) -> usize {
+        self.references.load(Ordering::Relaxed)
+    }
+
     pub fn decr_references(&self) {
-        let backoff = Backoff::new();
-        #[cfg(debug_assertions)]
-        loop {
-            let curr_refs = self.references.load(Ordering::Relaxed);
-            // If reference count is already 0, just return. This can happen in race conditions
-            // where a PendingEntry is dropped after the segment has been cleaned up.
-            debug_assert!(
-                curr_refs > 0,
-                "Segment {} has negative references {}",
-                self.id,
-                curr_refs
-            );
-            debug_assert!(
-                curr_refs != EXCLUSIVE_REF_COUNT,
-                "Segment {} has exclusive references, which should not happen",
-                self.id
-            );
-            if self
-                .references
-                .compare_exchange(
-                    curr_refs,
-                    curr_refs - 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                return;
-            }
-            backoff.spin();
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            self.references.fetch_sub(1, Ordering::Relaxed);
-        }
+        // Decrementing at zero is a real, documented race: a PendingEntry can
+        // be dropped after the segment has already been cleaned up. It must not
+        // wrap.
+        //
+        // `references` is a usize and EXCLUSIVE_REF_COUNT is usize::MAX, so the
+        // release build's `fetch_sub(1)` at zero wrapped to exactly the value
+        // that means "exclusively locked". The segment then looked permanently
+        // locked to everything: it could never be referenced, evicted, or
+        // promoted again, and eviction would report it as held by active
+        // references forever. The debug build instead tripped an assertion,
+        // which is why this surfaced as a flaky test rather than as the pin it
+        // actually was.
+        let _ = self
+            .references
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |curr| {
+                debug_assert!(
+                    curr != EXCLUSIVE_REF_COUNT,
+                    "Segment {} has exclusive references, which should not happen",
+                    self.id
+                );
+                if curr == 0 {
+                    // Already released by the cleanup this raced with.
+                    None
+                } else {
+                    Some(curr - 1)
+                }
+            });
     }
 
     pub fn mem_drop(&self, chunk: &Chunk) {

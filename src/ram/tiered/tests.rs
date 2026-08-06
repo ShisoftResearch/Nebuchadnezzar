@@ -4613,3 +4613,67 @@ fn cached_backup_handles_stay_bounded() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// Releasing a reference that was already released must not wrap.
+///
+/// `references` is a usize and EXCLUSIVE_REF_COUNT is usize::MAX, so a
+/// decrement at zero used to wrap to exactly the value meaning "exclusively
+/// locked". The segment then looked permanently locked: never referencable,
+/// never evictable, never promotable, and eviction would report it as held by
+/// active references forever. The race is documented in the code as expected --
+/// a PendingEntry dropped after cleanup -- so it had to be survivable rather
+/// than merely asserted against.
+#[test]
+fn releasing_an_already_released_reference_does_not_wrap() {
+    use crate::ram::segs::EXCLUSIVE_REF_COUNT;
+
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let schema = Schema::new("ref_wrap", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_refwrap_schema");
+    let _ = std::fs::remove_dir_all(&schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        4 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let segment = chunks.list[0]
+        .segments()
+        .into_iter()
+        .next()
+        .expect("chunk should have a segment");
+
+    // Balanced pair, then two extra releases racing with a cleanup that already
+    // took the count to zero.
+    assert!(segment.incr_references());
+    segment.decr_references();
+    segment.decr_references();
+    segment.decr_references();
+
+    let refs = segment.references_count();
+    assert_eq!(
+        refs, 0,
+        "over-release should saturate at zero, got {} (EXCLUSIVE_REF_COUNT is {})",
+        refs, EXCLUSIVE_REF_COUNT
+    );
+    assert_ne!(
+        refs, EXCLUSIVE_REF_COUNT,
+        "wrapping to EXCLUSIVE_REF_COUNT would pin the segment forever"
+    );
+    // And the segment must still be usable afterwards.
+    assert!(
+        segment.incr_references(),
+        "segment should still accept references after an over-release"
+    );
+    segment.decr_references();
+
+    let _ = std::fs::remove_dir_all(&schema_dir);
+}

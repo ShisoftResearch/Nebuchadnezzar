@@ -4,6 +4,10 @@
 #![feature(thread_id_value)]
 #![feature(is_sorted)]
 
+#[cfg(feature = "mimalloc-allocator")]
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 extern crate static_assertions;
 #[macro_use]
 extern crate log;
