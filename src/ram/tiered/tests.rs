@@ -4572,6 +4572,8 @@ fn cached_backup_handles_stay_bounded() {
     }
 
     let cached = COLD_BACKUP_FDS.load(O::Relaxed).saturating_sub(before);
+    let evicted = crate::ram::segs::COLD_BACKUP_EVICTIONS.load(O::Relaxed);
+    let cap = crate::ram::segs::cold_backup_fd_cap();
     let cold: usize = chunks
         .list
         .iter()
@@ -4579,14 +4581,32 @@ fn cached_backup_handles_stay_bounded() {
         .filter(|s| s.is_cold())
         .count();
     assert!(cold > 0, "test needs cold segments");
-    // The cap derives from RLIMIT_NOFILE, so assert the property rather than a
-    // constant: caching is bounded well below the descriptor limit.
-    let soft = 1024usize.max(cached + 1);
+
+    // Bounded by the cap, not merely by some large constant. Shards round the
+    // per-shard size up, so allow one slot of slack per shard.
     assert!(
-        cached <= 8192 && cached < soft.max(8192),
-        "cached handles {} must stay bounded (cold segments {})",
+        cached <= cap + 16,
+        "cached handles {} exceed the cap {} (cold segments {})",
         cached,
+        cap,
         cold
+    );
+
+    // And the bound has to come from eviction rather than from never filling:
+    // with more cold segments than slots, the cache must have replaced some.
+    // Otherwise this test would still pass if caching silently stopped working.
+    if cold > cap {
+        assert!(
+            evicted > 0,
+            "with {} cold segments against a cap of {}, the cache should have \
+             evicted, but did not -- is it caching at all?",
+            cold,
+            cap
+        );
+    }
+    println!(
+        "cold segments {} | cap {} | cached {} | evictions {}",
+        cold, cap, cached, evicted
     );
 
     for d in [&schema_dir, &backup_dir, &wal_dir] {

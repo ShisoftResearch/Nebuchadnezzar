@@ -102,16 +102,131 @@ pub static COLD_BACKUP_FDS: AtomicUsize = AtomicUsize::new(0);
 /// Derived from the process limit rather than fixed, so it adapts to whatever
 /// the deployment allows, and deliberately a small fraction of it: descriptors
 /// are shared with sockets, WAL files and everything else, and exhausting them
-/// takes down writes rather than merely slowing reads. Segments past the cap
-/// still work -- they open per fetch, which is what the code did before the
-/// cache existed.
-fn cold_backup_fd_cap() -> usize {
+/// takes down writes rather than merely slowing reads.
+pub fn cold_backup_fd_cap() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         let soft = rlimit_nofile().unwrap_or(1024);
         (soft / 8).clamp(64, 8192)
     })
 }
+
+/// A fixed-size cache of open backup handles, shared by every segment.
+///
+/// Holding a handle on the segment itself scaled with the number of cold
+/// segments, so a large enough dataset exhausted the descriptor table. Capping
+/// that scheme without eviction is not enough either: the first segments to go
+/// cold would keep their handles forever while segments actually being read got
+/// none. This keeps a fixed number and evicts by second chance, so the handles
+/// that survive are the ones being used.
+///
+/// Sharded because it sits on every cold read and a single lock would serialise
+/// them, which is the mistake the residency lock already made once.
+struct BackupFdCache {
+    shards: Vec<parking_lot::Mutex<FdShard>>,
+}
+
+struct FdShard {
+    /// Fixed slots. `None` means free; eviction reuses a slot in place so the
+    /// structure never grows.
+    slots: Vec<Option<FdSlot>>,
+    /// CLOCK hand.
+    hand: usize,
+}
+
+struct FdSlot {
+    key: (usize, u64, u64),
+    file: Arc<File>,
+    /// Set on every hit, cleared when the hand passes: one second chance.
+    used: bool,
+}
+
+impl BackupFdCache {
+    fn new(capacity: usize) -> Self {
+        // Shard for concurrency, but not so finely that each shard holds a
+        // handful of slots -- second chance needs room to be meaningful, and a
+        // 4-slot shard evicts entries that are still in use.
+        let shards = (capacity / 32).clamp(1, 16);
+        let per_shard = (capacity / shards).max(8);
+        BackupFdCache {
+            shards: (0..shards)
+                .map(|_| {
+                    parking_lot::Mutex::new(FdShard {
+                        slots: (0..per_shard).map(|_| None).collect(),
+                        hand: 0,
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    fn shard_of(&self, key: &(usize, u64, u64)) -> &parking_lot::Mutex<FdShard> {
+        // seq_id alone would cluster; mixing all three spreads segments evenly.
+        let h = key.0 as u64 ^ key.1.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ key.2;
+        &self.shards[(h as usize) % self.shards.len()]
+    }
+
+    fn get(&self, key: &(usize, u64, u64)) -> Option<Arc<File>> {
+        let mut shard = self.shard_of(key).lock();
+        for slot in shard.slots.iter_mut() {
+            if let Some(entry) = slot {
+                if entry.key == *key {
+                    entry.used = true;
+                    return Some(entry.file.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn insert(&self, key: (usize, u64, u64), file: Arc<File>) {
+        let mut shard = self.shard_of(&key).lock();
+        // Already cached by a racing reader.
+        if shard.slots.iter().flatten().any(|e| e.key == key) {
+            return;
+        }
+        let len = shard.slots.len();
+        for _ in 0..(len * 2) {
+            let idx = shard.hand % len;
+            shard.hand = shard.hand.wrapping_add(1);
+            match &mut shard.slots[idx] {
+                None => {
+                    shard.slots[idx] = Some(FdSlot { key, file, used: true });
+                    COLD_BACKUP_FDS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Some(entry) if entry.used => {
+                    // Second chance: survives this pass, not the next.
+                    entry.used = false;
+                }
+                Some(_) => {
+                    // Evicting drops the handle, closing the descriptor.
+                    shard.slots[idx] = Some(FdSlot { key, file, used: true });
+                    COLD_BACKUP_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn remove(&self, key: &(usize, u64, u64)) {
+        let mut shard = self.shard_of(key).lock();
+        for slot in shard.slots.iter_mut() {
+            if slot.as_ref().map_or(false, |e| e.key == *key) {
+                *slot = None;
+                COLD_BACKUP_FDS.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+lazy_static! {
+    static ref BACKUP_FD_CACHE: BackupFdCache = BackupFdCache::new(cold_backup_fd_cap());
+}
+
+/// Handles closed to make room for another.
+pub static COLD_BACKUP_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 fn rlimit_nofile() -> Option<usize> {
     let mut lim = libc::rlimit {
@@ -276,13 +391,6 @@ pub struct BlockResidency {
     present: Vec<u64>,
     /// Bytes currently faulted in through this path, for memory accounting.
     resident_bytes: usize,
-    /// Open handle to the backup this index describes.
-    ///
-    /// One open per block fetched is a syscall and a path walk per read, and
-    /// smaller blocks mean more fetches, so the handle is held for as long as
-    /// the index that goes with it. Invalidated together with the index in
-    /// `clear`, because both describe one specific backup file.
-    backup: Option<Arc<File>>,
 }
 
 impl BlockResidency {
@@ -322,9 +430,6 @@ impl BlockResidency {
     /// against a file that no longer matches it.
     fn clear(&mut self) {
         self.index = None;
-        if self.backup.take().is_some() {
-            COLD_BACKUP_FDS.fetch_sub(1, Ordering::Relaxed);
-        }
         self.present.clear();
         self.resident_bytes = 0;
     }
@@ -534,6 +639,10 @@ impl Segment {
         let mut residency = self.block_residency.write();
         residency.clear();
         drop(residency);
+        // The cache keys on seq_id, so a re-archived segment would simply miss
+        // rather than read the wrong file. Releasing here just returns the
+        // descriptor promptly instead of waiting for the hand to reach it.
+        self.drop_cached_backup();
     }
 
     /// Clear partial residency and report the bytes released, so the caller --
@@ -749,12 +858,10 @@ impl Segment {
     /// Reads go through `read_at`, which takes its own offset and so does not
     /// disturb a file position, making one handle safe to share across threads.
     fn backup_file(&self) -> io::Result<Arc<File>> {
-        if let Some(f) = self.block_residency.read().backup.as_ref() {
-            return Ok(f.clone());
+        let key = (self.chunk_id, self.id, self.seq_id);
+        if let Some(f) = BACKUP_FD_CACHE.get(&key) {
+            return Ok(f);
         }
-        // Past the cap, serve without caching. The handle is still correct --
-        // it is simply reopened next time, as it was before caching existed.
-        let may_cache = COLD_BACKUP_FDS.load(Ordering::Relaxed) < cold_backup_fd_cap();
         let path = {
             let state = self.file_state.lock();
             state
@@ -766,21 +873,17 @@ impl Segment {
         };
         let file = Arc::new(File::open(&path)?);
         COLD_BLOCK_OPENS.fetch_add(1, Ordering::Relaxed);
-        if !may_cache {
-            return Ok(file);
-        }
+        // Racing openers both insert; the cache keeps one and the other's
+        // handle closes when its Arc drops. Correct either way, and cheaper
+        // than holding a lock across the open.
+        BACKUP_FD_CACHE.insert(key, file.clone());
+        Ok(file)
+    }
 
-        let mut residency = self.block_residency.write();
-        // Another thread may have cached one while this opened; keep theirs so
-        // a single handle is shared rather than one per racing reader.
-        match residency.backup.as_ref() {
-            Some(existing) => Ok(existing.clone()),
-            None => {
-                residency.backup = Some(file.clone());
-                COLD_BACKUP_FDS.fetch_add(1, Ordering::Relaxed);
-                Ok(file)
-            }
-        }
+    /// Forget this segment's cached handle. Called when the backup it refers to
+    /// is no longer the right file to read.
+    fn drop_cached_backup(&self) {
+        BACKUP_FD_CACHE.remove(&(self.chunk_id, self.id, self.seq_id));
     }
 
     /// Read the header and block index from this segment's backup file.
@@ -2111,5 +2214,103 @@ mod tests {
         segment.punch_hole(0);
 
         assert!(true, "Edge cases handled correctly");
+    }
+}
+
+#[cfg(test)]
+mod backup_fd_cache_tests {
+    use super::*;
+
+    fn dummy_handle() -> Arc<File> {
+        // Any real descriptor will do; the cache never reads through it here.
+        Arc::new(File::open("/dev/null").expect("/dev/null should open"))
+    }
+
+    /// The cache must stay at its capacity and evict, not grow.
+    ///
+    /// The integration test cannot show this: producing more cold segments than
+    /// the live cap means tens of gigabytes of data. Exercising the structure
+    /// directly with a small capacity tests the property that actually matters
+    /// -- a 1.7TB import pinned 64,860 descriptors against a 65,535 limit and
+    /// took the server down with EMFILE.
+    #[test]
+    fn cache_evicts_rather_than_growing() {
+        let cap = 64;
+        let cache = BackupFdCache::new(cap);
+        let occupied = || {
+            cache
+                .shards
+                .iter()
+                .map(|s| s.lock().slots.iter().flatten().count())
+                .sum::<usize>()
+        };
+        let slots = cache
+            .shards
+            .iter()
+            .map(|s| s.lock().slots.len())
+            .sum::<usize>();
+
+        for i in 0..(slots * 8) as u64 {
+            cache.insert((0, i, 0), dummy_handle());
+        }
+
+        assert_eq!(
+            occupied(),
+            slots,
+            "cache should be full at its fixed size, never larger"
+        );
+        assert!(
+            slots <= cap + 16,
+            "total slots {} should honour the requested capacity {}",
+            slots,
+            cap
+        );
+    }
+
+    /// Handles being used should outlast handles that are not.
+    ///
+    /// Bounding alone is not enough: capping without eviction quality would let
+    /// the first segments to go cold keep the descriptors forever while the
+    /// segments actually being read got none. Second chance cannot promise any
+    /// individual entry survives -- when every slot is in use something must
+    /// go -- so the property tested is the one the policy actually provides:
+    /// used entries survive at a far higher rate than untouched ones.
+    #[test]
+    fn used_handles_outlast_untouched_ones() {
+        let cache = BackupFdCache::new(512);
+        let hot: Vec<_> = (0..32u64).map(|i| (0, 900_000 + i, 0)).collect();
+        let cold: Vec<_> = (0..32u64).map(|i| (0, 800_000 + i, 0)).collect();
+        for k in hot.iter().chain(cold.iter()) {
+            cache.insert(*k, dummy_handle());
+        }
+
+        // Churn through unrelated keys, touching only the hot set as we go.
+        for i in 0..2_000u64 {
+            for k in &hot {
+                let _ = cache.get(k);
+            }
+            cache.insert((1, i, 0), dummy_handle());
+        }
+
+        let hot_alive = hot.iter().filter(|k| cache.get(k).is_some()).count();
+        let cold_alive = cold.iter().filter(|k| cache.get(k).is_some()).count();
+        assert!(
+            hot_alive > cold_alive,
+            "handles in use ({} of {}) should outlast untouched ones ({}), \
+             otherwise the cache is evicting blind",
+            hot_alive,
+            hot.len(),
+            cold_alive
+        );
+    }
+
+    #[test]
+    fn removal_frees_a_slot() {
+        let cache = BackupFdCache::new(64);
+        let key = (7, 7, 7);
+        cache.insert(key, dummy_handle());
+        assert!(cache.get(&key).is_some());
+        cache.remove(&key);
+        assert!(cache.get(&key).is_none(), "removed handle should be gone");
     }
 }
