@@ -29,7 +29,7 @@ fn test_segment_initial_alignment() {
             seg.addr % 8 == 0
         );
         assert_eq!(seg.addr % 8, 0, "Segment address must be 8-byte aligned");
-        assert_eq!(seg.bound % 8, 0, "Segment bound must be 8-byte aligned");
+        assert_eq!(seg.bound() % 8, 0, "Segment bound must be 8-byte aligned");
         assert_eq!(
             seg.append_header.load(std::sync::atomic::Ordering::Acquire) % 8,
             0,

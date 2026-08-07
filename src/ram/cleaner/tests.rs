@@ -130,7 +130,7 @@ fn test_shrink_fully_utilized_segment() {
 
     segment
         .append_header
-        .store(segment.bound, Ordering::Relaxed);
+        .store(segment.bound(), Ordering::Relaxed);
 
     let used_size = segment.append_header.load(Ordering::Relaxed) - segment.addr;
     assert_eq!(used_size, SEGMENT_SIZE, "Segment should be fully utilized");

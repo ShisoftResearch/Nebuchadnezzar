@@ -624,7 +624,7 @@ impl Chunk {
             .filter(|segment| {
                 segment.segment_class() == SegmentClass::Regular
                     && segment.is_hot()
-                    && segment.append_header.load(Ordering::Acquire) < segment.bound
+                    && segment.append_header.load(Ordering::Acquire) < segment.bound()
             })
             .max_by_key(|segment| segment.seq_id)
             .map(|segment| segment.id)

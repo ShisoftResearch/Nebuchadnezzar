@@ -351,44 +351,81 @@ pub fn wal_sync_interval_ms() -> i64 {
 }
 
 #[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment
+/// A segment: one 8 MiB slice of a chunk's address space plus its bookkeeping.
+///
+/// One instance exists per segment ON DISK, not per segment in memory -- a
+/// 2 TB store holds ~250,000 of these structs resident while 90%+ of their
+/// data is cold. Everything here is therefore per-cold-segment overhead
+/// (see the fd-cache EMFILE incident for how that scales), and the layout is
+/// deliberate:
+///
+/// * `repr(C, align(64))`: fields are grouped by access pattern rather than
+///   left to the compiler, so the per-read `references` counter and the
+///   per-write `append_header` sit apart from read-only identity, and the
+///   struct starts cache-line aligned.
+/// * `bound` is not stored; it is always `addr + SEGMENT_SIZE` (see
+///   [`Self::bound`]).
+/// * `dead_bits` is lazy. Eagerly it was 128 KiB *per segment* -- 31 GB of
+///   heap at 245K segments, the largest single heap consumer of a terabyte
+///   import -- almost all of it for cold segments whose bitmap is never
+///   consulted (the combine cleaner skips cold segments).
+#[repr(C, align(64))]
 pub struct Segment {
+    // --- identity & geometry: written at construction, read everywhere ---
     pub id: u64,
     pub seq_id: u64,
     pub chunk_id: usize,
-    segment_class: SegmentClass,
     pub addr: usize,
-    pub bound: usize,
+
+    // --- write-path atomics ---
     pub append_header: AtomicUsize,
+    pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
+    pub last_sync_time: AtomicI64,     // Timestamp of last fsync in milliseconds
+    /// Per-read reference count; the hottest atomic in the struct.
+    references: AtomicUsize,
+
+    // --- cleaner bookkeeping ---
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
-    /// One bit per 8 bytes of segment space, set when the entry starting at
-    /// that offset dies. Collection consults the bitmap before probing the
-    /// cell index, so scan cost tracks live entries instead of backlog.
-    dead_bits: Vec<AtomicU64>,
     /// Generation counter for changes that introduce dead space (dead cells or tombstones)
     dead_bytes_generation: AtomicU64,
     /// Marker used by cleaners to skip segments that were cleaned without reclaiming space
     last_no_progress_clean_generation: AtomicU64,
-    references: AtomicUsize,
-    pub file_state: parking_lot::Mutex<SegmentFileState>,
-    pub dropped: AtomicBool,
-    // Tiered memory fields
-    /// Segment lock for tiered memory operations (eviction, promotion, cleaner)
-    /// Holds the hot/cold state: false = hot (anonymous memory), true = cold (backed by file)
-    /// Cell read/write operations do NOT need this lock, only cell-level locks
-    pub tiered_lock: AtomicU8, // 1 = hot, 2 = cold, highest bit for locking
-    pub reference_count: AtomicU8, // Multi-chance CLOCK: 0-7 chances before eviction
-    pub access_count: AtomicU8,    // Tracks cold accesses for promotion threshold
+
+    // --- tiering timestamps ---
     /// Timestamp in ms of last promotion, used to avoid immediate re-eviction
     pub last_promoted_ms: AtomicI64,
     /// Timestamp in ms of last eviction, used for churn detection
     pub last_evicted_ms: AtomicI64,
+
+    // --- byte-sized state, clustered so padding is paid once ---
+    segment_class: SegmentClass,
+    pub dropped: AtomicBool,
     /// Tracks if WAL has been written to since last successful archive
     /// Used to optimize eviction: if archived=true && is_dirty=false, can skip re-archiving
     is_dirty: AtomicBool,
-    // WAL batch sync tracking (for group commit optimization)
-    pub last_sync_time: AtomicI64, // Timestamp of last fsync in milliseconds
-    pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
+    /// Segment lock for tiered memory operations (eviction, promotion, cleaner)
+    /// Holds the hot/cold state. Cell read/write operations do NOT need this
+    /// lock, only cell-level locks.
+    pub tiered_lock: AtomicU8, // 1 = hot, 2 = cold, highest bit for locking
+    pub reference_count: AtomicU8, // Multi-chance CLOCK: 0-7 chances before eviction
+    pub access_count: AtomicU8,    // Tracks cold accesses for promotion threshold
+
+    // --- lock-guarded cold state ---
+    /// One bit per 8 bytes of segment space, set when the entry starting at
+    /// that offset dies. Collection consults the bitmap before probing the
+    /// cell index, so scan cost tracks live entries instead of backlog.
+    ///
+    /// PURELY an optimization: the cell index probe is the authority, and a
+    /// missing bit only costs a probe. That is what licenses the laziness --
+    /// `None` until the first dead entry lands while the segment is hot
+    /// (marks on cold segments are skipped: the combine cleaner never scans
+    /// cold segments, so their bits would never be read), and dropped at
+    /// eviction. An `RwLock` rather than a bare `AtomicPtr` because markers
+    /// can run holding only an `AArc` -- no segment reference -- so eviction's
+    /// exclusive guard cannot prove no marker holds the pointer.
+    dead_bits: parking_lot::RwLock<Option<Box<[AtomicU64]>>>,
+    pub file_state: parking_lot::Mutex<SegmentFileState>,
 
     /// Partial residency for a cold segment: which backup blocks have been
     /// faulted back into this segment's address range, and the block index
@@ -529,19 +566,19 @@ impl Segment {
             chunk_id, id, seq_id, size, buffer_ptr
         );
         let tiered_lock = if hot { HOT_SEGMENT } else { COLD_SEGMENT };
+        let _ = size;
         Segment {
             addr: buffer_ptr,
             id,
             seq_id,
             chunk_id,
             segment_class,
-            bound: buffer_ptr + size,
             append_header: AtomicUsize::new(buffer_ptr),
             dead_space: AtomicU32::new(0),
             tombstones: AtomicU32::new(0),
-            dead_bits: (0..SEGMENT_SIZE / 8 / 64)
-                .map(|_| AtomicU64::new(0))
-                .collect(),
+            // Lazy: allocated on the first dead entry while hot, dropped at
+            // eviction. See the field doc for why this is safe.
+            dead_bits: parking_lot::RwLock::new(None),
             dead_bytes_generation: AtomicU64::new(0),
             last_no_progress_clean_generation: AtomicU64::new(0),
             references: AtomicUsize::new(0),
@@ -572,7 +609,7 @@ impl Segment {
         loop {
             let curr_last = self.append_header.load(Ordering::Acquire);
             let exp_last = curr_last + size;
-            if exp_last > self.bound {
+            if exp_last > self.bound() {
                 return None;
             } else {
                 if self
@@ -631,7 +668,7 @@ impl Segment {
         let aligned_addr = align_address(PAGE_SIZE, start_addr);
 
         // Calculate the size to free (from aligned address to end of segment)
-        let end_addr = self.bound;
+        let end_addr = self.bound();
 
         if aligned_addr < end_addr {
             let size = end_addr - aligned_addr;
@@ -960,18 +997,62 @@ impl Segment {
         }
     }
 
+    /// Exclusive upper address of this segment's space. Always
+    /// `addr + SEGMENT_SIZE`; derived rather than stored.
+    #[inline]
+    pub fn bound(&self) -> usize {
+        self.addr + SEGMENT_SIZE
+    }
+
     /// Marks the entry starting at `addr` dead in the per-segment bitmap.
+    ///
+    /// The bitmap is allocated on the first mark, and only while the segment
+    /// is hot: the combine cleaner never scans cold segments, so bits marked
+    /// on a cold segment would never be read. Losing a mark is always safe --
+    /// the scan falls back to probing the cell index, which is the authority.
     #[inline]
     pub fn mark_dead_bit(&self, addr: usize) {
         let offset = (addr - self.addr) / 8;
-        self.dead_bits[offset / 64].fetch_or(1u64 << (offset % 64), Ordering::Release);
+        {
+            let bits = self.dead_bits.read();
+            if let Some(bits) = bits.as_ref() {
+                bits[offset / 64].fetch_or(1u64 << (offset % 64), Ordering::Release);
+                return;
+            }
+        }
+        if self.is_cold() {
+            return;
+        }
+        let mut guard = self.dead_bits.write();
+        let bits = guard.get_or_insert_with(|| {
+            (0..SEGMENT_SIZE / 8 / 64)
+                .map(|_| AtomicU64::new(0))
+                .collect()
+        });
+        bits[offset / 64].fetch_or(1u64 << (offset % 64), Ordering::Release);
     }
 
-    /// True when the entry starting at `addr` was marked dead.
+    /// True when the entry starting at `addr` was marked dead. A missing
+    /// bitmap reads as "not dead", which merely costs the caller an index
+    /// probe.
     #[inline]
     pub fn is_dead_at(&self, addr: usize) -> bool {
         let offset = (addr - self.addr) / 8;
-        self.dead_bits[offset / 64].load(Ordering::Acquire) & (1u64 << (offset % 64)) != 0
+        self.dead_bits
+            .read()
+            .as_ref()
+            .map_or(false, |bits| {
+                bits[offset / 64].load(Ordering::Acquire) & (1u64 << (offset % 64)) != 0
+            })
+    }
+
+    /// Drop the dead-entry bitmap, returning its heap to the allocator.
+    /// Called at eviction: a cold segment's bitmap is never consulted, and
+    /// 128 KiB per cold segment was the largest heap consumer of a terabyte
+    /// import. If the segment is later promoted and takes new dead entries,
+    /// the bitmap re-materializes on the first mark.
+    pub fn clear_dead_bits(&self) {
+        let _ = self.dead_bits.write().take();
     }
 
     pub fn dead_space(&self) -> u32 {
@@ -1783,7 +1864,7 @@ impl Segment {
 
     #[inline]
     pub fn contains_address(&self, addr: usize) -> bool {
-        self.addr <= addr && addr < self.bound
+        self.addr <= addr && addr < self.bound()
     }
 
     pub fn set_dirty(&self) {
@@ -2190,6 +2271,66 @@ pub unsafe fn madvise_free(addr: usize, size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ~250,000 Segment structs stay resident for a terabyte store, so both
+    /// their inline size and what they eagerly drag onto the heap are
+    /// regression surfaces.
+    ///
+    /// Inline: 5 cache lines. If a legitimate field pushes past this, raise
+    /// the bound consciously -- do not let the compiler pad silently (the
+    /// struct is repr(C, align(64)), so ordering is part of the contract).
+    ///
+    /// Heap: a fresh segment must allocate NO dead-entry bitmap. Eagerly that
+    /// bitmap was 128 KiB x 245K segments = 31 GB, the largest single heap
+    /// consumer of the 1.78 TB Wikidata import, almost all of it for cold
+    /// segments whose bitmap is never read.
+    #[test]
+    fn segment_struct_stays_lean() {
+        assert!(
+            std::mem::align_of::<Segment>() == 64,
+            "Segment must stay cache-line aligned"
+        );
+        assert!(
+            std::mem::size_of::<Segment>() <= 5 * 64,
+            "Segment grew past 5 cache lines: {} bytes -- new field or \
+             widened type? Justify before raising this bound",
+            std::mem::size_of::<Segment>()
+        );
+
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE);
+        let file_manager = Arc::new(SegmentFileManager::new(None, None));
+        let seg = allocator
+            .alloc_seg(&file_manager)
+            .expect("allocate test segment");
+
+        assert!(
+            seg.dead_bits.read().is_none(),
+            "a fresh segment must not allocate the dead-entry bitmap"
+        );
+
+        // First dead mark on a hot segment materializes the bitmap...
+        seg.mark_dead_bit(seg.addr + 64);
+        assert!(seg.dead_bits.read().is_some());
+        assert!(seg.is_dead_at(seg.addr + 64));
+        assert!(!seg.is_dead_at(seg.addr + 128));
+
+        // ...and eviction gives it back.
+        seg.clear_dead_bits();
+        assert!(seg.dead_bits.read().is_none());
+        assert!(
+            !seg.is_dead_at(seg.addr + 64),
+            "cleared bits read as not-dead (safe: scan falls back to the index probe)"
+        );
+
+        // Marks on a cold segment are skipped entirely -- its bitmap is never
+        // consulted, so allocating it would be 128 KiB of write-only memory.
+        seg.set_cold();
+        seg.mark_dead_bit(seg.addr + 64);
+        assert!(
+            seg.dead_bits.read().is_none(),
+            "a cold segment must not materialize the bitmap"
+        );
+    }
 
     #[test]
     fn test_punch_hole_alignment() {
