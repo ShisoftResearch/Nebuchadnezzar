@@ -34,6 +34,14 @@ pub struct SchemaStatistics {
 pub struct ChunkStatistics {
     pub timestamp: AtomicU32,
     pub changes: AtomicU32,
+    /// Single-flight guard for the refresh. A refresh walks the ENTIRE cell
+    /// index -- `entries()` alone materializes ~400 MB for a full 16 GB chunk
+    /// -- and the counter/timestamp gate does not stop concurrent writers
+    /// from all passing it at once. Without this, a write-heavy phase against
+    /// a large chunk had all 192 tokio workers re-scanning the same chunk
+    /// concurrently: request handlers starved (edge batches timed out) and
+    /// the discarded scan buffers churned >100 GB of allocator free lists.
+    refreshing: std::sync::atomic::AtomicBool,
     pub schemas: PtrHashMap<u32, Arc<SchemaStatistics>>,
 }
 
@@ -58,25 +66,88 @@ pub fn schema_tracks_statistics(schema_id: u32) -> bool {
             .contains(&schema_id)
 }
 
+/// At most this many statistics refreshes run process-wide. Refresh cost
+/// scales with TOTAL cells in a chunk while its trigger scales with writes,
+/// so on a large store every chunk wants to refresh constantly; the refresh
+/// runs synchronously on the write path (a tokio worker), and 128 chunks
+/// refreshing at once occupied every worker in the runtime -- request
+/// handlers starved and edge batches timed out wholesale. Statistics are
+/// advisory; requests are not.
+const MAX_CONCURRENT_REFRESHES: usize = 4;
+static ACTIVE_REFRESHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Clears the refresh flag even if the scan panics; a poisoned flag would
+/// silently disable statistics forever.
+struct ResetOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+impl Drop for ResetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl ChunkStatistics {
     pub fn new() -> Self {
         Self {
             timestamp: AtomicU32::new(0),
             changes: AtomicU32::new(0),
+            refreshing: std::sync::atomic::AtomicBool::new(false),
             schemas: PtrHashMap::with_capacity(32),
         }
     }
     pub fn refresh_from_chunk(&self, chunk: &Chunk) {
         let last_update = self.timestamp.load(Ordering::Relaxed);
         let refresh_changes = self.changes.fetch_add(1, Ordering::Relaxed) + 1;
-        if refresh_changes < REFRESH_CHANGES_THRESHOLD || now() - last_update < 10 {
+        // The interval grows with the chunk: a refresh walks every cell, so a
+        // fixed 10 s cadence that suited a hundred-thousand-cell chunk turns
+        // into a standing full-scan load at tens of millions. One second per
+        // million cells keeps refresh cost a bounded fraction of scan cost.
+        let min_interval = std::cmp::max(10, (chunk.cell_count() / 1_000_000) as u32);
+        if refresh_changes < REFRESH_CHANGES_THRESHOLD || now() - last_update < min_interval {
             return;
         }
         let claimed_changes = self.changes.swap(0, Ordering::AcqRel);
         if claimed_changes < REFRESH_CHANGES_THRESHOLD {
             return;
         }
-        self.ensured_refresh_chunk(chunk)
+        // Single flight: exactly one refresh per chunk at a time. A loser
+        // returns its claim so the changes still count toward the next
+        // refresh instead of vanishing.
+        if self
+            .refreshing
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            self.changes
+                .fetch_add(claimed_changes, Ordering::Relaxed);
+            return;
+        }
+        let done = ResetOnDrop(&self.refreshing);
+        // Process-wide cap, after the per-chunk flag: a loser here also
+        // returns its claim and lets a later write retry.
+        if ACTIVE_REFRESHES.fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            >= MAX_CONCURRENT_REFRESHES
+        {
+            ACTIVE_REFRESHES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.changes
+                .fetch_add(claimed_changes, Ordering::Relaxed);
+            return;
+        }
+        // Guarded like the flag: a panicking scan must not leak a slot.
+        struct SlotGuard;
+        impl Drop for SlotGuard {
+            fn drop(&mut self) {
+                ACTIVE_REFRESHES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        let slot = SlotGuard;
+        self.ensured_refresh_chunk(chunk);
+        drop(slot);
+        drop(done);
     }
 
     pub fn ensured_refresh_chunk(&self, chunk: &Chunk) {
@@ -229,9 +300,28 @@ fn build_partitation_statistics(
             continue;
         }
         let loc = addr;
+        // This scan reads raw addresses without cell locks or segment
+        // references, by design -- stale results are acceptable for
+        // statistics. That bargain has two consequences it must honor itself:
+        //
+        // * A cold segment's pages are MADV_DONTNEED'd and read back zeroed,
+        //   so decoding them yields garbage, silently and without I/O. Skip
+        //   cold segments outright -- a histogram of zeros is worse than a
+        //   histogram missing cold cells.
+        // * Even for hot segments the entry may be mid-write or the address
+        //   stale, so decode through the non-panicking path. A panic here
+        //   runs inside a rayon worker and takes the whole server down, which
+        //   is how a recovered store (218K cold segments) died on its first
+        //   statistics refresh.
+        match chunk.locate_segment(loc) {
+            Some(seg) if !seg.is_cold() => {}
+            _ => continue,
+        }
         match header_from_chunk_raw(loc) {
             Ok((header, _)) => {
-                let (entry_hdr, _) = Entry::decode_from(loc, |_, _| ());
+                let Some((entry_hdr, _)) = Entry::try_decode_from(loc, |_, _| ()) else {
+                    continue;
+                };
                 let cell_size = entry_hdr.content_length as usize;
                 let cell_seg = chunk.allocator.id_by_addr(loc);
                 let schema_id = header.schema;

@@ -77,6 +77,36 @@ impl Entry {
         pos + ENTRY_HEAD_SIZE
     }
 
+    /// Decode an entry header, or `None` when the bytes at `pos` are not a
+    /// valid entry.
+    ///
+    /// For callers that read raw addresses WITHOUT holding cell locks or
+    /// segment references -- the statistics scan is one, by design ("slightly
+    /// stale data is acceptable") -- garbage is an expected outcome, not
+    /// corruption: the address may point into a segment that went cold (its
+    /// pages read back zeroed), was combined away, or is mid-write. Such
+    /// callers must skip, not panic; `decode_from` panicking inside a rayon
+    /// worker took down a whole server when a recovered store's statistics
+    /// refresh walked into a cold segment.
+    pub fn try_decode_from<R, RR>(pos: usize, content_read: R) -> Option<(EntryHeader, RR)>
+    where
+        R: Fn(usize, EntryHeader) -> RR,
+    {
+        if pos % 8 != 0 {
+            return None;
+        }
+        let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut [u8; 8] as *mut [u8]) });
+        let entry_type_bits = cursor.read_u32::<Endian>().unwrap();
+        let content_length = cursor.read_u32::<Endian>().unwrap();
+        release_cursor(cursor);
+        let entry_type = EntryType::from_bits(entry_type_bits)?;
+        let entry = EntryHeader {
+            entry_type,
+            content_length,
+        };
+        Some((entry, content_read(Self::content_pos(pos), entry)))
+    }
+
     // Returns the entry header reader returns
     pub fn decode_from<R, RR>(mut pos: usize, content_read: R) -> (EntryHeader, RR)
     where

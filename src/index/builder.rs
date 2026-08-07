@@ -432,6 +432,29 @@ pub static INDEX_TASK_GLOBAL: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub static INDEX_GLOBAL_WAIT_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Unscoped index tasks currently spawned but not yet finished.
+///
+/// Request-scoped tasks are awaited by their request, so HTTP concurrency
+/// bounds them. Unscoped tasks -- the transaction path -- are spawned the
+/// moment they are created and nothing waits for them at creation time, so
+/// this gauge is the only view of how far execution has fallen behind
+/// production. Each in-flight task retains its payload (cell data, index
+/// keys, schema fields) until it completes: heap profiling the edge phase of
+/// a terabyte import found the largest live-heap chain typed as exactly that
+/// payload, which made an unbounded backlog here the prime suspect.
+pub static INDEX_TASKS_INFLIGHT: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Decrements the in-flight gauge when the task finishes, unwind included --
+/// a panicking index task must not leak a gauge increment, or the reading
+/// drifts up forever and any admission control keyed on it starves.
+struct InflightGuard;
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        INDEX_TASKS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
     // Inside a request scope the future is only collected; it is spawned once
     // for the whole request when the scope closes. Outside one there is no
@@ -453,7 +476,12 @@ fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 's
     }
 
     INDEX_TASK_GLOBAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let handle = tokio::spawn(pending.take().expect("index task should exist"));
+    INDEX_TASKS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let task = pending.take().expect("index task should exist");
+    let handle = tokio::spawn(async move {
+        let _guard = InflightGuard;
+        task.await
+    });
     let t0 = std::time::Instant::now();
     let mut guard = PENDING_INDEX_TASKS.lock();
     INDEX_GLOBAL_WAIT_NANOS

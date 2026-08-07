@@ -1,4 +1,43 @@
 use crate::ram::segs::SEGMENT_SIZE;
+
+/// glibc heap totals. Cheap (reads allocator bookkeeping, no page walk), so
+/// unlike the mincore walk this is always on.
+#[cfg(target_os = "linux")]
+fn heap_info() -> (usize, usize, usize, usize) {
+    let mi = unsafe { libc::mallinfo2() };
+    (
+        mi.uordblks as usize,
+        mi.fordblks as usize,
+        mi.arena as usize,
+        mi.hblkhd as usize,
+    )
+}
+#[cfg(not(target_os = "linux"))]
+fn heap_info() -> (usize, usize, usize, usize) {
+    (0, 0, 0, 0)
+}
+
+/// Whether to walk the maps with `mincore` for per-structure residency.
+///
+/// Off by default. The walk is cheap in CPU (~0.5 ms per 1.5 GiB map, ~70 ms
+/// for 128 chunks) but it takes the process `mmap_lock` for read, and chunk
+/// retirement takes that lock for write to sentinel-remap and `MADV_DONTNEED`
+/// released tables. A hard-polled status endpoint would contend with exactly
+/// the reclamation path this accounting exists to verify, so it is opt-in:
+/// set `NEB_STATUS_RESIDENCY=1` when diagnosing.
+fn residency_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NEB_STATUS_RESIDENCY").is_ok())
+}
+
+/// Resident set size of this process, from `/proc/self/statm` (pages).
+fn process_rss_bytes() -> usize {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<usize>().ok()))
+        .map(|pages| pages * 4096)
+        .unwrap_or(0)
+}
 use crate::server::NebServer;
 /// Per-chunk memory statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,6 +50,11 @@ pub struct ChunkMemoryStatus {
     pub cold_memory_bytes: usize,
     pub total_memory_bytes: usize,
     pub cell_count: usize,
+    /// Real resident memory of this chunk's `cell_index`, from `mincore` over
+    /// the live table structures. Attributes index cost directly instead of
+    /// inferring it as "RSS minus segments", which lumps in every other map,
+    /// the ranged index, and the heap.
+    pub cell_index_resident_bytes: usize,
 }
 
 /// Overall server memory status
@@ -28,6 +72,56 @@ pub struct ServerMemoryStatus {
     pub total_cold_memory_bytes: usize,
     pub total_memory_bytes: usize,
     pub total_cells: usize,
+    /// Sum of every chunk's `cell_index_resident_bytes`. Compare against RSS
+    /// minus segments: the remainder is the ranged index, full-text shards,
+    /// transaction state and plain heap -- none of which the cell index
+    /// explains, and which has been the largest unattributed term.
+    pub total_cell_index_resident_bytes: usize,
+    /// Segment sequence index, one `WordMap` per chunk.
+    pub total_seg_index_resident_bytes: usize,
+    /// Schema lookup maps (id -> schema, name -> id).
+    pub schema_maps_resident_bytes: usize,
+    /// Tiered manager's per-chunk state map.
+    pub tiered_states_resident_bytes: usize,
+    /// Full-text in-memory caches (`field_stats`, `doc_metadata`). Covers the
+    /// PtrHashMap tables and their node buffers only -- `doc_metadata` is keyed
+    /// per (schema, field, doc) and each value is an `Arc<Mutex<DocMeta>>` whose
+    /// payload lives on the heap and lands in `unattributed` instead.
+    pub fulltext_maps_resident_bytes: usize,
+    /// glibc heap accounting (`mallinfo2`), which splits the unattributed
+    /// remainder into memory the program is actually holding versus memory the
+    /// allocator has taken from the OS but is not lending out.
+    ///   * `heap_in_use`  - live allocations (`uordblks`)
+    ///   * `heap_free`    - on free lists, held by the allocator (`fordblks`)
+    ///   * `heap_arena`   - sbrk arena total (`arena`)
+    ///   * `heap_mmap`    - large blocks served by mmap (`hblkhd`)
+    /// `heap_free` growing while `heap_in_use` is flat is fragmentation or
+    /// per-thread arena retention, not a leak in the program.
+    /// Ranged index: registry-map residency, tree count, and total live keys.
+    /// The B-tree nodes are plain heap (`NodeCellRef`), so mincore cannot see
+    /// them -- the key count is what sizes this index, and it lands in
+    /// `heap_in_use` below.
+    pub ranged_maps_resident_bytes: usize,
+    pub ranged_tree_count: usize,
+    pub ranged_key_count: usize,
+    pub heap_in_use_bytes: usize,
+    pub heap_free_bytes: usize,
+    pub heap_arena_bytes: usize,
+    pub heap_mmap_bytes: usize,
+    /// Everything above, i.e. the Lightning tables this build can reach.
+    pub attributed_map_resident_bytes: usize,
+    /// Process RSS, so the remainder is explicit rather than inferred.
+    pub process_rss_bytes: usize,
+    /// `process_rss - resident_segments - attributed_maps`, where resident
+    /// segments are the hot tier plus faulted-in cold bytes. Do NOT use
+    /// `total_segments * SEGMENT_SIZE` here: that counts cold segments whose
+    /// data lives on disk, overstates residency once tiering engages, and
+    /// floors this to zero. Whatever this holds is
+    /// neither tiered data nor a map we account for: the ranged-index B-trees,
+    /// full-text posting shards, transaction state, allocator retention and
+    /// plain heap. This has been the largest unexplained term at scale, so it
+    /// is reported rather than left to subtraction by hand.
+    pub unattributed_resident_bytes: usize,
     pub living_transactions: usize,
     pub physical_memory_limit_bytes: Option<usize>,
     pub tiered_memory_enabled: bool,
@@ -81,6 +175,9 @@ pub struct ServerMemoryStatus {
     /// Index tasks by route, and time spent waiting for the global backlog lock.
     pub index_task_local: u64,
     pub index_task_global: u64,
+    /// Unscoped index tasks spawned but not yet finished. Growth here is
+    /// execution falling behind production; each task retains its payload.
+    pub index_tasks_inflight: i64,
     pub index_global_wait_ms: u64,
     /// Breakdown of the secondary-index phase.
     pub idx_probe_us: u64,
@@ -238,6 +335,8 @@ impl NebServer {
         let mut total_segments = 0;
         let mut total_cells = 0;
 
+        let mut total_index_resident = 0usize;
+        let mut total_seg_index_resident = 0usize;
         // Collect statistics for each chunk
         for chunk in &chunks.list {
             let segments = chunk.segments();
@@ -245,6 +344,11 @@ impl NebServer {
             let cold_count = segments.iter().filter(|s| s.is_cold()).count();
             let seg_count = segments.len();
             let cell_count = chunk.cell_count();
+            let index_resident = if residency_enabled() {
+                chunk.cell_index.resident_pages() * 4096
+            } else {
+                0
+            };
 
             let hot_memory = hot_count * SEGMENT_SIZE;
             let cold_memory = cold_count * SEGMENT_SIZE;
@@ -259,13 +363,57 @@ impl NebServer {
                 cold_memory_bytes: cold_memory,
                 total_memory_bytes: total_memory,
                 cell_count,
+                cell_index_resident_bytes: index_resident,
             });
 
             total_hot_segments += hot_count;
             total_cold_segments += cold_count;
             total_segments += seg_count;
             total_cells += cell_count;
+            total_index_resident += index_resident;
+            if residency_enabled() {
+                total_seg_index_resident += chunk.segs.index_resident_bytes();
+            }
         }
+
+        let schema_resident = if residency_enabled() {
+            self.meta().schemas.resident_bytes()
+        } else {
+            0
+        };
+        let tiered_states_resident = if residency_enabled() {
+            chunks
+                .tiered_manager
+                .as_ref()
+                .map(|m| m.states_resident_bytes())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let fulltext_resident = if residency_enabled() {
+            self.indexer()
+                .and_then(|b| b.clients.fulltext_indexer())
+                .map(|f| f.resident_bytes())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let (ranged_trees, ranged_keys, ranged_maps) = if residency_enabled() {
+            crate::index::ranged::tree::service::LOCAL_TREE_SERVICE
+                .get()
+                .map(|svc| svc.index_stats())
+                .unwrap_or((0, 0, 0))
+        } else {
+            (0, 0, 0)
+        };
+        let attributed = total_index_resident
+            + total_seg_index_resident
+            + schema_resident
+            + tiered_states_resident
+            + fulltext_resident
+            + ranged_maps;
+        let process_rss = process_rss_bytes();
+        let (heap_in_use, heap_free, heap_arena, heap_mmap) = heap_info();
 
         // The shared pool holds the server-wide limit directly — no per-chunk multiplication.
         let (total_physical_limit, tiered_enabled) =
@@ -311,6 +459,24 @@ impl NebServer {
             total_cold_memory_bytes: total_cold_segments * SEGMENT_SIZE,
             total_memory_bytes: total_segments * SEGMENT_SIZE,
             total_cells,
+            total_cell_index_resident_bytes: total_index_resident,
+            total_seg_index_resident_bytes: total_seg_index_resident,
+            schema_maps_resident_bytes: schema_resident,
+            tiered_states_resident_bytes: tiered_states_resident,
+            fulltext_maps_resident_bytes: fulltext_resident,
+            ranged_maps_resident_bytes: ranged_maps,
+            ranged_tree_count: ranged_trees,
+            ranged_key_count: ranged_keys,
+            heap_in_use_bytes: heap_in_use,
+            heap_free_bytes: heap_free,
+            heap_arena_bytes: heap_arena,
+            heap_mmap_bytes: heap_mmap,
+            attributed_map_resident_bytes: attributed,
+            process_rss_bytes: process_rss,
+            unattributed_resident_bytes: process_rss
+                .saturating_sub(total_hot_segments * SEGMENT_SIZE)
+                .saturating_sub(tiered_counters.cold_resident_bytes as usize)
+                .saturating_sub(attributed),
             living_transactions,
             physical_memory_limit_bytes: total_physical_limit,
             tiered_memory_enabled: tiered_enabled,
@@ -346,6 +512,7 @@ impl NebServer {
             write_stats_us: crate::ram::chunk::WRITE_STATS_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
             index_task_local: crate::index::builder::INDEX_TASK_LOCAL.load(std::sync::atomic::Ordering::Relaxed),
             index_task_global: crate::index::builder::INDEX_TASK_GLOBAL.load(std::sync::atomic::Ordering::Relaxed),
+            index_tasks_inflight: crate::index::builder::INDEX_TASKS_INFLIGHT.load(std::sync::atomic::Ordering::Relaxed),
             index_global_wait_ms: crate::index::builder::INDEX_GLOBAL_WAIT_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
             idx_probe_us: crate::index::builder::IDX_PROBE_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
             idx_key_us: crate::index::builder::IDX_KEY_NANOS.load(std::sync::atomic::Ordering::Relaxed) / 1000,
