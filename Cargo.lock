@@ -1591,7 +1591,7 @@ dependencies = [
 [[package]]
 name = "lightning-containers"
 version = "0.2.2"
-source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#7ab2a3b866e8e6f9e26facb1a1cb019762e47ed0"
+source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#583561f1761b5afdee2370f75851302ed761afcc"
 dependencies = [
  "affinity",
  "ahash",

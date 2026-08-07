@@ -550,6 +550,13 @@ pub struct InvertedIndexer {
 }
 
 impl InvertedIndexer {
+    /// Resident bytes of the in-memory full-text caches. Note this covers the
+    /// PtrHashMap tables and their value-node buffers, not the `FieldStats` /
+    /// `DocMeta` payloads behind the `Arc<Mutex<..>>`, which live on the heap.
+    pub fn resident_bytes(&self) -> usize {
+        (self.field_stats.resident_pages() + self.doc_metadata.resident_pages()) * 4096
+    }
+
     pub fn new(
         server_id: u64,
         chunks: Arc<Chunks>,

@@ -174,6 +174,11 @@ pub struct TieredMemoryManager {
 }
 
 impl TieredMemoryManager {
+    /// Resident bytes of the per-chunk state map.
+    pub fn states_resident_bytes(&self) -> usize {
+        self.chunk_states.resident_pages() * 4096
+    }
+
     /// Create a new shared tiered memory manager.
     pub fn new(shared_pool: Arc<SharedMemoryPool>) -> Self {
         TieredMemoryManager {

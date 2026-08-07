@@ -2234,12 +2234,16 @@ pub async fn init_ranged_indexer_service<C>(
         ranged::sm::generate_scoped_sm_id(group_name, database_name),
         raft_client,
     ));
+    let tree_service = Arc::new(ranged::tree::service::TreeService::new(
+        neb_client, &sm_client,
+    ));
+    // Publish a process-local handle so status reporting can size the ranged
+    // index; the RPC registry is otherwise the only owner.
+    let _ = ranged::tree::service::LOCAL_TREE_SERVICE.set(tree_service.clone());
     rpc_server
         .register_service_with_id(
             ranged::tree::service::generate_scoped_service_id(group_name, database_name),
-            &Arc::new(ranged::tree::service::TreeService::new(
-                neb_client, &sm_client,
-            )),
+            &tree_service,
         )
         .await;
 

@@ -66,6 +66,11 @@ impl SegmentList {
         }
     }
 
+    /// Resident bytes of the segment sequence index (one WordMap per chunk).
+    pub fn index_resident_bytes(&self) -> usize {
+        self.seq_id_index.resident_pages() * 4096
+    }
+
     /// Set a bit in the bitmap
     #[inline]
     fn set_bit(&self, index: usize) {

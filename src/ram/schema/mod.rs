@@ -663,6 +663,10 @@ impl LocalSchemasCache {
     pub fn get(&self, id: &u32) -> Option<SchemaRef> {
         self.map.get(id)
     }
+    /// Resident bytes of the schema maps behind this cache.
+    pub fn resident_bytes(&self) -> usize {
+        self.map.resident_bytes()
+    }
     pub fn debug_only_new_schema(&self, schema: Schema) {
         if !cfg!(debug_assertions) {
             panic!("for debug only");
@@ -745,6 +749,11 @@ pub enum DelSchemaError {
 }
 
 impl LocalSchemasMap {
+    /// Resident bytes of the two schema lookup maps.
+    pub fn resident_bytes(&self) -> usize {
+        (self.schema_map.resident_pages() + self.name_map.resident_pages()) * 4096
+    }
+
     pub fn new() -> Self {
         debug!("Schema map created");
         Self {

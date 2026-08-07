@@ -61,6 +61,13 @@ pub struct DistTree {
     prop: RwLock<DistProp>,
 }
 
+impl DistTree {
+    /// Live keys in this tree's in-memory B-tree.
+    pub fn key_count(&self) -> usize {
+        self.tree.tree.len()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistProp {
     boundary: Boundary,
@@ -116,6 +123,13 @@ service! {
 }
 
 service_with_id!(TreeService, DEFAULT_SERVICE_ID);
+
+/// Process-local handle to this node's tree service, published at
+/// construction. The service is otherwise only reachable through the RPC
+/// registry, so status reporting has no way to ask it how large the ranged
+/// index is. Read-only; nothing on an operation path touches it.
+pub static LOCAL_TREE_SERVICE: std::sync::OnceLock<std::sync::Arc<TreeService>> =
+    std::sync::OnceLock::new();
 
 pub struct TreeService {
     client: Arc<AsyncClient>,
@@ -597,6 +611,25 @@ impl Service for TreeService {
 }
 
 impl TreeService {
+    /// Ranged-index size: (trees, total keys, registry map resident bytes).
+    ///
+    /// Key counts come from each B-tree's `len` atomic, which is what actually
+    /// tracks the in-memory node population -- the nodes are plain heap
+    /// (`NodeCellRef`), invisible to mincore, so counting them is the only way
+    /// to size this index.
+    pub fn index_stats(&self) -> (usize, usize, usize) {
+        let trees = self.trees.entries();
+        let keys = trees.iter().map(|(_, t)| t.key_count()).sum();
+        (trees.len(), keys, self.resident_bytes())
+    }
+
+    /// Resident bytes of the tree registries. The B-tree *pages* themselves are
+    /// stored as cells inside the tiered segments, so they are already counted
+    /// there -- this is only the in-memory index of trees.
+    pub fn resident_bytes(&self) -> usize {
+        (self.trees.resident_pages() + self.pending_migrations.resident_pages()) * 4096
+    }
+
     pub fn new(client: &Arc<AsyncClient>, sm_client: &Arc<SMClient>) -> Self {
         info!("Initializing LSM tree service");
         let trees_map = Arc::new(HashMap::with_capacity(32));
