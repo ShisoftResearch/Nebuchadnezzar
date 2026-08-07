@@ -315,6 +315,136 @@ pub fn block_layout(data: &[u8]) -> Option<BlockLayout> {
     })
 }
 
+/// Resident form of a backup's block index, at half the on-disk size.
+///
+/// A cold segment that has served a block read keeps its index in memory for
+/// the life of its backup, and anything held per cold segment scales with the
+/// dataset -- the raw form (16-byte header + 12 bytes per block) reaches
+/// ~4.9 GiB across a 1.7 TB store at a 4 KiB block target. This packs each
+/// entry to 6 bytes: u24 `uncompressed_start` + u24 `file_offset`, both
+/// bounded by construction (a segment is 8 MiB; a backup file is the 16-byte
+/// header + index + blocks of at most that much). `compressed_len` is not
+/// stored at all: the writer lays blocks out contiguously
+/// (`compress_spans` advances one cursor), so each block's length is the gap
+/// to the next block's offset, with one trailing u32 carrying the file end
+/// for the last block.
+pub struct PackedBlockIndex {
+    /// `block_count` entries of 6 bytes, then a 4-byte little-endian file end.
+    packed: Box<[u8]>,
+    raw: bool,
+}
+
+const PACKED_ENTRY_SIZE: usize = 6;
+const U24_MAX: usize = (1 << 24) - 1;
+
+impl PackedBlockIndex {
+    /// Pack a raw on-disk index (header included). `file_len` bounds the last
+    /// block. Returns `None` when the bytes are not a block index or any value
+    /// exceeds u24 -- impossible for a well-formed backup, so `None` means
+    /// corruption and the caller treats the backup as unreadable-by-block.
+    pub fn from_index_bytes(data: &[u8], file_len: usize) -> Option<Self> {
+        let layout = block_layout(data)?;
+        let n = layout.block_count;
+        if n == 0 || file_len > U24_MAX || data.len() < BLOCK_HEADER_SIZE + n * BLOCK_INDEX_ENTRY_SIZE
+        {
+            return None;
+        }
+        let mut packed = vec![0u8; n * PACKED_ENTRY_SIZE + 4].into_boxed_slice();
+        for i in 0..n {
+            let at = BLOCK_HEADER_SIZE + i * BLOCK_INDEX_ENTRY_SIZE;
+            let rd = |o: usize| {
+                u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize
+            };
+            let (start, off) = (rd(at), rd(at + 4));
+            if start > U24_MAX || off > U24_MAX {
+                return None;
+            }
+            let p = i * PACKED_ENTRY_SIZE;
+            packed[p..p + 3].copy_from_slice(&(start as u32).to_le_bytes()[..3]);
+            packed[p + 3..p + 6].copy_from_slice(&(off as u32).to_le_bytes()[..3]);
+        }
+        let end = packed.len() - 4;
+        packed[end..].copy_from_slice(&(file_len as u32).to_le_bytes());
+        Some(PackedBlockIndex {
+            packed,
+            raw: layout.raw,
+        })
+    }
+
+    #[inline]
+    fn read_u24(&self, at: usize) -> usize {
+        u32::from_le_bytes([self.packed[at], self.packed[at + 1], self.packed[at + 2], 0]) as usize
+    }
+
+    #[inline]
+    pub fn block_count(&self) -> usize {
+        (self.packed.len() - 4) / PACKED_ENTRY_SIZE
+    }
+
+    pub fn raw(&self) -> bool {
+        self.raw
+    }
+
+    /// Heap bytes this index holds resident, for the residency accounting.
+    pub fn heap_bytes(&self) -> usize {
+        self.packed.len()
+    }
+
+    /// Entry for `block_idx`, as (uncompressed_start, file_offset, compressed_len).
+    /// The length is the distance to the next block's offset -- blocks are
+    /// contiguous in the file -- or to the file end for the last block.
+    pub fn entry(&self, block_idx: usize) -> io::Result<(usize, usize, usize)> {
+        let n = self.block_count();
+        if block_idx >= n {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("block {} out of range ({})", block_idx, n),
+            ));
+        }
+        let p = block_idx * PACKED_ENTRY_SIZE;
+        let start = self.read_u24(p);
+        let off = self.read_u24(p + 3);
+        let next_off = if block_idx + 1 < n {
+            self.read_u24((block_idx + 1) * PACKED_ENTRY_SIZE + 3)
+        } else {
+            let e = self.packed.len() - 4;
+            u32::from_le_bytes([
+                self.packed[e],
+                self.packed[e + 1],
+                self.packed[e + 2],
+                self.packed[e + 3],
+            ]) as usize
+        };
+        let len = next_off.checked_sub(off).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "non-monotonic block offsets")
+        })?;
+        Ok((start, off, len))
+    }
+
+    /// Block holding uncompressed `offset`, and the offset within that block.
+    /// Binary search over the packed starts, as `BlockLayout::locate`.
+    pub fn locate(&self, offset: usize) -> io::Result<(usize, usize)> {
+        let n = self.block_count();
+        let (mut lo, mut hi) = (0usize, n - 1);
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if self.read_u24(mid * PACKED_ENTRY_SIZE) <= offset {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let start = self.read_u24(lo * PACKED_ENTRY_SIZE);
+        if offset < start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("offset {} precedes first block", offset),
+            ));
+        }
+        Ok((lo, offset - start))
+    }
+}
+
 /// Decompress one block. This is the point of the format: serving a cold read
 /// touches `block_size` bytes rather than the whole segment.
 pub fn decompress_block(data: &[u8], block_idx: usize) -> io::Result<Vec<u8>> {
@@ -586,6 +716,55 @@ mod tests {
         // And the bytes at that offset really are there.
         let block = decompress_block(&packed, idx).unwrap();
         assert_eq!(block[within], data[offset]);
+    }
+
+    /// The packed resident index must agree with the on-disk layout entry for
+    /// entry: same block for every offset, same (start, file_offset), and a
+    /// compressed_len DERIVED from neighbour offsets that matches the stored
+    /// one -- that derivation is what lets it drop a third of every entry, and
+    /// it is only sound because the writer lays blocks out contiguously. At
+    /// half the bytes it exists for one reason: a cold segment keeps its index
+    /// resident for as long as it stays cold, and per-cold-segment memory
+    /// scales with the dataset.
+    #[test]
+    fn packed_index_agrees_with_layout_at_half_the_size() {
+        let data = segment_like(1 << 20);
+        let file = compress_blocks(&data).unwrap();
+        let layout = block_layout(&file).unwrap();
+        let index_len = BLOCK_HEADER_SIZE + layout.block_count * BLOCK_INDEX_ENTRY_SIZE;
+
+        let packed = PackedBlockIndex::from_index_bytes(&file[..index_len], file.len())
+            .expect("well-formed index must pack");
+
+        assert_eq!(packed.block_count(), layout.block_count);
+        assert_eq!(packed.raw(), layout.raw);
+        assert!(
+            packed.heap_bytes() * 2 <= index_len + BLOCK_HEADER_SIZE,
+            "packed ({}) should be about half the raw index ({})",
+            packed.heap_bytes(),
+            index_len
+        );
+
+        for idx in 0..layout.block_count {
+            let (s, o, l) = layout.entry(&file, idx).unwrap();
+            assert_eq!(packed.entry(idx).unwrap(), (s, o, l), "entry {idx}");
+        }
+        for offset in (0..data.len()).step_by(997) {
+            assert_eq!(
+                packed.locate(offset).unwrap(),
+                layout.locate(&file, offset).unwrap(),
+                "offset {offset}"
+            );
+        }
+        // The derived length of the LAST block reaches exactly the file end.
+        let (_, o, l) = packed.entry(layout.block_count - 1).unwrap();
+        assert_eq!(o + l, file.len());
+
+        // Rejects what it cannot represent rather than mis-packing it.
+        assert!(
+            PackedBlockIndex::from_index_bytes(&file[..index_len], (1 << 24) + 1).is_none(),
+            "a file too large for u24 offsets must refuse to pack"
+        );
     }
 
     #[test]

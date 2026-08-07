@@ -448,10 +448,12 @@ pub struct Segment {
 /// Per-segment state for serving reads from a cold segment without promoting it.
 #[derive(Default)]
 pub struct BlockResidency {
-    /// Header plus block index read from the backup file, kept resident so a
-    /// lookup costs no I/O after the first. ~3 KiB per segment at a 32 KiB
-    /// block target.
-    index: Option<Vec<u8>>,
+    /// Block index of the backup file, kept resident so a lookup costs no
+    /// I/O after the first -- in the packed 6-bytes-per-block form
+    /// ([`crate::ram::compression::PackedBlockIndex`]), half the on-disk
+    /// index size, because it lives for as long as the segment stays cold
+    /// and per-cold-segment memory scales with the dataset.
+    index: Option<crate::ram::compression::PackedBlockIndex>,
     /// One bit per block, set once that block has been written back into the
     /// segment's memory.
     present: Vec<u64>,
@@ -764,11 +766,7 @@ impl Segment {
     /// Blocks currently faulted in, and the total the backup holds.
     pub fn block_residency_stats(&self) -> (usize, usize) {
         let r = self.block_residency.read();
-        let total = r
-            .index
-            .as_deref()
-            .and_then(crate::ram::compression::block_layout)
-            .map_or(0, |l| l.block_count);
+        let total = r.index.as_ref().map_or(0, |i| i.block_count());
         (r.present_count(), total)
     }
 
@@ -808,13 +806,11 @@ impl Segment {
         {
             let residency = self.block_residency.read();
             if let Some(index) = residency.index.as_ref() {
-                if let Some(layout) = crate::ram::compression::block_layout(index) {
-                    let (block_idx, _within) = layout.locate(index, offset)?;
-                    if residency.is_present(block_idx) {
-                        COLD_BLOCK_HITS.fetch_add(1, Ordering::Relaxed);
-                        COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
-                        return Ok(Some(0));
-                    }
+                let (block_idx, _within) = index.locate(offset)?;
+                if residency.is_present(block_idx) {
+                    COLD_BLOCK_HITS.fetch_add(1, Ordering::Relaxed);
+                    COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(0));
                 }
             }
         }
@@ -833,19 +829,15 @@ impl Segment {
                         // 4 KiB block target -- and memory the pressure
                         // calculation cannot see is exactly what let residency
                         // grow unbounded before.
-                        residency.resident_bytes += index.len();
-                        newly_accounted += index.len();
+                        residency.resident_bytes += index.heap_bytes();
+                        newly_accounted += index.heap_bytes();
                         residency.index = Some(index);
                     }
                     None => return Ok(None),
                 }
             }
             let index = residency.index.as_ref().unwrap();
-            let Some(layout) = crate::ram::compression::block_layout(index) else {
-                return Ok(None);
-            };
-
-            let (block_idx, _within) = layout.locate(index, offset)?;
+            let (block_idx, _within) = index.locate(offset)?;
             if residency.is_present(block_idx) {
                 COLD_BLOCK_HITS.fetch_add(1, Ordering::Relaxed);
                 COLD_BLOCK_SERVES.fetch_add(1, Ordering::Relaxed);
@@ -854,8 +846,8 @@ impl Segment {
             }
             COLD_BLOCK_MISSES.fetch_add(1, Ordering::Relaxed);
 
-            let (block_start, file_off, comp_len) = layout.entry(index, block_idx)?;
-            (block_idx, block_start, file_off, comp_len, layout.raw)
+            let (block_start, file_off, comp_len) = index.entry(block_idx)?;
+            (block_idx, block_start, file_off, comp_len, index.raw())
         };
 
         // Read and decompress with no lock held. Two threads missing the same
@@ -955,7 +947,7 @@ impl Segment {
     /// Read the header and block index from this segment's backup file.
     ///
     /// `Ok(None)` means the backup is not in the block-indexed format.
-    fn load_block_index(&self) -> io::Result<Option<Vec<u8>>> {
+    fn load_block_index(&self) -> io::Result<Option<compression::PackedBlockIndex>> {
         use crate::ram::compression;
         let state = self.file_state.lock();
         let Some(path) = state
@@ -983,7 +975,13 @@ impl Segment {
         let index_len = 16 + layout.block_count * 12;
         let mut index = vec![0u8; index_len];
         read_exact_at(&file, &mut index, 0)?;
-        Ok(Some(index))
+        // The file length bounds the last block: blocks are laid out
+        // contiguously after the index, so the packed form derives every
+        // block's compressed length from its neighbour's offset and this end.
+        let file_len = file.metadata()?.len() as usize;
+        Ok(compression::PackedBlockIndex::from_index_bytes(
+            &index, file_len,
+        ))
     }
 
     fn append_header(&self) -> usize {
