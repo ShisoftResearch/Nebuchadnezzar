@@ -1,20 +1,22 @@
 use crate::ram::segs::SEGMENT_SIZE;
 
-/// glibc heap totals. Cheap (reads allocator bookkeeping, no page walk), so
-/// unlike the mincore walk this is always on.
-#[cfg(target_os = "linux")]
+/// Heap totals from the global-allocator shim (`crate::mem_shim`): exact
+/// live bytes from two relaxed atomics per alloc — genuinely always-on.
+///
+/// This replaces `mallinfo2`, whose "cheap bookkeeping read" is anything
+/// but at scale: it walks every arena's bins WITH THE ARENA LOCK HELD,
+/// which at a few hundred GB of heap takes seconds-to-minutes and stalls
+/// every allocating thread. Measured on the TB12 import: status polls put
+/// the busiest thread 78-99% inside `int_mallinfo` and each poll knocked
+/// the ingest rate into a trough. The shim keeps the same JSON shape:
+/// in_use = live bytes; the free/arena/mmap split was a glibc concept —
+/// arena now mirrors live, free reports 0, and the large-block band is
+/// served exactly by the >=128K histogram buckets (`heap_buckets`).
 fn heap_info() -> (usize, usize, usize, usize) {
-    let mi = unsafe { libc::mallinfo2() };
-    (
-        mi.uordblks as usize,
-        mi.fordblks as usize,
-        mi.arena as usize,
-        mi.hblkhd as usize,
-    )
-}
-#[cfg(not(target_os = "linux"))]
-fn heap_info() -> (usize, usize, usize, usize) {
-    (0, 0, 0, 0)
+    let live = crate::mem_shim::live_bytes();
+    let buckets = crate::mem_shim::bucket_stats();
+    let large: usize = buckets[1..].iter().map(|(b, _)| b).sum();
+    (live, 0, live, large)
 }
 
 /// Whether to walk the maps with `mincore` for per-structure residency.
@@ -88,15 +90,16 @@ pub struct ServerMemoryStatus {
     /// per (schema, field, doc) and each value is an `Arc<Mutex<DocMeta>>` whose
     /// payload lives on the heap and lands in `unattributed` instead.
     pub fulltext_maps_resident_bytes: usize,
-    /// glibc heap accounting (`mallinfo2`), which splits the unattributed
-    /// remainder into memory the program is actually holding versus memory the
-    /// allocator has taken from the OS but is not lending out.
-    ///   * `heap_in_use`  - live allocations (`uordblks`)
-    ///   * `heap_free`    - on free lists, held by the allocator (`fordblks`)
-    ///   * `heap_arena`   - sbrk arena total (`arena`)
-    ///   * `heap_mmap`    - large blocks served by mmap (`hblkhd`)
-    /// `heap_free` growing while `heap_in_use` is flat is fragmentation or
-    /// per-thread arena retention, not a leak in the program.
+    /// Heap accounting from the global-allocator shim (`mem_shim`): exact
+    /// live bytes, no allocator walk, no arena lock (see `heap_info`).
+    ///   * `heap_in_use`  - live allocation bytes (layout sizes)
+    ///   * `heap_free`    - always 0 (allocator retention is an RSS concern,
+    ///                      visible as `process_rss - attributed`, not a
+    ///                      demand gauge)
+    ///   * `heap_arena`   - mirrors `heap_in_use` (field kept for samplers)
+    ///   * `heap_mmap`    - live bytes in allocations >= 128 KiB (the
+    ///                      "large-block band" of the TB post-mortems)
+    /// `heap_buckets` below splits live bytes by size class.
     /// Ranged index: registry-map residency, tree count, and total live keys.
     /// The B-tree nodes are plain heap (`NodeCellRef`), so mincore cannot see
     /// them -- the key count is what sizes this index, and it lands in
@@ -108,6 +111,11 @@ pub struct ServerMemoryStatus {
     pub heap_free_bytes: usize,
     pub heap_arena_bytes: usize,
     pub heap_mmap_bytes: usize,
+    /// Live-allocation histogram by size class: bucket name -> (bytes,
+    /// count). Continuously answers "which band is growing" — the question
+    /// that previously took smaps walks (which hold `mmap_lock` and
+    /// perturb the workload being observed).
+    pub heap_buckets: std::collections::BTreeMap<String, (usize, usize)>,
     /// Everything above, i.e. the Lightning tables this build can reach.
     pub attributed_map_resident_bytes: usize,
     /// Process RSS, so the remainder is explicit rather than inferred.
@@ -471,6 +479,14 @@ impl NebServer {
             heap_free_bytes: heap_free,
             heap_arena_bytes: heap_arena,
             heap_mmap_bytes: heap_mmap,
+            heap_buckets: {
+                let stats = crate::mem_shim::bucket_stats();
+                crate::mem_shim::BUCKET_NAMES
+                    .iter()
+                    .zip(stats.iter())
+                    .map(|(name, (bytes, count))| (name.to_string(), (*bytes, *count)))
+                    .collect()
+            },
             attributed_map_resident_bytes: attributed,
             process_rss_bytes: process_rss,
             unattributed_resident_bytes: process_rss
