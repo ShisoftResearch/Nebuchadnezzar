@@ -456,57 +456,48 @@ fn build_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> Tar
     }
     // Build the approximated histogram from partitation histograms
     // https://arxiv.org/abs/1606.05633
-    // debug!("Building histogram with approximation");
-    let mut part_idxs = vec![0; partitations.len()];
-    let part_histos = partitations
-        .iter()
-        .map(|(histo, _, _)| histo)
-        .filter(|histo| !histo.is_empty())
-        .collect_vec();
+    //
+    // The k-way merge this used to do popped one key at a time with a
+    // linear min_by over every partition: O(total_keys x partitions),
+    // and both factors grow with chunk cell count, so the rebuild cost
+    // grew as cells^2 — a single refresh of a ~30M-cell chunk ground a
+    // thread for 25+ minutes (the TB13 P2AB wedge specimen). The merge
+    // of sorted runs is just a sort: flatten to (key, weight) and sort
+    // once, O(K log K) — milliseconds at the same scale.
     let num_total = partitations.iter().map(|(_, num, _)| num).sum::<usize>();
-    let part_depths = partitations
-        .iter()
-        .map(|(_, _, depth)| *depth)
-        .collect_vec();
     let max_key = partitations
         .iter()
         .filter_map(|(part, _, _)| part.last())
         .max()
         .cloned()
         .unwrap_or_default();
+    let mut all_keys: Vec<(HistogramKey, usize)> = Vec::with_capacity(num_all_keys);
+    for (histo, _, depth) in partitations.iter() {
+        all_keys.extend(histo.iter().map(|k| (*k, *depth)));
+    }
+    all_keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
     let target_width = num_total / HISTOGRAM_TARGET_BUCKETS;
     let mut target_histogram = [[0u8; 8]; HISTOGRAM_TARGET_KEYS];
-    // Perform a merge sort for sorted pre-histogram
+    // Same emission walk as the old merge: each bucket takes the first
+    // key once `target_width` worth of underlying rows has accumulated;
+    // an exhausted stream repeats the last key into remaining buckets.
+    let mut cursor = all_keys.iter();
     let mut filled = target_width;
-    let mut last_key = Default::default();
+    let mut last_key: (HistogramKey, usize) = Default::default();
     'HISTO_CONST: for i in 0..HISTOGRAM_TARGET_BUCKETS {
         loop {
-            let (key, ended) = if let Some((part_idx, histo)) = part_histos
-                .iter()
-                .enumerate()
-                .filter(|(i, h)| {
-                    let idx = part_idxs[*i];
-                    idx < h.len()
-                })
-                .min_by(|(i1, h1), (i2, h2)| {
-                    let h1_idx = part_idxs[*i1];
-                    let h2_idx = part_idxs[*i2];
-                    h1[h1_idx].cmp(&h2[h2_idx])
-                }) {
-                let histo_idx = part_idxs[part_idx];
-                part_idxs[part_idx] += 1;
-                ((histo[histo_idx], part_idx), false)
-            } else {
-                (last_key, true)
+            let (key, ended) = match cursor.next() {
+                Some(entry) => (*entry, false),
+                None => (last_key, true),
             };
             last_key = key;
-            let idx = last_key.1;
             if filled >= target_width || ended {
                 target_histogram[i] = last_key.0;
                 filled = 0;
                 continue 'HISTO_CONST;
             }
-            filled += part_depths[idx];
+            filled += last_key.1;
         }
     }
     target_histogram[HISTOGRAM_TARGET_BUCKETS] = max_key.clone();
@@ -611,6 +602,149 @@ mod tests {
     };
 
     use super::*;
+
+    /// The original k-way merge, kept verbatim as the oracle for the
+    /// sort-based rewrite: it popped one key at a time with a linear
+    /// min_by over every partition — O(total_keys x partitions), which
+    /// grows as cells^2 with chunk size (25+ minute refreshes at ~30M
+    /// cells). Correct, just unusable at scale.
+    fn build_histogram_kway_reference(
+        partitations: Vec<&(Vec<HistogramKey>, usize, usize)>,
+    ) -> TargetHistogram {
+        let mut part_idxs = vec![0; partitations.len()];
+        let part_histos = partitations
+            .iter()
+            .map(|(histo, _, _)| histo)
+            .filter(|histo| !histo.is_empty())
+            .collect_vec();
+        let num_total = partitations.iter().map(|(_, num, _)| num).sum::<usize>();
+        let part_depths = partitations
+            .iter()
+            .map(|(_, _, depth)| *depth)
+            .collect_vec();
+        let max_key = partitations
+            .iter()
+            .filter_map(|(part, _, _)| part.last())
+            .max()
+            .cloned()
+            .unwrap_or_default();
+        let target_width = num_total / HISTOGRAM_TARGET_BUCKETS;
+        let mut target_histogram = [[0u8; 8]; HISTOGRAM_TARGET_KEYS];
+        let mut filled = target_width;
+        let mut last_key: (HistogramKey, usize) = Default::default();
+        'HISTO_CONST: for i in 0..HISTOGRAM_TARGET_BUCKETS {
+            loop {
+                let (key, ended) = if let Some((part_idx, histo)) = part_histos
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, h)| {
+                        let idx = part_idxs[*i];
+                        idx < h.len()
+                    })
+                    .min_by(|(i1, h1), (i2, h2)| {
+                        let h1_idx = part_idxs[*i1];
+                        let h2_idx = part_idxs[*i2];
+                        h1[h1_idx].cmp(&h2[h2_idx])
+                    }) {
+                    let histo_idx = part_idxs[part_idx];
+                    part_idxs[part_idx] += 1;
+                    ((histo[histo_idx], part_idx), false)
+                } else {
+                    (last_key, true)
+                };
+                last_key = key;
+                let idx = last_key.1;
+                if filled >= target_width || ended {
+                    target_histogram[i] = last_key.0;
+                    filled = 0;
+                    continue 'HISTO_CONST;
+                }
+                filled += part_depths[idx];
+            }
+        }
+        target_histogram[HISTOGRAM_TARGET_BUCKETS] = max_key.clone();
+        target_histogram
+    }
+
+    /// Sort-based rewrite must reproduce the k-way merge exactly.
+    /// Keys are globally unique here: with duplicate keys across
+    /// partitions of different depths the two algorithms may order the
+    /// equal-key run differently, shifting a bucket boundary within
+    /// that run — immaterial for an approximation histogram, but it
+    /// would make byte-equality flaky.
+    #[test]
+    fn sort_based_histogram_matches_kway_reference() {
+        let mut rng = rand::thread_rng();
+        for case in 0..24usize {
+            let parts = 1 + case % 7;
+            let mut next_key: u64 = 0;
+            let partitions: Vec<(Vec<HistogramKey>, usize, usize)> = (0..parts)
+                .map(|p| {
+                    // Always at least HISTOGRAM_TARGET_KEYS per partition so
+                    // build_histogram takes the merge path being tested, not
+                    // the repeated_histogram redirect the reference lacks.
+                    let keys = HISTOGRAM_TARGET_KEYS + rng.gen_range(0..(50 + case * 40));
+                    let mut histo: Vec<HistogramKey> = (0..keys)
+                        .map(|_| {
+                            next_key += 1 + rng.gen_range(0..1000u64);
+                            next_key.to_be_bytes()
+                        })
+                        .collect();
+                    // Partitions arrive sorted but interleaved in key
+                    // space; rotate ranges so partition order != key order.
+                    if p % 2 == 1 {
+                        histo.reverse();
+                        histo.iter_mut().for_each(|k| {
+                            let v = u64::from_be_bytes(*k);
+                            *k = (u64::MAX / 2 - v).to_be_bytes();
+                        });
+                        histo.sort_unstable();
+                    }
+                    let depth = 1 + rng.gen_range(0..64usize);
+                    let num = histo.len() * depth;
+                    (histo, num, depth)
+                })
+                .collect();
+            let refs: Vec<&(Vec<HistogramKey>, usize, usize)> = partitions.iter().collect();
+            let expected = build_histogram_kway_reference(refs.clone());
+            let actual = build_histogram(refs);
+            assert_eq!(
+                actual, expected,
+                "sort-based histogram diverged from k-way reference (case {case})"
+            );
+        }
+    }
+
+    /// Wedge-specimen scale: ~30M cells => ~29.3K partitions x 101 keys.
+    /// The old k-way merge was O(total_keys x partitions) — ~87 billion
+    /// key comparisons here, a 25+ minute grind observed live. The sort
+    /// path must stay interactive at the same scale.
+    #[test]
+    fn histogram_merge_at_wedge_specimen_scale() {
+        let parts_n = 29_300usize;
+        let mut next = 0u64;
+        let partitions: Vec<(Vec<HistogramKey>, usize, usize)> = (0..parts_n)
+            .map(|_| {
+                let histo: Vec<HistogramKey> = (0..HISTOGRAM_PARTITATION_KEYS)
+                    .map(|_| {
+                        next += 3;
+                        next.to_be_bytes()
+                    })
+                    .collect();
+                (histo, HISTOGRAM_PARTITATION_SIZE, 10)
+            })
+            .collect();
+        let refs: Vec<&(Vec<HistogramKey>, usize, usize)> = partitions.iter().collect();
+        let start = std::time::Instant::now();
+        let histo = build_histogram(refs);
+        let elapsed = start.elapsed();
+        assert!(histo[0] != [0u8; 8]);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "full-scale histogram merge took {elapsed:?}; the quadratic merge is back"
+        );
+        println!("wedge-specimen-scale merge: {elapsed:?}");
+    }
 
     #[test]
     fn partitation_histogram() {
