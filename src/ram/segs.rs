@@ -246,6 +246,27 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
+/// Pooled 8 MiB staging buffers for `Segment::archive` (slab adopter #1).
+/// Bounded in practice by archiver concurrency; `cold_ranges` on so buffer
+/// memory returns to the OS when archiver threads retire.
+type ArchiveStagingBuf = [u8; SEGMENT_SIZE];
+
+fn archive_staging_pool(
+) -> &'static std::sync::Arc<lightning::slab_pool::SlabPool<ArchiveStagingBuf, 2>> {
+    static POOL: std::sync::OnceLock<
+        std::sync::Arc<lightning::slab_pool::SlabPool<ArchiveStagingBuf, 2>>,
+    > = std::sync::OnceLock::new();
+    POOL.get_or_init(|| lightning::slab_pool::SlabPool::new("archive_staging", true))
+}
+
+/// Frees the staging buffer on every exit path (plain data, no destructor).
+struct ArchiveStagingGuard(lightning::slab_pool::SlabHandle<ArchiveStagingBuf>);
+impl Drop for ArchiveStagingGuard {
+    fn drop(&mut self) {
+        archive_staging_pool().free_forget(self.0);
+    }
+}
+
 /// Assumed average payload of one cell, used only to pre-size the cell index.
 ///
 /// `WordMap` capacity is fixed at construction, so this number decides how many
@@ -1329,8 +1350,28 @@ impl Segment {
                         let data_block =
                             slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
 
-                        // Create a padded copy to SEGMENT_SIZE to match WAL-based archiving behavior
-                        let padded_data = Vec::from(data_block);
+                        // Snapshot the segment into a pooled staging buffer
+                        // (slab adopter #1; Lightning docs/slab-pools-
+                        // design.md). Previously a per-archive 8 MiB
+                        // Vec::from — one large-block heap alloc + free per
+                        // archived segment, continuously for the life of an
+                        // import. The pool is bounded by archiver
+                        // concurrency and recycles the same slots.
+                        let staging = archive_staging_pool();
+                        let staging_handle = staging.alloc_with(|slot| {
+                            ptr::copy_nonoverlapping(
+                                data_block.as_ptr(),
+                                slot.as_mut_ptr() as *mut u8,
+                                SEGMENT_SIZE,
+                            );
+                        });
+                        // Plain-data buffer: freed via free_forget on every
+                        // exit path by this guard.
+                        let _staging_guard = ArchiveStagingGuard(staging_handle);
+                        let padded_data: &[u8] = slice::from_raw_parts(
+                            staging_handle.as_ptr() as *const u8,
+                            SEGMENT_SIZE,
+                        );
 
                         debug_assert_eq!(padded_data.len(), SEGMENT_SIZE);
 

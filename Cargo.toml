@@ -102,3 +102,9 @@ harness = false
 [[bench]]
 name = "occ_transactions"
 harness = false
+
+# Feature-branch wiring: build against the slab-pools Lightning worktree.
+# Removed at merge time (Lightning feat/slab-pools merges first, then the
+# lock updates to the git rev as usual).
+[patch."ssh://git@192.168.10.134/shisoft-x/Lightning.git"]
+lightning-containers = { path = "../Lightning-slab" }
