@@ -916,15 +916,29 @@ impl DatabaseRuntime {
     }
 
     pub fn indexed_data_client(&self) -> IndexedDataClient {
+        // The indexer's embedded clients are scoped to the database they
+        // were constructed for. Reusing them for a DIFFERENT database
+        // resolves schemas, statistics, and index cells in the wrong
+        // scope: schema_by_id returns None, the planner builds no clause,
+        // and every indexed lookup answers instant-empty while the raw
+        // per-database query route works — the TB12 "claims/traverse
+        // hang, lookups empty" defect. (Single-database deployments and
+        // the unit suites never see this because the scopes coincide.)
+        // Fast path only when the scopes match; otherwise build a client
+        // scoped to this runtime's database.
         if let Some(index_builder) = self.indexer() {
-            IndexedDataClient::new_with_indexers(index_builder.clients.clone(), self.consh.clone())
-        } else {
-            let meta_plane_client = self.raft_client.plane(database_meta_plane_id(
-                &self.group_name,
-                &self.database_name,
-            ));
-            IndexedDataClient::new(&self.neb_client, &self.consh, &meta_plane_client)
+            if index_builder.clients.neb_client.database_name() == self.database_name {
+                return IndexedDataClient::new_with_indexers(
+                    index_builder.clients.clone(),
+                    self.consh.clone(),
+                );
+            }
         }
+        let meta_plane_client = self.raft_client.plane(database_meta_plane_id(
+            &self.group_name,
+            &self.database_name,
+        ));
+        IndexedDataClient::new(&self.neb_client, &self.consh, &meta_plane_client)
     }
 
     pub async fn data_client(&self, members: &Vec<String>) -> Result<AsyncClient, NebClientError> {
