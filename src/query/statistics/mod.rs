@@ -94,9 +94,22 @@ impl ChunkStatistics {
             schemas: PtrHashMap::with_capacity(32),
         }
     }
-    pub fn refresh_from_chunk(&self, chunk: &Chunk) {
+    /// Write-path hook: RECORD ONLY, never refresh. A refresh walks every
+    /// cell and can grind for minutes at scale; running it on the writer's
+    /// thread put that grind inside tokio worker polls — the id-list shard
+    /// workers froze mid-apply for exactly MAX_CONCURRENT_REFRESHES shards
+    /// and the whole edge phase wedged (P2AB). Writers bump the change
+    /// counter; the chunk sweeper thread does the walking.
+    pub fn refresh_from_chunk(&self, _chunk: &Chunk) {
+        self.changes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sweeper entry: refresh if the change/interval thresholds say so.
+    /// Runs on the dedicated statistics sweeper thread — never on a tokio
+    /// worker, never on a write path.
+    pub fn sweep_from_chunk(&self, chunk: &Chunk) {
         let last_update = self.timestamp.load(Ordering::Relaxed);
-        let refresh_changes = self.changes.fetch_add(1, Ordering::Relaxed) + 1;
+        let refresh_changes = self.changes.load(Ordering::Relaxed);
         // The interval grows with the chunk: a refresh walks every cell, so a
         // fixed 10 s cadence that suited a hundred-thousand-cell chunk turns
         // into a standing full-scan load at tens of millions. One second per
@@ -145,7 +158,25 @@ impl ChunkStatistics {
             }
         }
         let slot = SlotGuard;
-        self.ensured_refresh_chunk(chunk);
+        // A refresh walks every cell and can grind for minutes at scale. On a
+        // tokio pool worker that grind runs inside poll — and if that worker
+        // happens to hold the runtime's IO/time driver, tokio never steals it
+        // back: every timer and socket in the process freezes until the walk
+        // finishes (observed as a total server wedge in the P2AB edge-phase
+        // runs: importer connections dead, coordinator timeouts never firing,
+        // all runtime workers idle-parked off the driver). block_in_place
+        // hands the worker's core — and with it the driver — to a fresh
+        // thread before the walk starts. Non-runtime threads (cleaners,
+        // combine pools) and current_thread runtimes (tests) run inline as
+        // before; neither can hold a multi-thread driver.
+        let on_multithread_runtime = tokio::runtime::Handle::try_current()
+            .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        if on_multithread_runtime {
+            tokio::task::block_in_place(|| self.ensured_refresh_chunk(chunk));
+        } else {
+            self.ensured_refresh_chunk(chunk);
+        }
         drop(slot);
         drop(done);
     }
@@ -696,6 +727,9 @@ mod tests {
             let mut cell = OwnedCell { data, header };
             chunks.write_cell(&mut cell).unwrap();
         }
+        // Writes only RECORD changes now — the refresh itself belongs to the
+        // sweeper thread (or an explicit ensure), never the write path.
+        chunks.ensure_statistics();
         let stats = chunks.all_chunk_statistics(schema_id);
         assert_eq!(stats.len(), 1);
         let stat = stats[0].as_ref().unwrap();

@@ -1751,6 +1751,26 @@ impl Chunks {
             manager.register_chunks(&chunks_arc);
         }
 
+        // Statistics sweeper: the only place chunk statistics are rebuilt.
+        // Write paths just bump a change counter (a refresh walks every cell
+        // and can grind for minutes at scale; on a writer's thread that
+        // grind froze id-list shard workers inside their polls and wedged
+        // the whole edge phase). Weak: the thread must not keep the store
+        // alive, and exits when the Chunks drops (server-spawning tests).
+        {
+            let weak = Arc::downgrade(&chunks_arc);
+            std::thread::Builder::new()
+                .name("stats-sweeper".into())
+                .spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    let Some(chunks) = weak.upgrade() else { break };
+                    for chunk in &chunks.list {
+                        chunk.statistics.sweep_from_chunk(chunk);
+                    }
+                })
+                .expect("spawn stats-sweeper");
+        }
+
         // Store global pointer for signal handler access
         set_global_chunks(&chunks_arc);
 
