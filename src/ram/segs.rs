@@ -1393,6 +1393,41 @@ impl Segment {
                                 .map(|meta| meta.entry_pos.saturating_sub(self.addr))
                                 .take_while(|off| *off < SEGMENT_SIZE)
                                 .collect();
+
+                            // A segment holding appended bytes must yield at
+                            // least one entry. None means the walk found no
+                            // decodable header at `addr` — the resident image
+                            // is gone (zero-filled pages), not merely empty.
+                            // Archiving it would persist those zeros over a
+                            // good backup and silently destroy every cell the
+                            // index still points at: TB13 lost 15 segments
+                            // exactly this way, and the wreckage is legible in
+                            // the backups (block_count=1 from empty
+                            // boundaries, compressing 4-20x against the 2x
+                            // that real cell data achieves). Refuse instead,
+                            // loudly; the segment stays dirty and resident,
+                            // which is recoverable, while a zeroed backup is
+                            // not.
+                            let used = self.append_header.load(Ordering::Relaxed);
+                            if boundaries.is_empty() && used > self.addr {
+                                error!(
+                                    "REFUSING to archive segment {} (chunk {}, seq {}): {} appended bytes \
+                                     but no decodable entries — the resident image is zero-filled. \
+                                     Archiving would overwrite the backup with zeros.",
+                                    self.id,
+                                    self.chunk_id,
+                                    self.seq_id,
+                                    used - self.addr
+                                );
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "segment {} has appended bytes but no decodable entries; \
+                                         refusing to archive a zero-filled image",
+                                        self.id
+                                    ),
+                                ));
+                            }
                             let compressed_data =
                                 compression::compress_blocks_on_cells(&padded_data, &boundaries)?;
                             ARCHIVE_BYTES.fetch_add(compressed_data.len() as u64, Relaxed);
