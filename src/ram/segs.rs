@@ -1378,6 +1378,14 @@ impl Segment {
             // Backups are immutable once written, so an archive that would
             // shrink one to nothing is never legitimate: refuse and say so.
             // The segment keeps its existing backup and stays dirty.
+            //
+            // Every check that can refuse this archive runs HERE, before the
+            // first byte of the backup is disturbed. Refusing after the old
+            // backup has been renamed to `.old` and a fresh file truncated to
+            // zero is not a refusal at all -- it leaves the segment holding an
+            // empty backup, which is the exact loss these guards exist to
+            // prevent. On the TB14 store that is what happened: the zero-image
+            // guard fired correctly and the backup was already gone.
             if has_old_backup && self.append_header.load(Ordering::Relaxed) <= self.addr {
                 let old_len = fs::metadata(&backup_file).map(|m| m.len()).unwrap_or(0);
                 if old_len > 0 {
@@ -1397,6 +1405,54 @@ impl Segment {
                     ));
                 }
             }
+            // Break blocks on cell boundaries so a later read can decompress
+            // just the block holding the cell it wants, instead of the whole
+            // segment. Entry positions come from the live segment, which is
+            // resident here because we are archiving it.
+            //
+            // This walk reads memory only, so it belongs before the backup is
+            // touched -- it is also the zero-image test below.
+            #[cfg(feature = "compress_backups")]
+            let boundaries: Vec<usize> = self
+                .entry_iter()
+                .map(|meta| meta.entry_pos.saturating_sub(self.addr))
+                .take_while(|off| *off < SEGMENT_SIZE)
+                .collect();
+
+            // A segment holding appended bytes must yield at least one entry.
+            // None means the walk found no decodable header at `addr` -- the
+            // resident image is gone (zero-filled pages), not merely empty.
+            // Archiving it would persist those zeros over a good backup and
+            // silently destroy every cell the index still points at: TB13 lost
+            // 15 segments exactly this way, and the wreckage is legible in the
+            // backups (block_count=1 from empty boundaries, compressing 4-20x
+            // against the 2x that real cell data achieves). Refuse instead,
+            // loudly; the segment stays dirty and resident, which is
+            // recoverable, while a zeroed backup is not.
+            #[cfg(feature = "compress_backups")]
+            {
+                let used = self.append_header.load(Ordering::Relaxed);
+                if boundaries.is_empty() && used > self.addr {
+                    error!(
+                        "REFUSING to archive segment {} (chunk {}, seq {}): {} appended bytes \
+                         but no decodable entries — the resident image is zero-filled. \
+                         Archiving would overwrite the backup with zeros.",
+                        self.id,
+                        self.chunk_id,
+                        self.seq_id,
+                        used - self.addr
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "segment {} has appended bytes but no decodable entries; \
+                             refusing to archive a zero-filled image",
+                            self.id
+                        ),
+                    ));
+                }
+            }
+
             // If backup file already exists, we use make a backup of the existing file
             if has_old_backup {
                 debug!("Backup file {} already exists, moving to .old", backup_file);
@@ -1469,51 +1525,6 @@ impl Segment {
 
                         #[cfg(feature = "compress_backups")]
                         {
-                            // Break blocks on cell boundaries so a later read can
-                            // decompress just the block holding the cell it wants,
-                            // instead of the whole segment. Entry positions come
-                            // from the live segment, which is resident here
-                            // because we are archiving it.
-                            let boundaries: Vec<usize> = self
-                                .entry_iter()
-                                .map(|meta| meta.entry_pos.saturating_sub(self.addr))
-                                .take_while(|off| *off < SEGMENT_SIZE)
-                                .collect();
-
-                            // A segment holding appended bytes must yield at
-                            // least one entry. None means the walk found no
-                            // decodable header at `addr` — the resident image
-                            // is gone (zero-filled pages), not merely empty.
-                            // Archiving it would persist those zeros over a
-                            // good backup and silently destroy every cell the
-                            // index still points at: TB13 lost 15 segments
-                            // exactly this way, and the wreckage is legible in
-                            // the backups (block_count=1 from empty
-                            // boundaries, compressing 4-20x against the 2x
-                            // that real cell data achieves). Refuse instead,
-                            // loudly; the segment stays dirty and resident,
-                            // which is recoverable, while a zeroed backup is
-                            // not.
-                            let used = self.append_header.load(Ordering::Relaxed);
-                            if boundaries.is_empty() && used > self.addr {
-                                error!(
-                                    "REFUSING to archive segment {} (chunk {}, seq {}): {} appended bytes \
-                                     but no decodable entries — the resident image is zero-filled. \
-                                     Archiving would overwrite the backup with zeros.",
-                                    self.id,
-                                    self.chunk_id,
-                                    self.seq_id,
-                                    used - self.addr
-                                );
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "segment {} has appended bytes but no decodable entries; \
-                                         refusing to archive a zero-filled image",
-                                        self.id
-                                    ),
-                                ));
-                            }
                             let compressed_data =
                                 compression::compress_blocks_on_cells(&padded_data, &boundaries)?;
                             ARCHIVE_BYTES.fetch_add(compressed_data.len() as u64, Relaxed);
@@ -2483,6 +2494,61 @@ mod tests {
         assert!(
             seg.dead_bits.read().is_none(),
             "a cold segment must not materialize the bitmap"
+        );
+    }
+
+    /// A refused archive must leave the existing backup exactly as it was.
+    ///
+    /// The guards exist to stop a zero-filled image from overwriting a good
+    /// backup, but they used to fire *after* `archive()` had already renamed
+    /// the backup to `.old` and truncated a fresh file to zero -- so refusing
+    /// destroyed the very thing being protected. The refusal must happen
+    /// before any on-disk mutation.
+    #[cfg(feature = "compress_backups")]
+    #[test]
+    fn refused_archive_leaves_the_backup_untouched() {
+        let _ = env_logger::try_init();
+
+        let backup_dir = tempfile::tempdir().expect("backup dir");
+        let backup_path = backup_dir.path().to_string_lossy().into_owned();
+        let file_manager = Arc::new(SegmentFileManager::new(Some(backup_path), None));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let segment = allocator
+            .alloc_seg(&file_manager)
+            .expect("allocate test segment");
+
+        // Stand in for a real archive written earlier in the segment's life.
+        let backup_file = file_manager
+            .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+            .expect("backup path");
+        let good_backup = b"an earlier archive of this segment".to_vec();
+        std::fs::write(&backup_file, &good_backup).expect("seed backup");
+
+        // The failure mode: the segment claims a full 8 MiB of appended bytes
+        // while its pages read back as zeros, which is what a dropped
+        // (MADV_DONTNEED) resident image looks like.
+        segment
+            .append_header
+            .store(segment.addr + SEGMENT_SIZE - 64, Ordering::Relaxed);
+
+        let result = segment.archive();
+        assert!(
+            result.is_err(),
+            "archiving a zero-filled image must be refused"
+        );
+
+        let after = std::fs::read(&backup_file).expect("backup must still exist");
+        assert_eq!(
+            after, good_backup,
+            "the refused archive rewrote the backup it was meant to protect"
+        );
+        assert!(
+            !Path::new(&format!("{}.old", backup_file)).exists(),
+            "a refusal must not leave the backup renamed aside"
+        );
+        assert!(
+            segment.is_dirty(),
+            "a segment whose archive was refused stays dirty"
         );
     }
 
