@@ -1361,6 +1361,42 @@ impl Segment {
             // The reference counter is only for preventing madvise_free during eviction
             let backup_file_path = Path::new(&backup_file);
             let has_old_backup = backup_file_path.exists();
+
+            // An EMPTY segment must never replace a non-empty backup.
+            //
+            // A segment reporting zero appended bytes yields no entries, so
+            // `plan_blocks` collapses to a single whole-segment span and the
+            // archive writes an image of untouched memory. If that segment is
+            // in fact a live one whose append cursor was lost, the write
+            // destroys every cell the index still points at -- silently,
+            // because an empty segment looks legitimately empty to every
+            // check we have. TB14 lost 4 segments exactly this way: their
+            // backups carry block_count=1 and the archiver's zero-image guard
+            // could not fire, because that guard only triggers when the
+            // segment CLAIMS appended bytes.
+            //
+            // Backups are immutable once written, so an archive that would
+            // shrink one to nothing is never legitimate: refuse and say so.
+            // The segment keeps its existing backup and stays dirty.
+            if has_old_backup && self.append_header.load(Ordering::Relaxed) <= self.addr {
+                let old_len = fs::metadata(&backup_file).map(|m| m.len()).unwrap_or(0);
+                if old_len > 0 {
+                    error!(
+                        "REFUSING empty archive of segment {} (chunk {}, seq {}): the segment \
+                         reports no appended bytes but an existing backup holds {} bytes. \
+                         Its append cursor was lost; archiving would destroy the backup.",
+                        self.id, self.chunk_id, self.seq_id, old_len
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "segment {} reports empty but has a {}-byte backup; refusing to \
+                             overwrite it",
+                            self.id, old_len
+                        ),
+                    ));
+                }
+            }
             // If backup file already exists, we use make a backup of the existing file
             if has_old_backup {
                 debug!("Backup file {} already exists, moving to .old", backup_file);
