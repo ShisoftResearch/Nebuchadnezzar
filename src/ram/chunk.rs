@@ -1534,6 +1534,11 @@ impl Drop for PendingEntry {
         self.seg
             .write_wal(self.addr, self.size, self.skip_sync)
             .unwrap();
+        if !self.skip_sync {
+            // Timer-based group commit rides the WAL syncer thread now;
+            // transactional entries keep syncing at commit instead.
+            crate::ram::segs::queue_wal_sync(&self.seg);
+        }
         self.seg.set_dirty();
         self.seg.decr_references();
     }

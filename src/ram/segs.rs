@@ -40,6 +40,52 @@ pub static ARCHIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static ARCHIVE_REWRITES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Dirty registry for the WAL syncer: segments with unsynced non-transactional
+/// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). One
+/// dedicated thread fsyncs the whole set every `wal_sync_interval_ms` —
+/// replacing per-segment inline timer syncs (6,302 blocking fsyncs/s across an
+/// import's ~63 active segments) with O(dirty) syncs per tick on one thread.
+/// Entries hold `AArc`s, so segment lifecycle is a non-issue: an archived
+/// segment syncs as a no-op (its WAL file handle is gone) and drops.
+static WAL_DIRTY: parking_lot::Mutex<Vec<lightning::aarc::Arc<Segment>>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Enqueue a segment for the syncer's next pass and lazily start the syncer.
+pub fn queue_wal_sync(seg: &lightning::aarc::Arc<Segment>) {
+    if seg
+        .wal_sync_queued
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    WAL_DIRTY.lock().push(seg.clone());
+
+    static SYNCER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SYNCER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("wal-syncer".into())
+            .spawn(|| loop {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    wal_sync_interval_ms().max(1) as u64,
+                ));
+                let dirty = std::mem::take(&mut *WAL_DIRTY.lock());
+                for seg in dirty {
+                    // Clear the flag BEFORE syncing: bytes that land during
+                    // the sync re-enqueue for the next pass instead of being
+                    // silently absorbed into a sync that may miss them.
+                    seg.wal_sync_queued.store(false, Ordering::Release);
+                    if seg.bytes_since_sync.load(Ordering::Relaxed) > 0 {
+                        if let Err(e) = seg.force_wal_sync() {
+                            error!("wal-syncer: sync failed for segment {}: {e}", seg.id);
+                        }
+                    }
+                }
+            })
+            .expect("spawn wal-syncer");
+    });
+}
 /// Entries written to the WAL. Against the number of live cells this gives the
 /// rewrite factor: how many times the average cell's bytes are journalled,
 /// which is write amplification the tier has no part in.
@@ -402,6 +448,9 @@ pub struct Segment {
     pub append_header: AtomicUsize,
     pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
     pub last_sync_time: AtomicI64,     // Timestamp of last fsync in milliseconds
+    /// Set while this segment sits in the WAL syncer's dirty registry, so a
+    /// segment is enqueued at most once per syncer pass.
+    pub wal_sync_queued: std::sync::atomic::AtomicBool,
     /// Per-read reference count; the hottest atomic in the struct.
     references: AtomicUsize,
 
@@ -618,6 +667,7 @@ impl Segment {
             is_dirty: AtomicBool::new(true), // Start dirty
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
+            wal_sync_queued: std::sync::atomic::AtomicBool::new(false),
             block_residency: parking_lot::RwLock::new(BlockResidency::default()),
         }
     }
@@ -1564,39 +1614,33 @@ impl Segment {
                 return Ok(());
             }
 
-            // Group commit logic for non-transactional writes
-            let current_time = get_time();
+            // Group commit for non-transactional writes. The timer path
+            // belongs to the WAL syncer thread — with ~63 segments absorbing
+            // an import, per-segment 10ms timers produced 6,302 fsyncs/s
+            // with every writer thread blocking inline on its own sync. Only
+            // the byte threshold remains inline, as backpressure against one
+            // segment accumulating unbounded unsynced bytes.
             let bytes_written = self
                 .bytes_since_sync
                 .fetch_add(size as usize, Ordering::Relaxed)
                 + size as usize;
-            let last_sync = self.last_sync_time.load(Ordering::Relaxed);
-            let time_since_sync = current_time - last_sync;
 
-            // Sync if either threshold is reached:
-            // 1. Enough bytes have accumulated (batch size threshold)
-            // 2. Enough time has passed (time threshold)
-            let should_sync =
-                bytes_written >= WAL_SYNC_BATCH_SIZE || time_since_sync >= wal_sync_interval_ms();
-
-            if should_sync {
-                // Sync data to disk
+            if bytes_written >= WAL_SYNC_BATCH_SIZE {
                 WAL_SYNCS.fetch_add(1, Relaxed);
                 file.sync_data()?;
-
-                // Reset counters after successful sync
                 self.bytes_since_sync.store(0, Ordering::Relaxed);
-                self.last_sync_time.store(current_time, Ordering::Relaxed);
-
+                self.last_sync_time.store(get_time(), Ordering::Relaxed);
                 trace!(
-                    "WAL synced for segment {} ({} bytes, {} ms since last sync)",
+                    "WAL synced inline for segment {} ({} bytes)",
                     self.id,
-                    bytes_written,
-                    time_since_sync
+                    bytes_written
                 );
             } else {
-                trace!("WAL write buffered for segment {} ({} bytes accumulated, {} ms since last sync)",
-                       self.id, bytes_written, time_since_sync);
+                trace!(
+                    "WAL write buffered for segment {} ({} bytes accumulated; syncer owns the timer)",
+                    self.id,
+                    bytes_written
+                );
             }
         }
         Ok(())
