@@ -1165,6 +1165,20 @@ pub fn recover_chunks(
         chunk.reset_write_heads_after_recovery()?;
     }
 
+    // Heads are known now, so every other segment is sealed and must be
+    // archived. Repair any that are not before the tier, the cleaner or the
+    // archiver get to act on them.
+    let repaired: usize = chunks
+        .iter()
+        .map(|chunk| chunk.archive_unarchived_after_recovery())
+        .sum();
+    if repaired > 0 {
+        info!(
+            "Recovery repaired {} sealed segments that had no backup (WAL-only);              sealed-implies-archived restored",
+            repaired
+        );
+    }
+
     let final_hot = hot_count.load(Ordering::Relaxed);
     let final_cold = cold_count.load(Ordering::Relaxed);
     let final_processed = segments_processed.load(Ordering::Relaxed);

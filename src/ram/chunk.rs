@@ -429,6 +429,45 @@ impl Chunk {
         self.head_seg_id.load(Ordering::Acquire)
     }
 
+    /// Re-establish "sealed implies archived" after recovery.
+    ///
+    /// A crash, a kill, or any shutdown that loses its tail leaves segments
+    /// whose only durable copy is a WAL file. Recovery is the one point where
+    /// that can be repaired unconditionally: by here the write heads have been
+    /// reset, so every OTHER segment is sealed and immutable and must have a
+    /// backup. Archiving them once restores the invariant the tier, the
+    /// cleaner and the archiver all rely on — before any of them run.
+    ///
+    /// Only the heads are allowed to remain WAL-only, because only they are
+    /// still mutable. Returns how many segments had to be repaired; a nonzero
+    /// count is normal after an unclean stop and is reported so a run that
+    /// inherits a large backlog says so.
+    pub(crate) fn archive_unarchived_after_recovery(&self) -> usize {
+        let mut repaired = 0usize;
+        for segment in self.segments() {
+            if self.is_active_head(segment.id) {
+                continue;
+            }
+            let has_backup = self
+                .file_manager
+                .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+                .map(|p| std::path::Path::new(&p).exists())
+                .unwrap_or(false);
+            if has_backup {
+                continue;
+            }
+            match segment.archive() {
+                Ok(true) => repaired += 1,
+                Ok(false) => {}
+                Err(e) => error!(
+                    "recovery repair: failed to archive sealed segment {} (chunk {}): {}.                      Its only durable copy remains its WAL.",
+                    segment.id, self.id, e
+                ),
+            }
+        }
+        repaired
+    }
+
     pub fn is_active_head(&self, seg_id: u64) -> bool {
         self.head_seg_id.load(Ordering::Acquire) == seg_id
             || self.blob_head_seg_id.load(Ordering::Acquire) == seg_id
