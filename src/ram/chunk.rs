@@ -596,6 +596,35 @@ impl Chunk {
                             head_seg_id
                         );
                     }
+                    drop(state);
+
+                    // Seal-time archive. A segment stops being head exactly
+                    // once, and from then on it is immutable, so this is the
+                    // one place its durable copy should be written -- and the
+                    // only place that makes "sealed implies archived" an
+                    // invariant the rest of the system can rely on.
+                    //
+                    // Without it, archiving only happened incidentally: from
+                    // eviction, from combine, or from archive_all at
+                    // shutdown. A sealed segment that was never evicted stayed
+                    // durable only in its WAL, so a restart restored it from
+                    // WAL with no backup at all -- and everything downstream
+                    // (the tier believing it droppable, the cleaner freeing
+                    // it, the archiver later writing a zero-filled image over
+                    // it) followed from that. The 2016 boundary snapshot shows
+                    // 977 such segments against 20,697 archived ones; TB13
+                    // carried 18,336 of them into the restart that lost data.
+                    match old_head.archive() {
+                        Ok(true) => debug!("Sealed and archived segment {}", head_seg_id),
+                        // Already archived: re-sealing must never rewrite an
+                        // immutable segment.
+                        Ok(false) => {}
+                        Err(e) => error!(
+                            "SEAL ARCHIVE FAILED for segment {} (chunk {}): {}. It stays dirty \
+                             and resident; its only durable copy is its WAL.",
+                            head_seg_id, self.id, e
+                        ),
+                    }
                 }
             }
         }
