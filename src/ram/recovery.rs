@@ -1118,7 +1118,24 @@ pub fn recover_chunks(
 
                     apply_recovery_scan_result(&segment, &scan_result);
 
-                    segment.clear_dirty();
+                    // `clear_dirty` asserts "this segment is archived; its
+                    // bytes are on disk, so the tier may drop it from RAM at
+                    // will". That is only true when the segment came FROM a
+                    // backup file, or when cold recovery just synthesized one
+                    // (`ensure_backup_for_cold_recovery`). A segment restored
+                    // hot from a WAL file has NO backup: clearing it let
+                    // eviction release the pages, the read path went looking
+                    // for a `.nbackup` that never existed ("CRITICAL: segment
+                    // was marked archived but file is missing"), and every
+                    // cell in it read back as zeros -> SchemaDoesNotExisted(0)
+                    // and durable loss. TB13 hit this on the phase-1/phase-2
+                    // restart: 15 segments lost, 5.5K failed id-list updates,
+                    // and phase 3 could not enumerate neighbours at all.
+                    // Leaving such segments dirty makes the archiver write a
+                    // real backup before the tier is allowed to evict them.
+                    if file_info.is_backup || recover_as_cold {
+                        segment.clear_dirty();
+                    }
                     local_stashed.extend(scan_result.stashed_tombstones);
                     max_seq_ids[chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
 
