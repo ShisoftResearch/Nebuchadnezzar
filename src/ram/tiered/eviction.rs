@@ -126,49 +126,23 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
             .parent()
             .map(|p| p.exists())
             .unwrap_or(false);
-        // A segment claiming to be archived with no backup file on disk is
-        // always a bug upstream (recovery used to clear the dirty flag on
-        // WAL-restored segments, which have no backup — fixed there). But
-        // refusing the eviction outright leaves the segment pinned in RAM
-        // forever: TB13 logged 358,799 of these and the hot tier could
-        // never reach its watermark for the whole run, because the same
-        // segments were retried every pass and none could ever be freed.
-        // Self-heal instead — re-mark dirty and write the backup now — so
-        // one upstream mistake costs an archive, not the tier's ability to
-        // make progress.
-        warn!(
-            "Segment {} is marked archived but '{}' does not exist (parent_exists={}); \
-             re-archiving before eviction",
-            segment.id, backup_path, parent_exists
+        error!(
+            "CRITICAL: Segment {} backup file does not exist at '{}'. \
+             Parent directory exists: {}. dirty={}. \
+             This should not happen - segment was marked archived but file is missing!",
+            segment.id,
+            backup_path,
+            parent_exists,
+            segment.is_dirty()
         );
-        segment.set_dirty();
-        match segment.archive() {
-            Ok(true) if backup_path_ref.exists() => {
-                warn!(
-                    "Segment {} self-healed: missing backup written, eviction continues",
-                    segment.id
-                );
-            }
-            outcome => {
-                error!(
-                    "CRITICAL: Segment {} backup file does not exist at '{}' and could not be \
-                     re-archived ({:?}). Parent directory exists: {}. dirty={}.",
-                    segment.id,
-                    backup_path,
-                    outcome,
-                    parent_exists,
-                    segment.is_dirty()
-                );
-                segment.set_hot();
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "Segment {} backup file does not exist at '{}' (parent_exists={})",
-                        segment.id, backup_path, parent_exists
-                    ),
-                ));
-            }
-        }
+        segment.set_hot();
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "Segment {} backup file does not exist at '{}' (parent_exists={})",
+                segment.id, backup_path, parent_exists
+            ),
+        ));
     }
 
     #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
