@@ -2539,6 +2539,58 @@ mod tests {
 
     const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
+    /// The corruption itself: a reader holding a reference must still be able
+    /// to read the bytes it was pointed at.
+    ///
+    /// Pre-fix, `remove_segment` called `free_memory` immediately, and
+    /// `madvise(MADV_DONTNEED)` discards private anonymous pages at once --
+    /// so the reader's cell turned to zeros under its hands. That is the
+    /// `SchemaDoesNotExisted(0)` seen in the field, and the zero-filled
+    /// resident images the archiver later refused to persist.
+    #[test]
+    fn a_reader_inside_a_retired_segment_still_reads_its_data() {
+        let _ = env_logger::try_init();
+        let (chunks, schema) = setup_test_chunks();
+        let chunk = &chunks.list[0];
+
+        let id = Id::allocated(1, 0, 7);
+        let mut cell = payload_cell(schema.id, &id, 64);
+        chunks.write_cell(&mut cell).expect("write the cell to read back");
+
+        let addr = {
+            let stored = chunks.read_cell(&id).expect("read the cell");
+            stored.cell_guard().get_ptr()
+        };
+        let segment_id = chunk.get_head_seg_id();
+        let segment = chunk
+            .segs
+            .get(&(segment_id as usize))
+            .expect("segment is published");
+        assert!(
+            segment.incr_references(),
+            "the reader takes a live reference, as the read paths do"
+        );
+
+        // What the reader can see before the segment is taken away.
+        let before =
+            unsafe { std::slice::from_raw_parts(addr as *const u8, 64) }.to_vec();
+        assert!(
+            before.iter().any(|b| *b != 0),
+            "precondition: the cell has non-zero bytes to lose"
+        );
+
+        chunk.remove_segment(segment_id);
+
+        let after = unsafe { std::slice::from_raw_parts(addr as *const u8, 64) }.to_vec();
+        assert_eq!(
+            before, after,
+            "the reader's own data was discarded underneath it by unpublishing"
+        );
+
+        segment.decr_references();
+        assert_eq!(chunk.drain_retired_segments(), 1);
+    }
+
     /// Unpublishing a segment must never free it while a reader is inside.
     ///
     /// `remove_segment` used to drop the pages (`MADV_DONTNEED`, so they read
