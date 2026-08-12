@@ -2057,8 +2057,33 @@ impl Chunks {
                     info!("Recovery completed successfully");
                 }
                 Err(e) => {
-                    error!("Recovery failed: {:?}", e);
-                    error!("Starting with fresh storage");
+                    // Refuse to start rather than come up empty on top of a
+                    // store that exists.
+                    //
+                    // "Starting with fresh storage" was not a fallback, it was
+                    // silent data loss with a log line: the process continued
+                    // with empty chunks while the real segments sat on disk,
+                    // and every write from that point layered new state over a
+                    // store the operator still believed was intact. TB14 came
+                    // up this way after one unscannable segment, and the
+                    // ranged index then wiped 31 of its 40 trees against the
+                    // empty store it found.
+                    //
+                    // A store that cannot be recovered is a situation for a
+                    // human. Unscannable segments no longer reach here -- they
+                    // are quarantined individually -- so this is now reserved
+                    // for whole-store failures: unreadable directories, I/O
+                    // errors, a file larger than a segment. Every one of those
+                    // is worth stopping for, and none is improved by writing
+                    // more data on top.
+                    error!(
+                        "RECOVERY FAILED for this database: {:?}. REFUSING TO START. The \
+                         existing store is left untouched. Starting empty would hide it behind \
+                         new writes; individual unscannable segments are quarantined and do not \
+                         reach this path, so this is a whole-store failure that needs looking at.",
+                        e
+                    );
+                    panic!("recovery failed, refusing to start over an existing store: {e:?}");
                 }
             }
         }
