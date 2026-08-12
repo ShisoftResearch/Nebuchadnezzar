@@ -1432,6 +1432,43 @@ impl Segment {
             #[cfg(feature = "compress_backups")]
             {
                 let used = self.append_header.load(Ordering::Relaxed);
+                // A segment with no decodable entries is only legitimately
+                // archivable if its image is genuinely empty -- that is, all
+                // zeros. Anything else is a damaged image, and writing it
+                // persists the damage.
+                //
+                // This is the case the other two checks miss, and it is the
+                // one that produced TB14's `45-2053-3266.nbackup`: no entries,
+                // an append cursor reading empty, and no earlier backup to
+                // compare against, so the archiver wrote an 8 MiB image that
+                // was zeros at offset 0 with real cell data further in
+                // (block_count=1, 7.9x compression where cell data manages 2x).
+                // Recovery could then neither scan it nor ignore it.
+                //
+                // The test is the same one recovery applies, so an image that
+                // recovery would reject can no longer be created.
+                if boundaries.is_empty() && used <= self.addr {
+                    // Safety: the segment owns this range for its lifetime,
+                    // and archiving holds `file_state`, so it is not being
+                    // reclaimed underneath us.
+                    let image =
+                        unsafe { slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE) };
+                    if let Some(offset) = image.iter().position(|byte| *byte != 0) {
+                        error!(
+                            "REFUSING to archive segment {} (chunk {}, seq {}): it reports no appended \
+bytes and yields no entries, yet its image is non-zero from offset {}. That is a damaged \
+image, not an empty segment; archiving it would persist the damage.",
+                            self.id, self.chunk_id, self.seq_id, offset
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "segment {} is empty by its cursor but its image is non-zero                                  at offset {}; refusing to archive a damaged image",
+                                self.id, offset
+                            ),
+                        ));
+                    }
+                }
                 if boundaries.is_empty() && used > self.addr {
                     error!(
                         "REFUSING to archive segment {} (chunk {}, seq {}): {} appended bytes \
@@ -2514,6 +2551,62 @@ mod tests {
     /// the backup to `.old` and truncated a fresh file to zero -- so refusing
     /// destroyed the very thing being protected. The refusal must happen
     /// before any on-disk mutation.
+    /// The image that broke TB14 must be impossible to write.
+    ///
+    /// `45-2053-3266.nbackup` was archived from a segment that reported no
+    /// appended bytes and yielded no entries, but whose image was zeros at
+    /// offset 0 with real cell data further in -- a segment whose pages had
+    /// been dropped while it was still live. The archiver wrote it as a
+    /// single whole-segment block (block_count=1, 7.9x compression where cell
+    /// data manages 2x). Recovery could then neither scan it nor skip it, and
+    /// failed the whole store on it.
+    ///
+    /// Neither earlier guard covers this: one requires the cursor to claim
+    /// bytes, the other requires an existing backup to protect. A segment
+    /// that reads as empty is only archivable if its image really is empty.
+    #[cfg(feature = "compress_backups")]
+    #[test]
+    fn an_empty_cursor_over_a_non_zero_image_is_never_archived() {
+        let _ = env_logger::try_init();
+
+        let backup_dir = tempfile::tempdir().expect("backup dir");
+        let backup_path = backup_dir.path().to_string_lossy().into_owned();
+        let file_manager = Arc::new(SegmentFileManager::new(Some(backup_path), None));
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let segment = allocator
+            .alloc_seg(&file_manager)
+            .expect("allocate test segment");
+
+        // No prior backup: this is a first archive, so the empty-archive guard
+        // has nothing to compare against.
+        let backup_file = file_manager
+            .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+            .expect("backup path");
+        assert!(!Path::new(&backup_file).exists());
+
+        // The cursor says empty, but the image holds bytes further in --
+        // exactly a dropped first page with a written page behind it.
+        unsafe {
+            let image = slice::from_raw_parts_mut(segment.addr as *mut u8, SEGMENT_SIZE);
+            image[PAGE_SIZE + 128] = 0x7F;
+        }
+        assert_eq!(
+            segment.append_header.load(Ordering::Relaxed),
+            segment.addr,
+            "precondition: the cursor reports an empty segment"
+        );
+
+        let result = segment.archive();
+        assert!(
+            result.is_err(),
+            "an empty cursor over a non-zero image must not be archived"
+        );
+        assert!(
+            !Path::new(&backup_file).exists(),
+            "the refused archive still created a backup file"
+        );
+    }
+
     #[cfg(feature = "compress_backups")]
     #[test]
     fn refused_archive_leaves_the_backup_untouched() {
