@@ -1636,6 +1636,26 @@ image, not an empty segment; archiving it would persist the damage.",
                         "Archived segment {} to backup file '{}'",
                         self.id, backup_file
                     );
+
+                    // The previous backup was renamed aside before this write
+                    // as a safety net; the new one is now written, verified to
+                    // exist and about to be declared clean, so the old copy has
+                    // no further purpose. Nothing deleted it before, so every
+                    // rewritten segment left a full-size file behind forever --
+                    // invisible until a store runs out of disk.
+                    if has_old_backup {
+                        let old_path = format!("{}.old", backup_file);
+                        if let Err(e) = fs::remove_file(&old_path) {
+                            if e.kind() != io::ErrorKind::NotFound {
+                                warn!(
+                                    "Could not remove superseded backup '{}': {}. It is safe to \
+                                     delete by hand; the current backup is written.",
+                                    old_path, e
+                                );
+                            }
+                        }
+                    }
+
                     self.clear_dirty();
 
                     // Close and delete WAL file since backup now contains all data

@@ -1761,6 +1761,61 @@ use crate::ram::types::Id;
     /// store came up empty, and the ranged index then replaced 31 of its 40
     /// trees with empty ones because every page read returned
     /// CellDoesNotExisted. One bad segment cost 1.1 TB.
+    /// A rewritten segment must not leave its previous backup behind.
+    ///
+    /// `archive()` renames the existing backup to `.old` before writing, as a
+    /// safety net for the window where neither copy is complete. Nothing
+    /// removed it afterwards, so every rewrite left a full-size file on disk
+    /// forever -- invisible until a store runs out of space.
+    #[cfg(feature = "compress_backups")]
+    #[test]
+    fn a_rewritten_segment_does_not_leave_its_old_backup_behind() {
+        let _ = env_logger::try_init();
+        let backup_dir = TempDir::new().unwrap();
+        let chunks = Chunks::new_dummy_with_backup(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+        );
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(214, "old_backup_cleanup", false);
+        chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+
+        // Real content: archiving an empty segment over a non-empty backup is
+        // refused by design, so the segment has to hold decodable entries for
+        // the rewrite to be legitimate.
+        let id = Id::allocated(24, 0, 1);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data: data_map_value!(id: 13_i32, data: vec![0x4D_u8; DATA_SIZE]),
+        };
+        chunks.write_cell(&mut cell).expect("write a cell");
+
+        let segment = chunk
+            .segs
+            .get(&(chunk.get_head_seg_id() as usize))
+            .expect("head segment");
+        let backup_file = chunk
+            .file_manager
+            .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+            .expect("backup path");
+
+        segment.archive().expect("first archive");
+        assert!(Path::new(&backup_file).exists(), "first archive wrote nothing");
+
+        segment.set_dirty();
+        segment.archive().expect("second archive");
+
+        assert!(Path::new(&backup_file).exists(), "the rewrite lost the backup");
+        assert!(
+            !Path::new(&format!("{}.old", backup_file)).exists(),
+            "the superseded backup was left on disk"
+        );
+    }
+
     /// A torn backup file costs its own segment, not the store.
     ///
     /// TB15's OOM kill landed mid-archive and left an image whose index

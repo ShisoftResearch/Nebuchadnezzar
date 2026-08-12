@@ -2147,6 +2147,26 @@ impl Chunks {
         );
     }
 
+    /// A dummy chunk set with backup storage configured, for tests that need
+    /// segments which can actually be archived.
+    pub fn new_dummy_with_backup(
+        count: usize,
+        size: usize,
+        backup_storage: Option<String>,
+    ) -> Arc<Chunks> {
+        Chunks::new(
+            count,
+            size,
+            Arc::<ServerMeta>::new(ServerMeta {
+                schemas: LocalSchemasCache::new_local(""),
+            }),
+            None,
+            backup_storage,
+            None,
+            None,
+        )
+    }
+
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         // Dummy doesn't use tiered memory or recovery
         Chunks::new(
