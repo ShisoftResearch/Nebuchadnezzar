@@ -878,6 +878,9 @@ impl Chunk {
     // that keeps the bytes at `location` alive even after the cell index has
     // moved on to a newer version.
     pub(crate) fn head_at(&self, location: usize) -> Result<CellHeader, ReadError> {
+        // Decodes a header straight out of segment memory; same reasoning as
+        // `read_cell_at`.
+        let _qsbr = crate::ram::qsbr::QsbrSection::new();
         header_from_chunk_raw(location).map(|pair| pair.0)
     }
 
@@ -888,6 +891,11 @@ impl Chunk {
     // By-address full-cell read: materializes the cell exactly as stored at
     // `location`, bypassing the cell index entirely. See `head_at`.
     pub fn read_cell_at(&self, hash: u64, location: usize) -> Result<OwnedCell, ReadError> {
+        // Reads segment memory directly at `location`, so it needs a section
+        // of its own: there is no CellGuard here to carry one. The caller's
+        // pin keeps the segment alive; this keeps the reclaimer from freeing
+        // underneath the read itself.
+        let _qsbr = crate::ram::qsbr::QsbrSection::new();
         SharedCellData::from_chunk_raw(hash, location, self).map(|(cell, _)| cell.to_owned())
     }
 
@@ -913,6 +921,8 @@ impl Chunk {
         fields: &[u64],
         need_header: bool,
     ) -> Result<OwnedCell, ReadError> {
+        // By-address selection; same reasoning as `read_cell_at`.
+        let _qsbr = crate::ram::qsbr::QsbrSection::new();
         let (val, hdr) = select_from_chunk_raw(location, self, fields, need_header)?;
         Ok(SharedCellData::from_data(hdr, val).to_owned())
     }
@@ -2309,6 +2319,15 @@ pub struct CellGuard<'a> {
     chunk: &'a Chunk,
     hash: u64,
     version: u64,
+    /// The QSBR section covering this read.
+    ///
+    /// A read resolves a raw address out of the cell index and then touches
+    /// segment memory at it; between those two steps it holds no reference,
+    /// so no per-segment count can see it. The section does. It lives here
+    /// rather than on the reference count because a `CellGuard` borrows the
+    /// chunk and so cannot outlive the stack frame that made it -- which is
+    /// exactly the property a thread-scoped quiescent state needs.
+    _qsbr: crate::ram::qsbr::QsbrSection,
 }
 
 impl<'a> CellGuard<'a> {
@@ -2351,6 +2370,7 @@ impl<'a> CellGuard<'a> {
                                     tiered.note_cold_block_read();
                                 }
                                 return Some(CellGuard {
+                                _qsbr: crate::ram::qsbr::QsbrSection::new(),
                                     hash,
                                     guard: Some(guard),
                                     chunk,
@@ -2403,6 +2423,7 @@ impl<'a> CellGuard<'a> {
         }
 
         Some(Self {
+            _qsbr: crate::ram::qsbr::QsbrSection::new(),
             guard: Some(guard),
             chunk,
             hash,
@@ -2630,6 +2651,131 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// Two databases each have their own `Chunks`, their own cleaner and their
+    /// own retire list, but they share one QSBR epoch. What that sharing does
+    /// and does not couple is worth pinning down.
+    ///
+    /// A *reference* held in database A must not block database B: references
+    /// are per-segment, and B's segment has none. Only an in-flight read
+    /// section is global, and only for as long as the read runs.
+    #[test]
+    fn a_reference_in_one_database_does_not_block_another_from_reclaiming() {
+        let _ = env_logger::try_init();
+        let (chunks_a, _schema_a) = setup_test_chunks();
+        let (chunks_b, _schema_b) = setup_test_chunks();
+        let chunk_a = &chunks_a.list[0];
+        let chunk_b = &chunks_b.list[0];
+
+        // A long-lived pin in database A, of the kind a transaction holds.
+        let seg_a = chunk_a
+            .segs
+            .get(&(chunk_a.get_head_seg_id() as usize))
+            .expect("database A has a head segment");
+        assert!(seg_a.incr_references());
+
+        let b_seg_id = chunk_b.get_head_seg_id();
+        chunk_b.remove_segment(b_seg_id);
+        assert_eq!(chunk_b.retired_segment_count(), 1);
+
+        assert_eq!(
+            drain_until_reclaimed(chunk_b, std::time::Duration::from_secs(5)),
+            1,
+            "a pin in database A must not stop database B reclaiming its own segment"
+        );
+
+        seg_a.decr_references();
+    }
+
+    /// The coupling that IS real: a read in flight anywhere holds back every
+    /// reclamation, because the reclaimer cannot tell which segment that
+    /// reader is about to touch. It lasts only as long as the read.
+    #[test]
+    fn an_in_flight_read_holds_back_reclamation_until_it_finishes() {
+        let _ = env_logger::try_init();
+        let (chunks_a, schema_a) = setup_test_chunks();
+        let (chunks_b, _schema_b) = setup_test_chunks();
+        let chunk_a = &chunks_a.list[0];
+        let chunk_b = &chunks_b.list[0];
+
+        let id = Id::allocated(1, 0, 11);
+        let mut cell = payload_cell(schema_a.id, &id, 32);
+        chunks_a.write_cell(&mut cell).expect("write a cell to read");
+
+        // A read in progress in database A: the guard is the open section.
+        let reading = CellGuard::for_read(id.bits(), chunk_a).expect("read guard");
+
+        let b_seg_id = chunk_b.get_head_seg_id();
+        chunk_b.remove_segment(b_seg_id);
+        assert_eq!(
+            chunk_b.drain_retired_segments(),
+            0,
+            "a read in flight anywhere must hold back reclamation everywhere"
+        );
+
+        drop(reading);
+        assert_eq!(
+            drain_until_reclaimed(chunk_b, std::time::Duration::from_secs(5)),
+            1,
+            "once the read finishes, reclamation proceeds"
+        );
+    }
+
+    /// A segment reference taken on one thread and released on another must
+    /// not strand QSBR.
+    ///
+    /// This is not hypothetical: `PinnedReadSet` stores a
+    /// `SegmentReferenceGuard` for a transaction's whole lifetime, so the
+    /// thread that pins a repeatable read is rarely the thread that ends the
+    /// transaction. If entering and leaving the quiescent state are bound to
+    /// the acquiring thread, the pinning thread never returns to quiescence
+    /// and reclamation stalls for every database in the process.
+    #[test]
+    fn a_reference_released_on_another_thread_does_not_strand_reclamation() {
+        let _ = env_logger::try_init();
+        let (chunks, _schema) = setup_test_chunks();
+        let chunk = &chunks.list[0];
+
+        let segment = chunk
+            .segs
+            .get(&(chunk.get_head_seg_id() as usize))
+            .expect("head segment");
+
+        // Pin on one thread that then STAYS ALIVE doing other work, the way a
+        // tokio worker does after handling the request that pinned the read.
+        // A thread that exits would have its slot recycled and hide the bug.
+        let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let pinning = std::thread::spawn({
+            let segment = segment.clone();
+            move || {
+                assert!(segment.incr_references());
+                pinned_tx.send(()).unwrap();
+                // Still running, holding nothing on its stack.
+                finish_rx.recv().unwrap();
+            }
+        });
+        pinned_rx.recv().unwrap();
+
+        // The transaction ends on a different thread, dropping the guard there.
+        let releasing = std::thread::spawn({
+            let segment = segment.clone();
+            move || {
+                segment.decr_references();
+            }
+        });
+        releasing.join().expect("releasing thread");
+
+        let seg_id = chunk.get_head_seg_id();
+        chunk.remove_segment(seg_id);
+        assert_eq!(
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(5)),
+            1,
+            "a reference acquired and released on different threads stranded reclamation"
+        );
+        finish_tx.send(()).unwrap();
+        pinning.join().expect("pinning thread");
     }
 
     /// A chunk whose allocator is empty must refuse the write, not wedge.

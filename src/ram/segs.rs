@@ -1745,10 +1745,6 @@ impl Segment {
                 )
                 .is_ok()
             {
-                // Paired with the matching `exit` in `decr_references`, which
-                // runs only when the count actually goes down -- so the two
-                // stay balanced even on the documented decrement-at-zero race.
-                crate::ram::qsbr::segment_qsbr().enter();
                 return true;
             }
             backoff.spin();
@@ -1789,9 +1785,15 @@ impl Segment {
                 }
             })
             .is_ok();
-        if decremented {
-            crate::ram::qsbr::segment_qsbr().exit();
-        }
+        // Deliberately NOT a QSBR quiescent-state transition. A reference can
+        // outlive the stack that took it -- `PinnedReadSet` holds one for a
+        // whole transaction and drops it on whichever thread ends the
+        // transaction -- so binding the thread's quiescent state to this
+        // counter strands the acquiring thread outside quiescence forever.
+        // QSBR sections live on `CellGuard` instead, which is lifetime-bound
+        // to the chunk and therefore cannot migrate. Long-lived references are
+        // covered by the count itself, which the reclaimer also requires.
+        let _ = decremented;
     }
 
     pub fn mem_drop(&self, chunk: &Chunk) {
