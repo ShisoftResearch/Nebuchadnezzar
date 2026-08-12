@@ -698,7 +698,8 @@ mod test {
         println!("=== Recovering LSM tree from storage ===");
 
         // Recover the tree
-        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id).await;
+        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id).await
+            .expect("the tree should load back from storage");
 
         println!("=== Recovered tree state ===");
         println!("Recovered tree count: {}", recovered_tree.count());
@@ -912,7 +913,8 @@ mod test {
         drop(tree);
 
         println!("=== Recovering tree ===");
-        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id).await;
+        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id).await
+            .expect("the tree should load back from storage");
         println!("Recovered tree count: {}", recovered_tree.count());
 
         println!("=== Testing BACKWARD range queries AFTER recovery ===");
@@ -1374,7 +1376,8 @@ mod test {
             .await
             .expect("target tree head should be published before routing");
 
-        let recovered_target = RangedTree::recover(&client, &target_tree_id).await;
+        let recovered_target = RangedTree::recover(&client, &target_tree_id).await
+            .expect("the target tree should load back from storage");
         assert_eq!(
             recovered_target.count(),
             moved_keys.len(),

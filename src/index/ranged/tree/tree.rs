@@ -36,6 +36,50 @@ pub struct RangedTree {
     pub tree: DiskTree,
 }
 
+/// Why a tree could not be loaded from storage.
+///
+/// Every variant leaves persistent state exactly as it was. A tree that
+/// cannot be read is not the same thing as a tree that is empty, and the
+/// difference is only recoverable while the metadata still points at the
+/// original chain.
+#[derive(Debug)]
+pub enum TreeRecoverError {
+    /// The metadata cell itself could not be read.
+    RootCellUnreadable { tree_id: Id, reason: String },
+    /// The metadata cell exists but carries no head pointer.
+    RootHeadMissing { tree_id: Id },
+    /// The head is known but its page chain could not be read.
+    PagesUnreadable {
+        tree_id: Id,
+        head_id: Id,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for TreeRecoverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TreeRecoverError::RootCellUnreadable { tree_id, reason } => write!(
+                f,
+                "ranged tree {:?}: metadata cell unreadable: {}",
+                tree_id, reason
+            ),
+            TreeRecoverError::RootHeadMissing { tree_id } => {
+                write!(f, "ranged tree {:?}: metadata cell has no head pointer", tree_id)
+            }
+            TreeRecoverError::PagesUnreadable {
+                tree_id,
+                head_id,
+                reason,
+            } => write!(
+                f,
+                "ranged tree {:?}: page chain from head {:?} unreadable: {}",
+                tree_id, head_id, reason
+            ),
+        }
+    }
+}
+
 impl RangedTree {
     /// Create a new ranged tree
     pub async fn create(neb_client: &Arc<AsyncClient>, id: &Id) -> Self {
@@ -54,7 +98,28 @@ impl RangedTree {
                 match e {
                     WriteError::CellAlreadyExisted => {
                         info!("Ranged tree already exists for {:?}, recovering", id);
-                        Self::recover(neb_client, id).await
+                        match Self::recover(neb_client, id).await {
+                            Ok(tree) => tree,
+                            Err(error) => {
+                                // The tree exists on disk but cannot be read
+                                // right now. Returning a fresh in-memory tree
+                                // is safe only because this path does not
+                                // persist it: the metadata cell still points
+                                // at the real chain, so a later load recovers
+                                // it once the store can answer.
+                                error!(
+                                    "Ranged tree {:?} exists but could not be loaded: {}. \
+                                     Serving an unpersisted empty tree; the stored chain is \
+                                     untouched.",
+                                    id, error
+                                );
+                                let deletion_set =
+                                    Arc::new(lightning::map::HashSet::with_capacity(0));
+                                Self {
+                                    tree: DiskTree::new(&deletion_set),
+                                }
+                            }
+                        }
                     }
                     _ => panic!("Failed to create ranged tree cell: {:?}", e),
                 }
@@ -63,8 +128,24 @@ impl RangedTree {
         }
     }
 
-    /// Recover a ranged tree from persistent storage
-    pub async fn recover(neb_client: &Arc<AsyncClient>, tree_id: &Id) -> Self {
+    /// Load a ranged tree from persistent storage.
+    ///
+    /// **Never writes.** A failure here used to replace the tree: a fresh
+    /// empty `DiskTree` was persisted and the metadata cell updated to point
+    /// at it, which discarded the only reference to the real page chain. That
+    /// turned every read failure -- including one caused by a store that had
+    /// not finished recovering -- into permanent index loss. On TB14 that cost
+    /// 31 of 40 trees, because recovery had aborted and the store was empty
+    /// when the trees were loaded.
+    ///
+    /// So the caller gets an error and the persisted metadata is left alone.
+    /// A tree that cannot be read is left absent rather than installed empty,
+    /// and the next operation that touches its range retries the load -- which
+    /// is what makes a transient failure survivable.
+    pub async fn recover(
+        neb_client: &Arc<AsyncClient>,
+        tree_id: &Id,
+    ) -> Result<Self, TreeRecoverError> {
         info!("[TREE LOAD] Starting load for tree {:?}", tree_id);
 
         let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
@@ -76,36 +157,24 @@ impl RangedTree {
             }
             Ok(Err(e)) => {
                 error!(
-                    "[TREE LOAD] Failed to read tree root cell {:?}: {:?} - creating fresh tree",
+                    "[TREE LOAD] Cannot read tree root cell {:?}: {:?}. Leaving the tree \
+                     unloaded; its metadata is untouched and the load will be retried.",
                     tree_id, e
                 );
-                // Cell doesn't exist in NEB (WAL/backup loss after SM recorded this tree).
-                // Create a fresh empty tree and write the metadata cell for the first time.
-                let tree = DiskTree::new(&deletion_set);
-                tree.persist_root(neb_client).await;
-                let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
-                match neb_client.write_cell(tree_cell).await {
-                    Ok(Ok(_)) => info!(
-                        "[TREE LOAD] Created replacement tree root cell for {:?}",
-                        tree_id
-                    ),
-                    Ok(Err(e2)) => error!(
-                        "[TREE LOAD] Failed to create replacement cell for {:?}: {:?}",
-                        tree_id, e2
-                    ),
-                    Err(e2) => error!(
-                        "[TREE LOAD] RPC error creating replacement cell for {:?}: {:?}",
-                        tree_id, e2
-                    ),
-                }
-                return Self { tree };
+                return Err(TreeRecoverError::RootCellUnreadable {
+                    tree_id: *tree_id,
+                    reason: format!("{:?}", e),
+                });
             }
             Err(e) => {
                 error!(
                     "[TREE LOAD] RPC error reading tree root cell {:?}: {:?}",
                     tree_id, e
                 );
-                panic!("RPC error reading tree root cell");
+                return Err(TreeRecoverError::RootCellUnreadable {
+                    tree_id: *tree_id,
+                    reason: format!("rpc: {:?}", e),
+                });
             }
         };
 
@@ -113,26 +182,11 @@ impl RangedTree {
             Some(id) => *id,
             None => {
                 error!(
-                    "[TREE LOAD] Tree root cell {:?} exists but head pointer is missing \
-                     (corrupt cell). Creating a fresh empty tree.",
+                    "[TREE LOAD] Tree root cell {:?} carries no head pointer. Leaving the \
+                     tree unloaded rather than replacing it.",
                     tree_id
                 );
-                let tree = DiskTree::new(&deletion_set);
-                tree.persist_root(neb_client).await;
-                let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
-                // Cell already exists (we read it above), so use update_cell not write_cell
-                match neb_client.update_cell(tree_cell).await {
-                    Ok(Ok(_)) => info!("[TREE LOAD] Repaired corrupt tree root cell {:?}", tree_id),
-                    Ok(Err(e)) => error!(
-                        "[TREE LOAD] Failed to repair corrupt cell {:?}: {:?}",
-                        tree_id, e
-                    ),
-                    Err(e) => error!(
-                        "[TREE LOAD] RPC error repairing corrupt cell {:?}: {:?}",
-                        tree_id, e
-                    ),
-                }
-                return Self { tree };
+                return Err(TreeRecoverError::RootHeadMissing { tree_id: *tree_id });
             }
         };
         info!("[TREE LOAD] Loading B-tree from head {:?}", head_id);
@@ -144,32 +198,21 @@ impl RangedTree {
             }
             Err(e) => {
                 error!(
-                    "[TREE LOAD] Failed to reconstruct B-tree for {:?} from head {:?}: {:?}. Creating a fresh empty tree.",
+                    "[TREE LOAD] Cannot reconstruct B-tree for {:?} from head {:?}: {:?}. \
+                     The metadata still points at this head, so the chain is not lost -- \
+                     check whether the store finished recovering.",
                     tree_id, head_id, e
                 );
-                let tree = DiskTree::new(&deletion_set);
-                tree.persist_root(neb_client).await;
-                let tree_cell = ranged_tree_cell(&tree.head_id(), tree_id, None);
-                match neb_client.update_cell(tree_cell).await {
-                    Ok(Ok(_)) => info!(
-                        "[TREE LOAD] Replaced corrupt tree metadata for {:?}",
-                        tree_id
-                    ),
-                    Ok(Err(e2)) => error!(
-                        "[TREE LOAD] Failed to replace corrupt metadata for {:?}: {:?}",
-                        tree_id, e2
-                    ),
-                    Err(e2) => error!(
-                        "[TREE LOAD] RPC error replacing corrupt metadata for {:?}: {:?}",
-                        tree_id, e2
-                    ),
-                }
-                return Self { tree };
+                return Err(TreeRecoverError::PagesUnreadable {
+                    tree_id: *tree_id,
+                    head_id,
+                    reason: format!("{:?}", e),
+                });
             }
         };
         info!("[TREE LOAD] B-tree loaded with {} keys", tree.count());
 
-        Self { tree }
+        Ok(Self { tree })
     }
 
     /// Insert an entry into the tree
@@ -742,9 +785,115 @@ mod tests {
         storage::wait_until_updated().await;
         drop(tree);
 
-        let recovered = RangedTree::recover(&client, &tree_id).await;
+        let recovered = RangedTree::recover(&client, &tree_id).await
+            .expect("the tree should load back from storage");
         assert_eq!(recovered.count(), 2);
         assert_eq!(collect_visible(&recovered), vec![10, 12]);
+
+        server.shutdown().await;
+    }
+
+    /// A tree whose pages cannot be read must keep pointing at them.
+    ///
+    /// Recovery used to answer an unreadable page chain by persisting a fresh
+    /// empty tree and updating the metadata cell to point at it -- discarding
+    /// the only reference to the real chain. Any read failure therefore became
+    /// permanent loss, including one caused by a store that had simply not
+    /// finished recovering yet. On TB14 that turned an aborted recovery into
+    /// 31 destroyed indexes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_tree_keeps_its_head_pointer() {
+        use crate::client;
+        use crate::index::ranged::tree::btree::{page_schema, storage};
+        use crate::server::{NebServer, ServerOptions, Service};
+
+        let _ = env_logger::try_init();
+
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "ranged_tree_unreadable_head";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        storage::start_external_nodes_write_back(&client);
+
+        let tree_id = Id::from_parts(902, 902);
+        let tree = RangedTree::create(&client, &tree_id).await;
+        for value in 20..=22 {
+            assert!(tree.insert(&make_field_key(1, 778, value, Id::from_parts(6, value))));
+        }
+        storage::wait_until_updated().await;
+
+        let head_before = client
+            .read_cell(tree_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .data[*RANGED_TREE_HEAD_HASH]
+            .id()
+            .copied()
+            .expect("the tree metadata should carry a head pointer");
+        drop(tree);
+
+        // Make the head page unreadable, exactly as an unrecovered store does.
+        client.remove_cell(head_before).await.unwrap().unwrap();
+
+        let outcome = RangedTree::recover(&client, &tree_id).await;
+        assert!(
+            outcome.is_err(),
+            "a tree whose pages cannot be read must not load as an empty tree"
+        );
+
+        let head_after = client
+            .read_cell(tree_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .data[*RANGED_TREE_HEAD_HASH]
+            .id()
+            .copied()
+            .expect("the metadata cell must still carry a head pointer");
+        assert_eq!(
+            head_after, head_before,
+            "the failed load rewrote the head pointer, discarding the original chain"
+        );
 
         server.shutdown().await;
     }

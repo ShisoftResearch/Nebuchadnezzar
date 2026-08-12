@@ -300,7 +300,23 @@ impl Service for TreeService {
                 return;
             }
             info!("Called to load tree {:?}, boundary {:?}", id, boundary);
-            let tree = RangedTree::recover(&self.client, &id).await;
+            let tree = match RangedTree::recover(&self.client, &id).await {
+                Ok(tree) => tree,
+                Err(error) => {
+                    // Leave it absent rather than installing an empty tree.
+                    // An empty tree answers every range scan with "no rows",
+                    // which is indistinguishable from a correct answer and is
+                    // how a store that had not finished recovering came to
+                    // look like a store with no data. Absent means the next
+                    // operation on this range tries again.
+                    error!(
+                        "Not loading ranged tree {:?}: {}. The range it covers will report \
+                         errors until it can be read, which is preferable to reporting empty.",
+                        id, error
+                    );
+                    return;
+                }
+            };
             debug!(
                 "LSM tree loaded with {} keys, capacity {}.",
                 tree.count(),
@@ -675,7 +691,21 @@ impl TreeService {
                     upper,
                     placement.epoch
                 );
-                let tree = RangedTree::recover(&self.client, &id).await;
+                let tree = match RangedTree::recover(&self.client, &id).await {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        // Same reasoning as the load path: an unreadable tree
+                        // stays absent so the next attempt can succeed, rather
+                        // than becoming a permanently empty one.
+                        error!(
+                            "Cannot hydrate ranged tree {:?} for entry {:?}: {}",
+                            id,
+                            entry.id(),
+                            error
+                        );
+                        return false;
+                    }
+                };
                 if self.trees.contains_key(&id) {
                     return true;
                 }
