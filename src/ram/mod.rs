@@ -10,6 +10,7 @@ pub mod compression;
 pub mod entry;
 pub mod file_manager;
 pub mod io;
+pub mod qsbr;
 pub mod recovery;
 pub mod schema;
 pub mod segment_list;

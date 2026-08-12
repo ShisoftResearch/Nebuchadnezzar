@@ -281,6 +281,17 @@ impl Cleaner {
                 reduced_segments_count += num_reduced_segments;
             }
         }
+        // Segments unpublished by an earlier round whose readers had not left
+        // yet. Retrying every round keeps the delay bounded by reader lifetime
+        // rather than by the next combine.
+        let reclaimed = chunk.drain_retired_segments();
+        if reclaimed > 0 {
+            debug!(
+                "Chunk {} reclaimed {} retired segments whose readers had drained",
+                chunk.id, reclaimed
+            );
+        }
+
         let combined_cleaned_space = combiner_cleaned_space;
         chunk
             .total_space

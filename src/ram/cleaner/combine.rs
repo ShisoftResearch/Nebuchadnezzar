@@ -407,12 +407,24 @@ impl CombinedCleaner {
         })
     }
 
-    fn cleanup_segments(chunk: &Chunk, segments: &[SegmentCandidate]) {
-        debug!("Released references for {} source segments", segments.len());
-        for old_seg in segments {
+    /// Unpublish the combined-away sources and hand them to QSBR reclamation.
+    ///
+    /// Takes the candidates by value on purpose. Each one holds a *shared*
+    /// reference on its segment, so the segment can never be quiescent while
+    /// they are alive -- reclaiming here would either free under our own
+    /// reference or wait on ourselves, which is the same self-wait that
+    /// livelocked promotion. Unpublish first, drop the candidates, and let the
+    /// drain do the destructive part once readers have left.
+    fn cleanup_segments(chunk: &Chunk, segments: Vec<SegmentCandidate>) {
+        debug!("Unpublishing {} source segments", segments.len());
+        for old_seg in &segments {
             chunk.remove_segment(old_seg.id);
-            old_seg.mem_drop(chunk);
         }
+        // Releases our references; from here the segments can go quiescent.
+        drop(segments);
+        // Reclaim what is already safe, so the common case costs no delay.
+        let freed = chunk.drain_retired_segments();
+        debug!("Reclaimed {} retired segments after combine", freed);
     }
 
     pub fn combine_segments(
@@ -476,6 +488,28 @@ impl CombinedCleaner {
                 new_segs
             );
         } else {
+            // "No entries" is only a reason to delete these segments if they
+            // really hold nothing. If they claim used space, the entry walk
+            // failed to decode them -- which is exactly what a segment whose
+            // pages were dropped looks like -- and removing them would destroy
+            // every cell the index still points at, plus their backups and
+            // WALs. One unreadable segment would take every segment selected
+            // in the round with it.
+            let claimed_bytes: usize = segments.iter().map(|seg| seg.used_spaces() as usize).sum();
+            if claimed_bytes > 0 {
+                error!(
+                    "Combine decoded 0 entries from {} segments in chunk {} that claim {} used \
+                     bytes; refusing to remove them. Their resident images are unreadable, not \
+                     empty -- removing them would delete live cells along with their backups.",
+                    segments.len(),
+                    chunk.id,
+                    claimed_bytes
+                );
+                for seg in segments.iter() {
+                    seg.mark_clean_no_progress();
+                }
+                return (0, 0);
+            }
             debug!("No entries to work on, will remove all selected segments instead");
         }
 
@@ -487,7 +521,7 @@ impl CombinedCleaner {
             chunk.get_head_seg_id()
         );
 
-        Self::cleanup_segments(chunk, &segments);
+        Self::cleanup_segments(chunk, segments);
 
         debug!(
             "End combining segments, totally cleaned {} bytes, with {} segments.",

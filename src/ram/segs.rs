@@ -1745,6 +1745,10 @@ impl Segment {
                 )
                 .is_ok()
             {
+                // Paired with the matching `exit` in `decr_references`, which
+                // runs only when the count actually goes down -- so the two
+                // stay balanced even on the documented decrement-at-zero race.
+                crate::ram::qsbr::segment_qsbr().enter();
                 return true;
             }
             backoff.spin();
@@ -1769,7 +1773,7 @@ impl Segment {
         // references forever. The debug build instead tripped an assertion,
         // which is why this surfaced as a flaky test rather than as the pin it
         // actually was.
-        let _ = self
+        let decremented = self
             .references
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |curr| {
                 debug_assert!(
@@ -1783,7 +1787,11 @@ impl Segment {
                 } else {
                     Some(curr - 1)
                 }
-            });
+            })
+            .is_ok();
+        if decremented {
+            crate::ram::qsbr::segment_qsbr().exit();
+        }
     }
 
     pub fn mem_drop(&self, chunk: &Chunk) {

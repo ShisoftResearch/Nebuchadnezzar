@@ -62,6 +62,10 @@ static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.50f32;
 /// that are at least three-quarters dead.
 static DEAD_RATE_FOR_COMBINE_CLEANER_RELAXED: f32 = 0.25f32;
 
+/// Drain passes a retired segment may wait before each report. A retirement
+/// that never drains means a reference was leaked; that should be visible.
+const RETIRED_SEGMENT_REPORT_INTERVAL: usize = 64;
+
 const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
 const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 
@@ -209,6 +213,30 @@ pub struct Chunk {
     /// Shared wake signal to the background cleaner; allocation-pressure
     /// paths request a pass instead of cleaning inline.
     pub cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
+    /// Segments unpublished from `segs` and awaiting reclamation.
+    ///
+    /// Reclaiming a segment is destructive three times over: its pages are
+    /// dropped (`MADV_DONTNEED`, so they read back as zeros), its backup and
+    /// WAL are deleted, and its address returns to the allocator's free list
+    /// to be handed to the next segment. Doing any of that while a reader is
+    /// still inside is a use-after-free: the reader sees zeros, and once the
+    /// address is recycled it sees another segment's live bytes.
+    ///
+    /// Unpublishing stops new readers. Each entry carries the QSBR stamp taken
+    /// at that moment, and is reclaimed once every thread has passed through a
+    /// quiescent state since. Holding 8 MiB longer than necessary is the cost;
+    /// the alternative is silent corruption with no durable copy left.
+    pub retired_segments: Mutex<Vec<RetiredSegment>>,
+}
+
+/// A segment unpublished from its chunk, waiting for readers to drain.
+pub struct RetiredSegment {
+    pub segment: AArc<Segment>,
+    /// QSBR epoch stamped after the segment left `Chunk::segs`.
+    pub stamp: usize,
+    /// Drain passes this entry has survived, for reporting one that never
+    /// drains rather than retaining it in silence.
+    pub attempts: usize,
 }
 
 impl Chunk {
@@ -412,6 +440,7 @@ impl Chunk {
             statistics: ChunkStatistics::new(),
             tiered_manager,
             cleaner_wake,
+            retired_segments: Mutex::new(Vec::new()),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -1200,21 +1229,94 @@ impl Chunk {
             }
         }
 
-        // Now safe to remove and dispose
+        // Unpublish only. Freeing here would be a use-after-free: readers
+        // already inside hold pointers into this memory, and `segs.remove`
+        // only stops the ones that have not looked it up yet. The segment is
+        // stamped and reclaimed once every thread has been quiescent since.
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
-            // Free the segment memory
             if let Some(ref tiered) = self.tiered_manager {
                 tiered.release_cold_resident(seg.take_block_resident_bytes());
             }
-            seg.free_memory();
-            // Free the segment files
-            seg.dispense();
+            // The stamp must be taken AFTER the removal, so that a thread
+            // whose section began at or after it provably could not have
+            // found this segment.
+            let stamp = crate::ram::qsbr::segment_qsbr().retire_stamp();
+            self.retired_segments.lock().push(RetiredSegment {
+                segment: seg,
+                stamp,
+                attempts: 0,
+            });
         } else {
             error!(
                 "Segment {} not found in chunk {} to remove",
                 segment_id, self.id
             );
         }
+    }
+
+    /// Reclaim retired segments whose readers have drained.
+    ///
+    /// Returns how many were freed. Called from the cleaner's round, so a
+    /// retirement costs at most one round of delay in the common case.
+    pub fn drain_retired_segments(&self) -> usize {
+        // Nothing is freed while the lock is held longer than the swap: the
+        // list is short, but reclamation touches the allocator and the file
+        // system, and the cleaner is not the only writer here.
+        let pending = {
+            let mut retired = self.retired_segments.lock();
+            if retired.is_empty() {
+                return 0;
+            }
+            std::mem::take(&mut *retired)
+        };
+
+        let qsbr = crate::ram::qsbr::segment_qsbr();
+        let mut freed = 0usize;
+        let mut still_pending = Vec::new();
+        for mut entry in pending {
+            // Two independent conditions, both cheap here. QSBR covers the
+            // window between resolving a raw address from the cell index and
+            // taking a reference on its segment, which a per-segment count
+            // cannot see; the count covers a guard that outlived the thread
+            // that took it, which QSBR's per-thread accounting cannot see.
+            let quiesced = qsbr.is_quiesced(entry.stamp);
+            let unreferenced = entry.segment.no_references();
+            if quiesced && unreferenced {
+                entry.segment.free_memory();
+                entry.segment.dispense();
+                entry.segment.mem_drop(self);
+                freed += 1;
+                continue;
+            }
+
+            entry.attempts += 1;
+            // A retirement that never drains is a bug worth seeing rather
+            // than a slow leak worth ignoring.
+            if entry.attempts % RETIRED_SEGMENT_REPORT_INTERVAL == 0 {
+                warn!(
+                    "Segment {} (chunk {}) has waited {} drain passes to be reclaimed: \
+                     quiesced={} references={} blocking_threads={}. Its memory is held \
+                     until readers leave.",
+                    entry.segment.id,
+                    self.id,
+                    entry.attempts,
+                    quiesced,
+                    entry.segment.references_count(),
+                    qsbr.blocking_threads(entry.stamp),
+                );
+            }
+            still_pending.push(entry);
+        }
+
+        if !still_pending.is_empty() {
+            self.retired_segments.lock().extend(still_pending);
+        }
+        freed
+    }
+
+    /// Segments unpublished but not yet reclaimed, for tests and diagnostics.
+    pub fn retired_segment_count(&self) -> usize {
+        self.retired_segments.lock().len()
     }
 
     pub fn locate_segment(&self, addr: usize) -> Option<AArc<Segment>> {
@@ -2436,6 +2538,58 @@ mod tests {
     use env_logger;
 
     const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+    /// Unpublishing a segment must never free it while a reader is inside.
+    ///
+    /// `remove_segment` used to drop the pages (`MADV_DONTNEED`, so they read
+    /// back as zeros), delete the backup and the WAL, and return the address
+    /// to the allocator's free list -- all while combine held only a shared
+    /// reference and other readers could be mid-decode. The reader then saw
+    /// zeros, and once the address was recycled, another segment's live bytes.
+    #[test]
+    fn a_retired_segment_is_not_reclaimed_while_a_reader_is_inside() {
+        let _ = env_logger::try_init();
+        let (chunks, _schema) = setup_test_chunks();
+        let chunk = &chunks.list[0];
+
+        // The chunk's bootstrap segment stands in for any combined-away source.
+        let segment_id = chunk.get_head_seg_id();
+
+        // A reader takes a reference the way the read paths do.
+        let reader = chunk
+            .segs
+            .get(&(segment_id as usize))
+            .expect("segment is published");
+        assert!(reader.incr_references(), "reader takes a live reference");
+
+        chunk.remove_segment(segment_id);
+        assert!(
+            chunk.segs.get(&(segment_id as usize)).is_none(),
+            "removal must unpublish immediately so no new reader finds it"
+        );
+        assert_eq!(
+            chunk.retired_segment_count(),
+            1,
+            "the segment is retired, not freed"
+        );
+
+        assert_eq!(
+            chunk.drain_retired_segments(),
+            0,
+            "a segment with a reader inside must not be reclaimed"
+        );
+        assert_eq!(chunk.retired_segment_count(), 1);
+
+        // The reader leaves, announcing quiescence.
+        reader.decr_references();
+
+        assert_eq!(
+            chunk.drain_retired_segments(),
+            1,
+            "once the reader has left, the segment is reclaimed"
+        );
+        assert_eq!(chunk.retired_segment_count(), 0);
+    }
 
     fn setup_test_chunks() -> (Arc<Chunks>, Schema) {
         let fields = Field::new_schema(vec![
