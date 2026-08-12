@@ -2749,8 +2749,17 @@ mod backup_fd_cache_tests {
     use super::*;
 
     fn dummy_handle() -> Arc<File> {
-        // Any real descriptor will do; the cache never reads through it here.
-        Arc::new(File::open("/dev/null").expect("/dev/null should open"))
+        // Any real descriptor will do; the cache never reads through it here --
+        // so share ONE. These tests fill the cache thousands of times over
+        // (`used_handles_outlast_untouched_ones` alone inserts 2,064 entries),
+        // and a descriptor per entry exhausted the process limit once the rest
+        // of the suite was running alongside holding its own files and sockets:
+        // EMFILE out of `File::open`, reported as a panic in the middle of an
+        // eviction test that has nothing to do with descriptor limits.
+        static SHARED: std::sync::OnceLock<Arc<File>> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| Arc::new(File::open("/dev/null").expect("/dev/null should open")))
+            .clone()
     }
 
     /// The cache must stay at its capacity and evict, not grow.

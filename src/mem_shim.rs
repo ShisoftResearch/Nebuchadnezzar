@@ -170,35 +170,69 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
 mod tests {
     use super::*;
 
+    /// Attempts allowed when reading a process-global gauge. These counters are
+    /// net (`fetch_add` on alloc, `fetch_sub` on dealloc) and the shim is the
+    /// global allocator for the whole test binary, so every other test running
+    /// in parallel moves them between our two reads. A single window can show
+    /// less than we allocated -- observed at 420 KiB for a 1 MiB allocation
+    /// once the suite runs concurrently, which read as "allocation not visible"
+    /// and had nothing to do with the shim. The property is deterministic in a
+    /// quiet window, so retry until we get one rather than weaken the
+    /// assertion.
+    const GAUGE_ATTEMPTS: usize = 32;
+
     #[test]
     fn counters_track_alloc_and_dealloc() {
-        // The shim is the process global allocator in test builds, so any
-        // allocation moves the gauges; assert the mechanism directly on a
-        // controlled sequence instead of absolute values.
-        let before = live_bytes();
-        let v: Vec<u8> = Vec::with_capacity(1 << 20);
-        let mid = live_bytes();
-        assert!(
-            mid >= before + (1 << 20),
-            "1 MiB allocation not visible: before={before} mid={mid}"
-        );
-        drop(v);
-        let after = live_bytes();
-        assert!(
-            after < mid,
-            "deallocation not visible: mid={mid} after={after}"
+        let mut last = None;
+        for _ in 0..GAUGE_ATTEMPTS {
+            let before = live_bytes();
+            let v: Vec<u8> = Vec::with_capacity(1 << 20);
+            let mid = live_bytes();
+            if mid < before + (1 << 20) {
+                // Concurrent frees ate the window; nothing was learned.
+                last = Some((before, mid));
+                drop(v);
+                continue;
+            }
+            drop(v);
+            let after = live_bytes();
+            if after < mid {
+                return; // alloc and dealloc both observed in one clean window
+            }
+            last = Some((mid, after));
+        }
+        panic!(
+            "no quiet window in {GAUGE_ATTEMPTS} attempts; last reading {last:?} \
+             (gauges are process-global and every parallel test moves them)"
         );
     }
 
     #[test]
     fn buckets_split_by_size_class() {
-        let b_before = bucket_stats();
-        let small: Vec<u8> = Vec::with_capacity(64 << 10); // -> lt128k
-        let big: Vec<u8> = Vec::with_capacity(8 << 20); // -> 4m_16m
-        let b_mid = bucket_stats();
-        assert!(b_mid[0].0 >= b_before[0].0 + (64 << 10));
-        assert!(b_mid[3].0 >= b_before[3].0 + (8 << 20));
-        drop(small);
-        drop(big);
+        // Same process-global gauges as `counters_track_alloc_and_dealloc`, so
+        // same retry: a parallel test freeing a 64 KiB or 8 MiB buffer between
+        // our two reads hides ours.
+        for attempt in 0..GAUGE_ATTEMPTS {
+            let b_before = bucket_stats();
+            let small: Vec<u8> = Vec::with_capacity(64 << 10); // -> lt128k
+            let big: Vec<u8> = Vec::with_capacity(8 << 20); // -> 4m_16m
+            let b_mid = bucket_stats();
+            let small_seen = b_mid[0].0 >= b_before[0].0 + (64 << 10);
+            let big_seen = b_mid[3].0 >= b_before[3].0 + (8 << 20);
+            drop(small);
+            drop(big);
+            if small_seen && big_seen {
+                return;
+            }
+            assert!(
+                attempt + 1 < GAUGE_ATTEMPTS,
+                "no quiet window in {GAUGE_ATTEMPTS} attempts: \
+                 lt128k {} -> {}, 4m_16m {} -> {}",
+                b_before[0].0,
+                b_mid[0].0,
+                b_before[3].0,
+                b_mid[3].0
+            );
+        }
     }
 }
