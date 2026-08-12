@@ -124,12 +124,47 @@ service! {
 
 service_with_id!(TreeService, DEFAULT_SERVICE_ID);
 
-/// Process-local handle to this node's tree service, published at
-/// construction. The service is otherwise only reachable through the RPC
-/// registry, so status reporting has no way to ask it how large the ranged
-/// index is. Read-only; nothing on an operation path touches it.
-pub static LOCAL_TREE_SERVICE: std::sync::OnceLock<std::sync::Arc<TreeService>> =
-    std::sync::OnceLock::new();
+/// Process-local handles to this node's tree services, one per database,
+/// published at construction. The services are otherwise only reachable
+/// through the RPC registry, so status reporting has no way to ask them how
+/// large the ranged index is. Read-only; nothing on an operation path touches
+/// this.
+///
+/// Keyed per database because a `OnceLock` here reported the wrong index
+/// entirely: the tree service is built once per database, so only the first
+/// one to initialize was ever published, and every other database's health
+/// then reported *its* numbers. On TB15 that meant wikidata's health said
+/// 1 tree and 0 keys -- the default database's -- while wikidata's index held
+/// 43 trees and 117,677,730 keys. Under-reporting to zero is the worst
+/// direction for this particular number: an empty ranged index is exactly the
+/// failure being looked for.
+static LOCAL_TREE_SERVICES: std::sync::LazyLock<
+    lightning::map::PtrHashMap<String, std::sync::Arc<TreeService>>,
+> = std::sync::LazyLock::new(|| lightning::map::PtrHashMap::with_capacity(8));
+
+/// Key a database's tree service by the pair that scopes it everywhere else.
+pub fn local_tree_service_key(group_name: &str, database_name: &str) -> String {
+    format!("{group_name}/{database_name}")
+}
+
+/// Publish this database's tree service for status reporting.
+pub fn publish_local_tree_service(
+    group_name: &str,
+    database_name: &str,
+    service: std::sync::Arc<TreeService>,
+) {
+    use lightning::map::Map;
+    LOCAL_TREE_SERVICES.insert(local_tree_service_key(group_name, database_name), service);
+}
+
+/// This database's tree service, if it has one.
+pub fn local_tree_service(
+    group_name: &str,
+    database_name: &str,
+) -> Option<std::sync::Arc<TreeService>> {
+    use lightning::map::Map;
+    LOCAL_TREE_SERVICES.get(&local_tree_service_key(group_name, database_name))
+}
 
 pub struct TreeService {
     client: Arc<AsyncClient>,

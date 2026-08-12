@@ -2253,7 +2253,11 @@ pub async fn init_ranged_indexer_service<C>(
     ));
     // Publish a process-local handle so status reporting can size the ranged
     // index; the RPC registry is otherwise the only owner.
-    let _ = ranged::tree::service::LOCAL_TREE_SERVICE.set(tree_service.clone());
+    ranged::tree::service::publish_local_tree_service(
+        group_name,
+        database_name,
+        tree_service.clone(),
+    );
     rpc_server
         .register_service_with_id(
             ranged::tree::service::generate_scoped_service_id(group_name, database_name),

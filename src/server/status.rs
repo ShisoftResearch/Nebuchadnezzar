@@ -407,10 +407,12 @@ impl NebServer {
             0
         };
         let (ranged_trees, ranged_keys, ranged_maps) = if residency_enabled() {
-            crate::index::ranged::tree::service::LOCAL_TREE_SERVICE
-                .get()
-                .map(|svc| svc.index_stats())
-                .unwrap_or((0, 0, 0))
+            crate::index::ranged::tree::service::local_tree_service(
+                &self.group_name,
+                self.database_name(),
+            )
+            .map(|svc| svc.index_stats())
+            .unwrap_or((0, 0, 0))
         } else {
             (0, 0, 0)
         };
