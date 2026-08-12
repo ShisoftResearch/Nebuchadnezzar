@@ -1035,7 +1035,7 @@ impl Segment {
             Err(e) => return Err(e),
         };
 
-        let mut header = [0u8; 16];
+        let mut header = [0u8; compression::block_header_size()];
         if read_exact_at(&file, &mut header, 0).is_err() {
             return Ok(None);
         }
@@ -1043,7 +1043,8 @@ impl Segment {
             return Ok(None);
         };
 
-        let index_len = 16 + layout.block_count * 12;
+        let index_len = compression::block_header_size()
+            + layout.block_count * compression::block_index_entry_size();
         let mut index = vec![0u8; index_len];
         read_exact_at(&file, &mut index, 0)?;
         // The file length bounds the last block: blocks are laid out
@@ -1529,6 +1530,13 @@ image, not an empty segment; archiving it would persist the damage.",
                         let data_block =
                             slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
 
+                        // Read the append cursor BEFORE snapshotting the
+                        // image, so the recorded length can never exceed the
+                        // bytes captured. See the call to
+                        // `compress_blocks_on_cells` below.
+                        let used_len_at_snapshot =
+                            self.append_header.load(Ordering::Acquire) - self.addr;
+
                         // Snapshot the segment into a pooled staging buffer
                         // (slab adopter #1; Lightning docs/slab-pools-
                         // design.md). Previously a per-archive 8 MiB
@@ -1562,8 +1570,17 @@ image, not an empty segment; archiving it would persist the damage.",
 
                         #[cfg(feature = "compress_backups")]
                         {
-                            let compressed_data =
-                                compression::compress_blocks_on_cells(&padded_data, &boundaries)?;
+                            // The cursor is read BEFORE the snapshot above, not
+                            // after: reading it after would let a concurrent
+                            // append report a cursor past the bytes actually
+                            // captured, and recovery would then see phantom
+                            // truncation. Reading first can only under-report,
+                            // and bytes past the cursor are never interpreted.
+                            let compressed_data = compression::compress_blocks_on_cells(
+                                &padded_data,
+                                &boundaries,
+                                used_len_at_snapshot,
+                            )?;
                             ARCHIVE_BYTES.fetch_add(compressed_data.len() as u64, Relaxed);
                             file.write_all(&compressed_data)?;
                             debug!(

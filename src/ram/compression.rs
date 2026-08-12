@@ -16,6 +16,9 @@ use std::io;
 /// independently and stores their file offsets, so the block holding a given
 /// segment offset is `offset / block_size` -- arithmetic, no search -- and only
 /// that block need be read and decompressed.
+/// Identifies a block-indexed image, so a reader can tell one from a plain
+/// buffer. Not a version: there is one format, and images that do not match it
+/// are not read.
 pub const BLOCK_COMPRESSION_MAGIC: [u8; 4] = [0x4E, 0x45, 0x42, 0x03];
 
 /// Target uncompressed span for a block. A target, not a stride.
@@ -43,13 +46,29 @@ pub const BLOCK_COMPRESSION_MAGIC: [u8; 4] = [0x4E, 0x45, 0x42, 0x03];
 /// reading one of those decompresses exactly the cell and nothing else.
 pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024;
 
-/// magic(4) + crc32(4) + target_block_size(4) + block_count(4)
-const BLOCK_HEADER_SIZE: usize = 16;
+/// magic(4) + crc32(4) + target_block_size(4) + block_count(4) + used_len(4)
+///
+/// `used_len` is the segment's append cursor when the image was taken. It is
+/// recorded rather than inferred because inference cannot tell an empty
+/// segment from a damaged one -- both yield no entries. A segment whose pages
+/// had been dropped was archived as "no entries", and recovery, finding
+/// non-zero bytes it could not parse, failed the entire store on it.
+const BLOCK_HEADER_SIZE: usize = 20;
 /// Per-entry index: uncompressed_start(u32) + file_offset(u32) + compressed_len(u32)
 ///
 /// The uncompressed start is stored because block spans vary, so a reader
 /// cannot derive the block holding an offset by division.
 const BLOCK_INDEX_ENTRY_SIZE: usize = 12;
+
+/// Bytes before the block index: the fixed header.
+pub const fn block_header_size() -> usize {
+    BLOCK_HEADER_SIZE
+}
+
+/// Bytes per block-index entry.
+pub const fn block_index_entry_size() -> usize {
+    BLOCK_INDEX_ENTRY_SIZE
+}
 
 /// Target uncompressed span per block, overridable for measurement.
 pub fn block_size() -> usize {
@@ -134,8 +153,8 @@ pub fn decompress_if_compressed(data: &[u8]) -> io::Result<Vec<u8>> {
 /// Compress `data` as independently-decompressable blocks with an offset index.
 ///
 /// Layout:
-///   magic(4) | crc32(4) | block_size(4) | block_count(4)
-///   index:  [file_offset(u32), compressed_len(u32)] * block_count
+///   magic(4) | crc32(4) | block_size(4) | block_count(4) | used_len(4)
+///   index:  [uncompressed_start(u32), file_offset(u32), compressed_len(u32)] * block_count
 ///   blocks: lz4(block 0), lz4(block 1), ...
 ///
 /// The crc32 covers the whole uncompressed input, so a full read still verifies
@@ -151,18 +170,23 @@ pub fn compress_blocks(data: &[u8]) -> io::Result<Vec<u8>> {
         .step_by(bs.max(1))
         .map(|s| (s, (s + bs).min(data.len())))
         .collect();
-    compress_spans(data, &spans)
+    // No cursor known at this level; the whole buffer is the live extent.
+    compress_spans(data, &spans, data.len())
 }
 
 /// Compress `data` into blocks that break only on the supplied cell boundaries.
 ///
 /// `boundaries` are sorted cell start offsets within `data`.
-pub fn compress_blocks_on_cells(data: &[u8], boundaries: &[usize]) -> io::Result<Vec<u8>> {
+pub fn compress_blocks_on_cells(
+    data: &[u8],
+    boundaries: &[usize],
+    used_len: usize,
+) -> io::Result<Vec<u8>> {
     let spans = plan_blocks(boundaries, data.len(), block_size());
-    compress_spans(data, &spans)
+    compress_spans(data, &spans, used_len)
 }
 
-fn compress_spans(data: &[u8], spans: &[(usize, usize)]) -> io::Result<Vec<u8>> {
+fn compress_spans(data: &[u8], spans: &[(usize, usize)], used_len: usize) -> io::Result<Vec<u8>> {
     let checksum = crc32_checksum(data);
     let block_count = spans.len();
     let index_bytes = block_count * BLOCK_INDEX_ENTRY_SIZE;
@@ -197,6 +221,9 @@ fn compress_spans(data: &[u8], spans: &[(usize, usize)]) -> io::Result<Vec<u8>> 
     };
     out.extend_from_slice(&size_field.to_le_bytes());
     out.extend_from_slice(&(block_count as u32).to_le_bytes());
+    // The segment's append cursor when this image was taken, so a reader does
+    // not have to guess how much of the image is live.
+    out.extend_from_slice(&(used_len as u32).to_le_bytes());
     out.extend_from_slice(&index);
     for b in &blocks {
         out.extend_from_slice(b);
@@ -218,6 +245,10 @@ pub struct BlockLayout {
     pub block_size: usize,
     pub block_count: usize,
     pub checksum: u32,
+    /// The segment's append cursor when the image was taken: how many bytes of
+    /// the image are live. Everything past it is untouched segment memory and
+    /// must not be interpreted.
+    pub used_len: usize,
     /// Blocks are stored uncompressed. Reading one is then a copy rather than
     /// a decompress, and writing skipped the compressor entirely.
     pub raw: bool,
@@ -312,7 +343,13 @@ pub fn block_layout(data: &[u8]) -> Option<BlockLayout> {
         block_size: (raw_field & !RAW_BLOCKS_FLAG) as usize,
         block_count: u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize,
         raw: raw_field & RAW_BLOCKS_FLAG != 0,
+        used_len: u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize,
     })
+}
+
+/// The segment cursor recorded in an image.
+pub fn declared_used_len(data: &[u8]) -> Option<usize> {
+    block_layout(data).map(|layout| layout.used_len)
 }
 
 /// Resident form of a backup's block index, at half the on-disk size.
@@ -805,7 +842,7 @@ mod tests {
     #[ignore]
     fn block_size_curve() {
         let data = segment_like(8 * 1024 * 1024);
-        let whole = compress_spans(&data, &[(0, data.len())]).unwrap().len();
+        let whole = compress_spans(&data, &[(0, data.len())], data.len()).unwrap().len();
         println!(
             "\nwhole-segment (single span): {:.2}% of {} MiB\n",
             whole as f64 / data.len() as f64 * 100.0,
@@ -919,7 +956,7 @@ mod tests {
             data.extend(std::iter::repeat((i % 251) as u8).take(*s));
         }
 
-        let packed = compress_blocks_on_cells(&data, &bounds).unwrap();
+        let packed = compress_blocks_on_cells(&data, &bounds, data.len()).unwrap();
         assert_eq!(decompress_all_blocks(&packed).unwrap(), data);
 
         // Each cell must be reachable by decompressing exactly its own block.

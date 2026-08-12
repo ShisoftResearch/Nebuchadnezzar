@@ -33,6 +33,12 @@ pub fn load_file_to_memory(path: &Path) -> io::Result<Vec<u8>> {
     file_manager.read_file(path)
 }
 
+/// Load a segment file with the live extent its image declares, if any.
+pub fn load_file_with_used_len(path: &Path) -> io::Result<(Vec<u8>, Option<usize>)> {
+    let file_manager = SegmentFileManager::new(None, None);
+    file_manager.read_file_with_used_len(path)
+}
+
 /// Find the actual append_header by scanning segment data
 pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
     use byteorder::{LittleEndian, ReadBytesExt};
@@ -570,12 +576,21 @@ fn scan_segment_from_data(
     data: &[u8],
     version_map: &mut VersionMap,
     origin_floors: &[std::sync::atomic::AtomicU64],
+    declared_used_len: Option<usize>,
 ) -> io::Result<RecoveryScanResult> {
     use byteorder::{LittleEndian, ReadBytesExt};
     use std::io::Cursor;
 
     let data_base = data.as_ptr() as usize;
-    let bound = data_base + data.len();
+    // An image that records its live extent is read to exactly that point.
+    // Everything past it is untouched segment memory and carries no meaning,
+    // so it is never parsed -- which is what makes "empty" and "damaged"
+    // distinguishable at all. Without the cursor both look like "no entries",
+    // and recovery used to fail the whole store rather than guess.
+    let live_len = declared_used_len
+        .map(|len| len.min(data.len()))
+        .unwrap_or(data.len());
+    let bound = data_base + live_len;
 
     let mut cursor = data_base;
     let mut stashed_tombstones = Vec::new();
@@ -1054,7 +1069,8 @@ pub fn recover_chunks(
                         continue;
                     }
 
-                    let file_data = load_file_to_memory(&file_info.path)?;
+                    let (file_data, declared_used_len) =
+                        load_file_with_used_len(&file_info.path)?;
                     if file_data.len() > SEGMENT_SIZE {
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
                     }
@@ -1067,6 +1083,7 @@ pub fn recover_chunks(
                         &file_data,
                         &mut version_map,
                         origin_floors,
+                        declared_used_len,
                     ) {
                         Ok(scan_result) => scan_result,
                         Err(error) => {
@@ -1478,6 +1495,27 @@ use crate::ram::types::Id;
             data,
             &mut version_map,
             &floors,
+            None,
+        )
+    }
+
+    /// Scan helper for images that declare their live extent.
+    fn scan_segment_with_used_len_for_test(
+        chunk: &Chunk,
+        data: &[u8],
+        used_len: usize,
+    ) -> io::Result<RecoveryScanResult> {
+        let mut version_map = new_version_map(&[]);
+        let floors: Vec<std::sync::atomic::AtomicU64> =
+            (0..4096).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        scan_segment_from_data(
+            chunk,
+            1,
+            chunk.allocator.addr_by_id(1),
+            data,
+            &mut version_map,
+            &floors,
+            Some(used_len),
         )
     }
 
@@ -1693,6 +1731,70 @@ use crate::ram::types::Id;
     /// store came up empty, and the ranged index then replaced 31 of its 40
     /// trees with empty ones because every page read returned
     /// CellDoesNotExisted. One bad segment cost 1.1 TB.
+    /// The image that failed TB14 is no longer ambiguous.
+    ///
+    /// A segment whose cursor reads empty but whose image holds bytes used to
+    /// be unscannable: the walk found no entry at offset 0, saw non-zero bytes
+    /// after it, and had no way to tell "empty segment with junk in untouched
+    /// memory" from "damaged segment". It failed, and the failure took the
+    /// whole store with it.
+    ///
+    /// With the cursor recorded in the image there is nothing to decide: zero
+    /// live bytes means nothing is read, whatever the rest of the image holds.
+    #[test]
+    fn a_declared_empty_image_is_recovered_regardless_of_its_content() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+
+        let mut image = empty_segment_bytes();
+        image[ENTRY_HEAD_SIZE + 4] = 0xAA;
+
+        // Inferring the extent: unscannable, and fatal.
+        let inferred = scan_segment_for_recovery_test(chunk, &image);
+        assert!(
+            inferred.is_err(),
+            "without a recorded cursor this image is indistinguishable from damage"
+        );
+
+        // Declared empty: read nothing, recover the segment as empty.
+        let declared = scan_segment_with_used_len_for_test(chunk, &image, 0)
+            .expect("an image that declares no live bytes must recover as an empty segment");
+        assert_eq!(declared.segment_class, SegmentClass::Regular);
+    }
+
+    /// A recorded extent also stops the walk from wandering into untouched
+    /// memory past the live bytes.
+    #[test]
+    fn a_declared_extent_stops_the_scan_at_the_live_bytes() {
+        let _ = env_logger::try_init();
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let schema = schema_with_id(212, "recovery_declared_extent", false);
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        let cell_id = Id::allocated(22, 0, 1);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &cell_id),
+            data: data_map_value!(id: 9_i32, data: vec![0x33_u8; DATA_SIZE]),
+        };
+        writer_chunks.write_cell(&mut cell).unwrap();
+        let entry = entry_bytes_at(writer_chunks.address_of(&cell_id));
+
+        // One real entry, then garbage in memory the segment never used.
+        let mut image = empty_segment_bytes();
+        image[..entry.len()].copy_from_slice(&entry);
+        image[entry.len() + 32] = 0xC3;
+
+        let reader_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let reader_chunk = &reader_chunks.list[0];
+        let scan = scan_segment_with_used_len_for_test(reader_chunk, &image, entry.len())
+            .expect("the live prefix must recover with the garbage past it ignored");
+        assert_eq!(scan.segment_class, SegmentClass::Regular);
+    }
+
     #[test]
     fn test_recovery_quarantines_an_unscannable_segment_and_keeps_the_rest() {
         let _ = env_logger::try_init();

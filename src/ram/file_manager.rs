@@ -263,6 +263,14 @@ impl SegmentFileManager {
     /// Read file content into memory
     /// Automatically decompresses backup files if they are compressed
     pub fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        self.read_file_with_used_len(path).map(|(data, _)| data)
+    }
+
+    /// Read a segment file, along with the live extent its image declares.
+    ///
+    /// `None` means the file does not record one -- a WAL, whose live extent
+    /// is its length by construction, or a plain uncompressed buffer.
+    pub fn read_file_with_used_len(&self, path: &Path) -> io::Result<(Vec<u8>, Option<usize>)> {
         let mut file = File::open(path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
@@ -270,13 +278,14 @@ impl SegmentFileManager {
         // Check if this is a backup file by extension
         if let Some(extension) = path.extension() {
             if extension == "nbackup" {
+                let used_len = compression::declared_used_len(&buffer);
                 // Decompress backup files (auto-detects compression)
-                return compression::decompress_if_compressed(&buffer);
+                return compression::decompress_if_compressed(&buffer).map(|data| (data, used_len));
             }
         }
 
         // WAL files are not compressed, return as-is
-        Ok(buffer)
+        Ok((buffer, None))
     }
 
     /// Get file size
