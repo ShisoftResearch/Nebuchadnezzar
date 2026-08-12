@@ -1069,10 +1069,40 @@ pub fn recover_chunks(
                         continue;
                     }
 
+                    // Reading the file is per-segment too. A torn archive --
+                    // the OOM kill on TB15 landed mid-write and left "block 214
+                    // extends past end of buffer" -- is one segment's problem,
+                    // and propagating it from here failed the whole store just
+                    // as surely as an unscannable image did. Quarantine covers
+                    // the read, the size check and the scan alike: everything
+                    // whose blast radius is a single file.
                     let (file_data, declared_used_len) =
-                        load_file_with_used_len(&file_info.path)?;
+                        match load_file_with_used_len(&file_info.path) {
+                            Ok(loaded) => loaded,
+                            Err(error) => {
+                                error!(
+                                    "QUARANTINED segment {} (chunk {}, seq {}) from '{}': cannot read it: {}. Recovery continues; this segment's cells are missing from the store.",
+                                    file_info.seg_id,
+                                    chunk_id,
+                                    file_info.seq_id,
+                                    file_info.path.display(),
+                                    error
+                                );
+                                quarantined_segments.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        };
                     if file_data.len() > SEGMENT_SIZE {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "File too large"));
+                        error!(
+                            "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {} bytes is larger than a segment. Recovery continues; this segment's cells are missing from the store.",
+                            file_info.seg_id,
+                            chunk_id,
+                            file_info.seq_id,
+                            file_info.path.display(),
+                            file_data.len()
+                        );
+                        quarantined_segments.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
 
                     let segment_base = chunk.allocator.addr_by_id(file_info.seg_id as usize);
@@ -1731,6 +1761,71 @@ use crate::ram::types::Id;
     /// store came up empty, and the ranged index then replaced 31 of its 40
     /// trees with empty ones because every page read returned
     /// CellDoesNotExisted. One bad segment cost 1.1 TB.
+    /// A torn backup file costs its own segment, not the store.
+    ///
+    /// TB15's OOM kill landed mid-archive and left an image whose index
+    /// pointed past the end of the file ("block 214 extends past end of
+    /// buffer"). Recovery read that before it ever reached the scan, so the
+    /// quarantine did not cover it and the whole store failed to start.
+    #[test]
+    fn test_recovery_quarantines_a_torn_backup_and_keeps_the_rest() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        // A real segment, so there is something to lose.
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let schema = schema_with_id(213, "recovery_torn_backup", false);
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        let good_id = Id::allocated(23, 0, 1);
+        let mut good_cell = OwnedCell {
+            header: CellHeader::new(schema.id, &good_id),
+            data: data_map_value!(id: 11_i32, data: vec![0x2B_u8; DATA_SIZE]),
+        };
+        writer_chunks.write_cell(&mut good_cell).unwrap();
+        let mut good_segment = empty_segment_bytes();
+        let good_entry = entry_bytes_at(writer_chunks.address_of(&good_id));
+        good_segment[..good_entry.len()].copy_from_slice(&good_entry);
+
+        // A compressed image truncated mid-write, as SIGKILL leaves one.
+        let compressed = crate::ram::compression::compress_blocks_on_cells(
+            &good_segment,
+            &[0],
+            good_entry.len(),
+        )
+        .expect("compress");
+        let torn = &compressed[..compressed.len() / 2];
+
+        write_backup_segment(&backup_dir, 0, 0, 1, torn);
+        write_backup_segment(&backup_dir, 0, 1, 2, &good_segment);
+
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        let recovered = count_recovered_cells(&chunks.list);
+        assert!(
+            recovered > 0,
+            "a torn backup abandoned the entire store: {} cells recovered",
+            recovered
+        );
+    }
+
     /// The image that failed TB14 is no longer ambiguous.
     ///
     /// A segment whose cursor reads empty but whose image holds bytes used to
