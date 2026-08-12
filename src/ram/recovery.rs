@@ -996,6 +996,9 @@ pub fn recover_chunks(
     let hot_count = std::sync::atomic::AtomicUsize::new(0);
     let cold_count = std::sync::atomic::AtomicUsize::new(0);
     let segments_processed = std::sync::atomic::AtomicUsize::new(0);
+    /// Segments recovery could not scan. They are skipped rather than fatal,
+    /// so the count has to reach the operator: the store came up incomplete.
+    let quarantined_segments = std::sync::atomic::AtomicUsize::new(0);
 
     let files_by_chunk = group_files_by_chunk(files, chunks.len());
     let total_files: usize = files_by_chunk.iter().map(Vec::len).sum();
@@ -1057,14 +1060,46 @@ pub fn recover_chunks(
                     }
 
                     let segment_base = chunk.allocator.addr_by_id(file_info.seg_id as usize);
-                    let scan_result = scan_segment_from_data(
+                    let scan_result = match scan_segment_from_data(
                         chunk,
                         file_info.seg_id,
                         segment_base,
                         &file_data,
                         &mut version_map,
                         origin_floors,
-                    )?;
+                    ) {
+                        Ok(scan_result) => scan_result,
+                        Err(error) => {
+                            // Quarantine the segment; do not abandon the store.
+                            //
+                            // This used to be `?`, so one unreadable segment
+                            // failed the whole recovery -- every chunk, and
+                            // every segment not yet reached. On TB14 segment
+                            // 2053 did exactly that at 174,900 of 350,902
+                            // segments: the remaining 176,002 were never even
+                            // read, the caller logged "Starting with fresh
+                            // storage", and the ranged index then found an
+                            // empty store and replaced 31 of its 40 trees with
+                            // empty ones. One bad segment cost the database.
+                            //
+                            // Its files are left alone for forensics and for a
+                            // later repair; what is lost is this segment's
+                            // cells, which is the actual damage rather than
+                            // the whole store.
+                            error!(
+                                "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {}. \
+                                 Recovery continues; the cells in this segment are missing \
+                                 from the recovered store.",
+                                file_info.seg_id,
+                                chunk_id,
+                                file_info.seq_id,
+                                file_info.path.display(),
+                                error
+                            );
+                            quarantined_segments.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
                     let segment_class = scan_result.segment_class;
 
                     let existing_hot = chunk
@@ -1194,6 +1229,14 @@ pub fn recover_chunks(
 
     // Count recovered cells
     let total_cells = count_recovered_cells(chunks);
+
+    let quarantined = quarantined_segments.load(Ordering::Relaxed);
+    if quarantined > 0 {
+        error!(
+            "=== Recovery QUARANTINED {} unscannable segment(s). Their cells are NOT in the recovered store; everything else recovered normally. Grep 'QUARANTINED segment' for the files. ===",
+            quarantined
+        );
+    }
 
     info!(
         "=== Recovery complete: {} cells across {} segments ({} hot, {} cold) ===",
@@ -1639,6 +1682,73 @@ use crate::ram::types::Id;
         assert_eq!(segment.append_header.load(Ordering::Acquire), segment.addr);
         assert_eq!(total_hot_segments(&chunks), 1);
         assert_eq!(total_cold_segments(&chunks), 0);
+    }
+
+    /// One unscannable segment must cost that segment, not the store.
+    ///
+    /// Recovery used to propagate a segment's scan error out of the whole run
+    /// (`scan_segment_from_data(...)?`), and the caller answered by logging
+    /// "Starting with fresh storage". On TB14 segment 2053 tripped it at
+    /// 174,900 of 350,902 segments: the remaining 176,002 were never read, the
+    /// store came up empty, and the ranged index then replaced 31 of its 40
+    /// trees with empty ones because every page read returned
+    /// CellDoesNotExisted. One bad segment cost 1.1 TB.
+    #[test]
+    fn test_recovery_quarantines_an_unscannable_segment_and_keeps_the_rest() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        // A real cell, written so we have genuine segment bytes to recover.
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let schema = schema_with_id(211, "recovery_quarantine_regular", false);
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        let good_id = Id::allocated(21, 0, 1);
+        let mut good_cell = OwnedCell {
+            header: CellHeader::new(schema.id, &good_id),
+            data: data_map_value!(id: 7_i32, data: vec![0x5A_u8; DATA_SIZE]),
+        };
+        writer_chunks.write_cell(&mut good_cell).unwrap();
+        let mut good_segment = empty_segment_bytes();
+        let good_entry = entry_bytes_at(writer_chunks.address_of(&good_id));
+        good_segment[..good_entry.len()].copy_from_slice(&good_entry);
+
+        // A segment that claims to be empty yet holds non-zero bytes: exactly
+        // the "non-zero bytes after padding at offset 0" that aborted TB14.
+        let mut bad_segment = empty_segment_bytes();
+        bad_segment[ENTRY_HEAD_SIZE + 4] = 0xAA;
+
+        // The bad one first, so it aborts before the good one is ever read if
+        // the failure is still fatal.
+        write_backup_segment(&backup_dir, 0, 0, 1, &bad_segment);
+        write_backup_segment(&backup_dir, 0, 1, 2, &good_segment);
+
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        // The store must still hold what was readable.
+        let recovered = count_recovered_cells(&chunks.list);
+        assert!(
+            recovered > 0,
+            "an unscannable segment abandoned the entire store: {} cells recovered",
+            recovered
+        );
     }
 
     #[test]
