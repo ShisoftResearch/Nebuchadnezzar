@@ -93,6 +93,15 @@ fn read_field<'v>(
                     field.data_type,
                     tail_offset
                 );
+                // Consume the flag byte before returning. `plan_write_field`
+                // emits it for null and non-null alike and advances past it in
+                // both cases, so returning without advancing leaves the cursor
+                // parked on the flag and shifts every later field in this
+                // variable region back by one byte -- silently, since nothing
+                // downstream can tell a desynced read from a valid one. It
+                // surfaces as the *second* element of an array of maps reading
+                // garbage when the element schema has a nullable field.
+                *tail_offset += 1;
                 return SharedValue::Null;
             }
             // Skip null flag and align for data
@@ -433,5 +442,90 @@ mod tests {
         let val = read_dynamic_value(&mut ptr, Type::Null.id());
         assert!(matches!(val, SharedValue::Null));
         assert_eq!(ptr, 0);
+    }
+
+    /// A null field in the variable region must consume its flag byte on read,
+    /// exactly as `plan_write_field` consumes it on write. It used to return
+    /// early without advancing, so a null in one array element shifted every
+    /// following field back a byte and the *next* element read garbage -- no
+    /// error, just wrong data. Two elements is the smallest shape that shows
+    /// it: the first reads fine either way.
+    #[test]
+    fn null_in_variable_region_does_not_shift_later_fields() {
+        use crate::ram::io::writer::{execute_plan, plan_write_field, WriteInstructions};
+        use crate::ram::schema::Schema;
+        use crate::ram::types::{Id, OwnedValue};
+        use dovahkiin::types::{OwnedMap, OwnedPrimArray};
+
+        let schema = Schema::new(
+            "null_shift",
+            None,
+            Field::new_schema(vec![Field::new_map_array(
+                "entries",
+                vec![
+                    Field::new_unindexed("tag", Type::U32),
+                    // The nullable field sits before nothing in element 1, but
+                    // element 2 follows it in the same variable region.
+                    Field::new_unindexed_array_nullable("ids", Type::Id),
+                ],
+            )]),
+            false,
+            false,
+        );
+
+        let entry = |tag: u32, ids: Option<Vec<Id>>| {
+            let mut m = OwnedMap::new();
+            m.insert_key_id(types::key_hash("tag"), OwnedValue::U32(tag));
+            m.insert_key_id(
+                types::key_hash("ids"),
+                match ids {
+                    // First entry is null -- the case that used to desync.
+                    None => OwnedValue::Null,
+                    Some(ids) => OwnedValue::PrimArray(OwnedPrimArray::Id(ids)),
+                },
+            );
+            OwnedValue::Map(m)
+        };
+
+        let mut root = OwnedMap::new();
+        root.insert_key_id(
+            types::key_hash("entries"),
+            OwnedValue::Array(vec![
+                entry(11, None),
+                entry(22, Some(vec![Id::from_parts(7, 8)])),
+            ]),
+        );
+        let value = OwnedValue::Map(root);
+
+        let mut tail = schema.static_bound;
+        let mut ins = WriteInstructions::new();
+        plan_write_field(&mut tail, &schema.fields, &value, &mut ins, false).unwrap();
+        let mut buf = vec![0u8; tail + 64];
+        execute_plan(buf.as_mut_ptr() as usize, &ins);
+
+        let read = read_by_schema(buf.as_ptr() as usize, &schema);
+        let entries = match &read {
+            SharedValue::Map(m) => match m.get_by_key_id(types::key_hash("entries")) {
+                SharedValue::Array(v) => v.clone(),
+                other => panic!("entries not an array: {:?}", other),
+            },
+            other => panic!("root not a map: {:?}", other),
+        };
+        assert_eq!(entries.len(), 2, "both entries must be present");
+
+        let tag_of = |e: &SharedValue| match e {
+            SharedValue::Map(m) => match m.get_by_key_id(types::key_hash("tag")) {
+                SharedValue::U32(t) => **t,
+                other => panic!("tag not u32: {:?}", other),
+            },
+            other => panic!("entry not a map: {:?}", other),
+        };
+        assert_eq!(tag_of(&entries[0]), 11);
+        // This is the assertion that failed before the fix.
+        assert_eq!(
+            tag_of(&entries[1]),
+            22,
+            "second entry shifted -- a null in the first entry desynced the cursor"
+        );
     }
 }
