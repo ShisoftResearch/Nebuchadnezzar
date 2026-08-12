@@ -41,6 +41,10 @@ const EVICTION_BACKOFF_MS: u64 = 50;
 /// most passes found nothing new. A bounded pass with a resuming cursor covers
 /// the same ground across successive evictions at a fixed cost each.
 const RECLAIM_SCAN_LIMIT: usize = 2048;
+/// Ceiling on the over-budget sweep's reach. Large enough to cover a
+/// terabyte-scale store's cold set in a few passes -- 316,183 segments on
+/// TB15 -- and still bounded so one caller cannot walk forever.
+const OVER_BUDGET_SCAN_LIMIT: usize = 128 * 1024;
 const RECLAIM_CHUNKS_PER_PASS: usize = 4;
 
 /// Minimum spacing between "eviction could not free anything" warnings.
@@ -719,6 +723,31 @@ impl TieredMemoryManager {
     /// segment that is referenced rather than waiting for it -- waiting is what
     /// deadlocked promotion, and a sweep always has somewhere else to go.
     fn reclaim_cold_residency(&self, chunks: &[&Chunk], wanted: usize) -> usize {
+        self.reclaim_cold_residency_bounded(
+            chunks,
+            wanted,
+            RECLAIM_SCAN_LIMIT,
+            RECLAIM_CHUNKS_PER_PASS,
+        )
+    }
+
+    /// As `reclaim_cold_residency`, with the sweep's reach given explicitly.
+    ///
+    /// The default reach is deliberately small because the allocation path
+    /// runs this on every paced eviction and only ever needs a segment or two
+    /// back. That same reach is hopeless when the store is over budget by
+    /// hundreds of gigabytes: TB15 held 316,183 cold segments across 128
+    /// chunks, so a 2,048-segment, 4-chunk pass examined 0.65% of the
+    /// segments and 3% of the chunks while readers faulted blocks in across
+    /// all of them. The budget enforcement path therefore asks for a reach
+    /// proportional to the overage instead.
+    fn reclaim_cold_residency_bounded(
+        &self,
+        chunks: &[&Chunk],
+        wanted: usize,
+        scan_limit: usize,
+        chunks_per_pass: usize,
+    ) -> usize {
         if wanted == 0 || self.cold_resident_bytes.load(Ordering::Relaxed) == 0 {
             return 0;
         }
@@ -730,13 +759,13 @@ impl TieredMemoryManager {
         // its head.
         let start = self.reclaim_cursor.fetch_add(1, Ordering::Relaxed);
 
-        for i in 0..chunks.len().min(RECLAIM_CHUNKS_PER_PASS) {
+        for i in 0..chunks.len().min(chunks_per_pass) {
             let chunk = chunks[(start + i) % chunks.len()];
             // Collecting a chunk's segments allocates a vector of every one of
             // them, so the number of chunks touched per pass is bounded too,
             // not just the number of segments looked at.
             for segment in chunk.segments() {
-                if examined >= RECLAIM_SCAN_LIMIT {
+                if examined >= scan_limit {
                     return freed;
                 }
                 examined += 1;
@@ -1099,11 +1128,38 @@ impl TieredMemoryManager {
             let registered = self.collect_registered_chunk_sets();
             let chunks = self.all_registered_chunks(&registered);
             if !chunks.is_empty() {
-                let freed = self.reclaim_cold_residency(&chunks, over);
-                debug!(
-                    "cold budget: resident {} over limit {} by {}; reclaimed {} from faulted-in blocks",
-                    current, limit, over, freed
+                // Reach sized to the overage, across every chunk. The default
+                // pass exists to be cheap on the allocation path; this one
+                // exists to actually get the memory back, and it is batched
+                // and single-flight so its cost is amortised over the bytes
+                // that were faulted in since the last check.
+                let scan_limit = (over / SEGMENT_SIZE)
+                    .saturating_mul(2)
+                    .clamp(RECLAIM_SCAN_LIMIT, OVER_BUDGET_SCAN_LIMIT);
+                let freed = self.reclaim_cold_residency_bounded(
+                    &chunks,
+                    over,
+                    scan_limit,
+                    chunks.len(),
                 );
+                if freed >= over {
+                    debug!(
+                        "cold budget: {} over limit, reclaimed {} from faulted-in blocks",
+                        over, freed
+                    );
+                } else {
+                    // The sweep could not get it back. Segments referenced by
+                    // in-flight reads are skipped rather than waited on, so a
+                    // shortfall here means readers are holding what the budget
+                    // needs -- which is the shape that preceded TB15's OOM and
+                    // is worth seeing rather than inferring later.
+                    warn!(
+                        "cold budget: {} bytes over limit {} but only {} reclaimable from \
+                         faulted-in blocks after examining up to {} segments; resident memory \
+                         is not being bounded",
+                        over, limit, freed, scan_limit
+                    );
+                }
             }
         }
         self.cold_sweep_running.store(false, Ordering::Release);
