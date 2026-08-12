@@ -167,11 +167,26 @@ pub struct TieredMemoryManager {
     /// residency grew underneath it. Owned by the manager rather than a global,
     /// so one server's residency cannot inflate another's threshold.
     cold_resident_bytes: AtomicUsize,
+    /// Bytes faulted in since the cold budget was last checked. Checking on
+    /// every block would put a registry walk on the read path; this batches it.
+    cold_resident_unchecked: AtomicUsize,
+    /// Single-flight guard for the read-path sweep, so a burst of readers
+    /// crossing the budget together produces one sweep rather than N.
+    cold_sweep_running: std::sync::atomic::AtomicBool,
     /// Promotions refused because the hot tier was already at the hard limit.
     /// A rising count means reads are being served from cold to hold the limit,
     /// which is the intended trade rather than a fault.
     promotions_declined: AtomicU64,
 }
+
+/// Upper bound on how many bytes of newly faulted-in cold blocks may
+/// accumulate before the budget is re-checked. The interval scales with the
+/// budget (see `cold_budget_check_interval`) so the overshoot stays
+/// proportional; a fixed constant would dwarf a small limit entirely and never
+/// fire.
+const COLD_BUDGET_CHECK_INTERVAL_MAX: usize = 256 * 1024 * 1024;
+/// Floor, so the check is not on the path of every block read.
+const COLD_BUDGET_CHECK_INTERVAL_MIN: usize = 1024 * 1024;
 
 impl TieredMemoryManager {
     /// Resident bytes of the per-chunk state map.
@@ -203,6 +218,8 @@ impl TieredMemoryManager {
             cold_blocks_reclaimed: AtomicU64::new(0),
             reclaim_cursor: AtomicUsize::new(0),
             cold_resident_bytes: AtomicUsize::new(0),
+            cold_resident_unchecked: AtomicUsize::new(0),
+            cold_sweep_running: std::sync::atomic::AtomicBool::new(false),
             promotions_declined: AtomicU64::new(0),
         }
     }
@@ -1033,9 +1050,63 @@ impl TieredMemoryManager {
     /// Record blocks faulted into a cold segment.
     #[inline]
     pub fn add_cold_resident(&self, bytes: usize) {
-        if bytes > 0 {
-            self.cold_resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if bytes == 0 {
+            return;
         }
+        self.cold_resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+        // Enforce the budget where it grows.
+        //
+        // Cold residency counts against the same limit as hot segments, but
+        // the only thing that reclaimed it hung off the ALLOCATION path -- so
+        // a workload that only reads never checked it. A sidecar rebuild does
+        // exactly that: it faults blocks in from every cold segment in the
+        // store and allocates nothing, and resident set climbed from 298 GB to
+        // 600 GB on TB15 with nothing to stop it before the machine ran out.
+        let unchecked = self
+            .cold_resident_unchecked
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        if unchecked >= self.cold_budget_check_interval() {
+            self.cold_resident_unchecked.store(0, Ordering::Relaxed);
+            self.enforce_cold_budget();
+        }
+    }
+
+    /// How much newly faulted-in cold residency may accumulate between budget
+    /// checks: an eighth of the limit, clamped. Proportional so that the
+    /// overshoot is a fraction of the budget rather than a fixed number of
+    /// bytes that may be larger than the budget itself.
+    #[inline]
+    fn cold_budget_check_interval(&self) -> usize {
+        (self.shared_pool.physical_memory_limit / 8)
+            .clamp(COLD_BUDGET_CHECK_INTERVAL_MIN, COLD_BUDGET_CHECK_INTERVAL_MAX)
+    }
+
+    /// Reclaim faulted-in cold blocks if they have pushed resident memory past
+    /// the limit. Called from the read path, batched and single-flight.
+    fn enforce_cold_budget(&self) {
+        if self
+            .cold_sweep_running
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let hot_segments = self.shared_hot_segments();
+        let current = self.hot_memory_bytes(hot_segments);
+        let limit = self.threshold_limit();
+        if current > limit {
+            let over = current - limit;
+            let registered = self.collect_registered_chunk_sets();
+            let chunks = self.all_registered_chunks(&registered);
+            if !chunks.is_empty() {
+                let freed = self.reclaim_cold_residency(&chunks, over);
+                debug!(
+                    "cold budget: resident {} over limit {} by {}; reclaimed {} from faulted-in blocks",
+                    current, limit, over, freed
+                );
+            }
+        }
+        self.cold_sweep_running.store(false, Ordering::Release);
     }
 
     /// Release cold residency, saturating at zero.

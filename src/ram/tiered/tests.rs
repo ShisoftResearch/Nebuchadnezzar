@@ -3889,6 +3889,99 @@ fn reading_a_cold_segment_while_holding_a_guard_on_it_completes() {
 /// against a 40GB limit, and eviction spun because the excess lived in cold
 /// segments that evicting hot ones could not free.
 #[test]
+fn reading_cold_segments_alone_must_not_grow_past_the_limit() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    // Cold residency counts against the same limit as hot segments, but the
+    // only thing that reclaimed it hung off the ALLOCATION path. A workload
+    // that only reads never checked the budget, so faulted-in blocks grew
+    // without bound: TB15's sidecar rebuild -- which reads every cold segment
+    // in the store and allocates nothing -- took resident set from 298 GB to
+    // 600 GB against a 200 GB limit.
+    let limit = 4 * SEGMENT_SIZE;
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: limit,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("cold_readonly", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_readonly_schema");
+    let backup_dir = temp_path("neb_readonly_bk");
+    let wal_dir = temp_path("neb_readonly_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        32 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    let mut ids: Vec<Id> = Vec::new();
+    for i in 0..30_000usize {
+        let id = Id::allocated(0, 0, 900_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String("z".repeat(4_000)));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            ids.push(id);
+        }
+    }
+    assert!(ids.len() > 500, "setup wrote too few cells");
+
+    // Push everything cold, then stop writing entirely.
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 64);
+    }
+    let hot_after_evict = manager.shared_hot_segments();
+
+    // Pure reads from here: nothing allocates a segment, so nothing on the
+    // allocation path can enforce the budget.
+    for _ in 0..3 {
+        for id in ids.iter() {
+            let _ = chunks.read_cell(id);
+        }
+    }
+
+    let resident = manager.cold_resident_total();
+    let total = hot_after_evict * SEGMENT_SIZE + resident;
+    assert!(
+        total <= limit * 2,
+        "read-only faulting grew resident memory to {} against a {} limit \
+         ({} bytes of it cold blocks); nothing bounded it",
+        total,
+        limit,
+        resident
+    );
+
+    // And the data is still readable: the budget drops cache, not content.
+    for id in ids.iter().take(200) {
+        let cell = chunks
+            .read_cell(id)
+            .unwrap_or_else(|e| panic!("cell {:?} unreadable: {:?}", id, e));
+        assert_eq!(cell.data["data"].string().map(|s| s.len()), Some(4_000));
+    }
+
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
 fn cold_block_residency_is_reclaimed_under_pressure() {
     let _guard = test_lock();
     let _ = env_logger::try_init();
