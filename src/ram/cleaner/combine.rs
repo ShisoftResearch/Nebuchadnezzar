@@ -242,20 +242,58 @@ impl CombinedCleaner {
         pending_segments
     }
 
+    /// Reserve every destination segment before anything is copied.
+    ///
+    /// A combine that runs out of space halfway cannot be unwound: by then
+    /// some cells have been copied and repointed at new segments while others
+    /// still live in the sources, and there is no consistent state to return
+    /// to. Allocating up front makes exhaustion a decision taken while
+    /// nothing has changed yet. Returns `None` when the chunk cannot host the
+    /// destinations, handing back anything already taken.
+    fn reserve_destinations(
+        chunk: &Chunk,
+        pending_segments: &[DummySegment],
+    ) -> Option<Vec<Segment>> {
+        let mut reserved: Vec<Segment> = Vec::with_capacity(pending_segments.len());
+        for dummy_seg in pending_segments {
+            match chunk
+                .allocator
+                .alloc_seg_with_class(&chunk.file_manager, dummy_seg.segment_class)
+            {
+                Some(seg) => reserved.push(seg),
+                None => {
+                    warn!(
+                        "Combine needs {} destination segments in chunk {} but the allocator ran \
+                         out after {}; skipping this round. The sources keep their data and a \
+                         later round retries with whatever eviction has freed.",
+                        pending_segments.len(),
+                        chunk.id,
+                        reserved.len()
+                    );
+                    for seg in reserved {
+                        seg.dispense();
+                        seg.mem_drop(chunk);
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(reserved)
+    }
+
     fn execute_combine_phases(
         chunk: &Chunk,
         pending_segments: Vec<DummySegment>,
         cleaned_total_live_space: &AtomicUsize,
-    ) -> Vec<usize> {
+    ) -> Option<Vec<usize>> {
+        let reserved = Self::reserve_destinations(chunk, &pending_segments)?;
         // Use global thread pool for segment allocation
-        COMBINE_ALLOC_POOL.install(|| {
+        Some(COMBINE_ALLOC_POOL.install(|| {
             pending_segments
-                .par_iter()
-                .map(|dummy_seg| {
-                    let new_seg = chunk
-                        .allocator
-                        .alloc_seg_with_class(&chunk.file_manager, dummy_seg.segment_class)
-                        .expect("No space left during combine");
+                .into_par_iter()
+                .zip(reserved.into_par_iter())
+                .map(|(dummy_seg, new_seg)| {
+                    let dummy_seg = &dummy_seg;
                     let new_seg_id = new_seg.id;
                     let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
                     let mut seg_cursor = new_seg.addr;
@@ -404,7 +442,7 @@ impl CombinedCleaner {
                     new_seg_id
                 })
                 .collect::<Vec<_>>()
-        })
+        }))
     }
 
     /// Unpublish the combined-away sources and hand them to QSBR reclamation.
@@ -476,8 +514,17 @@ impl CombinedCleaner {
             );
 
             // Use global thread pool for segment allocation
-            let new_segs =
-                Self::execute_combine_phases(chunk, pending_segments, &cleaned_total_live_space);
+            let Some(new_segs) =
+                Self::execute_combine_phases(chunk, pending_segments, &cleaned_total_live_space)
+            else {
+                // Nothing was copied and nothing repointed, so the sources are
+                // still whole: leave them alone. Removing them here is what
+                // used to destroy data when combine panicked mid-round.
+                for seg in segments.iter() {
+                    seg.mark_clean_no_progress();
+                }
+                return (0, 0);
+            };
 
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
             debug!(

@@ -66,6 +66,32 @@ static DEAD_RATE_FOR_COMBINE_CLEANER_RELAXED: f32 = 0.25f32;
 /// that never drains means a reference was leaked; that should be visible.
 const RETIRED_SEGMENT_REPORT_INTERVAL: usize = 64;
 
+/// Holds the write-head slot while a new segment is allocated.
+///
+/// The slot reads `HEAD_SEG_ID_ALLOCATING` for that window and every other
+/// writer spins on it, so an early exit that leaves it there wedges the whole
+/// chunk -- permanently, since only this function ever replaces the value.
+/// Dropping without `publish` restores the previous head, which makes the
+/// window panic-safe as well as error-safe.
+struct HeadSlotGuard<'a> {
+    slot: &'a AtomicU64,
+    restore_to: u64,
+}
+
+impl<'a> HeadSlotGuard<'a> {
+    /// Install the newly allocated segment as the head and disarm the guard.
+    fn publish(self, new_seg_id: u64) {
+        self.slot.store(new_seg_id, Ordering::Release);
+        std::mem::forget(self);
+    }
+}
+
+impl<'a> Drop for HeadSlotGuard<'a> {
+    fn drop(&mut self) {
+        self.slot.store(self.restore_to, Ordering::Release);
+    }
+}
+
 const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
 const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 
@@ -629,16 +655,65 @@ impl Chunk {
                 continue;
             }
 
-            let new_seg_opt = self
+            // From here the head slot reads HEAD_SEG_ID_ALLOCATING, and every
+            // other writer spins waiting for it to be replaced. Leaving it
+            // that way is not a failed write, it is a chunk that never accepts
+            // another write: the old `.expect("No space left after full GCs")`
+            // panicked right here, and the survivors spun on ALLOCATING at
+            // 300% CPU forever. The guard restores the previous head on ANY
+            // early exit, panic included, so the worst case is an error the
+            // caller can act on.
+            let restore = HeadSlotGuard {
+                slot: head_slot,
+                restore_to: head_seg_id,
+            };
+
+            let new_seg_opt = match self
                 .allocator
-                .alloc_seg_with_class(&self.file_manager, segment_class);
-            let new_seg = new_seg_opt.expect("No space left after full GCs");
+                .alloc_seg_with_class(&self.file_manager, segment_class)
+            {
+                Some(seg) => Some(seg),
+                None => {
+                    // The capacity check above counts `segs`, but a segment
+                    // that has been unpublished still owns its address until
+                    // its readers drain and it is reclaimed. So the chunk can
+                    // read as having room while the allocator has none. Give
+                    // the reclaimer its chance before declaring exhaustion --
+                    // those addresses are ours, just not yet handed back.
+                    let reclaimed = self.drain_retired_segments();
+                    if reclaimed > 0 {
+                        debug!(
+                            "Chunk {} reclaimed {} retired segments to satisfy an allocation",
+                            self.id, reclaimed
+                        );
+                        self.allocator
+                            .alloc_seg_with_class(&self.file_manager, segment_class)
+                    } else {
+                        None
+                    }
+                }
+            };
+            let Some(new_seg) = new_seg_opt else {
+                // Space was there when we checked, and is gone now -- another
+                // writer took the last segment between the check and here.
+                // Hand the caller a refusal; the guard puts the head back.
+                drop(restore);
+                error!(
+                    "chunk-allocation-failure: chunk={}, segment_class={:?}, seg_count={}, \
+                     capacity={}: the allocator has no segment left after GC",
+                    self.id,
+                    segment_class,
+                    self.segs.len(),
+                    self.capacity
+                );
+                return Err(WriteError::CannotAllocateSpace);
+            };
             let new_seg_id = new_seg.id;
 
             // Publish new head segment id FIRST
             // This creates a window where the head_seg_id points to a segment not yet in self.segs.
             // Readers of head_seg_id must handle this by retrying.
-            head_slot.store(new_seg_id, Ordering::Release);
+            restore.publish(new_seg_id);
 
             self.put_segment(new_seg);
 
@@ -2539,6 +2614,105 @@ mod tests {
 
     const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
+    /// Drain until the retired segment is reclaimed, or give up.
+    ///
+    /// QSBR's epoch is process-global, so a thread inside a segment critical
+    /// section anywhere -- including another test running concurrently --
+    /// holds back every drain. Reclamation is therefore "once readers have
+    /// left", not "immediately", and a test must poll for it rather than
+    /// demand it on the first call.
+    fn drain_until_reclaimed(chunk: &Chunk, deadline: std::time::Duration) -> usize {
+        let started = std::time::Instant::now();
+        loop {
+            let freed = chunk.drain_retired_segments();
+            if freed > 0 || started.elapsed() > deadline {
+                return freed;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A chunk whose allocator is empty must refuse the write, not wedge.
+    ///
+    /// `try_acquire_in_class` publishes `HEAD_SEG_ID_ALLOCATING` into the head
+    /// slot while it allocates, and every other writer spins waiting for that
+    /// to be replaced. The allocation used to end in
+    /// `.expect("No space left after full GCs")`, so the slot stayed at
+    /// ALLOCATING forever and every writer spun on it -- three cores pinned
+    /// and no further write to that chunk, ever. The tiered stress test hung
+    /// on exactly this for over 25 minutes.
+    ///
+    /// The capacity check cannot prevent it, which is the point of this test:
+    /// it counts `segs`, so segments that are unpublished but not yet
+    /// reclaimed read as free space that the allocator does not have.
+    #[test]
+    fn an_empty_allocator_refuses_the_write_instead_of_wedging_the_head_slot() {
+        let _ = env_logger::try_init();
+        let fields = Field::new_schema(vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]);
+        let schema = Schema::new("wedge_test", None, fields, false, false);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        // Room for several segments, so the capacity guard stays out of the way.
+        let chunks = Chunks::new(
+            1,
+            TEST_CHUNK_SIZE * 8,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+            None,
+        );
+        let chunk = &chunks.list[0];
+
+        // Take every segment the allocator has without publishing any of them,
+        // so `segs.len()` still reports room while the supply is gone. This is
+        // the state combine reaches when its sources are unpublished and their
+        // addresses have not come back yet.
+        let mut hoarded = Vec::new();
+        while let Some(seg) = chunk.allocator.alloc_seg(&chunk.file_manager) {
+            hoarded.push(seg);
+        }
+        assert!(!hoarded.is_empty(), "the allocator should have had segments");
+
+        // Fill the published head. The write that overflows it is the one that
+        // has to allocate, and the allocator has nothing left to give.
+        let mut refusal = None;
+        for i in 0..5_000u64 {
+            let id = Id::allocated(1, 0, i + 1);
+            let mut cell = payload_cell(schema.id, &id, 4096);
+            if let Err(error) = chunks.write_cell(&mut cell) {
+                refusal = Some(error);
+                break;
+            }
+        }
+        assert!(
+            refusal.is_some(),
+            "overflowing the head with an empty allocator must fail, not succeed"
+        );
+        assert_ne!(
+            chunk.head_seg_id.load(Ordering::Acquire),
+            HEAD_SEG_ID_ALLOCATING,
+            "the failed allocation left the head slot poisoned; every later writer would spin on it"
+        );
+
+        // And the chunk still answers instead of spinning.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let chunks_for_probe = chunks.clone();
+        let schema_id = schema.id;
+        std::thread::spawn(move || {
+            let id = Id::allocated(1, 0, 9_999_999);
+            let mut cell = payload_cell(schema_id, &id, 4096);
+            let _ = tx.send(chunks_for_probe.write_cell(&mut cell).is_ok());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(20)).is_ok(),
+            "a write against an exhausted chunk never returned -- the head slot is wedged"
+        );
+    }
+
     /// The corruption itself: a reader holding a reference must still be able
     /// to read the bytes it was pointed at.
     ///
@@ -2588,7 +2762,11 @@ mod tests {
         );
 
         segment.decr_references();
-        assert_eq!(chunk.drain_retired_segments(), 1);
+        assert_eq!(
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(10)),
+            1,
+            "the segment should be reclaimed once its reader has left"
+        );
     }
 
     /// Unpublishing a segment must never free it while a reader is inside.
@@ -2636,7 +2814,7 @@ mod tests {
         reader.decr_references();
 
         assert_eq!(
-            chunk.drain_retired_segments(),
+            drain_until_reclaimed(chunk, std::time::Duration::from_secs(10)),
             1,
             "once the reader has left, the segment is reclaimed"
         );
