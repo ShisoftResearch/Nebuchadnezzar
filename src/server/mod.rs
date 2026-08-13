@@ -1600,6 +1600,39 @@ impl NebServer {
         true
     }
 
+    /// Forget the ranged-index placements for a database being purged.
+    ///
+    /// Purging deletes the database's storage and its trees, but the master
+    /// tree state machine registered on the meta plane keeps its placements in
+    /// memory (bifrost has no unregister). A database recreated under the same
+    /// name then inherited placements naming trees that no longer exist:
+    /// `has_placements()` answered true, genesis was skipped, and every seek
+    /// retried "tree placement was not found" until it gave up -- which is how
+    /// recreating a dropped database failed to initialize its CAGRA service.
+    ///
+    /// Only ever call this when the data is going away. Unloading a runtime
+    /// keeps the trees on disk, and clearing placements there would strand
+    /// them.
+    pub async fn reset_ranged_placements(&self, database_name: &str) -> bool {
+        let plane_client = self
+            .raft_client
+            .plane(database_meta_plane_id(&self.group_name, database_name));
+        let sm_client = ranged::sm::client::SMClient::new(
+            ranged::sm::generate_scoped_sm_id(&self.group_name, database_name),
+            &plane_client,
+        );
+        match sm_client.reset_placements().await {
+            Ok(cleared) => cleared,
+            Err(e) => {
+                warn!(
+                    "Failed to reset ranged placements for {}/{}: {:?}",
+                    self.group_name, database_name, e
+                );
+                false
+            }
+        }
+    }
+
     pub fn delete_database_storage(&self, database_name: &str) -> Result<(), String> {
         if database_name == self.database_name() {
             return Err("cannot delete storage for the default database runtime".to_string());

@@ -62,6 +62,7 @@ raft_state_machine! {
     def cmd split(src_tree: Id, new_tree: Id, pivot: EntryKey);
     def cmd try_init_genesis(tree_id: Id) -> bool;
     def qry has_placements() -> bool;
+    def cmd reset_placements() -> bool;
     // No subscription for clients
 }
 
@@ -163,6 +164,31 @@ impl StateMachineCmds for MasterTreeSM {
         future::ready(!self.tree.is_empty()).boxed()
     }
 
+    /// Forget every placement. Dropping a database deletes its storage and its
+    /// trees, but the state machine registered on the meta plane keeps living
+    /// in memory -- bifrost has no unregister -- so a database recreated under
+    /// the same name inherited placements naming trees that no longer exist.
+    /// `has_placements()` then answered true, genesis was skipped, and every
+    /// seek retried "tree placement was not found" until it gave up.
+    fn reset_placements(&mut self) -> BoxFuture<'_, bool> {
+        async move {
+            if self.tree.is_empty() {
+                return false;
+            }
+            info!(
+                "[RANGED INDEX] Clearing {} stale placement(s) on sm {}",
+                self.tree.len(),
+                self.sm_id
+            );
+            self.tree.clear();
+            if let Err(e) = self.persist_tree() {
+                error!("Failed to persist placement reset: {:?}", e);
+            }
+            true
+        }
+        .boxed()
+    }
+
     fn try_init_genesis(&mut self, tree_id: Id) -> BoxFuture<'_, bool> {
         // Genesis placement must be established through consensus: seeding it
         // into a member-local instance before registration leaves each member
@@ -200,7 +226,15 @@ impl StateMachineCtl for MasterTreeSM {
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
         let tree = utils::serde::deserialize(&data).unwrap();
         self.tree = tree;
-        future::ready(()).boxed()
+        // Load the trees these placements name. `try_initialize` does this at
+        // startup, but it runs BEFORE registration, so on a runtime reload it
+        // saw an empty map and loaded nothing -- the placements then arrived
+        // here and named trees no service had, and every seek retried "tree
+        // placement was not found" until it gave up.
+        async move {
+            self.load_all_placements().await;
+        }
+        .boxed()
     }
 
     fn recoverable(&self) -> bool {
@@ -281,7 +315,26 @@ impl MasterTreeSM {
                 "[RANGED INDEX LOAD] MasterTreeSM already has persisted data, loading {} trees",
                 self.tree.len()
             );
-            // Load all recovered trees into the TreeService
+            self.load_all_placements().await;
+            return true;
+        }
+
+        // No local data: genesis is established via the try_init_genesis raft
+        // command after this state machine registers on the plane. Seeding it
+        // here would give every cluster member a different member-local
+        // placement map — the split-brain that strands index entries.
+        info!(
+            "[RANGED INDEX LOAD] MasterTreeSM has no persisted data; genesis deferred to consensus"
+        );
+        false
+    }
+
+    /// Load every placed tree into the tree service. Idempotent, and needed
+    /// from two places: startup with persisted placements, and recovery, where
+    /// the placement map arrives from the plane AFTER `try_initialize` has
+    /// already run against an empty map.
+    async fn load_all_placements(&mut self) {
+        {
             let tree_entries: Vec<_> = self
                 .tree
                 .iter()
@@ -315,17 +368,7 @@ impl MasterTreeSM {
                 "[RANGED INDEX LOAD] All {} trees loaded successfully",
                 tree_entries.len()
             );
-            return true;
         }
-
-        // No local data: genesis is established via the try_init_genesis raft
-        // command after this state machine registers on the plane. Seeding it
-        // here would give every cluster member a different member-local
-        // placement map — the split-brain that strands index entries.
-        info!(
-            "[RANGED INDEX LOAD] MasterTreeSM has no persisted data; genesis deferred to consensus"
-        );
-        false
     }
 
     /// Selects a candidate genesis tree id preferring local ownership.
