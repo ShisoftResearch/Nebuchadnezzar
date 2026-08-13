@@ -2315,6 +2315,39 @@ pub async fn init_ranged_indexer_service<C>(
         .unwrap();
     meta_plane.recover_after_register().await.unwrap();
 
+    // A placement whose tree has no metadata cell is dangling: the database's
+    // storage went away (unload, purge, or a wiped volume) while the placement
+    // map, which lives on the meta plane, survived. Left alone, every seek
+    // retries against a tree nobody can load and the database never finishes
+    // initializing -- the failure surfaces far away, as an opaque index-service
+    // timeout.
+    //
+    // Re-establishing genesis here is deliberately narrow: it happens at a
+    // lifecycle boundary, only when the metadata cell is *provably* absent, and
+    // it says so loudly. It is NOT a per-read heal -- a read that cannot find
+    // its tree must still fail rather than invent an empty one, which is what
+    // silently wiped ranged trees before.
+    if matches!(sm_client.has_placements().await, Ok(true)) {
+        let placed = sm_client.locate_key(&ranged::trees::min_entry_key()).await;
+        if let Ok((_, placement, _)) = placed {
+            let readable = matches!(neb_client.read_cell(placement.id).await, Ok(Ok(_)));
+            if !readable {
+                error!(
+                    "Ranged-index placement for {}/{} names tree {:?} whose metadata cell is \
+                     absent; the placement map outlived the data it describes. Clearing it and \
+                     re-establishing genesis -- any index entries that tree held are already gone.",
+                    group_name, database_name, placement.id
+                );
+                if let Err(e) = sm_client.reset_placements().await {
+                    error!(
+                        "Failed to clear dangling ranged placements for {}/{}: {:?}",
+                        group_name, database_name, e
+                    );
+                }
+            }
+        }
+    }
+
     // Establish the genesis placement through consensus, but only when the
     // replicated placement map is empty: proposing a command while startup
     // recovery is replaying the plane log destabilizes recovery, and on any

@@ -18,6 +18,10 @@ use std::time::Duration;
 pub mod cursor;
 
 pub(super) const MAX_RETRY_ATTEMPTS: i32 = 300;
+/// Attempts to spend on a NotFound placement *after* refreshing it from the
+/// state machine. A refreshed placement that still cannot be found names a tree
+/// with no metadata cell; retrying to the full bound only delays the report.
+pub(super) const NOT_FOUND_GIVE_UP_ATTEMPTS: i32 = 8;
 pub(super) const RETRY_BACKOFF_MS: u64 = 500;
 pub(super) const MIGRATION_REFRESH_INTERVAL: i32 = 8;
 
@@ -328,13 +332,29 @@ impl RangedIndexerClient {
                             retried + 1
                         );
                     }
-                    last_retry_reason = Some("tree placement was not found".to_string());
+                    last_retry_reason = Some(format!(
+                        "tree placement was not found (tree {:?})",
+                        placement.id
+                    ));
                     debug!(
                         "Ranged client retry {} for key {:?}: {}",
                         retried + 1,
                         key,
                         last_retry_reason.as_deref().unwrap_or("unknown")
                     );
+                    // A placement we just refreshed from the state machine that
+                    // still reports NotFound is dangling, not racing: the tree
+                    // it names has no metadata cell to load. Spinning 300 times
+                    // turns that into an opaque timeout far from the cause, so
+                    // stop early and say what is wrong.
+                    if ensure_updated && retried >= NOT_FOUND_GIVE_UP_ATTEMPTS {
+                        warn!(
+                            "Ranged client giving up on key {:?}: placement names tree {:?} that \
+                             no server can load; the placement map has outlived its trees",
+                            key, placement.id
+                        );
+                        return Err(too_many_retry_error(last_retry_reason.as_deref()));
+                    }
                     ensure_updated = true;
                 }
                 OpResult::EpochMissMatch(expect, actual) => {
