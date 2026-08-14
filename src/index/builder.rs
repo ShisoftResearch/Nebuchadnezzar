@@ -859,10 +859,20 @@ impl IndexBuilder {
             .flat_map(|res| res.to_meta_hash_pairs())
             .collect::<HashMap<_, _>>();
 
-        // Remove unchanged indices
+        // Remove unchanged indices. Ranged entries are exempt on the insert
+        // side: a ranged tree lost to a crash (SIGKILL never flushes it) is
+        // rebuilt lazily by the writes that follow, and a value-unchanged
+        // update is exactly the write that must re-assert its entry -- the
+        // cells were recovered from the WAL but the tree never heard of
+        // them. Ranged insert of an already-present key is a no-op in the
+        // B+ tree, so the re-assert is idempotent. The removal side stays
+        // cancelled for identical pairs, and other index types keep the
+        // full skip (full-text re-adds are not idempotent in cost).
         for index in index_of_old_index.keys().cloned().collect::<Vec<_>>() {
             if index_of_new_index.contains_key(&index) {
-                index_of_new_index.remove(&index);
+                if !matches!(index_of_new_index[&index], IndexMeta::Ranged(_)) {
+                    index_of_new_index.remove(&index);
+                }
                 index_of_old_index.remove(&index);
             }
         }

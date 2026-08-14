@@ -242,6 +242,13 @@ fn discover_databases_for_startup_schema_registration(
     out
 }
 
+// NOTE on consensus identity: the plane id (and the schema SM id inside
+// it) is deliberately group-name-KEYED. The group names the logical
+// cluster; restarting the same deployment keeps the same group, and a
+// different group is a different cluster that must NOT silently adopt
+// another cluster's durable schema state. (A crash-churn harness that
+// rotated group names per cycle rediscovered this as "schema does not
+// exist after recovery" — the harness was wrong, not the identity.)
 pub fn database_meta_plane_id(group_name: &str, database_name: &str) -> raft::PlaneId {
     let mut raw =
         hash_str(&format!("MORPHEUS_DB_PLANE-{group_name}-{database_name}")).wrapping_add(2);
@@ -1457,6 +1464,17 @@ impl NebServer {
                 database_runtime.indexer.clone(),
             )
             .await;
+        }
+
+        if effective_opts.enable_recovery {
+            // The cleaner was constructed paused so compaction cannot move
+            // cells underneath recovery. Recovery is complete at this point
+            // (chunk/WAL recovery, undo-log rollback, and service init all
+            // happen above), so let GC run. Without this resume the
+            // recovered server never reclaims dead space: chunks fill with
+            // dead index-page versions and the graceful-shutdown flush
+            // livelocks on CannotAllocateSpace.
+            database_runtime.cleaner().resume();
         }
 
         debug!(

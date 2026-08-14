@@ -319,44 +319,71 @@ impl AsyncClient {
         &self,
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
-        let client = self.locate_plain_server(cell.id()).await?;
-        match client.write_cell(cell.clone()).await? {
-            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
-                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
-                    .await?;
-                client.write_cell(cell).await
+        // Local-shortcut RPC futures can complete without ever returning
+        // Pending, so a hot caller loop never yields to the runtime: it
+        // starves timers and peer tasks, and JoinHandle::abort can never
+        // land (the task must return from poll to be cancelled). Consuming
+        // coop budget bounds such loops to tokio's task budget. The yield
+        // sits AFTER the call so that on the all-local path a cancellation
+        // can only land once the write's side effects are complete -- never
+        // between the caller reserving work and the cell landing.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            match client.write_cell(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.write_cell(cell).await
+                }
+                other => Ok(other),
             }
-            other => Ok(other),
         }
+        .await;
+        tokio::task::consume_budget().await;
+        res
     }
     pub async fn update_cell(
         &self,
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
-        let client = self.locate_plain_server(cell.id()).await?;
-        match client.update_cell(cell.clone()).await? {
-            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
-                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
-                    .await?;
-                client.update_cell(cell).await
+        // See write_cell: keep always-ready shortcut calls cooperative,
+        // yielding only after the call's side effects are complete.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            match client.update_cell(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.update_cell(cell).await
+                }
+                other => Ok(other),
             }
-            other => Ok(other),
         }
+        .await;
+        tokio::task::consume_budget().await;
+        res
     }
     pub async fn upsert_cell(
         &self,
         cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
-        let client = self.locate_plain_server(cell.id()).await?;
-        // Clone only for the rare schema-miss retry path, not on every call.
-        match client.upsert_cell(cell.clone()).await? {
-            Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
-                self.refresh_owner_schema_cache_for_retry(&client, schema_id)
-                    .await?;
-                client.upsert_cell(cell).await
+        // See write_cell: keep always-ready shortcut calls cooperative,
+        // yielding only after the call's side effects are complete.
+        let res = async {
+            let client = self.locate_plain_server(cell.id()).await?;
+            // Clone only for the rare schema-miss retry path, not on every call.
+            match client.upsert_cell(cell.clone()).await? {
+                Err(WriteError::SchemaDoesNotExisted(schema_id)) => {
+                    self.refresh_owner_schema_cache_for_retry(&client, schema_id)
+                        .await?;
+                    client.upsert_cell(cell).await
+                }
+                other => Ok(other),
             }
-            other => Ok(other),
         }
+        .await;
+        tokio::task::consume_budget().await;
+        res
     }
 
     /// Batch upsert: groups cells by owning server and issues one RPC per
