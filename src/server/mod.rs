@@ -1746,8 +1746,17 @@ impl NebServer {
             // The write-back task processes this asynchronously.
             // We MUST wait for all nodes to be persisted before archiving!
             info!("Waiting for B-tree nodes write-back to complete...");
-            crate::index::ranged::tree::btree::storage::wait_until_updated().await;
-            info!("B-tree nodes write-back completed");
+            if !crate::index::ranged::tree::btree::storage::wait_until_updated().await {
+                error!(
+                    "B-tree write-back barrier NOT established at shutdown; the archive \
+                     below may miss index pages and recovery will refuse affected trees"
+                );
+            } else {
+                info!("B-tree nodes write-back completed");
+            }
+            // The hub itself is stopped inside flush_all_trees (service
+            // side, where the owning client handle lives) so no worker
+            // persists pages past the sync/archive below.
         } else {
             debug!("LSM tree service not available (likely not enabled)");
         }

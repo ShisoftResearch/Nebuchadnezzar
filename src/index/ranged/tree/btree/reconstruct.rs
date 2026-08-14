@@ -237,8 +237,6 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    use crate::ram::cell::ReadError;
-
     let mut ids = Vec::new();
     let mut current = head_id;
     let mut seen = HashSet::new();
@@ -254,30 +252,14 @@ where
 
         let cell = match neb.read_cell(current).await {
             Ok(Ok(cell)) => cell,
-            Ok(Err(ReadError::CellDoesNotExisted)) if !ids.is_empty() && upper_bound.is_some() => {
-                // A bounded tree's persisted chain can legitimately end in a
-                // dangling pointer: a split-off hands the right half of the
-                // chain to a sibling tree, and if the severed page's rewrite
-                // was not yet durable when the process stopped, the old link
-                // survives on disk while the sibling later rewrites and
-                // deletes the pages it took over. Every page read so far
-                // started below this tree's upper bound, so the tree's own
-                // range is covered; the unreadable continuation belongs to
-                // the sibling. Truncate rather than refuse -- but say so
-                // loudly, because for an unbounded tree (or a chain that
-                // loses its FIRST page) this same condition is genuine loss
-                // and still refuses below.
-                warn!(
-                    "[B-TREE LOAD] Chain from {:?} dangles into deleted page {:?} after {} \
-                     readable pages; tree is bounded (upper {:?}) so the continuation \
-                     belongs to a sibling tree. Truncating the chain at the boundary.",
-                    head_id,
-                    current,
-                    ids.len(),
-                    upper_bound
-                );
-                break;
-            }
+            // A missing page ALWAYS refuses, bounded or not. An earlier
+            // revision truncated bounded trees here on the theory that the
+            // dangling continuation belonged to a split sibling; on TB16
+            // that "heal" silently hid 3M live keys behind a mid-chain hole
+            // left by unordered write-back. With deletions fenced behind
+            // their link rewrites (storage.rs) and split seams committed
+            // transactionally, a chain that references an unreadable page
+            // is corruption, and serving a subset is worse than refusing.
             Ok(Err(_)) => {
                 return Err(ReconstructError::MissingPage {
                     page_id: current,

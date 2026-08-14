@@ -413,9 +413,19 @@ impl MasterTreeSM {
         let serialized = utils::serde::serialize(&entries);
         writer.write_all(&serialized)?;
         writer.flush()?;
+        // A rename is only atomic-durable if the file's contents are on
+        // disk first and the directory entry follows: without these syncs
+        // the placement snapshot could come back empty or truncated after
+        // a power failure, and split epochs would rewind.
+        writer.get_ref().sync_all()?;
 
         // Atomically replace the old file
         fs::rename(&temp_path, path)?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
 
         Ok(())
     }

@@ -13,7 +13,16 @@ use std::time::Duration;
 // in one process waited on each other's progress and a dead fleet poisoned
 // every later instance.
 pub struct WriteBackHub {
+    // Page upserts. Drained in batches by any worker.
     queue: SegQueue<(usize, external::ChangingNode)>,
+    // Page deletions, fenced: a deletion enqueued at id D executes only
+    // once progress covers every id before D — i.e. every modification
+    // (and earlier deletion) enqueued before it is durable. Without the
+    // fence, a batch of multi-worker drains could persist a page's removal
+    // while the link rewrite that unlinks it was still queued; a crash in
+    // that window left the on-disk chain pointing at deleted pages (TB16's
+    // genesis tree, 3M keys stranded behind a mid-chain hole).
+    deletions: Mutex<std::collections::VecDeque<(usize, crate::ram::types::Id, Arc<client::AsyncClient>)>>,
     counter: AtomicUsize,
     // usize::MAX = nothing processed yet (avoids counter=1/progress=0
     // looking like "operation 0 done").
@@ -62,6 +71,7 @@ pub fn hub_for(client: &Arc<client::AsyncClient>) -> Arc<WriteBackHub> {
     }
     let hub = Arc::new(WriteBackHub {
         queue: SegQueue::new(),
+        deletions: Mutex::new(std::collections::VecDeque::new()),
         counter: AtomicUsize::new(0),
         progress: AtomicUsize::new(usize::MAX),
         alive: AtomicUsize::new(0),
@@ -110,8 +120,43 @@ impl Drop for CompletionGuard {
 
 impl WriteBackHub {
     pub fn push(&self, changing: external::ChangingNode) {
-        let id = self.counter.fetch_add(1, Ordering::Relaxed);
-        self.queue.push((id, changing));
+        match changing {
+            external::ChangingNode::DeletedWithClient(cid, cl) => {
+                // Ids for deletions are drawn from the same counter as
+                // modifications, so "progress reached id-1" means every
+                // change enqueued before this deletion is durable.
+                let mut deletions = self
+                    .deletions
+                    .lock()
+                    .expect("write-back deletion lane poisoned");
+                let id = self.counter.fetch_add(1, Ordering::Relaxed);
+                deletions.push_back((id, cid, cl));
+            }
+            changing => {
+                let id = self.counter.fetch_add(1, Ordering::Relaxed);
+                self.queue.push((id, changing));
+            }
+        }
+    }
+
+    // Deletions whose fence is satisfied: every id before theirs is done.
+    fn take_ready_deletions(
+        &self,
+    ) -> Vec<(usize, crate::ram::types::Id, Arc<client::AsyncClient>)> {
+        let progress = self.progress.load(Ordering::Acquire);
+        let mut deletions = self
+            .deletions
+            .lock()
+            .expect("write-back deletion lane poisoned");
+        let mut ready = Vec::new();
+        while let Some(&(id, _, _)) = deletions.front() {
+            let fenced = id == 0 || (progress != usize::MAX && progress >= id - 1);
+            if !fenced {
+                break;
+            }
+            ready.push(deletions.pop_front().unwrap());
+        }
+        ready
     }
 
     fn record_completed(&self, id: usize) {
@@ -179,8 +224,6 @@ impl WriteBackHub {
                     // cancelled mid-flush (drop records the id).
                     let mut guards: Vec<CompletionGuard> = Vec::new();
                     let mut cells: Vec<crate::ram::cell::OwnedCell> = Vec::new();
-                    let mut deletes: Vec<(crate::ram::types::Id, Arc<client::AsyncClient>)> =
-                        Vec::new();
                     let mut batch_client: Option<Arc<client::AsyncClient>> = None;
                     for _ in 0..BATCH {
                         let Some((id, changing)) = hub.queue.pop() else {
@@ -207,18 +250,21 @@ impl WriteBackHub {
                                     ),
                                 }
                             }
+                            // Deletions never enter this queue; they live in
+                            // the fenced deletion lane.
                             external::ChangingNode::DeletedWithClient(cid, cl) => {
-                                deletes.push((cid, cl));
+                                error!(
+                                    "write-back worker {}: deletion {:?} found in the \
+                                     modification lane; executing unfenced",
+                                    worker_id, cid
+                                );
+                                let _ = cl.remove_cell(cid).await;
                             }
                         }
                         guards.push(guard);
                     }
 
-                    if cells.is_empty() && deletes.is_empty() {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                        continue;
-                    }
-
+                    let flushed_mods = !guards.is_empty();
                     if !cells.is_empty() {
                         let client = batch_client.expect("cells present implies a client");
                         match client.upsert_all_cells(cells).await {
@@ -234,7 +280,19 @@ impl WriteBackHub {
                             }
                         }
                     }
-                    for (cid, cl) in deletes {
+                    // Modification ids complete here, advancing the fence.
+                    drop(guards);
+
+                    // Deletions run only once every change enqueued before
+                    // them is durable, so a crash can never persist a page
+                    // removal ahead of the link rewrite that unlinks it.
+                    let ready = hub.take_ready_deletions();
+                    let flushed_dels = !ready.is_empty();
+                    for (id, cid, cl) in ready {
+                        let _guard = CompletionGuard {
+                            hub: hub.clone(),
+                            id,
+                        };
                         match cl.remove_cell(cid).await {
                             Ok(Ok(())) => {}
                             Ok(Err(e)) => {
@@ -245,9 +303,11 @@ impl WriteBackHub {
                             }
                         }
                     }
-                    // guards drop here, recording completion for every id in
-                    // the batch.
-                    drop(guards);
+
+                    if !flushed_mods && !flushed_dels {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
                 }
                 debug!("B-tree write-back worker {} stopped", worker_id);
             });
@@ -255,37 +315,44 @@ impl WriteBackHub {
         self.spawning.store(false, Ordering::SeqCst);
     }
 
-    pub async fn wait_until_updated(&self) {
+    /// Returns true when every change enqueued before the call is durable.
+    /// False means the barrier could NOT be established (no live workers, or
+    /// workers died mid-wait) — callers publishing head pointers or
+    /// archiving segments must treat false as a hard failure, not a flush.
+    pub async fn wait_until_updated(&self) -> bool {
         let counter = self.counter.load(Ordering::Acquire);
         if counter == 0 {
-            return;
+            return true;
         }
         let newest = counter - 1;
         let progress = self.progress.load(Ordering::Acquire);
         let has_pending = progress == usize::MAX || progress < newest;
         if !has_pending {
-            return;
+            return true;
         }
         if self.alive.load(Ordering::Acquire) == 0 {
             warn!(
                 "wait_until_updated: {} change(s) pending but no write-back worker \
-                 is alive on this hub; returning without waiting",
+                 is alive on this hub; barrier NOT established",
                 if progress == usize::MAX {
                     newest + 1
                 } else {
                     newest - progress
                 }
             );
-            return;
+            return false;
         }
         loop {
             let current = self.progress.load(Ordering::Acquire);
             if current != usize::MAX && current >= newest {
-                break;
+                return true;
             }
             if self.alive.load(Ordering::Acquire) == 0 {
-                warn!("wait_until_updated: write-back workers died while waiting; giving up");
-                break;
+                warn!(
+                    "wait_until_updated: write-back workers died while waiting; \
+                     barrier NOT established"
+                );
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -301,6 +368,10 @@ impl WriteBackHub {
             .clear();
         self.counter.store(0, Ordering::SeqCst);
         while self.queue.pop().is_some() {}
+        self.deletions
+            .lock()
+            .expect("write-back deletion lane poisoned")
+            .clear();
     }
 }
 
@@ -308,11 +379,21 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
     hub_for(client).ensure_workers();
 }
 
-/// Wait until every live hub has drained its pending changes.
-pub async fn wait_until_updated() {
+/// Wait until every live hub has drained its pending changes. A hub whose
+/// worker fleet died is respawned on the caller's runtime and retried once;
+/// false means at least one hub could not establish the barrier and pending
+/// page writes may not be durable.
+pub async fn wait_until_updated() -> bool {
+    let mut all_drained = true;
     for hub in all_hubs() {
-        hub.wait_until_updated().await;
+        let mut drained = hub.wait_until_updated().await;
+        if !drained {
+            hub.ensure_workers();
+            drained = hub.wait_until_updated().await;
+        }
+        all_drained &= drained;
     }
+    all_drained
 }
 
 /// Reset write-back state for server restart.
@@ -325,4 +406,85 @@ pub async fn reset_write_back_state() {
         .expect("write-back hub registry poisoned")
         .clear();
     debug!("B-tree write-back state reset");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ram::types::Id;
+    use crate::server::{NebServer, ServerOptions, Service};
+
+    /// The deletion lane must hold a page removal until every change
+    /// enqueued before it has completed. This is the fence that keeps a
+    /// crash from persisting a page delete ahead of the link rewrite that
+    /// unlinks it (the TB16 mid-chain hole).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deletion_fence_waits_for_prior_ids() {
+        let _ = env_logger::try_init();
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "writeback_deletion_fence";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 8 * 1024 * 1024,
+                db_size: 8 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                disable_storage_locks: true,
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // A fresh hub with NO workers: lane state is driven by hand.
+        let hub = hub_for(&client);
+        assert_eq!(hub.counter.load(Ordering::Acquire), 0);
+
+        // id 0: a modification (represented directly through the counter —
+        // the fence logic cares only about id completion order).
+        let mod_id = hub.counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(mod_id, 0);
+
+        // id 1: a deletion enqueued AFTER the modification.
+        hub.push(external::ChangingNode::DeletedWithClient(
+            Id::from_parts(42, 42),
+            client.clone(),
+        ));
+
+        // The modification has not completed: the deletion must stay fenced.
+        assert!(
+            hub.take_ready_deletions().is_empty(),
+            "a deletion must not run before changes enqueued ahead of it complete"
+        );
+
+        // Complete the modification; the fence opens.
+        hub.record_completed(mod_id);
+        let ready = hub.take_ready_deletions();
+        assert_eq!(ready.len(), 1, "the fenced deletion must be released");
+        assert_eq!(ready[0].1, Id::from_parts(42, 42));
+
+        // Deletions themselves advance the progress chain once executed.
+        hub.record_completed(ready[0].0);
+        assert!(hub.wait_until_updated().await);
+
+        server.shutdown().await;
+    }
 }

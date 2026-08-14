@@ -171,6 +171,9 @@ pub struct TreeService {
     sm_client: Arc<SMClient>,
     trees: Arc<HashMap<Id, Arc<DistTree>>>,
     pending_migrations: Arc<HashMap<Id, Arc<DistTree>>>,
+    // Set by flush_all_trees: freezes the balancer so no split or checkpoint
+    // races the shutdown flush and lands writes after the segment archive.
+    balancer_stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn trace_schema_from_key(key: &EntryKey) -> u32 {
@@ -335,6 +338,7 @@ impl Service for TreeService {
                 return;
             }
             info!("Called to load tree {:?}, boundary {:?}", id, boundary);
+            self.reconcile_split_marker(&id, &boundary).await;
             let tree =
                 match RangedTree::recover_bounded(&self.client, &id, Some(&boundary.upper)).await {
                 Ok(tree) => tree,
@@ -686,14 +690,90 @@ impl TreeService {
         info!("Initializing LSM tree service");
         let trees_map = Arc::new(HashMap::with_capacity(32));
         let pending_migrations = Arc::new(HashMap::with_capacity(32));
+        let balancer_stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         super::btree::storage::start_external_nodes_write_back(client);
-        Self::start_tree_balancer(&trees_map, &pending_migrations, client, sm_client);
+        Self::start_tree_balancer(
+            &trees_map,
+            &pending_migrations,
+            client,
+            sm_client,
+            &balancer_stopped,
+        );
         Self {
             client: client.clone(),
             sm_client: sm_client.clone(),
             trees: trees_map,
             pending_migrations,
+            balancer_stopped,
         }
+    }
+
+    /// Reconcile a durable split marker before loading `id`. A crash after
+    /// the seam barrier but before the placement flip leaves the source's
+    /// chain cut with an orphaned target tree; a crash before the barrier
+    /// leaves the chain intact with a stale marker. Committed splits (the
+    /// placement map knows the target) just shed the marker. The decision
+    /// key: whoever owns the key at this tree's placement upper bound.
+    async fn reconcile_split_marker(&self, id: &Id, boundary: &Boundary) {
+        let Some((head, Some(target))) =
+            super::tree::read_tree_metadata(&self.client, id).await
+        else {
+            return;
+        };
+        let committed = match self.sm_client.locate_key(&boundary.upper).await {
+            Ok((_, placement, _)) => placement.id == target,
+            Err(e) => {
+                warn!(
+                    "Cannot reconcile split marker on {:?} (target {:?}): placement \
+                     lookup failed: {:?}; leaving the marker for the next load",
+                    id, target, e
+                );
+                return;
+            }
+        };
+        if committed {
+            info!(
+                "Tree {:?} carries a committed split marker for {:?}; clearing it",
+                id, target
+            );
+            super::tree::clear_migration_marker(&self.client, id).await;
+            return;
+        }
+        // Uncommitted: the placement never flipped, so this tree still owns
+        // the whole range and the split must be undone.
+        if let Some((target_head, _)) =
+            super::tree::read_tree_metadata(&self.client, &target).await
+        {
+            let chain = super::tree::walk_chain_page_ids(&self.client, head).await;
+            if chain.contains(&target_head) {
+                debug!(
+                    "Uncommitted split of {:?}: chain still reaches the moved head; \
+                     no relink needed",
+                    id
+                );
+            } else if let Some(last) = chain.last() {
+                match super::tree::relink_page_next(&self.client, *last, target_head).await {
+                    Ok(()) => info!(
+                        "Uncommitted split of {:?}: rejoined severed chain at {:?} -> {:?}",
+                        id, last, target_head
+                    ),
+                    Err(e) => {
+                        error!(
+                            "Uncommitted split of {:?}: failed to rejoin chain: {}; \
+                             leaving marker so the next load retries",
+                            id, e
+                        );
+                        return;
+                    }
+                }
+            }
+            let _ = self.client.remove_cell(target).await;
+        }
+        super::tree::clear_migration_marker(&self.client, id).await;
+        info!(
+            "Rolled back uncommitted split of {:?} (orphaned target {:?})",
+            id, target
+        );
     }
 
     async fn hydrate_missing_tree(&self, id: Id, entry: &EntryKey) -> bool {
@@ -727,6 +807,8 @@ impl TreeService {
                     upper,
                     placement.epoch
                 );
+                self.reconcile_split_marker(&id, &Boundary::new(lower.clone(), upper.clone()))
+                    .await;
                 let tree = match RangedTree::recover_bounded(&self.client, &id, Some(&upper)).await
                 {
                     Ok(tree) => tree,
@@ -783,6 +865,11 @@ impl TreeService {
     /// Flush all trees to disk - called during shutdown
     pub async fn flush_all_trees(&self) {
         info!("Flushing all LSM trees to disk before shutdown");
+        // Structural churn stops first: a balancer split racing the final
+        // flush would enqueue page writes and head publishes after the
+        // barrier below, landing them after the segment archive.
+        self.balancer_stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         for (tree_id, dist_tree) in self.trees.entries() {
             let tree = &dist_tree.tree;
             let disk_count = tree.count();
@@ -799,19 +886,35 @@ impl TreeService {
         // CRITICAL: Wait for all external B-tree node writes to complete BEFORE marking migration
         // Otherwise, mark_migration() will update the LSM tree cell with head IDs pointing to
         // B-tree pages that haven't been persisted yet, causing "CellDoesNotExisted" on recovery
-        super::btree::storage::wait_until_updated().await;
-        info!("All B-tree nodes persisted, now marking migrations");
-
-        // Now it's safe to update the LSM tree cells with the new head IDs
-        for (tree_id, dist_tree) in self.trees.entries() {
-            let tree = &dist_tree.tree;
-            if let Err(e) = tree.mark_migration(&tree_id, None, &self.client).await {
-                warn!(
-                    "Failed to mark LSM tree migration after flush for tree {:?}: {:?}",
-                    tree_id, e
-                );
+        let barrier = super::btree::storage::wait_until_updated().await;
+        if barrier {
+            info!("All B-tree nodes persisted, now marking migrations");
+            // Now it's safe to update the LSM tree cells with the new head IDs
+            for (tree_id, dist_tree) in self.trees.entries() {
+                let tree = &dist_tree.tree;
+                if let Err(e) = tree.mark_migration(&tree_id, None, &self.client).await {
+                    warn!(
+                        "Failed to mark LSM tree migration after flush for tree {:?}: {:?}",
+                        tree_id, e
+                    );
+                }
             }
+        } else {
+            // Publishing heads over an unestablished barrier is exactly the
+            // recovery corruption this flush exists to prevent. The current
+            // metadata cells still point at the previous consistent chains,
+            // so skipping the publish loses at most recent writes -- never
+            // consistency.
+            error!(
+                "flush_all_trees: write-back barrier NOT established; refusing to publish \
+                 tree head pointers over undrained pages"
+            );
         }
+
+        // Stop THIS server's write-back hub so no worker persists pages
+        // after the caller's segment sync/archive. Other servers in the
+        // process keep their hubs.
+        super::btree::storage::hub_for(&self.client).reset().await;
 
         info!("All LSM trees flushed to disk");
     }
@@ -952,12 +1055,14 @@ impl TreeService {
         pending_migrations: &Arc<HashMap<Id, Arc<DistTree>>>,
         client: &Arc<AsyncClient>,
         sm_client: &Arc<SMClient>,
+        stopped: &Arc<std::sync::atomic::AtomicBool>,
     ) {
         debug!("Starting range indexer tree balancer");
         let trees_map = trees_map.clone();
         let pending_migrations = pending_migrations.clone();
         let client = client.clone();
         let sm_client = sm_client.clone();
+        let stopped = stopped.clone();
         tokio::spawn(async move {
             const SPLIT_RETRY_BACKOFF_MS: u64 = 2_000;
             // Periodic checkpoint: flush B-tree pages and update tree root cells
@@ -967,15 +1072,29 @@ impl TreeService {
             let mut split_backoff_until = StdHashMap::<Id, Instant>::new();
 
             loop {
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                    info!("Tree balancer stopped for shutdown");
+                    return;
+                }
                 let mut fast_mode = false;
                 checkpoint_counter = checkpoint_counter.wrapping_add(1);
                 let do_checkpoint = checkpoint_counter % CHECKPOINT_INTERVAL_LOOPS == 0;
 
+                // Head publishes below are gated on the drain barrier: a
+                // checkpoint over an unestablished barrier would point tree
+                // metadata at pages that never became durable.
+                let mut checkpoint_barrier = false;
                 if do_checkpoint {
                     // Ensure all pending B-tree node writes are flushed, then update
                     // tree root cells. This limits the recovery window to ~60 seconds
                     // of writes even if the server is killed without a clean shutdown.
-                    storage::wait_until_updated().await;
+                    checkpoint_barrier = storage::wait_until_updated().await;
+                    if !checkpoint_barrier {
+                        error!(
+                            "balancer checkpoint: write-back barrier NOT established; \
+                             skipping this round's head publishes"
+                        );
+                    }
                 }
 
                 for (_, dist_tree) in trees_map.entries() {
@@ -986,12 +1105,20 @@ impl TreeService {
                     // If merge happened, wait for external nodes to be written, then update the tree cell
                     if merged {
                         // Wait for all external B+tree nodes to be written to storage
-                        storage::wait_until_updated().await;
-                        // Now update the cell with the new head IDs
-                        if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
-                            warn!("Failed to mark LSM tree migration after merge: {:?}", e);
+                        if storage::wait_until_updated().await {
+                            // Now update the cell with the new head IDs
+                            if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await
+                            {
+                                warn!("Failed to mark LSM tree migration after merge: {:?}", e);
+                            }
+                        } else {
+                            error!(
+                                "post-merge publish for {:?} skipped: write-back barrier \
+                                 NOT established",
+                                dist_tree.id
+                            );
                         }
-                    } else if do_checkpoint {
+                    } else if do_checkpoint && checkpoint_barrier {
                         // Periodic checkpoint: update tree root cell to reflect current state
                         if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
                             warn!("Failed to checkpoint tree {:?}: {:?}", dist_tree.id, e);
@@ -1129,6 +1256,36 @@ impl TreeService {
                             {
                                 warn!(
                                     "Failed to clear migration marker for tree {:?} after target publish failure: {:?}",
+                                    dist_tree.id, unmark_err
+                                );
+                            }
+                            continue;
+                        }
+
+                        // Seam barrier: the placement flip below is the split's
+                        // commit point. Once it lands, the target may rewrite
+                        // or (fence-ordered) delete the formerly shared pages,
+                        // so the source's severed chain and the moved head's
+                        // cleared prev must be durable FIRST. The drain also
+                        // covers the insert backlog, but a split only fires on
+                        // an oversized tree during rebalancing, where that
+                        // cost is acceptable; a failed barrier rolls the split
+                        // back rather than committing over undrained pages.
+                        if !storage::wait_until_updated().await {
+                            error!(
+                                "Seam barrier for split of {:?} NOT established; rolling back",
+                                dist_tree.id
+                            );
+                            pending_migrations.remove(&migration_target_id);
+                            {
+                                let mut dist_prop = dist_tree.prop.write();
+                                dist_prop.migration = None;
+                            }
+                            if let Err(unmark_err) =
+                                tree.mark_migration(&dist_tree.id, None, &client).await
+                            {
+                                warn!(
+                                    "Failed to clear migration marker for tree {:?} after seam barrier failure: {:?}",
                                     dist_tree.id, unmark_err
                                 );
                             }
