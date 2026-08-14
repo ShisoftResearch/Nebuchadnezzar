@@ -150,6 +150,13 @@ where
                 // right of it moves; sever and capture.
                 let moved_first = mem::take(&mut n.next);
                 drop(node);
+                // The severed forward link must reach disk: the moved chain
+                // now belongs to the sibling tree, which will rewrite and
+                // delete these pages on its own schedule. An unpersisted cut
+                // leaves this tree's on-disk chain dangling into the
+                // sibling's deleted pages after a restart (TB16: MissingPage
+                // on the genesis tree, sidecar metadata unreachable).
+                external::make_changed(node_ref, tree);
                 capture_moved_chain::<KS, PS>(tree, moved_first, ctx);
                 return true;
             }
@@ -189,6 +196,11 @@ where
             moved_leaf.next = captured_next.clone();
             moved_leaf.prev = NodeCellRef::default();
             drop(node);
+            // The truncated boundary leaf changed on every axis that matters
+            // on disk: len shrank, right_bound moved to the pivot, and next
+            // was severed. Persist it, or a reload resurrects the moved keys
+            // AND follows the stale link into the sibling's pages.
+            external::make_changed(node_ref, tree);
             let moved_ref = NodeCellRef::new(Node::with_external(moved_leaf));
             // The leaf that followed the boundary now sits behind the freshly
             // created head; repoint its back-link into the new tree.

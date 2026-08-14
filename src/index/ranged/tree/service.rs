@@ -335,7 +335,8 @@ impl Service for TreeService {
                 return;
             }
             info!("Called to load tree {:?}, boundary {:?}", id, boundary);
-            let tree = match RangedTree::recover(&self.client, &id).await {
+            let tree =
+                match RangedTree::recover_bounded(&self.client, &id, Some(&boundary.upper)).await {
                 Ok(tree) => tree,
                 Err(error) => {
                     // Leave it absent rather than installing an empty tree.
@@ -726,7 +727,8 @@ impl TreeService {
                     upper,
                     placement.epoch
                 );
-                let tree = match RangedTree::recover(&self.client, &id).await {
+                let tree = match RangedTree::recover_bounded(&self.client, &id, Some(&upper)).await
+                {
                     Ok(tree) => tree,
                     Err(error) => {
                         // Same reasoning as the load path: an unreadable tree

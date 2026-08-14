@@ -7,7 +7,7 @@ pub use cursor::*;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::key_hash;
 use external::*;
-pub use external::{page_schema, PAGE_SCHEMA_ID};
+pub use external::{page_schema, NEXT_PAGE_KEY_HASH, PAGE_SCHEMA_ID};
 use futures::future::BoxFuture;
 use insert::*;
 use internal::*;
@@ -146,8 +146,9 @@ where
         neb: &AsyncClient,
         deletion: &Arc<DeletionSet>,
         level: usize,
+        upper_bound: Option<&EntryKey>,
     ) -> Result<Self, reconstruct::ReconstructError> {
-        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion, level).await
+        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion, level, upper_bound).await
     }
 
     pub fn from_root(

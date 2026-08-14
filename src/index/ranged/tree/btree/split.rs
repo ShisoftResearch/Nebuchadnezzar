@@ -84,11 +84,25 @@ where
             }
             drop(node);
             if key_index == 0 {
-                make_deleted::<KS, PS>(&node_id, tree);
+                // Persist the unlink BEFORE enqueueing the delete: the
+                // predecessor's severed next pointer must reach disk, and
+                // the write-back hub drains in enqueue order, so the link
+                // rewrite lands no later than the page removal. Clearing
+                // prev.next in memory alone left the on-disk chain pointing
+                // at deleted pages after a restart.
                 if !prev_node_ref.is_default() {
-                    let mut prev_node = write_node::<KS, PS>(&prev_node_ref);
-                    prev_node.extnode_mut(tree).next = Default::default();
+                    {
+                        let mut prev_node = write_node::<KS, PS>(&prev_node_ref);
+                        prev_node.extnode_mut(tree).next = Default::default();
+                    }
+                    external::make_changed(&prev_node_ref, tree);
                 }
+                make_deleted::<KS, PS>(&node_id, tree);
+            } else {
+                // The retained node was truncated (len) and its next taken;
+                // both must reach disk or a reload resurrects removed keys
+                // and follows the stale link.
+                external::make_changed(node_ref, tree);
             }
             while !right_node_ref.is_default() {
                 trace!("Obtaining right node lock for {:?}", right_node_ref);

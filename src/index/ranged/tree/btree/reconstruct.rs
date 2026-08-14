@@ -150,6 +150,7 @@ pub async fn reconstruct_from_head_id<KS, PS>(
     neb: &AsyncClient,
     deletion: &Arc<DeletionSet>,
     level: usize,
+    upper_bound: Option<&EntryKey>,
 ) -> Result<BPlusTree<KS, PS>, ReconstructError>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -167,7 +168,7 @@ where
         "[B-TREE LOAD] Starting reconstruction of level {} tree from head cell {:?}",
         level, resolved_head_id
     );
-    let page_ids = discover_page_chain_ids::<KS, PS>(resolved_head_id, neb).await?;
+    let page_ids = discover_page_chain_ids::<KS, PS>(resolved_head_id, neb, upper_bound).await?;
     let page_cells = fetch_page_chain_cells(page_ids, neb).await?;
     let mut len = 0;
     let mut page_count = 0;
@@ -230,11 +231,14 @@ where
 async fn discover_page_chain_ids<KS, PS>(
     head_id: Id,
     neb: &AsyncClient,
+    upper_bound: Option<&EntryKey>,
 ) -> Result<Vec<Id>, ReconstructError>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    use crate::ram::cell::ReadError;
+
     let mut ids = Vec::new();
     let mut current = head_id;
     let mut seen = HashSet::new();
@@ -248,13 +252,36 @@ where
             break;
         }
 
-        ids.push(current);
         let cell = match neb.read_cell(current).await {
             Ok(Ok(cell)) => cell,
+            Ok(Err(ReadError::CellDoesNotExisted)) if !ids.is_empty() && upper_bound.is_some() => {
+                // A bounded tree's persisted chain can legitimately end in a
+                // dangling pointer: a split-off hands the right half of the
+                // chain to a sibling tree, and if the severed page's rewrite
+                // was not yet durable when the process stopped, the old link
+                // survives on disk while the sibling later rewrites and
+                // deletes the pages it took over. Every page read so far
+                // started below this tree's upper bound, so the tree's own
+                // range is covered; the unreadable continuation belongs to
+                // the sibling. Truncate rather than refuse -- but say so
+                // loudly, because for an unbounded tree (or a chain that
+                // loses its FIRST page) this same condition is genuine loss
+                // and still refuses below.
+                warn!(
+                    "[B-TREE LOAD] Chain from {:?} dangles into deleted page {:?} after {} \
+                     readable pages; tree is bounded (upper {:?}) so the continuation \
+                     belongs to a sibling tree. Truncating the chain at the boundary.",
+                    head_id,
+                    current,
+                    ids.len(),
+                    upper_bound
+                );
+                break;
+            }
             Ok(Err(_)) => {
                 return Err(ReconstructError::MissingPage {
                     page_id: current,
-                    pages_read: ids.len() - 1,
+                    pages_read: ids.len(),
                 });
             }
             Err(e) => {
@@ -265,6 +292,22 @@ where
             }
         };
         let page = ExtNode::<KS, PS>::from_cell(&cell)?;
+        if let Some(upper) = upper_bound {
+            if page.node.len > 0 && page.node.keys.key_at(0) >= *upper {
+                // The chain walked past this tree's range into pages a
+                // split-off moved to a sibling: the severed link was never
+                // persisted. Everything from here on is the sibling's data;
+                // including it would serve duplicate shadowed keys.
+                warn!(
+                    "[B-TREE LOAD] Page {:?} starts at or beyond this tree's upper bound; \
+                     stopping the chain walk at the boundary ({} pages kept).",
+                    current,
+                    ids.len()
+                );
+                break;
+            }
+        }
+        ids.push(current);
         if page.next_id.is_unit_id() {
             break;
         }
@@ -470,7 +513,7 @@ mod test {
         }
         let deletion = Arc::new(HashSet::with_capacity(8));
         let tree = Arc::new(
-            LevelBPlusTree::from_head_id(&Id::from_parts(1, 1), &client, &deletion, 0)
+            LevelBPlusTree::from_head_id(&Id::from_parts(1, 1), &client, &deletion, 0, None)
                 .await
                 .expect("reconstruct from head id should succeed"),
         );

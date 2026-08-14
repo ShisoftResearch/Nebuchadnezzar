@@ -146,6 +146,19 @@ impl RangedTree {
         neb_client: &Arc<AsyncClient>,
         tree_id: &Id,
     ) -> Result<Self, TreeRecoverError> {
+        Self::recover_bounded(neb_client, tree_id, None).await
+    }
+
+    /// Like [`Self::recover`], but with the tree's placement upper bound.
+    /// A bounded tree may carry a stale chain link into pages a split-off
+    /// moved to a sibling; the bound lets reconstruction stop at the
+    /// boundary (or truncate a dangling link beyond it) instead of refusing
+    /// to load a tree whose own range is fully readable.
+    pub async fn recover_bounded(
+        neb_client: &Arc<AsyncClient>,
+        tree_id: &Id,
+        upper_bound: Option<&EntryKey>,
+    ) -> Result<Self, TreeRecoverError> {
         info!("[TREE LOAD] Starting load for tree {:?}", tree_id);
 
         let deletion_set = Arc::new(lightning::map::HashSet::with_capacity(0));
@@ -191,7 +204,9 @@ impl RangedTree {
         };
         info!("[TREE LOAD] Loading B-tree from head {:?}", head_id);
 
-        let tree = match DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0).await {
+        let tree = match DiskTree::from_head_id(&head_id, neb_client, &deletion_set, 0, upper_bound)
+            .await
+        {
             Ok(mut tree) => {
                 tree.set_writeback_client(neb_client);
                 tree
@@ -893,6 +908,150 @@ mod tests {
         assert_eq!(
             head_after, head_before,
             "the failed load rewrote the head pointer, discarding the original chain"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// A bounded tree whose persisted chain dangles past its upper bound must
+    /// truncate at the boundary instead of refusing to load.
+    ///
+    /// This is the TB16 corpse: a split-off hands the right half of a leaf
+    /// chain to a sibling tree, the severed page's rewrite is not yet durable
+    /// when the process stops, and the sibling later rewrites and deletes the
+    /// pages it took over. The left tree's on-disk chain then points at
+    /// deleted pages. Its own range is fully readable, so a bounded load must
+    /// serve it; an unbounded load of the same chain is genuine loss and must
+    /// still refuse.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bounded_tree_truncates_stale_cross_boundary_chain() {
+        use crate::client;
+        use crate::index::ranged::tree::btree::{page_schema, storage, NEXT_PAGE_KEY_HASH};
+        use crate::server::{NebServer, ServerOptions, Service};
+
+        let _ = env_logger::try_init();
+
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "ranged_tree_bounded_truncate";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 64 * 1024 * 1024,
+                db_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .new_schema_with_id(RANGED_TREE_SCHEMA.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        storage::start_external_nodes_write_back(&client);
+
+        let tree_id = Id::from_parts(903, 903);
+        let schema_id = 1;
+        let field = 779;
+        let tree = RangedTree::create(&client, &tree_id).await;
+        // Three pages at BTREE_NODE_SIZE=128 for monotone inserts.
+        let n = 300u64;
+        for value in 0..n {
+            assert!(tree.insert(&make_field_key(schema_id, field, value, Id::from_parts(7, value))));
+        }
+        storage::wait_until_updated().await;
+        drop(tree);
+
+        // Walk the persisted chain to find the page ids.
+        let head_id = client
+            .read_cell(tree_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .data[*RANGED_TREE_HEAD_HASH]
+            .id()
+            .copied()
+            .expect("the tree metadata should carry a head pointer");
+        let mut page_ids = vec![head_id];
+        loop {
+            let cell = client
+                .read_cell(*page_ids.last().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let next = cell.data[*NEXT_PAGE_KEY_HASH]
+                .id()
+                .copied()
+                .expect("pages must carry a next pointer");
+            if next.is_unit_id() {
+                break;
+            }
+            page_ids.push(next);
+        }
+        assert!(
+            page_ids.len() >= 3,
+            "expected at least 3 pages for {} keys, got {}",
+            n,
+            page_ids.len()
+        );
+
+        // Delete the LAST page's cell: the persisted chain now dangles into a
+        // deleted page, exactly as an unpersisted split-off cut leaves it.
+        let deleted_page = *page_ids.last().unwrap();
+        client.remove_cell(deleted_page).await.unwrap().unwrap();
+
+        // Unbounded load: this is indistinguishable from genuine tail loss
+        // and must refuse.
+        let outcome = RangedTree::recover(&client, &tree_id).await;
+        assert!(
+            outcome.is_err(),
+            "an unbounded tree with an unreadable page must refuse to load"
+        );
+
+        // Bounded load with the boundary at the deleted page's first key: the
+        // tree's own range is fully covered by the readable pages, so the
+        // dangling link is a stale cross-boundary pointer and the chain
+        // truncates there.
+        let keys_before_last_page = 128 * (page_ids.len() as u64 - 1);
+        let upper = make_field_key(
+            schema_id,
+            field,
+            keys_before_last_page,
+            Id::from_parts(7, keys_before_last_page),
+        );
+        let recovered = RangedTree::recover_bounded(&client, &tree_id, Some(&upper))
+            .await
+            .expect("a bounded tree must truncate a stale cross-boundary chain and load");
+        assert_eq!(
+            recovered.count() as u64,
+            keys_before_last_page,
+            "the truncated tree must serve every key below its boundary"
         );
 
         server.shutdown().await;
