@@ -136,6 +136,18 @@ impl NodeCellRef {
         unsafe { self.inner.as_ref().unwrap().obj.build_cell(self, deletion) }
     }
 
+    // The forward sibling this node's PERSISTED image will reference, but
+    // only while that sibling's own write is still pending (dirty). The
+    // write-back flusher serializes such siblings first, so any crash
+    // prefix of the flush stream is referentially closed — a persisted
+    // next pointer can never name a page that was never persisted.
+    pub fn dirty_next_ref(&self) -> Option<NodeCellRef> {
+        if self.is_default() {
+            return None;
+        }
+        unsafe { self.inner.as_ref().unwrap().obj.dirty_next_ref(self) }
+    }
+
     pub fn ptr_eq(&self, other: &Self) -> bool {
         std::ptr::addr_eq(self.inner, other.inner)
     }

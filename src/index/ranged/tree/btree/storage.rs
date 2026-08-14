@@ -43,19 +43,20 @@ lazy_static! {
 }
 
 fn write_back_worker_count() -> usize {
-    // Scale with the machine: page persistence (to_cell serialization plus a
-    // cell upsert) is the drain bottleneck, and a fixed cap of 8 leaves a
-    // large host almost idle while a big write-back backlog clears. Use about
-    // a quarter of the cores, bounded to keep cell-store contention sane, and
-    // allow an explicit override for tuning.
+    // ONE worker, deliberately. Crash consistency of the page chain rests on
+    // the flush stream being a single total order whose every prefix is
+    // referentially closed (dependency pull below). Parallel workers flush
+    // batches in arbitrary relative order, so a cancelled fleet could
+    // persist a page whose next pointer names a page another worker never
+    // got to — the TB17 corpse (a fresh split's link landing without the
+    // new page). The override exists for experiments only; anything > 1
+    // trades that guarantee away.
     if let Ok(v) = std::env::var("NEB_WRITEBACK_WORKERS") {
         if let Ok(n) = v.parse::<usize>() {
             return n.max(1);
         }
     }
-    std::thread::available_parallelism()
-        .map(|n| (n.get() / 4).clamp(4, 64))
-        .unwrap_or(4)
+    1
 }
 
 /// The hub owning write-back state for the server behind `client`.
@@ -238,16 +239,38 @@ impl WriteBackHub {
                                 if batch_client.is_none() {
                                     batch_client = Some(m.client.clone());
                                 }
-                                let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                    m.node.build_cell(&m.deletion)
-                                }));
-                                match built {
-                                    Ok(Some(cell)) => cells.push(cell),
-                                    Ok(None) => {}
-                                    Err(_) => error!(
-                                        "write-back worker {}: build_cell panicked for change {}",
-                                        worker_id, id
-                                    ),
+                                // Referential closure: if this page's image
+                                // will name a forward sibling whose own write
+                                // is still pending, serialize the sibling
+                                // FIRST (deepest-first along the dirty
+                                // chain). Cells apply in vec order, so every
+                                // prefix of the flush stream — including one
+                                // cut by cancellation mid-RPC — only ever
+                                // links to pages that are already durable.
+                                let mut chain = Vec::new();
+                                let mut cursor = m.node.clone();
+                                while chain.len() < 1024 {
+                                    match cursor.dirty_next_ref() {
+                                        Some(next) => {
+                                            chain.push(cursor);
+                                            cursor = next;
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                chain.push(cursor);
+                                while let Some(node) = chain.pop() {
+                                    let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                        node.build_cell(&m.deletion)
+                                    }));
+                                    match built {
+                                        Ok(Some(cell)) => cells.push(cell),
+                                        Ok(None) => {}
+                                        Err(_) => error!(
+                                            "write-back worker {}: build_cell panicked for change {}",
+                                            worker_id, id
+                                        ),
+                                    }
                                 }
                             }
                             // Deletions never enter this queue; they live in

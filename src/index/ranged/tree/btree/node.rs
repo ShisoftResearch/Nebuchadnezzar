@@ -320,6 +320,9 @@ pub trait AnyNode: Any + Send + Sync + 'static {
     fn build_cell(&self, node_ref: &NodeCellRef, deletion: &DeletionSet)
         -> Option<crate::ram::cell::OwnedCell>;
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef>;
+    // The forward sibling this node's persisted image references, if that
+    // sibling is itself dirty. See NodeCellRef::dirty_next_ref.
+    fn dirty_next_ref(&self, node_ref: &NodeCellRef) -> Option<NodeCellRef>;
 }
 
 // repr(C): see NodeData — cc/data offsets must not depend on KS/PS.
@@ -705,6 +708,23 @@ where
             }
         });
         res
+    }
+
+    fn dirty_next_ref(&self, node_ref: &NodeCellRef) -> Option<NodeCellRef> {
+        let guard = write_node::<KS, PS>(node_ref);
+        let next = match &*guard {
+            &NodeData::External(ref node) => node.next.clone(),
+            _ => return None,
+        };
+        drop(guard);
+        if next.is_default() {
+            return None;
+        }
+        let dirty = next
+            .deref::<KS, PS>()
+            .dirty
+            .load(std::sync::atomic::Ordering::Acquire);
+        dirty.then_some(next)
     }
 }
 

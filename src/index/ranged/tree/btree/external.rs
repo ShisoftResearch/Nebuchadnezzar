@@ -313,6 +313,12 @@ where
             extnode_2.keys.to_vec(0..extnode_2.len)
         );
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
+        // Dirty-mark the new page BEFORE any link to it is installed: the
+        // write-back flusher pulls dirty forward siblings into the flush
+        // stream ahead of their referrers, and that pull keys off this flag.
+        // A link installed first would leave a window where the left page
+        // serializes naming a page the flusher does not know is pending.
+        make_changed(&node_2, tree);
         if !self_next.is_ref_none() {
             let self_next_node = self_next.extnode_mut(tree);
             debug_assert!(
@@ -323,7 +329,6 @@ where
             self_next_node.prev = node_2.clone();
         }
         self.next = node_2.clone();
-        make_changed(&node_2, tree);
         (node_2, pivot_key)
     }
 
