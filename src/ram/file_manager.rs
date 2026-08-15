@@ -78,7 +78,19 @@ impl SegmentFileManager {
         seq_id: u64,
     ) -> io::Result<Option<File>> {
         if let Some(wal_path) = self.wal_path(chunk_id, seg_id, seq_id) {
-            let file = File::create(&wal_path)?;
+            // Open in APPEND mode, never truncate. A recovered segment
+            // resumes appending under the same (chunk, seg, seq), and its
+            // existing WAL is the only durable copy of everything the stale
+            // backup does not cover (for a WAL-only recovered head it is the
+            // only copy of ANYTHING). `File::create` truncated that history
+            // on the first post-restart write, so the next crash lost every
+            // pre-restart entry the archiver had not yet rewritten. With
+            // append, the file keeps accumulating the segment's suffix and
+            // recovery's backup+WAL reconciliation stays exact.
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)?;
             Ok(Some(file))
         } else {
             Ok(None)
@@ -206,58 +218,6 @@ impl SegmentFileManager {
         self.delete_backup(chunk_id, seg_id, seq_id)?;
         self.delete_wal(chunk_id, seg_id, seq_id)?;
         Ok(())
-    }
-
-    /// Copy WAL to backup with optional padding
-    pub fn copy_wal_to_backup(
-        &self,
-        chunk_id: usize,
-        seg_id: u64,
-        seq_id: u64,
-        pad_to_size: Option<usize>,
-    ) -> io::Result<bool> {
-        let wal_path = match self.wal_path(chunk_id, seg_id, seq_id) {
-            Some(path) => path,
-            None => return Ok(false),
-        };
-
-        let backup_path = match self.backup_path(chunk_id, seg_id, seq_id) {
-            Some(path) => path,
-            None => return Ok(false),
-        };
-
-        // Check if WAL exists
-        let wal_path_ref = Path::new(&wal_path);
-        if !wal_path_ref.exists() {
-            return Ok(false);
-        }
-
-        // Ensure backup parent directory exists
-        if let Some(parent) = Path::new(&backup_path).parent() {
-            create_dir_all(parent)?;
-        }
-
-        // Read WAL file
-        let mut wal_file = File::open(&wal_path)?;
-        let mut wal_data = Vec::new();
-        wal_file.read_to_end(&mut wal_data)?;
-        let wal_size = wal_data.len();
-
-        // Create backup file and write data
-        let mut backup_file = File::create(&backup_path)?;
-        backup_file.write_all(&wal_data)?;
-
-        // Pad if requested
-        if let Some(target_size) = pad_to_size {
-            if wal_size < target_size {
-                let padding_size = target_size - wal_size;
-                let padding = vec![0u8; padding_size];
-                backup_file.write_all(&padding)?;
-            }
-        }
-
-        backup_file.sync_all()?;
-        Ok(true)
     }
 
     /// Read file content into memory

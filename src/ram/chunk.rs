@@ -508,7 +508,13 @@ impl Chunk {
                 .backup_path(segment.chunk_id, segment.id, segment.seq_id)
                 .map(|p| std::path::Path::new(&p).exists())
                 .unwrap_or(false);
-            if has_backup {
+            // A backup only settles the matter if the segment is CLEAN. A
+            // segment recovered by reconciling a stale backup with its
+            // resumed WAL suffix stays dirty on purpose: its backup does not
+            // cover its full image. Re-archive it here so the complete image
+            // is durable in one file again (and the WAL can be released),
+            // instead of leaning on the twin-merge at every future restart.
+            if has_backup && !segment.is_dirty() {
                 continue;
             }
             match segment.archive() {
