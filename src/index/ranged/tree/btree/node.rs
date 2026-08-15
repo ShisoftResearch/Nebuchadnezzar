@@ -320,9 +320,9 @@ pub trait AnyNode: Any + Send + Sync + 'static {
     fn build_cell(&self, node_ref: &NodeCellRef, deletion: &DeletionSet)
         -> Option<crate::ram::cell::OwnedCell>;
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef>;
-    // The forward sibling this node's persisted image references, if that
-    // sibling is itself dirty. See NodeCellRef::dirty_next_ref.
-    fn dirty_next_ref(&self, node_ref: &NodeCellRef) -> Option<NodeCellRef>;
+    // The forward sibling this node's image will reference, if that sibling
+    // has no on-disk image yet. See NodeCellRef::unpersisted_next_ref.
+    fn unpersisted_next_ref(&self, node_ref: &NodeCellRef) -> Option<NodeCellRef>;
 }
 
 // repr(C): see NodeData — cc/data offsets must not depend on KS/PS.
@@ -337,6 +337,15 @@ where
     // node is queued for persistence, cleared by persist under the write
     // latch before it snapshots the page (docs/tla/DirtyCoalesce.tla).
     pub(super) dirty: std::sync::atomic::AtomicBool,
+    // False until this page's cell has been handed to the store at least
+    // once. A page that has NEVER been persisted has no on-disk image at
+    // all, so any persisted page naming it produces an unreadable chain --
+    // whereas naming a merely-dirty page is safe (its previous image is
+    // still there, just stale). The write-back flusher therefore orders on
+    // THIS flag, not on `dirty`: only never-persisted forward siblings must
+    // precede their referrer, and those chains are bounded by recent splits
+    // rather than by the whole dirty working set.
+    pub(super) persisted: std::sync::atomic::AtomicBool,
     data: UnsafeCell<NodeData<KS, PS>>,
 }
 
@@ -350,6 +359,7 @@ where
             data: UnsafeCell::new(data),
             cc: AtomicUsize::new(0),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            persisted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -669,6 +679,10 @@ where
         // this point re-queues the node, so the snapshot below plus the next
         // queue entry always cover the latest state.
         self.dirty.store(false, Release);
+        // From here the page has an image in the outgoing batch, so later
+        // pages may safely name it. A batch that ultimately fails latches
+        // barrier_failed and stops the flusher, so no referrer outlives it.
+        self.persisted.store(true, Release);
         match &mut *guard {
             &mut NodeData::External(ref mut node) => {
                 // Compact tombstoned keys while the latch is held; this also
@@ -710,7 +724,7 @@ where
         res
     }
 
-    fn dirty_next_ref(&self, node_ref: &NodeCellRef) -> Option<NodeCellRef> {
+    fn unpersisted_next_ref(&self, node_ref: &NodeCellRef) -> Option<NodeCellRef> {
         let guard = write_node::<KS, PS>(node_ref);
         let next = match &*guard {
             &NodeData::External(ref node) => node.next.clone(),
@@ -720,11 +734,11 @@ where
         if next.is_default() {
             return None;
         }
-        let dirty = next
+        let persisted = next
             .deref::<KS, PS>()
-            .dirty
+            .persisted
             .load(std::sync::atomic::Ordering::Acquire);
-        dirty.then_some(next)
+        (!persisted).then_some(next)
     }
 }
 

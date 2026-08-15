@@ -209,10 +209,31 @@ impl Service for NebRPCService {
         // maintenance still happen per cell, but the per-call dispatch and
         // marshaling overhead is amortized across the batch. Reuses the
         // single-cell handler so schema-miss retry behavior is identical.
+        //
+        // Applied strictly IN ORDER, and the batch STOPS at the first
+        // failure: the remaining cells are reported as BatchAborted without
+        // being attempted. The only caller is the B-tree write-back flusher,
+        // whose crash consistency rests on every durable prefix of its flush
+        // stream being referentially closed -- pages are ordered so that a
+        // referenced page always precedes the page that names it. Continuing
+        // past a failed cell used to persist referrers whose referenced page
+        // was never written (CannotAllocateSpace under chunk-full pressure),
+        // and a kill in that window left an on-disk chain pointing at a page
+        // recovery could not find: MissingPage, a tree that refuses to load,
+        // and seeks retrying "tree placement was not found" forever.
         async move {
             let mut results = Vec::with_capacity(cells.len());
+            let mut aborted = false;
             for cell in cells {
-                results.push(self.upsert_cell(cell).await);
+                if aborted {
+                    results.push(Err(WriteError::BatchAborted));
+                    continue;
+                }
+                let result = self.upsert_cell(cell).await;
+                if result.is_err() {
+                    aborted = true;
+                }
+                results.push(result);
             }
             results
         }

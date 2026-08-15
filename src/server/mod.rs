@@ -1791,6 +1791,15 @@ impl NebServer {
         // Step 1.6: Archive all dirty segments to backup storage
         // This ensures all in-memory data (including LSM B-Tree pages) is written to backup files
         // Recovery reads from backup files, not WAL, so this is critical for proper recovery
+        //
+        // Close writes FIRST. The RPC server does not stop until step 3 (it
+        // has to outlive the index flush above, which talks to this server),
+        // so without this a client write could land after its segment was
+        // archived: too late for the backup, and appending to an archived
+        // segment is exactly the twin that costs the post-archive suffix at
+        // the next crash. Refusing those writes makes them the client's
+        // problem to retry rather than silent loss.
+        self.chunks().close_writes();
         info!("Archiving all dirty segments to backup storage...");
         self.chunks().archive_all();
         info!("Segment archiving completed");
@@ -2355,23 +2364,58 @@ pub async fn init_ranged_indexer_service<C>(
     // its tree must still fail rather than invent an empty one, which is what
     // silently wiped ranged trees before.
     if matches!(sm_client.has_placements().await, Ok(true)) {
-        let placed = sm_client.locate_key(&ranged::trees::min_entry_key()).await;
-        if let Ok((_, placement, _)) = placed {
-            let readable = matches!(neb_client.read_cell(placement.id).await, Ok(Ok(_)));
-            if !readable {
-                error!(
-                    "Ranged-index placement for {}/{} names tree {:?} whose metadata cell is \
-                     absent; the placement map outlived the data it describes. Clearing it and \
-                     re-establishing genesis -- any index entries that tree held are already gone.",
-                    group_name, database_name, placement.id
-                );
-                if let Err(e) = sm_client.reset_placements().await {
-                    error!(
-                        "Failed to clear dangling ranged placements for {}/{}: {:?}",
-                        group_name, database_name, e
-                    );
-                }
+        // EVERY placement must be provably gone before the map is cleared.
+        // Sampling only the lowest key's tree was catastrophic: after a
+        // crash, one tree's metadata cell can be missing while dozens of
+        // healthy split trees still hold the index. Clearing the map then
+        // orphaned all of them and re-established an EMPTY genesis --
+        // 125,931 verified keys became 0 in a single restart (crash-churn
+        // cycle 3). A partially damaged map is not a dead map: the broken
+        // ranges refuse to load and say so, the intact ones keep serving.
+        //
+        // "Provably absent" also means exactly CellDoesNotExisted. Any
+        // other read outcome (RPC failure, a store still warming up) is
+        // unknown, not absent, and must never license a wipe.
+        let mut checked = 0usize;
+        let mut absent = 0usize;
+        let mut cursor = ranged::trees::min_entry_key();
+        loop {
+            let Ok(Some(info)) = sm_client
+                .next_tree(&cursor, &ranged::tree::btree::Ordering::Forward)
+                .await
+            else {
+                break;
+            };
+            checked += 1;
+            match neb_client.read_cell(info.placement.id).await {
+                Ok(Err(crate::ram::cell::ReadError::CellDoesNotExisted)) => absent += 1,
+                _ => {}
             }
+            if info.upper >= ranged::trees::max_entry_key() || checked > 4096 {
+                break;
+            }
+            cursor = info.upper.clone();
+        }
+        if checked > 0 && absent == checked {
+            error!(
+                "Ranged-index placements for {}/{} name {} tree(s) and EVERY metadata cell is \
+                 absent; the placement map outlived the data it describes. Clearing it and \
+                 re-establishing genesis -- any index entries those trees held are already gone.",
+                group_name, database_name, checked
+            );
+            if let Err(e) = sm_client.reset_placements().await {
+                error!(
+                    "Failed to clear dangling ranged placements for {}/{}: {:?}",
+                    group_name, database_name, e
+                );
+            }
+        } else if absent > 0 {
+            error!(
+                "Ranged-index placements for {}/{}: {} of {} tree metadata cell(s) are absent. \
+                 The map is NOT being cleared -- the intact trees keep serving and the damaged \
+                 ranges will report errors until repaired.",
+                group_name, database_name, absent, checked
+            );
         }
     }
 

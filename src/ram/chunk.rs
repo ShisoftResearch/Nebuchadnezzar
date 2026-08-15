@@ -253,6 +253,17 @@ pub struct Chunk {
     /// quiescent state since. Holding 8 MiB longer than necessary is the cost;
     /// the alternative is silent corruption with no durable copy left.
     pub retired_segments: Mutex<Vec<RetiredSegment>>,
+    /// Set once shutdown has begun archiving; no entry may be acquired after.
+    ///
+    /// Shutdown archives every dirty segment and only then stops the RPC
+    /// server, so cells kept arriving after their segment's image had already
+    /// been written. Those writes could not reach the backup, so they went to
+    /// a WAL re-created at a seq id that already had one -- the twin that
+    /// costs the whole post-archive suffix at the next crash. Sealing makes
+    /// such a write impossible; this makes it *visible*, refusing it with an
+    /// error instead of accepting a cell that no longer has anywhere durable
+    /// to go.
+    writes_closed: std::sync::atomic::AtomicBool,
 }
 
 /// A segment unpublished from its chunk, waiting for readers to drain.
@@ -467,6 +478,7 @@ impl Chunk {
             tiered_manager,
             cleaner_wake,
             retired_segments: Mutex::new(Vec::new()),
+            writes_closed: std::sync::atomic::AtomicBool::new(false),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -543,6 +555,9 @@ impl Chunk {
         full_gc: bool,
         segment_class: SegmentClass,
     ) -> Result<PendingEntry, WriteError> {
+        if self.writes_closed.load(Ordering::Acquire) {
+            return Err(WriteError::ServerShuttingDown);
+        }
         let mut tried_gc = false;
         let backoff = Backoff::new();
         let head_slot = self.head_slot(segment_class);
@@ -670,7 +685,7 @@ impl Chunk {
 
             let new_seg_opt = match self
                 .allocator
-                .alloc_seg_with_class(&self.file_manager, segment_class)
+                .alloc_seg_for_writer(&self.file_manager, segment_class)
             {
                 Some(seg) => Some(seg),
                 None => {
@@ -687,7 +702,7 @@ impl Chunk {
                             self.id, reclaimed
                         );
                         self.allocator
-                            .alloc_seg_with_class(&self.file_manager, segment_class)
+                            .alloc_seg_for_writer(&self.file_manager, segment_class)
                     } else {
                         None
                     }
@@ -797,6 +812,14 @@ impl Chunk {
                 segment.segment_class() == SegmentClass::Regular
                     && segment.is_hot()
                     && segment.append_header.load(Ordering::Acquire) < segment.bound()
+                    // A segment recovered from a backup is a CLOSED incarnation
+                    // (see `Segment::sealed`). Resuming one as the head is what
+                    // created backup/WAL twins at a single seq id: shutdown
+                    // archives the open head, the next run appends to it, and a
+                    // crash then loses everything written after the archive.
+                    // Its unfilled tail is given up on purpose; the next write
+                    // allocates a fresh segment with a fresh seq id.
+                    && !segment.is_sealed()
             })
             .max_by_key(|segment| segment.seq_id)
             .map(|segment| segment.id)
@@ -981,6 +1004,30 @@ impl Chunk {
         let write_plan = cell.plan_write(self)?;
         WRITE_PLAN_NANOS.fetch_add(t_plan.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        // Existing-cell fast path, BEFORE any allocation. Refusing the write
+        // is not enough: this is exactly the retry path a crashed index heals
+        // through -- a SIGKILL preserves acked cells in the WAL while the
+        // ranged tree loses its un-flushed tail, and the retrying writer's
+        // insert then finds the cell already present. Re-assert the indices
+        // from the EXISTING image (identical old/new pairs cancel for every
+        // index type except ranged, whose insert is idempotent and
+        // re-established on purpose; see ensure_indices_). Ordering matters:
+        // this must run before `allocate`, or a chunk too full to accept new
+        // entries fails with CannotAllocateSpace first and the heal path is
+        // unreachable exactly when nothing else can re-create the entries.
+        if let Some(mut cell_guard) = CellGuard::for_write(cell.header.id.bits(), true, self) {
+            if self.index_builder.is_some() {
+                if let Ok(existing) = cell_guard.read_cell_owned() {
+                    if let Some(schema) = self.meta.schemas.get(&existing.header.schema) {
+                        let old_indices = Some(probe_cell_indices(&existing, &*schema));
+                        drop(cell_guard);
+                        self.ensure_indices_with_res(&existing, old_indices, &*schema);
+                    }
+                }
+            }
+            return Err(WriteError::CellAlreadyExisted);
+        }
+
         let t_alloc = std::time::Instant::now();
         let pending_entry = write_plan.allocate(self, true)?;
         WRITE_ALLOC_NANOS.fetch_add(t_alloc.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1020,7 +1067,36 @@ impl Chunk {
                 self.refresh_statistics_for_schema(write_plan.schema.id);
                 WRITE_STATS_NANOS.fetch_add(t_stats.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-            None => return Err(WriteError::CellAlreadyExisted),
+            None => {
+                // The cell image is already appended; make sure recovery can
+                // never resurrect it over the write that won the race.
+                abandon_entry_version(pending_entry.addr);
+                // The write is refused, but this exact path is how a crashed
+                // index heals: a SIGKILL preserves acked cells in the WAL
+                // while the ranged tree loses its un-flushed tail, and the
+                // retrying writer's insert then finds the cell already
+                // present. Re-assert the indices from the EXISTING image --
+                // identical old/new pairs cancel for every index type except
+                // ranged, whose insert is idempotent and re-established on
+                // purpose (see ensure_indices_). This needs no allocation,
+                // so it converges even in a chunk too full to accept writes.
+                if self.index_builder.is_some() {
+                    if let Some(mut cell_guard) =
+                        CellGuard::for_write(cell.header.id.bits(), true, self)
+                    {
+                        if let Ok(existing) = cell_guard.read_cell_owned() {
+                            if let Some(schema) = self.meta.schemas.get(&existing.header.schema)
+                            {
+                                let old_indices =
+                                    Some(probe_cell_indices(&existing, &*schema));
+                                drop(cell_guard);
+                                self.ensure_indices_with_res(&existing, old_indices, &*schema);
+                            }
+                        }
+                    }
+                }
+                return Err(WriteError::CellAlreadyExisted);
+            }
         }
         WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
         cell.header.version = write_result.new_version;
@@ -1062,6 +1138,9 @@ impl Chunk {
             let write_result =
                 self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
             let new_cell_loc = write_result.addr;
+            // The image carries `old_version + 1`: recovery would pick it
+            // over the tombstone of a deleted cell and resurrect the data.
+            abandon_entry_version(new_cell_loc);
             self.mark_dead_entry_with_cell(new_cell_loc, cell);
             return Err(WriteError::CellDoesNotExisted);
         }
@@ -2100,6 +2179,21 @@ impl Chunks {
             }
         }
         info!("All WAL data synced to disk.");
+    }
+
+    /// Refuse further entry allocation, everywhere, before shutdown archives.
+    ///
+    /// This must be called before `archive_all`, and it is one-way: a segment
+    /// that has been archived is sealed and can never take another append, so
+    /// a write accepted after this point would have no durable home. Callers
+    /// see `WriteError::ServerShuttingDown`, which is honest and retryable --
+    /// the alternative is accepting the cell and losing it silently at the
+    /// next crash.
+    pub fn close_writes(&self) {
+        for chunk in &self.list {
+            chunk.writes_closed.store(true, Ordering::Release);
+        }
+        info!("Entry allocation closed on {} chunks for shutdown", self.list.len());
     }
 
     /// Archive all dirty segments to backup storage across all chunks

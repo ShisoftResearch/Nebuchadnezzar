@@ -78,7 +78,18 @@ impl SegmentFileManager {
         seq_id: u64,
     ) -> io::Result<Option<File>> {
         if let Some(wal_path) = self.wal_path(chunk_id, seg_id, seq_id) {
-            let file = File::create(&wal_path)?;
+            // APPEND, not truncate. `File::create` here destroyed the durable
+            // copy of a segment recovered from a WAL alone: recovery replays
+            // the log into memory, and the first post-restart write then
+            // truncated the very file it was replayed from, so a crash before
+            // the next archive lost every cell in it. Appending can only ever
+            // preserve more history, and a seq id is never reused (segments
+            // that have a backup are sealed, and dispense deletes both files),
+            // so there is nothing here that truncation was protecting against.
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&wal_path)?;
             Ok(Some(file))
         } else {
             Ok(None)
@@ -314,10 +325,66 @@ impl SegmentFileManager {
         let mut best_files: HashMap<(usize, u64), SegmentFileInfo> = HashMap::new();
 
         for file in files {
+            // A zero-byte backup is always a torn archive: a kill landed
+            // between creating the file and writing its image (legitimate
+            // backups always carry at least a compression header, and an
+            // uncompressed one is a full segment). Letting it into the
+            // dedup below would SHADOW the complete WAL at the same seq id
+            // and silently drop every cell in the segment. Newly written
+            // backups are rename-installed and can no longer be torn; this
+            // guard covers stores written before that fix.
+            if file.is_backup && file.size == 0 {
+                warn!(
+                    "Ignoring zero-byte backup '{}' (chunk {} seg {} seq {}): torn archive; \
+                     recovery falls back to the WAL or an earlier file for this segment",
+                    file.path.display(),
+                    file.chunk_id,
+                    file.seg_id,
+                    file.seq_id
+                );
+                continue;
+            }
             let key = (file.chunk_id, file.seg_id);
             let should_replace = match best_files.get(&key) {
                 None => true,
                 Some(existing) => {
+                    // A backup and a WAL at the SAME seq id are twins, and the
+                    // preference below assumes the backup is the complete
+                    // image. That assumption used to be violated: archiving
+                    // the open head deleted its WAL, and appending afterwards
+                    // re-created one at the same seq, leaving a prefix image
+                    // and a suffix log that only make sense concatenated.
+                    // Preferring the backup then silently dropped every write
+                    // after the archive.
+                    //
+                    // Segments with a backup are sealed now, so a store this
+                    // build wrote cannot produce twins. One still on disk was
+                    // written by an older build: say so, loudly and per pair,
+                    // because the loss is otherwise invisible. Recovery still
+                    // takes the backup -- a prefix is the safe half, and the
+                    // seam between them is not reliably recoverable (a merge
+                    // that guessed it wrong trimmed the WAL to nothing).
+                    if file.seq_id == existing.seq_id && file.is_backup != existing.is_backup {
+                        let (backup, wal) = if file.is_backup {
+                            (&file, existing)
+                        } else {
+                            (existing, &file)
+                        };
+                        error!(
+                            "TWIN SEGMENT FILES for chunk {} seg {} seq {}: backup '{}' ({} bytes) \
+                             and WAL '{}' ({} bytes) share one seq id. This store was written by a \
+                             build that appended to an archived segment; the WAL holds writes made \
+                             after the backup and they CANNOT be recovered. Taking the backup. \
+                             Re-import to get a clean store.",
+                            file.chunk_id,
+                            file.seg_id,
+                            file.seq_id,
+                            backup.path.display(),
+                            backup.size,
+                            wal.path.display(),
+                            wal.size
+                        );
+                    }
                     // Prefer higher seq_id (more recent)
                     // If seq_id is the same, prefer backup over WAL
                     if file.seq_id > existing.seq_id {
@@ -493,9 +560,18 @@ mod tests {
         create_dir_all(&backup_dir).unwrap();
         create_dir_all(&wal_dir).unwrap();
 
-        // Create some test files
-        File::create(backup_dir.join("0-1-1.nbackup")).unwrap();
-        File::create(backup_dir.join("0-2-2.nbackup")).unwrap();
+        // Create some test files. Backups carry content on purpose: a
+        // zero-byte backup is a torn archive and discovery now ignores it,
+        // so an empty fixture would be testing the guard, not discovery.
+        use std::io::Write as _;
+        File::create(backup_dir.join("0-1-1.nbackup"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        File::create(backup_dir.join("0-2-2.nbackup"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         File::create(wal_dir.join("0-3-3.nlog")).unwrap();
 
         let mgr = SegmentFileManager::new(

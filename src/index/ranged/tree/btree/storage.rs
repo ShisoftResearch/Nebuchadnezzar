@@ -33,9 +33,18 @@ pub struct WriteBackHub {
     alive: AtomicUsize,
     spawning: AtomicBool,
     should_stop: AtomicBool,
+    // Latched when a worker abandons cells it could not persist. The ids
+    // still complete (so waiters resolve), but the barrier must report
+    // failure: those pages are NOT durable and nothing may publish a head
+    // that names them. Cleared by reset().
+    barrier_failed: AtomicBool,
     // Completions that finished ahead of earlier queue ids.
     completions: Mutex<BTreeSet<usize>>,
 }
+
+// Bounded so a permanently failing store cannot wedge shutdown: ~200
+// attempts at 100ms is ~20s of genuine transient-failure tolerance.
+const WRITE_BACK_MAX_ATTEMPTS: u32 = 200;
 
 lazy_static! {
     static ref HUBS: Mutex<Vec<(Weak<client::AsyncClient>, Arc<WriteBackHub>)>> =
@@ -78,6 +87,7 @@ pub fn hub_for(client: &Arc<client::AsyncClient>) -> Arc<WriteBackHub> {
         alive: AtomicUsize::new(0),
         spawning: AtomicBool::new(false),
         should_stop: AtomicBool::new(false),
+        barrier_failed: AtomicBool::new(false),
         completions: Mutex::new(BTreeSet::new()),
     });
     hubs.push((Arc::downgrade(client), hub.clone()));
@@ -214,7 +224,13 @@ impl WriteBackHub {
                 // (each under its own node latch), and flush the whole batch
                 // in one upsert_all_cells RPC — amortizing per-cell location
                 // lookup and RPC round-trips across the batch.
-                const BATCH: usize = 256;
+                // One ordered flusher means batch size IS throughput: each
+                // batch costs one upsert RPC, so a small batch caps the
+                // drain rate and lets dirty pages pile up in memory (16k
+                // pages queued in a 2s churn burst before this was raised).
+                // Dirty pages are coalesced, so a large batch is bounded by
+                // the working set, not by the write rate.
+                const BATCH: usize = 4096;
                 loop {
                     if hub.should_stop.load(Ordering::SeqCst) {
                         debug!("B-tree write-back worker {} stopping", worker_id);
@@ -226,6 +242,13 @@ impl WriteBackHub {
                     let mut guards: Vec<CompletionGuard> = Vec::new();
                     let mut cells: Vec<crate::ram::cell::OwnedCell> = Vec::new();
                     let mut batch_client: Option<Arc<client::AsyncClient>> = None;
+                    // Node addresses already serialized into THIS batch. Any
+                    // image of a page id in the batch satisfies referential
+                    // closure for pages that link to it; the refs keep those
+                    // node objects alive so the addresses stay unambiguous.
+                    let mut built_addrs: std::collections::HashSet<usize> =
+                        std::collections::HashSet::new();
+                    let mut built_refs: Vec<super::NodeCellRef> = Vec::new();
                     for _ in 0..BATCH {
                         let Some((id, changing)) = hub.queue.pop() else {
                             break;
@@ -239,18 +262,24 @@ impl WriteBackHub {
                                 if batch_client.is_none() {
                                     batch_client = Some(m.client.clone());
                                 }
-                                // Referential closure: if this page's image
-                                // will name a forward sibling whose own write
-                                // is still pending, serialize the sibling
-                                // FIRST (deepest-first along the dirty
-                                // chain). Cells apply in vec order, so every
-                                // prefix of the flush stream — including one
-                                // cut by cancellation mid-RPC — only ever
-                                // links to pages that are already durable.
+                                // Referential closure: a page whose next
+                                // pointer names a page with NO on-disk image
+                                // yet must never land first -- the reader
+                                // would walk into a hole. Naming a merely
+                                // dirty page is fine (its older image is
+                                // still readable), so the chain we must
+                                // order on is the never-persisted one, which
+                                // is bounded by recent splits rather than by
+                                // the whole dirty working set. Deepest first,
+                                // and never truncated: a cut anywhere in this
+                                // chain leaves its tail naming a hole (the
+                                // 1024-cap version produced exactly that
+                                // corpse at crash-churn cycle 6).
                                 let mut chain = Vec::new();
                                 let mut cursor = m.node.clone();
-                                while chain.len() < 1024 {
-                                    match cursor.dirty_next_ref() {
+                                let mut seen = std::collections::HashSet::new();
+                                while seen.insert(cursor.address()) {
+                                    match cursor.unpersisted_next_ref() {
                                         Some(next) => {
                                             chain.push(cursor);
                                             cursor = next;
@@ -259,6 +288,13 @@ impl WriteBackHub {
                                     }
                                 }
                                 chain.push(cursor);
+                                if chain.len() > 1 {
+                                    debug!(
+                                        "write-back: pulled {} unpersisted forward sibling(s) \
+                                         ahead of their referrer",
+                                        chain.len() - 1
+                                    );
+                                }
                                 while let Some(node) = chain.pop() {
                                     let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
                                         node.build_cell(&m.deletion)
@@ -290,17 +326,118 @@ impl WriteBackHub {
                     let flushed_mods = !guards.is_empty();
                     if !cells.is_empty() {
                         let client = batch_client.expect("cells present implies a client");
-                        match client.upsert_all_cells(cells).await {
-                            Ok(results) => {
-                                for r in results {
-                                    if let Err(e) = r {
-                                        warn!("write-back batch: cell update rejected: {:?}", e);
+                        // Retry transient failures INLINE, before this batch's
+                        // completion guards drop. A rejected upsert used to be
+                        // warn-and-forget -- but the node's dirty flag was
+                        // already cleared at build time, so unless a later
+                        // insert happened to touch that exact page again its
+                        // current image was never flushed at all: under
+                        // chunk-full pressure (CannotAllocateSpace) whole
+                        // batches of page images silently evaporated, and a
+                        // later crash recovered the pages at whatever version
+                        // last succeeded. Retrying inline keeps the flush
+                        // stream's total order (single worker, nothing later
+                        // lands first), resends the SAME built images (a
+                        // rebuilt snapshot could name forward siblings that
+                        // are not yet in the flush stream, breaking prefix
+                        // closure), and keeps the deletion fence honest: the
+                        // guards for these ids are still held, so no fenced
+                        // deletion can run ahead of a link rewrite that is
+                        // still being retried.
+                        let mut pending: Vec<crate::ram::cell::OwnedCell> = cells;
+                        let mut attempt: u32 = 0;
+                        loop {
+                            attempt += 1;
+                            let pending_len = pending.len();
+                            let round = pending.clone();
+                            let mut retry: Vec<crate::ram::cell::OwnedCell> = Vec::new();
+                            match client.upsert_all_cells(round).await {
+                                Ok(results) => {
+                                    for (r, cell) in
+                                        results.into_iter().zip(pending.into_iter())
+                                    {
+                                        match r {
+                                            Ok(_) => {}
+                                            Err(
+                                                crate::ram::cell::WriteError::CannotAllocateSpace
+                                                | crate::ram::cell::WriteError::BatchAborted,
+                                            ) => {
+                                                retry.push(cell);
+                                            }
+                                            Err(e) => {
+                                                // Non-transient rejection: retrying
+                                                // cannot fix it; keep the historical
+                                                // warn-and-drop but say so loudly.
+                                                warn!(
+                                                    "write-back batch: cell update rejected \
+                                                     (not retryable): {:?}",
+                                                    e
+                                                );
+                                            }
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    error!(
+                                        "write-back batch upsert RPC error (attempt {}): {:?}; \
+                                         retrying the whole batch",
+                                        attempt, e
+                                    );
+                                    retry = pending;
+                                }
                             }
-                            Err(e) => {
-                                error!("write-back batch upsert RPC error: {:?}", e);
+                            if retry.is_empty() {
+                                break;
                             }
+                            if hub.should_stop.load(Ordering::SeqCst) {
+                                warn!(
+                                    "write-back worker {} stopping with {} unflushed cell(s) \
+                                     after {} attempt(s); shutdown reset owns the state now",
+                                    worker_id,
+                                    retry.len(),
+                                    attempt
+                                );
+                                break;
+                            }
+                            if attempt % 40 == 0 {
+                                error!(
+                                    "write-back batch still failing after {} attempts; {} cell(s) \
+                                     pending (store out of space?)",
+                                    attempt,
+                                    retry.len()
+                                );
+                            }
+                            // A permanently failing store (out of space, a
+                            // rejected schema) must not wedge the process:
+                            // retrying forever holds the drain barrier open
+                            // and a graceful shutdown never returns. Give up
+                            // loudly instead -- the guards below record
+                            // completion, so wait_until_updated resolves and
+                            // reports an UNESTABLISHED barrier, which every
+                            // publisher already treats as "do not publish
+                            // heads". Data is not lost silently: the pages
+                            // stay dirty in memory and the durable metadata
+                            // still names the last consistent chain.
+                            if attempt >= WRITE_BACK_MAX_ATTEMPTS {
+                                error!(
+                                    "write-back worker {} ABANDONING {} cell(s) after {} \
+                                     attempts; the drain barrier will report failure and no \
+                                     head pointer will be published over these pages",
+                                    worker_id,
+                                    retry.len(),
+                                    attempt
+                                );
+                                hub.barrier_failed.store(true, Ordering::SeqCst);
+                                // Stop the worker outright. Continuing would
+                                // let later pages land on top of the hole
+                                // these abandoned cells leave, and a referrer
+                                // above a hole is exactly the unreadable
+                                // chain this design exists to prevent.
+                                hub.should_stop.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            pending = retry;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
                     // Modification ids complete here, advancing the fence.
@@ -343,6 +480,10 @@ impl WriteBackHub {
     /// workers died mid-wait) — callers publishing head pointers or
     /// archiving segments must treat false as a hard failure, not a flush.
     pub async fn wait_until_updated(&self) -> bool {
+        if self.barrier_failed.load(Ordering::SeqCst) {
+            warn!("wait_until_updated: a worker abandoned unpersistable cells; barrier NOT established");
+            return false;
+        }
         let counter = self.counter.load(Ordering::Acquire);
         if counter == 0 {
             return true;
@@ -366,6 +507,10 @@ impl WriteBackHub {
             return false;
         }
         loop {
+            if self.barrier_failed.load(Ordering::SeqCst) {
+                warn!("wait_until_updated: worker abandoned cells mid-wait; barrier NOT established");
+                return false;
+            }
             let current = self.progress.load(Ordering::Acquire);
             if current != usize::MAX && current >= newest {
                 return true;
@@ -390,11 +535,31 @@ impl WriteBackHub {
             .expect("write-back completion lock poisoned")
             .clear();
         self.counter.store(0, Ordering::SeqCst);
-        while self.queue.pop().is_some() {}
-        self.deletions
-            .lock()
-            .expect("write-back deletion lane poisoned")
-            .clear();
+        self.barrier_failed.store(false, Ordering::SeqCst);
+        // Anything still queued here is a page write that will NEVER become
+        // durable, while a head pointer published during shutdown may
+        // already name it. That is the MissingPage corpse, so say so
+        // loudly rather than dropping the work in silence.
+        let mut discarded_pages = 0usize;
+        while self.queue.pop().is_some() {
+            discarded_pages += 1;
+        }
+        let discarded_deletes = {
+            let mut deletions = self
+                .deletions
+                .lock()
+                .expect("write-back deletion lane poisoned");
+            let n = deletions.len();
+            deletions.clear();
+            n
+        };
+        if discarded_pages > 0 || discarded_deletes > 0 {
+            error!(
+                "write-back reset DISCARDED {} queued page write(s) and {} deletion(s); \
+                 a head published during this shutdown may name a page that never landed",
+                discarded_pages, discarded_deletes
+            );
+        }
     }
 }
 

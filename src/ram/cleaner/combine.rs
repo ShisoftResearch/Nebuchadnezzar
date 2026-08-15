@@ -469,20 +469,59 @@ impl CombinedCleaner {
         chunk: &Chunk,
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
     ) -> (usize, usize) {
-        let segments = Self::select_candidate_segments(chunk, selected_segments);
+        let mut segments = Self::select_candidate_segments(chunk, selected_segments);
         if segments.is_empty() {
             return (0, 0);
         }
 
-        let space_to_collect = segments
-            .iter()
-            .map(|seg| seg.used_spaces() as usize)
-            .sum::<usize>();
-
-        let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
-
-        let all_entries =
-            Self::collect_and_deduplicate_entries(chunk, &segments, &segment_ids_to_combine);
+        let space_to_collect;
+        let segment_ids_to_combine: HashSet<_>;
+        let all_entries;
+        // A round that cannot reserve enough destination segments is retried
+        // with fewer sources instead of being skipped: in a nearly full chunk
+        // the allocator may only have the cleaner's reserve segment to give,
+        // and a two-into-one combine through that single destination is
+        // exactly how such a chunk frees its first segment. Skipping meant a
+        // full chunk with plenty of dead space could never reclaim any of it.
+        loop {
+            let ids: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
+            let entries = Self::collect_and_deduplicate_entries(chunk, &segments, &ids);
+            if entries.is_empty() {
+                segment_ids_to_combine = ids;
+                all_entries = entries;
+                space_to_collect = segments
+                    .iter()
+                    .map(|seg| seg.used_spaces() as usize)
+                    .sum::<usize>();
+                break;
+            }
+            let segment_class = segments[0].segment_class();
+            let planned = Self::plan_segment_layout(&entries, segment_class);
+            let available = chunk.allocator.available_segments();
+            if planned.len() > available && segments.len() > 2 {
+                let keep = (segments.len() / 2).max(2);
+                debug!(
+                    "Combine round needs {} destinations but chunk {} has {}; retrying \
+                     with {} of {} sources",
+                    planned.len(),
+                    chunk.id,
+                    available,
+                    keep,
+                    segments.len()
+                );
+                for seg in segments.drain(keep..) {
+                    seg.mark_clean_no_progress();
+                }
+                continue;
+            }
+            segment_ids_to_combine = ids;
+            all_entries = entries;
+            space_to_collect = segments
+                .iter()
+                .map(|seg| seg.used_spaces() as usize)
+                .sum::<usize>();
+            break;
+        }
 
         let mut num_reduced_segments: isize = 0;
         let mut space_cleaned = 0;

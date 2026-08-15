@@ -240,12 +240,22 @@ impl LeafKeys {
         let pl = b.prefix_len;
         let mut template = EntryKey::new();
         template.as_mut_slice()[..pl].copy_from_slice(&b.prefix[..pl]);
+        // The caller computed `range` from an OLDER observation of the node;
+        // a concurrent repack may have swapped in a smaller buffer between
+        // that observation and load() above. This runs inside optimistic
+        // (seqlock) read sections whose version re-check discards torn
+        // results -- so a torn range must clamp, not panic: the panic killed
+        // the reading task where the retry would have simply rerun it
+        // (docs/tla/SeqlockCursor.tla).
+        let avail = b.data.len();
+        let start = (range.start * w).min(avail);
+        let end = (range.end * w).min(avail).max(start);
         PackedKeys {
             template,
             prefix_len: pl,
             width: w,
-            suffixes: b.data[range.start * w..range.end * w].to_vec(),
-            len: range.len(),
+            suffixes: b.data[start..end].to_vec(),
+            len: if w == 0 { range.len() } else { (end - start) / w },
         }
     }
 
@@ -262,7 +272,12 @@ impl LeafKeys {
             out.resize(range.len(), template);
             return out;
         }
-        for suffix in b.data[range.start * w..range.end * w].chunks_exact(w) {
+        // Same torn-range clamp as packed_snapshot: the buffer may have been
+        // repacked smaller since the caller observed the node's len.
+        let avail = b.data.len();
+        let start = (range.start * w).min(avail);
+        let end = (range.end * w).min(avail).max(start);
+        for suffix in b.data[start..end].chunks_exact(w) {
             let mut key = template.clone();
             key.as_mut_slice()[pl..].copy_from_slice(suffix);
             out.push(key);
