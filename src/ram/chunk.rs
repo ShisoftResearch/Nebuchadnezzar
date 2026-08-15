@@ -734,6 +734,50 @@ impl Chunk {
 
             if head_seg_id != HEAD_SEG_ID_EMPTY {
                 if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
+                    // Let the writers that acquired from this segment finish
+                    // before it stops being writable.
+                    //
+                    // Rotation only publishes a new head; entries acquired from
+                    // the old one moments earlier are still in flight, and each
+                    // holds a reference until its `PendingEntry` drops (which is
+                    // where the WAL write happens). Closing its WAL and
+                    // archiving underneath them is what made the twin: the late
+                    // write found no WAL and re-created one beside a backup that
+                    // did not contain it. Sealing turned that silent corruption
+                    // into a refused write -- 3,958 failed batches in one import
+                    // -- which is the same race being reported instead of
+                    // hidden. Draining first is the actual fix.
+                    //
+                    // Bounded, because a reference can also be a long-lived read
+                    // guard and rotation runs on the write path. If it does not
+                    // drain, the archive is simply skipped: the segment stays
+                    // dirty and unsealed, so late writes still land in its WAL
+                    // and eviction, shutdown or recovery archive it later.
+                    let drain = Backoff::new();
+                    let mut drained = old_head.no_references();
+                    for _ in 0..512 {
+                        if drained {
+                            break;
+                        }
+                        // We are waiting on other threads to finish their
+                        // writes; the head slot already points at the new
+                        // segment, so nothing is blocked behind this. Yield
+                        // periodically rather than burning a core on a wait
+                        // that is normally over in microseconds.
+                        drain.spin();
+                        std::thread::yield_now();
+                        drained = old_head.no_references();
+                    }
+                    if !drained {
+                        debug!(
+                            "Segment {} (chunk {}) still has {} references at rotation; leaving it \
+                             dirty and unsealed rather than archiving under an active writer",
+                            head_seg_id,
+                            self.id,
+                            old_head.references_count()
+                        );
+                        continue;
+                    }
                     if let Err(e) = old_head.force_wal_sync() {
                         warn!(
                             "Failed to sync WAL for old head segment {}: {}",
