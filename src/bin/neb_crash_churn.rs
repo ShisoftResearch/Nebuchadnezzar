@@ -405,13 +405,25 @@ async fn child_async(
     // fast. Keys continue from the scanned count -- duplicates with an
     // earlier incarnation's unacked tail are harmless upserts.
     let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(count));
-    let acked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The acked mark is the CONTIGUOUS prefix, not the high-water.
+    //
+    // Keys are handed out by `fetch_add` across several writers, so a write
+    // can fail while a higher-numbered one succeeds -- at any interruption,
+    // and especially once shutdown starts refusing writes. A high-water mark
+    // then claims keys that were never written, and the parent reports a
+    // regression of a few keys against a server that lost nothing. Only "every
+    // key below this point is durable" is a property the store actually owes,
+    // and holes above the cursor are the harness's business, not the store's.
+    let acked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(count));
+    let pending_acks =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<u64>::new()));
     const WRITERS: usize = 4;
     let mut writer_handles = Vec::new();
     for _ in 0..WRITERS {
         let client = client.clone();
         let next = next.clone();
         let acked = acked.clone();
+        let pending_acks = pending_acks.clone();
         writer_handles.push(tokio::spawn(async move {
             loop {
                 let seq = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -424,7 +436,15 @@ async fn child_async(
                 value[PAD_FIELD] = OwnedValue::String(format!("pad-{:0>200}", seq));
                 let cell = OwnedCell::new_with_id(CHURN_SCHEMA_ID, &id, value);
                 if let Ok(Ok(_)) = client.write_cell(cell).await {
-                    acked.fetch_max(seq + 1, std::sync::atomic::Ordering::Relaxed);
+                    // Advance the cursor over whatever contiguous run this
+                    // completes; anything above it waits for its predecessor.
+                    let mut pending = pending_acks.lock().unwrap();
+                    pending.insert(seq);
+                    let mut cursor = acked.load(std::sync::atomic::Ordering::Relaxed);
+                    while pending.remove(&cursor) {
+                        cursor += 1;
+                    }
+                    acked.store(cursor, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }));

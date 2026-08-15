@@ -1265,6 +1265,12 @@ pub fn recover_chunks(
                     // real backup before the tier is allowed to evict them.
                     if file_info.is_backup || recover_as_cold {
                         segment.clear_dirty();
+                        // Both arms mean a backup exists for this seq id --
+                        // the image came from one, or `ensure_backup_for_cold_recovery`
+                        // is about to write one. Either way the incarnation is
+                        // closed and must never be picked up as a write head
+                        // again; see `Segment::sealed`.
+                        segment.seal();
                     }
                     local_stashed.extend(scan_result.stashed_tombstones);
                     max_seq_ids[chunk_id].fetch_max(file_info.seq_id + 1, Ordering::Relaxed);
@@ -1788,10 +1794,16 @@ use crate::ram::types::Id;
         let chunk = &chunks.list[0];
         let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
         let segment = chunk
-            .segs
-            .get(&(regular_head as usize))
+            .segments()
+            .into_iter()
+            .next()
             .expect("recovery should keep an empty regular segment resident");
 
+        // Resident, but not the write head: it was recovered from a backup, so
+        // its seq id already has a complete image and appending to it would
+        // re-create a WAL alongside that backup. See `Segment::sealed`.
+        assert!(segment.is_sealed());
+        assert_ne!(regular_head, segment.id);
         assert_eq!(blob_head, None);
         assert_eq!(chunk.segments().len(), 1);
         assert_eq!(segment.segment_class(), SegmentClass::Regular);
@@ -1861,6 +1873,107 @@ use crate::ram::types::Id;
         assert!(
             !Path::new(&format!("{}.old", backup_file)).exists(),
             "the superseded backup was left on disk"
+        );
+    }
+
+    /// An archived segment is closed forever: it never becomes a write head
+    /// again, and nothing may re-create its WAL.
+    ///
+    /// This is the fix for the twin-file corpse. Shutdown archives the OPEN
+    /// append head (backup written, WAL deleted); the next incarnation used to
+    /// resume that same segment, whose fresh WAL then held only the
+    /// post-restart suffix. Backup and WAL at one seq id stopped being two
+    /// versions of an image and became two halves of one, so discovery's
+    /// "prefer the backup on a seq tie" silently dropped every write made
+    /// after the archive -- ranged pages that were provably built and applied
+    /// came back as `MissingPage`. Sealing makes the twin unrepresentable
+    /// rather than making the seam recoverable (reconstructing it by content
+    /// was tried, and a mis-detected seam trimmed the WAL to zero).
+    #[test]
+    fn an_archived_segment_is_never_appended_to_again() {
+        let _ = env_logger::try_init();
+        let backup_dir = TempDir::new().unwrap();
+        let wal_dir = TempDir::new().unwrap();
+        let chunks = Chunks::new(
+            1,
+            TEST_SEGMENT_SIZE * 8,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+        );
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(215, "seal_on_archive", false);
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
+
+        let id = Id::allocated(25, 0, 1);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data: data_map_value!(id: 13_i32, data: vec![0x5E_u8; DATA_SIZE]),
+        };
+        chunks.write_cell(&mut cell).expect("write a cell");
+
+        let head_id = chunk.get_head_seg_id();
+        let head = chunk.segs.get(&(head_id as usize)).expect("head segment");
+        let wal_file = chunk
+            .file_manager
+            .wal_path(head.chunk_id, head.id, head.seq_id)
+            .expect("wal path");
+
+        // Shutdown archives the open head -- this is `archive_all`'s job, and
+        // the head is not sealed by rotation because it never stopped being
+        // the head.
+        head.archive().expect("archive the open head");
+        assert!(head.is_sealed(), "archiving must close the incarnation");
+        assert!(
+            !Path::new(&wal_file).exists(),
+            "archive is supposed to delete the WAL it supersedes"
+        );
+
+        // What recovery does on the next start: pick a write head from the
+        // recovered segments. The archived one must not be eligible, however
+        // much room is left in it.
+        assert!(
+            head.append_header.load(Ordering::Acquire) < head.bound(),
+            "the test needs a head with space left, or it proves nothing"
+        );
+        chunk
+            .reset_write_heads_after_recovery()
+            .expect("reset write heads");
+        assert_ne!(
+            chunk.get_head_seg_id(),
+            head_id,
+            "a segment with a backup was resumed as the write head; its next append \
+             re-creates a WAL at a seq id that already has a complete backup"
+        );
+
+        // And the backstop, in case some other path ever selects it anyway.
+        assert!(
+            head.write_wal(head.addr, 8, true).is_err(),
+            "a sealed segment must refuse to re-create its WAL"
+        );
+        assert!(
+            !Path::new(&wal_file).exists(),
+            "the refused append left a WAL twin next to the backup"
+        );
+
+        // Writing still works -- it lands in a fresh segment with a fresh seq
+        // id, which is where the retired tail goes.
+        let id2 = Id::allocated(25, 0, 2);
+        let mut cell2 = OwnedCell {
+            header: CellHeader::new(schema.id, &id2),
+            data: data_map_value!(id: 14_i32, data: vec![0x5F_u8; DATA_SIZE]),
+        };
+        chunks
+            .write_cell(&mut cell2)
+            .expect("writes continue after the head is retired");
+        assert_ne!(
+            chunk.get_head_seg_id(),
+            head_id,
+            "the write went back into the sealed segment"
         );
     }
 
@@ -2295,10 +2408,14 @@ use crate::ram::types::Id;
         let chunk = &chunks.list[0];
         let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
         let segment = chunk
-            .segs
-            .get(&(regular_head as usize))
+            .segments()
+            .into_iter()
+            .next()
             .expect("recovery should keep a tombstone-only regular segment resident");
 
+        // Resident but sealed, as for any backup-recovered segment.
+        assert!(segment.is_sealed());
+        assert_ne!(regular_head, segment.id);
         assert_eq!(blob_head, None);
         assert_eq!(segment.segment_class(), SegmentClass::Regular);
         assert_eq!(segment.tombstones.load(Ordering::Acquire), 1);
@@ -2441,10 +2558,6 @@ use crate::ram::types::Id;
 
             let chunk = &chunks.list[0];
             let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
-            let regular_head_segment = chunk
-                .segs
-                .get(&(regular_head as usize))
-                .expect("recovery should leave a regular write head installed");
             let regular_segments: Vec<_> = chunk
                 .segments()
                 .into_iter()
@@ -2465,26 +2578,32 @@ use crate::ram::types::Id;
             assert_eq!(
                 regular_segments.len(),
                 1,
-                "recovery should reuse the recovered regular segment instead of allocating a fresh empty head"
+                "recovery should keep the recovered regular segment resident"
             );
             assert!(
                 blob_segments[0].is_cold(),
                 "recovered blob segments must come back cold"
             );
-            assert_eq!(
-                regular_head_segment.segment_class(),
-                SegmentClass::Regular,
-                "recovery should re-establish a regular runtime head"
+            // The recovered regular segment was archived by the setup above,
+            // so it comes back sealed and cannot serve as the write head --
+            // appending to it would put a WAL next to its backup at one seq
+            // id, which is the twin recovery cannot arbitrate. The first write
+            // after recovery allocates a fresh segment instead.
+            assert!(
+                regular_segments[0].is_sealed(),
+                "a segment recovered from a backup must come back sealed"
             );
-            assert_eq!(
-                regular_head_segment.id, regular_segments[0].id,
-                "the regular write head should reuse the recovered hot regular segment"
+            assert_ne!(
+                regular_head, regular_segments[0].id,
+                "an archived segment was resumed as the write head"
             );
-            assert_eq!(
-                regular_head_segment.append_header.load(Ordering::Relaxed)
-                    > regular_head_segment.addr,
-                true,
-                "the regular head after recovery should keep the recovered append position"
+            // The recovered segment keeps its append position -- its cells are
+            // there and readable, which is what the cursor is for. It is simply
+            // no longer a place new entries may go.
+            assert!(
+                regular_segments[0].append_header.load(Ordering::Relaxed)
+                    > regular_segments[0].addr,
+                "the recovered regular segment lost its append position"
             );
 
             let blob_cell = chunks.read_cell(&blob_id).unwrap();

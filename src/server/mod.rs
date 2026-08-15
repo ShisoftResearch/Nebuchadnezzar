@@ -1791,6 +1791,15 @@ impl NebServer {
         // Step 1.6: Archive all dirty segments to backup storage
         // This ensures all in-memory data (including LSM B-Tree pages) is written to backup files
         // Recovery reads from backup files, not WAL, so this is critical for proper recovery
+        //
+        // Close writes FIRST. The RPC server does not stop until step 3 (it
+        // has to outlive the index flush above, which talks to this server),
+        // so without this a client write could land after its segment was
+        // archived: too late for the backup, and appending to an archived
+        // segment is exactly the twin that costs the post-archive suffix at
+        // the next crash. Refusing those writes makes them the client's
+        // problem to retry rather than silent loss.
+        self.chunks().close_writes();
         info!("Archiving all dirty segments to backup storage...");
         self.chunks().archive_all();
         info!("Segment archiving completed");

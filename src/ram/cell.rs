@@ -56,6 +56,10 @@ pub enum WriteError {
     DataMismatchSchema(Field, OwnedValue),
     CellVersionMismatch,
     CompressionFailed(Field, String),
+    /// Shutdown has begun archiving segments, so there is nowhere durable left
+    /// to put a new entry. Nothing was written; the write must be retried
+    /// against a live server.
+    ServerShuttingDown,
     /// The cell was never attempted: an ordered batch stopped at an earlier
     /// failure. Applying later cells after an earlier one failed would break
     /// the caller's ordering contract (the B-tree write-back stream must be

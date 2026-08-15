@@ -474,6 +474,33 @@ pub struct Segment {
     /// Tracks if WAL has been written to since last successful archive
     /// Used to optimize eviction: if archived=true && is_dirty=false, can skip re-archiving
     is_dirty: AtomicBool,
+    /// Set once a backup exists for this `(chunk, seg, seq)`. From then on the
+    /// incarnation is CLOSED: nothing may append to it, and in particular no
+    /// WAL may be (re-)created at this seq id.
+    ///
+    /// This is what makes recovery's file arbitration decidable. Discovery
+    /// dedups by `(chunk_id, seg_id)` and, on a seq tie, prefers the backup
+    /// over the WAL -- which is only sound if a backup at a seq is a COMPLETE
+    /// image that supersedes the log. Archiving upholds that by deleting the
+    /// WAL; what broke it was appending afterwards, which lazily re-created a
+    /// WAL at the SAME seq. Shutdown archives the open append head, so the
+    /// next incarnation resumed that very segment and its fresh WAL held only
+    /// the post-restart suffix: backup and WAL became complementary HALVES of
+    /// one image rather than two versions of it, and the tie-break silently
+    /// dropped every post-restart write. A SIGKILL there cost the ranged
+    /// index pages that were provably built and applied -- `MissingPage` on
+    /// reload, "tree placement was not found" on scan.
+    ///
+    /// Reconstructing the seam after the fact was tried and reverted: the
+    /// merge had to GUESS where the backup ended, and a mis-detected seam
+    /// trimmed the WAL to zero (see git history). Sealing removes the choice
+    /// instead -- a seq id has either a complete backup or a live WAL, never
+    /// both -- so the ambiguity cannot be represented and no merge is needed.
+    ///
+    /// Cost: a graceful shutdown retires the unfilled tail of one open segment
+    /// per chunk. The segment stays readable and the cleaner can still reclaim
+    /// it; only its remaining append space is given up.
+    sealed: AtomicBool,
     /// Segment lock for tiered memory operations (eviction, promotion, cleaner)
     /// Holds the hot/cold state. Cell read/write operations do NOT need this
     /// lock, only cell-level locks.
@@ -665,6 +692,7 @@ impl Segment {
             last_promoted_ms: AtomicI64::new(0),
             last_evicted_ms: AtomicI64::new(0),
             is_dirty: AtomicBool::new(true), // Start dirty
+            sealed: AtomicBool::new(false),
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
             wal_sync_queued: std::sync::atomic::AtomicBool::new(false),
@@ -678,6 +706,16 @@ impl Segment {
     }
 
     pub fn try_acquire(&self, size: u32) -> Option<usize> {
+        // A sealed segment is out of append space by definition, whatever its
+        // cursor says: it has a backup at its seq id, so an append here could
+        // only become durable through a WAL that must never exist (see the
+        // `sealed` field). Refusing at acquisition -- before any bytes are
+        // placed -- is what lets the caller rotate to a fresh segment; the
+        // refusal in `write_wal` is only a backstop, and reaching it means an
+        // entry was already written into memory that cannot be made durable.
+        if self.is_sealed() {
+            return None;
+        }
         let size = size as usize;
         loop {
             let curr_last = self.append_header.load(Ordering::Acquire);
@@ -1660,6 +1698,12 @@ image, not an empty segment; archiving it would persist the damage.",
 
                     self.clear_dirty();
 
+                    // A backup now exists at this seq id, so this incarnation
+                    // is closed: no append may follow, or the WAL deleted just
+                    // below would come back at the same seq and recovery could
+                    // no longer tell a complete backup from half an image.
+                    self.seal();
+
                     // Close and delete WAL file since backup now contains all data
                     // Recovery prefers backup files over WAL files (see file_manager.rs:272-285)
                     // Closing the file descriptor first ensures clean deletion
@@ -1709,6 +1753,28 @@ image, not an empty segment; archiving it would persist the damage.",
         let _hold_guard = WalHoldTimer(held_start);
         // Lazily create WAL file on first write if not already present
         if state.wal.is_none() {
+            // The twin-birth site. A sealed segment has a backup at this seq
+            // id; re-creating its WAL would put a prefix image and a suffix
+            // log under one name, which recovery cannot arbitrate. Nothing
+            // should reach here -- head selection skips sealed segments -- so
+            // refuse loudly rather than write a file that silently costs data
+            // at the next crash.
+            if self.is_sealed() {
+                error!(
+                    "REFUSING to re-create the WAL for sealed segment {} (chunk {}, seq {}): it \
+                     has been archived, so this incarnation is closed. Appending here would make \
+                     its backup and WAL two halves of one image and recovery would drop the \
+                     suffix. This is a bug in whoever selected this segment for writing.",
+                    self.id, self.chunk_id, self.seq_id
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "segment {} (chunk {}, seq {}) is sealed; cannot append",
+                        self.id, self.chunk_id, self.seq_id
+                    ),
+                ));
+            }
             state.wal = state
                 .manager
                 .create_wal_file(self.chunk_id, self.id, self.seq_id)?;
@@ -2125,6 +2191,17 @@ image, not an empty segment; archiving it would persist the damage.",
 
     pub fn is_dirty(&self) -> bool {
         self.is_dirty.load(Ordering::Relaxed)
+    }
+
+    /// Close this incarnation: a backup exists at its seq id, so it may never
+    /// be appended to again. See the `sealed` field for why this is an
+    /// invariant of recovery rather than a policy choice.
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::Release);
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(Ordering::Acquire)
     }
 }
 
