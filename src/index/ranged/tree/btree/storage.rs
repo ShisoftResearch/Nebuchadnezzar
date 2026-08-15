@@ -46,43 +46,6 @@ pub struct WriteBackHub {
 // attempts at 100ms is ~20s of genuine transient-failure tolerance.
 const WRITE_BACK_MAX_ATTEMPTS: u32 = 200;
 
-// Crash-forensics tap, disabled unless NEB_WB_ID_LOG names a file: appends
-// one line per page-cell event in the flush stream (built / applied /
-// rejected / deleted), so a corpse's broken chain can be diffed against
-// exactly what the flusher persisted -- never-written vs written-then-lost
-// vs linked-too-early. Diagnostic only; does not alter flush behavior.
-fn wb_id_log(line: std::fmt::Arguments<'_>) {
-    use std::io::Write;
-    lazy_static! {
-        static ref WB_ID_LOG: Option<Mutex<std::fs::File>> = {
-            std::env::var("NEB_WB_ID_LOG").ok().and_then(|path| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .ok()
-                    .map(Mutex::new)
-            })
-        };
-    }
-    if let Some(file) = WB_ID_LOG.as_ref() {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut file = file.lock().expect("wb id log poisoned");
-        let _ = writeln!(file, "{} {} {}", ms, std::process::id(), line);
-    }
-}
-
-macro_rules! wb_id_log {
-    ($($arg:tt)*) => {
-        if std::env::var_os("NEB_WB_ID_LOG").is_some() {
-            wb_id_log(format_args!($($arg)*));
-        }
-    };
-}
-
 lazy_static! {
     static ref HUBS: Mutex<Vec<(Weak<client::AsyncClient>, Arc<WriteBackHub>)>> =
         Mutex::new(Vec::new());
@@ -332,84 +295,17 @@ impl WriteBackHub {
                                         chain.len() - 1
                                     );
                                 }
-                                let mut built_this_entry: Vec<super::NodeCellRef> = Vec::new();
                                 while let Some(node) = chain.pop() {
-                                    if built_addrs.contains(&node.address()) {
-                                        continue;
-                                    }
                                     let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
                                         node.build_cell(&m.deletion)
                                     }));
                                     match built {
-                                        Ok(Some(cell)) => {
-                                            wb_id_log!(
-                                                "built id={} change={}",
-                                                cell.id().bits(),
-                                                id
-                                            );
-                                            cells.push(cell);
-                                            built_addrs.insert(node.address());
-                                            built_refs.push(node.clone());
-                                            built_this_entry.push(node);
-                                        }
+                                        Ok(Some(cell)) => cells.push(cell),
                                         Ok(None) => {}
                                         Err(_) => error!(
                                             "write-back worker {}: build_cell panicked for change {}",
                                             worker_id, id
                                         ),
-                                    }
-                                }
-                                // Close the walk/build window. The chain walk
-                                // above and each node's snapshot are separate
-                                // latch sections, so a concurrent split can
-                                // land between them: the snapshot then names a
-                                // freshly linked page the walk never saw, and
-                                // that page's own queue entry sits BEHIND this
-                                // batch -- a kill in the gap leaves a durable
-                                // referrer naming a page with no image. Re-read
-                                // every built node's CURRENT next: a
-                                // still-unpersisted successor missing from this
-                                // batch is serialized now and PREPENDED, so it
-                                // lands before every referrer. (A split landing
-                                // after a snapshot is harmless -- that snapshot
-                                // still names the old, persisted sibling.)
-                                for node in built_this_entry {
-                                    let mut cur = node;
-                                    let mut late_seen = std::collections::HashSet::new();
-                                    while let Some(next) = cur.unpersisted_next_ref() {
-                                        if built_addrs.contains(&next.address())
-                                            || !late_seen.insert(next.address())
-                                        {
-                                            break;
-                                        }
-                                        let built =
-                                            std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                                next.build_cell(&m.deletion)
-                                            }));
-                                        match built {
-                                            Ok(Some(cell)) => {
-                                                debug!(
-                                                    "write-back: serialized late-linked \
-                                                     successor {:?} ahead of its referrer",
-                                                    cell.id()
-                                                );
-                                                wb_id_log!(
-                                                    "built id={} change={} late-linked",
-                                                    cell.id().bits(),
-                                                    id
-                                                );
-                                                cells.insert(0, cell);
-                                                built_addrs.insert(next.address());
-                                                built_refs.push(next.clone());
-                                            }
-                                            Ok(None) => {}
-                                            Err(_) => error!(
-                                                "write-back worker {}: build_cell panicked for \
-                                                 late-linked successor of change {}",
-                                                worker_id, id
-                                            ),
-                                        }
-                                        cur = next;
                                     }
                                 }
                             }
@@ -461,12 +357,7 @@ impl WriteBackHub {
                                         results.into_iter().zip(pending.into_iter())
                                     {
                                         match r {
-                                            Ok(_) => {
-                                                wb_id_log!(
-                                                    "applied id={}",
-                                                    cell.id().bits()
-                                                );
-                                            }
+                                            Ok(_) => {}
                                             Err(
                                                 crate::ram::cell::WriteError::CannotAllocateSpace
                                                 | crate::ram::cell::WriteError::BatchAborted,
@@ -477,11 +368,6 @@ impl WriteBackHub {
                                                 // Non-transient rejection: retrying
                                                 // cannot fix it; keep the historical
                                                 // warn-and-drop but say so loudly.
-                                                wb_id_log!(
-                                                    "rejected id={} err={:?}",
-                                                    cell.id().bits(),
-                                                    e
-                                                );
                                                 warn!(
                                                     "write-back batch: cell update rejected \
                                                      (not retryable): {:?}",
@@ -568,9 +454,7 @@ impl WriteBackHub {
                             id,
                         };
                         match cl.remove_cell(cid).await {
-                            Ok(Ok(())) => {
-                                wb_id_log!("deleted id={} change={}", cid.bits(), id);
-                            }
+                            Ok(Ok(())) => {}
                             Ok(Err(e)) => {
                                 warn!("write-back: cell removal rejected for {:?}: {:?}", cid, e)
                             }

@@ -398,46 +398,28 @@ fn observe_recovered_segment_class(
     Ok(())
 }
 
-fn ensure_backup_for_cold_recovery(
-    chunk: &Chunk,
-    file_info: &SegmentFileInfo,
-    image: &[u8],
-) -> io::Result<()> {
+fn ensure_backup_for_cold_recovery(chunk: &Chunk, file_info: &SegmentFileInfo) -> io::Result<()> {
     if file_info.is_backup {
         return Ok(());
     }
 
-    // Write the RESOLVED image, not the WAL file. For a resumed segment the
-    // WAL holds only the post-restart suffix (the stale backup holds the
-    // prefix), so copying the WAL alone would install a backup missing every
-    // pre-restart entry -- and cold reads serve straight from the backup.
-    // tmp+rename so a crash can never leave a torn image at the final path.
-    let backup_path = chunk
-        .file_manager
-        .backup_path(file_info.chunk_id, file_info.seg_id, file_info.seq_id)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "cold recovery for segment {} requires backup storage, but none is configured",
-                    file_info.seg_id
-                ),
-            )
-        })?;
-    if let Some(parent) = Path::new(&backup_path).parent() {
-        fs::create_dir_all(parent)?;
+    let copied = chunk.file_manager.copy_wal_to_backup(
+        file_info.chunk_id,
+        file_info.seg_id,
+        file_info.seq_id,
+        Some(SEGMENT_SIZE),
+    )?;
+    if copied {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "cold recovery for segment {} requires a backup file, but WAL copy failed",
+                file_info.seg_id
+            ),
+        ))
     }
-    let tmp_path = format!("{}.tmp", backup_path);
-    {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(image)?;
-        if image.len() < SEGMENT_SIZE {
-            file.write_all(&vec![0u8; SEGMENT_SIZE - image.len()])?;
-        }
-        file.sync_all()?;
-    }
-    fs::rename(&tmp_path, &backup_path)?;
-    Ok(())
 }
 
 fn apply_recovery_scan_result(segment: &Segment, scan_result: &RecoveryScanResult) {
@@ -580,38 +562,6 @@ fn current_segment_entry_content_length(
     let entry_addr = data_base + offset;
     let (entry, _) = Entry::decode_from(entry_addr, |_, _| {});
     Some(entry.content_length)
-}
-
-/// Length of the decodable entry-stream prefix of `data`, bounded by
-/// `limit`: the offset at which the first invalid, undecided, or truncated
-/// entry begins. Side-effect free; mirrors `scan_segment_from_data`'s walk
-/// so the two always agree on a file's live extent. Used to find the exact
-/// seam when reconciling a stale backup with its resumed segment's WAL.
-fn entry_stream_extent(data: &[u8], limit: usize) -> usize {
-    use byteorder::{LittleEndian, ReadBytesExt};
-    use std::io::Cursor;
-    let bound = limit.min(data.len());
-    let mut offset = 0usize;
-    while offset + ENTRY_HEAD_SIZE <= bound {
-        let entry_type_bits = {
-            let mut reader = Cursor::new(&data[offset..offset + 8]);
-            reader.read_u32::<LittleEndian>().unwrap()
-        };
-        if EntryType::from_bits(entry_type_bits).is_none() {
-            break;
-        }
-        let (entry_header, _) =
-            Entry::decode_from(data.as_ptr() as usize + offset, |_, header| header);
-        if entry_header.entry_type == EntryType::UNDECIDED || entry_header.content_length == 0 {
-            break;
-        }
-        let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
-        if entry_size > SEGMENT_SIZE || offset + entry_size > bound {
-            break;
-        }
-        offset += entry_size;
-    }
-    offset
 }
 
 /// Scan recovered segment data from a slice and update the recovery index state.
@@ -1126,374 +1076,125 @@ pub fn recover_chunks(
                     // as surely as an unscannable image did. Quarantine covers
                     // the read, the size check and the scan alike: everything
                     // whose blast radius is a single file.
-                    let segment_base = chunk.allocator.addr_by_id(file_info.seg_id as usize);
-
-                    // Resolve the segment's DEFINITIVE byte image before
-                    // anything scans. A segment that was archived and then
-                    // RESUMED -- the open append head is archived at graceful
-                    // shutdown, and the next incarnation recovers it and
-                    // keeps appending under the same (chunk, seg, seq) --
-                    // leaves TWO files at that key: the backup holds the
-                    // pre-restart PREFIX of the segment, and the re-created
-                    // WAL holds only the post-restart SUFFIX. Neither is
-                    // complete on its own, and discovery's "prefer the backup
-                    // at equal seq" rule silently dropped every entry the WAL
-                    // gained after the archive. That was the crash-churn
-                    // corpse at cycle 9: 28 applied images of a split
-                    // target's page lived only in the suffix WAL, the stale
-                    // backup won, and the tree refused to load (MissingPage
-                    // at pages_read 156).
                     //
-                    // A backup with a same-seq WAL twin is therefore
-                    // reconciled by CONTENT, at the seam found by
-                    // entry_stream_extent:
-                    //   - WAL bytes begin with the backup's live image: the
-                    //     WAL is the full history (the archive wrote the
-                    //     backup but had not deleted the WAL); whichever
-                    //     covers more wins.
-                    //   - WAL bytes diverge at the first entry: the WAL was
-                    //     re-created after the archive, so it is the resumed
-                    //     suffix, and the true image is backup ++ WAL.
-                    // A segment whose backup does not cover its full image
-                    // stays dirty (is_backup=false) so the archiver rewrites
-                    // a complete backup before the WAL can be discarded.
-                    struct CandidateImage {
-                        data: Vec<u8>,
-                        declared_used_len: Option<usize>,
-                        is_backup: bool,
-                        // Path of the WAL whose bytes contributed the image's
-                        // tail, plus the image offset where those bytes
-                        // start. After the scan the WAL is trimmed to the
-                        // bytes the scan accepted, so a torn tail can never
-                        // sit mid-file once appends resume.
-                        wal_path: Option<std::path::PathBuf>,
-                        wal_base_offset: usize,
-                        label: &'static str,
-                    }
-
-                    let load_bounded =
-                        |path: &std::path::Path| -> io::Result<(Vec<u8>, Option<usize>)> {
-                            let (data, used) = load_file_with_used_len(path)?;
-                            if data.len() > SEGMENT_SIZE {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("{} bytes is larger than a segment", data.len()),
-                                ));
-                            }
-                            Ok((data, used))
-                        };
-
-                    let wal_twin_path = if file_info.is_backup {
-                        chunk
-                            .file_manager
-                            .wal_path(chunk_id, file_info.seg_id, file_info.seq_id)
-                            .map(std::path::PathBuf::from)
-                            .filter(|path| path.exists())
-                    } else {
-                        None
-                    };
-
-                    // Candidate images, most complete first. Scan side
-                    // effects begin only once a first entry is accepted, and
-                    // every scan rejection fires before that point, so
-                    // falling through to the next candidate is safe.
-                    let mut candidates: Vec<CandidateImage> = Vec::new();
-                    match load_bounded(&file_info.path) {
-                        Ok((base, declared_used_len)) => {
-                            let twin = wal_twin_path.as_ref().and_then(|path| {
-                                match load_bounded(path) {
-                                    Ok((data, _)) if !data.is_empty() => Some(data),
-                                    Ok(_) => None,
-                                    Err(twin_error) => {
-                                        warn!(
-                                            "WAL twin '{}' for segment {} (chunk {}, seq {}) is \
-                                             unreadable ({}); recovering from the backup alone",
-                                            path.display(),
-                                            file_info.seg_id,
-                                            chunk_id,
-                                            file_info.seq_id,
-                                            twin_error
-                                        );
-                                        None
-                                    }
-                                }
-                            });
-                            match (file_info.is_backup, twin) {
-                                (true, Some(wal)) => {
-                                    let declared_bound = declared_used_len
-                                        .map(|len| len.min(base.len()))
-                                        .unwrap_or(base.len());
-                                    let base_extent = entry_stream_extent(&base, declared_bound);
-                                    let shared = base_extent.min(wal.len());
-                                    if base[..shared] == wal[..shared] {
-                                        // Same history. The longer coverage wins;
-                                        // equal coverage means the backup is
-                                        // current and authoritative.
-                                        if wal.len() > base_extent {
-                                            info!(
-                                                "Segment {} (chunk {}, seq {}): full-history WAL \
-                                                 ({} B) extends past its backup ({} B live); \
-                                                 recovering from the WAL, segment stays dirty",
-                                                file_info.seg_id,
-                                                chunk_id,
-                                                file_info.seq_id,
-                                                wal.len(),
-                                                base_extent
-                                            );
-                                            candidates.push(CandidateImage {
-                                                data: wal,
-                                                declared_used_len: None,
-                                                is_backup: false,
-                                                wal_path: wal_twin_path.clone(),
-                                                wal_base_offset: 0,
-                                                label: "full-history WAL twin",
-                                            });
-                                        }
-                                        candidates.push(CandidateImage {
-                                            data: base,
-                                            declared_used_len,
-                                            is_backup: true,
-                                            wal_path: None,
-                                            wal_base_offset: 0,
-                                            label: "backup",
-                                        });
-                                    } else if base_extent + wal.len() <= SEGMENT_SIZE {
-                                        // Divergent first entry: the WAL was
-                                        // re-created after the archive, so it is
-                                        // the resumed segment's suffix.
-                                        warn!(
-                                            "Segment {} (chunk {}, seq {}) was resumed after its \
-                                             archive: merging the stale backup ({} B live) with \
-                                             its post-restart WAL suffix ({} B). The segment \
-                                             stays dirty so the archiver rewrites a complete \
-                                             backup.",
-                                            file_info.seg_id,
-                                            chunk_id,
-                                            file_info.seq_id,
-                                            base_extent,
-                                            wal.len()
-                                        );
-                                        let mut merged =
-                                            Vec::with_capacity(base_extent + wal.len());
-                                        merged.extend_from_slice(&base[..base_extent]);
-                                        merged.extend_from_slice(&wal);
-                                        candidates.push(CandidateImage {
-                                            data: merged,
-                                            declared_used_len: None,
-                                            is_backup: false,
-                                            wal_path: wal_twin_path.clone(),
-                                            wal_base_offset: base_extent,
-                                            label: "backup+WAL merge",
-                                        });
-                                        candidates.push(CandidateImage {
-                                            data: base,
-                                            declared_used_len,
-                                            is_backup: true,
-                                            wal_path: None,
-                                            wal_base_offset: 0,
-                                            label: "backup",
-                                        });
-                                    } else {
-                                        error!(
-                                            "Segment {} (chunk {}, seq {}): backup ({} B live) \
-                                             and diverging WAL twin ({} B) exceed a segment when \
-                                             merged; recovering from the backup alone and \
-                                             keeping the WAL for forensics",
-                                            file_info.seg_id,
-                                            chunk_id,
-                                            file_info.seq_id,
-                                            base_extent,
-                                            wal.len()
-                                        );
-                                        candidates.push(CandidateImage {
-                                            data: base,
-                                            declared_used_len,
-                                            is_backup: true,
-                                            wal_path: None,
-                                            wal_base_offset: 0,
-                                            label: "backup",
-                                        });
-                                    }
-                                }
-                                _ => {
-                                    candidates.push(CandidateImage {
-                                        data: base,
-                                        declared_used_len,
-                                        is_backup: file_info.is_backup,
-                                        wal_path: (!file_info.is_backup)
-                                            .then(|| file_info.path.clone()),
-                                        wal_base_offset: 0,
-                                        label: if file_info.is_backup { "backup" } else { "WAL" },
-                                    });
-                                }
-                            }
+                    // Before quarantining, though: a BACKUP that cannot be
+                    // read or scanned may have a complete WAL twin at the same
+                    // seq id -- the archive deletes the WAL only after the
+                    // backup is fully durable, so a torn backup implies the
+                    // WAL is still whole. Discovery preferred the backup;
+                    // falling back to the WAL here recovers every cell the
+                    // torn file would have dropped. (The crash-churn fuzzer's
+                    // corpse was exactly this: a mid-archive SIGKILL left a
+                    // partial backup shadowing an intact WAL, and the ranged
+                    // tree's metadata cell vanished with the segment.)
+                    let segment_base = chunk.allocator.addr_by_id(file_info.seg_id as usize);
+                    let mut attempt = |path: &std::path::Path,
+                                       version_map: &mut VersionMap|
+                     -> io::Result<(Vec<u8>, Option<usize>, RecoveryScanResult)> {
+                        let (file_data, declared_used_len) = load_file_with_used_len(path)?;
+                        if file_data.len() > SEGMENT_SIZE {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "{} bytes is larger than a segment",
+                                    file_data.len()
+                                ),
+                            ));
                         }
-                        Err(error) => {
-                            // A BACKUP that cannot be read may still have a
-                            // WAL twin at the same seq -- a torn legacy
-                            // archive left the WAL whole. Recover what the
-                            // twin holds rather than quarantining outright.
-                            if let Some(wal_path) = &wal_twin_path {
-                                match load_bounded(wal_path) {
-                                    Ok((wal, _)) => {
-                                        warn!(
-                                            "Backup '{}' for segment {} (chunk {}, seq {}) is unreadable ({}); \
-                                             recovering the segment from its WAL twin '{}' instead. The segment \
-                                             stays dirty so the archiver rewrites a good backup.",
-                                            file_info.path.display(),
-                                            file_info.seg_id,
-                                            chunk_id,
-                                            file_info.seq_id,
-                                            error,
-                                            wal_path.display()
-                                        );
-                                        candidates.push(CandidateImage {
-                                            data: wal,
-                                            declared_used_len: None,
-                                            is_backup: false,
-                                            wal_path: Some(wal_path.clone()),
-                                            wal_base_offset: 0,
-                                            label: "WAL twin (backup unreadable)",
-                                        });
-                                    }
-                                    Err(wal_error) => {
-                                        error!(
-                                            "WAL twin '{}' for segment {} also failed: {}",
-                                            wal_path.display(),
-                                            file_info.seg_id,
-                                            wal_error
-                                        );
-                                    }
-                                }
-                            }
-                            if candidates.is_empty() {
-                                // Quarantine the segment; do not abandon the store.
-                                //
-                                // This used to be `?`, so one unreadable segment
-                                // failed the whole recovery -- every chunk, and
-                                // every segment not yet reached. On TB14 segment
-                                // 2053 did exactly that at 174,900 of 350,902
-                                // segments: the remaining 176,002 were never even
-                                // read, the caller logged "Starting with fresh
-                                // storage", and the ranged index then found an
-                                // empty store and replaced 31 of its 40 trees with
-                                // empty ones. One bad segment cost the database.
-                                //
-                                // Its files are left alone for forensics and for a
-                                // later repair; what is lost is this segment's
-                                // cells, which is the actual damage rather than
-                                // the whole store.
-                                error!(
-                                    "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {}. \
-                                     Recovery continues; the cells in this segment are missing \
-                                     from the recovered store.",
-                                    file_info.seg_id,
-                                    chunk_id,
-                                    file_info.seq_id,
-                                    file_info.path.display(),
-                                    error
-                                );
-                                quarantined_segments.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-                        }
-                    }
-
-                    let mut resolved: Option<(CandidateImage, RecoveryScanResult)> = None;
-                    for candidate in candidates {
-                        match scan_segment_from_data(
+                        let scan_result = scan_segment_from_data(
                             chunk,
                             file_info.seg_id,
                             segment_base,
-                            &candidate.data,
-                            &mut version_map,
+                            &file_data,
+                            version_map,
                             origin_floors,
-                            candidate.declared_used_len,
-                        ) {
-                            Ok(scan_result) => {
-                                resolved = Some((candidate, scan_result));
-                                break;
-                            }
-                            Err(scan_error) => {
-                                error!(
-                                    "Segment {} (chunk {}, seq {}) image from {} failed to \
-                                     scan: {}",
-                                    file_info.seg_id,
-                                    chunk_id,
-                                    file_info.seq_id,
-                                    candidate.label,
-                                    scan_error
-                                );
-                            }
-                        }
-                    }
-                    let Some((image, scan_result)) = resolved else {
-                        error!(
-                            "QUARANTINED segment {} (chunk {}, seq {}) from '{}': no candidate \
-                             image could be scanned. Recovery continues; the cells in this \
-                             segment are missing from the recovered store.",
-                            file_info.seg_id,
-                            chunk_id,
-                            file_info.seq_id,
-                            file_info.path.display(),
-                        );
-                        quarantined_segments.fetch_add(1, Ordering::Relaxed);
-                        continue;
+                            declared_used_len,
+                        )?;
+                        Ok((file_data, declared_used_len, scan_result))
                     };
-                    let file_data = image.data;
-                    // Downstream decisions (cold recovery, clear_dirty) key
-                    // off whether the BACKUP alone supplied the full image.
-                    let file_info = SegmentFileInfo {
-                        is_backup: image.is_backup,
-                        ..file_info
-                    };
-
-                    // Trim the WAL to exactly the bytes the scan accepted.
-                    // Appends resume in APPEND mode at the recovered frontier
-                    // (write_wal/create_wal_file), so a crash-torn tail left
-                    // mid-file would poison every later entry behind it: the
-                    // next recovery's prefix-consistent scan stops at the
-                    // first tear. Bytes past the accepted extent are exactly
-                    // that tear (a mid-write kill can only tear the tail).
-                    if let Some(wal_path) = &image.wal_path {
-                        let accepted_wal_bytes = scan_result
-                            .append_offset
-                            .saturating_sub(image.wal_base_offset)
-                            as u64;
-                        match std::fs::OpenOptions::new().write(true).open(wal_path) {
-                            Ok(wal_file) => {
-                                let trimmed = wal_file
-                                    .metadata()
-                                    .map(|meta| meta.len() > accepted_wal_bytes)
-                                    .unwrap_or(false);
-                                if trimmed {
-                                    if let Err(trim_error) = wal_file.set_len(accepted_wal_bytes)
-                                    {
-                                        warn!(
-                                            "Could not trim WAL '{}' to its accepted {} bytes: {}",
-                                            wal_path.display(),
-                                            accepted_wal_bytes,
-                                            trim_error
+                    let mut source_is_backup = file_info.is_backup;
+                    let (file_data, _declared_used_len, scan_result) =
+                        match attempt(&file_info.path, &mut version_map) {
+                            Ok(loaded) => loaded,
+                            Err(error) => {
+                                let wal_twin = if file_info.is_backup {
+                                    chunk
+                                        .file_manager
+                                        .wal_path(chunk_id, file_info.seg_id, file_info.seq_id)
+                                        .map(std::path::PathBuf::from)
+                                        .filter(|path| path.exists())
+                                } else {
+                                    None
+                                };
+                                let mut recovered_from_wal = None;
+                                if let Some(wal_path) = wal_twin {
+                                    match attempt(&wal_path, &mut version_map) {
+                                        Ok(loaded) => {
+                                            warn!(
+                                                "Backup '{}' for segment {} (chunk {}, seq {}) is unreadable ({}); \
+                                                 recovered the segment from its WAL twin '{}' instead. The segment \
+                                                 stays dirty so the archiver rewrites a good backup.",
+                                                file_info.path.display(),
+                                                file_info.seg_id,
+                                                chunk_id,
+                                                file_info.seq_id,
+                                                error,
+                                                wal_path.display()
+                                            );
+                                            source_is_backup = false;
+                                            recovered_from_wal = Some(loaded);
+                                        }
+                                        Err(wal_error) => {
+                                            error!(
+                                                "WAL twin '{}' for segment {} also failed: {}",
+                                                wal_path.display(),
+                                                file_info.seg_id,
+                                                wal_error
+                                            );
+                                        }
+                                    }
+                                }
+                                match recovered_from_wal {
+                                    Some(loaded) => loaded,
+                                    None => {
+                                        // Quarantine the segment; do not abandon the store.
+                                        //
+                                        // This used to be `?`, so one unreadable segment
+                                        // failed the whole recovery -- every chunk, and
+                                        // every segment not yet reached. On TB14 segment
+                                        // 2053 did exactly that at 174,900 of 350,902
+                                        // segments: the remaining 176,002 were never even
+                                        // read, the caller logged "Starting with fresh
+                                        // storage", and the ranged index then found an
+                                        // empty store and replaced 31 of its 40 trees with
+                                        // empty ones. One bad segment cost the database.
+                                        //
+                                        // Its files are left alone for forensics and for a
+                                        // later repair; what is lost is this segment's
+                                        // cells, which is the actual damage rather than
+                                        // the whole store.
+                                        error!(
+                                            "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {}. \
+                                             Recovery continues; the cells in this segment are missing \
+                                             from the recovered store.",
+                                            file_info.seg_id,
+                                            chunk_id,
+                                            file_info.seq_id,
+                                            file_info.path.display(),
+                                            error
                                         );
-                                    } else {
-                                        info!(
-                                            "Trimmed WAL '{}' to its accepted {} bytes \
-                                             (crash-torn tail removed)",
-                                            wal_path.display(),
-                                            accepted_wal_bytes
-                                        );
+                                        quarantined_segments.fetch_add(1, Ordering::Relaxed);
+                                        continue;
                                     }
                                 }
                             }
-                            Err(open_error) => {
-                                warn!(
-                                    "Could not open WAL '{}' to trim its tail: {}",
-                                    wal_path.display(),
-                                    open_error
-                                );
-                            }
-                        }
-                    }
+                        };
+                    // Downstream decisions (cold recovery, clear_dirty) key
+                    // off which SOURCE actually supplied the image.
+                    let file_info = SegmentFileInfo {
+                        is_backup: source_is_backup,
+                        ..file_info
+                    };
                     let segment_class = scan_result.segment_class;
 
                     let existing_hot = chunk
@@ -1528,7 +1229,7 @@ pub fn recover_chunks(
                     }
 
                     if recover_as_cold {
-                        ensure_backup_for_cold_recovery(chunk, &file_info, &file_data)?;
+                        ensure_backup_for_cold_recovery(chunk, &file_info)?;
                     }
 
                     let segment = prepare_recovered_segment(
@@ -2346,100 +2047,6 @@ use crate::ram::types::Id;
             1,
             "an unreadable backup must fall back to its complete WAL twin, not quarantine"
         );
-    }
-
-    /// A segment archived at graceful shutdown and RESUMED by the next
-    /// incarnation leaves two files at the same (chunk, seg, seq): the
-    /// backup holds the pre-restart PREFIX, and the re-created WAL holds
-    /// only the post-restart SUFFIX. Discovery's "prefer the backup at
-    /// equal seq" rule silently dropped every entry the WAL gained after
-    /// the archive -- the crash-churn cycle-9 corpse: 28 applied images of
-    /// a split target's page lived only in the suffix WAL, the stale
-    /// backup won, and the tree refused to load (MissingPage). Recovery
-    /// must reconcile the twins by content:
-    ///   - divergent first entry  -> resumed suffix  -> backup ++ WAL
-    ///   - WAL begins with backup -> full history    -> longer file wins
-    #[test]
-    fn a_stale_backup_cannot_shadow_its_resumed_segments_wal_suffix() {
-        let _ = env_logger::try_init();
-        let wal_dir = TempDir::new().unwrap();
-        let backup_dir = TempDir::new().unwrap();
-        let (_raft_dir, raft_path) = temp_raft_dir();
-
-        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
-        let writer_chunk = &writer_chunks.list[0];
-        let schema = schema_with_id(216, "recovery_resumed_segment_twins", false);
-        writer_chunk
-            .meta
-            .schemas
-            .debug_only_new_schema(schema.clone());
-        let mut entries = Vec::new();
-        let mut written = Vec::new();
-        for seq in 1..=4_u64 {
-            let cell_id = Id::allocated(26, 0, seq);
-            let mut cell = OwnedCell {
-                header: CellHeader::new(schema.id, &cell_id),
-                data: data_map_value!(id: seq as i32, data: vec![seq as u8; DATA_SIZE]),
-            };
-            writer_chunks.write_cell(&mut cell).unwrap();
-            entries.push(entry_bytes_at(writer_chunks.address_of(&cell_id)));
-            written.push(cell);
-        }
-
-        let chunk_wal_dir = wal_dir.path().join("chunk-wal-0");
-        fs::create_dir_all(&chunk_wal_dir).unwrap();
-
-        // Segment 0: the resumed-suffix case. The backup snapshots the
-        // pre-restart prefix (cell 1); the post-restart WAL was re-created
-        // after the archive deleted its predecessor, so it carries only the
-        // suffix (cell 2) and diverges from the backup at byte 0.
-        write_backup_segment(&backup_dir, 0, 0, 0, &entries[0]);
-        fs::write(chunk_wal_dir.join("0-0-0.nlog"), &entries[1]).unwrap();
-
-        // Segment 1: the full-history case (archive wrote the backup but a
-        // kill landed before the WAL deletion). The WAL begins with the
-        // backup's exact image and extends past it (cells 3 and 4).
-        write_backup_segment(&backup_dir, 0, 1, 1, &entries[2]);
-        let full_history: Vec<u8> = entries[2]
-            .iter()
-            .chain(entries[3].iter())
-            .cloned()
-            .collect();
-        fs::write(chunk_wal_dir.join("0-1-1.nlog"), &full_history).unwrap();
-
-        let reader_schemas = setup_test_schema();
-        reader_schemas.debug_only_new_schema(schema.clone());
-        let chunks = Chunks::new_with_recovery(
-            1,
-            TEST_SEGMENT_SIZE * 4,
-            Arc::new(ServerMeta {
-                schemas: reader_schemas,
-            }),
-            None,
-            Some(backup_dir.path().to_str().unwrap().to_string()),
-            Some(wal_dir.path().to_str().unwrap().to_string()),
-            None,
-            true,
-            Some(raft_path),
-        );
-
-        assert_eq!(
-            count_recovered_cells(&chunks.list),
-            4,
-            "twin reconciliation must recover the backup prefix AND the WAL suffix"
-        );
-        for (seq, written_cell) in (1..=4_u64).zip(written.iter()) {
-            let cell_id = Id::allocated(26, 0, seq);
-            let recovered = chunks
-                .read_cell(&cell_id)
-                .unwrap_or_else(|e| panic!("cell {} must be recovered: {:?}", seq, e))
-                .to_owned();
-            assert_eq!(
-                recovered.data, written_cell.data,
-                "cell {} content must survive twin reconciliation",
-                seq
-            );
-        }
     }
 
     /// A write that loses the exists race leaves its already-appended image
