@@ -314,6 +314,25 @@ impl SegmentFileManager {
         let mut best_files: HashMap<(usize, u64), SegmentFileInfo> = HashMap::new();
 
         for file in files {
+            // A zero-byte backup is always a torn archive: a kill landed
+            // between creating the file and writing its image (legitimate
+            // backups always carry at least a compression header, and an
+            // uncompressed one is a full segment). Letting it into the
+            // dedup below would SHADOW the complete WAL at the same seq id
+            // and silently drop every cell in the segment. Newly written
+            // backups are rename-installed and can no longer be torn; this
+            // guard covers stores written before that fix.
+            if file.is_backup && file.size == 0 {
+                warn!(
+                    "Ignoring zero-byte backup '{}' (chunk {} seg {} seq {}): torn archive; \
+                     recovery falls back to the WAL or an earlier file for this segment",
+                    file.path.display(),
+                    file.chunk_id,
+                    file.seg_id,
+                    file.seq_id
+                );
+                continue;
+            }
             let key = (file.chunk_id, file.seg_id);
             let should_replace = match best_files.get(&key) {
                 None => true,
@@ -493,9 +512,18 @@ mod tests {
         create_dir_all(&backup_dir).unwrap();
         create_dir_all(&wal_dir).unwrap();
 
-        // Create some test files
-        File::create(backup_dir.join("0-1-1.nbackup")).unwrap();
-        File::create(backup_dir.join("0-2-2.nbackup")).unwrap();
+        // Create some test files. Backups carry content on purpose: a
+        // zero-byte backup is a torn archive and discovery now ignores it,
+        // so an empty fixture would be testing the guard, not discovery.
+        use std::io::Write as _;
+        File::create(backup_dir.join("0-1-1.nbackup"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        File::create(backup_dir.join("0-2-2.nbackup"))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         File::create(wal_dir.join("0-3-3.nlog")).unwrap();
 
         let mgr = SegmentFileManager::new(

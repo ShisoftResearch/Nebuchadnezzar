@@ -240,7 +240,39 @@ fn parent_main(args: &[String]) -> ExitCode {
 
 // ----------------------------------------------------------------- child --
 
+/// Minimal stderr logger for diagnostics: active only when NEB_CHURN_LOG is
+/// set (to a level name), silent otherwise. env_logger is a dev-dependency,
+/// so the bin carries its own ~20 lines.
+struct ChurnLogger(log::LevelFilter);
+impl log::Log for ChurnLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= self.0
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {} - {}", record.level(), record.target(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn init_diag_logging() {
+    let Ok(level) = std::env::var("NEB_CHURN_LOG") else {
+        return;
+    };
+    let filter = match level.to_ascii_lowercase().as_str() {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Info,
+    };
+    let _ = log::set_boxed_logger(Box::new(ChurnLogger(filter)));
+    log::set_max_level(filter);
+}
+
 fn child_main(args: &[String]) -> ExitCode {
+    init_diag_logging();
     let addr = args.get(0).expect("addr").clone();
     let group = args.get(1).expect("group").clone();
     let base_dir = args.get(2).expect("base_dir").clone();
@@ -290,7 +322,7 @@ async fn child_async(
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_size: 64 * 1024 * 1024,
-            db_size: 256 * 1024 * 1024,
+            db_size: 2 * 1024 * 1024 * 1024,
             tiered_config: None,
             backup_storage: Some(dir.join("backup").to_string_lossy().into_owned()),
             wal_storage: Some(dir.join("wal").to_string_lossy().into_owned()),
@@ -383,7 +415,10 @@ async fn child_async(
         writer_handles.push(tokio::spawn(async move {
             loop {
                 let seq = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let id = Id::from_parts(9, seq);
+                // Spread across partitions: every cell sharing one high part
+                // lands in a single chunk, so the store fills at ~150k keys
+                // no matter how large db_size is.
+                let id = Id::from_parts(9 + (seq % 64), seq);
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value[KEY_FIELD] = OwnedValue::U64(seq);
                 value[PAD_FIELD] = OwnedValue::String(format!("pad-{:0>200}", seq));

@@ -670,7 +670,7 @@ impl Chunk {
 
             let new_seg_opt = match self
                 .allocator
-                .alloc_seg_with_class(&self.file_manager, segment_class)
+                .alloc_seg_for_writer(&self.file_manager, segment_class)
             {
                 Some(seg) => Some(seg),
                 None => {
@@ -687,7 +687,7 @@ impl Chunk {
                             self.id, reclaimed
                         );
                         self.allocator
-                            .alloc_seg_with_class(&self.file_manager, segment_class)
+                            .alloc_seg_for_writer(&self.file_manager, segment_class)
                     } else {
                         None
                     }
@@ -981,6 +981,30 @@ impl Chunk {
         let write_plan = cell.plan_write(self)?;
         WRITE_PLAN_NANOS.fetch_add(t_plan.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+        // Existing-cell fast path, BEFORE any allocation. Refusing the write
+        // is not enough: this is exactly the retry path a crashed index heals
+        // through -- a SIGKILL preserves acked cells in the WAL while the
+        // ranged tree loses its un-flushed tail, and the retrying writer's
+        // insert then finds the cell already present. Re-assert the indices
+        // from the EXISTING image (identical old/new pairs cancel for every
+        // index type except ranged, whose insert is idempotent and
+        // re-established on purpose; see ensure_indices_). Ordering matters:
+        // this must run before `allocate`, or a chunk too full to accept new
+        // entries fails with CannotAllocateSpace first and the heal path is
+        // unreachable exactly when nothing else can re-create the entries.
+        if let Some(mut cell_guard) = CellGuard::for_write(cell.header.id.bits(), true, self) {
+            if self.index_builder.is_some() {
+                if let Ok(existing) = cell_guard.read_cell_owned() {
+                    if let Some(schema) = self.meta.schemas.get(&existing.header.schema) {
+                        let old_indices = Some(probe_cell_indices(&existing, &*schema));
+                        drop(cell_guard);
+                        self.ensure_indices_with_res(&existing, old_indices, &*schema);
+                    }
+                }
+            }
+            return Err(WriteError::CellAlreadyExisted);
+        }
+
         let t_alloc = std::time::Instant::now();
         let pending_entry = write_plan.allocate(self, true)?;
         WRITE_ALLOC_NANOS.fetch_add(t_alloc.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1020,7 +1044,36 @@ impl Chunk {
                 self.refresh_statistics_for_schema(write_plan.schema.id);
                 WRITE_STATS_NANOS.fetch_add(t_stats.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
-            None => return Err(WriteError::CellAlreadyExisted),
+            None => {
+                // The cell image is already appended; make sure recovery can
+                // never resurrect it over the write that won the race.
+                abandon_entry_version(pending_entry.addr);
+                // The write is refused, but this exact path is how a crashed
+                // index heals: a SIGKILL preserves acked cells in the WAL
+                // while the ranged tree loses its un-flushed tail, and the
+                // retrying writer's insert then finds the cell already
+                // present. Re-assert the indices from the EXISTING image --
+                // identical old/new pairs cancel for every index type except
+                // ranged, whose insert is idempotent and re-established on
+                // purpose (see ensure_indices_). This needs no allocation,
+                // so it converges even in a chunk too full to accept writes.
+                if self.index_builder.is_some() {
+                    if let Some(mut cell_guard) =
+                        CellGuard::for_write(cell.header.id.bits(), true, self)
+                    {
+                        if let Ok(existing) = cell_guard.read_cell_owned() {
+                            if let Some(schema) = self.meta.schemas.get(&existing.header.schema)
+                            {
+                                let old_indices =
+                                    Some(probe_cell_indices(&existing, &*schema));
+                                drop(cell_guard);
+                                self.ensure_indices_with_res(&existing, old_indices, &*schema);
+                            }
+                        }
+                    }
+                }
+                return Err(WriteError::CellAlreadyExisted);
+            }
         }
         WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
         cell.header.version = write_result.new_version;
@@ -1062,6 +1115,9 @@ impl Chunk {
             let write_result =
                 self.write_cell_to_chunk(cell, &write_plan, &pending_entry, cell.header.version)?;
             let new_cell_loc = write_result.addr;
+            // The image carries `old_version + 1`: recovery would pick it
+            // over the tombstone of a deleted cell and resurrect the data.
+            abandon_entry_version(new_cell_loc);
             self.mark_dead_entry_with_cell(new_cell_loc, cell);
             return Err(WriteError::CellDoesNotExisted);
         }

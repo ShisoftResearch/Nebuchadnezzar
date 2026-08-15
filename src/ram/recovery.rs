@@ -1076,76 +1076,124 @@ pub fn recover_chunks(
                     // as surely as an unscannable image did. Quarantine covers
                     // the read, the size check and the scan alike: everything
                     // whose blast radius is a single file.
-                    let (file_data, declared_used_len) =
-                        match load_file_with_used_len(&file_info.path) {
+                    //
+                    // Before quarantining, though: a BACKUP that cannot be
+                    // read or scanned may have a complete WAL twin at the same
+                    // seq id -- the archive deletes the WAL only after the
+                    // backup is fully durable, so a torn backup implies the
+                    // WAL is still whole. Discovery preferred the backup;
+                    // falling back to the WAL here recovers every cell the
+                    // torn file would have dropped. (The crash-churn fuzzer's
+                    // corpse was exactly this: a mid-archive SIGKILL left a
+                    // partial backup shadowing an intact WAL, and the ranged
+                    // tree's metadata cell vanished with the segment.)
+                    let segment_base = chunk.allocator.addr_by_id(file_info.seg_id as usize);
+                    let mut attempt = |path: &std::path::Path,
+                                       version_map: &mut VersionMap|
+                     -> io::Result<(Vec<u8>, Option<usize>, RecoveryScanResult)> {
+                        let (file_data, declared_used_len) = load_file_with_used_len(path)?;
+                        if file_data.len() > SEGMENT_SIZE {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "{} bytes is larger than a segment",
+                                    file_data.len()
+                                ),
+                            ));
+                        }
+                        let scan_result = scan_segment_from_data(
+                            chunk,
+                            file_info.seg_id,
+                            segment_base,
+                            &file_data,
+                            version_map,
+                            origin_floors,
+                            declared_used_len,
+                        )?;
+                        Ok((file_data, declared_used_len, scan_result))
+                    };
+                    let mut source_is_backup = file_info.is_backup;
+                    let (file_data, _declared_used_len, scan_result) =
+                        match attempt(&file_info.path, &mut version_map) {
                             Ok(loaded) => loaded,
                             Err(error) => {
-                                error!(
-                                    "QUARANTINED segment {} (chunk {}, seq {}) from '{}': cannot read it: {}. Recovery continues; this segment's cells are missing from the store.",
-                                    file_info.seg_id,
-                                    chunk_id,
-                                    file_info.seq_id,
-                                    file_info.path.display(),
-                                    error
-                                );
-                                quarantined_segments.fetch_add(1, Ordering::Relaxed);
-                                continue;
+                                let wal_twin = if file_info.is_backup {
+                                    chunk
+                                        .file_manager
+                                        .wal_path(chunk_id, file_info.seg_id, file_info.seq_id)
+                                        .map(std::path::PathBuf::from)
+                                        .filter(|path| path.exists())
+                                } else {
+                                    None
+                                };
+                                let mut recovered_from_wal = None;
+                                if let Some(wal_path) = wal_twin {
+                                    match attempt(&wal_path, &mut version_map) {
+                                        Ok(loaded) => {
+                                            warn!(
+                                                "Backup '{}' for segment {} (chunk {}, seq {}) is unreadable ({}); \
+                                                 recovered the segment from its WAL twin '{}' instead. The segment \
+                                                 stays dirty so the archiver rewrites a good backup.",
+                                                file_info.path.display(),
+                                                file_info.seg_id,
+                                                chunk_id,
+                                                file_info.seq_id,
+                                                error,
+                                                wal_path.display()
+                                            );
+                                            source_is_backup = false;
+                                            recovered_from_wal = Some(loaded);
+                                        }
+                                        Err(wal_error) => {
+                                            error!(
+                                                "WAL twin '{}' for segment {} also failed: {}",
+                                                wal_path.display(),
+                                                file_info.seg_id,
+                                                wal_error
+                                            );
+                                        }
+                                    }
+                                }
+                                match recovered_from_wal {
+                                    Some(loaded) => loaded,
+                                    None => {
+                                        // Quarantine the segment; do not abandon the store.
+                                        //
+                                        // This used to be `?`, so one unreadable segment
+                                        // failed the whole recovery -- every chunk, and
+                                        // every segment not yet reached. On TB14 segment
+                                        // 2053 did exactly that at 174,900 of 350,902
+                                        // segments: the remaining 176,002 were never even
+                                        // read, the caller logged "Starting with fresh
+                                        // storage", and the ranged index then found an
+                                        // empty store and replaced 31 of its 40 trees with
+                                        // empty ones. One bad segment cost the database.
+                                        //
+                                        // Its files are left alone for forensics and for a
+                                        // later repair; what is lost is this segment's
+                                        // cells, which is the actual damage rather than
+                                        // the whole store.
+                                        error!(
+                                            "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {}. \
+                                             Recovery continues; the cells in this segment are missing \
+                                             from the recovered store.",
+                                            file_info.seg_id,
+                                            chunk_id,
+                                            file_info.seq_id,
+                                            file_info.path.display(),
+                                            error
+                                        );
+                                        quarantined_segments.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                }
                             }
                         };
-                    if file_data.len() > SEGMENT_SIZE {
-                        error!(
-                            "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {} bytes is larger than a segment. Recovery continues; this segment's cells are missing from the store.",
-                            file_info.seg_id,
-                            chunk_id,
-                            file_info.seq_id,
-                            file_info.path.display(),
-                            file_data.len()
-                        );
-                        quarantined_segments.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-
-                    let segment_base = chunk.allocator.addr_by_id(file_info.seg_id as usize);
-                    let scan_result = match scan_segment_from_data(
-                        chunk,
-                        file_info.seg_id,
-                        segment_base,
-                        &file_data,
-                        &mut version_map,
-                        origin_floors,
-                        declared_used_len,
-                    ) {
-                        Ok(scan_result) => scan_result,
-                        Err(error) => {
-                            // Quarantine the segment; do not abandon the store.
-                            //
-                            // This used to be `?`, so one unreadable segment
-                            // failed the whole recovery -- every chunk, and
-                            // every segment not yet reached. On TB14 segment
-                            // 2053 did exactly that at 174,900 of 350,902
-                            // segments: the remaining 176,002 were never even
-                            // read, the caller logged "Starting with fresh
-                            // storage", and the ranged index then found an
-                            // empty store and replaced 31 of its 40 trees with
-                            // empty ones. One bad segment cost the database.
-                            //
-                            // Its files are left alone for forensics and for a
-                            // later repair; what is lost is this segment's
-                            // cells, which is the actual damage rather than
-                            // the whole store.
-                            error!(
-                                "QUARANTINED segment {} (chunk {}, seq {}) from '{}': {}. \
-                                 Recovery continues; the cells in this segment are missing \
-                                 from the recovered store.",
-                                file_info.seg_id,
-                                chunk_id,
-                                file_info.seq_id,
-                                file_info.path.display(),
-                                error
-                            );
-                            quarantined_segments.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
+                    // Downstream decisions (cold recovery, clear_dirty) key
+                    // off which SOURCE actually supplied the image.
+                    let file_info = SegmentFileInfo {
+                        is_backup: source_is_backup,
+                        ..file_info
                     };
                     let segment_class = scan_result.segment_class;
 
@@ -1878,6 +1926,224 @@ use crate::ram::types::Id;
             recovered > 0,
             "a torn backup abandoned the entire store: {} cells recovered",
             recovered
+        );
+    }
+
+    /// A zero-byte backup -- the artifact of a SIGKILL between creating the
+    /// backup file and writing its image -- must not shadow the complete WAL
+    /// at the same seq id.
+    ///
+    /// Discovery prefers a backup over a WAL for the same (chunk, seg, seq),
+    /// so the torn file used to win the dedup, scan as "no entries", and
+    /// silently drop every cell whose newest version lived in that segment.
+    /// The crash-churn fuzzer's corpse was exactly this: the ranged tree's
+    /// metadata cell sat in the shadowed segment, recovery answered
+    /// CellDoesNotExisted, and the placement layer wiped itself and
+    /// re-established an empty genesis tree ("B-tree loaded with 0 keys").
+    #[test]
+    fn a_zero_byte_backup_does_not_shadow_a_complete_wal() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let schema = schema_with_id(213, "recovery_torn_backup_wal_twin", false);
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        let cell_id = Id::allocated(23, 0, 1);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &cell_id),
+            data: data_map_value!(id: 11_i32, data: vec![0x77_u8; DATA_SIZE]),
+        };
+        writer_chunks.write_cell(&mut cell).unwrap();
+        let entry = entry_bytes_at(writer_chunks.address_of(&cell_id));
+
+        // The complete WAL for (chunk 0, seg 0, seq 0), in the per-chunk
+        // subdirectory the chunk's own file manager uses...
+        let chunk_wal_dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&chunk_wal_dir).unwrap();
+        fs::write(chunk_wal_dir.join("0-0-0.nlog"), &entry).unwrap();
+        // ...shadowed by the torn zero-byte backup at the same seq.
+        write_backup_segment(&backup_dir, 0, 0, 0, &[]);
+
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        assert_eq!(
+            count_recovered_cells(&chunks.list),
+            1,
+            "the zero-byte backup shadowed the complete WAL and lost its cells"
+        );
+    }
+
+    /// An unreadable (non-empty but garbage) backup with a complete WAL twin
+    /// at the same seq id must recover the segment from the WAL instead of
+    /// quarantining it.
+    ///
+    /// The archive deletes a segment's WAL only after its backup is fully
+    /// durable, so a backup that fails to load or scan implies the WAL is
+    /// still whole -- falling back to it recovers every cell the torn file
+    /// would have dropped.
+    #[test]
+    fn an_unreadable_backup_falls_back_to_its_wal_twin() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let schema = schema_with_id(214, "recovery_partial_backup_wal_twin", false);
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        let cell_id = Id::allocated(24, 0, 1);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &cell_id),
+            data: data_map_value!(id: 12_i32, data: vec![0x66_u8; DATA_SIZE]),
+        };
+        writer_chunks.write_cell(&mut cell).unwrap();
+        let entry = entry_bytes_at(writer_chunks.address_of(&cell_id));
+
+        let chunk_wal_dir = wal_dir.path().join("chunk-wal-0");
+        fs::create_dir_all(&chunk_wal_dir).unwrap();
+        fs::write(chunk_wal_dir.join("0-0-0.nlog"), &entry).unwrap();
+        // A partial backup: bytes that decode as neither a compressed image
+        // nor a valid entry stream, as a kill mid-write leaves behind.
+        write_backup_segment(&backup_dir, 0, 0, 0, &[0xFF_u8; 64]);
+
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: setup_test_schema(),
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        assert_eq!(
+            count_recovered_cells(&chunks.list),
+            1,
+            "an unreadable backup must fall back to its complete WAL twin, not quarantine"
+        );
+    }
+
+    /// A write that loses the exists race leaves its already-appended image
+    /// behind as dead space -- and that image carries `old_version + 1`, the
+    /// SAME version as the write that won. Recovery resolves each cell by
+    /// max version with a later-scanned-wins tie-break, so the abandoned
+    /// image used to shadow the winner. The crash-churn fuzzer hit this on
+    /// every fresh start: the genesis `crate_tree` re-create lost its
+    /// metadata write race, and every post-SIGKILL recovery then served the
+    /// loser's image -- a head pointer to an orphan empty page, loaded as
+    /// "B-tree loaded with 0 keys". Failed writes now zero their image's
+    /// version, which must lose to any live version.
+    #[test]
+    fn a_failed_insert_image_cannot_shadow_the_winning_write() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let schema = schema_with_id(215, "recovery_failed_insert_ghost", false);
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+        let cell_id = Id::allocated(25, 0, 1);
+        let mut winner = OwnedCell {
+            header: CellHeader::new(schema.id, &cell_id),
+            data: data_map_value!(id: 1_i32, data: vec![0x11_u8; DATA_SIZE]),
+        };
+        writer_chunks.write_cell(&mut winner).unwrap();
+        let winner_addr = writer_chunks.address_of(&cell_id);
+        let winner_entry = entry_bytes_at(winner_addr);
+
+        // A losing write that already appended its image before discovering
+        // the collision. The public write path now refuses before allocating
+        // (and heals indices instead), so the append-then-lose window only
+        // remains for a genuine check/insert race -- reproduce its exact
+        // mechanics here: append the full image, then abandon it as the race
+        // arm does.
+        let loser = OwnedCell {
+            header: CellHeader::new(schema.id, &cell_id),
+            data: data_map_value!(id: 2_i32, data: vec![0x22_u8; DATA_SIZE]),
+        };
+        let ghost_addr = {
+            let write_plan = loser.plan_write(writer_chunk).unwrap();
+            let pending = write_plan.allocate(writer_chunk, true).unwrap();
+            let result = writer_chunk
+                .write_cell_to_chunk(&loser, &write_plan, &pending, loser.header.version)
+                .unwrap();
+            crate::ram::cell::abandon_entry_version(result.addr);
+            result.addr
+        };
+        assert_eq!(
+            ghost_addr,
+            winner_addr + winner_entry.len(),
+            "appends should be sequential in this idle chunk"
+        );
+        let ghost_header =
+            cell_header_from_entry_content_addr(Entry::content_pos(ghost_addr));
+        assert_eq!(ghost_header.id, cell_id, "expected the loser's image here");
+        assert_eq!(
+            ghost_header.version, 0,
+            "a failed write must abandon its image at version 0"
+        );
+        let ghost_entry = entry_bytes_at(ghost_addr);
+
+        // Recovery over [winner][ghost] must keep the winner, whatever the
+        // scan order tie-break would have said.
+        let mut image = empty_segment_bytes();
+        image[..winner_entry.len()].copy_from_slice(&winner_entry);
+        image[winner_entry.len()..winner_entry.len() + ghost_entry.len()]
+            .copy_from_slice(&ghost_entry);
+        write_backup_segment(&backup_dir, 0, 0, 0, &image);
+
+        let reader_schemas = setup_test_schema();
+        reader_schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: reader_schemas,
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        assert_eq!(count_recovered_cells(&chunks.list), 1);
+        let recovered = chunks.read_cell(&cell_id).unwrap().to_owned();
+        assert_eq!(
+            recovered.data, winner.data,
+            "recovery resurrected the failed write's image over the winner"
         );
     }
 

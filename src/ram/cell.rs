@@ -56,6 +56,12 @@ pub enum WriteError {
     DataMismatchSchema(Field, OwnedValue),
     CellVersionMismatch,
     CompressionFailed(Field, String),
+    /// The cell was never attempted: an ordered batch stopped at an earlier
+    /// failure. Applying later cells after an earlier one failed would break
+    /// the caller's ordering contract (the B-tree write-back stream must be
+    /// prefix-closed: a persisted page may only reference pages persisted
+    /// before it). Always retryable -- nothing was written.
+    BatchAborted,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -708,6 +714,34 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
     };
     release_cursor(cursor);
     return header;
+}
+
+/// Zero the persisted version of the CELL entry at `entry_addr` (the entry's
+/// head address, as returned by the allocator).
+///
+/// Write paths append the full cell image BEFORE the index decides whether
+/// the write wins: an insert that loses the exists race, or an update whose
+/// target turned out not to exist, leaves a fully-formed CELL entry behind as
+/// dead space. The running store never reads it -- but RECOVERY scans raw
+/// segments and resolves each cell by MAX VERSION, and the abandoned image
+/// carries `old_version + 1`: the same version as the racing winner (so the
+/// scan-order tie-break resurrected whichever landed later in the segment),
+/// or one MORE than the tombstone of a deleted cell (so the failed update
+/// resurrected deleted data). The crash-churn fuzzer hit the first form on
+/// every fresh start: the genesis `crate_tree` re-create lost the metadata
+/// write race, its abandoned image named a head page nothing ever wrote to,
+/// and every post-SIGKILL load served "B-tree loaded with 0 keys" from that
+/// orphan.
+///
+/// Zeroing the version makes the abandoned image lose to every live version
+/// and every tombstone. The patch happens while the entry's `PendingEntry`
+/// is still alive, so the WAL append (which runs at its drop) carries the
+/// patched bytes.
+pub fn abandon_entry_version(entry_addr: usize) {
+    let content_addr = Entry::content_pos(entry_addr);
+    let mut cursor = addr_to_header_cursor(content_addr);
+    cursor.write_u64::<Endian>(0).unwrap();
+    release_cursor(cursor);
 }
 
 pub fn cell_version_from_entry_content_addr(addr: usize) -> u64 {

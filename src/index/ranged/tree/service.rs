@@ -174,6 +174,14 @@ pub struct TreeService {
     // Set by flush_all_trees: freezes the balancer so no split or checkpoint
     // races the shutdown flush and lands writes after the segment archive.
     balancer_stopped: Arc<std::sync::atomic::AtomicBool>,
+    // Cleared by the balancer when it has actually left its loop. Setting
+    // `balancer_stopped` alone is NOT enough: the balancer only observes the
+    // flag between iterations, and an iteration can be mid-merge or mid-split
+    // for seconds. Flushing while it still runs lets it enqueue page writes
+    // after the drain barrier and publish head pointers for them -- and the
+    // hub reset then discards those queued writes, leaving durable heads that
+    // name pages which never landed (TB16/17/18 MissingPage corpses).
+    balancer_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn trace_schema_from_key(key: &EntryKey) -> u32 {
@@ -691,6 +699,7 @@ impl TreeService {
         let trees_map = Arc::new(HashMap::with_capacity(32));
         let pending_migrations = Arc::new(HashMap::with_capacity(32));
         let balancer_stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let balancer_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         super::btree::storage::start_external_nodes_write_back(client);
         Self::start_tree_balancer(
             &trees_map,
@@ -698,6 +707,7 @@ impl TreeService {
             client,
             sm_client,
             &balancer_stopped,
+            &balancer_running,
         );
         Self {
             client: client.clone(),
@@ -705,6 +715,7 @@ impl TreeService {
             trees: trees_map,
             pending_migrations,
             balancer_stopped,
+            balancer_running,
         }
     }
 
@@ -865,11 +876,33 @@ impl TreeService {
     /// Flush all trees to disk - called during shutdown
     pub async fn flush_all_trees(&self) {
         info!("Flushing all LSM trees to disk before shutdown");
-        // Structural churn stops first: a balancer split racing the final
-        // flush would enqueue page writes and head publishes after the
-        // barrier below, landing them after the segment archive.
+        // Structural churn stops first -- and we WAIT for it to actually
+        // stop. The balancer observes the flag only between iterations, and
+        // an iteration can sit inside a merge or a split for seconds; every
+        // page write or head publish it makes after the barrier below is
+        // either lost to the hub reset or lands after the segment archive.
         self.balancer_stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ack_started = Instant::now();
+        const BALANCER_ACK_TIMEOUT: Duration = Duration::from_secs(120);
+        while self
+            .balancer_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            if ack_started.elapsed() > BALANCER_ACK_TIMEOUT {
+                error!(
+                    "flush_all_trees: tree balancer did not acknowledge the stop within {:?}; \
+                     proceeding, but page writes it makes from here may be discarded",
+                    BALANCER_ACK_TIMEOUT
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        info!(
+            "Tree balancer acknowledged stop in {:?}",
+            ack_started.elapsed()
+        );
         for (tree_id, dist_tree) in self.trees.entries() {
             let tree = &dist_tree.tree;
             let disk_count = tree.count();
@@ -909,6 +942,14 @@ impl TreeService {
                 "flush_all_trees: write-back barrier NOT established; refusing to publish \
                  tree head pointers over undrained pages"
             );
+        }
+
+        // Head publishes can themselves dirty pages (tombstone compaction
+        // during to_cell), so re-drain before stopping the hub: the reset
+        // DISCARDS whatever is still queued, and anything discarded here is
+        // a page some durable head may already name.
+        if !super::btree::storage::wait_until_updated().await {
+            error!("flush_all_trees: post-publish drain barrier NOT established");
         }
 
         // Stop THIS server's write-back hub so no worker persists pages
@@ -1056,6 +1097,7 @@ impl TreeService {
         client: &Arc<AsyncClient>,
         sm_client: &Arc<SMClient>,
         stopped: &Arc<std::sync::atomic::AtomicBool>,
+        running: &Arc<std::sync::atomic::AtomicBool>,
     ) {
         debug!("Starting range indexer tree balancer");
         let trees_map = trees_map.clone();
@@ -1063,7 +1105,19 @@ impl TreeService {
         let client = client.clone();
         let sm_client = sm_client.clone();
         let stopped = stopped.clone();
+        let running = running.clone();
+        // Clears `running` however the loop ends -- returning on the stop
+        // flag, panicking, or being cancelled with its runtime -- so a
+        // shutdown waiting on the acknowledgment can never wait forever on
+        // a balancer that is already gone.
+        struct RunningGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for RunningGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         tokio::spawn(async move {
+            let _running_guard = RunningGuard(running);
             const SPLIT_RETRY_BACKOFF_MS: u64 = 2_000;
             // Periodic checkpoint: flush B-tree pages and update tree root cells
             // every ~60 seconds to ensure durability even without explicit shutdown.

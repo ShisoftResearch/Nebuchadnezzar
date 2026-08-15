@@ -202,6 +202,14 @@ where
             len += node.len;
             node.prev = prev_ref.clone();
             let node_ref = NodeCellRef::new(Node::with_external(Box::new(node)));
+            // This page came FROM the store, so it already has an on-disk
+            // image: later pages may name it freely. Leaving it marked
+            // unpersisted would drag the entire reloaded chain into the
+            // first flush batch after every restart.
+            node_ref
+                .deref::<KS, PS>()
+                .persisted
+                .store(true, std::sync::atomic::Ordering::Release);
             if !prev_lock.is_ref_none() {
                 *prev_lock.right_bound_mut() = first_key.clone();
                 *prev_lock.right_ref_mut().unwrap() = node_ref.clone();

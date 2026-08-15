@@ -1491,40 +1491,30 @@ image, not an empty segment; archiving it would persist the damage.",
                 }
             }
 
-            // If backup file already exists, we use make a backup of the existing file
-            if has_old_backup {
-                debug!("Backup file {} already exists, moving to .old", backup_file);
-                // Handle race condition where file might be deleted between check and rename
-                match fs::rename(&backup_file, format!("{}.old", backup_file)) {
-                    Ok(_) => {
-                        debug!("Successfully moved old backup file to .old");
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        // File was deleted between exists() check and rename - this is fine
-                        debug!("Backup file disappeared before rename (likely deleted by another process)");
-                    }
-                    Err(e) => {
-                        // Other errors should be propagated
-                        return Err(e);
-                    }
-                }
-                // Prepare the new backup file by creating a fresh writer
-                let _ = state.manager.open_or_create_backup_writer(
-                    self.chunk_id,
-                    self.id,
-                    self.seq_id,
-                )?;
-            }
             {
-                // Always open a fresh backup writer for this archive operation
-                if let Some(mut file) = state.manager.open_or_create_backup_writer(
-                    self.chunk_id,
-                    self.id,
-                    self.seq_id,
-                )? {
-                    // Truncate the file to zero and write from beginning
-                    file.set_len(0)?;
-                    file.sync_all()?;
+                // Write the new image to a TEMPORARY path and rename it into
+                // place only after every byte is durable. The archive used to
+                // truncate and rewrite the FINAL path in place, so a SIGKILL
+                // mid-archive left a zero-byte or partial `.nbackup` where
+                // recovery expects a complete image. Recovery prefers a
+                // backup over the WAL at the same seq id, so that torn file
+                // SHADOWED a complete WAL and every cell whose newest version
+                // lived in this segment vanished from the recovered store --
+                // for the crash-churn fuzzer that was the ranged tree's
+                // metadata cell, which cascaded into "placement names a tree
+                // whose metadata cell is absent" -> placement wipe -> an
+                // empty genesis tree serving scans. With the rename, the
+                // final path only ever holds a complete image: a kill leaves
+                // either the previous backup or no backup at all, and the
+                // WAL (deleted only after success, below) still covers the
+                // segment either way. `.tmp` files are invisible to recovery
+                // (`SegmentFileInfo::parse_filename` filters by extension).
+                let tmp_backup_file = format!("{}.tmp", backup_file);
+                if let Some(parent) = Path::new(&backup_file).parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                {
+                    let mut file = File::create(&tmp_backup_file)?;
 
                     unsafe {
                         let data_block =
@@ -1616,6 +1606,17 @@ image, not an empty segment; archiving it would persist the damage.",
                         );
                     }
 
+                    // The image is durable at the temp path; atomically
+                    // replace whatever the final path held. rename(2) within
+                    // one directory either fully installs the new image or
+                    // leaves the previous state -- there is no torn middle.
+                    fs::rename(&tmp_backup_file, &backup_file)?;
+                    if let Some(parent) = Path::new(&backup_file).parent() {
+                        if let Ok(dir) = File::open(parent) {
+                            let _ = dir.sync_all();
+                        }
+                    }
+
                     // Sanity check: verify backup file actually exists before marking archived
                     let backup_file_path = Path::new(&backup_file);
                     if !backup_file_path.exists() {
@@ -1637,12 +1638,13 @@ image, not an empty segment; archiving it would persist the damage.",
                         self.id, backup_file
                     );
 
-                    // The previous backup was renamed aside before this write
-                    // as a safety net; the new one is now written, verified to
-                    // exist and about to be declared clean, so the old copy has
-                    // no further purpose. Nothing deleted it before, so every
-                    // rewritten segment left a full-size file behind forever --
-                    // invisible until a store runs out of disk.
+                    // Earlier revisions renamed the previous backup aside as
+                    // `.old` before rewriting in place; the atomic rename
+                    // above made that dance unnecessary, but stores written
+                    // by those revisions may still carry the leftover file.
+                    // Clean it up so a rewritten segment does not pin a
+                    // full-size file forever -- invisible until a store runs
+                    // out of disk.
                     if has_old_backup {
                         let old_path = format!("{}.old", backup_file);
                         if let Err(e) = fs::remove_file(&old_path) {
@@ -1677,11 +1679,6 @@ image, not an empty segment; archiving it would persist the damage.",
                     }
 
                     return Ok(true);
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Failed to create backup writer",
-                    ));
                 }
             }
         } else {
@@ -2247,6 +2244,10 @@ pub struct SegmentAllocator {
     limit: usize,
     gc_threshold: usize,
     free: LinkedRingBufferList<usize, 64>,
+    /// Segments currently on the free list. Kept alongside the list because
+    /// the writer-path reserve below needs an O(1) "how much headroom is
+    /// left" answer and the list has no cheap length.
+    free_count: AtomicUsize,
     pub next_seq_id: AtomicUsize,
     chunk_id: usize,
 }
@@ -2293,9 +2294,25 @@ impl SegmentAllocator {
             limit,
             gc_threshold: base + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
             free: LinkedRingBufferList::new(),
+            free_count: AtomicUsize::new(0),
             next_seq_id: AtomicUsize::new(0),
             chunk_id,
         }
+    }
+
+    /// Segments still grantable: the free list plus untouched bump space.
+    /// Approximate under concurrency, which is fine -- it feeds a headroom
+    /// heuristic, not an invariant.
+    pub fn available_segments(&self) -> usize {
+        let bump_left = self
+            .limit
+            .saturating_sub(self.offset.load(Relaxed))
+            >> SEGMENT_BITS_SHIFT;
+        self.free_count.load(Relaxed) + bump_left
+    }
+
+    fn capacity_segments(&self) -> usize {
+        (self.limit - self.base) >> SEGMENT_BITS_SHIFT
     }
 
     pub fn meet_gc_threshold(&self) -> bool {
@@ -2306,13 +2323,51 @@ impl SegmentAllocator {
         self.alloc_seg_with_class(file_manager, SegmentClass::Regular)
     }
 
+    /// Writer-path allocation that keeps compaction headroom for the
+    /// cleaner. A chunk whose every segment is allocated cannot be
+    /// compacted: combine copies the LIVE portion of its sources into fresh
+    /// destination segments, so reclaiming space from segments that are
+    /// mostly live needs several destinations at once (a 4-into-3 round
+    /// only pays off when 3 destinations exist). A store that fills to the
+    /// last segment therefore wedges permanently -- dead space exists but
+    /// can never be reclaimed, and the index write-back (whose page upserts
+    /// need allocation) retries forever; the crash-churn fuzzer hit that as
+    /// a 120s graceful-shutdown hang. Holding a few segments back from
+    /// ordinary appends is log-structured over-provisioning: the cleaner
+    /// (and recovery) allocate through the unreserved paths and keep space
+    /// flowing back. Small chunks scale the reserve down to nothing so
+    /// tests with tiny stores keep their capacity.
+    pub fn alloc_seg_for_writer(
+        &self,
+        file_manager: &Arc<SegmentFileManager>,
+        segment_class: SegmentClass,
+    ) -> Option<Segment> {
+        let reserve = self.capacity_segments().saturating_sub(5).min(3);
+        if reserve > 0 && self.available_segments() <= reserve {
+            debug!(
+                "Chunk {} down to its {}-segment compaction reserve; refusing writer \
+                 allocation so the cleaner keeps destinations",
+                self.chunk_id, reserve
+            );
+            return None;
+        }
+        self.alloc_seg_with_class(file_manager, segment_class)
+    }
+
+    fn take_free(&self) -> Option<usize> {
+        let addr = self.free.pop_front();
+        if addr.is_some() {
+            self.free_count.fetch_sub(1, Relaxed);
+        }
+        addr
+    }
+
     pub fn alloc_seg_with_class(
         &self,
         file_manager: &Arc<SegmentFileManager>,
         segment_class: SegmentClass,
     ) -> Option<Segment> {
-        self.free
-            .pop_front()
+        self.take_free()
             .or_else(|| loop {
                 debug!("Allocate segment by bump pointer");
                 let addr = self.offset.load(Relaxed);
@@ -2363,8 +2418,7 @@ impl SegmentAllocator {
         segment_class: SegmentClass,
     ) -> Option<Segment> {
         // First allocate the address
-        self.free
-            .pop_front()
+        self.take_free()
             .or_else(|| loop {
                 debug!("Allocate segment by bump pointer (recovery)");
                 let addr = self.offset.load(Relaxed);
@@ -2478,6 +2532,7 @@ impl SegmentAllocator {
         debug_assert!(seg_addr < self.limit);
         debug!("Segment {} freed", seg_addr);
         self.free.push_front(seg_addr);
+        self.free_count.fetch_add(1, Relaxed);
     }
 
     pub fn id_by_addr(&self, addr: usize) -> usize {
