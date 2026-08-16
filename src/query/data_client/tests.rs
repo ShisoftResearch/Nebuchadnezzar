@@ -5920,3 +5920,111 @@ async fn aggregate_orders_by_alias_and_applies_offset_limit() {
         &OwnedValue::U64(20)
     );
 }
+
+/// A limited scan must read cells in proportion to its LIMIT, not to the size
+/// of the schema it walks.
+///
+/// This is the regression guard the rest of the suite structurally cannot be.
+/// The bug it covers never returned a wrong row: `filter_ids_by_selection_limit`
+/// was called with no limit, so a selection the index could not serve read
+/// EVERY cell of the schema and filtered afterwards. Correct answers, at a
+/// price that only shows up at scale -- on the terabyte Wikidata store a
+/// `limit 20` over 117.7M entities ran for 9m46s, pinned a segment reference
+/// per cell so the tier could free nothing, and pushed RSS from 535GB to
+/// 689GB. Every assertion we own passed throughout.
+///
+/// So this asserts the WORK, which is scale-free: the pathology needs a
+/// terabyte to hurt, but not to be detected. The selection is on the
+/// unindexed field on purpose -- an indexed one would be served by a plan and
+/// would never reach the scan path that broke.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_limited_scan_reads_cells_in_proportion_to_its_limit() {
+    const DATA_1: &'static str = "DATA_1";
+    const DATA_2: &'static str = "DATA_2";
+    let _ = env_logger::try_init();
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let server_group = String::from("scan_limit_work_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size: 512 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: true,
+            services: vec![Service::Cell, Service::Query],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        &server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let fields = Field::new_schema(vec![
+        Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
+        Field::new_unindexed(DATA_2, Type::U32),
+    ]);
+    let schema_id = 4242;
+    let schema = Schema::new_with_id(
+        schema_id,
+        &String::from("scan_limit_work"),
+        None,
+        fields,
+        false,
+        true, // Scannable
+    );
+    let client = server.data_client(&vec![server_addr]).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    // Every row matches, so a bounded scan can stop almost immediately while
+    // an unbounded one has the whole schema to chew through.
+    let num: u64 = 2048;
+    for i in 0..num {
+        let id = Id::from_parts(1, i);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(i);
+        value[DATA_2] = OwnedValue::U32(7);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+    }
+    crate::index::builder::IndexBuilder::await_all_indices().await;
+    crate::index::ranged::tree::btree::storage::wait_until_updated().await;
+
+    let idx_data_client = server.indexed_data_client();
+    let limit = 8usize;
+    let before = crate::query::data_client::read::cells_read_count();
+    let mut cursor = idx_data_client
+        .query_with_options(
+            schema_id,
+            parse_to_serde_expr(&format!("(= {} 7u32)", DATA_2)).unwrap()[0].clone(),
+            QueryOrdering::Asc,
+            None,
+            None,
+            Some(limit),
+            None,
+            projection_fields(&[DATA_1]),
+        )
+        .await
+        .unwrap();
+    let mut returned = 0usize;
+    while let Some(_row) = cursor.next().await.unwrap() {
+        returned += 1;
+    }
+    let cells_read = crate::query::data_client::read::cells_read_count() - before;
+
+    assert_eq!(returned, limit, "the limit must still be honoured");
+    assert!(
+        cells_read < num as usize / 2,
+        "a limit-{} scan read {} cells out of {} rows: the scan is doing work \
+         proportional to the SCHEMA rather than to the limit, which is correct \
+         but costs the whole table -- at terabyte scale that is a 9-minute \
+         query and hundreds of GB of pinned segments",
+        limit,
+        cells_read,
+        num
+    );
+}

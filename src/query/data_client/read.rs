@@ -26,6 +26,24 @@ use super::{DataCursor, IndexedDataClient, QueryOrdering, SCAN_BUFFER_SIZE};
 
 const SCHEMA_SCAN_BUFFER_SIZE: u16 = 2048;
 
+/// Total cells this client has read from ids, ever.
+///
+/// A correctness suite cannot see this bug. Reverting the limit pushdown
+/// returns the same rows in the same order for every test we have -- it just
+/// reads the whole schema to produce them, which only becomes visible when
+/// the schema is 117.7M entities on cold storage. The rows are the same; the
+/// work is not. So the work is what has to be asserted, and counting cells
+/// read makes the shape testable at any size: a bounded scan reads a number
+/// of cells proportional to the LIMIT, an unbounded one proportional to the
+/// ROWS. One relaxed add per batch, so it costs nothing to leave compiled in.
+pub(crate) static CELLS_READ: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Cells read so far; take two readings and subtract to measure one query.
+pub(crate) fn cells_read_count() -> usize {
+    CELLS_READ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl IndexedDataClient {
     pub(super) async fn scan_schema_index<'a>(
         &'a self,
@@ -205,6 +223,7 @@ impl IndexedDataClient {
         selection: &Expr,
         proc: &Expr,
     ) -> Vec<OwnedCell> {
+        CELLS_READ.fetch_add(ids.len(), std::sync::atomic::Ordering::Relaxed);
         let normalized_selection = normalize_selection_for_eval(selection);
         let expect_full_batch = normalized_selection.is_empty() && proc.is_empty();
         let mut all_cells = vec![];
