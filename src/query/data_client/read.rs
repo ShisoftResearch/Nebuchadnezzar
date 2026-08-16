@@ -73,6 +73,71 @@ impl IndexedDataClient {
         Ok(ids)
     }
 
+    /// Schema scan that filters as it walks and stops at `limit`, holding at
+    /// most one batch of ids and the matches found so far.
+    ///
+    /// The eager form -- enumerate every id for the schema, then filter -- is
+    /// O(rows scanned) in memory no matter how small the limit is. Pushing the
+    /// limit into the filter bounded the cells it READS, which is what costs
+    /// disk and pins segments, but `scan_schema_ids` still built a `Vec` of
+    /// every id in the schema first (~2GB at 117.7M entities), because it
+    /// drains a perfectly lazy cursor into a vector for no reason. Pulling
+    /// from that cursor instead makes the whole path O(batch + limit).
+    ///
+    /// Forward only. `Ordering::Backward` needs the scan to seek from the
+    /// schema's upper key bound, which `EntryKey::for_schema` does not
+    /// provide; the caller keeps the materialising path for that case, where
+    /// correctness comes from sorting the full set.
+    pub(super) async fn stream_schema_scan_filtered(
+        &self,
+        schema: u32,
+        selection: &Expr,
+        limit: usize,
+    ) -> Result<Vec<Id>, RPCError> {
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let key = EntryKey::for_schema(schema);
+        let Some(mut index_cursor) = self
+            .index_clients
+            .range_seek(
+                Range::new_inclusive_opened(key, Ordering::Forward),
+                SCHEMA_SCAN_BUFFER_SIZE,
+                Some(SCHEMA_SCAN_PATT_SIZE),
+            )
+            .await?
+        else {
+            return Ok(vec![]);
+        };
+        let batch = usize::from(SCAN_BUFFER_SIZE.max(1));
+        let mut selected: Vec<Id> = Vec::with_capacity(limit);
+        let mut pending: Vec<Id> = Vec::with_capacity(batch);
+        loop {
+            pending.clear();
+            while pending.len() < batch {
+                match index_cursor.next().await? {
+                    Some(id) => pending.push(id),
+                    None => break,
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            let cells = self
+                .read_cells_from_ids(&pending, &vec![], &Expr::nothing(), &Expr::nothing())
+                .await;
+            for cell in cells {
+                if cell_matches_selection(&cell, selection) {
+                    selected.push(cell.id());
+                    if selected.len() >= limit {
+                        return Ok(selected);
+                    }
+                }
+            }
+        }
+        Ok(selected)
+    }
+
     pub(super) async fn filter_ids_by_selection_limit(
         &self,
         candidate_ids: &[Id],
