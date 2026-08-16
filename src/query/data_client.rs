@@ -539,6 +539,33 @@ impl IndexedDataClient {
                 .map(|plan| plan.is_pure_relevance_ranked_scan())
                 .unwrap_or(false);
         let selection_requires_post_filter = !selection.is_empty();
+        // Bounded schema scan: filter while walking the index and stop at the
+        // limit, so memory follows the rows RETURNED rather than the rows
+        // scanned. Only taken when nothing downstream needs the full set --
+        // the same conditions that let the limit be pushed into the filter
+        // below, which is also where the reasoning for each one is written.
+        let can_stream_scan = plan.is_none()
+            && selection_requires_post_filter
+            && explicit_order_by_field.is_none()
+            && inferred_order_field.is_none()
+            && distinct_fields.is_none()
+            && !preserve_relevance_order
+            && ordering == QueryOrdering::Asc;
+        if let (true, Some(limit)) = (can_stream_scan, effective_limit) {
+            let mut selected_ids = self
+                .stream_schema_scan_filtered(schema, &selection, limit)
+                .await?;
+            let offset = offset.unwrap_or(0);
+            let selected_ids = if offset >= selected_ids.len() {
+                vec![]
+            } else {
+                selected_ids.split_off(offset)
+            };
+            return Ok(IdCursor {
+                buffer: selected_ids,
+                pos: 0,
+            });
+        }
         let (candidate_ids, requires_selection_filter): (Vec<Id>, bool) = if let Some(plan) = plan {
             if plan.is_impossible() {
                 (vec![], false)
@@ -562,8 +589,47 @@ impl IndexedDataClient {
         } else {
             candidate_ids
         };
+        // Stop filtering once the limit is met, when nothing downstream needs
+        // the whole filtered set.
+        //
+        // Without a limit, `filter_ids_by_selection_limit` reads EVERY
+        // candidate cell in one call and filters afterwards, so a selection
+        // the index cannot serve costs memory proportional to the rows
+        // scanned rather than the rows returned. On a terabyte store that is
+        // not a slow query, it is a different failure: `limit 20` over 117.7M
+        // entities materialised every one of them, held a reference to each
+        // segment it touched so the tier could free nothing, and drove RSS
+        // from 535GB to 689GB on a 755GB machine before it was stopped. The
+        // batched path that stops early already existed; only the call site
+        // never asked for it.
+        //
+        // The guards mirror `plan_limit` above and add the two cases that
+        // consume the filtered set as a whole: a post-filter sort has to see
+        // every match before the truncation picks a prefix, and a distinct
+        // collapse can turn many matches into few, so stopping at `limit`
+        // matches would under-fill the result.
+        //
+        // The ordering guard is the subtle one. `scan_schema_ids` ignores the
+        // requested ordering and always walks the index forward, and the
+        // post-filter `sort_ids_by_query_order` fixes it up afterwards. Under
+        // `Desc`, then, stopping at the first `limit` matches keeps the
+        // SMALLEST ids and sorts those descending, where the answer is the
+        // LARGEST -- the sqlite alignment corpus catches this immediately.
+        // Early exit is only sound while the candidate order already agrees
+        // with the requested one; making the scan seek backwards for `Desc`
+        // would lift the restriction.
+        let filter_limit = if explicit_order_by_field.is_some()
+            || inferred_order_field.is_some()
+            || distinct_fields.is_some()
+            || preserve_relevance_order
+            || ordering != QueryOrdering::Asc
+        {
+            None
+        } else {
+            effective_limit
+        };
         let mut selected_ids = if requires_selection_filter {
-            self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, None)
+            self.filter_ids_by_selection_limit(&ordered_candidate_ids, &selection, filter_limit)
                 .await
         } else {
             ordered_candidate_ids
