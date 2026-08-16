@@ -2379,12 +2379,44 @@ pub async fn init_ranged_indexer_service<C>(
         let mut checked = 0usize;
         let mut absent = 0usize;
         let mut cursor = ranged::trees::min_entry_key();
+        // Seed the walk INCLUSIVELY. `next_tree` is exclusive of its cursor,
+        // and genesis places its only tree at exactly `min_entry_key`, so
+        // starting from `next_tree(min_entry_key)` skips the very placement
+        // this loop exists to validate. The two SM queries then disagree:
+        // `has_placements()` sees the tree, the walk does not, `checked`
+        // stays 0, and the repair below cannot fire because it requires
+        // `checked > 0`. Genesis is skipped too, because placements exist.
+        // A database whose storage was replaced -- a runtime reloaded after
+        // unload, or any store without persistent backing -- was left with a
+        // placement map naming trees that no longer exist and no way out of
+        // it: every seek retried "tree placement was not found" until it
+        // gave up, and the CAGRA service failed to initialize.
+        let mut pending_first = match sm_client.locate_key(&cursor).await {
+            Ok((lower, placement, upper)) => Some(ranged::sm::TreeInfo {
+                lower,
+                upper,
+                placement,
+            }),
+            Err(e) => {
+                warn!(
+                    "Could not locate the first ranged placement for {}/{}: {:?}",
+                    group_name, database_name, e
+                );
+                None
+            }
+        };
         loop {
-            let Ok(Some(info)) = sm_client
-                .next_tree(&cursor, &ranged::tree::btree::Ordering::Forward)
-                .await
-            else {
-                break;
+            let info = match pending_first.take() {
+                Some(info) => info,
+                None => {
+                    let Ok(Some(info)) = sm_client
+                        .next_tree(&cursor, &ranged::tree::btree::Ordering::Forward)
+                        .await
+                    else {
+                        break;
+                    };
+                    info
+                }
             };
             checked += 1;
             match neb_client.read_cell(info.placement.id).await {
