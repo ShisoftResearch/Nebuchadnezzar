@@ -2025,37 +2025,6 @@ impl Chunks {
         use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
         use std::ptr;
 
-        // There is ONE chunk space per process, not per database. Every cell
-        // address in the process is resolved against a single global base
-        // (`GLOBAL_CHUNK_BASE`), so allocating a second space re-points all
-        // of them: cells written into the previous region become unreachable
-        // and read back as `CellDoesNotExisted` even though the write
-        // succeeded moments earlier.
-        //
-        // That is exactly how the multi-database failures present. A second
-        // `create_database`, or reloading a runtime after unload, allocates
-        // here and silently orphans the first database's cells; the ranged
-        // index then holds a placement naming a tree whose root cell has
-        // just been made unreachable, and every seek retries "tree placement
-        // was not found" until it gives up.
-        //
-        // Warn rather than refuse: a single-database server never reaches
-        // this, and returning an error here would break deployments that
-        // work today. The real fix is to make chunk addressing per-`Chunks`
-        // instead of global, which is a change to the hottest path in the
-        // storage engine and wants its own campaign.
-        let previous_base = GLOBAL_CHUNK_BASE.load(Ordering::Acquire);
-        if previous_base != 0 {
-            warn!(
-                "Allocating a SECOND global chunk space (previous base={:#x}). Cell \
-                 addressing is process-global, so every cell in the previous region is \
-                 now unreachable and will read back as CellDoesNotExisted. Multiple \
-                 database runtimes in one process are not supported by this addressing \
-                 scheme.",
-                previous_base
-            );
-        }
-
         // Calculate exact chunk size
         let chunk_size = size.next_power_of_two();
         let chunk_size_bits = chunk_size.trailing_zeros() as usize;
