@@ -582,6 +582,17 @@ impl Chunk {
                         continue;
                     }
                 };
+                // Take the reference BEFORE claiming space, not after.
+                //
+                // The reference is what rotation waits on before it archives a
+                // segment. Claiming space first left a gap in which a rotation
+                // could see zero references, conclude every writer had
+                // finished, and seal the segment out from under a writer that
+                // had already advanced its append cursor -- whose WAL write
+                // then had nowhere to go. One entry in 845M hit exactly that
+                // during a TB import, which is rare enough to look like noise
+                // and is still a lost write.
+                head.incr_references();
                 if let Some(addr) = head.try_acquire(size) {
                     trace!(
                         "Chunk {} acquired address {} for size {} in segment {} ({:?})",
@@ -591,7 +602,6 @@ impl Chunk {
                         head.id,
                         segment_class
                     );
-                    head.incr_references();
                     return Ok(PendingEntry {
                         addr,
                         seg: head,
@@ -599,6 +609,9 @@ impl Chunk {
                         skip_sync: is_in_transaction(),
                     });
                 }
+                // No space in this segment: give the reference back, or it
+                // pins the segment against eviction and reclamation forever.
+                head.decr_references();
             }
 
             let total_space = self.segs.len() * SEGMENT_SIZE;
