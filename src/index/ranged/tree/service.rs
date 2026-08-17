@@ -1598,7 +1598,7 @@ pub async fn locate_tree_server_from_conshash(
 ) -> Result<Arc<AsyncServiceClient>, RPCError> {
     if let Some(server_id) = conshash.get_server_id_by(id) {
         DEFAULT_CLIENT_POOL
-            .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
+            .get_by_id(server_id, move |sid| conshash.try_server_name(sid))
             .await
             .map_err(|e| RPCError::IOError(e))
             .map(|c| client_by_rpc_client(&c, group_name, database_name))

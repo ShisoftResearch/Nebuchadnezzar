@@ -198,7 +198,7 @@ impl TransactionManagerDeps {
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<RPCClient>> {
         let consh = self.consh.clone();
         self.member_pool
-            .get_by_id(server_id, move |_| consh.to_server_name(server_id))
+            .get_by_id(server_id, move |_| consh.try_server_name(server_id))
             .await
     }
 

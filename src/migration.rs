@@ -1767,6 +1767,187 @@ mod cluster_tests {
         client.read_cell(id).await.unwrap().unwrap();
     }
 
+    /// Phase 5: a drain under sustained writes loses nothing.
+    ///
+    /// The drain analogue of `writes_racing_a_migration_are_never_lost`, and the
+    /// harder case: a drain moves *every* slot the member owns, so a writer aimed
+    /// at that member is writing into ground that is being taken away underneath
+    /// it for the whole run. Every acknowledged write must still be readable, and
+    /// the member must end up owning nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_under_sustained_writes_loses_nothing() {
+        let (servers, client) = start_pair("migration_drain_racing_writes_test").await;
+        let departing = servers[0].server_id;
+        let remaining = servers[1].server_id;
+
+        const SLOTS: [u16; 3] = [221, 222, 223];
+        const WRITES: u64 = 45;
+
+        let mut seeded: HashSet<Id> = HashSet::new();
+        for slot in SLOTS {
+            for seq in 0..4 {
+                let (id, cell) = cell_in_slot(slot, seq, "seed");
+                client.write_cell(cell).await.unwrap().unwrap();
+                seeded.insert(id);
+            }
+        }
+
+        let writer_client = client.clone();
+        let writer = tokio::spawn(async move {
+            let mut acknowledged = Vec::new();
+            for seq in 200..(200 + WRITES) {
+                for slot in SLOTS {
+                    let (id, cell) = cell_in_slot(slot, seq, "during-drain");
+                    // Acknowledged means the cluster owes us this cell from here
+                    // on. A refusal or an RPC error means nothing was written and
+                    // nothing is owed -- the honest outcome, not a loss.
+                    if let Ok(Ok(_)) = writer_client.upsert_cell(cell).await {
+                        acknowledged.push(id);
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            acknowledged
+        });
+
+        let drain = crate::migration::drain::drain_member(
+            &client,
+            departing,
+            &[remaining],
+            &MigrationPlan::default(),
+        )
+        .await
+        .expect("the drain should run while writes are in flight");
+
+        let acknowledged = writer.await.expect("writer task should not panic");
+        assert!(
+            !acknowledged.is_empty(),
+            "the writer never got a single write through; this proves nothing"
+        );
+
+        // Every acknowledged write, and every seeded cell, still readable.
+        for id in acknowledged.iter().chain(seeded.iter()) {
+            let cell = client.read_cell(*id).await.unwrap().unwrap_or_else(|error| {
+                panic!("{id:?} was lost by a drain under load: {error:?}")
+            });
+            assert_eq!(cell.header.id, *id);
+        }
+
+        // A drain racing a writer may legitimately not finish in one call -- the
+        // writer keeps handing it new work. What must NOT happen is data loss, and
+        // what must be true either way is that the report is honest about it.
+        if drain.is_complete() {
+            assert!(crate::migration::drain::owns_nothing(&client, departing)
+                .await
+                .unwrap());
+        } else {
+            assert!(
+                !crate::migration::drain::owns_nothing(&client, departing)
+                    .await
+                    .unwrap(),
+                "an incomplete drain must not claim the member owns nothing"
+            );
+        }
+    }
+
+    /// Phase 5: an unreachable recipient leaves the slot with its donor.
+    ///
+    /// The donor stays authoritative for the whole transfer, so losing the
+    /// recipient must cost nothing but the attempt. Asserted on placement *and*
+    /// on the data, because a slot correctly left with its donor while the cells
+    /// were dropped would satisfy the first and be a catastrophe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreachable_recipient_leaves_the_slot_with_its_donor() {
+        let (servers, client) = start_pair("migration_recipient_death_test").await;
+        let donor_id = servers[0].server_id;
+        let recipient_id = servers[1].server_id;
+
+        const SLOT: u16 = 231;
+        let mut expected: HashSet<Id> = HashSet::new();
+        for seq in 0..5 {
+            let (id, cell) = cell_in_slot(SLOT, seq, "kept");
+            client.write_cell(cell).await.unwrap().unwrap();
+            expected.insert(id);
+        }
+
+        // The recipient goes away before the transfer can reach it.
+        servers[1].shutdown().await;
+
+        let outcome = migrate_slot(
+            &client,
+            SLOT as u32,
+            donor_id,
+            recipient_id,
+            &MigrationPlan::default(),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a migration to a member that is gone must fail, not report success"
+        );
+
+        // Placement is back with the donor -- either never moved, or aborted --
+        // and never left mid-flight claiming a recipient that cannot answer.
+        let state = placement_client(&client)
+            .slot_state(&slot_group_id(client.group_name()), &(SLOT as u32))
+            .await
+            .unwrap();
+        assert_eq!(
+            state,
+            Some(SlotState::Stable { owner: donor_id }),
+            "the slot must be left stable on its donor, not stuck migrating"
+        );
+        assert_eq!(client.locate_server_id(expected.iter().next().unwrap()).unwrap(), donor_id);
+
+        // And the data is all still there, on the donor.
+        assert_eq!(held_in_slot(&servers[0], SLOT), expected);
+        for id in &expected {
+            client.read_cell(*id).await.unwrap().unwrap();
+        }
+    }
+
+    /// Phase 5: a drain that cannot finish says so, rather than reporting success.
+    ///
+    /// The safety gate is only worth having if it fails closed: a drain whose
+    /// destination cannot take the data must leave the member owning it, and must
+    /// report `is_complete() == false` so a caller gated on that never removes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_to_a_member_that_cannot_take_it_fails_closed() {
+        let (servers, client) = start_pair("migration_drain_aborted_test").await;
+        let departing = servers[0].server_id;
+
+        const SLOT: u16 = 241;
+        let (id, cell) = cell_in_slot(SLOT, 1, "undrainable");
+        client.write_cell(cell).await.unwrap().unwrap();
+
+        // A member id that is not in this cluster at all.
+        const GHOST: u64 = 0xDEAD_BEEF_CAFE;
+        let drain = crate::migration::drain::drain_member(
+            &client,
+            departing,
+            &[GHOST],
+            &MigrationPlan::default(),
+        )
+        .await
+        .expect("the drain should report, not error out");
+
+        assert!(
+            !drain.is_complete(),
+            "a drain that moved nothing must not report itself complete"
+        );
+        assert!(
+            !drain.stranded.is_empty(),
+            "it must name what it could not move"
+        );
+        assert!(!crate::migration::drain::owns_nothing(&client, departing)
+            .await
+            .unwrap());
+
+        // Nothing lost.
+        assert_eq!(held_in_slot(&servers[0], SLOT), HashSet::from([id]));
+        client.read_cell(id).await.unwrap().unwrap();
+    }
+
     /// MEASUREMENT, not a unit test. Run explicitly, on a machine with room:
     ///
     /// ```text

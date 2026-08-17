@@ -126,8 +126,14 @@ impl DataCursor {
                             let proc = &self.proc;
                             let group_name = self.client.group_name.clone();
                             let database_name = self.client.database_name.clone();
-                            let server_name = self.client.conshash.to_server_name(sid);
+                            let server_name = self.client.conshash.try_server_name(sid);
                             async move {
+                                let Some(server_name) = server_name else {
+                                    return Err(RPCError::IOError(std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        format!("no address known for server id {sid}"),
+                                    )));
+                                };
                                 match client_by_server_name_for_database(
                                     sid,
                                     server_name,

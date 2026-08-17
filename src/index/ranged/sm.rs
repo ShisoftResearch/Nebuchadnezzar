@@ -518,7 +518,7 @@ impl MasterTreeSM {
     async fn locate_tree_server(&self, id: &Id) -> Result<Arc<LSMServiceClient>, RPCError> {
         if let Some(server_id) = self.conshash.get_server_id_by(id) {
             bifrost::rpc::DEFAULT_CLIENT_POOL
-                .get_by_id(server_id, move |sid| self.conshash.to_server_name(sid))
+                .get_by_id(server_id, move |sid| self.conshash.try_server_name(sid))
                 .await
                 .map_err(|e| RPCError::IOError(e))
                 .map(|rpc| LSMServiceClient::new_with_service_id(self.tree_service_id, &rpc))

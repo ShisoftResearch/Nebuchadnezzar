@@ -2201,7 +2201,7 @@ impl NebServer {
     }
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
         self.member_pool
-            .get_by_id(server_id, |_| self.consh.to_server_name(server_id))
+            .get_by_id(server_id, |_| self.consh.try_server_name(server_id))
             .await
     }
     pub async fn get_member_by_server_id_async(
@@ -2210,7 +2210,7 @@ impl NebServer {
     ) -> Result<Arc<RPCClient>, io::Error> {
         let cons_hash = self.consh.clone();
         self.member_pool
-            .get_by_id(server_id, move |_| cons_hash.to_server_name(server_id))
+            .get_by_id(server_id, move |_| cons_hash.try_server_name(server_id))
             .await
     }
     pub fn conshash(&self) -> &ConsistentHashing {
@@ -2293,7 +2293,7 @@ pub async fn rpc_client_by_id(
         .unwrap();
     let conshash = conshash.clone();
     DEFAULT_CLIENT_POOL
-        .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
+        .get_by_id(server_id, move |sid| conshash.try_server_name(sid))
         .await
         .map_err(|e| RPCError::IOError(e))
 }
@@ -2564,7 +2564,7 @@ pub async fn init_ranged_indexer_service<C>(
             );
             let owner_client = match cons_hash.get_server_id_by(&genesis_id) {
                 Some(server_id) => bifrost::rpc::DEFAULT_CLIENT_POOL
-                    .get_by_id(server_id, |sid| cons_hash.to_server_name(sid))
+                    .get_by_id(server_id, |sid| cons_hash.try_server_name(sid))
                     .await
                     .map(|rpc| {
                         ranged::tree::service::AsyncServiceClient::new_with_service_id(
