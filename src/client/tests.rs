@@ -1044,3 +1044,93 @@ pub async fn server_isolation() {
         "-score"
     );
 }
+
+/// The slot table is seeded from the ring at startup, and agrees with it.
+///
+/// This is the property that lets the table be introduced at all: if adoption
+/// produced *different* placement than `jump_hash` already computes, switching
+/// over would relocate live data. So it is not enough that the table is
+/// populated — every entry has to match what the ring would have said.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn slot_table_is_seeded_to_agree_with_the_ring() {
+    let _ = env_logger::try_init();
+    let server_group = "slot_adoption_test";
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let database_name = "testdb_slot_adoption";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        server_group,
+        database_name,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let table = crate::slots::load_table(
+        &server_group.to_string(),
+        &server.raft_client,
+        crate::server::SLOTS_SM_ID,
+    )
+    .await
+    .expect("slot table query should succeed")
+    .expect("startup should have seeded a table, not left it absent");
+
+    assert_eq!(
+        table.len(),
+        crate::slots::SLOT_COUNT,
+        "every slot must be placed; a partial table would leave some ids unroutable"
+    );
+
+    // Agreement with the ring, entry by entry. Anything else means adopting the
+    // table silently moves data.
+    let conshash = server.conshash();
+    for slot in 0..crate::slots::SLOT_COUNT {
+        let expected = conshash
+            .get_server_id(slot as u64)
+            .expect("the ring places every slot on a single-member cluster");
+        let placed = table
+            .get(&(slot as u32))
+            .expect("slot should be in the table");
+        assert_eq!(
+            placed.serving_owner(),
+            expected,
+            "slot {slot} was adopted onto {} but the ring says {expected}",
+            placed.serving_owner()
+        );
+        assert!(
+            !placed.is_migrating(),
+            "a freshly seeded slot must not be in flight: slot {slot}"
+        );
+    }
+
+    // Re-adopting claims nothing: a restart must not disturb placement, and
+    // every member runs this concurrently at startup.
+    let readopted = crate::slots::adopt_from_ring(
+        &server_group.to_string(),
+        &server.consh,
+        &server.raft_client,
+        crate::server::SLOTS_SM_ID,
+    )
+    .await
+    .expect("re-adoption should succeed");
+    assert_eq!(
+        readopted, 0,
+        "adoption must be idempotent; claiming slots again would move data"
+    );
+}
+
+

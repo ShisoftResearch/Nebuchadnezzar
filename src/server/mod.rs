@@ -42,6 +42,9 @@ pub mod transactions;
 pub use status::{ChunkMemoryStatus, ServerMemoryStatus};
 
 pub static CONS_HASH_ID: u64 = hash_ident!(NEB_CONSHASH_MEM_WEIGHTS) as u64;
+/// Slot ownership table. Separate from the weights SM above because it is
+/// authoritative for placement rather than an input to computing it.
+pub static SLOTS_SM_ID: u64 = hash_ident!(NEB_CONSHASH_SLOT_PLACEMENT) as u64;
 const META_CLUSTER_JOIN_MAX_RETRIES: usize = 100;
 const META_CLUSTER_JOIN_RETRY_DELAY_MS: u64 = 100;
 const CLUSTER_GROUP_JOIN_MAX_RETRIES: usize = 100;
@@ -1002,6 +1005,22 @@ pub async fn init_conshash(
             if !ch.init_table().await.is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);
+            }
+            // Seed the slot table from the placement the ring just computed, so
+            // the table starts out agreeing with the ring exactly and nothing
+            // appears to move. First writer wins per slot, so every member can
+            // do this concurrently and a restart is a no-op.
+            //
+            // Best-effort on purpose: failing startup because the table could
+            // not be seeded would trade a placement problem for an availability
+            // one. Callers treat an absent table as "fall back to the ring".
+            match crate::slots::adopt_from_ring(group_name, &ch, raft_client, SLOTS_SM_ID).await {
+                Ok(0) => debug!("slot placement table already seeded"),
+                Ok(adopted) => info!("seeded {} slots into the placement table", adopted),
+                Err(reason) => warn!(
+                    "could not seed the slot placement table ({}); placement falls back to the ring",
+                    reason
+                ),
             }
             return Ok(ch);
         }
@@ -2055,6 +2074,11 @@ impl NebServer {
             database_name,
         );
         Weights::new_with_id(CONS_HASH_ID, &raft_service).await;
+        // Registered before start() for the same reason as the weights SM: an
+        // SM registered afterwards never receives replayed WAL entries, and a
+        // placement table that silently loses its history would send every
+        // lookup to the wrong member.
+        bifrost::conshash::slots::Slots::new_with_id(SLOTS_SM_ID, &raft_service).await;
 
         // TODO: If RangedIndexer service is enabled, MasterTreeSM should also be
         // registered here before start() to enable WAL replay recovery
