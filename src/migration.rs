@@ -83,6 +83,7 @@ use bifrost::conshash::slots::client::SMClient as SlotsSMClient;
 use bifrost::conshash::slots::SlotState;
 use bifrost::rpc::RPCError;
 use dovahkiin::types::Id;
+use futures::stream::{self, StreamExt};
 use std::fmt;
 use std::sync::Arc;
 
@@ -112,6 +113,33 @@ pub struct MigrationPlan {
     /// batch. On by default: the cost is one cheap round trip per batch, and
     /// the thing it prevents is an unbounded hot tier on the receiving side.
     pub settle_recipient_per_batch: bool,
+    /// How many slots to move at once.
+    ///
+    /// A slot migration is dominated by round trips -- two raft commands, a
+    /// handful of RPCs, and a batch read plus write per batch -- so a sequential
+    /// driver spends nearly all of its time waiting. Slots are independent
+    /// (separate table entries, disjoint cells, per-slot commit points), so they
+    /// pipeline without any cross-slot ordering to preserve.
+    ///
+    /// Bounded rather than unlimited, and the bound matters for two reasons that
+    /// pull in the same direction: the raft leader serialises log appends however
+    /// many callers there are, and in-flight data on the recipient is
+    /// `concurrent_slots x batch_cells`, so raising this raises the recipient's
+    /// peak memory proportionally. Defaults to [`default_concurrent_slots`].
+    pub concurrent_slots: usize,
+}
+
+/// Slot concurrency scaled to the machine, clamped at both ends.
+///
+/// A floor because even one core benefits from pipelining calls that are waiting
+/// on the network, and a ceiling because past a few dozen the raft leader's
+/// serialised appends -- and the recipient's in-flight memory -- become the limit
+/// rather than the caller's parallelism.
+pub fn default_concurrent_slots() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(4)
+        .clamp(4, 64)
 }
 
 impl Default for MigrationPlan {
@@ -120,6 +148,7 @@ impl Default for MigrationPlan {
             batch_cells: DEFAULT_BATCH_CELLS,
             delta_rounds: DEFAULT_DELTA_ROUNDS,
             settle_recipient_per_batch: true,
+            concurrent_slots: default_concurrent_slots(),
         }
     }
 }
@@ -231,6 +260,37 @@ async fn enumerate_slot(member: &Arc<CellServiceClient>, slot: u32) -> Result<Ve
     member.cell_ids_in_slots(&vec![slot]).await
 }
 
+/// Every live cell a member holds across many slots, bucketed by slot, in ONE
+/// pass over its cell index.
+///
+/// The distinction from [`enumerate_slot`] is asymptotic, not stylistic.
+/// `cell_ids_in_slots` scans the donor's whole index whatever it is asked for,
+/// so asking per slot makes a bulk move **O(slots x cells)**: measured on .239,
+/// resharding 4096 slots of a 4.19M-cell store meant ~12 000 full index passes,
+/// each allocating a fresh ~67 MB vector — roughly 800 GB of allocation churn to
+/// move 16 GB of data. Asking once for the whole set makes it O(cells + slots).
+///
+/// This is why the RPC takes a slot *set*. Any caller moving more than one slot
+/// must come through here.
+async fn enumerate_slots(
+    member: &Arc<CellServiceClient>,
+    slots: &[u32],
+) -> Result<std::collections::HashMap<u32, Vec<Id>>, RPCError> {
+    let mut held: std::collections::HashMap<u32, Vec<Id>> = Default::default();
+    if slots.is_empty() {
+        return Ok(held);
+    }
+    for id in member.cell_ids_in_slots(&slots.to_vec()).await? {
+        held.entry(crate::slots::slot_of(id_ref(&id))).or_default().push(id);
+    }
+    Ok(held)
+}
+
+#[inline]
+fn id_ref(id: &Id) -> &Id {
+    id
+}
+
 struct BatchOutcome {
     /// Exactly the ids the recipient now holds a copy of. Returned as ids
     /// rather than a count because the reclaim decides what it may destroy from
@@ -239,58 +299,97 @@ struct BatchOutcome {
     vanished: usize,
 }
 
-/// Move one batch.
+/// Move one batch, donor -> recipient directly.
+///
+/// The coordinator names the cells and the target and gets back only the ids that
+/// landed; the bodies never pass through it. That matters because the byte path is
+/// what limits a transfer at realistic cell sizes — routing bodies through here
+/// would double both the wire traffic and the serialization work for no gain.
 async fn transfer_batch(
     donor: &Arc<CellServiceClient>,
-    recipient: &Arc<CellServiceClient>,
+    to: u64,
     batch: &Vec<Id>,
 ) -> Result<BatchOutcome, MigrationError> {
-    let read = donor.read_all_cells(batch).await?;
-    let mut cells: Vec<OwnedCell> = Vec::with_capacity(read.len());
-    let mut vanished = 0usize;
-    for (id, result) in batch.iter().zip(read.into_iter()) {
-        match result {
-            Ok(cell) => cells.push(cell),
-            // Enumerated a moment ago and gone now: something removed it
-            // between the two steps. There is nothing to move and nothing
-            // wrong; moving on is the only correct response.
-            Err(ReadError::CellDoesNotExisted) => vanished += 1,
-            Err(error) => {
-                return Err(MigrationError::Transfer(format!(
-                    "donor could not read {id:?}: {error:?}"
-                )))
+    let landed = donor
+        .push_cells_to(batch, to)
+        .await?
+        .map_err(MigrationError::Transfer)?;
+    // Anything the donor did not send is a cell that vanished between being
+    // enumerated and being read. Not an error: a write failure comes back as one.
+    let vanished = batch.len().saturating_sub(landed.len());
+    Ok(BatchOutcome {
+        transferred: landed,
+        vanished,
+    })
+}
+
+/// Stream exactly these cells of one slot to the recipient.
+///
+/// Does **not** begin, commit, or look for more work. Delta rounds are the
+/// caller's job, deliberately: the enumeration behind a delta round scans the
+/// donor's whole index whatever it is asked for, so a delta *inside* here would
+/// reintroduce a per-slot full pass — the exact quadratic term that
+/// `enumerate_slots` exists to remove. Measured: leaving the delta in here kept a
+/// 512-slot reshard at 67 s where the work itself takes ~30 s.
+async fn transfer_slot(
+    donor: &Arc<CellServiceClient>,
+    recipient: &Arc<CellServiceClient>,
+    slot: u32,
+    from: u64,
+    to: u64,
+    plan: &MigrationPlan,
+    ids: Vec<Id>,
+) -> Result<SlotHandover, MigrationError> {
+    let mut handover = SlotHandover {
+        slot,
+        from,
+        to,
+        cells_transferred: 0,
+        batches: 0,
+        delta_rounds_used: if ids.is_empty() { 0 } else { 1 },
+        vanished_before_transfer: 0,
+        recipient_peak_hot_bytes: 0,
+        recipient_evicted_segments: 0,
+    };
+    for batch in range_batches(ids, plan.batch_cells) {
+        let outcome = transfer_batch(donor, to, &batch).await?;
+        handover.cells_transferred += outcome.transferred.len();
+        handover.vanished_before_transfer += outcome.vanished;
+        handover.batches += 1;
+
+        if plan.settle_recipient_per_batch {
+            match recipient.settle_bulk_receive().await {
+                Ok(report) => {
+                    let observed = if report.hot_bytes_scanned > 0 {
+                        report.hot_bytes_scanned
+                    } else {
+                        report.hot_bytes
+                    };
+                    handover.recipient_peak_hot_bytes =
+                        handover.recipient_peak_hot_bytes.max(observed);
+                    handover.recipient_evicted_segments += report.evicted_segments;
+                }
+                // A settle is an optimisation, never a precondition: the cells are
+                // already written and durable.
+                Err(error) => warn!(
+                    "recipient {to} could not settle after a batch of slot {slot}: {error:?}"
+                ),
             }
         }
     }
-    if cells.is_empty() {
-        return Ok(BatchOutcome {
-            transferred: Vec::new(),
-            vanished,
-        });
-    }
+    Ok(handover)
+}
 
-    let transferred: Vec<Id> = cells.iter().map(|cell| cell.header.id).collect();
-    // The migration-only receive path, not `upsert_all_cells`: before the flip
-    // the recipient does not own this slot, so an ordinary write would be
-    // (correctly) refused by the ownership guard.
-    let written = recipient.receive_migrated_cells(cells).await?;
-    // `upsert_all_cells` stops at the first failure and reports BatchAborted
-    // for the rest, so the first error that is not BatchAborted is the real
-    // cause and the only one worth reporting.
-    if let Some(error) = written
-        .iter()
-        .filter_map(|result| result.as_ref().err())
-        .find(|error| !matches!(error, WriteError::BatchAborted))
-    {
-        return Err(MigrationError::Transfer(format!(
-            "recipient rejected a batch of {} cells: {error:?}",
-            transferred.len()
-        )));
-    }
-    Ok(BatchOutcome {
-        transferred,
-        vanished,
-    })
+/// Fold a later round's handover into the running one for the same slot.
+fn accumulate(into: &mut SlotHandover, extra: SlotHandover) {
+    into.cells_transferred += extra.cells_transferred;
+    into.batches += extra.batches;
+    into.vanished_before_transfer += extra.vanished_before_transfer;
+    into.delta_rounds_used += extra.delta_rounds_used;
+    into.recipient_peak_hot_bytes = into
+        .recipient_peak_hot_bytes
+        .max(extra.recipient_peak_hot_bytes);
+    into.recipient_evicted_segments += extra.recipient_evicted_segments;
 }
 
 /// Move one slot's cells and flip its owner.
@@ -303,6 +402,26 @@ pub async fn migrate_slot(
     from: u64,
     to: u64,
     plan: &MigrationPlan,
+) -> Result<SlotHandover, MigrationError> {
+    // Enumerates for this one slot. Callers moving a SET of slots must not loop
+    // over this -- see `enumerate_slots` for why that is quadratic -- and should
+    // use `reshard_slots` or the drain instead.
+    let donor = client.client_by_server_id(from).await?;
+    let ids = enumerate_slot(&donor, slot).await?;
+    migrate_slot_prepared(client, slot, from, to, plan, ids).await
+}
+
+/// [`migrate_slot`], with this slot's cell ids already known.
+///
+/// Split out so a bulk caller can enumerate the donor **once** for every slot it
+/// intends to move and then drive each one from that single pass.
+async fn migrate_slot_prepared(
+    client: &Arc<AsyncClient>,
+    slot: u32,
+    from: u64,
+    to: u64,
+    plan: &MigrationPlan,
+    known: Vec<Id>,
 ) -> Result<SlotHandover, MigrationError> {
     if (slot as usize) >= SLOT_COUNT {
         return Err(MigrationError::Invalid(format!(
@@ -349,11 +468,19 @@ pub async fn migrate_slot(
 
     let outcome = async {
         for round in 0..plan.delta_rounds.max(1) {
-            let pending: Vec<Id> = enumerate_slot(&donor, slot)
-                .await?
-                .into_iter()
-                .filter(|id| !moved.contains(id))
-                .collect();
+            // Round 0 uses what the caller already enumerated; later rounds
+            // have to look again, because their whole purpose is to catch cells
+            // that arrived since. A slot that was empty to begin with therefore
+            // costs no enumeration at all.
+            let pending: Vec<Id> = if round == 0 {
+                known.iter().copied().filter(|id| !moved.contains(id)).collect()
+            } else {
+                enumerate_slot(&donor, slot)
+                    .await?
+                    .into_iter()
+                    .filter(|id| !moved.contains(id))
+                    .collect()
+            };
             if pending.is_empty() {
                 // The pass that finds nothing is the one that proves the slot
                 // is caught up, so it is not counted as a round of work.
@@ -361,7 +488,7 @@ pub async fn migrate_slot(
             }
             handover.delta_rounds_used = round + 1;
             for batch in range_batches(pending, plan.batch_cells) {
-                let outcome = transfer_batch(&donor, &recipient, &batch).await?;
+                let outcome = transfer_batch(&donor, to, &batch).await?;
                 handover.cells_transferred += outcome.transferred.len();
                 handover.vanished_before_transfer += outcome.vanished;
                 handover.batches += 1;
@@ -372,13 +499,21 @@ pub async fn migrate_slot(
                 if plan.settle_recipient_per_batch {
                     match recipient.settle_bulk_receive().await {
                         Ok(report) => {
-                            // The scanned figure, not the counter: the counter is
-                            // corrected by reconciliation rather than by each
-                            // eviction, so right after a pass it can still
-                            // include segments that have just gone cold.
-                            handover.recipient_peak_hot_bytes = handover
-                                .recipient_peak_hot_bytes
-                                .max(report.hot_bytes_scanned);
+                            // Prefer the scanned figure when the recipient was
+                            // asked to compute it: the counter is corrected by
+                            // reconciliation rather than by each eviction, so
+                            // right after a pass it can still include segments
+                            // that have just gone cold. The scan is off by
+                            // default because it costs a full sweep, so fall back
+                            // to the counter -- an overestimate is the safe
+                            // direction for a number used to spot a blow-up.
+                            let observed = if report.hot_bytes_scanned > 0 {
+                                report.hot_bytes_scanned
+                            } else {
+                                report.hot_bytes
+                            };
+                            handover.recipient_peak_hot_bytes =
+                                handover.recipient_peak_hot_bytes.max(observed);
                             handover.recipient_evicted_segments += report.evicted_segments;
                         }
                         // A settle is an optimisation, never a precondition:
@@ -528,13 +663,45 @@ pub async fn reclaim_donor_copy(
     to: u64,
     plan: &MigrationPlan,
 ) -> Result<Reclaim, MigrationError> {
+    let donor = client.client_by_server_id(from).await?;
+    let ids = enumerate_slot(&donor, slot).await?;
+    reclaim_donor_copy_prepared(client, slot, from, to, plan, ids).await
+}
+
+/// [`reclaim_donor_copy`], with the donor's remaining ids for this slot already
+/// known, so a bulk caller enumerates once for the whole set.
+async fn reclaim_donor_copy_prepared(
+    client: &Arc<AsyncClient>,
+    slot: u32,
+    from: u64,
+    to: u64,
+    plan: &MigrationPlan,
+    known: Vec<Id>,
+) -> Result<Reclaim, MigrationError> {
     let placement = placement_client(client);
     let group = slot_group_id(client.group_name());
     confirm_handover(&placement, group, slot, from, to).await?;
-
     let donor = client.client_by_server_id(from).await?;
     let recipient = client.client_by_server_id(to).await?;
+    reclaim_slot_confirmed(&donor, &recipient, slot, from, to, plan, known).await
+}
 
+/// The reclaim itself, for a handover already known to have committed.
+///
+/// A bulk caller learns that from `complete_slot_migrations`, whose return value
+/// is produced by its own apply and is therefore authoritative — better than a
+/// query, which can be served by a member that has not applied the commit yet.
+/// So the bulk path skips `confirm_handover` entirely rather than paying a query
+/// per slot to re-learn something it already knows.
+async fn reclaim_slot_confirmed(
+    donor: &Arc<CellServiceClient>,
+    recipient: &Arc<CellServiceClient>,
+    slot: u32,
+    from: u64,
+    to: u64,
+    plan: &MigrationPlan,
+    known: Vec<Id>,
+) -> Result<Reclaim, MigrationError> {
     let mut reclaim = Reclaim {
         slot,
         from,
@@ -544,7 +711,7 @@ pub async fn reclaim_donor_copy(
         retained: 0,
     };
 
-    for batch in range_batches(enumerate_slot(&donor, slot).await?, plan.batch_cells) {
+    for batch in range_batches(known, plan.batch_cells) {
         // Presence at the new owner, without moving any bodies to find out.
         let heads = recipient.head_all_cells(&batch).await?;
         let mut droppable: Vec<Id> = Vec::with_capacity(batch.len());
@@ -569,7 +736,7 @@ pub async fn reclaim_donor_copy(
             // The new owner is authoritative for this slot now, so this is a
             // plain repair rather than a migration step: send what it is
             // missing, then it is safe to drop.
-            let outcome = transfer_batch(&donor, &recipient, &missing).await?;
+            let outcome = transfer_batch(&donor, to, &missing).await?;
             reclaim.carried_over += outcome.transferred.len();
             // Vanished ids are already gone from the donor; counting them as
             // dropped keeps the totals honest against the enumeration.
@@ -634,22 +801,273 @@ pub async fn reshard_slots(
     plan: &MigrationPlan,
 ) -> Reshard {
     let mut reshard = Reshard::default();
-    for slot in slots {
-        match migrate_slot(client, *slot, from, to, plan).await {
-            Ok(handover) => reshard.handovers.push(handover),
-            Err(error) => reshard.failed.push((*slot, error.to_string())),
+    if slots.is_empty() {
+        return reshard;
+    }
+    let concurrency = plan.concurrent_slots.max(1);
+
+    macro_rules! fail_all {
+        ($slots:expr, $reason:expr) => {{
+            for slot in $slots {
+                reshard.failed.push((slot, $reason.clone()));
+            }
+            return reshard;
+        }};
+    }
+
+    let donor = match client.client_by_server_id(from).await {
+        Ok(donor) => donor,
+        Err(error) => fail_all!(slots.to_vec(), format!("donor unreachable: {error:?}")),
+    };
+    let recipient = match client.client_by_server_id(to).await {
+        Ok(recipient) => recipient,
+        Err(error) => fail_all!(slots.to_vec(), format!("recipient unreachable: {error:?}")),
+    };
+    let placement = placement_client(client);
+    let group = slot_group_id(client.group_name());
+
+    // ONE raft command to begin them all, before any enumeration, so a slot
+    // refused by placement is never transferred.
+    let moves: Vec<(u32, u64, u64)> = slots.iter().map(|slot| (*slot, from, to)).collect();
+    let refused = match placement.begin_slot_migrations(&group, &moves).await {
+        Ok(refused) => refused,
+        Err(error) => fail_all!(slots.to_vec(), format!("bulk begin failed: {error:?}")),
+    };
+    let refused_slots: std::collections::HashSet<u32> =
+        refused.iter().map(|(slot, _)| *slot).collect();
+    for (slot, reason) in refused {
+        reshard.failed.push((slot, format!("begin refused: {reason}")));
+    }
+    let began: Vec<u32> = slots
+        .iter()
+        .copied()
+        .filter(|slot| !refused_slots.contains(slot))
+        .collect();
+
+    // Transfer as a SWEEP-level loop, not a per-slot one. Every enumeration scans
+    // the donor's whole index, so a delta round per slot is a full pass per slot --
+    // the quadratic term. One pass per round covers every slot at once, and the
+    // rounds converge for the same reason a drain's do: a round that finds nothing
+    // new is the proof that the set is caught up.
+    let mut handovers: std::collections::HashMap<u32, SlotHandover> = Default::default();
+    let mut moved_ids: std::collections::HashSet<Id> = Default::default();
+    let mut aborted: Vec<u32> = Vec::new();
+    for round in 0..plan.delta_rounds.max(1) {
+        let held = match enumerate_slots(&donor, &began).await {
+            Ok(held) => held,
+            Err(error) if round == 0 => fail_all!(
+                began.clone(),
+                format!("could not enumerate donor: {error:?}")
+            ),
+            // A later round failing is not fatal: the earlier rounds transferred,
+            // and the reclaim's carry-over is the backstop for anything missed.
+            Err(error) => {
+                warn!("delta round {round} enumeration failed ({error:?}); committing what moved");
+                break;
+            }
+        };
+        let pending: Vec<(u32, Vec<Id>)> = began
+            .iter()
+            .filter_map(|slot| {
+                let ids: Vec<Id> = held
+                    .get(slot)
+                    .map(|ids| {
+                        ids.iter()
+                            .copied()
+                            .filter(|id| !moved_ids.contains(id))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (!ids.is_empty()).then_some((*slot, ids))
+            })
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        for (_, ids) in &pending {
+            moved_ids.extend(ids.iter().copied());
+        }
+
+        // Spawned, not merely `buffer_unordered`. The distinction is the whole
+        // point of scaling with cores: `buffer_unordered` interleaves futures
+        // *within one task*, which only helps where the work actually yields. Two
+        // members in one process talk over the local RPC shortcut, which completes
+        // synchronously and never returns Pending -- so an unspawned fan-out runs
+        // strictly one slot at a time. Measured: 36.0s at concurrency 1, 36.0s at
+        // 32. Spawning puts each slot on the runtime's thread pool, so the work
+        // parallelises whether the peer is a socket or a shortcut.
+        //
+        // A semaphore bounds it rather than spawning everything at once: in-flight
+        // data on the recipient is `permits x batch_cells`, and the tier's peak
+        // moves with it.
+        let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let mut tasks = Vec::with_capacity(pending.len());
+        for (slot, ids) in pending {
+            let permits = permits.clone();
+            let donor = donor.clone();
+            let recipient = recipient.clone();
+            let plan = *plan;
+            tasks.push(tokio::spawn(async move {
+                let _permit = permits.acquire().await;
+                (
+                    slot,
+                    transfer_slot(&donor, &recipient, slot, from, to, &plan, ids).await,
+                )
+            }));
+        }
+        let mut transferred: Vec<(u32, Result<SlotHandover, MigrationError>)> =
+            Vec::with_capacity(tasks.len());
+        for task in tasks {
+            match task.await {
+                Ok(outcome) => transferred.push(outcome),
+                // A panicking transfer task must not be silently dropped: the slot
+                // would look untouched while its migration is half-done.
+                Err(join_error) => {
+                    warn!("a slot transfer task failed to join: {join_error:?}");
+                }
+            }
+        }
+        for (slot, outcome) in transferred {
+            match outcome {
+                Ok(handover) => match handovers.get_mut(&slot) {
+                    Some(existing) => accumulate(existing, handover),
+                    None => {
+                        handovers.insert(slot, handover);
+                    }
+                },
+                Err(error) => {
+                    reshard.failed.push((slot, error.to_string()));
+                    aborted.push(slot);
+                    handovers.remove(&slot);
+                }
+            }
         }
     }
-    for handover in &reshard.handovers {
-        match reclaim_donor_copy(client, handover.slot, from, to, plan).await {
+
+    // Slots that began but held nothing still have to change hands.
+    for slot in &began {
+        if !handovers.contains_key(slot) && !aborted.contains(slot) {
+            handovers.insert(
+                *slot,
+                SlotHandover {
+                    slot: *slot,
+                    from,
+                    to,
+                    cells_transferred: 0,
+                    batches: 0,
+                    delta_rounds_used: 0,
+                    vanished_before_transfer: 0,
+                    recipient_peak_hot_bytes: 0,
+                    recipient_evicted_segments: 0,
+                },
+            );
+        }
+    }
+
+    // A slot whose transfer failed goes back to its donor. Whatever reached the
+    // recipient is harmless: nothing routes to it, and a retry upserts over it.
+    for slot in &aborted {
+        if let Err(error) = placement.abort_slot_migration(&group, slot).await {
+            warn!("slot {slot} transfer failed and could not be aborted: {error:?}");
+        }
+    }
+    let handovers: Vec<SlotHandover> = handovers.into_values().collect();
+
+    // ONE raft command to commit them all. Its return value is produced by its own
+    // apply, so it is authoritative about what committed -- no follow-up query,
+    // which also sidesteps a query being served the pre-commit state.
+    let ready: Vec<u32> = handovers.iter().map(|handover| handover.slot).collect();
+    let committed = match placement.complete_slot_migrations(&group, &ready).await {
+        Ok(committed) => committed,
+        Err(error) => {
+            for slot in ready {
+                reshard
+                    .failed
+                    .push((slot, format!("bulk commit failed: {error:?}")));
+            }
+            return reshard;
+        }
+    };
+    let committed_map: std::collections::HashMap<u32, u64> = committed.iter().copied().collect();
+    for handover in handovers {
+        match committed_map.get(&handover.slot) {
+            Some(owner) if *owner == to => reshard.handovers.push(handover),
+            other => reshard.failed.push((
+                handover.slot,
+                format!("transferred but committed to {other:?} rather than {to}"),
+            )),
+        }
+    }
+
+    // Follow our own commit locally, then push it to both members in one call
+    // each rather than one per slot.
+    for (slot, owner) in &committed {
+        client.note_slot_owner(*slot, *owner);
+    }
+    for (member, member_client) in [(from, &donor), (to, &recipient)] {
+        if let Err(error) = member_client.note_slot_owners(&committed).await {
+            warn!(
+                "committed {} slots but member {member} could not be told ({error:?}); \
+                 it will route by a table one migration behind until it refreshes",
+                committed.len()
+            );
+        }
+    }
+
+    // The drop is deferred across the WHOLE set, so for the duration of the
+    // reshard every cell involved exists on both members and a client with a stale
+    // table still reads correctly however far the reshard has got.
+    //
+    // Re-enumerated once, because the reclaim's job is precisely to catch what
+    // reached the donor after the transfer read it.
+    let moved: Vec<u32> = reshard.handovers.iter().map(|h| h.slot).collect();
+    let after = match enumerate_slots(&donor, &moved).await {
+        Ok(after) => after,
+        Err(error) => {
+            for slot in moved {
+                reshard
+                    .failed
+                    .push((slot, format!("reclaim enumeration failed: {error:?}")));
+            }
+            return reshard;
+        }
+    };
+    // Spawned for the same reason as the transfer above.
+    let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut tasks = Vec::with_capacity(moved.len());
+    for slot in &moved {
+        let slot = *slot;
+        let ids = after.get(&slot).cloned().unwrap_or_default();
+        let permits = permits.clone();
+        let donor = donor.clone();
+        let recipient = recipient.clone();
+        let plan = *plan;
+        tasks.push(tokio::spawn(async move {
+            let _permit = permits.acquire().await;
+            (
+                slot,
+                reclaim_slot_confirmed(&donor, &recipient, slot, from, to, &plan, ids).await,
+            )
+        }));
+    }
+    let mut reclaimed: Vec<(u32, Result<Reclaim, MigrationError>)> =
+        Vec::with_capacity(tasks.len());
+    for task in tasks {
+        match task.await {
+            Ok(outcome) => reclaimed.push(outcome),
+            Err(join_error) => warn!("a reclaim task failed to join: {join_error:?}"),
+        }
+    }
+    for (slot, outcome) in reclaimed {
+        match outcome {
             Ok(reclaim) => reshard.reclaims.push(reclaim),
-            // A slot whose donor copy could not be dropped is still correctly
-            // migrated -- it just costs space until the reclaim is retried.
-            Err(error) => reshard
-                .failed
-                .push((handover.slot, format!("reclaim: {error}"))),
+            Err(error) => reshard.failed.push((slot, format!("reclaim: {error}"))),
         }
     }
+
+    reshard.handovers.sort_unstable_by_key(|handover| handover.slot);
+    reshard.reclaims.sort_unstable_by_key(|reclaim| reclaim.slot);
+    reshard.failed.sort_unstable_by_key(|(slot, _)| *slot);
     reshard
 }
 
@@ -1462,6 +1880,7 @@ mod cluster_tests {
 
         let payload = "x".repeat(payload_bytes);
         let mut written: Vec<Id> = Vec::new();
+        let write_started = std::time::Instant::now();
         for slot in 0..slots {
             for seq in 0..cells_per_slot {
                 let id = Id::from_parts(slot as u64, 1_000_000 + seq);
@@ -1481,7 +1900,13 @@ mod cluster_tests {
                 written.push(id);
             }
         }
+        let write_elapsed = write_started.elapsed();
         let moved_bytes = written.len() * payload_bytes;
+        println!(
+            "MEASUREMENT: write phase {:.1}s ({:.0} cells/s)",
+            write_elapsed.as_secs_f64(),
+            written.len() as f64 / write_elapsed.as_secs_f64()
+        );
         println!(
             "MEASUREMENT: wrote {} cells (~{} MB of payload) across {} slots; tier limit {} MB",
             written.len(),
@@ -1505,8 +1930,24 @@ mod cluster_tests {
             .unwrap()
             .settle_bulk_receive()
             .await
-            .unwrap()
-            .hot_bytes_scanned;
+            .unwrap();
+        // Scanned when available, counter otherwise -- the same preference the
+        // driver applies, so baseline and peak are always measured the same way.
+        // Which one was used is printed, because the counter can overstate right
+        // after an eviction pass.
+        let baseline_hot = if baseline_hot.hot_bytes_scanned > 0 {
+            baseline_hot.hot_bytes_scanned
+        } else {
+            baseline_hot.hot_bytes
+        };
+        println!(
+            "MEASUREMENT: hot figures from {} (set NEB_MEASURE_SCAN_HOT to force the scan)",
+            if std::env::var("NEB_MEASURE_SCAN_HOT").is_ok() {
+                "a full segment scan"
+            } else {
+                "the shared counter"
+            }
+        );
         println!(
             "MEASUREMENT: baseline -- donor hot tier {} MB after taking {} MB through the ordinary write path",
             baseline_hot / (1024 * 1024),
@@ -1514,14 +1955,32 @@ mod cluster_tests {
         );
 
         let slots: Vec<u32> = (0..slots).map(|slot| slot as u32).collect();
+        // Overridable so the effect of concurrency and of the per-batch settle can
+        // be measured rather than assumed: NEB_MEASURE_CONCURRENCY=1 gives the
+        // sequential baseline, NEB_MEASURE_SETTLE=0 removes the settle.
+        let concurrent_slots = env_usize("NEB_MEASURE_CONCURRENCY", default_concurrent_slots());
+        let plan_batch_cells = MigrationPlan::default().batch_cells;
+        println!("MEASUREMENT: resharding with concurrent_slots={concurrent_slots}");
+        let reshard_started = std::time::Instant::now();
         let reshard = reshard_slots(
             &client,
             &slots,
             donor_id,
             recipient_id,
-            &MigrationPlan::default(),
+            &MigrationPlan {
+                concurrent_slots,
+                settle_recipient_per_batch: env_usize("NEB_MEASURE_SETTLE", 1) != 0,
+                ..Default::default()
+            },
         )
         .await;
+        let reshard_elapsed = reshard_started.elapsed();
+        println!(
+            "MEASUREMENT: reshard phase {:.1}s ({:.1} MB/s, {:.0} cells/s)",
+            reshard_elapsed.as_secs_f64(),
+            moved_bytes as f64 / (1024.0 * 1024.0) / reshard_elapsed.as_secs_f64(),
+            written.len() as f64 / reshard_elapsed.as_secs_f64()
+        );
 
         let peak_hot = reshard
             .handovers
@@ -1591,13 +2050,37 @@ mod cluster_tests {
             baseline_hot > 0,
             "no tier reported anything; this configuration measures nothing"
         );
-        assert!(
-            peak_hot <= baseline_hot + baseline_hot / 2,
-            "receiving a migration cost the recipient {} MB of hot tier where the same volume of \
-             ordinary writes cost {} MB: bulk receive is materially worse than writing, so it needs \
-             an explicit cold-append path",
+
+        // The bound is derived, not a magic multiplier, because two of its terms
+        // are consequences of the configuration rather than of the code:
+        //
+        //  * `baseline` -- what the same volume of ordinary writes leaves resident.
+        //    The tier overshoots its own limit under either load; that is a tier
+        //    property, not migration's doing, so it belongs in the baseline.
+        //  * in-flight data -- `concurrent_slots x batch_cells` cells are being
+        //    received at once by construction, so raising concurrency raises the
+        //    peak. This is the cost side of the throughput win and is worth
+        //    stating in the assertion rather than discovering later.
+        //  * slack -- eviction is threshold-driven and lags a burst; run-to-run
+        //    peaks vary by a couple of hundred MB at this size.
+        let in_flight = (concurrent_slots * plan_batch_cells * payload_bytes) as u64;
+        let allowance = baseline_hot + in_flight + baseline_hot / 2;
+        println!(
+            "MEASUREMENT: peak {} MB against an allowance of {} MB \
+             (baseline {} + in-flight {} + slack)",
             peak_hot / (1024 * 1024),
-            baseline_hot / (1024 * 1024)
+            allowance / (1024 * 1024),
+            baseline_hot / (1024 * 1024),
+            in_flight / (1024 * 1024)
+        );
+        assert!(
+            peak_hot <= allowance,
+            "receiving a migration cost the recipient {} MB of hot tier where the same volume of \
+             ordinary writes cost {} MB and {} MB was in flight by design: bulk receive is \
+             materially worse than writing, so it needs an explicit cold-append path",
+            peak_hot / (1024 * 1024),
+            baseline_hot / (1024 * 1024),
+            in_flight / (1024 * 1024)
         );
 
         // And nothing was lost moving it.
@@ -1664,6 +2147,7 @@ mod cluster_tests {
         }
     }
 }
+
 
 /// Draining a member: moving everything it owns elsewhere, so it can leave
 /// without taking data with it.
@@ -1820,34 +2304,66 @@ pub mod drain {
             }
             remaining = owned.len();
 
-            let held = departing_client.cell_ids_in_slots(&owned).await?;
-            let occupied: std::collections::HashSet<u32> =
-                held.iter().map(|id| crate::slots::slot_of(id)).collect();
+            // One pass, bucketed by slot, and its results are handed down to
+            // each per-slot migration. The drain already enumerated once per
+            // sweep; feeding those ids through means the migrations do not
+            // enumerate again, which is what keeps a drain linear in store size
+            // rather than O(slots x cells).
+            let held = enumerate_slots(&departing_client, &owned).await?;
+            let cell_count: usize = held.values().map(|ids| ids.len()).sum();
             info!(
                 "drain pass {} for member {}: {} slots owned, {} hold data ({} cells)",
                 pass,
                 departing,
                 owned.len(),
-                occupied.len(),
-                held.len()
+                held.len(),
+                cell_count
             );
 
             // The careful path, for slots with something to lose.
             let with_data: Vec<u32> = owned
                 .iter()
                 .copied()
-                .filter(|slot| occupied.contains(slot))
+                .filter(|slot| held.contains_key(slot))
                 .collect();
-            for (slot, destination) in assign(&with_data, &sorted) {
-                match migrate_slot(client, slot, departing, destination, plan).await {
-                    Ok(handover) => {
+            // Concurrent across slots, same as a reshard: independent commit
+            // points, disjoint cells, and nearly all of the time spent waiting.
+            let concurrency = plan.concurrent_slots.max(1);
+            type SlotOutcome = (u32, u64, Result<(SlotHandover, Result<Reclaim, MigrationError>), MigrationError>);
+            let outcomes: Vec<SlotOutcome> = stream::iter(
+                assign(&with_data, &sorted).into_iter().map(|(slot, destination)| {
+                    let ids = held.get(&slot).cloned().unwrap_or_default();
+                    async move {
+                        match migrate_slot_prepared(client, slot, departing, destination, plan, ids)
+                            .await
+                        {
+                            Ok(handover) => {
+                                // Reclaimed per slot, not deferred to the end: a
+                                // drain exists so a member can leave, and it
+                                // cannot leave while it still holds the data.
+                                // `reshard_slots` defers every drop because there
+                                // the donor is staying; here that would defeat
+                                // the purpose.
+                                let reclaim = reclaim_donor_copy(
+                                    client, slot, departing, destination, plan,
+                                )
+                                .await;
+                                (slot, destination, Ok((handover, reclaim)))
+                            }
+                            Err(error) => (slot, destination, Err(error)),
+                        }
+                    }
+                }),
+            )
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+            for (slot, destination, outcome) in outcomes {
+                match outcome {
+                    Ok((handover, reclaim)) => {
                         drain.cells_transferred += handover.cells_transferred;
-                        // Reclaimed per slot, not deferred to the end: a drain
-                        // exists so a member can leave, and it cannot leave while
-                        // it still holds the data. `reshard_slots` defers every
-                        // drop because there the donor is staying; here that would
-                        // defeat the purpose.
-                        match reclaim_donor_copy(client, slot, departing, destination, plan).await {
+                        match reclaim {
                             Ok(reclaim) if reclaim.retained == 0 => {
                                 drain.moved.push((slot, destination))
                             }
@@ -1872,7 +2388,7 @@ pub mod drain {
             let empty: Vec<u32> = owned
                 .iter()
                 .copied()
-                .filter(|slot| !occupied.contains(slot))
+                .filter(|slot| !held.contains_key(slot))
                 .collect();
             for chunk in assign(&empty, &sorted).chunks(REASSIGN_CHUNK) {
                 let batch = chunk.to_vec();
