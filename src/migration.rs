@@ -1237,6 +1237,118 @@ mod cluster_tests {
         assert!(handover.cells_transferred >= 20);
     }
 
+    /// A drained member owns nothing and has lost nothing.
+    ///
+    /// The safety property Phase 3 exists for: a *planned* departure never loses
+    /// data. Both halves are asserted, because either alone is worthless -- a
+    /// member that owns nothing because its data was dropped would satisfy the
+    /// first half and be a catastrophe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn draining_a_member_moves_everything_it_owns_and_loses_nothing() {
+        let (servers, client) = start_pair("migration_drain_test").await;
+        let departing = servers[0].server_id;
+        let remaining = servers[1].server_id;
+
+        // Several slots with several cells each, so the drain has to enumerate
+        // and move a set rather than a single lucky slot.
+        const SLOTS: [u16; 4] = [201, 202, 203, 204];
+        let mut expected: HashSet<Id> = HashSet::new();
+        for slot in SLOTS {
+            for seq in 0..4 {
+                let (id, cell) = cell_in_slot(slot, seq, "drain");
+                client.write_cell(cell).await.unwrap().unwrap();
+                expected.insert(id);
+            }
+        }
+        assert!(!crate::migration::drain::owns_nothing(&client, departing)
+            .await
+            .unwrap());
+
+        let drain = crate::migration::drain::drain_member(
+            &client,
+            departing,
+            &[remaining],
+            &MigrationPlan::default(),
+        )
+        .await
+        .expect("the drain should run");
+
+        assert!(
+            drain.is_complete(),
+            "drain left slots stranded: {:?}",
+            drain.stranded
+        );
+        // Every slot the member owned moved, which in a two-member cluster is the
+        // whole space -- the four holding data through the careful path and the
+        // rest in bulk. Asserting the total is what catches a split that silently
+        // drops the empty majority.
+        assert_eq!(drain.moved.len(), crate::slots::SLOT_COUNT);
+        assert_eq!(drain.cells_transferred, expected.len());
+
+        // Owns nothing -- read back from the state machine, not from the report.
+        assert!(crate::migration::drain::owns_nothing(&client, departing)
+            .await
+            .unwrap());
+
+        // And every cell survived, readable through the ordinary hashed path.
+        for id in &expected {
+            let cell = client.read_cell(*id).await.unwrap().unwrap_or_else(|error| {
+                panic!("{id:?} was lost by the drain: {error:?}")
+            });
+            assert_eq!(cell.header.id, *id);
+        }
+        // The departing member holds none of it.
+        for slot in SLOTS {
+            assert!(held_in_slot(&servers[0], slot).is_empty());
+        }
+        let received: HashSet<Id> = SLOTS
+            .iter()
+            .flat_map(|slot| held_in_slot(&servers[1], *slot))
+            .collect();
+        assert_eq!(received, expected);
+    }
+
+    /// A drain with nowhere to send data refuses, rather than half-emptying a
+    /// member and reporting success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_with_no_destination_refuses() {
+        let (servers, client) = start_pair("migration_drain_refusal_test").await;
+        let departing = servers[0].server_id;
+
+        const SLOT: u16 = 211;
+        let (id, cell) = cell_in_slot(SLOT, 1, "kept");
+        client.write_cell(cell).await.unwrap().unwrap();
+
+        assert!(matches!(
+            crate::migration::drain::drain_member(
+                &client,
+                departing,
+                &[],
+                &MigrationPlan::default()
+            )
+            .await,
+            Err(MigrationError::Invalid(_))
+        ));
+        // Draining onto itself is not a drain either.
+        assert!(matches!(
+            crate::migration::drain::drain_member(
+                &client,
+                departing,
+                &[departing],
+                &MigrationPlan::default()
+            )
+            .await,
+            Err(MigrationError::Invalid(_))
+        ));
+
+        // Nothing moved and nothing was lost.
+        assert!(!crate::migration::drain::owns_nothing(&client, departing)
+            .await
+            .unwrap());
+        assert_eq!(held_in_slot(&servers[0], SLOT), HashSet::from([id]));
+        client.read_cell(id).await.unwrap().unwrap();
+    }
+
     /// MEASUREMENT, not a unit test. Run explicitly, on a machine with room:
     ///
     /// ```text
@@ -1535,5 +1647,284 @@ mod cluster_tests {
             assert_eq!(client.locate_server_id(id).unwrap(), recipient_id);
             client.read_cell(*id).await.unwrap().unwrap();
         }
+    }
+}
+
+/// Draining a member: moving everything it owns elsewhere, so it can leave
+/// without taking data with it.
+///
+/// This is the phase that turns a planned departure into a safe one, and it is
+/// deliberately built before any automatic rebalancing, because its policy is
+/// trivial and unambiguous — *all* of this member's slots, spread over whoever
+/// is left — while auto-balance is an optimisation with a scheduling policy that
+/// can be got wrong.
+///
+/// It is genuinely symmetric with growing the cluster, which is the second
+/// payoff of storing placement: nothing is recomputed, so the only slots that
+/// move are the ones being drained.
+///
+/// **Ungraceful loss is still loss.** There is no replication anywhere in Neb, so
+/// a member that vanishes takes its slots' data with it and no amount of
+/// draining afterwards can help. What this guarantees is narrower and worth
+/// stating exactly: a member that is drained *first* loses nothing.
+pub mod drain {
+    use super::*;
+
+    /// What draining one member did.
+    #[derive(Debug, Default)]
+    pub struct Drain {
+        pub departing: u64,
+        /// Slots successfully handed over, with their new owner.
+        pub moved: Vec<(u32, u64)>,
+        /// Slots still owned by the departing member, with why. **Non-empty means
+        /// it is not safe to remove the member.**
+        pub stranded: Vec<(u32, String)>,
+        pub cells_transferred: usize,
+    }
+
+    impl Drain {
+        /// Whether the departing member can now be removed without losing data.
+        ///
+        /// The only question that matters, and the reason it is a method rather
+        /// than left to the caller to work out from two vectors.
+        pub fn is_complete(&self) -> bool {
+            self.stranded.is_empty()
+        }
+    }
+
+    /// Spread a departing member's slots over the remaining ones.
+    ///
+    /// Round-robin over the destinations in a stable order, so the assignment is
+    /// reproducible and an interrupted drain resumed later makes the same choices
+    /// for the slots it has left.
+    fn assign(slots: &[u32], destinations: &[u64]) -> Vec<(u32, u64)> {
+        slots
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| (*slot, destinations[index % destinations.len()]))
+            .collect()
+    }
+
+    /// How many empty slots to reassign per raft command.
+    ///
+    /// The whole table is 32768 entries; proposing it as one command makes a
+    /// ~400 KB raft entry. Chunking keeps entries small, and because each chunk
+    /// only moves slots still stable on the departing member, a partly applied
+    /// drain is not a broken one -- the next pass picks up whatever is left.
+    const REASSIGN_CHUNK: usize = 4096;
+
+    /// How many times to sweep before giving up.
+    ///
+    /// A drain is written as a convergent loop rather than a single pass, and
+    /// that shape earns its keep three separate ways: a placement *query* can be
+    /// served by a member that has not applied the command we just committed
+    /// (see `AsyncClient::note_slot_owner`), a cell can be written to a slot
+    /// after we enumerated it, and an individual transfer can fail for its own
+    /// reasons. All three look identical from here -- the member still owns
+    /// something -- and all three are answered by sweeping again.
+    const DRAIN_PASSES: usize = 6;
+
+    /// Move every slot a member owns to the other members, then report whether it
+    /// is safe to remove.
+    ///
+    /// Does **not** remove the member from the group. That is the caller's step
+    /// and it must be gated on [`Drain::is_complete`], which is the entire safety
+    /// property this exists to establish. Splitting them is deliberate: a drain
+    /// that half-succeeded should leave a cluster that is correct and still has
+    /// all its data, not one that has already said goodbye.
+    ///
+    /// ## Two paths, because a drain has two quite different jobs
+    ///
+    /// A departing member owns every slot it was ever given, which in a small
+    /// cluster is the whole 32768-slot space -- and the great majority hold
+    /// nothing. The first version walked all of them through the full migration
+    /// sequence: ~200 000 round trips, almost all to move nothing. Correct, and
+    /// unusable. So each pass enumerates the member's cells once and splits:
+    ///
+    /// - **Slots holding data** go through `migrate_slot` + `reclaim_donor_copy`,
+    ///   unchanged. The careful path is what makes an interrupted drain safe, and
+    ///   it is used wherever there is anything to be careful about.
+    /// - **Empty slots** move in bulk via `reassign_slots`. No data to strand, so
+    ///   no commit point to protect -- and that command only moves slots still
+    ///   stable on the departing member, so it cannot steal one from a third
+    ///   member or disturb a transfer in flight.
+    pub async fn drain_member(
+        client: &Arc<AsyncClient>,
+        departing: u64,
+        destinations: &[u64],
+        plan: &MigrationPlan,
+    ) -> Result<Drain, MigrationError> {
+        if destinations.is_empty() {
+            return Err(MigrationError::Invalid(format!(
+                "cannot drain member {departing}: there is nowhere to put its slots"
+            )));
+        }
+        if destinations.contains(&departing) {
+            return Err(MigrationError::Invalid(format!(
+                "member {departing} cannot be a destination for its own drain"
+            )));
+        }
+
+        let placement = placement_client(client);
+        let group = slot_group_id(client.group_name());
+        let departing_client = client.client_by_server_id(departing).await?;
+
+        // Sorted and deduped so the assignment does not depend on the order a
+        // caller happened to enumerate members in.
+        let mut sorted = destinations.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut drain = Drain {
+            departing,
+            ..Default::default()
+        };
+        let mut failed: Vec<(u32, String)> = Vec::new();
+        let mut remaining = usize::MAX;
+
+        for pass in 0..DRAIN_PASSES {
+            let owned = placement
+                .slots_owned_by(&group, &departing)
+                .await
+                .map_err(|error| MigrationError::Placement(format!("{error:?}")))?;
+            if owned.is_empty() {
+                break;
+            }
+            // No progress means sweeping again will not help: either every
+            // remaining slot has a real reason to be stuck, or something is
+            // writing to this member faster than we can drain it. Either way the
+            // caller needs to see it rather than wait.
+            if owned.len() >= remaining {
+                debug!(
+                    "drain of {} made no progress on pass {} ({} slots remain)",
+                    departing,
+                    pass,
+                    owned.len()
+                );
+                break;
+            }
+            remaining = owned.len();
+
+            let held = departing_client.cell_ids_in_slots(&owned).await?;
+            let occupied: std::collections::HashSet<u32> =
+                held.iter().map(|id| crate::slots::slot_of(id)).collect();
+            info!(
+                "drain pass {} for member {}: {} slots owned, {} hold data ({} cells)",
+                pass,
+                departing,
+                owned.len(),
+                occupied.len(),
+                held.len()
+            );
+
+            // The careful path, for slots with something to lose.
+            let with_data: Vec<u32> = owned
+                .iter()
+                .copied()
+                .filter(|slot| occupied.contains(slot))
+                .collect();
+            for (slot, destination) in assign(&with_data, &sorted) {
+                match migrate_slot(client, slot, departing, destination, plan).await {
+                    Ok(handover) => {
+                        drain.cells_transferred += handover.cells_transferred;
+                        // Reclaimed per slot, not deferred to the end: a drain
+                        // exists so a member can leave, and it cannot leave while
+                        // it still holds the data. `reshard_slots` defers every
+                        // drop because there the donor is staying; here that would
+                        // defeat the purpose.
+                        match reclaim_donor_copy(client, slot, departing, destination, plan).await {
+                            Ok(reclaim) if reclaim.retained == 0 => {
+                                drain.moved.push((slot, destination))
+                            }
+                            Ok(reclaim) => failed.push((
+                                slot,
+                                format!(
+                                    "handed over to {destination} but {} cells could not be dropped",
+                                    reclaim.retained
+                                ),
+                            )),
+                            Err(error) => failed.push((
+                                slot,
+                                format!("migrated to {destination}, reclaim failed: {error}"),
+                            )),
+                        }
+                    }
+                    Err(error) => failed.push((slot, error.to_string())),
+                }
+            }
+
+            // The bulk path, for slots with nothing in them.
+            let empty: Vec<u32> = owned
+                .iter()
+                .copied()
+                .filter(|slot| !occupied.contains(slot))
+                .collect();
+            for chunk in assign(&empty, &sorted).chunks(REASSIGN_CHUNK) {
+                let batch = chunk.to_vec();
+                let moved = placement
+                    .reassign_slots(&group, &batch, &departing)
+                    .await
+                    .map_err(|error| MigrationError::Placement(format!("{error:?}")))?;
+                for (slot, destination) in batch.into_iter().take(moved) {
+                    drain.moved.push((slot, destination));
+                }
+            }
+        }
+
+        // Whatever is still owned when the sweeping stops is the honest answer to
+        // "can this member leave", read from the state machine rather than
+        // inferred from what we believe we did.
+        let still_owned = placement
+            .slots_owned_by(&group, &departing)
+            .await
+            .map_err(|error| MigrationError::Placement(format!("{error:?}")))?;
+        drain.moved.sort_unstable();
+        drain.moved.dedup();
+        drain.moved.retain(|(slot, _)| !still_owned.contains(slot));
+        for slot in still_owned {
+            let reason = failed
+                .iter()
+                .find(|(stranded, _)| *stranded == slot)
+                .map(|(_, reason)| reason.clone())
+                .unwrap_or_else(|| "still owned after the drain".to_string());
+            drain.stranded.push((slot, reason));
+        }
+
+        if drain.is_complete() {
+            info!(
+                "member {} drained: {} slots moved, {} cells transferred; safe to remove",
+                departing,
+                drain.moved.len(),
+                drain.cells_transferred
+            );
+        } else {
+            warn!(
+                "member {} is NOT drained: {} slots moved but {} remain. \
+                 Do not remove it -- retry the drain instead.",
+                departing,
+                drain.moved.len(),
+                drain.stranded.len()
+            );
+        }
+        Ok(drain)
+    }
+
+    /// Confirm from the state machine that a member owns nothing.
+    ///
+    /// The gate to check before removing a member, and it deliberately re-reads
+    /// placement rather than trusting a [`Drain`] the caller is holding: that
+    /// report describes what one drain did, while this answers the question that
+    /// actually matters, which is whether anything is still there *now*.
+    pub async fn owns_nothing(
+        client: &Arc<AsyncClient>,
+        member: u64,
+    ) -> Result<bool, MigrationError> {
+        let placement = placement_client(client);
+        let group = slot_group_id(client.group_name());
+        Ok(placement
+            .slots_owned_by(&group, &member)
+            .await
+            .map_err(|error| MigrationError::Placement(format!("{error:?}")))?
+            .is_empty())
     }
 }
