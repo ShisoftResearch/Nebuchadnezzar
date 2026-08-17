@@ -1022,6 +1022,19 @@ pub async fn init_conshash(
                     reason
                 ),
             }
+            // Install the table into the ring object itself, so every consumer of
+            // this `ConsistentHashing` gets one answer for "who owns this cell".
+            // Leaving it out of here and reading it only in the client is what
+            // gives a cluster two placement oracles -- and a write and a read
+            // that pick different ones do not fail, they lose the data.
+            match crate::slots::load_owner_vec(group_name, raft_client, SLOTS_SM_ID).await {
+                Ok(Some(owners)) => ch.set_slot_overrides(Some(owners)),
+                Ok(None) => debug!("no slot placement table for this group; routing by the ring"),
+                Err(reason) => warn!(
+                    "could not load the slot placement table ({}); routing by the ring",
+                    reason
+                ),
+            }
             return Ok(ch);
         }
         Err(e) => {
@@ -2177,8 +2190,14 @@ impl NebServer {
         .await
     }
 
+    /// Which member holds this cell.
+    ///
+    /// Through the slot-aware call, not the raw ring: this is asked by code that
+    /// then goes and reads or writes the cell, so it has to give the same answer
+    /// the write path gave. Before the slot table this distinction did not exist;
+    /// with it, a site left on `get_server_id` is a second placement oracle.
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
-        self.consh.get_server_id(id.locality() as u64)
+        self.consh.get_server_id_for_slot(id.locality() as u64)
     }
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
         self.member_pool
@@ -2196,6 +2215,42 @@ impl NebServer {
     }
     pub fn conshash(&self) -> &ConsistentHashing {
         &*self.consh
+    }
+
+    /// Re-read the slot placement table into this server's ring and into every
+    /// database client it hosts.
+    ///
+    /// This is how a member catches up on a migration it did not perform. The
+    /// committer already knows the new owner and applies it directly; everyone
+    /// else has to be told, and until they are they route by a table that is one
+    /// migration behind. That window is survivable only because a migration
+    /// defers dropping the donor's copy, so a stale member still reads correct
+    /// data -- it is a latency problem, not a data one.
+    ///
+    /// Returns whether the table was read successfully. A failure leaves the
+    /// current table in place rather than clearing it: clearing would fall back
+    /// to the ring, which is the answer the table exists to override.
+    pub async fn refresh_slot_placement(&self) -> bool {
+        match crate::slots::load_owner_vec(&self.group_name, &self.raft_client, SLOTS_SM_ID).await {
+            Ok(owners) => {
+                self.consh.set_slot_overrides(owners);
+                // Each database client builds its own ring object, so refreshing
+                // only `self.consh` would leave the read and write paths of this
+                // very server disagreeing.
+                for (_name, runtime) in lightning::map::Map::entries(&self.database_runtimes) {
+                    runtime.neb_client.reload_slot_owners().await;
+                }
+                true
+            }
+            Err(reason) => {
+                warn!(
+                    "could not refresh slot placement for group {} ({}); \
+                     keeping the table this server already has",
+                    self.group_name, reason
+                );
+                false
+            }
+        }
     }
     pub fn raft_client(&self) -> &RaftClient {
         &*self.raft_client
@@ -2223,7 +2278,9 @@ pub async fn rpc_client_by_id(
     id: &Id,
     conshash: &Arc<ConsistentHashing>,
 ) -> Result<Arc<RPCClient>, RPCError> {
-    let server_id = conshash.get_server_id(id.locality() as u64).unwrap();
+    let server_id = conshash
+        .get_server_id_for_slot(id.locality() as u64)
+        .unwrap();
     let conshash = conshash.clone();
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |sid| conshash.to_server_name(sid))

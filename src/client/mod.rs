@@ -54,65 +54,11 @@ pub enum NebClientError {
 
 pub struct AsyncClient {
     pub conshash: Arc<ConsistentHashing>,
-    /// Slot -> owning server, indexed by slot; 0 means "not placed".
-    ///
-    /// `None` means the table has never been seeded for this group, and
-    /// placement falls back to the ring. That is a different answer from a
-    /// table of zeroes, which would claim nothing is placed anywhere.
-    ///
-    /// A `RwLock` rather than a lock-free cell because this is written at most
-    /// once per migration and read once per cell lookup; the read is
-    /// uncontended in practice and swapping it for something lock-free is a
-    /// measurement away, not a guess away.
-    slot_owners: parking_lot::RwLock<Option<Vec<u64>>>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient,
     pub database_catalog_client: DatabaseCatalogClient,
     pub group_name: String,
     pub database_name: String,
-}
-
-/// Load the placement table as a slot-indexed vector, or `None` when the group
-/// has no table.
-///
-/// Flattening to a vector here rather than keeping the map is deliberate: this
-/// is read once per cell lookup, so the representation should be an index, not
-/// a hash. A slot with no owner stays 0 and the caller falls back to the ring.
-///
-/// `Ok(None)` means the group genuinely has no table; `Err` means we could not
-/// find out. Callers must distinguish them, because the safe answer differs:
-/// no table means route by the ring, while a failed query means keep believing
-/// whatever we already knew.
-async fn try_load_slot_owners(
-    group: &str,
-    raft_client: &Arc<RaftClient>,
-) -> Result<Option<Vec<u64>>, String> {
-    let table = crate::slots::load_table(group, raft_client, crate::server::SLOTS_SM_ID).await?;
-    Ok(table.map(|table| {
-        let mut owners = vec![0u64; crate::slots::SLOT_COUNT];
-        for (slot, state) in table {
-            if let Some(entry) = owners.get_mut(slot as usize) {
-                *entry = state.serving_owner();
-            }
-        }
-        owners
-    }))
-}
-
-/// A query failure is reported as `None`, not as an error: a client that cannot
-/// reach the placement SM should route by the ring exactly as it always did,
-/// not refuse to start.
-async fn load_slot_owners(group: &str, raft_client: &Arc<RaftClient>) -> Option<Vec<u64>> {
-    match try_load_slot_owners(group, raft_client).await {
-        Ok(owners) => owners,
-        Err(reason) => {
-            warn!(
-                "could not load the slot placement table for group {} ({}); routing by the ring",
-                group, reason
-            );
-            None
-        }
-    }
 }
 
 impl AsyncClient {
@@ -153,10 +99,31 @@ impl AsyncClient {
                                 &schema_plane_client,
                             )
                         },
-                        slot_owners: parking_lot::RwLock::new(
-                            load_slot_owners(group, &raft_client).await,
-                        ),
-                        conshash: chash,
+                        conshash: {
+                            // One placement oracle per ring object. A client
+                            // builds its own `ConsistentHashing`, so it must
+                            // install the table too -- otherwise this client
+                            // routes by the ring while the server it talks to
+                            // routes by the table.
+                            match crate::slots::load_owner_vec(
+                                group,
+                                &raft_client,
+                                crate::server::SLOTS_SM_ID,
+                            )
+                            .await
+                            {
+                                Ok(owners @ Some(_)) => chash.set_slot_overrides(owners),
+                                Ok(None) => {}
+                                // Route by the ring exactly as before rather
+                                // than refuse to start.
+                                Err(reason) => warn!(
+                                    "could not load the slot placement table for group {} ({}); \
+                                     routing by the ring",
+                                    group, reason
+                                ),
+                            }
+                            chash
+                        },
                         raft_client: raft_client.clone(),
                         database_catalog_client: {
                             let shared_plane_client =
@@ -220,30 +187,19 @@ impl AsyncClient {
     }
     /// Which server holds this id's cell.
     ///
-    /// The slot table answers when it has been seeded, and the ring answers
-    /// otherwise. That order is the whole point: the ring recomputes placement
-    /// whenever membership changes, so a cell written under one ring becomes
-    /// unaddressable under the next -- not corrupted, just looked up at a
-    /// different address than it was written to. The table does not move, so a
-    /// member joining or leaving cannot strand anything by arithmetic alone.
-    ///
-    /// Falling back rather than failing keeps a group that never seeded a table
-    /// working exactly as it did before, which is what makes this safe to
-    /// introduce.
+    /// Delegates to the ring object, which consults the stored slot table before
+    /// computing an answer. That indirection is the point: placement must have
+    /// exactly one oracle. A client that kept its own copy of the table would be
+    /// a second one, and a write routed by the table while a read routes by the
+    /// ring does not fail loudly -- it looks like the cell was never written.
     pub fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
         if id.is_unit_id() {
             return Ok(0);
         }
-        let slot = crate::slots::slot_of(id) as usize;
-        if let Some(owners) = self.slot_owners.read().as_ref() {
-            // A zero entry is an unplaced slot, not a server: fall through to
-            // the ring rather than routing to a server id that cannot exist.
-            match owners.get(slot).copied() {
-                Some(owner) if owner != 0 => return Ok(owner),
-                _ => {}
-            }
-        }
-        match self.conshash.get_server_id(id.locality() as u64) {
+        match self
+            .conshash
+            .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+        {
             Some(n) => Ok(n),
             None => Err(RPCError::IOError(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -252,49 +208,48 @@ impl AsyncClient {
         }
     }
 
-    /// Replace the cached placement table.
+    /// Replace the placement table this client's ring routes by.
     ///
-    /// Used when a migration commits. Kept explicit rather than refreshed on a
-    /// timer so that a stale table is always the result of a missed
-    /// notification, never of a poll that has not come round yet.
+    /// Kept explicit rather than refreshed on a timer so that a stale table is
+    /// always the result of a missed notification, never of a poll that has not
+    /// come round yet.
     pub fn refresh_slot_owners(&self, owners: Option<Vec<u64>>) {
-        *self.slot_owners.write() = owners;
+        self.conshash.set_slot_overrides(owners);
     }
 
-    /// Record one slot's owner in the cached table.
+    /// Record one slot's owner without re-reading the table.
     ///
-    /// Used by a migration on its own commit, and it deliberately does not
-    /// re-read the table to do it. A raft *command* returns the value its own
-    /// apply produced, but a *query* issued straight afterwards round-robins
-    /// over the members and can be served by one that has the log entry and has
-    /// not applied it yet — measured here: reading the table immediately after
-    /// `complete_slot_migration` returned the old owner, and reading it again a
+    /// Used by a migration on its own commit, and it deliberately does not read
+    /// back. A raft *command* returns the value its own apply produced, but a
+    /// *query* issued straight afterwards round-robins over the members and can
+    /// be served by one that has the log entry and has not applied it yet --
+    /// measured here: reading the table immediately after
+    /// `complete_slot_migration` returned the OLD owner, and reading it again a
     /// moment later returned the new one. So the committer applies what it
-    /// knows rather than asking, which is both authoritative and cheaper than
-    /// pulling all 32768 entries.
-    ///
-    /// With no cached table this creates one holding just this slot. That is
-    /// the correct meaning and not a lie: every other slot stays 0, which reads
-    /// as unplaced and falls back to the ring exactly as before.
+    /// already knows, which is both authoritative and cheaper than pulling all
+    /// 32768 entries.
     pub fn note_slot_owner(&self, slot: u32, owner: u64) {
-        let mut cached = self.slot_owners.write();
-        let owners = cached.get_or_insert_with(|| vec![0u64; crate::slots::SLOT_COUNT]);
-        if let Some(entry) = owners.get_mut(slot as usize) {
-            *entry = owner;
-        }
+        self.conshash
+            .note_slot_owner(slot as u64, owner, crate::slots::SLOT_COUNT);
     }
 
-    /// Re-read the placement table from the state machine into the local cache.
+    /// Re-read the placement table from the state machine.
     ///
-    /// Called after a migration commits, by the driver and by any member told
-    /// to catch up. Returns whether the table was actually replaced.
+    /// For a member catching up on somebody else's migration. Returns whether
+    /// the table was actually replaced.
     ///
     /// A failed query keeps the current table rather than clearing it. Clearing
     /// would fall back to the ring, and the ring is precisely the answer the
     /// table exists to override -- so a transient raft hiccup would silently
     /// resume routing cells to wherever `jump_hash` happens to point.
     pub async fn reload_slot_owners(&self) -> bool {
-        match try_load_slot_owners(&self.group_name, &self.raft_client).await {
+        match crate::slots::load_owner_vec(
+            &self.group_name,
+            &self.raft_client,
+            crate::server::SLOTS_SM_ID,
+        )
+        .await
+        {
             Ok(owners) => {
                 self.refresh_slot_owners(owners);
                 true

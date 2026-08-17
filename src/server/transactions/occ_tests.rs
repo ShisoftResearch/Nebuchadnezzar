@@ -118,22 +118,56 @@ fn counter_cell(schema_id: u32, id: Id, score: u64, name: &str) -> OwnedCell {
     OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data))
 }
 
-fn ids_on_distinct_servers(server: &Arc<NebServer>) -> ((Id, u64), (Id, u64)) {
-    let mut first = None;
-    for partition in 1..8192u64 {
-        let id = Id::from_parts(partition, 90_000 + partition);
-        let server_id = server
-            .get_server_id_by_id(&id)
-            .expect("cluster should route every partition");
-        if let Some((first_id, first_server_id)) = first {
-            if server_id != first_server_id {
-                return ((first_id, first_server_id), (id, server_id));
-            }
-        } else {
-            first = Some((id, server_id));
-        }
+/// Two ids that genuinely live on different members.
+///
+/// A second site has to be *given* a slot rather than found by probing for one
+/// the hash happens to send elsewhere: placement is a stored table now, and a
+/// member joining a running cluster deliberately owns nothing, which is what
+/// stops a join from making existing cells unreachable. So this hands one slot
+/// to the second member and tells both members about it.
+///
+/// The tests are stronger for it. They used to depend on `jump_hash` splitting
+/// an 8192-wide probe range across exactly these two servers; now the split is
+/// stated, and each id's owner is asserted rather than discovered.
+async fn ids_on_distinct_servers(servers: &[Arc<NebServer>]) -> ((Id, u64), (Id, u64)) {
+    let local = &servers[0];
+    let remote = &servers[1];
+    let local_id = Id::from_parts(1, 90_001);
+    let remote_id = Id::from_parts(2, 90_002);
+    assert_ne!(
+        local_id.locality(),
+        remote_id.locality(),
+        "the two ids must be in different slots or one migration moves both"
+    );
+
+    // The slot is empty at this point, so this transfers nothing and only flips
+    // ownership -- which is all the tests need. Cells written to `remote_id`
+    // afterwards are placed on the second member by the table.
+    crate::migration::migrate_slot(
+        &local.neb_client,
+        remote_id.locality() as u32,
+        local.server_id,
+        remote.server_id,
+        &crate::migration::MigrationPlan::default(),
+    )
+    .await
+    .expect("a slot should migrate to the second member");
+    for server in servers {
+        server.refresh_slot_placement().await;
     }
-    panic!("expected at least two routed servers in the test cluster");
+
+    let local_server_id = local
+        .get_server_id_by_id(&local_id)
+        .expect("cluster should route every slot");
+    let remote_server_id = local
+        .get_server_id_by_id(&remote_id)
+        .expect("cluster should route every slot");
+    assert_eq!(local_server_id, local.server_id);
+    assert_eq!(
+        remote_server_id, remote.server_id,
+        "the migrated slot should now be owned by the second member"
+    );
+    ((local_id, local_server_id), (remote_id, remote_server_id))
 }
 
 fn score_of(cell: &OwnedCell) -> u64 {
@@ -215,7 +249,7 @@ async fn prepare_failure_racing_with_slow_success_settles_before_cleanup() {
     let servers = start_occ_test_cluster(&addresses, group).await;
     let schema = install_occ_schema_on_servers(&servers);
     let ((slow_id, slow_server_id), (fail_id, fail_server_id)) =
-        ids_on_distinct_servers(&servers[0]);
+        ids_on_distinct_servers(&servers).await;
     let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
         .iter()
         .map(|server| (server.server_id, server.clone()))
@@ -363,7 +397,7 @@ async fn cancelled_prepare_future_still_settles_votes_and_cleans_up_in_backgroun
     let servers = start_occ_test_cluster(&addresses, group).await;
     let schema = install_occ_schema_on_servers(&servers);
     let ((slow_id, slow_server_id), (fail_id, fail_server_id)) =
-        ids_on_distinct_servers(&servers[0]);
+        ids_on_distinct_servers(&servers).await;
     let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
         .iter()
         .map(|server| (server.server_id, server.clone()))
@@ -642,7 +676,7 @@ async fn partial_abort_failure_ends_successful_sites_and_remains_retryable() {
     let servers = start_occ_test_cluster(&addresses, group).await;
     let schema = install_occ_schema_on_servers(&servers);
     let ((success_id, success_server_id), (fail_id, fail_server_id)) =
-        ids_on_distinct_servers(&servers[0]);
+        ids_on_distinct_servers(&servers).await;
     let servers_by_id: HashMap<u64, Arc<NebServer>> = servers
         .iter()
         .map(|server| (server.server_id, server.clone()))

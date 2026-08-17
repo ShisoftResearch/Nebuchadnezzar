@@ -28,6 +28,17 @@
 //!    answer instead of a spurious miss. Deferring the drop is what turns the
 //!    cache-staleness window from a correctness problem into a latency one.
 //!
+//! ## A migration is per database, not per server
+//!
+//! Cell RPC services are scoped per database
+//! (`cell_rpc::generate_scoped_service_id`), so the [`AsyncClient`] handed to
+//! [`migrate_slot`] decides *which database's* cells move. Moving a slot for a
+//! whole server means driving this once per database hosted there.
+//!
+//! Worth stating because the failure mode is quiet: a migration driven by the
+//! wrong database's client enumerates that database's chunks, finds the slot
+//! empty, transfers nothing, and reports success.
+//!
 //! ## Memory on the receiving side
 //!
 //! A slot's worth of cells arriving as ordinary writes lands in the recipient's

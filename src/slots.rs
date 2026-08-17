@@ -97,6 +97,32 @@ pub async fn adopt_from_ring(
     Ok(adopted)
 }
 
+/// The table as a slot-indexed vector, or `None` when the group has no table.
+///
+/// Flattened to a vector rather than kept as a map because this is read once per
+/// cell lookup: the representation should be an index, not a hash. A slot with
+/// no owner stays 0 and the caller falls back to the ring.
+pub async fn load_owner_vec(
+    group_name: &str,
+    raft_client: &Arc<RaftClient>,
+    slots_sm_id: u64,
+) -> Result<Option<Vec<u64>>, String> {
+    Ok(load_table(group_name, raft_client, slots_sm_id)
+        .await?
+        .map(|table| {
+            let mut owners = vec![0u64; SLOT_COUNT];
+            for (slot, state) in table {
+                if let Some(entry) = owners.get_mut(slot as usize) {
+                    // The *serving* owner: during a migration that is still the
+                    // donor, which is what keeps an interrupted transfer
+                    // unambiguous.
+                    *entry = state.serving_owner();
+                }
+            }
+            owners
+        }))
+}
+
 /// Read the whole table for a group, or `None` when it has never been seeded.
 ///
 /// `None` and an empty table are different answers and callers must not

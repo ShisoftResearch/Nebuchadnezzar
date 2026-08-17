@@ -188,8 +188,11 @@ pub struct TransactionManagerDeps {
 }
 
 impl TransactionManagerDeps {
+    /// Which member holds this cell. Slot-aware for the same reason
+    /// `NebServer::get_server_id_by_id` is: a transaction that located a cell one
+    /// way and wrote it another would corrupt exactly what it was protecting.
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
-        self.consh.get_server_id(id.locality() as u64)
+        self.consh.get_server_id_for_slot(id.locality() as u64)
     }
 
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<RPCClient>> {
