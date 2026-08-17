@@ -1134,3 +1134,119 @@ pub async fn slot_table_is_seeded_to_agree_with_the_ring() {
 }
 
 
+
+/// Routing through the table must agree with routing through the ring, and must
+/// still work when there is no table.
+///
+/// This is the switchover safety property. The table only becomes authoritative
+/// if it answers identically to what it replaces — otherwise adopting it
+/// relocates live data. And a group that never seeded one has to keep working
+/// exactly as before, which is what makes the change safe to land.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn placement_reads_the_table_and_falls_back_to_the_ring() {
+    let _ = env_logger::try_init();
+    let server_group = "slot_routing_test";
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let database_name = "testdb_slot_routing";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        server_group,
+        database_name,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let client = Arc::new(
+        client::AsyncClient::new_for_database(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+            database_name,
+        )
+        .await
+        .unwrap(),
+    );
+
+    // Spread across the slot space, including both id classes and the extremes,
+    // so this is not just testing one lucky slot.
+    let probes = [
+        Id::from_parts(0, 1),
+        Id::from_parts(1, 1),
+        Id::from_parts(12345, 99),
+        Id::from_parts(dovahkiin::types::custom_types::id::ID_LOCALITY_MASK, 7),
+        Id::hashed(0x1234_5678_9abc_def0),
+        Id::hashed(u64::MAX),
+    ];
+
+    for id in probes {
+        let by_table = client.locate_server_id(&id).expect("table routing");
+        let by_ring = server
+            .conshash()
+            .get_server_id(id.locality() as u64)
+            .expect("ring routing");
+        assert_eq!(
+            by_table, by_ring,
+            "id {id:?} routes to {by_table} through the table but {by_ring} through the ring; \
+             adopting the table must not move anything"
+        );
+    }
+
+    // With no table at all, the ring still answers -- a group that never seeded
+    // one behaves exactly as it did before this existed.
+    client.refresh_slot_owners(None);
+    for id in probes {
+        let by_ring = server
+            .conshash()
+            .get_server_id(id.locality() as u64)
+            .expect("ring routing");
+        assert_eq!(
+            client.locate_server_id(&id).expect("fallback routing"),
+            by_ring,
+            "with no table, placement must fall back to the ring"
+        );
+    }
+
+    // An unplaced slot inside an otherwise-present table also falls back,
+    // rather than routing to server id 0, which is not a server.
+    let mut sparse = vec![0u64; crate::slots::SLOT_COUNT];
+    let probe = Id::from_parts(4242, 1);
+    let expected = server
+        .conshash()
+        .get_server_id(probe.locality() as u64)
+        .expect("ring routing");
+    sparse[crate::slots::slot_of(&probe) as usize] = 0;
+    client.refresh_slot_owners(Some(sparse));
+    assert_eq!(
+        client.locate_server_id(&probe).expect("sparse routing"),
+        expected,
+        "a zero entry is an unplaced slot, not a server id"
+    );
+
+    // And the table genuinely overrides the ring when it says something else --
+    // otherwise none of the above proves the table is being consulted at all.
+    let mut overridden = vec![0u64; crate::slots::SLOT_COUNT];
+    const SENTINEL: u64 = 0xDEAD_BEEF;
+    overridden[crate::slots::slot_of(&probe) as usize] = SENTINEL;
+    client.refresh_slot_owners(Some(overridden));
+    assert_eq!(
+        client.locate_server_id(&probe).expect("override routing"),
+        SENTINEL,
+        "the table must be authoritative where it has an entry"
+    );
+}
