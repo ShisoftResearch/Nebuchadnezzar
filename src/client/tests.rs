@@ -1372,3 +1372,194 @@ pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
         "an empty slot set must enumerate empty"
     );
 }
+
+/// The campaign's headline claim, as a deterministic test: **a member joining a
+/// running cluster does not make existing cells unreachable.**
+///
+/// This is the failure that five startup-ordering patches tried and failed to
+/// fix. Its mechanism was arithmetic, not timing: placement was
+/// `nodes[jump_hash(n, locality)]`, so the instant `n` changed, roughly half of
+/// all localities pointed at a different member — with their cells still on the
+/// old one. Nothing was corrupted and nothing was deleted; the data was simply
+/// looked up at an address it had never been written to.
+///
+/// The test is deliberately built so that it would *fail* without the slot
+/// table rather than passing for free, and it says so out loud: it counts how
+/// many of its own localities the ring now maps somewhere else, and refuses to
+/// conclude anything if that count is zero.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn cells_stay_addressable_when_a_member_joins_a_running_cluster() {
+    use bifrost::conshash::slots::client::SMClient as SlotsSMClient;
+
+    let _ = env_logger::try_init();
+    let server_group = "slot_join_stability_test";
+    let addresses = vec![
+        crate::utils::test_port::unique_localhost_addr(),
+        crate::utils::test_port::unique_localhost_addr(),
+    ];
+    let opts = ServerOptions {
+        chunk_size: 16 * 1024 * 1024,
+        db_size: 16 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: None,
+        wal_storage: None,
+        undo_log_storage: None,
+        raft_storage: None,
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: false,
+        disable_storage_locks: true,
+    };
+
+    // One member, which is how every cluster necessarily starts: the first node
+    // cannot wait for the second, because the second cannot join until the
+    // first is up.
+    let first = NebServer::new_cluster_from_opts(
+        &opts,
+        &addresses[0],
+        &addresses,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let client = Arc::new(
+        client::AsyncClient::new(&first.rpc, &first.membership, &addresses, server_group)
+            .await
+            .unwrap(),
+    );
+    client
+        .new_schema_with_id(Schema::new_with_id(
+            1400,
+            &String::from("join_stability_schema"),
+            None,
+            default_fields(),
+            false,
+            false,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Spread across the slot space rather than clustered, so this cannot pass by
+    // landing entirely in localities the ring happens not to reassign.
+    let ids: Vec<Id> = (0..96u64).map(|i| Id::from_parts(i * 331, 1)).collect();
+    for (seq, id) in ids.iter().enumerate() {
+        let mut value = types::OwnedMap::new();
+        value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+        value.insert(&String::from("score"), OwnedValue::U64(seq as u64));
+        value.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("pre-join-{seq}")),
+        );
+        client
+            .write_cell(OwnedCell::new_with_id(
+                1400,
+                id,
+                OwnedValue::Map(value),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    for id in &ids {
+        client.read_cell(*id).await.unwrap().unwrap();
+    }
+
+    // The second member joins a cluster that is already holding data.
+    let second = NebServer::new_cluster_from_opts(
+        &opts,
+        &addresses[1],
+        &addresses,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    // Wait for the join to be visible in the ring, because the whole point is
+    // what happens *after* membership changes. A test that ran before the ring
+    // noticed would prove nothing.
+    let mut converged = false;
+    for _ in 0..100 {
+        if first.conshash().server_count() >= 2 {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        converged,
+        "the ring never saw the second member, so this test cannot say anything about joins"
+    );
+
+    // How many of these localities would the RING now send elsewhere? This is
+    // the test's own proof that it is not passing for free: if placement were
+    // still computed, this many cells would have become unreachable.
+    let reassigned_by_ring = ids
+        .iter()
+        .filter(|id| {
+            first.conshash().get_server_id(id.locality() as u64) != Some(first.server_id)
+        })
+        .count();
+    assert!(
+        reassigned_by_ring > 0,
+        "the ring reassigned none of {} localities on this join, so the test is vacuous",
+        ids.len()
+    );
+
+    // The authoritative table, re-read from the state machine rather than from
+    // the cache the client happened to load before the join.
+    client.reload_slot_owners().await;
+    let placement = SlotsSMClient::new(crate::server::SLOTS_SM_ID, &client.raft_client);
+    let group = crate::slots::slot_group_id(server_group);
+    assert_eq!(
+        placement
+            .slots_owned_by(&group, &first.server_id)
+            .await
+            .unwrap()
+            .len(),
+        crate::slots::SLOT_COUNT,
+        "a joining member must own nothing: the table is not recomputed, so every slot \
+         stays where it was"
+    );
+    assert!(
+        placement
+            .slots_owned_by(&group, &second.server_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the new member should own no slots until something explicitly assigns them"
+    );
+
+    // And the part that actually matters: every cell written before the join is
+    // still readable through the ordinary hashed path afterwards.
+    for id in &ids {
+        let cell = client
+            .read_cell(*id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{id:?} (locality {}) became unreachable when a member joined: {error:?}",
+                    id.locality()
+                )
+            });
+        assert_eq!(cell.header.id, *id);
+    }
+
+    // Placement and the ring now genuinely disagree, which is the point -- and
+    // the table is the one being obeyed.
+    let disagreements = ids
+        .iter()
+        .filter(|id| {
+            Some(client.locate_server_id(id).unwrap())
+                != first.conshash().get_server_id(id.locality() as u64)
+        })
+        .count();
+    assert_eq!(
+        disagreements, reassigned_by_ring,
+        "every locality the ring reassigned should be one where the table overrides it"
+    );
+}
