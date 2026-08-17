@@ -209,9 +209,11 @@ fn create_test_meta(schema_id: u32, field_id: u64, doc_id: Id, text: &str) -> Fu
 fn find_owned_doc_ids(conshash: &ConsistentHashing, server_id: u64, count: usize) -> Vec<Id> {
     let mut doc_ids = Vec::new();
     for i in 0..10000 {
-        let test_id = Id::new(i, i);
+        let test_id = Id::from_parts(i, i);
         if conshash
-            .get_server_id(test_id.higher)
+            // Placement is keyed by locality, which after the compact-id layout
+            // is a field of the single id word rather than a separate half.
+            .get_server_id(test_id.locality() as u64)
             .map(|sid| sid == server_id)
             .unwrap_or(false)
         {
@@ -339,7 +341,7 @@ fn bench_search(c: &mut Criterion) {
                 |b, query| {
                     b.to_async(&rt).iter(|| async {
                         let hits = indexer
-                            .bm25_search(schema_id, field_id, black_box(query), 10)
+                            .bm25_search(schema_id, field_id, black_box(query), 10, false)
                             .await
                             .unwrap();
                         black_box(hits);
@@ -456,7 +458,7 @@ fn bench_search_limit(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(limit), limit, |b, limit| {
             b.to_async(&rt).iter(|| async {
                 let hits = indexer
-                    .bm25_search(schema_id, field_id, black_box("rust programming"), *limit)
+                    .bm25_search(schema_id, field_id, black_box("rust programming"), *limit, false)
                     .await
                     .unwrap();
                 black_box(hits);
