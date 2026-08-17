@@ -406,6 +406,25 @@ impl AsyncClient {
             })
             .collect())
     }
+    /// Follow a `NotSlotOwner` refusal to the member that really owns the slot.
+    ///
+    /// The refusal carries the owner, so this costs no table reload: record what
+    /// the refusing member told us and go there. That is the point of the
+    /// refusal -- a stale table becomes one extra hop instead of a write that
+    /// succeeds into a place nothing will read again.
+    ///
+    /// One redirect only. A second refusal means placement is moving faster than
+    /// a single write can follow it, and retrying in a loop would turn that into
+    /// a hang instead of an error the caller can see.
+    async fn redirect_to_slot_owner(
+        &self,
+        id: &Id,
+        owner: u64,
+    ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+        self.note_slot_owner(crate::slots::slot_of(id), owner);
+        self.client_by_server_id(owner).await
+    }
+
     pub async fn write_cell(
         &self,
         cell: OwnedCell,
@@ -425,6 +444,10 @@ impl AsyncClient {
                     self.refresh_owner_schema_cache_for_retry(&client, schema_id)
                         .await?;
                     client.write_cell(cell).await
+                }
+                Err(WriteError::NotSlotOwner(owner)) => {
+                    let owner_client = self.redirect_to_slot_owner(&cell.id(), owner).await?;
+                    owner_client.write_cell(cell).await
                 }
                 other => Ok(other),
             }
@@ -447,6 +470,10 @@ impl AsyncClient {
                         .await?;
                     client.update_cell(cell).await
                 }
+                Err(WriteError::NotSlotOwner(owner)) => {
+                    let owner_client = self.redirect_to_slot_owner(&cell.id(), owner).await?;
+                    owner_client.update_cell(cell).await
+                }
                 other => Ok(other),
             }
         }
@@ -468,6 +495,10 @@ impl AsyncClient {
                     self.refresh_owner_schema_cache_for_retry(&client, schema_id)
                         .await?;
                     client.upsert_cell(cell).await
+                }
+                Err(WriteError::NotSlotOwner(owner)) => {
+                    let owner_client = self.redirect_to_slot_owner(&cell.id(), owner).await?;
+                    owner_client.upsert_cell(cell).await
                 }
                 other => Ok(other),
             }
@@ -517,6 +548,10 @@ impl AsyncClient {
                 self.refresh_owner_schema_cache_for_retry(&client, schema_id)
                     .await?;
                 client.remove_cell(id).await
+            }
+            Err(WriteError::NotSlotOwner(owner)) => {
+                let owner_client = self.redirect_to_slot_owner(&id, owner).await?;
+                owner_client.remove_cell(id).await
             }
             other => Ok(other),
         }

@@ -31,8 +31,17 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct BulkReceiveReport {
     pub evicted_segments: u64,
+    /// From the shared striped counter -- cheap, and what production pacing
+    /// decides on. It is corrected by reconciliation rather than by every
+    /// eviction, so straight after an eviction pass it can still include
+    /// segments that have just gone cold.
     pub hot_segments: u64,
     pub hot_bytes: u64,
+    /// Counted by scanning every registered chunk for actually-hot segments.
+    /// Ground truth, and the only one of the two safe to draw a conclusion from;
+    /// the gap between them is counter drift.
+    pub hot_segments_scanned: u64,
+    pub hot_bytes_scanned: u64,
 }
 
 pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
@@ -52,7 +61,8 @@ service! {
     rpc upsert_all_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
     rpc remove_cell(key: Id) -> Result<(), WriteError>;
     rpc head_all_cells(keys: &Vec<Id>) -> Vec<Result<CellHeader, ReadError>>;
-    rpc remove_all_cells(keys: &Vec<Id>) -> Vec<Result<(), WriteError>>;
+    rpc drop_migrated_cells(keys: &Vec<Id>) -> Vec<Result<(), WriteError>>;
+    rpc receive_migrated_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
     rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
     rpc settle_bulk_receive() -> BulkReceiveReport;
     rpc note_slot_owner(slot: u32, owner: u64) -> ();
@@ -148,6 +158,7 @@ impl Service for NebRPCService {
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
+            self.refuse_if_not_owner(&cell.header.id)?;
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().write_cell(&mut cell))
                 .await;
@@ -168,6 +179,7 @@ impl Service for NebRPCService {
 
     fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
+            self.refuse_if_not_owner(&cell.header.id)?;
             let result = self
                 .with_indices_ensured(|| self.database_runtime.chunks().update_cell(&mut cell))
                 .await;
@@ -187,37 +199,71 @@ impl Service for NebRPCService {
     }
     fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
         async move {
-            let result = self
-                .with_indices_ensured(|| self.database_runtime.chunks().remove_cell(&key))
-                .await;
-            match result {
-                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
-                    self.refresh_local_schema_cache_for_write(missing_schema_id)
-                        .await?;
-                    self.with_indices_ensured(|| self.database_runtime.chunks().remove_cell(&key))
-                        .await
-                }
-                other => other,
-            }
+            self.refuse_if_not_owner(&key)?;
+            self.remove_cell_unchecked(key).await
         }
         .boxed()
     }
-    fn upsert_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+    fn upsert_cell(&self, cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
-            let result = self
-                .with_indices_ensured(|| self.database_runtime.chunks().upsert_cell(&mut cell))
-                .await;
-            match result {
-                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
-                    self.refresh_local_schema_cache_for_write(missing_schema_id)
-                        .await?;
-                    self.with_indices_ensured(|| {
-                        self.database_runtime.chunks().upsert_cell(&mut cell)
-                    })
-                    .await
+            self.refuse_if_not_owner(&cell.header.id)?;
+            self.upsert_cell_unchecked(cell).await
+        }
+        .boxed()
+    }
+    fn receive_migrated_cells(
+        &self,
+        cells: Vec<OwnedCell>,
+    ) -> BoxFuture<'_, Vec<Result<CellHeader, WriteError>>> {
+        // Migration transfers arrive here instead of through `upsert_all_cells`
+        // because the recipient does **not** own the slot yet: the table entry
+        // flips only after the data has landed, which is the whole point of
+        // having a single commit point. So this path is exempt from the
+        // ownership guard by construction.
+        //
+        // That exemption is exactly why it is a separate RPC rather than a flag.
+        // A caller cannot reach it by accident, and anyone reading the service
+        // can see at a glance which writes bypass the check -- which matters,
+        // because the check is the only thing standing between a stale client
+        // and a silently discarded write.
+        //
+        // Batch semantics mirror `upsert_all_cells`: in order, stopping at the
+        // first failure. A migration aborts the whole slot on any failure
+        // anyway, so there is nothing to gain from continuing.
+        async move {
+            let mut results = Vec::with_capacity(cells.len());
+            let mut aborted = false;
+            for cell in cells {
+                if aborted {
+                    results.push(Err(WriteError::BatchAborted));
+                    continue;
                 }
-                other => other,
+                let result = self.upsert_cell_unchecked(cell).await;
+                if result.is_err() {
+                    aborted = true;
+                }
+                results.push(result);
             }
+            results
+        }
+        .boxed()
+    }
+    fn drop_migrated_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<(), WriteError>>> {
+        // The reclaim's removal path, and exempt for the mirror-image reason:
+        // by the time a donor drops its copy the slot belongs to somebody else,
+        // so the donor is deliberately deleting cells it no longer owns.
+        //
+        // Does NOT stop at the first failure, unlike the batch upsert above. A
+        // reclaim needs to know exactly which keys are still present, and an
+        // abort would hide that behind one error -- leaving it unable to tell
+        // "not removed" from "not attempted".
+        let keys = keys.clone();
+        async move {
+            let mut results = Vec::with_capacity(keys.len());
+            for key in keys {
+                results.push(self.remove_cell_unchecked(key).await);
+            }
+            results
         }
         .boxed()
     }
@@ -272,28 +318,6 @@ impl Service for NebRPCService {
         .boxed()
     }
 
-    fn remove_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<(), WriteError>>> {
-        // Deliberately does NOT stop at the first failure, unlike
-        // `upsert_all_cells`. That batch aborts because its caller's crash
-        // consistency depends on every durable prefix being referentially
-        // closed; removals carry no such ordering. The caller here is a
-        // migration dropping a donor copy, and it needs to know exactly which
-        // keys are still present -- an abort would hide that behind one error
-        // and leave it unable to tell "not removed" from "not attempted".
-        // Copied up front so the future borrows only `self`: removals are
-        // sequential awaits, and a borrow of the caller's slice would have to
-        // outlive the request.
-        let keys = keys.clone();
-        async move {
-            let mut results = Vec::with_capacity(keys.len());
-            for key in keys {
-                results.push(self.remove_cell(key).await);
-            }
-            results
-        }
-        .boxed()
-    }
-
     fn cell_ids_in_slots(&self, slots: &Vec<u32>) -> BoxFuture<'_, Vec<Id>> {
         // Slots are `u32` on the wire because that is what the placement state
         // machine speaks, and `u16` at the storage layer because a Neb slot IS
@@ -338,10 +362,13 @@ impl Service for NebRPCService {
                         0
                     });
                 let hot_segments = manager.shared_hot_segments();
+                let scanned = manager.scanned_hot_segments();
                 BulkReceiveReport {
                     evicted_segments: evicted as u64,
                     hot_segments: hot_segments as u64,
                     hot_bytes: (hot_segments * crate::ram::segs::SEGMENT_SIZE) as u64,
+                    hot_segments_scanned: scanned as u64,
+                    hot_bytes_scanned: (scanned * crate::ram::segs::SEGMENT_SIZE) as u64,
                 }
             }
             // No tier configured: everything is resident by design and there is
@@ -379,6 +406,7 @@ impl Service for NebRPCService {
         mut cell: OwnedCell,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
+            self.refuse_if_not_owner(&key)?;
             let result = self
                 .with_indices_ensured(|| {
                     self.database_runtime
@@ -410,6 +438,7 @@ impl Service for NebRPCService {
         value: OwnedValue,
     ) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
+            self.refuse_if_not_owner(&key)?;
             let first_value = value.clone();
             let result = self
                 .with_indices_ensured(|| {
@@ -596,6 +625,80 @@ impl NebRPCService {
             }
         }
     }
+    fn upsert_cell_unchecked(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
+        async move {
+            let result = self
+                .with_indices_ensured(|| self.database_runtime.chunks().upsert_cell(&mut cell))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(|| {
+                        self.database_runtime.chunks().upsert_cell(&mut cell)
+                    })
+                    .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
+    fn remove_cell_unchecked(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
+        async move {
+            let result = self
+                .with_indices_ensured(|| self.database_runtime.chunks().remove_cell(&key))
+                .await;
+            match result {
+                Err(WriteError::SchemaDoesNotExisted(missing_schema_id)) => {
+                    self.refresh_local_schema_cache_for_write(missing_schema_id)
+                        .await?;
+                    self.with_indices_ensured(|| self.database_runtime.chunks().remove_cell(&key))
+                        .await
+                }
+                other => other,
+            }
+        }
+        .boxed()
+    }
+
+    /// Refuse a write for a slot this member does not own.
+    ///
+    /// This is what makes a stale placement table a latency problem instead of a
+    /// data-loss one. Reads are already safe: a migration defers dropping the
+    /// donor's copy, so a member one migration behind still reads correct data.
+    /// Writes are not, and they fail silently -- a client with an old table
+    /// writes to a former owner, the write succeeds, and the data lands
+    /// somewhere nothing will look again. Refusing turns that into a retry.
+    ///
+    /// Three conditions have to hold before refusing anything, and each one is
+    /// load-bearing:
+    ///
+    /// 1. **A table must be installed.** With no table, placement is derived and
+    ///    two members can legitimately disagree while the ring is still forming.
+    ///    Refusing then would turn a placement question into an availability
+    ///    failure during exactly the window that is hardest to get right -- the
+    ///    window that already absorbed five reverted patches.
+    /// 2. **The slot must have an owner in it.** A zero entry means unplaced, so
+    ///    the answer came from the ring, so we are back in case 1 for that slot.
+    /// 3. **The owner must be somebody else.** During a migration the donor is
+    ///    still the serving owner and must keep accepting; only the *recipient*
+    ///    would refuse, which is why migration transfers arrive through
+    ///    `receive_migrated_cells` rather than as ordinary writes.
+    fn refuse_if_not_owner(&self, id: &Id) -> Result<(), WriteError> {
+        let conshash = &self.database_runtime.consh;
+        if !conshash.has_slot_overrides() {
+            return Ok(());
+        }
+        let slot = crate::slots::slot_of(id) as u64;
+        match conshash.slot_override(slot) {
+            Some(owner) if owner != self.database_runtime.rpc.server_id => {
+                Err(WriteError::NotSlotOwner(owner))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn with_indices_ensured<'a, R, F>(&'a self, op: F) -> BoxFuture<'a, R>
     where
         R: Send + 'a,
