@@ -1075,6 +1075,85 @@ pub async fn reshard_slots(
 mod tests {
     use super::*;
 
+    /// MEASUREMENT: how much of a transfer's per-cell cost is bifrost's codec?
+    ///
+    /// ```text
+    /// cargo test --release --lib codec_share_of_transfer_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// Asked because "the transfer is slow" is not an actionable statement until
+    /// the cost is attributed. A migration batch pays: read from the donor's
+    /// segment, `to_owned`, serialize, ship, deserialize, write into the
+    /// recipient's chunk, WAL, index. Only two of those are bifrost's, and the
+    /// answer decides whether the next optimisation belongs in the RPC layer or in
+    /// the storage path.
+    ///
+    /// **Must be run in release.** bifrost picks its codec by build profile --
+    /// `serde_cbor` in release, `serde_json` under `debug_assertions` -- so a debug
+    /// measurement is measuring JSON and is not a statement about production.
+    #[test]
+    #[ignore]
+    fn codec_share_of_transfer_cost() {
+        use crate::ram::types::{Map, OwnedMap, OwnedValue};
+
+        const CELLS: usize = 1024;
+        const PAYLOAD: usize = 4096;
+
+        assert!(
+            !cfg!(debug_assertions),
+            "run this with --release: bifrost serializes with JSON under \
+             debug_assertions and CBOR otherwise, so a debug number says nothing \
+             about production"
+        );
+
+        let payload = "x".repeat(PAYLOAD);
+        let cells: Vec<crate::ram::cell::OwnedCell> = (0..CELLS)
+            .map(|seq| {
+                let mut value = OwnedMap::new();
+                value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+                value.insert(&String::from("score"), OwnedValue::U64(seq as u64));
+                value.insert(&String::from("name"), OwnedValue::String(payload.clone()));
+                crate::ram::cell::OwnedCell::new_with_id(
+                    1,
+                    &Id::from_parts(1, seq as u64),
+                    OwnedValue::Map(value),
+                )
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        let encoded = bifrost::utils::serde::serialize(&cells);
+        let encode = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let decoded: Option<Vec<crate::ram::cell::OwnedCell>> =
+            bifrost::utils::serde::deserialize(&encoded);
+        let decode = started.elapsed();
+        assert_eq!(decoded.map(|cells| cells.len()), Some(CELLS));
+
+        let bytes = (CELLS * PAYLOAD) as f64;
+        let round_trip = encode + decode;
+        println!(
+            "CODEC: {} cells x {} B -> {} B wire ({:.2}x)",
+            CELLS,
+            PAYLOAD,
+            encoded.len(),
+            encoded.len() as f64 / bytes
+        );
+        println!(
+            "CODEC: encode {:.1} us/cell ({:.0} MB/s), decode {:.1} us/cell ({:.0} MB/s)",
+            encode.as_secs_f64() * 1e6 / CELLS as f64,
+            bytes / (1024.0 * 1024.0) / encode.as_secs_f64(),
+            decode.as_secs_f64() * 1e6 / CELLS as f64,
+            bytes / (1024.0 * 1024.0) / decode.as_secs_f64()
+        );
+        println!(
+            "CODEC: round trip {:.1} us/cell -- compare against the transfer's \
+             measured per-cell cost to get the codec's share",
+            round_trip.as_secs_f64() * 1e6 / CELLS as f64
+        );
+    }
+
     #[test]
     fn batches_never_straddle_an_id_class() {
         // A slot is two spans of the id space, not one. A batch that mixes them
