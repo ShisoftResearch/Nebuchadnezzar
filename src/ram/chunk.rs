@@ -1857,6 +1857,33 @@ impl Chunk {
         self.cell_index.len()
     }
 
+    /// Ids of the live cells this chunk holds whose slot is in `slots`.
+    ///
+    /// The enumeration primitive migration is built on. `cell_index` is keyed by
+    /// `id.bits()` (see the insert in `apply_cell`), so a cell's slot is bits
+    /// 62..48 of the key and this needs to read no cell bodies at all — which
+    /// is what makes it cheap enough to run over a whole chunk, and what makes
+    /// it work whether or not indexing is enabled.
+    ///
+    /// Takes a set rather than one slot so a caller planning many moves makes
+    /// one pass instead of one pass per slot.
+    pub fn cell_ids_in_slots(&self, slots: &std::collections::HashSet<u16>) -> Vec<Id> {
+        self.cell_index
+            .entries()
+            .into_iter()
+            .filter_map(|(key, address)| {
+                // A zero address is a reserved-but-unwritten slot in the index,
+                // not a live cell; migrating it would move nothing and the
+                // recipient would answer for a cell that does not exist.
+                if address == 0 {
+                    return None;
+                }
+                let id = Id::from_bits(key as u64);
+                slots.contains(&id.locality()).then_some(id)
+            })
+            .collect()
+    }
+
     #[inline]
     fn refresh_statistics(&self) {
         self.statistics.refresh_from_chunk(self)
@@ -2433,6 +2460,18 @@ impl Chunks {
     pub fn address_of(&self, key: &Id) -> usize {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return *chunk.location_for_read(hash).unwrap();
+    }
+
+    /// Ids of every live cell on this server whose slot is in `slots`.
+    ///
+    /// One pass per chunk, and the caller supplies the whole slot set so a
+    /// migration plan covering many slots costs one sweep rather than one per
+    /// slot.
+    pub fn cell_ids_in_slots(&self, slots: &std::collections::HashSet<u16>) -> Vec<Id> {
+        self.list
+            .iter()
+            .flat_map(|chunk| chunk.cell_ids_in_slots(slots))
+            .collect()
     }
 
     pub fn count(&self) -> usize {

@@ -1250,3 +1250,125 @@ pub async fn placement_reads_the_table_and_falls_back_to_the_ring() {
         "the table must be authoritative where it has an entry"
     );
 }
+
+/// Slot enumeration must find exactly the cells in the requested slots.
+///
+/// This is the primitive migration is built on, so its precision matters more
+/// than its speed: a missed cell is data left behind on the donor, and an extra
+/// one is a cell moved that nobody asked to move. It reads no cell bodies —
+/// `cell_index` is keyed by `id.bits()`, so a slot is bits 62..48 of the key.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
+    use std::collections::HashSet;
+
+    let _ = env_logger::try_init();
+    let server_group = "slot_enumeration_test";
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let database_name = "testdb_slot_enumeration";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        server_group,
+        database_name,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let client = Arc::new(
+        client::AsyncClient::new_for_database(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+            database_name,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let schema = Schema::new_with_id(
+        1200,
+        &String::from("slot_enum_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    // Three slots, several cells each, written with explicit ids so the expected
+    // answer is known rather than inferred.
+    const SLOTS: [u16; 3] = [11, 22, 33];
+    const PER_SLOT: u64 = 4;
+    let mut expected: std::collections::HashMap<u16, HashSet<Id>> = Default::default();
+    for slot in SLOTS {
+        for seq in 0..PER_SLOT {
+            let id = Id::from_parts(slot as u64, 5000 + seq);
+            let mut value = OwnedMap::new();
+            value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+            value.insert(&String::from("score"), OwnedValue::U64(0));
+            value.insert(
+                &String::from("name"),
+                OwnedValue::String(format!("slot{slot}-{seq}")),
+            );
+            let cell = OwnedCell::new_with_id(1200, &id, OwnedValue::Map(value));
+            client.write_cell(cell).await.unwrap().unwrap();
+            expected.entry(slot).or_default().insert(id);
+        }
+    }
+
+    let chunks = server.chunks();
+
+    // One slot at a time: exact set, nothing from its neighbours.
+    for slot in SLOTS {
+        let found: HashSet<Id> = chunks
+            .cell_ids_in_slots(&HashSet::from([slot]))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            found, expected[&slot],
+            "slot {slot} enumerated {found:?}, expected {:?}",
+            expected[&slot]
+        );
+    }
+
+    // Several slots in one pass: the union, which is the form a migration plan
+    // actually uses.
+    let all_requested: HashSet<u16> = SLOTS.into_iter().collect();
+    let found: HashSet<Id> = chunks
+        .cell_ids_in_slots(&all_requested)
+        .into_iter()
+        .collect();
+    let union: HashSet<Id> = expected.values().flatten().copied().collect();
+    assert_eq!(
+        found, union,
+        "a multi-slot pass must return the union and nothing else"
+    );
+
+    // A slot nobody wrote to is empty, not "everything" -- a filter that fails
+    // open would migrate the whole server.
+    assert!(
+        chunks
+            .cell_ids_in_slots(&HashSet::from([9999u16]))
+            .is_empty(),
+        "an unused slot must enumerate empty"
+    );
+    assert!(
+        chunks.cell_ids_in_slots(&HashSet::new()).is_empty(),
+        "an empty slot set must enumerate empty"
+    );
+}
