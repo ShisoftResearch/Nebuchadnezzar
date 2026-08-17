@@ -1373,16 +1373,31 @@ mod cluster_tests {
         // The tier limit is set far BELOW the data being moved on purpose. If the
         // recipient's hot tier tracked the transfer rather than its own bound,
         // that shows up as peak hot bytes climbing past the limit.
-        // Sized so the payload is 4x the tier limit. If it were below the limit
-        // the tier would never need to shed and the measurement would pass
-        // without testing anything -- which is the trap this whole test exists
-        // to avoid falling into by argument instead of by numbers.
-        const TIER_LIMIT: usize = 256 * 1024 * 1024;
+        // Sized so the payload is several times the tier limit. If it were below
+        // the limit the tier would never need to shed and this would pass without
+        // testing anything -- the trap the whole measurement exists to avoid.
+        //
+        // Parameterised by environment, because the answer depends on the size of
+        // the limit and not only on the code: a 256 MB limit is 32 segments, which
+        // is few enough that eviction's give-up rule dominates. Re-run with a
+        // realistic limit before treating any of this as a sizing fact.
+        //
+        //   NEB_MEASURE_TIER_MB, NEB_MEASURE_SLOTS, NEB_MEASURE_CELLS_PER_SLOT,
+        //   NEB_MEASURE_PAYLOAD_BYTES, NEB_MEASURE_DB_GB
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        let tier_limit = env_usize("NEB_MEASURE_TIER_MB", 256) * 1024 * 1024;
+        let slots = env_usize("NEB_MEASURE_SLOTS", 512).min(crate::slots::SLOT_COUNT) as u16;
+        let cells_per_slot = env_usize("NEB_MEASURE_CELLS_PER_SLOT", 512) as u64;
+        let payload_bytes = env_usize("NEB_MEASURE_PAYLOAD_BYTES", 4096);
+        let db_size = env_usize("NEB_MEASURE_DB_GB", 8) * 1024 * 1024 * 1024;
         const CHUNK_SIZE: usize = 64 * 1024 * 1024;
-        const DB_SIZE: usize = 8 * 1024 * 1024 * 1024;
-        const SLOTS: u16 = 512;
-        const CELLS_PER_SLOT: u64 = 512;
-        const PAYLOAD_BYTES: usize = 4096;
+        let (tier_limit, db_size) = (tier_limit, db_size);
+        let (slots, cells_per_slot, payload_bytes) = (slots, cells_per_slot, payload_bytes);
 
         let group = "migration_memory_measurement";
         let addresses = vec![
@@ -1399,11 +1414,11 @@ mod cluster_tests {
             let member_root = storage_root.join(format!("member-{index}"));
             let opts = ServerOptions {
                 chunk_size: CHUNK_SIZE,
-                db_size: DB_SIZE,
+                db_size: db_size,
                 tiered_config: Some(crate::ram::tiered::TieredConfig {
                     threshold: 0.8,
                     lower_watermark: 0.72,
-                    physical_memory_limit: TIER_LIMIT,
+                    physical_memory_limit: tier_limit,
                     promotion_cooldown_ms: 2000,
                 }),
                 // Eviction needs somewhere to put a segment it is demoting;
@@ -1445,10 +1460,10 @@ mod cluster_tests {
             .unwrap()
             .unwrap();
 
-        let payload = "x".repeat(PAYLOAD_BYTES);
+        let payload = "x".repeat(payload_bytes);
         let mut written: Vec<Id> = Vec::new();
-        for slot in 0..SLOTS {
-            for seq in 0..CELLS_PER_SLOT {
+        for slot in 0..slots {
+            for seq in 0..cells_per_slot {
                 let id = Id::from_parts(slot as u64, 1_000_000 + seq);
                 let mut value = OwnedMap::new();
                 value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
@@ -1466,13 +1481,13 @@ mod cluster_tests {
                 written.push(id);
             }
         }
-        let moved_bytes = written.len() * PAYLOAD_BYTES;
+        let moved_bytes = written.len() * payload_bytes;
         println!(
             "MEASUREMENT: wrote {} cells (~{} MB of payload) across {} slots; tier limit {} MB",
             written.len(),
             moved_bytes / (1024 * 1024),
-            SLOTS,
-            TIER_LIMIT / (1024 * 1024)
+            slots,
+            tier_limit / (1024 * 1024)
         );
 
         let donor_id = servers[0].server_id;
@@ -1498,7 +1513,7 @@ mod cluster_tests {
             moved_bytes / (1024 * 1024)
         );
 
-        let slots: Vec<u32> = (0..SLOTS).map(|slot| slot as u32).collect();
+        let slots: Vec<u32> = (0..slots).map(|slot| slot as u32).collect();
         let reshard = reshard_slots(
             &client,
             &slots,
@@ -1533,7 +1548,7 @@ mod cluster_tests {
         println!(
             "MEASUREMENT: recipient peak hot tier {} MB against a {} MB limit while receiving {} MB",
             peak_hot / (1024 * 1024),
-            TIER_LIMIT / (1024 * 1024),
+            tier_limit / (1024 * 1024),
             moved_bytes / (1024 * 1024)
         );
         println!(
