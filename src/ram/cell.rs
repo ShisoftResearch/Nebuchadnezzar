@@ -66,6 +66,17 @@ pub enum WriteError {
     /// prefix-closed: a persisted page may only reference pages persisted
     /// before it). Always retryable -- nothing was written.
     BatchAborted,
+    /// This member does not own the cell's slot; the named member does.
+    ///
+    /// Nothing was written, and the write is retryable at the named owner. The
+    /// point is that it is refused *loudly* rather than accepted: a client
+    /// holding a placement table one migration behind would otherwise write to
+    /// a former owner, which succeeds, satisfies the client, and puts the data
+    /// somewhere nothing will ever read it again.
+    ///
+    /// Carries the owner so a client can retry immediately instead of reloading
+    /// 32768 entries to discover what this member already knew.
+    NotSlotOwner(u64),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
