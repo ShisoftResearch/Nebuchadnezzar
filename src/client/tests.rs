@@ -1044,3 +1044,522 @@ pub async fn server_isolation() {
         "-score"
     );
 }
+
+/// The slot table is seeded from the ring at startup, and agrees with it.
+///
+/// This is the property that lets the table be introduced at all: if adoption
+/// produced *different* placement than `jump_hash` already computes, switching
+/// over would relocate live data. So it is not enough that the table is
+/// populated — every entry has to match what the ring would have said.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn slot_table_is_seeded_to_agree_with_the_ring() {
+    let _ = env_logger::try_init();
+    let server_group = "slot_adoption_test";
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let database_name = "testdb_slot_adoption";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        server_group,
+        database_name,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let table = crate::slots::load_table(
+        &server_group.to_string(),
+        &server.raft_client,
+        crate::server::SLOTS_SM_ID,
+    )
+    .await
+    .expect("slot table query should succeed")
+    .expect("startup should have seeded a table, not left it absent");
+
+    assert_eq!(
+        table.len(),
+        crate::slots::SLOT_COUNT,
+        "every slot must be placed; a partial table would leave some ids unroutable"
+    );
+
+    // Agreement with the ring, entry by entry. Anything else means adopting the
+    // table silently moves data.
+    let conshash = server.conshash();
+    for slot in 0..crate::slots::SLOT_COUNT {
+        let expected = conshash
+            .get_server_id(slot as u64)
+            .expect("the ring places every slot on a single-member cluster");
+        let placed = table
+            .get(&(slot as u32))
+            .expect("slot should be in the table");
+        assert_eq!(
+            placed.serving_owner(),
+            expected,
+            "slot {slot} was adopted onto {} but the ring says {expected}",
+            placed.serving_owner()
+        );
+        assert!(
+            !placed.is_migrating(),
+            "a freshly seeded slot must not be in flight: slot {slot}"
+        );
+    }
+
+    // Re-adopting claims nothing: a restart must not disturb placement, and
+    // every member runs this concurrently at startup.
+    let readopted = crate::slots::adopt_from_ring(
+        &server_group.to_string(),
+        &server.consh,
+        &server.raft_client,
+        crate::server::SLOTS_SM_ID,
+    )
+    .await
+    .expect("re-adoption should succeed");
+    assert_eq!(
+        readopted, 0,
+        "adoption must be idempotent; claiming slots again would move data"
+    );
+}
+
+
+
+/// Routing through the table must agree with routing through the ring, and must
+/// still work when there is no table.
+///
+/// This is the switchover safety property. The table only becomes authoritative
+/// if it answers identically to what it replaces — otherwise adopting it
+/// relocates live data. And a group that never seeded one has to keep working
+/// exactly as before, which is what makes the change safe to land.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn placement_reads_the_table_and_falls_back_to_the_ring() {
+    let _ = env_logger::try_init();
+    let server_group = "slot_routing_test";
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let database_name = "testdb_slot_routing";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        server_group,
+        database_name,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let client = Arc::new(
+        client::AsyncClient::new_for_database(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+            database_name,
+        )
+        .await
+        .unwrap(),
+    );
+
+    // Spread across the slot space, including both id classes and the extremes,
+    // so this is not just testing one lucky slot.
+    let probes = [
+        Id::from_parts(0, 1),
+        Id::from_parts(1, 1),
+        Id::from_parts(12345, 99),
+        Id::from_parts(dovahkiin::types::custom_types::id::ID_LOCALITY_MASK, 7),
+        Id::hashed(0x1234_5678_9abc_def0),
+        Id::hashed(u64::MAX),
+    ];
+
+    for id in probes {
+        let by_table = client.locate_server_id(&id).expect("table routing");
+        let by_ring = server
+            .conshash()
+            .get_server_id(id.locality() as u64)
+            .expect("ring routing");
+        assert_eq!(
+            by_table, by_ring,
+            "id {id:?} routes to {by_table} through the table but {by_ring} through the ring; \
+             adopting the table must not move anything"
+        );
+    }
+
+    // With no table at all, the ring still answers -- a group that never seeded
+    // one behaves exactly as it did before this existed.
+    client.refresh_slot_owners(None);
+    for id in probes {
+        let by_ring = server
+            .conshash()
+            .get_server_id(id.locality() as u64)
+            .expect("ring routing");
+        assert_eq!(
+            client.locate_server_id(&id).expect("fallback routing"),
+            by_ring,
+            "with no table, placement must fall back to the ring"
+        );
+    }
+
+    // An unplaced slot inside an otherwise-present table also falls back,
+    // rather than routing to server id 0, which is not a server.
+    let mut sparse = vec![0u64; crate::slots::SLOT_COUNT];
+    let probe = Id::from_parts(4242, 1);
+    let expected = server
+        .conshash()
+        .get_server_id(probe.locality() as u64)
+        .expect("ring routing");
+    sparse[crate::slots::slot_of(&probe) as usize] = 0;
+    client.refresh_slot_owners(Some(sparse));
+    assert_eq!(
+        client.locate_server_id(&probe).expect("sparse routing"),
+        expected,
+        "a zero entry is an unplaced slot, not a server id"
+    );
+
+    // And the table genuinely overrides the ring when it says something else --
+    // otherwise none of the above proves the table is being consulted at all.
+    let mut overridden = vec![0u64; crate::slots::SLOT_COUNT];
+    const SENTINEL: u64 = 0xDEAD_BEEF;
+    overridden[crate::slots::slot_of(&probe) as usize] = SENTINEL;
+    client.refresh_slot_owners(Some(overridden));
+    assert_eq!(
+        client.locate_server_id(&probe).expect("override routing"),
+        SENTINEL,
+        "the table must be authoritative where it has an entry"
+    );
+}
+
+/// Slot enumeration must find exactly the cells in the requested slots.
+///
+/// This is the primitive migration is built on, so its precision matters more
+/// than its speed: a missed cell is data left behind on the donor, and an extra
+/// one is a cell moved that nobody asked to move. It reads no cell bodies —
+/// `cell_index` is keyed by `id.bits()`, so a slot is bits 62..48 of the key.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
+    use std::collections::HashSet;
+
+    let _ = env_logger::try_init();
+    let server_group = "slot_enumeration_test";
+    let server_addr = crate::utils::test_port::unique_localhost_addr();
+    let database_name = "testdb_slot_enumeration";
+
+    let server = NebServer::new_from_opts_in_database(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &server_addr,
+        server_group,
+        database_name,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let client = Arc::new(
+        client::AsyncClient::new_for_database(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+            database_name,
+        )
+        .await
+        .unwrap(),
+    );
+
+    let schema = Schema::new_with_id(
+        1200,
+        &String::from("slot_enum_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+    // Three slots, several cells each, written with explicit ids so the expected
+    // answer is known rather than inferred.
+    const SLOTS: [u16; 3] = [11, 22, 33];
+    const PER_SLOT: u64 = 4;
+    let mut expected: std::collections::HashMap<u16, HashSet<Id>> = Default::default();
+    for slot in SLOTS {
+        for seq in 0..PER_SLOT {
+            let id = Id::from_parts(slot as u64, 5000 + seq);
+            let mut value = OwnedMap::new();
+            value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+            value.insert(&String::from("score"), OwnedValue::U64(0));
+            value.insert(
+                &String::from("name"),
+                OwnedValue::String(format!("slot{slot}-{seq}")),
+            );
+            let cell = OwnedCell::new_with_id(1200, &id, OwnedValue::Map(value));
+            client.write_cell(cell).await.unwrap().unwrap();
+            expected.entry(slot).or_default().insert(id);
+        }
+    }
+
+    let chunks = server.chunks();
+
+    // One slot at a time: exact set, nothing from its neighbours.
+    for slot in SLOTS {
+        let found: HashSet<Id> = chunks
+            .cell_ids_in_slots(&HashSet::from([slot]))
+            .into_iter()
+            .collect();
+        assert_eq!(
+            found, expected[&slot],
+            "slot {slot} enumerated {found:?}, expected {:?}",
+            expected[&slot]
+        );
+    }
+
+    // Several slots in one pass: the union, which is the form a migration plan
+    // actually uses.
+    let all_requested: HashSet<u16> = SLOTS.into_iter().collect();
+    let found: HashSet<Id> = chunks
+        .cell_ids_in_slots(&all_requested)
+        .into_iter()
+        .collect();
+    let union: HashSet<Id> = expected.values().flatten().copied().collect();
+    assert_eq!(
+        found, union,
+        "a multi-slot pass must return the union and nothing else"
+    );
+
+    // A slot nobody wrote to is empty, not "everything" -- a filter that fails
+    // open would migrate the whole server.
+    assert!(
+        chunks
+            .cell_ids_in_slots(&HashSet::from([9999u16]))
+            .is_empty(),
+        "an unused slot must enumerate empty"
+    );
+    assert!(
+        chunks.cell_ids_in_slots(&HashSet::new()).is_empty(),
+        "an empty slot set must enumerate empty"
+    );
+}
+
+/// The campaign's headline claim, as a deterministic test: **a member joining a
+/// running cluster does not make existing cells unreachable.**
+///
+/// This is the failure that five startup-ordering patches tried and failed to
+/// fix. Its mechanism was arithmetic, not timing: placement was
+/// `nodes[jump_hash(n, locality)]`, so the instant `n` changed, roughly half of
+/// all localities pointed at a different member — with their cells still on the
+/// old one. Nothing was corrupted and nothing was deleted; the data was simply
+/// looked up at an address it had never been written to.
+///
+/// The test is deliberately built so that it would *fail* without the slot
+/// table rather than passing for free, and it says so out loud: it counts how
+/// many of its own localities the ring now maps somewhere else, and refuses to
+/// conclude anything if that count is zero.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn cells_stay_addressable_when_a_member_joins_a_running_cluster() {
+    use bifrost::conshash::slots::client::SMClient as SlotsSMClient;
+
+    let _ = env_logger::try_init();
+    let server_group = "slot_join_stability_test";
+    let addresses = vec![
+        crate::utils::test_port::unique_localhost_addr(),
+        crate::utils::test_port::unique_localhost_addr(),
+    ];
+    let opts = ServerOptions {
+        chunk_size: 16 * 1024 * 1024,
+        db_size: 16 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: None,
+        wal_storage: None,
+        undo_log_storage: None,
+        raft_storage: None,
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: false,
+        disable_storage_locks: true,
+    };
+
+    // One member, which is how every cluster necessarily starts: the first node
+    // cannot wait for the second, because the second cannot join until the
+    // first is up.
+    let first = NebServer::new_cluster_from_opts(
+        &opts,
+        &addresses[0],
+        &addresses,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let client = Arc::new(
+        client::AsyncClient::new(&first.rpc, &first.membership, &addresses, server_group)
+            .await
+            .unwrap(),
+    );
+    client
+        .new_schema_with_id(Schema::new_with_id(
+            1400,
+            &String::from("join_stability_schema"),
+            None,
+            default_fields(),
+            false,
+            false,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Spread across the slot space rather than clustered, so this cannot pass by
+    // landing entirely in localities the ring happens not to reassign.
+    let ids: Vec<Id> = (0..96u64).map(|i| Id::from_parts(i * 331, 1)).collect();
+    for (seq, id) in ids.iter().enumerate() {
+        let mut value = types::OwnedMap::new();
+        value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+        value.insert(&String::from("score"), OwnedValue::U64(seq as u64));
+        value.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("pre-join-{seq}")),
+        );
+        client
+            .write_cell(OwnedCell::new_with_id(
+                1400,
+                id,
+                OwnedValue::Map(value),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    for id in &ids {
+        client.read_cell(*id).await.unwrap().unwrap();
+    }
+
+    // The second member joins a cluster that is already holding data.
+    let second = NebServer::new_cluster_from_opts(
+        &opts,
+        &addresses[1],
+        &addresses,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    // Wait for the join to be visible in the ring, because the whole point is
+    // what happens *after* membership changes. A test that ran before the ring
+    // noticed would prove nothing.
+    let mut converged = false;
+    for _ in 0..100 {
+        if first.conshash().server_count() >= 2 {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        converged,
+        "the ring never saw the second member, so this test cannot say anything about joins"
+    );
+
+    // How many of these localities would the RING now send elsewhere? This is
+    // the test's own proof that it is not passing for free: if placement were
+    // still computed, this many cells would have become unreachable.
+    let reassigned_by_ring = ids
+        .iter()
+        .filter(|id| {
+            first.conshash().get_server_id(id.locality() as u64) != Some(first.server_id)
+        })
+        .count();
+    assert!(
+        reassigned_by_ring > 0,
+        "the ring reassigned none of {} localities on this join, so the test is vacuous",
+        ids.len()
+    );
+
+    // The authoritative table, re-read from the state machine rather than from
+    // the cache the client happened to load before the join.
+    client.reload_slot_owners().await;
+    let placement = SlotsSMClient::new(crate::server::SLOTS_SM_ID, &client.raft_client);
+    let group = crate::slots::slot_group_id(server_group);
+    assert_eq!(
+        placement
+            .slots_owned_by(&group, &first.server_id)
+            .await
+            .unwrap()
+            .len(),
+        crate::slots::SLOT_COUNT,
+        "a joining member must own nothing: the table is not recomputed, so every slot \
+         stays where it was"
+    );
+    assert!(
+        placement
+            .slots_owned_by(&group, &second.server_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the new member should own no slots until something explicitly assigns them"
+    );
+
+    // And the part that actually matters: every cell written before the join is
+    // still readable through the ordinary hashed path afterwards.
+    for id in &ids {
+        let cell = client
+            .read_cell(*id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{id:?} (locality {}) became unreachable when a member joined: {error:?}",
+                    id.locality()
+                )
+            });
+        assert_eq!(cell.header.id, *id);
+    }
+
+    // Placement and the ring now genuinely disagree, which is the point -- and
+    // the table is the one being obeyed.
+    let disagreements = ids
+        .iter()
+        .filter(|id| {
+            Some(client.locate_server_id(id).unwrap())
+                != first.conshash().get_server_id(id.locality() as u64)
+        })
+        .count();
+    assert_eq!(
+        disagreements, reassigned_by_ring,
+        "every locality the ring reassigned should be one where the table overrides it"
+    );
+}

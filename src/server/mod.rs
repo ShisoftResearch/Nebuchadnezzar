@@ -42,6 +42,9 @@ pub mod transactions;
 pub use status::{ChunkMemoryStatus, ServerMemoryStatus};
 
 pub static CONS_HASH_ID: u64 = hash_ident!(NEB_CONSHASH_MEM_WEIGHTS) as u64;
+/// Slot ownership table. Separate from the weights SM above because it is
+/// authoritative for placement rather than an input to computing it.
+pub static SLOTS_SM_ID: u64 = hash_ident!(NEB_CONSHASH_SLOT_PLACEMENT) as u64;
 const META_CLUSTER_JOIN_MAX_RETRIES: usize = 100;
 const META_CLUSTER_JOIN_RETRY_DELAY_MS: u64 = 100;
 const CLUSTER_GROUP_JOIN_MAX_RETRIES: usize = 100;
@@ -1002,6 +1005,35 @@ pub async fn init_conshash(
             if !ch.init_table().await.is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);
+            }
+            // Seed the slot table from the placement the ring just computed, so
+            // the table starts out agreeing with the ring exactly and nothing
+            // appears to move. First writer wins per slot, so every member can
+            // do this concurrently and a restart is a no-op.
+            //
+            // Best-effort on purpose: failing startup because the table could
+            // not be seeded would trade a placement problem for an availability
+            // one. Callers treat an absent table as "fall back to the ring".
+            match crate::slots::adopt_from_ring(group_name, &ch, raft_client, SLOTS_SM_ID).await {
+                Ok(0) => debug!("slot placement table already seeded"),
+                Ok(adopted) => info!("seeded {} slots into the placement table", adopted),
+                Err(reason) => warn!(
+                    "could not seed the slot placement table ({}); placement falls back to the ring",
+                    reason
+                ),
+            }
+            // Install the table into the ring object itself, so every consumer of
+            // this `ConsistentHashing` gets one answer for "who owns this cell".
+            // Leaving it out of here and reading it only in the client is what
+            // gives a cluster two placement oracles -- and a write and a read
+            // that pick different ones do not fail, they lose the data.
+            match crate::slots::load_owner_vec(group_name, raft_client, SLOTS_SM_ID).await {
+                Ok(Some(owners)) => ch.set_slot_overrides(Some(owners)),
+                Ok(None) => debug!("no slot placement table for this group; routing by the ring"),
+                Err(reason) => warn!(
+                    "could not load the slot placement table ({}); routing by the ring",
+                    reason
+                ),
             }
             return Ok(ch);
         }
@@ -2055,6 +2087,11 @@ impl NebServer {
             database_name,
         );
         Weights::new_with_id(CONS_HASH_ID, &raft_service).await;
+        // Registered before start() for the same reason as the weights SM: an
+        // SM registered afterwards never receives replayed WAL entries, and a
+        // placement table that silently loses its history would send every
+        // lookup to the wrong member.
+        bifrost::conshash::slots::Slots::new_with_id(SLOTS_SM_ID, &raft_service).await;
 
         // TODO: If RangedIndexer service is enabled, MasterTreeSM should also be
         // registered here before start() to enable WAL replay recovery
@@ -2153,8 +2190,14 @@ impl NebServer {
         .await
     }
 
+    /// Which member holds this cell.
+    ///
+    /// Through the slot-aware call, not the raw ring: this is asked by code that
+    /// then goes and reads or writes the cell, so it has to give the same answer
+    /// the write path gave. Before the slot table this distinction did not exist;
+    /// with it, a site left on `get_server_id` is a second placement oracle.
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
-        self.consh.get_server_id(id.locality() as u64)
+        self.consh.get_server_id_for_slot(id.locality() as u64)
     }
     pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
         self.member_pool
@@ -2172,6 +2215,52 @@ impl NebServer {
     }
     pub fn conshash(&self) -> &ConsistentHashing {
         &*self.consh
+    }
+
+    /// Re-read the slot placement table into this server's ring and into every
+    /// database client it hosts.
+    ///
+    /// This is how a member catches up on a migration it did not perform. The
+    /// committer already knows the new owner and applies it directly; everyone
+    /// else has to be told, and until they are they route by a table that is one
+    /// migration behind. That window is survivable only because a migration
+    /// defers dropping the donor's copy, so a stale member still reads correct
+    /// data -- it is a latency problem, not a data one.
+    ///
+    /// **Catch-up only. Do not use this to observe a migration that just
+    /// committed.** It reads the table with a raft *query*, and a query can be
+    /// served by a member that holds the committing log entry without having
+    /// applied it -- so calling this right after a commit can install the state
+    /// the commit replaced, which is worse than not refreshing at all because it
+    /// looks current. A migration pushes the new owner to the members that must
+    /// not be wrong (`cell_rpc::note_slot_owner`) for exactly this reason. This
+    /// cost a day's worth of intermittent failures; see the `note_slot_owner`
+    /// docs on `AsyncClient`.
+    ///
+    /// Returns whether the table was read successfully. A failure leaves the
+    /// current table in place rather than clearing it: clearing would fall back
+    /// to the ring, which is the answer the table exists to override.
+    pub async fn refresh_slot_placement(&self) -> bool {
+        match crate::slots::load_owner_vec(&self.group_name, &self.raft_client, SLOTS_SM_ID).await {
+            Ok(owners) => {
+                self.consh.set_slot_overrides(owners);
+                // Each database client builds its own ring object, so refreshing
+                // only `self.consh` would leave the read and write paths of this
+                // very server disagreeing.
+                for (_name, runtime) in lightning::map::Map::entries(&self.database_runtimes) {
+                    runtime.neb_client.reload_slot_owners().await;
+                }
+                true
+            }
+            Err(reason) => {
+                warn!(
+                    "could not refresh slot placement for group {} ({}); \
+                     keeping the table this server already has",
+                    self.group_name, reason
+                );
+                false
+            }
+        }
     }
     pub fn raft_client(&self) -> &RaftClient {
         &*self.raft_client
@@ -2199,7 +2288,9 @@ pub async fn rpc_client_by_id(
     id: &Id,
     conshash: &Arc<ConsistentHashing>,
 ) -> Result<Arc<RPCClient>, RPCError> {
-    let server_id = conshash.get_server_id(id.locality() as u64).unwrap();
+    let server_id = conshash
+        .get_server_id_for_slot(id.locality() as u64)
+        .unwrap();
     let conshash = conshash.clone();
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |sid| conshash.to_server_name(sid))

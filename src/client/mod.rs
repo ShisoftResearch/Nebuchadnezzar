@@ -99,7 +99,31 @@ impl AsyncClient {
                                 &schema_plane_client,
                             )
                         },
-                        conshash: chash,
+                        conshash: {
+                            // One placement oracle per ring object. A client
+                            // builds its own `ConsistentHashing`, so it must
+                            // install the table too -- otherwise this client
+                            // routes by the ring while the server it talks to
+                            // routes by the table.
+                            match crate::slots::load_owner_vec(
+                                group,
+                                &raft_client,
+                                crate::server::SLOTS_SM_ID,
+                            )
+                            .await
+                            {
+                                Ok(owners @ Some(_)) => chash.set_slot_overrides(owners),
+                                Ok(None) => {}
+                                // Route by the ring exactly as before rather
+                                // than refuse to start.
+                                Err(reason) => warn!(
+                                    "could not load the slot placement table for group {} ({}); \
+                                     routing by the ring",
+                                    group, reason
+                                ),
+                            }
+                            chash
+                        },
                         raft_client: raft_client.clone(),
                         database_catalog_client: {
                             let shared_plane_client =
@@ -161,16 +185,83 @@ impl AsyncClient {
             Ok(()) | Err(CreateDatabaseError::NameExists(_)) => Ok(()),
         }
     }
+    /// Which server holds this id's cell.
+    ///
+    /// Delegates to the ring object, which consults the stored slot table before
+    /// computing an answer. That indirection is the point: placement must have
+    /// exactly one oracle. A client that kept its own copy of the table would be
+    /// a second one, and a write routed by the table while a read routes by the
+    /// ring does not fail loudly -- it looks like the cell was never written.
     pub fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
         if id.is_unit_id() {
             return Ok(0);
         }
-        match self.conshash.get_server_id(id.locality() as u64) {
+        match self
+            .conshash
+            .get_server_id_for_slot(crate::slots::slot_of(id) as u64)
+        {
             Some(n) => Ok(n),
             None => Err(RPCError::IOError(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("cannot locate server for id {:?}", id),
             ))),
+        }
+    }
+
+    /// Replace the placement table this client's ring routes by.
+    ///
+    /// Kept explicit rather than refreshed on a timer so that a stale table is
+    /// always the result of a missed notification, never of a poll that has not
+    /// come round yet.
+    pub fn refresh_slot_owners(&self, owners: Option<Vec<u64>>) {
+        self.conshash.set_slot_overrides(owners);
+    }
+
+    /// Record one slot's owner without re-reading the table.
+    ///
+    /// Used by a migration on its own commit, and it deliberately does not read
+    /// back. A raft *command* returns the value its own apply produced, but a
+    /// *query* issued straight afterwards round-robins over the members and can
+    /// be served by one that has the log entry and has not applied it yet --
+    /// measured here: reading the table immediately after
+    /// `complete_slot_migration` returned the OLD owner, and reading it again a
+    /// moment later returned the new one. So the committer applies what it
+    /// already knows, which is both authoritative and cheaper than pulling all
+    /// 32768 entries.
+    pub fn note_slot_owner(&self, slot: u32, owner: u64) {
+        self.conshash
+            .note_slot_owner(slot as u64, owner, crate::slots::SLOT_COUNT);
+    }
+
+    /// Re-read the placement table from the state machine.
+    ///
+    /// For a member catching up on somebody else's migration. Returns whether
+    /// the table was actually replaced.
+    ///
+    /// A failed query keeps the current table rather than clearing it. Clearing
+    /// would fall back to the ring, and the ring is precisely the answer the
+    /// table exists to override -- so a transient raft hiccup would silently
+    /// resume routing cells to wherever `jump_hash` happens to point.
+    pub async fn reload_slot_owners(&self) -> bool {
+        match crate::slots::load_owner_vec(
+            &self.group_name,
+            &self.raft_client,
+            crate::server::SLOTS_SM_ID,
+        )
+        .await
+        {
+            Ok(owners) => {
+                self.refresh_slot_owners(owners);
+                true
+            }
+            Err(reason) => {
+                warn!(
+                    "could not reload the slot placement table for group {} ({}); \
+                     keeping the table this client already has",
+                    self.group_name, reason
+                );
+                false
+            }
         }
     }
 
