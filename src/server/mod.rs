@@ -2227,6 +2227,16 @@ impl NebServer {
     /// defers dropping the donor's copy, so a stale member still reads correct
     /// data -- it is a latency problem, not a data one.
     ///
+    /// **Catch-up only. Do not use this to observe a migration that just
+    /// committed.** It reads the table with a raft *query*, and a query can be
+    /// served by a member that holds the committing log entry without having
+    /// applied it -- so calling this right after a commit can install the state
+    /// the commit replaced, which is worse than not refreshing at all because it
+    /// looks current. A migration pushes the new owner to the members that must
+    /// not be wrong (`cell_rpc::note_slot_owner`) for exactly this reason. This
+    /// cost a day's worth of intermittent failures; see the `note_slot_owner`
+    /// docs on `AsyncClient`.
+    ///
     /// Returns whether the table was read successfully. A failure leaves the
     /// current table in place rather than clearing it: clearing would fall back
     /// to the ring, which is the answer the table exists to override.
