@@ -55,6 +55,7 @@ service! {
     rpc remove_all_cells(keys: &Vec<Id>) -> Vec<Result<(), WriteError>>;
     rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
     rpc settle_bulk_receive() -> BulkReceiveReport;
+    rpc note_slot_owner(slot: u32, owner: u64) -> ();
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
@@ -349,6 +350,26 @@ impl Service for NebRPCService {
             None => BulkReceiveReport::default(),
         };
         future::ready(report).boxed()
+    }
+
+    fn note_slot_owner(&self, slot: u32, owner: u64) -> BoxFuture<'_, ()> {
+        // Pushed by the member that committed the migration, rather than pulled
+        // by this one, and that direction is the whole point. A *query* for the
+        // table can be served by a member that holds the committing log entry
+        // and has not applied it, so a member asked to "go and re-read" can
+        // install the state the commit replaced -- and then route writes to a
+        // former owner while believing it is current. The committer already has
+        // the authoritative answer; telling is safe where asking is not.
+        //
+        // Both rings, because a database client builds its own: updating one
+        // would leave this server's read and write paths disagreeing.
+        self.database_runtime.consh.note_slot_owner(
+            slot as u64,
+            owner,
+            crate::slots::SLOT_COUNT,
+        );
+        self.neb_client.note_slot_owner(slot, owner);
+        future::ready(()).boxed()
     }
 
     fn compare_version_and_update_cell(

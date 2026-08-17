@@ -412,6 +412,22 @@ pub async fn migrate_slot(
     // re-reading the table -- see `note_slot_owner` for why a read-back here
     // can legitimately return the state before the commit.
     client.note_slot_owner(slot, owner);
+    // And push it to the two members that must not be wrong about this slot:
+    // the new owner, which is about to start answering for it, and the donor,
+    // which must stop. Pushed rather than left for them to re-read, for the
+    // same reason -- a query can be served the state this commit replaced.
+    //
+    // Best-effort: the table is already committed, so a member that misses this
+    // is stale rather than wrong, and its copy of the data is still intact
+    // because the drop is deferred.
+    for (member, member_client) in [(from, &donor), (to, &recipient)] {
+        if let Err(error) = member_client.note_slot_owner(slot, owner).await {
+            warn!(
+                "slot {slot} committed to {owner} but member {member} could not be told \
+                 ({error:?}); it will route by a table one migration behind until it refreshes"
+            );
+        }
+    }
 
     info!(
         "slot {} migrated {} -> {}: {} cells in {} batches over {} pass(es), \
