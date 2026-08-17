@@ -79,21 +79,32 @@ pub struct AsyncClient {
 /// is read once per cell lookup, so the representation should be an index, not
 /// a hash. A slot with no owner stays 0 and the caller falls back to the ring.
 ///
+/// `Ok(None)` means the group genuinely has no table; `Err` means we could not
+/// find out. Callers must distinguish them, because the safe answer differs:
+/// no table means route by the ring, while a failed query means keep believing
+/// whatever we already knew.
+async fn try_load_slot_owners(
+    group: &str,
+    raft_client: &Arc<RaftClient>,
+) -> Result<Option<Vec<u64>>, String> {
+    let table = crate::slots::load_table(group, raft_client, crate::server::SLOTS_SM_ID).await?;
+    Ok(table.map(|table| {
+        let mut owners = vec![0u64; crate::slots::SLOT_COUNT];
+        for (slot, state) in table {
+            if let Some(entry) = owners.get_mut(slot as usize) {
+                *entry = state.serving_owner();
+            }
+        }
+        owners
+    }))
+}
+
 /// A query failure is reported as `None`, not as an error: a client that cannot
 /// reach the placement SM should route by the ring exactly as it always did,
 /// not refuse to start.
 async fn load_slot_owners(group: &str, raft_client: &Arc<RaftClient>) -> Option<Vec<u64>> {
-    match crate::slots::load_table(group, raft_client, crate::server::SLOTS_SM_ID).await {
-        Ok(Some(table)) => {
-            let mut owners = vec![0u64; crate::slots::SLOT_COUNT];
-            for (slot, state) in table {
-                if let Some(entry) = owners.get_mut(slot as usize) {
-                    *entry = state.serving_owner();
-                }
-            }
-            Some(owners)
-        }
-        Ok(None) => None,
+    match try_load_slot_owners(group, raft_client).await {
+        Ok(owners) => owners,
         Err(reason) => {
             warn!(
                 "could not load the slot placement table for group {} ({}); routing by the ring",
@@ -248,6 +259,55 @@ impl AsyncClient {
     /// notification, never of a poll that has not come round yet.
     pub fn refresh_slot_owners(&self, owners: Option<Vec<u64>>) {
         *self.slot_owners.write() = owners;
+    }
+
+    /// Record one slot's owner in the cached table.
+    ///
+    /// Used by a migration on its own commit, and it deliberately does not
+    /// re-read the table to do it. A raft *command* returns the value its own
+    /// apply produced, but a *query* issued straight afterwards round-robins
+    /// over the members and can be served by one that has the log entry and has
+    /// not applied it yet — measured here: reading the table immediately after
+    /// `complete_slot_migration` returned the old owner, and reading it again a
+    /// moment later returned the new one. So the committer applies what it
+    /// knows rather than asking, which is both authoritative and cheaper than
+    /// pulling all 32768 entries.
+    ///
+    /// With no cached table this creates one holding just this slot. That is
+    /// the correct meaning and not a lie: every other slot stays 0, which reads
+    /// as unplaced and falls back to the ring exactly as before.
+    pub fn note_slot_owner(&self, slot: u32, owner: u64) {
+        let mut cached = self.slot_owners.write();
+        let owners = cached.get_or_insert_with(|| vec![0u64; crate::slots::SLOT_COUNT]);
+        if let Some(entry) = owners.get_mut(slot as usize) {
+            *entry = owner;
+        }
+    }
+
+    /// Re-read the placement table from the state machine into the local cache.
+    ///
+    /// Called after a migration commits, by the driver and by any member told
+    /// to catch up. Returns whether the table was actually replaced.
+    ///
+    /// A failed query keeps the current table rather than clearing it. Clearing
+    /// would fall back to the ring, and the ring is precisely the answer the
+    /// table exists to override -- so a transient raft hiccup would silently
+    /// resume routing cells to wherever `jump_hash` happens to point.
+    pub async fn reload_slot_owners(&self) -> bool {
+        match try_load_slot_owners(&self.group_name, &self.raft_client).await {
+            Ok(owners) => {
+                self.refresh_slot_owners(owners);
+                true
+            }
+            Err(reason) => {
+                warn!(
+                    "could not reload the slot placement table for group {} ({}); \
+                     keeping the table this client already has",
+                    self.group_name, reason
+                );
+                false
+            }
+        }
     }
 
     pub fn client_by_server_id<'a>(

@@ -15,10 +15,25 @@ use dovahkiin::integrated::lisp;
 use dovahkiin::types::OwnedValue;
 use futures::future::BoxFuture;
 use futures::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use bifrost_plugins::hash_ident;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
+
+/// What the receiving member's memory looks like after a migration batch has
+/// been given the chance to reach disk.
+///
+/// Reported back to the migration driver rather than only logged, because the
+/// recipient's hot tier is the thing a bulk transfer can blow up and the driver
+/// is the only party that knows how much more it intends to send. Zero
+/// everywhere means there is no tier configured, not that nothing was received.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct BulkReceiveReport {
+    pub evicted_segments: u64,
+    pub hot_segments: u64,
+    pub hot_bytes: u64,
+}
 
 pub fn generate_scoped_service_id(group: &str, database_name: &str) -> u64 {
     hash_str(&format!("NEB_CELL_RPC_SERVICE-{}-{}", group, database_name))
@@ -36,6 +51,10 @@ service! {
     rpc upsert_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc upsert_all_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
     rpc remove_cell(key: Id) -> Result<(), WriteError>;
+    rpc head_all_cells(keys: &Vec<Id>) -> Vec<Result<CellHeader, ReadError>>;
+    rpc remove_all_cells(keys: &Vec<Id>) -> Vec<Result<(), WriteError>>;
+    rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
+    rpc settle_bulk_receive() -> BulkReceiveReport;
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
@@ -239,6 +258,99 @@ impl Service for NebRPCService {
         }
         .boxed()
     }
+    fn head_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<CellHeader, ReadError>>> {
+        // Presence and version for many cells without moving a single body.
+        // A migration reclaiming a donor copy has to ask "does the new owner
+        // already have this?" for every id it is about to destroy, and reading
+        // the cells back to answer that would double the cost of the move.
+        future::ready(
+            keys.into_iter()
+                .map(|id| self.database_runtime.chunks().head_cell(id))
+                .collect(),
+        )
+        .boxed()
+    }
+
+    fn remove_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<(), WriteError>>> {
+        // Deliberately does NOT stop at the first failure, unlike
+        // `upsert_all_cells`. That batch aborts because its caller's crash
+        // consistency depends on every durable prefix being referentially
+        // closed; removals carry no such ordering. The caller here is a
+        // migration dropping a donor copy, and it needs to know exactly which
+        // keys are still present -- an abort would hide that behind one error
+        // and leave it unable to tell "not removed" from "not attempted".
+        // Copied up front so the future borrows only `self`: removals are
+        // sequential awaits, and a borrow of the caller's slice would have to
+        // outlive the request.
+        let keys = keys.clone();
+        async move {
+            let mut results = Vec::with_capacity(keys.len());
+            for key in keys {
+                results.push(self.remove_cell(key).await);
+            }
+            results
+        }
+        .boxed()
+    }
+
+    fn cell_ids_in_slots(&self, slots: &Vec<u32>) -> BoxFuture<'_, Vec<Id>> {
+        // Slots are `u32` on the wire because that is what the placement state
+        // machine speaks, and `u16` at the storage layer because a Neb slot IS
+        // an id's locality, which is 15 bits. A value too large to be a
+        // locality can match no cell, so it is dropped rather than truncated
+        // into some other slot's answer.
+        let wanted: std::collections::HashSet<u16> = slots
+            .iter()
+            .filter(|slot| (**slot as usize) < crate::slots::SLOT_COUNT)
+            .map(|slot| *slot as u16)
+            .collect();
+        future::ready(self.database_runtime.chunks().cell_ids_in_slots(&wanted)).boxed()
+    }
+
+    fn settle_bulk_receive(&self) -> BoxFuture<'_, BulkReceiveReport> {
+        // Migration's memory contract on the receiving side.
+        //
+        // Received cells are ordinary writes: they append to the head segment,
+        // which is archived the moment it seals, so the durable copy exists
+        // without anything special. What is NOT automatic is when the resident
+        // copy goes away -- that is the tier's job, and in production only the
+        // background cleaner asks for it. A bulk transfer can push far more
+        // into the hot tier between two cleaner passes than a normal write
+        // workload would, so the driver asks here, once per batch, and the
+        // received data becomes disk-resident at the pace of the migration
+        // instead of at the cleaner's cadence.
+        //
+        // The pass respects the tier's own threshold, so this is a no-op when
+        // there is no pressure -- it makes the existing bound act promptly, it
+        // does not invent a second one.
+        let chunks = self.database_runtime.chunks();
+        let report = match chunks.tiered_manager.as_ref() {
+            Some(manager) => {
+                // Reconciled rather than cached: a transfer that just wrote
+                // several segments' worth is exactly the case where the shared
+                // counter is most stale, and acting on a stale count is how a
+                // settle silently does nothing.
+                let evicted = manager
+                    .evict_for_allocation_reconciled()
+                    .unwrap_or_else(|error| {
+                        warn!("bulk-receive settle could not evict: {}", error);
+                        0
+                    });
+                let hot_segments = manager.shared_hot_segments();
+                BulkReceiveReport {
+                    evicted_segments: evicted as u64,
+                    hot_segments: hot_segments as u64,
+                    hot_bytes: (hot_segments * crate::ram::segs::SEGMENT_SIZE) as u64,
+                }
+            }
+            // No tier configured: everything is resident by design and there is
+            // nothing to settle. Zeroes rather than an error, so the driver's
+            // per-batch step stays unconditional.
+            None => BulkReceiveReport::default(),
+        };
+        future::ready(report).boxed()
+    }
+
     fn compare_version_and_update_cell(
         &self,
         key: Id,
