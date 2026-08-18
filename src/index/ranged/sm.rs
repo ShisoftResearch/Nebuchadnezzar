@@ -57,7 +57,7 @@ pub struct MasterTreeSM {
 }
 
 raft_state_machine! {
-    def qry locate_key(entry: EntryKey) -> (EntryKey, TreePlacement, EntryKey);
+    def qry locate_key(entry: EntryKey) -> Option<(EntryKey, TreePlacement, EntryKey)>;
     def qry next_tree(tree_lower: EntryKey, ordering: Ordering) -> Option<TreeInfo>;
     def cmd split(src_tree: Id, new_tree: Id, pivot: EntryKey);
     def cmd try_init_genesis(tree_id: Id) -> bool;
@@ -67,13 +67,26 @@ raft_state_machine! {
 }
 
 impl StateMachineCmds for MasterTreeSM {
-    fn locate_key(&self, entry: EntryKey) -> BoxFuture<'_, (EntryKey, TreePlacement, EntryKey)> {
-        let (lower, tree) = self
+    /// `None` when no tree covers the key, which means the placement map is
+    /// empty -- a member has not yet applied the genesis snapshot.
+    ///
+    /// This used to `unwrap`, so a routine startup state killed the process:
+    /// under parallel load a member can query this before genesis has been
+    /// applied locally, and every caller inherited the panic. Callers already
+    /// `match` on this call and have a not-ready path; give them something to
+    /// match on instead of aborting.
+    fn locate_key(
+        &self,
+        entry: EntryKey,
+    ) -> BoxFuture<'_, Option<(EntryKey, TreePlacement, EntryKey)>> {
+        let Some((lower, tree)) = self
             .tree
             .range(..=&entry)
             .last()
             .map(|(key, tree)| (key.to_owned(), tree.to_owned()))
-            .unwrap();
+        else {
+            return future::ready(None).boxed();
+        };
         let upper = self
             .tree
             .range((Excluded(entry), Unbounded))
@@ -81,7 +94,7 @@ impl StateMachineCmds for MasterTreeSM {
             .map(|(key, _)| key)
             .unwrap_or_else(|| &*MAX_ENTRY_KEY)
             .to_owned();
-        future::ready((lower, tree, upper)).boxed()
+        future::ready(Some((lower, tree, upper))).boxed()
     }
 
     fn next_tree(

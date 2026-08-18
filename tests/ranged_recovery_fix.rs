@@ -57,7 +57,11 @@ async fn lazy_hydration_recovers_missing_active_tree() {
     let local_service = TreeService::new(&client, &sm_client);
 
     let entry = EntryKey::for_scannable(&Id::from_parts(7, 7), 0x12_34_56_78);
-    let (_lower, placement, _upper) = sm_client.locate_key(&entry).await.unwrap();
+    let (_lower, placement, _upper) = sm_client
+        .locate_key(&entry)
+        .await
+        .unwrap()
+        .expect("placement map should cover the key after recovery");
 
     let insert_result =
         TreeRpcService::insert(&local_service, placement.id, entry.clone(), placement.epoch).await;

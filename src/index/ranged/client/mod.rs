@@ -243,8 +243,23 @@ impl RangedIndexerClient {
                 );
                 return Err(too_many_retry_error(last_retry_reason.as_deref()));
             }
-            let (placement, tree_client, lower, upper) =
-                self.locate_key_server(&key, ensure_updated).await?;
+            let Some((placement, tree_client, lower, upper)) =
+                self.locate_key_server(&key, ensure_updated).await?
+            else {
+                // No tree covers the key yet -- the placement map has not
+                // been populated on this member. Retry like any other
+                // transient routing state; the loop's own bound turns a
+                // permanent absence into an error instead of a hang.
+                retried += 1;
+                last_retry_reason =
+                    Some("no ranged placement covers the key yet".to_string());
+                ensure_updated = true;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    migration_retry_delay_ms(retried, &key),
+                ))
+                .await;
+                continue;
+            };
             if trace_seek {
                 debug!(
                     "MIGRATION_SEEK_ROUTE key={:?} retry={} ensure_updated={} tree_id={:?} epoch={} lower={:?} upper={:?}",
@@ -390,7 +405,7 @@ impl RangedIndexerClient {
         &self,
         key: &EntryKey,
         ensure_updated: bool,
-    ) -> Result<(TreePlacement, Arc<AsyncServiceClient>, EntryKey, EntryKey), RPCError> {
+    ) -> Result<Option<(TreePlacement, Arc<AsyncServiceClient>, EntryKey, EntryKey)>, RPCError> {
         let mut tree_prop = None;
         if !ensure_updated {
             if let Some((lower, (placement, upper))) =
@@ -402,13 +417,20 @@ impl RangedIndexerClient {
             }
         }
         if tree_prop.is_none() {
-            tree_prop = Some(
-                self.refresh_key_mapping(key)
-                    .await
-                    .expect("Cannot locate key"),
-            );
+            // A placement lookup that fails outright is an error; one that
+            // simply has no tree yet is not. This used to `expect`, so a
+            // member querying before it applied genesis took the process
+            // down with it.
+            tree_prop = self.refresh_key_mapping(key).await.map_err(|e| {
+                RPCError::IOError(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Cannot locate key {:?}: {:?}", key, e),
+                ))
+            })?;
         }
-        let (lower, tree_placement, upper) = tree_prop.unwrap();
+        let Some((lower, tree_placement, upper)) = tree_prop else {
+            return Ok(None);
+        };
         let tree_client = locate_tree_server_from_conshash(
             &tree_placement.id,
             &self.conshash,
@@ -416,14 +438,18 @@ impl RangedIndexerClient {
             &self.database_name,
         )
         .await?;
-        Ok((tree_placement, tree_client, lower, upper))
+        Ok(Some((tree_placement, tree_client, lower, upper)))
     }
 
+    /// `Ok(None)` when the placement map has no tree covering the key yet.
+    /// That is a routine startup state, not an error: callers retry.
     async fn refresh_key_mapping(
         &self,
         key: &EntryKey,
-    ) -> Result<(EntryKey, TreePlacement, EntryKey), ExecError> {
-        let (lower, placement, upper) = self.sm.locate_key(key).await?;
+    ) -> Result<Option<(EntryKey, TreePlacement, EntryKey)>, ExecError> {
+        let Some((lower, placement, upper)) = self.sm.locate_key(key).await? else {
+            return Ok(None);
+        };
         debug_assert!(
             key >= &lower && key < &upper,
             "Key {:?}, lower {:?}, upper {:?}",
@@ -434,7 +460,7 @@ impl RangedIndexerClient {
         self.placement
             .write()
             .insert(lower.clone(), (placement.clone(), upper.clone()));
-        return Ok((lower, placement, upper));
+        return Ok(Some((lower, placement, upper)));
     }
 
     pub async fn next_tree(
@@ -453,12 +479,20 @@ impl RangedIndexerClient {
                     (lower.clone(), upper.clone())
                 } else {
                     drop(placement);
-                    let (lower, _placement, upper) = self.refresh_key_mapping(origin_key).await?;
+                    let Some((lower, _placement, upper)) =
+                        self.refresh_key_mapping(origin_key).await?
+                    else {
+                        return Ok(None);
+                    };
                     (lower, upper)
                 }
             } else {
                 drop(placement);
-                let (lower, _placement, upper) = self.refresh_key_mapping(origin_key).await?;
+                let Some((lower, _placement, upper)) =
+                    self.refresh_key_mapping(origin_key).await?
+                else {
+                    return Ok(None);
+                };
                 (lower, upper)
             }
         };

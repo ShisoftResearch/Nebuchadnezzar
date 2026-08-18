@@ -2488,11 +2488,12 @@ pub async fn init_ranged_indexer_service<C>(
         // it: every seek retried "tree placement was not found" until it
         // gave up, and the CAGRA service failed to initialize.
         let mut pending_first = match sm_client.locate_key(&cursor).await {
-            Ok((lower, placement, upper)) => Some(ranged::sm::TreeInfo {
+            Ok(Some((lower, placement, upper))) => Some(ranged::sm::TreeInfo {
                 lower,
                 upper,
                 placement,
             }),
+            Ok(None) => None,
             Err(e) => {
                 warn!(
                     "Could not locate the first ranged placement for {}/{}: {:?}",

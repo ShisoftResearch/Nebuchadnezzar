@@ -1368,6 +1368,34 @@ impl Chunk {
         Ok(())
     }
 
+    /// Remove a cell's body but leave its index entries in place.
+    ///
+    /// For a migration reclaiming a donor copy, and correct **only** there.
+    ///
+    /// A ranged index entry is keyed `[schema][field][feature][id]`, so there is
+    /// one logical entry per id for the whole cluster -- it does not name the
+    /// member holding the cell. A migration therefore inserts and deletes the same
+    /// entry: the recipient's upsert calls `ensure_indices` and creates it, then
+    /// the donor's ordinary `remove_cell` calls `remove_indices` and destroys it.
+    /// Net effect, measured: every migrated cell vanished from the index -- a scan
+    /// found 6 before a migration and 0 after, which in Morpheus surfaced as
+    /// "enumerated no vertices ... the index could not be enumerated".
+    ///
+    /// Keeping the entries is not a leak: the cell still exists, on the recipient,
+    /// and the entry still names it correctly. Removing them is what was wrong.
+    fn remove_cell_keeping_indices(&self, hash: u64) -> Result<(), WriteError> {
+        let guard = match CellGuard::for_read(hash, self) {
+            Ok(guard) => guard,
+            Err(ReadError::CellDoesNotExisted) => return Err(WriteError::CellDoesNotExisted),
+            Err(ReadError::CellIdIsUnitId) => return Err(WriteError::CellDoesNotExisted),
+            Err(e) => return Err(WriteError::ReadError(e)),
+        };
+        let cell_location = guard.get_ptr();
+        guard.remove_cell();
+        self.put_tombstone_by_cell_loc(cell_location)?;
+        Ok(())
+    }
+
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
     where
         P: Fn(&SharedCell) -> bool,
@@ -2446,6 +2474,12 @@ impl Chunks {
         let chunk = self.locate_chunk_by_partition(cell.header.id.locality() as u64);
         return chunk.upsert_cell(cell);
     }
+    /// See `Chunk::remove_cell_keeping_indices`: for a migration's reclaim only.
+    pub fn remove_cell_keeping_indices(&self, key: &Id) -> Result<(), WriteError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        chunk.remove_cell_keeping_indices(hash)
+    }
+
     pub fn remove_cell(&self, key: &Id) -> Result<(), WriteError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell(hash);
