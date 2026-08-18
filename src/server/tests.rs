@@ -8,6 +8,7 @@ use futures::stream::FuturesUnordered;
 use rand::prelude::*;
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use test::Bencher;
 use tokio_stream::StreamExt;
 
@@ -1666,5 +1667,169 @@ pub async fn dynamic_tail_layout_roundtrip_across_array_lengths() {
             }
             other => panic!("unexpected list value at len {len}: {:?}", other),
         }
+    }
+}
+
+/// Thread census for this process, by thread name.
+#[cfg(target_os = "linux")]
+fn threads_by_name() -> std::collections::BTreeMap<String, usize> {
+    let mut census = std::collections::BTreeMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+        for entry in entries.flatten() {
+            let comm = entry.path().join("comm");
+            if let Ok(name) = std::fs::read_to_string(comm) {
+                *census.entry(name.trim().to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    census
+}
+
+#[cfg(target_os = "linux")]
+fn thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+/// Does a server give its threads back when it goes away?
+///
+/// It did not, and the graceful path hid it. Measured on the Morpheus suite:
+/// after ~2950 tests the process held **9100 threads** and ~22 GB across
+/// resident and swap -- 3456 `raft-server`, 2416 `cleaner-clean-t`,
+/// 1208 `cleaner-evict-t`, 802 `stats-sweeper`, 302 `Cleaner main` -- and the
+/// last test in the run, 11-18 s standalone, had not finished in 40 minutes.
+///
+/// The server itself always dropped. What survived was the graph it hands to
+/// others: `rpc::Server` keeps a strong `Arc` to every service it hosts, and
+/// the Raft service is held by its own plane tasks. Awaiting `shutdown` broke
+/// both; dropping did not.
+///
+/// **The assertion is per-server, not a thread census.** A census is
+/// meaningless inside a suite where hundreds of other tests are creating and
+/// dropping servers concurrently -- it failed exactly that way. What is
+/// deterministic is that a dropped server told its own cleaner and its own
+/// store to stop. Set `NEB_THREAD_CENSUS=1` to also count process threads;
+/// only do that when running this test alone.
+///
+/// Both paths are checked, and the dropped one is the point: a test that only
+/// exercised `shutdown` passed throughout the entire period the leak existed.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_that_goes_away_gives_its_threads_back() {
+    let _ = env_logger::try_init();
+    const ROUNDS: usize = 3;
+    let census = std::env::var("NEB_THREAD_CENSUS").is_ok();
+
+    async fn spawn_server(label: &str) -> Arc<NebServer> {
+        NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 16 * 1024 * 1024,
+                db_size: 16 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                enable_recovery: false,
+                disable_storage_locks: true,
+            },
+            &crate::utils::test_port::unique_localhost_addr(),
+            label,
+            async |_| {},
+        )
+        .await
+        .unwrap()
+    }
+
+    spawn_server("thread_lifecycle_warmup").await.shutdown().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    for graceful in [true, false] {
+        let before = thread_count();
+        let census_before = threads_by_name();
+        for round in 0..ROUNDS {
+            let server = spawn_server(&format!("thread_lifecycle_{graceful}_{round}")).await;
+            // Held across the drop so the teardown can be observed after it.
+            let cleaner = server.cleaner().clone();
+            let chunks = server.chunks().clone();
+            let weak_runtime = Arc::downgrade(&server.database_runtime);
+            assert!(
+                !cleaner.is_stopped() && !chunks.is_background_stopped(),
+                "a running server should not already be torn down"
+            );
+            if graceful {
+                server.shutdown().await;
+            }
+            drop(server);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                cleaner.is_stopped(),
+                "graceful={graceful} round={round}: the server went away without stopping its \
+                 cleaner, which is 13 threads per server"
+            );
+            assert!(
+                chunks.is_background_stopped(),
+                "graceful={graceful} round={round}: the server went away without stopping its \
+                 store's background work"
+            );
+            drop(cleaner);
+            drop(chunks);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Reported, NOT asserted, and the difference is the honest part.
+            // Dropping a server stops its threads; it does not free its store,
+            // because the RPC services that hold the store cannot be removed
+            // safely while other servers share a `(group, database)` name. A
+            // graceful shutdown does free it. See `stop_owned_background_work`.
+            println!(
+                "STILL REACHABLE (graceful={graceful} round={round}): runtime={}",
+                weak_runtime.strong_count()
+            );
+            if graceful {
+                assert_eq!(
+                    weak_runtime.strong_count(),
+                    0,
+                    "a gracefully shut down server must let its database runtime go"
+                );
+            }
+        }
+
+        if !census {
+            continue;
+        }
+        // Bounded wait: threads exit on their own schedule, and a census taken
+        // the instant the last server dropped would report scheduling as a leak.
+        let mut after = thread_count();
+        for _ in 0..30 {
+            if after <= before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            after = thread_count();
+        }
+        let census_after = threads_by_name();
+        let mut grew: Vec<(String, usize, usize)> = census_after
+            .iter()
+            .filter_map(|(name, count)| {
+                let was = census_before.get(name).copied().unwrap_or(0);
+                (*count > was).then(|| (name.clone(), was, *count))
+            })
+            .collect();
+        grew.sort_by_key(|(_, was, now)| std::cmp::Reverse(now - was));
+        println!(
+            "THREADS (graceful={graceful}): {before} before, {after} after {ROUNDS} lifecycles ({:+})",
+            after as i64 - before as i64
+        );
+        for (name, was, now) in &grew {
+            println!("THREADS:   {name}: {was} -> {now}");
+        }
+        assert!(
+            after <= before,
+            "graceful={graceful}: {ROUNDS} servers were created and dropped, and the process \
+             kept {} extra threads ({before} -> {after}); by name: {grew:?}",
+            after as i64 - before as i64
+        );
     }
 }

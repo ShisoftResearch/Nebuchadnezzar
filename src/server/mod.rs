@@ -992,6 +992,18 @@ pub struct NebServer {
     pub neb_client: Arc<AsyncClient>,
 }
 
+impl Drop for NebServer {
+    fn drop(&mut self) {
+        // A server dropped without `shutdown` used to strand 26 threads; see
+        // `stop_owned_background_work`. Doing it
+        // here rather than asking every caller to remember is deliberate: a
+        // forgotten shutdown should cost the ordering guarantees `shutdown`
+        // adds -- the index drain, the WAL sync, the archive -- and nothing
+        // more. It should not cost 26 threads and a memory store.
+        self.stop_owned_background_work();
+    }
+}
+
 pub async fn init_conshash(
     group_name: &String,
     address: &String,
@@ -1756,6 +1768,59 @@ impl NebServer {
         self.database_runtime.txn_manager()
     }
 
+    /// Stop the background threads this server owns, so dropping it does not
+    /// strand them.
+    ///
+    /// MEASURED: dropping a server without awaiting `shutdown` kept **26
+    /// threads per server** alive -- 12 `raft-server`, 8 `cleaner-clean-t`,
+    /// 4 `cleaner-evict-t`, 1 `Cleaner main`, 1 `stats-sweeper`. By the end of
+    /// the Morpheus suite that was 9100 threads and ~22 GB across resident and
+    /// swap, and the last test in the run, 11-18 s on its own, had not finished
+    /// in 40 minutes.
+    ///
+    /// The server itself DID drop every time. What survived was the graph it
+    /// hands to others: `rpc::Server` keeps a strong `Arc` to every service it
+    /// hosts, so the store stayed reachable from the RPC server, and the Raft
+    /// service is held by its own plane tasks, so its runtime never tore down.
+    ///
+    /// So the threads are stopped **directly**, rather than by trying to make
+    /// the object graph unwind. That distinction is not stylistic -- see
+    /// `stop_background` on the store, which exists because a store outliving
+    /// its server is normal, and a thread waiting for the store to drop would
+    /// wait forever.
+    ///
+    /// **What this deliberately does NOT do is release the RPC services.**
+    /// Removing them is what would let the store's memory go, and it breaks the
+    /// suite: Neb's services are registered under ids scoped by
+    /// `(group, database)`, tests reuse those names, and process-global state is
+    /// keyed the same way -- so one server's teardown reaches into a live
+    /// server's registrations. Measured: `client::tests` went 10/10 to 0/10, and
+    /// concurrent tests failed with `SchemaDoesNotExisted` and rings that never
+    /// converged. Freeing the store needs that keying fixed first; freeing the
+    /// threads does not, and that is what this does.
+    ///
+    /// Synchronous by necessity: this is what `Drop` calls, and `Drop` cannot
+    /// await. `shutdown` calls it too, at the end, so the graceful path and the
+    /// dropped path converge rather than diverging.
+    fn stop_owned_background_work(&self) {
+        let mut runtimes = vec![self.database_runtime.clone()];
+        for (_name, runtime) in lightning::map::Map::entries(&self.database_runtimes) {
+            if !runtimes.iter().any(|known| Arc::ptr_eq(known, &runtime)) {
+                runtimes.push(runtime);
+            }
+        }
+        for runtime in &runtimes {
+            // The cleaner first: it is the only one of these that touches the
+            // store, so it stops before anything else changes underneath it.
+            runtime.cleaner().stop();
+            runtime.chunks().stop_background();
+        }
+        // The Raft runtime's threads outlive their service because the service
+        // is held by its own plane tasks. Idempotent -- `Drop` on the service
+        // does the same thing, if the last reference ever goes.
+        self.raft_service.begin_teardown();
+    }
+
     /// Gracefully shutdown the server, flushing all data to disk
     pub async fn shutdown(&self) {
         info!("Starting graceful server shutdown");
@@ -1850,6 +1915,12 @@ impl NebServer {
         info!("Shutting down RPC server");
         let _ = self.rpc.shutdown().await;
         info!("RPC server shutdown complete");
+
+        // Step 4: stop the background threads. `rpc.shutdown` above already
+        // released the services, so the store is on its way out either way;
+        // this makes the graceful path and the dropped path end in the same
+        // state rather than diverging.
+        self.stop_owned_background_work();
 
         info!("Server shutdown complete");
     }
