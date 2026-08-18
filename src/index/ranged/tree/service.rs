@@ -732,7 +732,15 @@ impl TreeService {
             return;
         };
         let committed = match self.sm_client.locate_key(&boundary.upper).await {
-            Ok((_, placement, _)) => placement.id == target,
+            Ok(Some((_, placement, _))) => placement.id == target,
+            Ok(None) => {
+                warn!(
+                    "Cannot reconcile split marker on {:?} (target {:?}): no placement \
+                     covers the boundary yet; leaving the marker for the next load",
+                    id, target
+                );
+                return;
+            }
             Err(e) => {
                 warn!(
                     "Cannot reconcile split marker on {:?} (target {:?}): placement \
@@ -793,7 +801,7 @@ impl TreeService {
         }
 
         match self.sm_client.locate_key(entry).await {
-            Ok((lower, placement, upper)) if placement.id == id => {
+            Ok(Some((lower, placement, upper))) if placement.id == id => {
                 if let Some(pending_tree) = self.pending_migrations.remove(&id) {
                     {
                         let mut pending_prop = pending_tree.prop.write();
@@ -851,7 +859,15 @@ impl TreeService {
                 );
                 true
             }
-            Ok((_lower, placement, _upper)) => {
+            Ok(None) => {
+                warn!(
+                    "Cannot hydrate missing tree {:?} for entry {:?}: no placement covers it yet",
+                    id,
+                    entry.id()
+                );
+                false
+            }
+            Ok(Some((_lower, placement, _upper))) => {
                 warn!(
                     "Cannot hydrate missing tree {:?} for entry {:?}: placement currently points to {:?} (epoch={})",
                     id,
@@ -970,7 +986,7 @@ impl TreeService {
 
         for attempt in 0..SPLIT_RECONCILE_ATTEMPTS {
             match sm_client.locate_key(pivot_key).await {
-                Ok((_lower, placement, _upper)) if placement.id == target_id => {
+                Ok(Some((_lower, placement, _upper))) if placement.id == target_id => {
                     debug!(
                         "Placement split reconciliation succeeded for pivot {:?} -> {:?} on attempt {}",
                         pivot_key,
@@ -979,7 +995,14 @@ impl TreeService {
                     );
                     return true;
                 }
-                Ok((_lower, placement, _upper)) => {
+                Ok(None) => {
+                    debug!(
+                        "Placement split reconciliation attempt {} for pivot {:?} found no placement covering it yet",
+                        attempt + 1,
+                        pivot_key
+                    );
+                }
+                Ok(Some((_lower, placement, _upper))) => {
                     debug!(
                         "Placement split reconciliation attempt {} for pivot {:?} still points to {:?} instead of {:?}",
                         attempt + 1,
@@ -1348,10 +1371,16 @@ impl TreeService {
 
                         debug!("Calling placement for split to {:?}", migration_target_id);
                         match sm_client.locate_key(&pivot_key).await {
-                            Ok((_lower, placement, _upper)) => {
+                            Ok(Some((_lower, placement, _upper))) => {
                                 debug!(
                                     "Preflighted split for source {:?} at pivot {:?}; current placement tree {:?}, epoch {}",
                                     dist_tree.id, pivot_key, placement.id, placement.epoch
+                                );
+                            }
+                            Ok(None) => {
+                                debug!(
+                                    "Preflighted split for source {:?} at pivot {:?}; no placement covers the pivot yet",
+                                    dist_tree.id, pivot_key
                                 );
                             }
                             Err(e) => {
