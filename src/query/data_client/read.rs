@@ -251,8 +251,16 @@ impl IndexedDataClient {
                 let proc = proc.clone();
                 let group_name = self.group_name.clone();
                 let database_name = self.database_name.clone();
-                let server_name = self.conshash.to_server_name(sid);
+                let server_name = self.conshash.try_server_name(sid);
                 async move {
+                    let Some(server_name) = server_name else {
+                        // See above: an unroutable member fails these ids rather
+                        // than taking the process down.
+                        return Err(RPCError::IOError(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("no address known for server id {sid}"),
+                        )));
+                    };
                     match client_by_server_name_for_database(
                         sid,
                         server_name,
@@ -325,7 +333,13 @@ impl IndexedDataClient {
                     warn!("Missing server mapping for id {:?}", ids[idx]);
                     continue;
                 };
-                let server_name = self.conshash.to_server_name(sid);
+                // Unknown member: it has left the ring, or a stale placement table
+                // still names it. Skipped exactly like a missing mapping above --
+                // an unroutable id is not grounds for panicking the process.
+                let Some(server_name) = self.conshash.try_server_name(sid) else {
+                    warn!("No address known for server {} holding {:?}", sid, ids[idx]);
+                    continue;
+                };
                 match client_by_server_name_for_database(
                     sid,
                     server_name,
@@ -415,8 +429,16 @@ impl IndexedDataClient {
                 let fields = fields.to_vec();
                 let group_name = self.group_name.clone();
                 let database_name = self.database_name.clone();
-                let server_name = self.conshash.to_server_name(sid);
+                let server_name = self.conshash.try_server_name(sid);
                 async move {
+                    let Some(server_name) = server_name else {
+                        // See above: an unroutable member fails these ids rather
+                        // than taking the process down.
+                        return Err(RPCError::IOError(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("no address known for server id {sid}"),
+                        )));
+                    };
                     match client_by_server_name_for_database(
                         sid,
                         server_name,

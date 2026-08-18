@@ -64,12 +64,19 @@ impl DistributedInvertedIndexCoordinator {
     /// Get RPC client for a specific server
     async fn get_client(&self, server_id: u64) -> Result<Arc<AsyncServiceClient>, RPCError> {
         // Get the server address from consistent hashing
-        let server_addr = self.conshash.to_server_name(server_id);
+        // An unknown member is routine here -- placement can name one that has
+        // left -- so it is an error the caller handles, not a panic.
+        let server_addr = self.conshash.try_server_name(server_id).ok_or_else(|| {
+            RPCError::IOError(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no address known for server id {server_id}"),
+            ))
+        })?;
 
         // Get or create RPC client from the client pool
         let rpc_client = self
             .client_pool
-            .get_by_id(server_id, |_| server_addr)
+            .get_by_id(server_id, |_| Some(server_addr))
             .await
             .map_err(|e| RPCError::IOError(e))?;
 

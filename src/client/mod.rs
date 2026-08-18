@@ -939,7 +939,7 @@ pub async fn client_by_server_id_for_database(
     database_name: &str,
 ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
     DEFAULT_CLIENT_POOL
-        .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
+        .get_by_id(server_id, move |sid| conshash.try_server_name(sid))
         .await
         .map_err(|e| RPCError::IOError(e))
         .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))
@@ -959,7 +959,7 @@ pub async fn client_by_server_name_for_database(
     database_name: &str,
 ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
     DEFAULT_CLIENT_POOL
-        .get_by_id(server_id, move |_sid| server_name)
+        .get_by_id(server_id, move |_sid| Some(server_name))
         .await
         .map_err(|e| RPCError::IOError(e))
         .map(|c| client_by_rpc_client_for_database(&c, group_name, database_name))

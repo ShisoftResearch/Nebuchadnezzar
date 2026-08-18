@@ -63,9 +63,11 @@ service! {
     rpc head_all_cells(keys: &Vec<Id>) -> Vec<Result<CellHeader, ReadError>>;
     rpc drop_migrated_cells(keys: &Vec<Id>) -> Vec<Result<(), WriteError>>;
     rpc receive_migrated_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
+    rpc push_cells_to(keys: &Vec<Id>, target: u64) -> Result<Vec<Id>, String>;
     rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
     rpc settle_bulk_receive() -> BulkReceiveReport;
     rpc note_slot_owner(slot: u32, owner: u64) -> ();
+    rpc note_slot_owners(owners: &Vec<(u32, u64)>) -> ();
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
@@ -351,10 +353,14 @@ impl Service for NebRPCService {
         let chunks = self.database_runtime.chunks();
         let report = match chunks.tiered_manager.as_ref() {
             Some(manager) => {
-                // Reconciled rather than cached: a transfer that just wrote
-                // several segments' worth is exactly the case where the shared
-                // counter is most stale, and acting on a stale count is how a
-                // settle silently does nothing.
+                // Reconciled, and MEASURED to be worth it. This forces
+                // `force_reconcile_all_chunks` -- a scan of every segment of every
+                // chunk -- once per batch, which is 28% of a reshard's wall time
+                // (2.3s without any settle, 3.0s with this one, for 1 GB). The
+                // cheap `evict_for_allocation` was tried and is worse on BOTH
+                // counts: 3.4s and a recipient peak of 1584 MB against this
+                // version's 1336 MB. Acting on a stale counter makes the pass shed
+                // less, the extra resident pressure costs more than the scan saves.
                 let evicted = manager
                     .evict_for_allocation_reconciled()
                     .unwrap_or_else(|error| {
@@ -362,7 +368,16 @@ impl Service for NebRPCService {
                         0
                     });
                 let hot_segments = manager.shared_hot_segments();
-                let scanned = manager.scanned_hot_segments();
+                // Gated, because it is O(every segment of every chunk) and the
+                // driver calls this once per batch. Accurate is worth paying for
+                // in a measurement and indefensible in a production transfer:
+                // measured on .239 with 768 chunks it dominated the reshard,
+                // turning ~20 minutes of transfer into a projected 2.5 hours.
+                let scanned = if std::env::var("NEB_MEASURE_SCAN_HOT").is_ok() {
+                    manager.scanned_hot_segments()
+                } else {
+                    0
+                };
                 BulkReceiveReport {
                     evicted_segments: evicted as u64,
                     hot_segments: hot_segments as u64,
@@ -396,6 +411,76 @@ impl Service for NebRPCService {
             crate::slots::SLOT_COUNT,
         );
         self.neb_client.note_slot_owner(slot, owner);
+        future::ready(()).boxed()
+    }
+
+    fn push_cells_to(&self, keys: &Vec<Id>, target: u64) -> BoxFuture<'_, Result<Vec<Id>, String>> {
+        // Donor -> recipient directly, with the coordinator only orchestrating.
+        //
+        // The obvious shape -- coordinator reads from the donor, then writes to the
+        // recipient -- makes every cell body cross the wire twice and pay two full
+        // serialize/deserialize round trips, because the coordinator materializes
+        // each `OwnedCell` only to hand it straight back. Measured in-process, the
+        // byte path is what limits a transfer at realistic cell sizes: dropping the
+        // payload from 4 KB to 256 B raised throughput 5.3x in cells/s, so per-byte
+        // work dominates per-cell work for anything but tiny cells.
+        //
+        // Only the ids that landed come back, which is what the reclaim needs to
+        // decide what it may destroy, and they are 8 bytes each instead of a cell.
+        let keys = keys.clone();
+        async move {
+            let recipient = self
+                .neb_client
+                .client_by_server_id(target)
+                .await
+                .map_err(|error| format!("cannot reach recipient {target}: {error:?}"))?;
+
+            let mut cells = Vec::with_capacity(keys.len());
+            for key in &keys {
+                match self.database_runtime.chunks().read_cell(key) {
+                    Ok(cell) => cells.push(cell.to_owned()),
+                    // Enumerated a moment ago and gone now: nothing to move, and
+                    // nothing wrong.
+                    Err(crate::ram::cell::ReadError::CellDoesNotExisted) => {}
+                    Err(error) => {
+                        return Err(format!("donor could not read {key:?}: {error:?}"))
+                    }
+                }
+            }
+            if cells.is_empty() {
+                return Ok(Vec::new());
+            }
+            let landed: Vec<Id> = cells.iter().map(|cell| cell.header.id).collect();
+            let written = recipient
+                .receive_migrated_cells(cells)
+                .await
+                .map_err(|error| format!("recipient {target} unreachable mid-push: {error:?}"))?;
+            if let Some(error) = written
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .find(|error| !matches!(error, WriteError::BatchAborted))
+            {
+                return Err(format!(
+                    "recipient {target} rejected a batch of {} cells: {error:?}",
+                    landed.len()
+                ));
+            }
+            Ok(landed)
+        }
+        .boxed()
+    }
+
+    fn note_slot_owners(&self, owners: &Vec<(u32, u64)>) -> BoxFuture<'_, ()> {
+        // The batched form of `note_slot_owner`, for a bulk migration that has
+        // just committed many slots at once. Same reasoning as the single version
+        // -- pushed by the committer, because a query can be answered with the
+        // state the commit replaced -- and one round trip instead of one per slot.
+        for (slot, owner) in owners {
+            self.database_runtime
+                .consh
+                .note_slot_owner(*slot as u64, *owner, crate::slots::SLOT_COUNT);
+            self.neb_client.note_slot_owner(*slot, *owner);
+        }
         future::ready(()).boxed()
     }
 
