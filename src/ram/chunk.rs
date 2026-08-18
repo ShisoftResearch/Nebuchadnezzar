@@ -592,7 +592,28 @@ impl Chunk {
                 // then had nowhere to go. One entry in 845M hit exactly that
                 // during a TB import, which is rare enough to look like noise
                 // and is still a lost write.
-                head.incr_references();
+                //
+                // And the reference must actually be TAKEN. `incr_references`
+                // returns false when the segment is exclusively held -- an
+                // evictor, a promoter or the cleaner owns it and is about to
+                // free or replace its pages. Every reader honours that answer;
+                // this path used to discard it and append anyway, which puts a
+                // cell into memory that `evict_segment` is about to
+                // `madvise(MADV_DONTNEED)`. The append cursor moves, the WAL
+                // entry is written, the cell index takes the address, and the
+                // pages are then zeroed underneath it -- so the next read finds
+                // `Id(0)` where the cell should be and reports it missing.
+                //
+                // That is the signature behind the silent cell loss under tier
+                // pressure: `stale cell read: ... found Id(0)`, only ever with
+                // eviction active, intermittent because it needs the exclusive
+                // CAS to land inside this window.
+                if !head.incr_references() {
+                    // Someone owns this segment exclusively. Do not write into
+                    // it; wait for the head to rotate or the owner to finish.
+                    backoff.spin();
+                    continue;
+                }
                 if let Some(addr) = head.try_acquire(size) {
                     trace!(
                         "Chunk {} acquired address {} for size {} in segment {} ({:?})",
@@ -3227,6 +3248,94 @@ mod tests {
             drain_until_reclaimed(chunk, std::time::Duration::from_secs(10)),
             1,
             "the segment should be reclaimed once its reader has left"
+        );
+    }
+
+    /// A writer must never append into a segment somebody holds exclusively.
+    ///
+    /// `incr_references` returns false when a segment is exclusively held -- an
+    /// evictor, a promoter or the cleaner owns it and is about to free or
+    /// replace its pages. Every READ path honours that answer. The write path
+    /// discarded it and appended anyway, so a cell could be placed in memory
+    /// that `evict_segment` was about to `madvise(MADV_DONTNEED)`: the append
+    /// cursor moved, the WAL entry was written, the cell index took the address,
+    /// and the pages were then zeroed underneath it.
+    ///
+    /// That is the mechanism behind the silent cell loss under tier pressure --
+    /// `stale cell read: ... found Id(0)` -- which only ever appeared with
+    /// eviction active and was intermittent because it needs the exclusive CAS
+    /// to land inside this window. A scale reshard lost 129 of 1048576 cells
+    /// that way while reporting 0 failures.
+    ///
+    /// The test holds the head exclusively for the whole run: a writer that
+    /// respects the protocol makes no progress into it (it waits for the head to
+    /// rotate or the owner to finish), and one that does not returns an address
+    /// inside it immediately. Whether the writer waits or rotates is its
+    /// business; putting a cell inside a segment being freed is not.
+    #[test]
+    fn a_writer_never_appends_into_an_exclusively_held_segment() {
+        let _ = env_logger::try_init();
+        let (chunks, _schema) = setup_test_chunks();
+        let chunk = &chunks.list[0];
+
+        let head_id = chunk.get_head_seg_id();
+        let head = chunk
+            .segs
+            .get(&(head_id as usize))
+            .expect("the bootstrap segment is published");
+        let head_start = head.addr;
+        let head_end = head.bound();
+
+        // Stand in for an evictor, which takes the segment exclusively before it
+        // archives and frees the pages.
+        assert!(
+            head.obtain_exclusive_references(),
+            "a quiet segment should be claimable exclusively"
+        );
+
+        let acquired: Arc<std::sync::Mutex<Option<usize>>> = Arc::new(std::sync::Mutex::new(None));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let chunks_for_writer = chunks.clone();
+        let acquired_for_writer = acquired.clone();
+        let done_for_writer = done.clone();
+        let writer = std::thread::spawn(move || {
+            let chunk = &chunks_for_writer.list[0];
+            if let Ok(entry) = chunk.try_acquire(64, false) {
+                *acquired_for_writer.lock().unwrap() = Some(entry.addr);
+                // Do NOT run the WAL/dirty/decr path on a segment we should
+                // never have been given: just record the address and leak the
+                // entry, which is all the assertion needs.
+                std::mem::forget(entry);
+            }
+            done_for_writer.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        // Generous: the unfixed path returns in microseconds.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let inside = acquired
+            .lock()
+            .unwrap()
+            .map(|addr| addr >= head_start && addr < head_end)
+            .unwrap_or(false);
+        assert!(
+            !inside,
+            "a writer was handed an address inside a segment held exclusively for eviction, \
+             so its cell would be zeroed by the madvise that follows"
+        );
+
+        // Release and let the writer finish, so the test leaves nothing spinning.
+        head.release_exclusive_references();
+        for _ in 0..200 {
+            if done.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = writer.join();
+        assert!(
+            done.load(std::sync::atomic::Ordering::Acquire),
+            "the writer must make progress once the segment is released; if it never does, \
+             honouring the reference has turned a rare loss into a hang"
         );
     }
 
