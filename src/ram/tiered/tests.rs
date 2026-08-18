@@ -4770,3 +4770,154 @@ fn releasing_an_already_released_reference_does_not_wrap() {
 
     let _ = std::fs::remove_dir_all(&schema_dir);
 }
+
+/// Does a cell survive being written past the tier limit?
+///
+/// The narrowest statement of a loss found by a scale run on .239: a reshard of
+/// 4 GB of payload against a 1 GB tier limit moved 129 fewer cells than were
+/// written and reported **0 failures**, because the donor's read of each of
+/// those 129 came back `CellDoesNotExisted`. The log says exactly what was
+/// there instead:
+///
+/// ```text
+/// WARN neb::ram::cell] stale cell read: requested id bits N found Id(0) at 0x72f0b...
+/// ```
+///
+/// 129 distinct ids at 129 distinct addresses, every one of them reading as
+/// `Id(0)` -- zeroed memory, not another cell's bytes. The same run with the
+/// tier limit raised ABOVE the payload evicted nothing and lost nothing, which
+/// is what makes this a tier bug rather than a migration one. Migration only
+/// made it visible, by being the first thing to read every cell back.
+///
+/// This test therefore contains no migration at all: write past the limit,
+/// read everything back. Sized by environment so the same test can be run as a
+/// quick gate or as a long stress:
+///
+///   NEB_TIER_SURVIVAL_CELLS, NEB_TIER_SURVIVAL_PAYLOAD, NEB_TIER_SURVIVAL_SEGMENTS
+///
+/// It is intermittent -- the .239 reproduction lost 129 cells on one run and 0
+/// on the next with identical settings, under different background load -- so a
+/// single pass proving nothing is expected. Run it in a loop when hunting.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_cell_survives_being_written_past_the_tier_limit() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+    let cells = env_usize("NEB_TIER_SURVIVAL_CELLS", 65536);
+    let payload_len = env_usize("NEB_TIER_SURVIVAL_PAYLOAD", 4096);
+    let limit_segments = env_usize("NEB_TIER_SURVIVAL_SEGMENTS", 4);
+
+    let backup_dir = temp_path("neb_tier_survival_bk");
+    let wal_dir = temp_path("neb_tier_survival_wal");
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::create_dir_all(&backup_dir);
+    let _ = std::fs::create_dir_all(&wal_dir);
+
+    // The store has to be able to HOLD everything; only the hot tier is small.
+    // Sizing the chunk to the tier limit instead would test the allocator's
+    // behaviour when it runs out of space, which is a different question.
+    let store_bytes = (cells * payload_len * 3).max(64 * SEGMENT_SIZE);
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: store_bytes,
+            db_size: store_bytes,
+            tiered_config: Some(crate::ram::tiered::TieredConfig {
+                threshold: 0.8,
+                lower_watermark: 0.72,
+                physical_memory_limit: limit_segments * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            }),
+            backup_storage: Some(backup_dir.to_string()),
+            wal_storage: Some(wal_dir.to_string()),
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &crate::utils::test_port::unique_localhost_addr(),
+        "tiered_cell_survival",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    const SCHEMA: u32 = 9077;
+    let schema = Schema::new_with_id(
+        SCHEMA,
+        &String::from("tier_survival_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    // `register_internal_schema`, not `debug_only_new_schema`: this test has to
+    // run in RELEASE. bifrost picks its codec by build profile and the tier's
+    // pacing is entirely different under a debug build, so a debug-only run
+    // would be measuring a store that nobody ships. The id is fixed, which is
+    // what that entry point requires.
+    server.meta().schemas.register_internal_schema(schema.clone());
+
+    let mut written: Vec<Id> = Vec::with_capacity(cells);
+    for index in 0..cells {
+        let id = Id::allocated(0, 0, index as u64);
+        let mut cell = large_string_cell(SCHEMA, id, payload_len, "tier-survival");
+        server
+            .chunks()
+            .write_cell(&mut cell)
+            .expect("writing past the tier limit should succeed");
+        written.push(id);
+    }
+
+    // Eviction is threshold-driven and runs on the cleaner's own interval, so
+    // give it a bounded chance to catch up before reading. Without this the
+    // test can finish before anything is cold and fail its own vacuity guard
+    // rather than testing the tier.
+    for _ in 0..100 {
+        if total_cold_segments(&server.chunks()) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Read every one of them back. The tier is several times smaller than what
+    // was just written, so most of these have to come from a cold segment.
+    let mut lost: Vec<(Id, String)> = Vec::new();
+    for id in &written {
+        match server.chunks().read_cell(id) {
+            Ok(cell) => assert_eq!(cell.header.id, *id),
+            Err(error) => lost.push((*id, format!("{error:?}"))),
+        }
+    }
+
+    let hot = total_hot_segments(&server.chunks());
+    let cold = total_cold_segments(&server.chunks());
+    server.cleaner().stop();
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+
+    assert!(
+        cold > 0,
+        "nothing was evicted ({hot} hot, {cold} cold segments for {cells} cells against a \
+         {limit_segments}-segment limit), so this run proves nothing -- raise the payload \
+         or lower the limit"
+    );
+    assert!(
+        lost.is_empty(),
+        "{} of {} cells became unreadable after being written past a {}-segment tier limit \
+         ({hot} hot, {cold} cold); first few: {:?}",
+        lost.len(),
+        written.len(),
+        limit_segments,
+        lost.iter().take(5).collect::<Vec<_>>()
+    );
+}
