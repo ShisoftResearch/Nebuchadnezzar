@@ -138,9 +138,20 @@ service_with_id!(TreeService, DEFAULT_SERVICE_ID);
 /// 43 trees and 117,677,730 keys. Under-reporting to zero is the worst
 /// direction for this particular number: an empty ranged index is exactly the
 /// failure being looked for.
+/// A plain `RwLock<HashMap>`, and it must stay removable. This was a
+/// `PtrHashMap` that was only ever inserted into -- so every database's tree
+/// service, and with it every page its trees held, stayed alive for the life of
+/// the process even after the database was unloaded or dropped. Two separate
+/// mistakes: nothing retired the entry, and `PtrHashMap::remove` would not have
+/// released it anyway (it returns a clone and leaves the original in the retired
+/// node, so removal is not a release; see
+/// `neb::server::tests::ptr_hash_map_remove_does_not_release_the_value`).
+///
+/// Per the comment above, nothing on an operation path reads this, so a lock
+/// costs nothing here.
 static LOCAL_TREE_SERVICES: std::sync::LazyLock<
-    lightning::map::PtrHashMap<String, std::sync::Arc<TreeService>>,
-> = std::sync::LazyLock::new(|| lightning::map::PtrHashMap::with_capacity(8));
+    parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<TreeService>>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
 /// Key a database's tree service by the pair that scopes it everywhere else.
 pub fn local_tree_service_key(group_name: &str, database_name: &str) -> String {
@@ -153,8 +164,21 @@ pub fn publish_local_tree_service(
     database_name: &str,
     service: std::sync::Arc<TreeService>,
 ) {
-    use lightning::map::Map;
-    LOCAL_TREE_SERVICES.insert(local_tree_service_key(group_name, database_name), service);
+    LOCAL_TREE_SERVICES
+        .write()
+        .insert(local_tree_service_key(group_name, database_name), service);
+}
+
+/// Forget a database's tree service, because the database is going away.
+///
+/// Must be called when a runtime is unloaded or dropped. Without it the service
+/// -- and every page its trees hold -- outlives the database that owned it, for
+/// the life of the process.
+pub fn retire_local_tree_service(group_name: &str, database_name: &str) -> bool {
+    LOCAL_TREE_SERVICES
+        .write()
+        .remove(&local_tree_service_key(group_name, database_name))
+        .is_some()
 }
 
 /// This database's tree service, if it has one.
@@ -162,8 +186,10 @@ pub fn local_tree_service(
     group_name: &str,
     database_name: &str,
 ) -> Option<std::sync::Arc<TreeService>> {
-    use lightning::map::Map;
-    LOCAL_TREE_SERVICES.get(&local_tree_service_key(group_name, database_name))
+    LOCAL_TREE_SERVICES
+        .read()
+        .get(&local_tree_service_key(group_name, database_name))
+        .cloned()
 }
 
 pub struct TreeService {
@@ -1638,3 +1664,4 @@ pub async fn locate_tree_server_from_conshash(
         Err(RPCError::RequestError(RPCRequestError::Other))
     }
 }
+

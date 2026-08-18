@@ -2000,18 +2000,17 @@ async fn unloading_a_database_gives_its_threads_back() {
 
     server.shutdown().await;
 
-    // Reported, NOT asserted. `database_runtimes` is a `PtrHashMap`, and its
-    // `remove` CLONES the value out and retires the node -- the map's own `Arc`
-    // is destroyed when that node is REUSED, not when it is removed, so an
-    // unloaded runtime's memory is retained for an unbounded time. Measured: 10
-    // further load/unload cycles reclaimed none of 4. That is its own task; what
-    // this test guards is that the THREADS come back regardless, which they can
-    // because the unload stops them explicitly instead of waiting for a drop
-    // that may never come.
-    println!(
-        "DB CHURN: {} of {DATABASES} unloaded runtimes still reachable (memory retained by \
-         PtrHashMap node reuse)",
-        still_alive.len()
+    // ASSERTED, and it used to be a `println!` reporting 4 of 4 still reachable.
+    // `database_runtimes` was a `PtrHashMap`, whose `remove` returns a CLONE and
+    // leaves the original in the retired node -- so removal was not a release and
+    // every database ever unloaded stayed resident for the life of the process,
+    // memory store included. It is a plain `RwLock<HashMap>` now, which drops on
+    // removal like anything else; the map was never on a request path, so there
+    // was no lock-free property to trade away.
+    assert!(
+        still_alive.is_empty(),
+        "unloading a database must release its runtime, and these are still reachable: \
+         {still_alive:?}"
     );
     assert!(
         !census || after <= before,
