@@ -364,6 +364,45 @@ pub struct SharedCellData<'v> {
     compression_plan: Option<SchemaCompressionPlan>,
 }
 
+/// Why does the memory at `ptr` not hold the cell the index says it does?
+///
+/// Diagnostic for the one branch that has already decided something is wrong;
+/// see the call site in `SharedCellData::from_chunk_raw` for how to read it.
+fn describe_stale_pointer(ptr: usize, chunk: &Chunk) -> String {
+    use std::sync::atomic::Ordering;
+    let Some(segment) = chunk.locate_segment(ptr) else {
+        return format!(
+            "segment for {:#x} is GONE from the chunk -- the cleaner relocated it and the \
+             index kept the old address",
+            ptr
+        );
+    };
+    let offset = ptr.saturating_sub(segment.addr);
+    let frontier = segment.append_header.load(Ordering::Relaxed);
+    let within_written = ptr < frontier;
+    let now = clock::now() as i64;
+    let ago = |stamp: i64| {
+        if stamp <= 0 {
+            "never".to_string()
+        } else {
+            format!("{}ms ago", now.saturating_sub(stamp))
+        }
+    };
+    format!(
+        "segment {} (seq {}) is {}, {}dirty; offset {} of the segment, write frontier at {}, \
+         so the address is {} the written range; evicted {}, promoted {}",
+        segment.id,
+        segment.seq_id,
+        if segment.is_cold() { "COLD" } else { "HOT" },
+        if segment.is_dirty() { "" } else { "not " },
+        offset,
+        frontier.saturating_sub(segment.addr),
+        if within_written { "INSIDE" } else { "PAST" },
+        ago(segment.last_evicted_ms.load(Ordering::Relaxed)),
+        ago(segment.last_promoted_ms.load(Ordering::Relaxed)),
+    )
+}
+
 impl<'v> SharedCellData<'v> {
     //TODO: check or set checksum from crc32c cell content
     pub fn from_chunk_raw(
@@ -376,9 +415,28 @@ impl<'v> SharedCellData<'v> {
             // Stale pointer: the entry at this address no longer belongs to
             // the requested cell (relocated or replaced). Parsing it would
             // misinterpret another cell's bytes.
+            //
+            // The segment's state at this instant is what says WHICH subsystem
+            // is responsible, and it is only available here. Three readings, and
+            // they point at different code:
+            //
+            //   * offset inside the segment's written range, segment COLD and
+            //     recently evicted -> eviction freed the pages under a live
+            //     reader (`evict_segment` has its cell locking commented out).
+            //   * offset inside the written range, segment HOT and recently
+            //     promoted -> promotion restored an image that never contained
+            //     the cell: the archive-then-append window.
+            //   * segment absent, or offset past the write frontier -> the
+            //     cleaner relocated the cell and the index kept the old address.
+            //
+            // Only reached on the mismatch branch, which already warned, so this
+            // costs nothing on the read path.
             warn!(
-                "stale cell read: requested id bits {} found {:?} at {:#x}",
-                hash, header.id, ptr
+                "stale cell read: requested id bits {} found {:?} at {:#x}; {}",
+                hash,
+                header.id,
+                ptr,
+                describe_stale_pointer(ptr, chunk)
             );
             return Err(ReadError::StaleCellPointer);
         }
