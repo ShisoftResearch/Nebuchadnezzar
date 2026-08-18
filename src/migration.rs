@@ -3535,14 +3535,24 @@ pub mod drain {
             // Concurrent across slots, same as a reshard: independent commit
             // points, disjoint cells, and nearly all of the time spent waiting.
             //
-            // SPAWNED, not `buffer_unordered`. This path had the same bug the
-            // reshard was measured out of: `buffer_unordered` interleaves futures
-            // within ONE task, so it only parallelises work that actually yields,
-            // and two members in one process talk over the local RPC shortcut,
-            // which completes synchronously and never returns Pending. The
-            // reshard's fix did not reach here because the two drivers do not
-            // share their fan-out. A semaphore bounds it, so in-flight data on a
-            // destination is still `permits x batch_cells`.
+            // SPAWNED, not `buffer_unordered`, and the A/B says why. Measured on
+            // .239, 1024 slots x 64 cells x 4 KB, `drain_throughput_measurement`:
+            //
+            //   concurrency |  buffer_unordered |  spawn
+            //             1 |            70.6 s |  73.3 s
+            //            32 |             8.9 s |   1.1 s   (8.0x)
+            //
+            // Note what this is NOT: unlike the reshard, `buffer_unordered` here
+            // was not giving zero parallelism -- 70.6 s to 8.9 s is real 7.9x
+            // scaling, because a drain's per-slot work includes per-slot raft
+            // commands, which genuinely await. What it cannot do is use more than
+            // one core: interleaving happens inside ONE task. Spawning is worth
+            // another 8x on top. Do not carry the reshard's "buffer_unordered is
+            // not parallelism" number over to this path; it was measured, and it
+            // is a different number for a different reason.
+            //
+            // A semaphore bounds it, so in-flight data on a destination is still
+            // `permits x batch_cells`.
             let concurrency = plan.concurrent_slots.max(1);
             type SlotOutcome = (u32, u64, Result<(SlotHandover, Result<Reclaim, MigrationError>), MigrationError>);
             let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
