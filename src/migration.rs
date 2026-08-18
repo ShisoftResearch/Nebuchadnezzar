@@ -2363,6 +2363,132 @@ mod cluster_tests {
         }
     }
 
+    /// Does a migrated cell stay findable through the RANGED INDEX?
+    ///
+    /// Every other migration test here runs with `index_enabled: false`, which is
+    /// why none of them ever exercised this — and why the deterministic Morpheus
+    /// failure ("enumerated no vertices ... the index could not be enumerated"
+    /// after any migration) has no Neb-level counterpart yet.
+    ///
+    /// Migration writes each cell on the recipient through the ordinary upsert
+    /// path, so `ensure_indices` should add its entries there, and the reclaim
+    /// removes the donor's through `remove_indices`. If that holds, a scan sees
+    /// the same set before and after. If it does not, this is the Neb-level
+    /// reproduction of the last open blocker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_migrated_cell_is_still_found_by_a_ranged_scan() {
+        let _ = env_logger::try_init();
+        let group = "migration_ranged_scan_test";
+        let addresses = vec![
+            crate::utils::test_port::unique_localhost_addr(),
+            crate::utils::test_port::unique_localhost_addr(),
+        ];
+        let opts = ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            // The whole point: every other migration test leaves this off.
+            index_enabled: true,
+            services: vec![Service::Cell, Service::RangedIndexer],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        };
+        let mut servers = Vec::new();
+        for address in &addresses {
+            servers.push(
+                NebServer::new_cluster_from_opts(&opts, address, &addresses, group, async |_| {})
+                    .await
+                    .unwrap(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        let client = Arc::new(
+            client::AsyncClient::new(&servers[0].rpc, &servers[0].membership, &addresses, group)
+                .await
+                .unwrap(),
+        );
+        client.reload_slot_owners().await;
+        const SCHEMA: u32 = 1600;
+        client
+            .new_schema_with_id(Schema::new_with_id(
+                SCHEMA,
+                &String::from("ranged_scan_schema"),
+                None,
+                default_fields(),
+                false,
+                true,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        const SLOT: u16 = 321;
+        let mut written: HashSet<Id> = HashSet::new();
+        for seq in 0..6 {
+            let (id, mut cell) = cell_in_slot(SLOT, seq, "indexed");
+            cell.header.schema = SCHEMA;
+            client.write_cell(cell).await.unwrap().unwrap();
+            written.insert(id);
+        }
+        let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        async fn scan_ids(client: &Arc<AsyncClient>, schema: u32) -> HashSet<Id> {
+            let mut found = HashSet::new();
+            if let Ok(Some(mut cursor)) = client.ranged().scan_schema(schema, 64).await {
+                loop {
+                    match cursor.next().await {
+                        Ok(Some(id)) => {
+                            found.insert(id);
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            found
+        }
+
+        let before = scan_ids(&client, SCHEMA).await;
+        assert!(
+            written.is_subset(&before),
+            "the scan must find the cells before any migration, or this proves nothing: \
+             wrote {}, scan found {}",
+            written.len(),
+            before.len()
+        );
+
+        let donor_id = servers[0].server_id;
+        let recipient_id = servers[1].server_id;
+        let plan = MigrationPlan::default();
+        migrate_slot(&client, SLOT as u32, donor_id, recipient_id, &plan)
+            .await
+            .expect("slot should migrate");
+        reclaim_donor_copy(&client, SLOT as u32, donor_id, recipient_id, &plan)
+            .await
+            .expect("donor copy should be reclaimable");
+        for server in &servers {
+            server.refresh_slot_placement().await;
+        }
+        let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        let after = scan_ids(&client, SCHEMA).await;
+        let lost: Vec<&Id> = written.iter().filter(|id| !after.contains(id)).collect();
+        assert!(
+            lost.is_empty(),
+            "{} of {} migrated cells vanished from the ranged index \
+             (scan found {} before, {} after): {:?}",
+            lost.len(),
+            written.len(),
+            before.len(),
+            after.len(),
+            lost.iter().take(3).collect::<Vec<_>>()
+        );
+    }
+
     /// THE BUG, in isolation: an update to an already-transferred cell is lost.
     ///
     /// The migration doc has always said delta rounds catch *new* cells and not

@@ -280,7 +280,21 @@ impl Service for NebRPCService {
         async move {
             let mut results = Vec::with_capacity(keys.len());
             for key in keys {
-                results.push(self.remove_cell_unchecked(key).await);
+                // Index entries are deliberately LEFT BEHIND. They are keyed by
+                // `[schema][field][feature][id]`, so there is one logical entry
+                // per id for the whole cluster and the recipient's upsert has
+                // already (re)created exactly it. Removing it here deletes the
+                // entry that now describes the recipient's copy: measured, every
+                // migrated cell vanished from the index, 6 found by a scan before
+                // a migration and 0 after.
+                results.push(
+                    self.with_indices_ensured(|| {
+                        self.database_runtime
+                            .chunks()
+                            .remove_cell_keeping_indices(&key)
+                    })
+                    .await,
+                );
             }
             results
         }
