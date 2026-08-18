@@ -3512,36 +3512,61 @@ pub mod drain {
                 .collect();
             // Concurrent across slots, same as a reshard: independent commit
             // points, disjoint cells, and nearly all of the time spent waiting.
+            //
+            // SPAWNED, not `buffer_unordered`. This path had the same bug the
+            // reshard was measured out of: `buffer_unordered` interleaves futures
+            // within ONE task, so it only parallelises work that actually yields,
+            // and two members in one process talk over the local RPC shortcut,
+            // which completes synchronously and never returns Pending. The
+            // reshard's fix did not reach here because the two drivers do not
+            // share their fan-out. A semaphore bounds it, so in-flight data on a
+            // destination is still `permits x batch_cells`.
             let concurrency = plan.concurrent_slots.max(1);
             type SlotOutcome = (u32, u64, Result<(SlotHandover, Result<Reclaim, MigrationError>), MigrationError>);
-            let outcomes: Vec<SlotOutcome> = stream::iter(
-                assign(&with_data, &sorted).into_iter().map(|(slot, destination)| {
-                    let ids = held.get(&slot).cloned().unwrap_or_default();
-                    async move {
-                        match migrate_slot_prepared(client, slot, departing, destination, plan, ids)
-                            .await
-                        {
-                            Ok(handover) => {
-                                // Reclaimed per slot, not deferred to the end: a
-                                // drain exists so a member can leave, and it
-                                // cannot leave while it still holds the data.
-                                // `reshard_slots` defers every drop because there
-                                // the donor is staying; here that would defeat
-                                // the purpose.
-                                let reclaim = reclaim_donor_copy(
-                                    client, slot, departing, destination, plan,
-                                )
-                                .await;
-                                (slot, destination, Ok((handover, reclaim)))
-                            }
-                            Err(error) => (slot, destination, Err(error)),
+            let permits = Arc::new(tokio::sync::Semaphore::new(concurrency));
+            let mut tasks = Vec::new();
+            for (slot, destination) in assign(&with_data, &sorted) {
+                let ids = held.get(&slot).cloned().unwrap_or_default();
+                let permits = permits.clone();
+                let client = client.clone();
+                let plan = *plan;
+                tasks.push(tokio::spawn(async move {
+                    let _permit = permits.acquire().await;
+                    match migrate_slot_prepared(&client, slot, departing, destination, &plan, ids)
+                        .await
+                    {
+                        Ok(handover) => {
+                            // Reclaimed per slot, not deferred to the end: a
+                            // drain exists so a member can leave, and it
+                            // cannot leave while it still holds the data.
+                            // `reshard_slots` defers every drop because there
+                            // the donor is staying; here that would defeat
+                            // the purpose.
+                            let reclaim = reclaim_donor_copy(
+                                &client, slot, departing, destination, &plan,
+                            )
+                            .await;
+                            (slot, destination, Ok((handover, reclaim)))
                         }
+                        Err(error) => (slot, destination, Err(error)),
                     }
-                }),
-            )
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
+                }));
+            }
+            let mut outcomes: Vec<SlotOutcome> = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                match task.await {
+                    Ok(outcome) => outcomes.push(outcome),
+                    // A panicking migration task must not be silently dropped:
+                    // the slot would look untouched while its migration is
+                    // half-done, and a drain that reports success on a
+                    // half-moved slot is how a member leaves with data.
+                    Err(join_error) => {
+                        return Err(MigrationError::Invalid(format!(
+                            "a slot migration task failed to join during the drain of                              {departing}: {join_error:?}"
+                        )));
+                    }
+                }
+            }
 
             for (slot, destination, outcome) in outcomes {
                 match outcome {
