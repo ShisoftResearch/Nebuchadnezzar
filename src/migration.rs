@@ -3137,10 +3137,16 @@ mod cluster_tests {
             .iter()
             .map(|handover| handover.cells_transferred)
             .sum();
+        let vanished: usize = reshard
+            .handovers
+            .iter()
+            .map(|handover| handover.vanished_before_transfer)
+            .sum();
         println!(
-            "MEASUREMENT: {} slots handed over, {} cells transferred, {} failures",
+            "MEASUREMENT: {} slots handed over, {} cells transferred, {} vanished before transfer, {} failures",
             reshard.handovers.len(),
             transferred,
+            vanished,
             reshard.failed.len()
         );
         println!(
@@ -3162,12 +3168,6 @@ mod cluster_tests {
                 .unwrap_or(0)
         );
 
-        assert!(
-            reshard.failed.is_empty(),
-            "reshard reported failures: {:?}",
-            reshard.failed
-        );
-        assert_eq!(transferred, written.len());
 
         // The property under test, stated against the baseline rather than
         // against the tier limit.
@@ -3222,6 +3222,11 @@ mod cluster_tests {
             in_flight / (1024 * 1024)
         );
 
+        // The survey runs BEFORE the count assertions on purpose. "The transfer
+        // moved 129 fewer cells than were written" is a fact about a counter;
+        // "those cells are on neither member" is a fact about the data, and only
+        // the second one says whether anything was actually lost.
+        //
         // And nothing was lost moving it -- as a SURVEY, not a first-failure
         // panic. At this scale "one cell is missing" and "an entire slot is
         // missing" are completely different bugs with completely different
@@ -3270,12 +3275,29 @@ mod cluster_tests {
         }
         assert!(
             lost.is_empty(),
-            "the reshard lost {} of {} cells",
+            "the reshard lost {} of {} cells ({} were never transferred, {} vanished before \
+             transfer, {} slots reported failures)",
             lost.len(),
-            written.len()
+            written.len(),
+            written.len().saturating_sub(transferred),
+            vanished,
+            reshard.failed.len()
         );
         println!(
             "MEASUREMENT: all {} cells readable after the reshard",
+            written.len()
+        );
+        assert!(
+            reshard.failed.is_empty(),
+            "reshard reported failures: {:?}",
+            reshard.failed
+        );
+        assert_eq!(
+            transferred,
+            written.len(),
+            "the reshard moved {} cells where {} were written, and every cell is still \
+             readable -- so the shortfall is an accounting bug rather than data loss",
+            transferred,
             written.len()
         );
 
