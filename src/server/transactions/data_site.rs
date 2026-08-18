@@ -502,7 +502,9 @@ impl DataManager {
     }
 
     /// Create a segment reference guard to prevent eviction during transaction.
-    /// Returns None if segment not found (already freed/evicted).
+    /// Returns None if the segment is not found (already freed/evicted) or is
+    /// held exclusively by an evictor, promoter or the cleaner -- in which case
+    /// its pages are about to go and a transaction must not pin a read there.
     /// The guard is RAII - reference is automatically released when dropped.
     #[inline]
     fn acquire_segment_guard(
@@ -512,7 +514,7 @@ impl DataManager {
     ) -> Option<SegmentReferenceGuard> {
         if let Some(chunk) = self.chunks().list.get(chunk_idx) {
             if let Some(segment) = chunk.segs.get(&(segment_id as usize)) {
-                return Some(SegmentReferenceGuard::new(segment));
+                return SegmentReferenceGuard::new(segment);
             }
         }
         warn!(

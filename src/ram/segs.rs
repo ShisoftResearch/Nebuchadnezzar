@@ -2213,15 +2213,28 @@ pub struct SegmentReferenceGuard {
 }
 
 impl SegmentReferenceGuard {
-    /// Create a new guard and increment the segment's reference count
-    pub fn new(segment: lightning::aarc::Arc<Segment>) -> Self {
-        segment.incr_references();
+    /// Take a reference, or `None` if the segment is held exclusively.
+    ///
+    /// Fallible on purpose. `incr_references` refuses while an evictor, a
+    /// promoter or the cleaner owns the segment and is about to free or replace
+    /// its pages; this used to discard that answer and hand back a guard that
+    /// had pinned nothing, so the holder believed it was safe to read memory
+    /// that could be `madvise`d away underneath it -- and its `Drop` then
+    /// decremented a reference it never took.
+    pub fn new(segment: lightning::aarc::Arc<Segment>) -> Option<Self> {
+        if !segment.incr_references() {
+            debug!(
+                "SegmentReferenceGuard refused for segment {}: held exclusively",
+                segment.id
+            );
+            return None;
+        }
         debug!(
             "SegmentReferenceGuard acquired for segment {} (ref count: {})",
             segment.id,
             segment.references.load(Ordering::Relaxed)
         );
-        Self { segment }
+        Some(Self { segment })
     }
 
     /// Get the segment ID
