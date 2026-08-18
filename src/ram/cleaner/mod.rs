@@ -310,6 +310,13 @@ impl Cleaner {
         info!("Cleaner stopped");
     }
 
+    /// Has this cleaner been told to stop? Observable so a test can assert the
+    /// teardown happened without counting process-wide threads, which is
+    /// meaningless while hundreds of other tests are creating servers.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
         info!("Cleaner paused");

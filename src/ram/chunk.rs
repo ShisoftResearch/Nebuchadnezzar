@@ -2006,9 +2006,32 @@ pub struct Chunks {
     pub chunk_size_bits: usize,
     /// Total mapped bytes across all chunks of this instance.
     pub total_size: usize,
+    /// Set when the owning server goes away, so the background sweeper exits
+    /// without waiting for the store itself to be dropped. The store can
+    /// outlive its server -- an RPC service still holds it -- and a thread that
+    /// only notices a dropped store would then never exit at all.
+    background_stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Chunks {
+    /// Stop this store's background threads.
+    ///
+    /// Called when the owning server goes away. Separate from dropping the
+    /// store because the two are not the same event: an RPC service registered
+    /// on the server holds the store, so it can outlive the server that made
+    /// it, and a sweeper waiting for the store to drop would then wait forever.
+    pub fn stop_background(&self) {
+        self.background_stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// See [`stop_background`]. Observable so a test can assert the teardown
+    /// happened without a process-wide thread census.
+    pub fn is_background_stopped(&self) -> bool {
+        self.background_stopped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Decodes an address inside this instance's mapping into
     /// `(chunk_id, segment_id)`. Deterministic per instance, unlike the
     /// module-level last-writer-wins diagnostic helper.
@@ -2196,6 +2219,7 @@ impl Chunks {
             base_addr: global_base_addr,
             chunk_size_bits,
             total_size,
+            background_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         if let Some(ref manager) = chunks_arc.tiered_manager {
@@ -2208,15 +2232,37 @@ impl Chunks {
         // grind froze id-list shard workers inside their polls and wedged
         // the whole edge phase). Weak: the thread must not keep the store
         // alive, and exits when the Chunks drops (server-spawning tests).
+        //
+        // It checks EVERY SECOND and sweeps every thirtieth check, rather than
+        // sleeping thirty seconds and then checking. Same sweep cadence, but a
+        // dropped store gets its thread back in about a second instead of up to
+        // half a minute -- which matters to anything that creates and drops
+        // stores in a loop, where those seconds accumulate into hundreds of
+        // live threads.
         {
             let weak = Arc::downgrade(&chunks_arc);
+            let stopped = chunks_arc.background_stopped.clone();
             std::thread::Builder::new()
                 .name("stats-sweeper".into())
-                .spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_secs(30));
-                    let Some(chunks) = weak.upgrade() else { break };
-                    for chunk in &chunks.list {
-                        chunk.statistics.sweep_from_chunk(chunk);
+                .spawn(move || {
+                    const SWEEP_EVERY: u32 = 30;
+                    let mut ticks: u32 = 0;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        // Upgrade too: a store that is dropped outright never
+                        // gets the chance to set the flag.
+                        let Some(chunks) = weak.upgrade() else { break };
+                        ticks += 1;
+                        if ticks < SWEEP_EVERY {
+                            continue;
+                        }
+                        ticks = 0;
+                        for chunk in &chunks.list {
+                            chunk.statistics.sweep_from_chunk(chunk);
+                        }
                     }
                 })
                 .expect("spawn stats-sweeper");
