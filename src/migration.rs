@@ -1233,11 +1233,20 @@ mod cluster_tests {
     const SCHEMA_ID: u32 = 1300;
 
     async fn start_pair(group: &str) -> (Vec<Arc<NebServer>>, Arc<AsyncClient>) {
+        start_cluster(group, 2).await
+    }
+
+    /// Start `members` servers in one group, with a client bound to the first.
+    ///
+    /// Returns them in start order, which is also ownership order: the first to
+    /// come up adopts the whole slot table and every later member claims nothing.
+    /// That is the property these tests rest on, and it is what makes them
+    /// deterministic without waiting for a ring to settle.
+    async fn start_cluster(group: &str, members: usize) -> (Vec<Arc<NebServer>>, Arc<AsyncClient>) {
         let _ = env_logger::try_init();
-        let addresses = vec![
-            crate::utils::test_port::unique_localhost_addr(),
-            crate::utils::test_port::unique_localhost_addr(),
-        ];
+        let addresses: Vec<String> = (0..members)
+            .map(|_| crate::utils::test_port::unique_localhost_addr())
+            .collect();
         let opts = ServerOptions {
             chunk_size: 16 * 1024 * 1024,
             db_size: 16 * 1024 * 1024,
@@ -1913,18 +1922,34 @@ mod cluster_tests {
         }
 
         // A drain racing a writer may legitimately not finish in one call -- the
-        // writer keeps handing it new work. What must NOT happen is data loss, and
-        // what must be true either way is that the report is honest about it.
+        // writer keeps handing it new work. What must not happen is data loss,
+        // which is asserted above.
+        //
+        // The one directional claim worth making: if it says complete, the member
+        // really owns nothing. Polled, because the check is a query and a query can
+        // be served by a member that has not applied the last reassignment yet.
+        //
+        // Deliberately NOT the converse. `stranded` is computed from a table read
+        // at the end of the drain, and a lagging read makes it report slots that
+        // have in fact moved -- so an "incomplete" drain can be complete moments
+        // later. That is the safe direction (it fails closed, and a caller gated on
+        // `is_complete` simply retries), and asserting the converse made this test
+        // fail about one run in three on nothing but replica lag.
         if drain.is_complete() {
-            assert!(crate::migration::drain::owns_nothing(&client, departing)
-                .await
-                .unwrap());
-        } else {
-            assert!(
-                !crate::migration::drain::owns_nothing(&client, departing)
+            let mut empty = false;
+            for _ in 0..40 {
+                if crate::migration::drain::owns_nothing(&client, departing)
                     .await
-                    .unwrap(),
-                "an incomplete drain must not claim the member owns nothing"
+                    .unwrap()
+                {
+                    empty = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(
+                empty,
+                "a drain that reported itself complete must leave the member owning nothing"
             );
         }
     }
@@ -2025,6 +2050,203 @@ mod cluster_tests {
         // Nothing lost.
         assert_eq!(held_in_slot(&servers[0], SLOT), HashSet::from([id]));
         client.read_cell(id).await.unwrap().unwrap();
+    }
+
+    /// Phase 5: a donor that dies mid-migration is DETECTED, not survived.
+    ///
+    /// This one is data loss and the plan says so: there is no replication, so a
+    /// member that vanishes takes its slots' contents with it. The property worth
+    /// having is therefore not recovery but honesty — the migration must fail
+    /// loudly, and placement must never end up claiming the recipient holds data
+    /// that never arrived. A silent success here would be the worst outcome in the
+    /// whole design: the cluster would believe the cells are somewhere they are
+    /// not, and the reclaim would happily delete a donor copy that no longer
+    /// exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_donor_that_dies_mid_migration_is_detected() {
+        let (servers, client) = start_pair("migration_donor_death_test").await;
+        let donor_id = servers[0].server_id;
+        let recipient_id = servers[1].server_id;
+
+        const SLOT: u16 = 251;
+        for seq in 0..5 {
+            let (_, cell) = cell_in_slot(SLOT, seq, "doomed");
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+
+        // The donor goes away with the data still on it.
+        servers[0].shutdown().await;
+
+        let outcome = migrate_slot(
+            &client,
+            SLOT as u32,
+            donor_id,
+            recipient_id,
+            &MigrationPlan::default(),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a migration from a member that is gone must fail loudly; \
+             reporting success would tell the cluster the cells are somewhere they are not"
+        );
+
+        // Placement must not claim the recipient owns this slot: it holds nothing.
+        let state = placement_client(&client)
+            .slot_state(&slot_group_id(client.group_name()), &(SLOT as u32))
+            .await
+            .unwrap();
+        assert_ne!(
+            state,
+            Some(SlotState::Stable {
+                owner: recipient_id
+            }),
+            "placement must never commit a handover whose data never arrived"
+        );
+        assert!(held_in_slot(&servers[1], SLOT).is_empty());
+
+        // And the reclaim must refuse, because refusing is what stops it deleting
+        // a donor copy on the strength of a handover that did not happen.
+        assert!(reclaim_donor_copy(
+            &client,
+            SLOT as u32,
+            donor_id,
+            recipient_id,
+            &MigrationPlan::default()
+        )
+        .await
+        .is_err());
+    }
+
+    /// Phase 5: a second member joining during a join moves nothing.
+    ///
+    /// The plan lists this as a failure model because under computed placement it
+    /// was one: each join reshuffled the space, so joins racing each other
+    /// reshuffled it twice and orphaned whatever was written in between. With
+    /// placement stored, a joining member owns nothing and the question becomes
+    /// trivial — which is the point, and worth pinning so it stays trivial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn members_joining_a_running_cluster_own_nothing_and_move_nothing() {
+        let (servers, client) = start_cluster("migration_double_join_test", 3).await;
+        let first = servers[0].server_id;
+
+        // Written while all three are up, so this is about placement rather than
+        // about a write that happened to precede a join.
+        let mut expected: HashSet<Id> = HashSet::new();
+        for slot in [261u16, 262, 263, 264] {
+            for seq in 0..3 {
+                let (id, cell) = cell_in_slot(slot, seq, "joined");
+                client.write_cell(cell).await.unwrap().unwrap();
+                expected.insert(id);
+            }
+        }
+
+        let placement = placement_client(&client);
+        let group = slot_group_id(client.group_name());
+        assert_eq!(
+            placement.slots_owned_by(&group, &first).await.unwrap().len(),
+            crate::slots::SLOT_COUNT,
+            "the first member up should still own the whole space after two joins"
+        );
+        for later in &servers[1..] {
+            assert!(
+                placement
+                    .slots_owned_by(&group, &later.server_id)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a member that joined a running cluster must own nothing"
+            );
+        }
+
+        // Everything readable, and all of it on the first member.
+        for id in &expected {
+            let cell = client.read_cell(*id).await.unwrap().unwrap_or_else(|error| {
+                panic!("{id:?} became unreachable across two joins: {error:?}")
+            });
+            assert_eq!(cell.header.id, *id);
+            assert_eq!(client.locate_server_id(id).unwrap(), first);
+        }
+    }
+
+    /// Phase 5: losing a member does not silently re-map its slots.
+    ///
+    /// The ring-version-regression model, restated for stored placement. Under a
+    /// computed ring this was the whole disease: membership changes, `jump_hash`
+    /// answers differently, and cells are looked up at addresses they were never
+    /// written to. Now the table is what answers, so a member leaving must change
+    /// **nothing** about placement — its slots keep naming it.
+    ///
+    /// That looks unhelpful (those cells are unreachable, and without replication
+    /// they are gone) and it is exactly right: placement that quietly re-pointed
+    /// the slots at a survivor would claim data had moved when nothing had. An
+    /// operator gets a slot that names a dead member, which is a fact they can act
+    /// on, instead of a lie they cannot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_leaving_does_not_re_map_its_slots() {
+        let (servers, client) = start_pair("migration_ring_regression_test").await;
+        let first = servers[0].server_id;
+        let second = servers[1].server_id;
+
+        const MOVED: u16 = 271;
+        let (moved_id, cell) = cell_in_slot(MOVED, 1, "on-the-second-member");
+        client.write_cell(cell).await.unwrap().unwrap();
+        migrate_slot(
+            &client,
+            MOVED as u32,
+            first,
+            second,
+            &MigrationPlan::default(),
+        )
+        .await
+        .expect("slot should migrate so the second member owns something to lose");
+        assert_eq!(client.locate_server_id(&moved_id).unwrap(), second);
+
+        let placement = placement_client(&client);
+        let group = slot_group_id(client.group_name());
+
+        // The member holding that slot goes away ungracefully.
+        servers[1].shutdown().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Asserted as a PROPERTY of the final table rather than by diffing two
+        // snapshots. Two `all_slots` queries round-robin over members and can be
+        // served by replicas one apply apart, so a snapshot diff reports lag as
+        // change -- it did, showing slot 271 as `Migrating` in the "before" read
+        // and `Stable` in the "after" one, for a commit that had already happened
+        // before either. Polling for a settled table and then checking what it
+        // says is immune to that, and is the claim worth making anyway.
+        let mut owned_by_departed = Vec::new();
+        for _ in 0..40 {
+            owned_by_departed = placement.slots_owned_by(&group, &second).await.unwrap();
+            if owned_by_departed == vec![MOVED as u32] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            owned_by_departed,
+            vec![MOVED as u32],
+            "the departed member must still own exactly the slot it was given; \
+             re-pointing it at a survivor would claim data moved when nothing did"
+        );
+        assert_eq!(
+            placement.slots_owned_by(&group, &first).await.unwrap().len(),
+            crate::slots::SLOT_COUNT - 1,
+            "and the survivor must own exactly what it owned before, no more"
+        );
+        assert_eq!(
+            placement.slot_state(&group, &(MOVED as u32)).await.unwrap(),
+            Some(SlotState::Stable { owner: second }),
+            "the slot must name the departed member, so the loss is visible \
+             rather than silently papered over"
+        );
+
+        // Everything the surviving member owns is still readable -- the loss is
+        // confined to the departed member's slots rather than spread by a reshuffle.
+        let (survivor_id, cell) = cell_in_slot(272, 1, "still-here");
+        client.write_cell(cell).await.unwrap().unwrap();
+        client.read_cell(survivor_id).await.unwrap().unwrap();
     }
 
     /// MEASUREMENT, not a unit test. Run explicitly, on a machine with room:
