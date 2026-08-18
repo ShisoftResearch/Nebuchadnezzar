@@ -235,11 +235,28 @@ impl Service for NebRPCService {
         async move {
             let mut results = Vec::with_capacity(cells.len());
             let mut aborted = false;
-            for cell in cells {
+            for mut cell in cells {
                 if aborted {
                     results.push(Err(WriteError::BatchAborted));
                     continue;
                 }
+                // Land the cell on the SAME version it had on the donor.
+                //
+                // The write path assigns `old_version + 1` (`cell.rs:226`), so a
+                // straight upsert would move a cell and quietly renumber it. That
+                // is not cosmetic: callers derive *cell ids* from a container's
+                // version -- Morpheus's id lists compute segment ids from
+                // `(container, field, schema, root, root_version)` -- so a bumped
+                // version repoints every derived id at a cell that does not exist.
+                // The symptom appears nowhere near the cause: an edge append fails
+                // with "root segment cell does not exist" on a vertex that
+                // migrated perfectly, only under load, only after a migration.
+                //
+                // Pre-decrementing is the smallest change that survives the
+                // existing write path; `migration_preserves_cell_versions` pins the
+                // property so a future change to the increment rule fails loudly
+                // here rather than silently downstream.
+                cell.header.version = cell.header.version.saturating_sub(1);
                 let result = self.upsert_cell_unchecked(cell).await;
                 if result.is_err() {
                     aborted = true;

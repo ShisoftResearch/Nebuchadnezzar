@@ -2052,6 +2052,51 @@ mod cluster_tests {
         client.read_cell(id).await.unwrap().unwrap();
     }
 
+    /// A migrated cell keeps its version.
+    ///
+    /// Not a cosmetic property. Callers derive *cell ids* from a container's
+    /// version -- Morpheus's id lists compute their segment ids from
+    /// `(container, field, schema, root, root_version)` -- so a migration that
+    /// bumps the version silently repoints every derived id at a cell that does
+    /// not exist. The symptom is far from the cause: an edge append fails with
+    /// "root segment cell does not exist" on a vertex that migrated perfectly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_preserves_cell_versions() {
+        let (servers, client) = start_pair("migration_version_preservation_test").await;
+        let donor_id = servers[0].server_id;
+        let recipient_id = servers[1].server_id;
+
+        const SLOT: u16 = 281;
+        let (id, cell) = cell_in_slot(SLOT, 1, "versioned");
+        client.write_cell(cell).await.unwrap().unwrap();
+        // Update a few times so the version is something specific rather than the
+        // value a fresh insert happens to produce.
+        for seq in 0..3 {
+            let (_, mut updated) = cell_in_slot(SLOT, 1, &format!("update-{seq}"));
+            updated.header.id = id;
+            client.upsert_cell(updated).await.unwrap().unwrap();
+        }
+        let before = client.read_cell(id).await.unwrap().unwrap().header.version;
+
+        migrate_slot(
+            &client,
+            SLOT as u32,
+            donor_id,
+            recipient_id,
+            &MigrationPlan::default(),
+        )
+        .await
+        .expect("slot should migrate");
+
+        let after = client.read_cell(id).await.unwrap().unwrap().header.version;
+        assert_eq!(
+            after, before,
+            "migration changed the cell version from {before} to {after}; \
+             any id derived from a container's version now points at a cell that \
+             does not exist"
+        );
+    }
+
     /// Phase 5: a donor that dies mid-migration is DETECTED, not survived.
     ///
     /// This one is data loss and the plan says so: there is no replication, so a
