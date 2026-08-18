@@ -4921,3 +4921,160 @@ async fn every_cell_survives_being_written_past_the_tier_limit() {
         lost.iter().take(5).collect::<Vec<_>>()
     );
 }
+
+/// A read racing eviction must never be told the cell is gone.
+///
+/// The sibling test above writes past the limit and then reads everything back,
+/// and it passes 24/24 under four-way load on .239 -- so a quiet store that has
+/// finished writing is not where the loss lives. What the .239 reshard had that
+/// it does not is **readers running while the tier is still evicting**: the
+/// migration reads every cell on the donor at the same time as the recipient's
+/// writes are pushing both members' tiers over their limit.
+///
+/// So this test keeps writing while it reads. Any `StaleCellPointer` is a
+/// definite bug -- the index entry pointed at memory that does not hold the
+/// cell -- and that is a distinct error precisely so this assertion can be
+/// exact instead of hedging about whether a cell might really have been
+/// deleted. Nothing here deletes anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_racing_eviction_never_sees_a_stale_pointer() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+    let seed_cells = env_usize("NEB_TIER_RACE_SEED", 32768);
+    let churn_cells = env_usize("NEB_TIER_RACE_CHURN", 32768);
+    let payload_len = env_usize("NEB_TIER_RACE_PAYLOAD", 4096);
+    let limit_segments = env_usize("NEB_TIER_RACE_SEGMENTS", 4);
+    let readers = env_usize("NEB_TIER_RACE_READERS", 8);
+
+    let backup_dir = temp_path("neb_tier_race_bk");
+    let wal_dir = temp_path("neb_tier_race_wal");
+    for dir in [&backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let store_bytes = ((seed_cells + churn_cells) * payload_len * 3).max(64 * SEGMENT_SIZE);
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: store_bytes,
+            db_size: store_bytes,
+            tiered_config: Some(crate::ram::tiered::TieredConfig {
+                threshold: 0.8,
+                lower_watermark: 0.72,
+                physical_memory_limit: limit_segments * SEGMENT_SIZE,
+                promotion_cooldown_ms: 0,
+            }),
+            backup_storage: Some(backup_dir.to_string()),
+            wal_storage: Some(wal_dir.to_string()),
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &crate::utils::test_port::unique_localhost_addr(),
+        "tiered_read_eviction_race",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    const SCHEMA: u32 = 9078;
+    server
+        .meta()
+        .schemas
+        .register_internal_schema(Schema::new_with_id(
+            SCHEMA,
+            &String::from("tier_race_schema"),
+            None,
+            default_fields(),
+            false,
+            false,
+        ));
+
+    for index in 0..seed_cells {
+        let id = Id::allocated(0, 0, index as u64);
+        let mut cell = large_string_cell(SCHEMA, id, payload_len, "tier-race-seed");
+        server.chunks().write_cell(&mut cell).expect("seed write");
+    }
+
+    // Readers sweep the seeded ids while the writer keeps the tier over its
+    // limit. A stale pointer is counted separately from every other outcome:
+    // it is the one that cannot be explained by anything the test does.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stale = Arc::new(AtomicU64::new(0));
+    let absent = Arc::new(AtomicU64::new(0));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for reader in 0..readers {
+        let chunks = server.chunks().clone();
+        let stop = stop.clone();
+        let stale = stale.clone();
+        let absent = absent.clone();
+        let reads = reads.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut index = reader;
+            while !stop.load(AtomicOrdering::Relaxed) {
+                let id = Id::allocated(0, 0, (index % seed_cells) as u64);
+                match chunks.read_cell(&id) {
+                    Ok(_) => {}
+                    Err(ReadError::StaleCellPointer) => {
+                        stale.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    Err(ReadError::CellDoesNotExisted) => {
+                        absent.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    Err(_) => {}
+                }
+                reads.fetch_add(1, AtomicOrdering::Relaxed);
+                index += readers;
+            }
+        }));
+    }
+
+    for index in 0..churn_cells {
+        let id = Id::allocated(1, 0, index as u64);
+        let mut cell = large_string_cell(SCHEMA, id, payload_len, "tier-race-churn");
+        server.chunks().write_cell(&mut cell).expect("churn write");
+    }
+    stop.store(true, AtomicOrdering::Relaxed);
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    let stale = stale.load(AtomicOrdering::Relaxed);
+    let absent = absent.load(AtomicOrdering::Relaxed);
+    let reads = reads.load(AtomicOrdering::Relaxed);
+    let cold = total_cold_segments(&server.chunks());
+    server.cleaner().stop();
+    server.shutdown().await;
+    for dir in [&backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    println!(
+        "TIER RACE: {reads} reads, {stale} stale pointers, {absent} reported absent, {cold} cold segments"
+    );
+    assert!(
+        cold > 0,
+        "nothing was evicted, so this run raced nothing ({reads} reads)"
+    );
+    assert_eq!(
+        stale, 0,
+        "{stale} reads of {reads} found the index pointing at memory that does not hold the \
+         cell, while the tier was evicting under a concurrent writer"
+    );
+    assert_eq!(
+        absent, 0,
+        "{absent} reads of {reads} were told a seeded cell does not exist; nothing in this \
+         test deletes anything"
+    );
+}

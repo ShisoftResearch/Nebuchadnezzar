@@ -91,6 +91,17 @@ pub enum ReadError {
     ExecError(String),
     SegmentPromotionFailed,
     DecompressionFailed(String),
+    /// The index entry for this cell points at memory that does not hold it.
+    ///
+    /// NOT the same thing as the cell being absent, and it used to be reported
+    /// as if it were. That misclassification is how a reshard came back with a
+    /// silent shortfall: the donor read 129 cells whose entries pointed at
+    /// ZEROED memory, `CellDoesNotExisted` told the migration they had been
+    /// deleted, and the migration correctly concluded there was nothing to
+    /// move. An absence is an ordinary outcome; this is the store disagreeing
+    /// with itself, and every caller that can afford to should treat it as an
+    /// error rather than an empty result.
+    StaleCellPointer,
 }
 
 impl CellHeader {
@@ -369,7 +380,7 @@ impl<'v> SharedCellData<'v> {
                 "stale cell read: requested id bits {} found {:?} at {:#x}",
                 hash, header.id, ptr
             );
-            return Err(ReadError::CellDoesNotExisted);
+            return Err(ReadError::StaleCellPointer);
         }
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
