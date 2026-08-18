@@ -2767,6 +2767,145 @@ mod cluster_tests {
         client.read_cell(survivor_id).await.unwrap().unwrap();
     }
 
+    /// MEASUREMENT: how fast does a drain actually move data?
+    ///
+    /// ```text
+    /// cargo test --release --lib drain_throughput -- --ignored --nocapture
+    /// ```
+    ///
+    /// **Release only.** bifrost picks its codec by build profile -- `serde_cbor`
+    /// in release, `serde_json` under `debug_assertions` -- so a debug number is a
+    /// statement about JSON and nothing else.
+    ///
+    /// A drain is the operator-facing operation of this whole campaign: it is what
+    /// runs when a machine has to leave. `reshard_slots` has a measured number and
+    /// the drain did not, and the two paths do NOT share their fan-out, so the
+    /// reshard's figure says nothing about this one.
+    ///
+    ///   NEB_DRAIN_SLOTS, NEB_DRAIN_CELLS_PER_SLOT, NEB_DRAIN_PAYLOAD_BYTES,
+    ///   NEB_DRAIN_CONCURRENCY, NEB_DRAIN_DB_GB
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn drain_throughput_measurement() {
+        let _ = env_logger::try_init();
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        let slots = env_usize("NEB_DRAIN_SLOTS", 256).min(crate::slots::SLOT_COUNT) as u16;
+        let cells_per_slot = env_usize("NEB_DRAIN_CELLS_PER_SLOT", 64) as u64;
+        let payload_bytes = env_usize("NEB_DRAIN_PAYLOAD_BYTES", 4096);
+        let db_size = env_usize("NEB_DRAIN_DB_GB", 4) * 1024 * 1024 * 1024;
+        let concurrency = env_usize("NEB_DRAIN_CONCURRENCY", default_concurrent_slots());
+
+        let group = "migration_drain_throughput";
+        let addresses = vec![
+            crate::utils::test_port::unique_localhost_addr(),
+            crate::utils::test_port::unique_localhost_addr(),
+        ];
+        let opts = ServerOptions {
+            chunk_size: 64 * 1024 * 1024,
+            db_size,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        };
+        let mut servers = Vec::new();
+        for address in &addresses {
+            servers.push(
+                NebServer::new_cluster_from_opts(&opts, address, &addresses, group, async |_| {})
+                    .await
+                    .unwrap(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let client = Arc::new(
+            client::AsyncClient::new(&servers[0].rpc, &servers[0].membership, &addresses, group)
+                .await
+                .unwrap(),
+        );
+        client.reload_slot_owners().await;
+        client
+            .new_schema_with_id(Schema::new_with_id(
+                SCHEMA_ID,
+                &String::from("migration_schema"),
+                None,
+                default_fields(),
+                false,
+                false,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let payload = "x".repeat(payload_bytes);
+        let mut written = 0usize;
+        for slot in 0..slots {
+            for seq in 0..cells_per_slot {
+                let id = Id::from_parts(slot as u64, 2_000_000 + seq);
+                let mut value = OwnedMap::new();
+                value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+                value.insert(&String::from("score"), OwnedValue::U64(seq));
+                value.insert(&String::from("name"), OwnedValue::String(payload.clone()));
+                client
+                    .write_cell(crate::ram::cell::OwnedCell::new_with_id(
+                        SCHEMA_ID,
+                        &id,
+                        OwnedValue::Map(value),
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                written += 1;
+            }
+        }
+        let moved_bytes = written * payload_bytes;
+        println!(
+            "DRAIN MEASUREMENT: {} cells (~{} MB) across {} slots, concurrency {}",
+            written,
+            moved_bytes / (1024 * 1024),
+            slots,
+            concurrency
+        );
+
+        let departing = servers[0].server_id;
+        let remaining = servers[1].server_id;
+        let started = std::time::Instant::now();
+        let drain = crate::migration::drain::drain_member(
+            &client,
+            departing,
+            &[remaining],
+            &MigrationPlan {
+                concurrent_slots: concurrency,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the drain should run");
+        let elapsed = started.elapsed();
+
+        println!(
+            "DRAIN MEASUREMENT: {:.1}s ({:.1} MB/s, {:.0} cells/s); {} slots moved, {} cells, {} stranded",
+            elapsed.as_secs_f64(),
+            moved_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
+            written as f64 / elapsed.as_secs_f64(),
+            drain.moved.len(),
+            drain.cells_transferred,
+            drain.stranded.len()
+        );
+        // A measurement of a drain that lost data is not a measurement of a drain.
+        assert!(drain.is_complete(), "drain stranded {:?}", drain.stranded);
+        assert_eq!(drain.cells_transferred, written);
+    }
+
     /// MEASUREMENT, not a unit test. Run explicitly, on a machine with room:
     ///
     /// ```text
@@ -3083,13 +3222,58 @@ mod cluster_tests {
             in_flight / (1024 * 1024)
         );
 
-        // And nothing was lost moving it.
+        // And nothing was lost moving it -- as a SURVEY, not a first-failure
+        // panic. At this scale "one cell is missing" and "an entire slot is
+        // missing" are completely different bugs with completely different
+        // causes, and stopping at the first missing id cannot tell them apart.
+        // Measured 2026-08-18 on .239 at a 4 GB tier limit with 16 GB of payload:
+        // the reshard reported 4194304 of 4194304 cells transferred and 0
+        // failures, and a read still came back CellDoesNotExisted.
+        let mut lost: Vec<Id> = Vec::new();
         for id in &written {
-            let cell = client.read_cell(*id).await.unwrap().unwrap_or_else(|error| {
-                panic!("{id:?} was lost by the reshard: {error:?}")
-            });
-            assert_eq!(cell.header.id, *id);
+            match client.read_cell(*id).await {
+                Ok(Ok(cell)) => assert_eq!(cell.header.id, *id),
+                Ok(Err(_)) | Err(_) => lost.push(*id),
+            }
         }
+        if !lost.is_empty() {
+            let mut by_slot: std::collections::BTreeMap<u32, usize> = Default::default();
+            for id in &lost {
+                *by_slot.entry(crate::slots::slot_of(id)).or_default() += 1;
+            }
+            println!(
+                "MEASUREMENT: {} of {} cells UNREADABLE after the reshard, across {} slots",
+                lost.len(),
+                written.len(),
+                by_slot.len()
+            );
+            // Whole-slot losses mean routing or a dropped handover; scattered
+            // ones mean the transfer itself skipped cells. Print enough of both
+            // to tell which, and say who actually holds each sample -- "neither"
+            // is data loss, "the donor" is a reclaim that ran too early, and
+            // "the recipient" is a read that went to the wrong member.
+            for (slot, count) in by_slot.iter().take(8) {
+                let donor_holds = held_in_slot(&servers[0], *slot as u16).len();
+                let recipient_holds = held_in_slot(&servers[1], *slot as u16).len();
+                println!(
+                    "MEASUREMENT:   slot {slot}: {count} unreadable, donor holds {donor_holds}, recipient holds {recipient_holds}"
+                );
+            }
+            for id in lost.iter().take(4) {
+                let slot = crate::slots::slot_of(id);
+                println!(
+                    "MEASUREMENT:   sample {id:?} (slot {slot}) donor_has={} recipient_has={}",
+                    held_in_slot(&servers[0], slot as u16).contains(id),
+                    held_in_slot(&servers[1], slot as u16).contains(id)
+                );
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "the reshard lost {} of {} cells",
+            lost.len(),
+            written.len()
+        );
         println!(
             "MEASUREMENT: all {} cells readable after the reshard",
             written.len()
