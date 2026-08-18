@@ -712,12 +712,43 @@ async fn reclaim_slot_confirmed(
     };
 
     for batch in range_batches(known, plan.batch_cells) {
-        // Presence at the new owner, without moving any bodies to find out.
+        // Freshness at the new owner, without moving any bodies to find out.
+        //
+        // Existence alone is not enough, and that gap was data loss: the donor
+        // stays the serving owner for the whole transfer, so it legitimately
+        // accepts writes *after* the transfer has read a cell. Those updates are
+        // invisible to the delta rounds, which look for new ids rather than new
+        // versions, and a carry-over that only asks "does the recipient have it?"
+        // then drops the newer copy. Demonstrated by
+        // `an_update_during_transfer_is_lost`.
+        //
+        // Comparing versions is sound *because* migration preserves them: a
+        // transferred cell lands on the version it had, so the two sides agree
+        // unless one of them has since taken a write. Before that fix the
+        // recipient was always one ahead and this comparison would have been
+        // meaningless -- which is why an earlier version of this code did not try.
         let heads = recipient.head_all_cells(&batch).await?;
+        let donor_heads = donor.head_all_cells(&batch).await?;
+        let donor_versions: std::collections::HashMap<Id, u64> = batch
+            .iter()
+            .zip(donor_heads.into_iter())
+            .filter_map(|(id, head)| head.ok().map(|header| (*id, header.version)))
+            .collect();
         let mut droppable: Vec<Id> = Vec::with_capacity(batch.len());
         let mut missing: Vec<Id> = Vec::new();
         for (id, head) in batch.iter().zip(heads.into_iter()) {
             match head {
+                // The recipient has it, but the donor's copy is NEWER: a write
+                // landed after the transfer read this cell. Carry it over rather
+                // than destroy it. `missing` is really "needs sending", and a
+                // stale copy needs sending exactly as much as an absent one does.
+                Ok(header)
+                    if donor_versions
+                        .get(id)
+                        .is_some_and(|donor_version| *donor_version > header.version) =>
+                {
+                    missing.push(*id)
+                }
                 Ok(_) => droppable.push(*id),
                 Err(ReadError::CellDoesNotExisted) => missing.push(*id),
                 Err(error) => {
@@ -2094,6 +2125,87 @@ mod cluster_tests {
             "migration changed the cell version from {before} to {after}; \
              any id derived from a container's version now points at a cell that \
              does not exist"
+        );
+    }
+
+    /// THE BUG, in isolation: an update to an already-transferred cell is lost.
+    ///
+    /// The migration doc has always said delta rounds catch *new* cells and not
+    /// updates to ones already copied. This shows what that costs, without a graph
+    /// or a transaction anywhere near it: transfer a cell, update it on the donor
+    /// while the slot is still `Migrating` (so the donor is the serving owner and
+    /// the write is legitimately accepted), then commit.
+    ///
+    /// The recipient ends up with the pre-update value, and because the reclaim
+    /// only carries over cells the recipient is *missing* — never ones whose donor
+    /// copy is newer — dropping the donor's copy destroys the newer version.
+    ///
+    /// This is the shape behind the Morpheus id-list failure: the cell that gets
+    /// updated there is a type list, and the pointer it gains names a segment that
+    /// the recipient never receives, so a read that resolves the pointer reports
+    /// "root segment cell does not exist".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_during_transfer_is_lost() {
+        let (servers, client) = start_pair("migration_lost_update_test").await;
+        let donor_id = servers[0].server_id;
+        let recipient_id = servers[1].server_id;
+
+        const SLOT: u16 = 291;
+        let (id, cell) = cell_in_slot(SLOT, 1, "original");
+        client.write_cell(cell).await.unwrap().unwrap();
+
+        let placement = placement_client(&client);
+        let group = slot_group_id(client.group_name());
+        let donor = client.client_by_server_id(donor_id).await.unwrap();
+        let recipient = client.client_by_server_id(recipient_id).await.unwrap();
+
+        // Drive the sequence by hand so the update lands in the window the driver
+        // cannot see: after the transfer has read the cell, before the flip.
+        placement
+            .begin_slot_migration(&group, &(SLOT as u32), &donor_id, &recipient_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let ids = donor.cell_ids_in_slots(&vec![SLOT as u32]).await.unwrap();
+        donor.push_cells_to(&ids, recipient_id).await.unwrap().unwrap();
+
+        // The donor is still the serving owner, so this write is correct to accept.
+        let (_, updated) = cell_in_slot(SLOT, 1, "UPDATED-mid-transfer");
+        donor.upsert_cell(updated).await.unwrap().unwrap();
+
+        placement
+            .complete_slot_migration(&group, &(SLOT as u32))
+            .await
+            .unwrap()
+            .unwrap();
+        client.note_slot_owner(SLOT as u32, recipient_id);
+
+        // What the new owner holds is the value from before the update.
+        let landed = recipient.read_cell(id).await.unwrap().unwrap();
+        let landed_name = landed.data["name"].string().cloned().unwrap_or_default();
+
+        // And the reclaim will not rescue it: the recipient HAS the cell, so the
+        // carry-over sees nothing missing and the donor's newer copy is dropped.
+        let reclaim = reclaim_donor_copy(
+            &client,
+            SLOT as u32,
+            donor_id,
+            recipient_id,
+            &MigrationPlan::default(),
+        )
+        .await
+        .expect("reclaim should run");
+        assert_eq!(
+            reclaim.carried_over, 1,
+            "the carry-over must notice the donor holds a newer version and send it"
+        );
+
+        let after = client.read_cell(id).await.unwrap().unwrap();
+        let after_name = after.data["name"].string().cloned().unwrap_or_default();
+        assert_eq!(
+            after_name, "UPDATED-mid-transfer",
+            "an update accepted by the donor mid-transfer was lost: the cluster now \
+             serves {after_name:?} (transferred value was {landed_name:?})"
         );
     }
 
