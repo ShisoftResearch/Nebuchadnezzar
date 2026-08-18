@@ -4961,9 +4961,25 @@ async fn a_read_racing_eviction_never_sees_a_stale_pointer() {
     }
 
     let store_bytes = ((seed_cells + churn_cells) * payload_len * 3).max(64 * SEGMENT_SIZE);
+    // One chunk by DEFAULT, many chunks on request
+    // (`NEB_TIER_RACE_CHUNK_SEGMENTS` + `NEB_TIER_RACE_PARTITIONS`). The
+    // configuration that lost cells used 64 MB chunks in a 16 GB store -- 256
+    // of them -- so the GLOBAL cross-chunk evictor is in play there and not
+    // here, which is the leading suspect.
+    //
+    // Trying it produced a different finding instead, worth its own look: with
+    // 64 chunks of 8 segments and a 4-segment limit, 256 MB of payload evicted
+    // **nothing at all** -- the run raced nothing rather than losing anything,
+    // and the tier limit was simply not enforced. The single-chunk default is
+    // kept because it demonstrably does evict, and a test that silently stops
+    // testing is worse than one that is narrow.
+    let chunk_bytes = env_usize("NEB_TIER_RACE_CHUNK_SEGMENTS", 0)
+        .checked_mul(SEGMENT_SIZE)
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(store_bytes);
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: store_bytes,
+            chunk_size: chunk_bytes,
             db_size: store_bytes,
             tiered_config: Some(crate::ram::tiered::TieredConfig {
                 threshold: 0.8,
@@ -5000,8 +5016,14 @@ async fn a_read_racing_eviction_never_sees_a_stale_pointer() {
             false,
         ));
 
+    // Spread across localities so the writes actually reach many chunks. A cell
+    // is placed by `locate_chunk_by_partition(id.locality())`, so a single
+    // locality piles the whole payload into one chunk and runs it out of space
+    // long before the tier is under any pressure.
+    let partitions = env_usize("NEB_TIER_RACE_PARTITIONS", 1).max(1) as u64;
+    let seed_id = |index: usize| Id::allocated((index as u64 % partitions) as u16, 0, index as u64);
     for index in 0..seed_cells {
-        let id = Id::allocated(0, 0, index as u64);
+        let id = seed_id(index);
         let mut cell = large_string_cell(SCHEMA, id, payload_len, "tier-race-seed");
         server.chunks().write_cell(&mut cell).expect("seed write");
     }
@@ -5023,7 +5045,8 @@ async fn a_read_racing_eviction_never_sees_a_stale_pointer() {
         handles.push(std::thread::spawn(move || {
             let mut index = reader;
             while !stop.load(AtomicOrdering::Relaxed) {
-                let id = Id::allocated(0, 0, (index % seed_cells) as u64);
+                let logical = index % seed_cells;
+                let id = Id::allocated((logical as u64 % partitions) as u16, 0, logical as u64);
                 match chunks.read_cell(&id) {
                     Ok(_) => {}
                     Err(ReadError::StaleCellPointer) => {
@@ -5041,7 +5064,11 @@ async fn a_read_racing_eviction_never_sees_a_stale_pointer() {
     }
 
     for index in 0..churn_cells {
-        let id = Id::allocated(1, 0, index as u64);
+        // Offset well past the seeded range so churn never collides with it --
+        // an overwritten seed cell would be a legitimate reason for a reader to
+        // see something else, and this test must have none of those.
+        let logical = index + 10_000_000;
+        let id = Id::allocated((logical as u64 % partitions) as u16, 0, logical as u64);
         let mut cell = large_string_cell(SCHEMA, id, payload_len, "tier-race-churn");
         server.chunks().write_cell(&mut cell).expect("churn write");
     }
