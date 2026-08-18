@@ -965,7 +965,23 @@ impl DatabaseRuntime {
 
 pub struct NebServer {
     pub database_runtime: Arc<DatabaseRuntime>,
-    database_runtimes: lightning::map::PtrHashMap<String, Arc<DatabaseRuntime>>,
+    /// The databases this server hosts, besides its default one.
+    ///
+    /// A plain `RwLock<HashMap>`, deliberately, where this used to be a
+    /// `PtrHashMap`. That map's `remove` returns a CLONE and leaves the original
+    /// in the retired node -- correct, since a concurrent reader may still be
+    /// dereferencing it, but it means removal is not a release and the value
+    /// dies only on node reuse or map drop. This map outlives its removals, so
+    /// every database ever unloaded stayed resident for the life of the process,
+    /// entire memory store included. See
+    /// `server::tests::ptr_hash_map_remove_does_not_release_the_value`.
+    ///
+    /// Nothing is lost by the change: the map is written only when a database is
+    /// loaded or unloaded, and read on the same path plus status and shutdown.
+    /// It is not on any request path -- a request reaches its runtime through the
+    /// scoped RPC service that already holds it -- so there is no lock-free
+    /// requirement here to trade away.
+    database_runtimes: parking_lot::RwLock<std::collections::HashMap<String, Arc<DatabaseRuntime>>>,
     registered_schema_services: lightning::map::HashSet<String>,
     runtime_init_lock: tokio::sync::Mutex<()>,
     host_options: ServerOptions,
@@ -1533,8 +1549,14 @@ impl NebServer {
         Ok(database_runtime)
     }
 
+    /// Every runtime this server hosts, snapshotted so callers do not hold the
+    /// lock while touching a runtime.
+    fn hosted_runtimes(&self) -> Vec<Arc<DatabaseRuntime>> {
+        self.database_runtimes.read().values().cloned().collect()
+    }
+
     pub fn database(&self, database_name: &str) -> Option<Arc<DatabaseRuntime>> {
-        lightning::map::Map::get(&self.database_runtimes, &database_name.to_string())
+        self.database_runtimes.read().get(database_name).cloned()
     }
 
     pub fn current_database(&self) -> Arc<DatabaseRuntime> {
@@ -1582,11 +1604,9 @@ impl NebServer {
                 .insert(database_name.to_string());
         }
 
-        lightning::map::Map::insert(
-            &self.database_runtimes,
-            database_name.to_string(),
-            database_runtime.clone(),
-        );
+        self.database_runtimes
+            .write()
+            .insert(database_name.to_string(), database_runtime.clone());
 
         Ok(database_runtime)
     }
@@ -1601,8 +1621,7 @@ impl NebServer {
     /// Unload a database runtime, bypassing the default-database protection.
     /// Used when intentionally resetting the default database.
     pub async fn unload_database_runtime_unchecked(&self, database_name: &str) -> bool {
-        let runtime =
-            lightning::map::Map::remove(&self.database_runtimes, &database_name.to_string());
+        let runtime = self.database_runtimes.write().remove(database_name);
 
         let Some(runtime) = runtime else {
             return false;
@@ -1628,16 +1647,39 @@ impl NebServer {
         }
 
         runtime.cleaner().stop();
-        // The store's background work has to be stopped EXPLICITLY, not left to
-        // the store being dropped, because unloading does not drop it.
-        // `database_runtimes` is a `PtrHashMap`, whose `remove` CLONES the value
-        // out and retires the node -- the map's own `Arc` is destroyed when that
-        // node is reused, not when it is removed. Measured: 14 databases loaded
-        // and unloaded left 14 runtimes reachable and 14 `stats-sweeper` threads
-        // running, and 10 further load/unload cycles reclaimed none of them. So a
-        // sweeper that waits for its store to drop waits for something that may
-        // never happen.
+        // Stop the store's background work EXPLICITLY rather than letting the
+        // store's drop do it. Thread lifetime should not be coupled to a
+        // refcount reaching zero: a service, an in-flight request or a future
+        // holder can all keep the store alive a while, and the sweeper has no
+        // business running for a database that is gone.
+        //
+        // It used to be load-bearing rather than defensive. `database_runtimes`
+        // was a `PtrHashMap`, whose `remove` returns a CLONE and leaves the
+        // original in the retired node, so unloading never released the runtime
+        // at all -- 14 databases loaded and unloaded left 14 runtimes reachable
+        // and 14 `stats-sweeper` threads running, and 10 further load/unload
+        // cycles reclaimed none of them. The map is a plain `RwLock<HashMap>`
+        // now and the runtime does drop, which is asserted by
+        // `unloading_a_database_gives_its_threads_back`.
         runtime.chunks().stop_background();
+        // And forget its tree service. Nothing else retires it, and it holds every
+        // page its trees loaded.
+        //
+        // UNVERIFIED BY AN AUTOMATED TEST, deliberately. The natural test --
+        // start an indexed server, load a database, unload it, check the entry is
+        // gone -- passes alone and destabilises the suite: A/B'd at 3/3 clean
+        // without it and 1/3 with it, the casualty being the unrelated
+        // `a_migrated_cell_is_still_found_by_a_ranged_scan`. The reason is a few
+        // lines above -- unloading calls `IndexBuilder::await_all_indices()`,
+        // which is PROCESS-GLOBAL, so one database's unload reaches into another
+        // database's in-flight index work. That coupling is the bug worth fixing;
+        // until it is, this retirement is verified by inspection (the registry is
+        // read only by status reporting, so retiring an entry cannot affect any
+        // operation path) rather than by a test that makes the suite lie.
+        ranged::tree::service::retire_local_tree_service(
+            runtime.group_name(),
+            runtime.database_name(),
+        );
 
         self.rpc
             .remove_service(cell_rpc::generate_scoped_service_id(
@@ -1744,10 +1786,7 @@ impl NebServer {
     }
 
     pub fn database_names(&self) -> Vec<String> {
-        lightning::map::Map::entries(&self.database_runtimes)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect()
+        self.database_runtimes.read().keys().cloned().collect()
     }
 
     pub fn database_runtime(&self) -> &DatabaseRuntime {
@@ -1814,7 +1853,7 @@ impl NebServer {
     /// dropped path converge rather than diverging.
     fn stop_owned_background_work(&self) {
         let mut runtimes = vec![self.database_runtime.clone()];
-        for (_name, runtime) in lightning::map::Map::entries(&self.database_runtimes) {
+        for runtime in self.hosted_runtimes() {
             if !runtimes.iter().any(|known| Arc::ptr_eq(known, &runtime)) {
                 runtimes.push(runtime);
             }
@@ -2016,12 +2055,9 @@ impl NebServer {
         let server = Arc::new(NebServer {
             database_runtime: database_runtime.clone(),
             database_runtimes: {
-                let runtimes = lightning::map::PtrHashMap::with_capacity(16);
-                lightning::map::Map::insert(
-                    &runtimes,
-                    database_name.to_string(),
-                    database_runtime.clone(),
-                );
+                let mut runtimes = std::collections::HashMap::with_capacity(16);
+                runtimes.insert(database_name.to_string(), database_runtime.clone());
+                let runtimes = parking_lot::RwLock::new(runtimes);
                 runtimes
             },
             registered_schema_services: {
@@ -2331,7 +2367,7 @@ impl NebServer {
                 // only `self.consh` would leave the read and write paths of this
                 // very server disagreeing. Fan out this same result rather than
                 // issuing another Raft command per database.
-                for (_name, runtime) in lightning::map::Map::entries(&self.database_runtimes) {
+                for runtime in self.hosted_runtimes() {
                     runtime
                         .neb_client
                         .refresh_slot_owners(owners.clone(), applied_index);
