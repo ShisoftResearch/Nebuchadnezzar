@@ -97,7 +97,8 @@ pub async fn adopt_from_ring(
     Ok(adopted)
 }
 
-/// The table as a slot-indexed vector, or `None` when the group has no table.
+/// The table as a slot-indexed vector plus the command's applied Raft log index,
+/// or `None` when the group has no table.
 ///
 /// Flattened to a vector rather than kept as a map because this is read once per
 /// cell lookup: the representation should be an index, not a hash. A slot with
@@ -106,10 +107,10 @@ pub async fn load_owner_vec(
     group_name: &str,
     raft_client: &Arc<RaftClient>,
     slots_sm_id: u64,
-) -> Result<Option<Vec<u64>>, String> {
-    Ok(load_table(group_name, raft_client, slots_sm_id)
-        .await?
-        .map(|table| {
+) -> Result<(Option<Vec<u64>>, u64), String> {
+    let (table, applied_index) = load_table(group_name, raft_client, slots_sm_id).await?;
+    Ok((
+        table.map(|table| {
             let mut owners = vec![0u64; SLOT_COUNT];
             for (slot, state) in table {
                 if let Some(entry) = owners.get_mut(slot as usize) {
@@ -120,10 +121,13 @@ pub async fn load_owner_vec(
                 }
             }
             owners
-        }))
+        }),
+        applied_index,
+    ))
 }
 
-/// Read the whole table for a group, or `None` when it has never been seeded.
+/// Read the whole table through an ordered Raft command, returning that command's
+/// applied log index, or `None` when the group has never been seeded.
 ///
 /// `None` and an empty table are different answers and callers must not
 /// conflate them: the first means "fall back to the ring", the second would
@@ -132,12 +136,18 @@ pub async fn load_table(
     group_name: &str,
     raft_client: &Arc<RaftClient>,
     slots_sm_id: u64,
-) -> Result<Option<std::collections::HashMap<u32, SlotState>>, String> {
+) -> Result<
+    (
+        Option<std::collections::HashMap<u32, SlotState>>,
+        u64,
+    ),
+    String,
+> {
     let client = SlotsSMClient::new(slots_sm_id, raft_client);
     client
-        .all_slots(&slot_group_id(group_name))
+        .all_slots_consistent_with_index(&slot_group_id(group_name))
         .await
-        .map_err(|error| format!("slot table query failed: {error:?}"))
+        .map_err(|error| format!("consistent slot table command failed: {error:?}"))
 }
 
 #[cfg(test)]

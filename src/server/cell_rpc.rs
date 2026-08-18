@@ -66,8 +66,8 @@ service! {
     rpc push_cells_to(keys: &Vec<Id>, target: u64) -> Result<Vec<Id>, String>;
     rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
     rpc settle_bulk_receive() -> BulkReceiveReport;
-    rpc note_slot_owner(slot: u32, owner: u64) -> ();
-    rpc note_slot_owners(owners: &Vec<(u32, u64)>) -> ();
+    rpc note_slot_owner(slot: u32, owner: u64, applied_index: u64) -> ();
+    rpc note_slot_owners(owners: &Vec<(u32, u64)>, applied_index: u64) -> ();
     rpc compare_version_and_update_cell(key: Id, version: u64, cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc compare_version_and_set_field(key: Id, version: u64, field: u64, value: OwnedValue) -> Result<CellHeader, WriteError>;
     rpc count() -> u64;
@@ -413,7 +413,7 @@ impl Service for NebRPCService {
         future::ready(report).boxed()
     }
 
-    fn note_slot_owner(&self, slot: u32, owner: u64) -> BoxFuture<'_, ()> {
+    fn note_slot_owner(&self, slot: u32, owner: u64, applied_index: u64) -> BoxFuture<'_, ()> {
         // Pushed by the member that committed the migration, rather than pulled
         // by this one, and that direction is the whole point. A *query* for the
         // table can be served by a member that holds the committing log entry
@@ -428,8 +428,10 @@ impl Service for NebRPCService {
             slot as u64,
             owner,
             crate::slots::SLOT_COUNT,
+            applied_index,
         );
-        self.neb_client.note_slot_owner(slot, owner);
+        self.neb_client
+            .note_slot_owner(slot, owner, applied_index);
         future::ready(()).boxed()
     }
 
@@ -489,7 +491,11 @@ impl Service for NebRPCService {
         .boxed()
     }
 
-    fn note_slot_owners(&self, owners: &Vec<(u32, u64)>) -> BoxFuture<'_, ()> {
+    fn note_slot_owners(
+        &self,
+        owners: &Vec<(u32, u64)>,
+        applied_index: u64,
+    ) -> BoxFuture<'_, ()> {
         // The batched form of `note_slot_owner`, for a bulk migration that has
         // just committed many slots at once. Same reasoning as the single version
         // -- pushed by the committer, because a query can be answered with the
@@ -497,8 +503,14 @@ impl Service for NebRPCService {
         for (slot, owner) in owners {
             self.database_runtime
                 .consh
-                .note_slot_owner(*slot as u64, *owner, crate::slots::SLOT_COUNT);
-            self.neb_client.note_slot_owner(*slot, *owner);
+                .note_slot_owner(
+                    *slot as u64,
+                    *owner,
+                    crate::slots::SLOT_COUNT,
+                    applied_index,
+                );
+            self.neb_client
+                .note_slot_owner(*slot, *owner, applied_index);
         }
         future::ready(()).boxed()
     }
@@ -795,9 +807,12 @@ impl NebRPCService {
             return Ok(());
         }
         let slot = crate::slots::slot_of(id) as u64;
-        match conshash.slot_override(slot) {
-            Some(owner) if owner != self.database_runtime.rpc.server_id => {
-                Err(WriteError::NotSlotOwner(owner))
+        match conshash.slot_override_with_index(slot) {
+            Some((owner, applied_index)) if owner != self.database_runtime.rpc.server_id => {
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                })
             }
             _ => Ok(()),
         }

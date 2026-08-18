@@ -1080,14 +1080,14 @@ pub async fn slot_table_is_seeded_to_agree_with_the_ring() {
     .await
     .unwrap();
 
-    let table = crate::slots::load_table(
+    let (table, _applied_index) = crate::slots::load_table(
         &server_group.to_string(),
         &server.raft_client,
         crate::server::SLOTS_SM_ID,
     )
     .await
-    .expect("slot table query should succeed")
-    .expect("startup should have seeded a table, not left it absent");
+    .expect("slot table command should succeed");
+    let table = table.expect("startup should have seeded a table, not left it absent");
 
     assert_eq!(
         table.len(),
@@ -1209,7 +1209,7 @@ pub async fn placement_reads_the_table_and_falls_back_to_the_ring() {
 
     // With no table at all, the ring still answers -- a group that never seeded
     // one behaves exactly as it did before this existed.
-    client.refresh_slot_owners(None);
+    client.refresh_slot_owners(None, u64::MAX - 2);
     for id in probes {
         let by_ring = server
             .conshash()
@@ -1231,7 +1231,7 @@ pub async fn placement_reads_the_table_and_falls_back_to_the_ring() {
         .get_server_id(probe.locality() as u64)
         .expect("ring routing");
     sparse[crate::slots::slot_of(&probe) as usize] = 0;
-    client.refresh_slot_owners(Some(sparse));
+    client.refresh_slot_owners(Some(sparse), u64::MAX - 1);
     assert_eq!(
         client.locate_server_id(&probe).expect("sparse routing"),
         expected,
@@ -1243,7 +1243,7 @@ pub async fn placement_reads_the_table_and_falls_back_to_the_ring() {
     let mut overridden = vec![0u64; crate::slots::SLOT_COUNT];
     const SENTINEL: u64 = 0xDEAD_BEEF;
     overridden[crate::slots::slot_of(&probe) as usize] = SENTINEL;
-    client.refresh_slot_owners(Some(overridden));
+    client.refresh_slot_owners(Some(overridden), u64::MAX);
     assert_eq!(
         client.locate_server_id(&probe).expect("override routing"),
         SENTINEL,

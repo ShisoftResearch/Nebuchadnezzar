@@ -74,9 +74,10 @@ pub enum WriteError {
     /// a former owner, which succeeds, satisfies the client, and puts the data
     /// somewhere nothing will ever read it again.
     ///
-    /// Carries the owner so a client can retry immediately instead of reloading
-    /// 32768 entries to discover what this member already knew.
-    NotSlotOwner(u64),
+    /// Carries the owner and the Raft log index that established it so a client
+    /// can retry immediately without letting a late refusal roll back newer
+    /// placement knowledge.
+    NotSlotOwner { owner: u64, applied_index: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]

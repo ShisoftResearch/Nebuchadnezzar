@@ -112,8 +112,9 @@ impl AsyncClient {
                             )
                             .await
                             {
-                                Ok(owners @ Some(_)) => chash.set_slot_overrides(owners),
-                                Ok(None) => {}
+                                Ok((owners, applied_index)) => {
+                                    chash.set_slot_overrides(owners, applied_index);
+                                }
                                 // Route by the ring exactly as before rather
                                 // than refuse to start.
                                 Err(reason) => warn!(
@@ -213,8 +214,8 @@ impl AsyncClient {
     /// Kept explicit rather than refreshed on a timer so that a stale table is
     /// always the result of a missed notification, never of a poll that has not
     /// come round yet.
-    pub fn refresh_slot_owners(&self, owners: Option<Vec<u64>>) {
-        self.conshash.set_slot_overrides(owners);
+    pub fn refresh_slot_owners(&self, owners: Option<Vec<u64>>, applied_index: u64) -> bool {
+        self.conshash.set_slot_overrides(owners, applied_index)
     }
 
     /// Record one slot's owner without re-reading the table.
@@ -228,9 +229,23 @@ impl AsyncClient {
     /// moment later returned the new one. So the committer applies what it
     /// already knows, which is both authoritative and cheaper than pulling all
     /// 32768 entries.
-    pub fn note_slot_owner(&self, slot: u32, owner: u64) {
-        self.conshash
-            .note_slot_owner(slot as u64, owner, crate::slots::SLOT_COUNT);
+    pub fn note_slot_owner(&self, slot: u32, owner: u64, applied_index: u64) -> bool {
+        self.conshash.note_slot_owner(
+            slot as u64,
+            owner,
+            crate::slots::SLOT_COUNT,
+            applied_index,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_slot_owner_for_test(&self, slot: u32, owner: u64) {
+        let applied_index = self
+            .conshash
+            .slot_override_with_index(slot as u64)
+            .map(|(_, applied_index)| applied_index)
+            .expect("test requires an installed owner for the slot");
+        assert!(self.note_slot_owner(slot, owner, applied_index));
     }
 
     /// Re-read the placement table from the state machine.
@@ -238,10 +253,10 @@ impl AsyncClient {
     /// For a member catching up on somebody else's migration. Returns whether
     /// the table was actually replaced.
     ///
-    /// A failed query keeps the current table rather than clearing it. Clearing
-    /// would fall back to the ring, and the ring is precisely the answer the
-    /// table exists to override -- so a transient raft hiccup would silently
-    /// resume routing cells to wherever `jump_hash` happens to point.
+    /// A failed command keeps the current table rather than clearing it.
+    /// Clearing would fall back to the ring, and the ring is precisely the
+    /// answer the table exists to override -- so a transient raft hiccup would
+    /// silently resume routing cells to wherever `jump_hash` happens to point.
     pub async fn reload_slot_owners(&self) -> bool {
         match crate::slots::load_owner_vec(
             &self.group_name,
@@ -250,10 +265,7 @@ impl AsyncClient {
         )
         .await
         {
-            Ok(owners) => {
-                self.refresh_slot_owners(owners);
-                true
-            }
+            Ok((owners, applied_index)) => self.refresh_slot_owners(owners, applied_index),
             Err(reason) => {
                 warn!(
                     "could not reload the slot placement table for group {} ({}); \
@@ -408,21 +420,23 @@ impl AsyncClient {
     }
     /// Follow a `NotSlotOwner` refusal to the member that really owns the slot.
     ///
-    /// The refusal carries the owner, so this costs no table reload: record what
-    /// the refusing member told us and go there. That is the point of the
-    /// refusal -- a stale table becomes one extra hop instead of a write that
-    /// succeeds into a place nothing will read again.
+    /// The refusal carries the owner, so this costs no table reload: merge what
+    /// the refusing member told us, then route by the cache after that monotonic
+    /// merge. The second step matters when the reply itself is stale; its owner
+    /// is rejected, and this write must use the newer owner already cached.
     ///
     /// One redirect only. A second refusal means placement is moving faster than
     /// a single write can follow it, and retrying in a loop would turn that into
     /// a hang instead of an error the caller can see.
-    async fn redirect_to_slot_owner(
+    pub(crate) async fn redirect_to_slot_owner(
         &self,
         id: &Id,
         owner: u64,
+        applied_index: u64,
     ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
-        self.note_slot_owner(crate::slots::slot_of(id), owner);
-        self.client_by_server_id(owner).await
+        self.note_slot_owner(crate::slots::slot_of(id), owner, applied_index);
+        let current_owner = self.locate_server_id(id)?;
+        self.client_by_server_id(current_owner).await
     }
 
     pub async fn write_cell(
@@ -445,8 +459,13 @@ impl AsyncClient {
                         .await?;
                     client.write_cell(cell).await
                 }
-                Err(WriteError::NotSlotOwner(owner)) => {
-                    let owner_client = self.redirect_to_slot_owner(&cell.id(), owner).await?;
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
                     owner_client.write_cell(cell).await
                 }
                 other => Ok(other),
@@ -470,8 +489,13 @@ impl AsyncClient {
                         .await?;
                     client.update_cell(cell).await
                 }
-                Err(WriteError::NotSlotOwner(owner)) => {
-                    let owner_client = self.redirect_to_slot_owner(&cell.id(), owner).await?;
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
                     owner_client.update_cell(cell).await
                 }
                 other => Ok(other),
@@ -496,8 +520,13 @@ impl AsyncClient {
                         .await?;
                     client.upsert_cell(cell).await
                 }
-                Err(WriteError::NotSlotOwner(owner)) => {
-                    let owner_client = self.redirect_to_slot_owner(&cell.id(), owner).await?;
+                Err(WriteError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }) => {
+                    let owner_client = self
+                        .redirect_to_slot_owner(&cell.id(), owner, applied_index)
+                        .await?;
                     owner_client.upsert_cell(cell).await
                 }
                 other => Ok(other),
@@ -549,8 +578,13 @@ impl AsyncClient {
                     .await?;
                 client.remove_cell(id).await
             }
-            Err(WriteError::NotSlotOwner(owner)) => {
-                let owner_client = self.redirect_to_slot_owner(&id, owner).await?;
+            Err(WriteError::NotSlotOwner {
+                owner,
+                applied_index,
+            }) => {
+                let owner_client = self
+                    .redirect_to_slot_owner(&id, owner, applied_index)
+                    .await?;
                 owner_client.remove_cell(id).await
             }
             other => Ok(other),

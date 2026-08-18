@@ -1028,8 +1028,13 @@ pub async fn init_conshash(
             // gives a cluster two placement oracles -- and a write and a read
             // that pick different ones do not fail, they lose the data.
             match crate::slots::load_owner_vec(group_name, raft_client, SLOTS_SM_ID).await {
-                Ok(Some(owners)) => ch.set_slot_overrides(Some(owners)),
-                Ok(None) => debug!("no slot placement table for this group; routing by the ring"),
+                Ok((owners, applied_index)) => {
+                    let has_table = owners.is_some();
+                    ch.set_slot_overrides(owners, applied_index);
+                    if !has_table {
+                        debug!("no slot placement table for this group; routing by the ring");
+                    }
+                }
                 Err(reason) => warn!(
                     "could not load the slot placement table ({}); routing by the ring",
                     reason
@@ -2227,28 +2232,28 @@ impl NebServer {
     /// defers dropping the donor's copy, so a stale member still reads correct
     /// data -- it is a latency problem, not a data one.
     ///
-    /// **Catch-up only. Do not use this to observe a migration that just
-    /// committed.** It reads the table with a raft *query*, and a query can be
-    /// served by a member that holds the committing log entry without having
-    /// applied it -- so calling this right after a commit can install the state
-    /// the commit replaced, which is worse than not refreshing at all because it
-    /// looks current. A migration pushes the new owner to the members that must
-    /// not be wrong (`cell_rpc::note_slot_owner`) for exactly this reason. This
-    /// cost a day's worth of intermittent failures; see the `note_slot_owner`
-    /// docs on `AsyncClient`.
+    /// The load is a read-only Raft command rather than a query, so the returned
+    /// table includes all placement commands ordered before it. It also carries
+    /// its applied log index: if a migration commits and pushes a newer owner
+    /// between command apply and local installation, the per-slot cache keeps
+    /// the newer push instead of replacing it with this snapshot.
     ///
     /// Returns whether the table was read successfully. A failure leaves the
     /// current table in place rather than clearing it: clearing would fall back
     /// to the ring, which is the answer the table exists to override.
     pub async fn refresh_slot_placement(&self) -> bool {
         match crate::slots::load_owner_vec(&self.group_name, &self.raft_client, SLOTS_SM_ID).await {
-            Ok(owners) => {
-                self.consh.set_slot_overrides(owners);
+            Ok((owners, applied_index)) => {
+                self.consh
+                    .set_slot_overrides(owners.clone(), applied_index);
                 // Each database client builds its own ring object, so refreshing
                 // only `self.consh` would leave the read and write paths of this
-                // very server disagreeing.
+                // very server disagreeing. Fan out this same result rather than
+                // issuing another Raft command per database.
                 for (_name, runtime) in lightning::map::Map::entries(&self.database_runtimes) {
-                    runtime.neb_client.reload_slot_owners().await;
+                    runtime
+                        .neb_client
+                        .refresh_slot_owners(owners.clone(), applied_index);
                 }
                 true
             }

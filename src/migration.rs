@@ -545,11 +545,11 @@ async fn migrate_slot_prepared(
     }
 
     // The commit point.
-    let owner = placement
-        .complete_slot_migration(&group, &slot)
+    let (owner, applied_index) = placement
+        .complete_slot_migration_with_index(&group, &slot)
         .await
-        .map_err(|error| MigrationError::Placement(format!("{error:?}")))?
-        .map_err(MigrationError::NotCommitted)?;
+        .map_err(|error| MigrationError::Placement(format!("{error:?}")))?;
+    let owner = owner.map_err(MigrationError::NotCommitted)?;
     if owner != to {
         return Err(MigrationError::NotCommitted(format!(
             "slot {slot} committed to {owner}, not to the intended recipient {to}"
@@ -561,7 +561,7 @@ async fn migrate_slot_prepared(
     // to ask to drop it. Applied from the command's own answer rather than by
     // re-reading the table -- see `note_slot_owner` for why a read-back here
     // can legitimately return the state before the commit.
-    client.note_slot_owner(slot, owner);
+    client.note_slot_owner(slot, owner, applied_index);
     // And push it to the two members that must not be wrong about this slot:
     // the new owner, which is about to start answering for it, and the donor,
     // which must stop. Pushed rather than left for them to re-read, for the
@@ -571,7 +571,10 @@ async fn migrate_slot_prepared(
     // is stale rather than wrong, and its copy of the data is still intact
     // because the drop is deferred.
     for (member, member_client) in [(from, &donor), (to, &recipient)] {
-        if let Err(error) = member_client.note_slot_owner(slot, owner).await {
+        if let Err(error) = member_client
+            .note_slot_owner(slot, owner, applied_index)
+            .await
+        {
             warn!(
                 "slot {slot} committed to {owner} but member {member} could not be told \
                  ({error:?}); it will route by a table one migration behind until it refreshes"
@@ -1008,7 +1011,10 @@ pub async fn reshard_slots(
     // apply, so it is authoritative about what committed -- no follow-up query,
     // which also sidesteps a query being served the pre-commit state.
     let ready: Vec<u32> = handovers.iter().map(|handover| handover.slot).collect();
-    let committed = match placement.complete_slot_migrations(&group, &ready).await {
+    let (committed, applied_index) = match placement
+        .complete_slot_migrations_with_index(&group, &ready)
+        .await
+    {
         Ok(committed) => committed,
         Err(error) => {
             for slot in ready {
@@ -1033,10 +1039,13 @@ pub async fn reshard_slots(
     // Follow our own commit locally, then push it to both members in one call
     // each rather than one per slot.
     for (slot, owner) in &committed {
-        client.note_slot_owner(*slot, *owner);
+        client.note_slot_owner(*slot, *owner, applied_index);
     }
     for (member, member_client) in [(from, &donor), (to, &recipient)] {
-        if let Err(error) = member_client.note_slot_owners(&committed).await {
+        if let Err(error) = member_client
+            .note_slot_owners(&committed, applied_index)
+            .await
+        {
             warn!(
                 "committed {} slots but member {member} could not be told ({error:?}); \
                  it will route by a table one migration behind until it refreshes",
@@ -1611,13 +1620,17 @@ mod cluster_tests {
         assert!(
             matches!(
                 donor.upsert_cell(late).await.unwrap(),
-                Err(crate::ram::cell::WriteError::NotSlotOwner(owner)) if owner == recipient_id
+                Err(crate::ram::cell::WriteError::NotSlotOwner { owner, .. })
+                    if owner == recipient_id
             ),
             "the former owner must refuse and name the member that took over"
         );
-        assert_eq!(
-            donor.remove_cell(seed_id).await.unwrap(),
-            Err(crate::ram::cell::WriteError::NotSlotOwner(recipient_id)),
+        assert!(
+            matches!(
+                donor.remove_cell(seed_id).await.unwrap(),
+                Err(crate::ram::cell::WriteError::NotSlotOwner { owner, .. })
+                    if owner == recipient_id
+            ),
             "removals are writes too -- a delete accepted here would be lost"
         );
 
@@ -1674,7 +1687,7 @@ mod cluster_tests {
 
         // Wind this client's placement back to before the migration, which is
         // what a member that missed the push looks like.
-        client.note_slot_owner(SLOT as u32, donor_id);
+        client.force_slot_owner_for_test(SLOT as u32, donor_id);
         assert_eq!(client.locate_server_id(&seed_id).unwrap(), donor_id);
 
         let (late_id, late) = cell_in_slot(SLOT, 2, "late-but-redirected");
@@ -1689,6 +1702,74 @@ mod cluster_tests {
         assert!(!held_in_slot(&servers[0], SLOT).contains(&late_id));
         assert_eq!(client.locate_server_id(&late_id).unwrap(), recipient_id);
         client.read_cell(late_id).await.unwrap().unwrap();
+    }
+
+    /// A refusal from an intermediate owner cannot wind an already newer client
+    /// back to that intermediate placement for the retry itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_refusal_uses_the_clients_newer_redirect_target() {
+        let (servers, client) =
+            start_cluster_with("migration_stale_refusal_test", 3, vec![Service::Cell]).await;
+
+        const SLOT: u16 = 62;
+        let (seed_id, seed) = cell_in_slot(SLOT, 1, "seed");
+        let first_owner = client.locate_server_id(&seed_id).unwrap();
+        let mut other_owners = servers
+            .iter()
+            .map(|server| server.server_id)
+            .filter(|owner| *owner != first_owner);
+        let intermediate_owner = other_owners.next().unwrap();
+        let newest_owner = other_owners.next().unwrap();
+
+        client.write_cell(seed).await.unwrap().unwrap();
+        migrate_slot(
+            &client,
+            SLOT as u32,
+            first_owner,
+            intermediate_owner,
+            &MigrationPlan::default(),
+        )
+        .await
+        .expect("first migration should commit");
+        let (_, intermediate_index) = client
+            .conshash
+            .slot_override_with_index(SLOT as u64)
+            .expect("first migration should version the owner");
+
+        migrate_slot(
+            &client,
+            SLOT as u32,
+            intermediate_owner,
+            newest_owner,
+            &MigrationPlan::default(),
+        )
+        .await
+        .expect("second migration should commit");
+        let (cached_owner, newest_index) = client
+            .conshash
+            .slot_override_with_index(SLOT as u64)
+            .expect("second migration should version the owner");
+        assert_eq!(cached_owner, newest_owner);
+        assert!(newest_index > intermediate_index);
+
+        // This is the reply from a request sent before the second migration:
+        // it names the then-current intermediate owner at its older index.
+        let redirect = client
+            .redirect_to_slot_owner(&seed_id, intermediate_owner, intermediate_index)
+            .await
+            .unwrap();
+        let (late_id, late) = cell_in_slot(SLOT, 2, "newer-than-refusal");
+        redirect
+            .upsert_cell(late)
+            .await
+            .unwrap()
+            .expect("the retry must use the newer cached owner");
+
+        let newest_server = servers
+            .iter()
+            .find(|server| server.server_id == newest_owner)
+            .unwrap();
+        assert!(held_in_slot(newest_server, SLOT).contains(&late_id));
     }
 
     /// Phase 5's racing-write model: sustained writes across a migration lose
@@ -2150,7 +2231,6 @@ mod cluster_tests {
     ///
     /// Repeated because the symptom is intermittent under load; a single pass
     /// proving nothing is exactly how this class of bug survives.
-    #[ignore = "ROOT CAUSE FOUND, fix designed, not yet implemented. See docs/superpowers/specs/2026-08-18-linearizable-slot-placement-refresh-design.md. What happens: migrate_slot commits and pushes the new owner, then refresh_slot_placement reloads the table with Slots::all_slots - a Raft QUERY, which can run on a replica that has committed but not applied the migration and so returns the PREVIOUS owner. Refresh overwrites the authoritative local table with that stale snapshot, the coordinator routes to the donor whose copy the reclaim deleted, and the read misses. Skipping only the refresh makes 4 concurrent copies pass. CAUTION - an earlier diagnosis in this repo blamed a permanent ReadTooLate from data_site.rs. That was wrong. There was never a real ReadTooLate: this test manufactured it by mapping a missing cell to a RETRYABLE NotRealizable(ReadTooLate), so the client retried 1000 times and it looked like a hang. The participant never logged its own ReadTooLate warning even once. Fixing that mapping to expect a cell that must exist is worth landing on its own, before the consensus work. Its control a_transaction_reads_an_unmigrated_cell passes 4/4 and is what makes any of this attributable."]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_transaction_reads_a_migrated_cell() {
         let (servers, client) = start_cluster_with(
@@ -2328,12 +2408,12 @@ mod cluster_tests {
         let (_, updated) = cell_in_slot(SLOT, 1, "UPDATED-mid-transfer");
         donor.upsert_cell(updated).await.unwrap().unwrap();
 
-        placement
-            .complete_slot_migration(&group, &(SLOT as u32))
+        let (owner, applied_index) = placement
+            .complete_slot_migration_with_index(&group, &(SLOT as u32))
             .await
-            .unwrap()
             .unwrap();
-        client.note_slot_owner(SLOT as u32, recipient_id);
+        assert_eq!(owner.unwrap(), recipient_id);
+        client.note_slot_owner(SLOT as u32, recipient_id, applied_index);
 
         // What the new owner holds is the value from before the update.
         let landed = recipient.read_cell(id).await.unwrap().unwrap();
