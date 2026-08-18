@@ -2020,3 +2020,62 @@ async fn unloading_a_database_gives_its_threads_back() {
         after as i64 - before as i64
     );
 }
+
+/// `PtrHashMap::remove` is not a release, and this server depends on knowing it.
+///
+/// Pinned here rather than in Lightning because Lightning is not what is wrong.
+/// Leaving the value in the retired node is documented, intended and correct: a
+/// concurrent reader may still be dereferencing that node, so dropping at
+/// removal time would be a use-after-free, and QSBR exists to make the eventual
+/// drop safe. What QSBR guarantees is that the drop is SAFE, not that it
+/// HAPPENS -- it is coupled to node reuse.
+///
+/// Treating `remove` as a release was OUR mistake. `NebServer.database_runtimes`
+/// is a `PtrHashMap<String, Arc<DatabaseRuntime>>` that lives as long as the
+/// server, so every database ever unloaded stays resident for the life of the
+/// process. That is why `unload_database_runtime_unchecked` stops the store's
+/// background work explicitly instead of waiting for a drop.
+#[test]
+fn ptr_hash_map_remove_does_not_release_the_value() {
+    use lightning::map::{Map, PtrHashMap};
+
+    let map: PtrHashMap<usize, Arc<String>> = PtrHashMap::with_capacity(64);
+    let value = Arc::new(String::from("owned"));
+    assert_eq!(Arc::strong_count(&value), 1);
+
+    map.insert(1, value.clone());
+    assert_eq!(Arc::strong_count(&value), 2, "the map holds one");
+
+    let removed = map.remove(&1).expect("the entry was inserted");
+    assert!(map.get(&1).is_none(), "the key is gone from the map");
+    assert_eq!(
+        Arc::strong_count(&value),
+        3,
+        "remove CLONES: ours, the retired node's original, and the returned clone"
+    );
+
+    drop(removed);
+    assert_eq!(
+        Arc::strong_count(&value),
+        2,
+        "dropping what remove returned still leaves the retired node's original"
+    );
+
+    // Churn on this thread -- the only one whose free list can reuse that node.
+    for key in 100..1000 {
+        map.insert(key, Arc::new(String::from("filler")));
+        map.remove(&key);
+    }
+    let after_churn = Arc::strong_count(&value);
+    drop(map);
+    let after_map_drop = Arc::strong_count(&value);
+    println!(
+        "PTRMAP RELEASE: {after_churn} refs after 900 insert/remove cycles, \
+         {after_map_drop} after dropping the map"
+    );
+    assert_eq!(
+        after_map_drop, 1,
+        "dropping the map releases the retired values; a map that outlives its removals \
+         is what holds them"
+    );
+}
