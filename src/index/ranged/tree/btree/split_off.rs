@@ -189,7 +189,7 @@ where
             let captured_next = mem::take(&mut n.next);
             let right_bound = mem::replace(&mut n.right_bound, pivot.clone());
             n.len = key_index;
-            let new_id = BPlusTree::<KS, PS>::new_page_id();
+            let new_id = BPlusTree::<KS, PS>::new_page_id_near(&n.id);
             let mut moved_leaf = ExtNode::<KS, PS>::new(new_id, right_bound);
             moved_leaf.keys = LeafKeys::from_keys(&moved_keys, KS::slice_len());
             moved_leaf.len = moved_keys.len();
@@ -352,7 +352,7 @@ where
                 let captured_next = mem::take(&mut n.next);
                 let right_bound = mem::replace(&mut n.right_bound, pivot.clone());
                 n.len = key_index;
-                let new_id = BPlusTree::<KS, PS>::new_page_id();
+                let new_id = BPlusTree::<KS, PS>::new_page_id_near(&n.id);
                 let mut moved_leaf = ExtNode::<KS, PS>::new(new_id, right_bound);
                 moved_leaf.keys = LeafKeys::from_keys(&moved_keys, KS::slice_len());
                 moved_leaf.len = moved_keys.len();

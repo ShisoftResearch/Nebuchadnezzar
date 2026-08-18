@@ -1596,7 +1596,10 @@ pub async fn locate_tree_server_from_conshash(
     group_name: &str,
     database_name: &str,
 ) -> Result<Arc<AsyncServiceClient>, RPCError> {
-    if let Some(server_id) = conshash.get_server_id_by(id) {
+    // Slot-keyed: see `locate_tree_server`. A tree's pages inherit its locality,
+    // so its service has to be found the same way or the two part company the
+    // first time that slot migrates.
+    if let Some(server_id) = conshash.get_server_id_for_slot(id.locality() as u64) {
         DEFAULT_CLIENT_POOL
             .get_by_id(server_id, move |sid| conshash.try_server_name(sid))
             .await

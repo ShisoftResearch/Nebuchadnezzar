@@ -375,7 +375,11 @@ impl MasterTreeSM {
     pub fn select_genesis_tree_id(conshash: &ConsistentHashing, local_server_id: u64) -> Id {
         for _ in 0..LOCAL_TREE_ID_SELECTION_MAX_ATTEMPTS {
             let id = Id::rand();
-            if conshash.get_server_id_by(&id) == Some(local_server_id) {
+            // By slot, like everything else that locates stored data. A tree's
+            // pages now inherit its locality, so choosing its server the same way
+            // keeps service and pages on one member -- and keeps them together
+            // when that slot migrates.
+            if conshash.get_server_id_for_slot(id.locality() as u64) == Some(local_server_id) {
                 return id;
             }
         }
@@ -516,7 +520,10 @@ impl MasterTreeSM {
     }
 
     async fn locate_tree_server(&self, id: &Id) -> Result<Arc<LSMServiceClient>, RPCError> {
-        if let Some(server_id) = self.conshash.get_server_id_by(id) {
+        // Slot-keyed, so the tree is served by whoever holds its pages. Hashing
+        // the whole id (the old rule) is a placement function the slot table does
+        // not govern, so a migration moved the pages and left the service behind.
+        if let Some(server_id) = self.conshash.get_server_id_for_slot(id.locality() as u64) {
             bifrost::rpc::DEFAULT_CLIENT_POOL
                 .get_by_id(server_id, move |sid| self.conshash.try_server_name(sid))
                 .await

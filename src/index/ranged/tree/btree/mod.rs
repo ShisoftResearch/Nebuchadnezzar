@@ -322,9 +322,29 @@ where
         self.height.load(Relaxed)
     }
 
+    /// The id of a tree's FIRST page, which establishes the slot the whole tree
+    /// lives in. Random, because nothing constrains where a new tree goes.
     fn new_page_id() -> Id {
-        // TODO: achieve locality
         Id::rand()
+    }
+
+    /// A fresh page id in the same slot as an existing page of the same tree.
+    ///
+    /// This is the "TODO: achieve locality" that used to sit on `new_page_id`, and
+    /// it turned out to be a correctness requirement rather than a nicety.
+    /// Placement moves a **slot** at a time, so a slot is only a safe unit if it is
+    /// a closure. Page ids were `Id::rand()`, which spreads one tree's pages
+    /// uniformly over all 32768 slots — so *every* tree had pages in *every* slot,
+    /// and migrating any slot tore a random slice out of every tree while its
+    /// `TreePlacement` still named the old member. The tree could not read its own
+    /// pages: "enumerated no vertices ... the index could not be enumerated",
+    /// measured 0/12 under load.
+    ///
+    /// Anchoring on the splitting page rather than on the tree keeps this local to
+    /// the split sites and correct by induction: the root establishes the slot, and
+    /// every page inherits from the page it split from.
+    fn new_page_id_near(anchor: &Id) -> Id {
+        Id::rand().with_locality(anchor.locality())
     }
 }
 

@@ -256,7 +256,7 @@ where
         } else {
             self.len / 2
         };
-        let new_page_id = BPlusTree::<KS, PS>::new_page_id();
+        let new_page_id = BPlusTree::<KS, PS>::new_page_id_near(&self.id);
         let mut keys_2 = self.keys.split_off(pivot, self.len);
         let mut keys_1_len = pivot;
         let mut keys_2_len = self.len - pivot;

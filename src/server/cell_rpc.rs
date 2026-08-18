@@ -331,7 +331,9 @@ impl Service for NebRPCService {
         // the cells back to answer that would double the cost of the move.
         future::ready(
             keys.into_iter()
-                .map(|id| self.database_runtime.chunks().head_cell(id))
+                .map(|id| {
+                    self.database_runtime.chunks().head_cell(id)
+                })
                 .collect(),
         )
         .boxed()
