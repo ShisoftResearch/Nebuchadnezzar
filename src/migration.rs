@@ -2195,12 +2195,10 @@ mod cluster_tests {
             let outcome = client
                 .transaction(|txn| {
                     Box::pin(async move {
-                        let cell = txn.read(id).await?;
-                        let mut cell = cell.ok_or(
-                            crate::client::transaction::TxnError::NotRealizable(
-                                crate::client::transaction::NotRealizableReason::ReadTooLate(id),
-                            ),
-                        )?;
+                        let mut cell = txn
+                            .read(id)
+                            .await?
+                            .expect("the migrated cell must still exist after placement refresh");
                         if let OwnedValue::Map(ref mut map) = cell.data {
                             map.insert(
                                 &String::from("name"),
