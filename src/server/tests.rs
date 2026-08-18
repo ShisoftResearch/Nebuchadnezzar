@@ -1833,3 +1833,190 @@ async fn a_server_that_goes_away_gives_its_threads_back() {
         );
     }
 }
+
+/// Does UNLOADING a database give its threads back?
+///
+/// This is the production-shaped question, and the reason the sibling test
+/// above is not the whole story. A whole server going away is a process
+/// exiting, where nothing is reclaimed and nothing needs to be. What a
+/// long-lived server really does is load and unload DATABASES -- Morpheus
+/// exposes exactly that as `unload_runtime` and `drop_database`, clusterwide --
+/// and each one carries a cleaner, its two rayon pools, and a statistics
+/// sweeper.
+///
+/// So this test churns database runtimes on one server. Like its sibling, it
+/// asserts PER-RUNTIME facts -- this runtime's cleaner stopped, this runtime's
+/// store stopped -- rather than a process-wide thread census, which is
+/// meaningless while hundreds of other tests create servers concurrently.
+/// `NEB_THREAD_CENSUS=1` adds the census for running it alone.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn unloading_a_database_gives_its_threads_back() {
+    let _ = env_logger::try_init();
+    const DATABASES: usize = 4;
+
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_size: 16 * 1024 * 1024,
+            db_size: 16 * 1024 * 1024,
+            tiered_config: None,
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        },
+        &crate::utils::test_port::unique_localhost_addr(),
+        "database_runtime_churn",
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    // One load/unload first, so the baseline includes anything a database
+    // initialises once per process rather than once per database.
+    server.ensure_database_runtime("churn_warmup").await.unwrap();
+    assert!(server.unload_database_runtime("churn_warmup").await);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let census = std::env::var("NEB_THREAD_CENSUS").is_ok();
+    let before = thread_count();
+    let census_before = threads_by_name();
+    // The cleaner and the store are held across the unload so the teardown can
+    // be observed after it -- exactly what the unload cannot rely on itself,
+    // since the runtime is not dropped (see below).
+    let mut loaded_dbs = Vec::new();
+    for index in 0..DATABASES {
+        let name = format!("churn_db_{index}");
+        let runtime = server.ensure_database_runtime(&name).await.unwrap();
+        loaded_dbs.push((
+            name,
+            runtime.cleaner().clone(),
+            runtime.chunks().clone(),
+            Arc::downgrade(&runtime),
+        ));
+    }
+    let loaded = thread_count();
+    if census {
+        assert!(
+            loaded > before,
+            "loading {DATABASES} databases added no threads ({before} -> {loaded}), so this run \
+             cannot say anything about unloading them"
+        );
+    }
+
+    for (name, cleaner, chunks, weak) in &loaded_dbs {
+        assert!(
+            !cleaner.is_stopped() && !chunks.is_background_stopped(),
+            "{name} is loaded and should not already be torn down"
+        );
+        let before_refs = weak.strong_count();
+        assert!(
+            server.unload_database_runtime(name).await,
+            "{name} should have been loaded and unloadable"
+        );
+        assert!(
+            server.database(name).is_none(),
+            "{name} was unloaded but is still in the runtime map"
+        );
+        assert!(
+            cleaner.is_stopped(),
+            "{name} was unloaded without stopping its cleaner, which is 13 threads"
+        );
+        assert!(
+            chunks.is_background_stopped(),
+            "{name} was unloaded without stopping its store's background work, which is the \
+             statistics sweeper -- and it cannot notice on its own, because unloading does \
+             not drop the store"
+        );
+        println!(
+            "DB CHURN: {name} refs {before_refs} -> {} after unload",
+            weak.strong_count()
+        );
+    }
+    let weak_runtimes: Vec<(String, std::sync::Weak<DatabaseRuntime>)> = loaded_dbs
+        .into_iter()
+        .map(|(name, _, _, weak)| (name, weak))
+        .collect();
+
+    // Is the residue a LEAK or just lazy? `PtrHashMap::remove` clones the value
+    // out and retires the node, so the map's own copy is destroyed by
+    // epoch-based reclamation, which only advances with further activity. Churn
+    // the map and see whether the earlier runtimes are reclaimed.
+    let alive_before_churn = weak_runtimes
+        .iter()
+        .filter(|(_, weak)| weak.strong_count() > 0)
+        .count();
+    for round in 0..10 {
+        let name = format!("churn_extra_{round}");
+        server.ensure_database_runtime(&name).await.unwrap();
+        server.unload_database_runtime(&name).await;
+    }
+    let alive_after_churn = weak_runtimes
+        .iter()
+        .filter(|(_, weak)| weak.strong_count() > 0)
+        .count();
+    println!(
+        "DB CHURN: {alive_before_churn} of {DATABASES} runtimes alive before extra churn,          {alive_after_churn} after 10 more load/unload cycles"
+    );
+
+    let mut after = thread_count();
+    for _ in 0..30 {
+        if after <= before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        after = thread_count();
+    }
+    let census_after = if census {
+        threads_by_name()
+    } else {
+        census_before.clone()
+    };
+    let still_alive: Vec<&String> = weak_runtimes
+        .iter()
+        .filter(|(_, weak)| weak.strong_count() > 0)
+        .map(|(name, _)| name)
+        .collect();
+    let mut grew: Vec<(String, usize, usize)> = census_after
+        .iter()
+        .filter_map(|(name, count)| {
+            let was = census_before.get(name).copied().unwrap_or(0);
+            (*count > was).then(|| (name.clone(), was, *count))
+        })
+        .collect();
+    grew.sort_by_key(|(_, was, now)| std::cmp::Reverse(now - was));
+    println!(
+        "DB CHURN: {before} threads before, {loaded} with {DATABASES} loaded, {after} after \
+         unloading ({:+})",
+        after as i64 - before as i64
+    );
+    for (name, was, now) in &grew {
+        println!("DB CHURN:   {name}: {was} -> {now}");
+    }
+
+    server.shutdown().await;
+
+    // Reported, NOT asserted. `database_runtimes` is a `PtrHashMap`, and its
+    // `remove` CLONES the value out and retires the node -- the map's own `Arc`
+    // is destroyed when that node is REUSED, not when it is removed, so an
+    // unloaded runtime's memory is retained for an unbounded time. Measured: 10
+    // further load/unload cycles reclaimed none of 4. That is its own task; what
+    // this test guards is that the THREADS come back regardless, which they can
+    // because the unload stops them explicitly instead of waiting for a drop
+    // that may never come.
+    println!(
+        "DB CHURN: {} of {DATABASES} unloaded runtimes still reachable (memory retained by \
+         PtrHashMap node reuse)",
+        still_alive.len()
+    );
+    assert!(
+        !census || after <= before,
+        "{DATABASES} databases were loaded and unloaded, and the server kept {} extra threads \
+         ({before} -> {after}); by name: {grew:?}",
+        after as i64 - before as i64
+    );
+}

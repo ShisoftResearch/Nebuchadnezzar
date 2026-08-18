@@ -1628,6 +1628,16 @@ impl NebServer {
         }
 
         runtime.cleaner().stop();
+        // The store's background work has to be stopped EXPLICITLY, not left to
+        // the store being dropped, because unloading does not drop it.
+        // `database_runtimes` is a `PtrHashMap`, whose `remove` CLONES the value
+        // out and retires the node -- the map's own `Arc` is destroyed when that
+        // node is reused, not when it is removed. Measured: 14 databases loaded
+        // and unloaded left 14 runtimes reachable and 14 `stats-sweeper` threads
+        // running, and 10 further load/unload cycles reclaimed none of them. So a
+        // sweeper that waits for its store to drop waits for something that may
+        // never happen.
+        runtime.chunks().stop_background();
 
         self.rpc
             .remove_service(cell_rpc::generate_scoped_service_id(
