@@ -1274,6 +1274,16 @@ mod cluster_tests {
     /// That is the property these tests rest on, and it is what makes them
     /// deterministic without waiting for a ring to settle.
     async fn start_cluster(group: &str, members: usize) -> (Vec<Arc<NebServer>>, Arc<AsyncClient>) {
+        start_cluster_with(group, members, vec![Service::Cell]).await
+    }
+
+    /// As [`start_cluster`], with the services spelled out. Transaction tests need
+    /// `Service::Transaction`, which the cell-only default does not start.
+    async fn start_cluster_with(
+        group: &str,
+        members: usize,
+        services: Vec<Service>,
+    ) -> (Vec<Arc<NebServer>>, Arc<AsyncClient>) {
         let _ = env_logger::try_init();
         let addresses: Vec<String> = (0..members)
             .map(|_| crate::utils::test_port::unique_localhost_addr())
@@ -1287,7 +1297,7 @@ mod cluster_tests {
             undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
-            services: vec![Service::Cell],
+            services,
             enable_recovery: false,
             disable_storage_locks: true,
         };
@@ -2126,6 +2136,153 @@ mod cluster_tests {
              any id derived from a container's version now points at a cell that \
              does not exist"
         );
+    }
+
+    /// Reproduction target: a cell read THROUGH A TRANSACTION right after its slot
+    /// migrated.
+    ///
+    /// Every other test here reads with `AsyncClient::read_cell`, and those pass.
+    /// The Morpheus failure reads through a distributed transaction instead, which
+    /// is a different path with its own placement lookup, its own per-transaction
+    /// cache, and a participant RPC to the owning site. This narrows the search to
+    /// that difference: same migration, same reclaim, same refresh, but the read
+    /// and the write go through `txn`.
+    ///
+    /// Repeated because the symptom is intermittent under load; a single pass
+    /// proving nothing is exactly how this class of bug survives.
+    #[ignore = "REPRODUCTION of the read-after-migration failure, in Neb alone -- no graph, no id lists, no Morpheus. Fails 1/4 to 3/4 under 4-way process load; its control a_transaction_reads_an_unmigrated_cell passes 4/4, so the migration is what causes it. DIAGNOSIS so far: the coordinator retries the transaction with growing backoff (observed to attempt 26, 5120ms) and every attempt is rejected as NotRealizable(ReadTooLate). That comes from data_site.rs read_too_late: the cell metadata write stamp is newer than any timestamp the coordinator can present, and the code notes waiting cannot help. It looks like a hang because the client retries up to TRANSACTION_MAX_RETRY = 1000 times. NARROWED: meta.write is only ever set by the transactional path at commit, never by the plain cell path that migration uses -- so the stamp is not written by the transfer itself. The reclaim is implicated and with the OPPOSITE polarity to the Morpheus symptom: here 1/4 passes with the reclaim and 3/4 without, where Morpheus was 10/12 with and 4/12 without. Two different failures, then. Note refresh_slot_placement reads the table with a QUERY and can install a pre-migration view, which would route a transaction to the donor whose copy the reclaim just deleted -- the next thing to instrument."]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transaction_reads_a_migrated_cell() {
+        let (servers, client) = start_cluster_with(
+            "migration_txn_read_test",
+            2,
+            vec![Service::Cell, Service::Transaction],
+        )
+        .await;
+        let donor_id = servers[0].server_id;
+        let recipient_id = servers[1].server_id;
+
+        const SLOTS: [u16; 6] = [301, 302, 303, 304, 305, 306];
+        let mut ids = Vec::new();
+        for slot in SLOTS {
+            for seq in 0..4 {
+                let (id, cell) = cell_in_slot(slot, seq, "before");
+                client.write_cell(cell).await.unwrap().unwrap();
+                ids.push(id);
+            }
+        }
+
+        let plan = MigrationPlan::default();
+        for slot in SLOTS {
+            migrate_slot(&client, slot as u32, donor_id, recipient_id, &plan)
+                .await
+                .expect("slot should migrate");
+            if std::env::var("NEB_DIAG_NO_RECLAIM").is_err() {
+                reclaim_donor_copy(&client, slot as u32, donor_id, recipient_id, &plan)
+                    .await
+                    .expect("donor copy should be reclaimable");
+            }
+        }
+        for server in &servers {
+            server.refresh_slot_placement().await;
+        }
+
+        // Read every migrated cell inside a transaction, then update it, which is
+        // the shape of the Morpheus link that fails: read a container, decide,
+        // write back.
+        for id in &ids {
+            let id = *id;
+            let outcome = client
+                .transaction(|txn| {
+                    Box::pin(async move {
+                        let cell = txn.read(id).await?;
+                        let mut cell = cell.ok_or(
+                            crate::client::transaction::TxnError::NotRealizable(
+                                crate::client::transaction::NotRealizableReason::ReadTooLate(id),
+                            ),
+                        )?;
+                        if let OwnedValue::Map(ref mut map) = cell.data {
+                            map.insert(
+                                &String::from("name"),
+                                OwnedValue::String("after".to_string()),
+                            );
+                        }
+                        txn.update(cell).await?;
+                        Ok(())
+                    })
+                })
+                .await;
+            outcome.unwrap_or_else(|error| {
+                panic!("a transaction could not read+update migrated {id:?}: {error:?}")
+            });
+        }
+
+        // And the updates are visible afterwards, on the new owner.
+        for id in &ids {
+            let cell = client.read_cell(*id).await.unwrap().unwrap();
+            assert_eq!(
+                cell.data["name"].string().map(|s| s.as_str()),
+                Some("after"),
+                "{id:?} did not keep the transactional update"
+            );
+        }
+    }
+
+    /// CONTROL for `a_transaction_reads_a_migrated_cell`: the same cluster and the
+    /// same transactions, with no migration at all.
+    ///
+    /// Without this the other test cannot attribute anything. If both hang under
+    /// load then the hang belongs to two-member transactions, not to migration,
+    /// and chasing it inside the migration code would be chasing the wrong thing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transaction_reads_an_unmigrated_cell() {
+        let (_servers, client) = start_cluster_with(
+            "migration_txn_control_test",
+            2,
+            vec![Service::Cell, Service::Transaction],
+        )
+        .await;
+
+        const SLOTS: [u16; 6] = [311, 312, 313, 314, 315, 316];
+        let mut ids = Vec::new();
+        for slot in SLOTS {
+            for seq in 0..4 {
+                let (id, cell) = cell_in_slot(slot, seq, "before");
+                client.write_cell(cell).await.unwrap().unwrap();
+                ids.push(id);
+            }
+        }
+
+        for id in &ids {
+            let id = *id;
+            client
+                .transaction(|txn| {
+                    Box::pin(async move {
+                        let cell = txn.read(id).await?;
+                        let mut cell = cell.ok_or(
+                            crate::client::transaction::TxnError::NotRealizable(
+                                crate::client::transaction::NotRealizableReason::ReadTooLate(id),
+                            ),
+                        )?;
+                        if let OwnedValue::Map(ref mut map) = cell.data {
+                            map.insert(
+                                &String::from("name"),
+                                OwnedValue::String("after".to_string()),
+                            );
+                        }
+                        txn.update(cell).await?;
+                        Ok(())
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("a transaction could not read+update {id:?}: {error:?}")
+                });
+        }
+        for id in &ids {
+            let cell = client.read_cell(*id).await.unwrap().unwrap();
+            assert_eq!(cell.data["name"].string().map(|s| s.as_str()), Some("after"));
+        }
     }
 
     /// THE BUG, in isolation: an update to an already-transferred cell is lost.
