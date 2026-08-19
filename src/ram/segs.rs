@@ -473,7 +473,19 @@ pub struct Segment {
     pub dropped: AtomicBool,
     /// Tracks if WAL has been written to since last successful archive
     /// Used to optimize eviction: if archived=true && is_dirty=false, can skip re-archiving
-    is_dirty: AtomicBool,
+    /// Marks of "this segment holds bytes that are not in its backup", as a
+    /// COUNTER rather than a flag.
+    ///
+    /// A flag could be clobbered, and was. An archive snapshots the image, then
+    /// clears the flag when it finishes writing the backup -- so a write that
+    /// completed *after* the snapshot but *before* the clear had its mark erased,
+    /// leaving a segment that holds un-archived bytes and claims to be clean.
+    /// Eviction then skips re-archiving and frees the pages, and those cells read
+    /// back as zeros forever. Counting instead lets the archive clear only what it
+    /// actually captured: see `dirty_mark` and `clear_dirty_upto`.
+    dirty_seq: AtomicU64,
+    /// The highest `dirty_seq` known to be captured in the backup.
+    archived_seq: AtomicU64,
     /// Set once a backup exists for this `(chunk, seg, seq)`. From then on the
     /// incarnation is CLOSED: nothing may append to it, and in particular no
     /// WAL may be (re-)created at this seq id.
@@ -691,7 +703,9 @@ impl Segment {
             access_count: AtomicU8::new(0),
             last_promoted_ms: AtomicI64::new(0),
             last_evicted_ms: AtomicI64::new(0),
-            is_dirty: AtomicBool::new(true), // Start dirty
+            // Start dirty: nothing is in a backup yet.
+            dirty_seq: AtomicU64::new(1),
+            archived_seq: AtomicU64::new(0),
             sealed: AtomicBool::new(false),
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
@@ -1393,6 +1407,23 @@ impl Segment {
         );
 
         if let Some(backup_file) = backup_path_opt {
+            // Take the dirty mark BEFORE anything is read, and clear only up to
+            // it when the backup is durable.
+            //
+            // This archive does not exclude writers -- see the note just below
+            // about why it deliberately does not wait for references to drain --
+            // so a write can complete after the image is snapshotted and before
+            // the backup is renamed into place. Clearing the flag outright then
+            // erased that write's mark, leaving a segment holding bytes its
+            // backup does not have while claiming to be clean. Eviction trusts
+            // `is_dirty`, skips re-archiving, frees the pages, and those cells
+            // read back as zeros for good.
+            //
+            // Measured at 16 GiB: 126 cells of one slot, all in one segment, all
+            // reported COLD + "not dirty" + INSIDE the written range, the same id
+            // failing at the same address minutes apart. Persistent, because the
+            // backup genuinely never contained them.
+            let dirty_mark = self.dirty_mark();
             // NOTE: We do NOT wait for no_references() here because:
             // 1. The file_state mutex already ensures only one archive at a time
             // 2. Waiting here could deadlock if another component holds tiered_lock
@@ -1696,7 +1727,10 @@ image, not an empty segment; archiving it would persist the damage.",
                         }
                     }
 
-                    self.clear_dirty();
+                    // Only what the snapshot could have captured. A write that
+                    // landed after it keeps the segment dirty, so the next
+                    // eviction re-archives instead of dropping those bytes.
+                    self.clear_dirty_upto(dirty_mark);
 
                     // A backup now exists at this seq id, so this incarnation
                     // is closed: no append may follow, or the WAL deleted just
@@ -2181,16 +2215,38 @@ image, not an empty segment; archiving it would persist the damage.",
 
     pub fn set_dirty(&self) {
         debug!("set_dirty for segment {}", self.id);
-        self.is_dirty.store(true, Ordering::Release);
+        self.dirty_seq.fetch_add(1, Ordering::Release);
     }
 
+    /// Everything marked so far is now in the backup.
+    ///
+    /// For callers that know nothing can be in flight. An archive must use
+    /// [`clear_dirty_upto`] with a mark taken before its snapshot, or it erases
+    /// marks for bytes it never captured.
     pub fn clear_dirty(&self) {
         debug!("clear_dirty for segment {}", self.id);
-        self.is_dirty.store(false, Ordering::Release);
+        let seen = self.dirty_seq.load(Ordering::Acquire);
+        self.archived_seq.fetch_max(seen, Ordering::AcqRel);
+    }
+
+    /// The dirty mark as it stands now. Read this BEFORE snapshotting an image,
+    /// and pass it to [`clear_dirty_upto`] when the backup is durable.
+    pub fn dirty_mark(&self) -> u64 {
+        self.dirty_seq.load(Ordering::Acquire)
+    }
+
+    /// Clear only the marks that existed at `mark`.
+    ///
+    /// Anything marked after it describes bytes the snapshot could not have
+    /// contained, so the segment stays dirty and the next eviction re-archives
+    /// instead of dropping them.
+    pub fn clear_dirty_upto(&self, mark: u64) {
+        debug!("clear_dirty_upto({}) for segment {}", mark, self.id);
+        self.archived_seq.fetch_max(mark, Ordering::AcqRel);
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.is_dirty.load(Ordering::Relaxed)
+        self.dirty_seq.load(Ordering::Acquire) > self.archived_seq.load(Ordering::Acquire)
     }
 
     /// Close this incarnation: a backup exists at its seq id, so it may never
@@ -2846,6 +2902,65 @@ mod tests {
         assert!(
             segment.is_dirty(),
             "a segment whose archive was refused stays dirty"
+        );
+    }
+
+    /// An archive must not clear a dirty mark made after its snapshot.
+    ///
+    /// `archive()` deliberately does not exclude writers -- it says so, and
+    /// waiting for references to drain there could deadlock. So a write can
+    /// complete between the image snapshot and the backup being renamed into
+    /// place. Clearing the flag outright then erased that write's mark, leaving
+    /// a segment that holds bytes its backup does not have and reports itself
+    /// clean. Eviction trusts `is_dirty`, skips re-archiving and frees the
+    /// pages, so those cells read back as zeros permanently.
+    ///
+    /// Found at 16 GiB: 126 cells of one slot, every warning naming the same
+    /// segment as COLD + "not dirty" + INSIDE the written range, the same id
+    /// failing at the same address minutes apart -- persistent, because the
+    /// backup genuinely never contained them.
+    ///
+    /// This pins the ordering rule alone, with no I/O, so it cannot become a
+    /// timing test: a mark taken before the snapshot must not clear a mark made
+    /// after it.
+    #[test]
+    fn an_archive_does_not_clear_a_dirty_mark_made_after_its_snapshot() {
+        let _ = env_logger::try_init();
+        let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
+        let file_manager = Arc::new(SegmentFileManager::new(None, None));
+        let segment = allocator
+            .alloc_seg(&file_manager)
+            .expect("a fresh allocator has a segment");
+
+        // Start from the state an archive leaves behind.
+        segment.clear_dirty();
+        assert!(!segment.is_dirty(), "a fully archived segment is clean");
+
+        // An archive begins: it reads the mark, then snapshots the image.
+        let mark = segment.dirty_mark();
+
+        // A writer finishes after that snapshot -- its bytes are NOT in the
+        // image the archive is about to write.
+        segment.set_dirty();
+
+        // The archive completes and clears what it captured.
+        segment.clear_dirty_upto(mark);
+
+        assert!(
+            segment.is_dirty(),
+            "the archive cleared a mark for bytes it never captured; the segment now claims \
+             to be clean while holding cells that exist only in memory, and the next eviction \
+             will free them"
+        );
+
+        // And the ordinary case still works: a mark taken after the write is
+        // allowed to clear it.
+        let later = segment.dirty_mark();
+        segment.clear_dirty_upto(later);
+        assert!(
+            !segment.is_dirty(),
+            "an archive that did capture the write must be able to clear its mark, or every \
+             segment stays dirty forever and nothing is ever evicted"
         );
     }
 
