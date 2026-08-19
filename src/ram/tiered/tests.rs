@@ -5094,10 +5094,13 @@ async fn a_read_racing_eviction_never_sees_a_stale_pointer() {
         cold > 0,
         "nothing was evicted, so this run raced nothing ({reads} reads)"
     );
+    let (recorded, verdict) = crate::ram::cell::stale_pointer_record::snapshot();
     assert_eq!(
         stale, 0,
         "{stale} reads of {reads} found the index pointing at memory that does not hold the \
-         cell, while the tier was evicting under a concurrent writer"
+         cell, while the tier was evicting under a concurrent writer.\n\
+         VERDICT (process-wide count {recorded}, most recent): {}",
+        verdict.as_deref().unwrap_or("none recorded -- the mismatch branch did not run here")
     );
     assert_eq!(
         absent, 0,

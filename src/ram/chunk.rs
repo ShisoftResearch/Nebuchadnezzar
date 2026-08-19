@@ -2695,11 +2695,33 @@ impl<'a> CellGuard<'a> {
                         // itself. That livelocked 33 threads in sched_yield for
                         // 50 minutes during a sidecar build, which reads several
                         // cells of one segment at a time.
+                        // Pin BEFORE faulting the block in, not after.
+                        //
+                        // `try_reclaim_resident_blocks` hands a cold segment's
+                        // faulted-in blocks back under pressure, and it takes the
+                        // segment exclusively to do it -- which only excludes
+                        // readers that already hold a reference. Faulting first
+                        // and referencing second left a window: the block is
+                        // resident, the reclaimer sees zero references, takes
+                        // exclusivity, `madvise`s the segment away and releases
+                        // it, and the reader's `incr_references` then SUCCEEDS on
+                        // a segment whose pages are gone. It returns a guard onto
+                        // freed memory and reads `Id(0)`.
+                        //
+                        // Caught by `a_read_racing_eviction_never_sees_a_stale_pointer`
+                        // at 1 stale read in ~295k, whose verdict named it exactly:
+                        // "segment 14 is COLD, offset INSIDE the written range,
+                        // promoted never".
+                        //
+                        // The reference is released again on every path that does
+                        // not return a guard, because promotion below waits for
+                        // references to drain and would otherwise wait on us --
+                        // the livelock that cost 33 threads 50 minutes once.
+                        if !seg.incr_references() {
+                            return None;
+                        }
                         match seg.fault_in_block_for(*guard) {
                             Ok(Some(newly_resident)) => {
-                                if !seg.incr_references() {
-                                    return None;
-                                }
                                 seg.mark_referenced();
                                 if let Some(ref tiered) = chunk.tiered_manager {
                                     tiered.add_cold_resident(newly_resident);
@@ -2714,11 +2736,16 @@ impl<'a> CellGuard<'a> {
                                     version,
                                 });
                             }
-                            Ok(None) => {}
-                            Err(e) => debug!(
-                                "Partial read of segment {} in chunk {} failed, promoting: {}",
-                                seg.id, chunk.id, e
-                            ),
+                            Ok(None) => {
+                                seg.decr_references();
+                            }
+                            Err(e) => {
+                                seg.decr_references();
+                                debug!(
+                                    "Partial read of segment {} in chunk {} failed, promoting: {}",
+                                    seg.id, chunk.id, e
+                                )
+                            }
                         }
 
                         // CRITICAL: Release the cell lock BEFORE promotion to avoid deadlock.
