@@ -568,6 +568,17 @@ pub struct BlockResidency {
     present: Vec<u64>,
     /// Bytes currently faulted in through this path, for memory accounting.
     resident_bytes: usize,
+    /// This segment's pages have been dropped, so its mapping no longer holds
+    /// a whole image -- only whatever blocks were faulted back in for reads.
+    ///
+    /// This is the exact predicate `archive` needs, and it is not the same
+    /// question as "is this segment cold". `is_settled_cold` was a proxy for
+    /// it and missed the window a promotion runs in: `lock_cold` sets the
+    /// locking bit, so a segment part-way through being restored answers
+    /// `false` to settled-cold while its image is still a patchwork. Archiving
+    /// there writes zeros over the one authoritative copy of the cells the
+    /// promotion is in the middle of restoring.
+    pages_dropped: bool,
 }
 
 impl BlockResidency {
@@ -710,7 +721,12 @@ impl Segment {
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
             wal_sync_queued: std::sync::atomic::AtomicBool::new(false),
-            block_residency: parking_lot::RwLock::new(BlockResidency::default()),
+            // A segment born cold has no image in its mapping either: the
+            // backup is all there is until something promotes it.
+            block_residency: parking_lot::RwLock::new(BlockResidency {
+                pages_dropped: !hot,
+                ..BlockResidency::default()
+            }),
         }
     }
 
@@ -829,6 +845,7 @@ impl Segment {
         // the accounting must drop too or the limit would drift upward forever.
         let mut residency = self.block_residency.write();
         residency.clear();
+        residency.pages_dropped = true;
         drop(residency);
         // The cache keys on seq_id, so a re-archived segment would simply miss
         // rather than read the wrong file. Releasing here just returns the
@@ -858,8 +875,17 @@ impl Segment {
     /// are about to be dropped, so no reader may be inside them. The attempt is
     /// made once and abandoned if the segment is referenced; spinning here is
     /// what deadlocked promotion, and a sweep has other segments to try.
+    ///
+    /// **Settled-cold, not merely cold.** `is_cold` is deliberately true while a
+    /// promotion is in flight, and a promotion releases nothing this can wait
+    /// on -- it holds the locking bit, not a reference. Reclaiming there takes
+    /// exclusivity the promoter is not holding and `madvise`s away the image it
+    /// has just restored, or is part-way through restoring, leaving a HOT
+    /// segment with a hole in it and an intact backup nobody consults again.
+    /// There is also nothing to gain: those blocks are about to be replaced by
+    /// the full image anyway.
     pub fn try_reclaim_resident_blocks(&self) -> Option<usize> {
-        if !self.is_cold() {
+        if !self.is_settled_cold() {
             return None;
         }
         // Residency includes the index, so a segment holding only an index is
@@ -878,7 +904,34 @@ impl Segment {
             madvise_free(self.addr, SEGMENT_SIZE);
         }
         residency.clear();
+        residency.pages_dropped = true;
         Some(released)
+    }
+
+    /// Whether this segment's mapping holds a whole image or a patchwork.
+    ///
+    /// True from the moment eviction (or the cold-budget sweeper) drops the
+    /// pages until a promotion has restored every byte of them.
+    pub fn image_is_partial(&self) -> bool {
+        self.block_residency.read().pages_dropped
+    }
+
+    /// Record that a promotion has restored the whole image, and hand back the
+    /// block-residency bytes so the caller can return them to the tiered
+    /// manager's accounting.
+    ///
+    /// Both halves matter. The residency describes blocks faulted in from the
+    /// backup while the segment was cold; once the full image is back they are
+    /// not a separate resident thing any more, and leaving them charged made
+    /// the manager count a promoted segment twice -- once as a hot segment and
+    /// once as the blocks it no longer holds separately -- until its next
+    /// eviction.
+    pub fn mark_image_restored(&self) -> usize {
+        let mut residency = self.block_residency.write();
+        let released = residency.resident_bytes();
+        residency.clear();
+        residency.pages_dropped = false;
+        released
     }
 
     /// Bytes this segment currently holds through partial block residency.
@@ -1507,14 +1560,24 @@ impl Segment {
             // block index and `used_len` are byte-identical to a healthy sibling.
             // The archive captured a hole; the restore was faithful all along.
             //
-            // Eviction is unaffected: it archives while holding the transition
-            // bits, so `is_settled_cold` is false and its intact image still
-            // gets written.
-            if self.is_settled_cold() {
+            // Eviction is unaffected: it archives BEFORE dropping the pages,
+            // so its intact image still gets written.
+            //
+            // The question asked here is "does the mapping hold a whole image",
+            // not "is this segment cold". Those differ in exactly one window,
+            // and it is the window task #71 was measured in: `promote_segment`
+            // sets the locking bit before restoring, so a segment part-way
+            // through promotion answers FALSE to `is_settled_cold` while its
+            // image is still nothing but the blocks a reader happened to fault
+            // in. A TLA+ model of this protocol (`docs/tla/SegmentTier.tla`)
+            // reaches that state in nine steps and loses the cell from memory
+            // and backup alike. Asking about the image directly closes it, and
+            // keeps every case the settled-cold test already caught.
+            if self.image_is_partial() || self.is_settled_cold() {
                 warn!(
-                    "REFUSING to archive settled-cold segment {} (chunk {}, seq {}): its pages \
-                     were dropped at eviction, so its image is a patchwork of faulted-in \
-                     blocks. The existing backup is authoritative.",
+                    "REFUSING to archive segment {} (chunk {}, seq {}): its pages were dropped \
+                     and not yet restored, so its image is a patchwork of faulted-in blocks. \
+                     The existing backup is authoritative.",
                     self.id, self.chunk_id, self.seq_id
                 );
                 return Ok(false);

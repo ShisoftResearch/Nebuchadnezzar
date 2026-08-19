@@ -774,7 +774,10 @@ impl TieredMemoryManager {
                 // segment can hold faulted-in blocks, and most hold none. Both
                 // are plain loads, against a guard that is a CAS on a shared
                 // line.
-                if !segment.is_cold() || segment.block_resident_bytes() == 0 {
+                // Settled-cold, matching `try_reclaim_resident_blocks`: a
+                // segment mid-promotion is `is_cold` but must not have its
+                // pages taken out from under the restore.
+                if !segment.is_settled_cold() || segment.block_resident_bytes() == 0 {
                     continue;
                 }
                 if let Some(bytes) = segment.try_reclaim_resident_blocks() {
@@ -908,7 +911,13 @@ impl TieredMemoryManager {
         let churn_candidate =
             segment.recently_evicted_within(self.shared_pool.promotion_cooldown_ms);
 
-        promote_segment(segment);
+        // Promotion replaces the faulted-in blocks with the whole image, so the
+        // bytes it was charging for them go back to the manager here. Without
+        // this the counter kept them until the segment's next eviction, and a
+        // promoted segment was billed twice: once as a hot segment, once as
+        // blocks it no longer separately held.
+        let released_residency = promote_segment(segment);
+        self.release_cold_resident(released_residency);
         segment.reset_access_count();
 
         self.increment_hot_count_for(chunk);

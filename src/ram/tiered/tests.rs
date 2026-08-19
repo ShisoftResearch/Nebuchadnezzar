@@ -5108,3 +5108,362 @@ async fn a_read_racing_eviction_never_sees_a_stale_pointer() {
          test deletes anything"
     );
 }
+
+/// A segment part-way through promotion must be untouchable by the two things
+/// that drop pages or overwrite backups.
+///
+/// Both used to be reachable there. `is_cold()` is deliberately true while a
+/// promotion runs, so the cold-budget sweeper's `try_reclaim_resident_blocks`
+/// passed its gate; and `is_settled_cold()` is false, because `lock_cold` sets
+/// the locking bit, so the archive refusal added in d8b0039c did not fire. The
+/// promoter meanwhile held no reference at all -- it took the exclusive guard
+/// only to flip the state and dropped it before reading a single byte.
+///
+/// The measured consequence was task #71: two cells of 4.2M reading as `Id(0)`
+/// from a segment reporting HOT, not dirty, offset inside the written range.
+/// `docs/tla/SegmentTier.tla` has the model and both counterexamples.
+#[test]
+fn a_promoting_segment_is_not_archived_or_reclaimed_from_underneath_it() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("promoting_seg", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_promoting_schema");
+    let backup_dir = temp_path("neb_promoting_bk");
+    let wal_dir = temp_path("neb_promoting_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        16 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    let mut ids: Vec<Id> = Vec::new();
+    for i in 0..8_000usize {
+        let id = Id::allocated(0, 0, 730_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String("y".repeat(4_000)));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            ids.push(id);
+        }
+    }
+    assert!(ids.len() > 500, "setup wrote too few cells");
+
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 32);
+    }
+    // Reads of cold cells fault single blocks back in, which is what makes the
+    // resident image a patchwork rather than nothing at all.
+    for id in ids.iter() {
+        let _ = chunks.read_cell(id);
+    }
+
+    let chunk = &chunks.list[0];
+    let target = chunk
+        .segments()
+        .into_iter()
+        .find(|s| s.is_settled_cold() && s.block_resident_bytes() > 0)
+        .expect("expected a cold segment holding faulted-in blocks");
+
+    assert!(
+        target.image_is_partial(),
+        "an evicted segment's mapping is a patchwork until a promotion restores it"
+    );
+
+    let backup_path = chunk
+        .file_manager
+        .backup_path(target.chunk_id, target.id, target.seq_id)
+        .expect("cold segment must have a backup");
+    let before = std::fs::metadata(&backup_path).expect("backup exists").len();
+
+    // Stand where `promote_segment` stands after `lock_cold`.
+    assert!(
+        target.lock_cold(),
+        "a settled-cold segment must be lockable for promotion"
+    );
+
+    assert_eq!(
+        target.try_reclaim_resident_blocks(),
+        None,
+        "the cold-budget sweeper must not madvise a segment that is being restored"
+    );
+    assert!(
+        target.block_resident_bytes() > 0,
+        "and it must not have cleared the residency either"
+    );
+    assert_eq!(
+        target.archive().expect("archive must not error"),
+        false,
+        "a patchwork image must never be written over an authoritative backup"
+    );
+    assert_eq!(
+        std::fs::metadata(&backup_path).expect("backup still exists").len(),
+        before,
+        "the refusal must leave the backup byte-for-byte intact"
+    );
+
+    target.set_cold();
+}
+
+/// Promotion owns the image it restores: afterwards nothing is flagged partial
+/// and the block-residency bytes come back to the manager's accounting.
+///
+/// The accounting half was a leak of its own. The bytes charged for blocks
+/// faulted in while cold stayed charged after promotion replaced those blocks
+/// with the whole image, so a promoted segment was billed twice -- once as a
+/// hot segment, once as blocks it no longer separately held -- until its next
+/// eviction happened to hand them back.
+#[test]
+fn a_promotion_restores_the_whole_image_and_returns_its_residency() {
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("promo_residency", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_promo_res_schema");
+    let backup_dir = temp_path("neb_promo_res_bk");
+    let wal_dir = temp_path("neb_promo_res_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        16 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    let mut ids: Vec<Id> = Vec::new();
+    for i in 0..8_000usize {
+        let id = Id::allocated(0, 0, 880_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String("y".repeat(4_000)));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            ids.push(id);
+        }
+    }
+    assert!(ids.len() > 500, "setup wrote too few cells");
+
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 32);
+    }
+    for id in ids.iter() {
+        let _ = chunks.read_cell(id);
+    }
+
+    let chunk = &chunks.list[0];
+    let target = chunk
+        .segments()
+        .into_iter()
+        .find(|s| s.is_settled_cold() && s.block_resident_bytes() > 0)
+        .expect("expected a cold segment holding faulted-in blocks");
+    let charged = target.block_resident_bytes();
+    let accounted_before = manager.cold_resident_total();
+
+    let released = crate::ram::tiered::promotion::promote_segment(&target);
+
+    assert!(target.is_hot(), "promotion must leave the segment hot");
+    assert!(
+        !target.image_is_partial(),
+        "a restored segment holds a whole image, and must say so before it goes hot"
+    );
+    assert_eq!(
+        target.block_resident_bytes(),
+        0,
+        "the faulted-in blocks are part of the whole image now, not a separate residency"
+    );
+    assert_eq!(
+        released, charged,
+        "promotion must hand back exactly what the segment was charging"
+    );
+    manager.release_cold_resident(released);
+    assert_eq!(
+        manager.cold_resident_total(),
+        accounted_before - charged,
+        "the manager's cold total must drop by what the promotion returned"
+    );
+}
+
+/// The race itself, driven rather than hoped for.
+///
+/// A promotion is held open at the exact point it has taken the cold lock and
+/// restored nothing, and the three things that used to be able to reach it are
+/// tried from another thread.
+///
+/// Against the pre-fix code all three succeed: the promoter held no reference,
+/// `is_cold()` is true in that window so the cold-budget sweeper passed its
+/// gate, and `is_settled_cold()` is false there so the archive refusal did not
+/// fire. Any of them alone loses the cells -- the sweeper by `madvise`ing the
+/// image away, the archive by writing the patchwork over the one authoritative
+/// copy.
+///
+/// An earlier version of this test hammered a sweeper thread against unpaused
+/// promotions. It passed against the broken code, because the window is
+/// microseconds wide at unit-test scale. That is why the hook exists.
+#[test]
+fn nothing_can_reach_into_the_promotion_window() {
+    use crate::ram::tiered::promotion::test_hooks;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    let _guard = test_lock();
+    let _ = env_logger::try_init();
+
+    let manager = Arc::new(crate::ram::tiered::manager::TieredMemoryManager::new(
+        crate::ram::tiered::SharedMemoryPool::new(&crate::ram::tiered::TieredConfig {
+            threshold: 0.8,
+            lower_watermark: 0.72,
+            physical_memory_limit: 64 * SEGMENT_SIZE,
+            promotion_cooldown_ms: 0,
+        }),
+    ));
+
+    let schema = Schema::new("promo_window", None, default_fields(), false, false);
+    let schema_dir = temp_path("neb_promo_window_schema");
+    let backup_dir = temp_path("neb_promo_window_bk");
+    let wal_dir = temp_path("neb_promo_window_wal");
+    for d in [&schema_dir, &backup_dir, &wal_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
+    schemas.debug_only_new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        16 * SEGMENT_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.clone()),
+        Some(wal_dir.clone()),
+        Some(manager.clone()),
+    );
+
+    let mut ids: Vec<Id> = Vec::new();
+    for i in 0..8_000usize {
+        let id = Id::allocated(0, 0, 910_000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String("y".repeat(4_000)));
+        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        if chunks.write_cell(&mut cell).is_ok() {
+            ids.push(id);
+        }
+    }
+    assert!(ids.len() > 500, "setup wrote too few cells");
+
+    for chunk in &chunks.list {
+        let _ = manager.explicit_evict(chunk, 32);
+    }
+    for id in ids.iter() {
+        let _ = chunks.read_cell(id);
+    }
+
+    let chunk = &chunks.list[0];
+    let target = chunk
+        .segments()
+        .into_iter()
+        .find(|s| s.is_settled_cold() && s.block_resident_bytes() > 0)
+        .expect("expected a cold segment holding faulted-in blocks");
+
+    let backup_path = chunk
+        .file_manager
+        .backup_path(target.chunk_id, target.id, target.seq_id)
+        .expect("cold segment must have a backup");
+    let backup_len_before = std::fs::metadata(&backup_path).expect("backup exists").len();
+
+    test_hooks::PAUSE_AFTER_LOCK_COLD.store(true, AtomicOrdering::Release);
+    let promoter = {
+        let target = target.clone();
+        std::thread::spawn(move || crate::ram::tiered::promotion::promote_segment(&target))
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !test_hooks::PROMOTION_IS_PAUSED.load(AtomicOrdering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the promotion never reached its window"
+        );
+        std::thread::yield_now();
+    }
+
+    // 1. The promoter must own the segment for the whole restore, not just for
+    //    the state flip. This is the fix the other two assertions rest on.
+    assert!(
+        !target.incr_references(),
+        "a promotion must hold the segment exclusively while it restores; without \
+         that, anything at all can take it and madvise the image away underneath"
+    );
+    // 2. The cold-budget sweeper must decline: `is_cold()` is true here.
+    assert_eq!(
+        target.try_reclaim_resident_blocks(),
+        None,
+        "the sweeper must not reclaim from a segment that is being restored"
+    );
+    // 3. And an archive must decline: `is_settled_cold()` is false here.
+    assert_eq!(
+        target.archive().expect("archive must not error"),
+        false,
+        "a patchwork image must never be written over an authoritative backup"
+    );
+    assert_eq!(
+        std::fs::metadata(&backup_path).expect("backup still exists").len(),
+        backup_len_before,
+        "the refusal must leave the backup byte-for-byte intact"
+    );
+
+    test_hooks::PAUSE_AFTER_LOCK_COLD.store(false, AtomicOrdering::Release);
+    let released = promoter.join().expect("promotion thread");
+    manager.release_cold_resident(released);
+
+    let mut unreadable = Vec::new();
+    for id in ids.iter() {
+        if chunks.read_cell(id).is_err() {
+            unreadable.push(*id);
+        }
+    }
+    assert!(
+        unreadable.is_empty(),
+        "{} of {} cells were lost around the promotion window; first few: {:?}",
+        unreadable.len(),
+        ids.len(),
+        &unreadable[..unreadable.len().min(5)]
+    );
+}

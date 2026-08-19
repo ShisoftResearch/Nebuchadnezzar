@@ -6,6 +6,32 @@ use std::ptr;
 use std::sync::atomic::Ordering;
 use std::thread;
 
+/// Test-only control over the promotion window.
+///
+/// The window between `lock_cold` and `set_hot` is where task #71 lived, and it
+/// is microseconds wide in a unit test -- a stress test that hammers a sweeper
+/// against it passes just as happily on the broken code, which is worse than no
+/// test at all. Arming this holds every promotion open at exactly that point so
+/// the race can be driven rather than hoped for.
+#[cfg(test)]
+pub mod test_hooks {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub static PAUSE_AFTER_LOCK_COLD: AtomicBool = AtomicBool::new(false);
+    pub static PROMOTION_IS_PAUSED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn wait_if_armed() {
+        if !PAUSE_AFTER_LOCK_COLD.load(Ordering::Acquire) {
+            return;
+        }
+        PROMOTION_IS_PAUSED.store(true, Ordering::Release);
+        while PAUSE_AFTER_LOCK_COLD.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        PROMOTION_IS_PAUSED.store(false, Ordering::Release);
+    }
+}
+
 /// Promote a cold segment to hot storage with cell-level locking
 ///
 /// This operation uses cell-level locking to ensure safety:
@@ -16,7 +42,7 @@ use std::thread;
 /// Process:
 /// 1. Acquire segment lock (blocks until available) - ensures only one promotion at a time
 /// 2. Check if already hot (skip if so)
-/// 3. Wait for no active references (prevents races with cleaner)
+/// 3. HOLD the exclusive reference for the whole restore (see below)
 /// 4. Check if segment is transaction-protected (skip if so)
 /// 5. Read file into a TEMPORARY buffer (NOT the segment address)
 /// 6. Scan temporary buffer to find all cell IDs
@@ -31,16 +57,42 @@ use std::thread;
 /// - Uses temporary buffer to avoid corrupting segment address
 /// - No "empty window" - data is copied atomically from reader's perspective
 /// This function have to succeed or panic.
-pub fn promote_segment(segment: &Segment) {
+///
+/// **The exclusive reference is held across the entire restore.** It used to be
+/// bound inside the acquisition loop, so `break` dropped it and everything below
+/// -- opening the backup, reading it, decompressing it, the 8 MiB memcpy -- ran
+/// with the segment holding no references at all. `is_cold()` is deliberately
+/// true throughout that window, which is enough for `try_reclaim_resident_blocks`
+/// to take exclusivity nobody was holding and `madvise` the segment away, either
+/// part-way through the copy (leaving a hole) or just after it (leaving nothing).
+/// The segment then goes HOT over that hole, and because the backup is intact and
+/// the segment is not dirty, nothing ever looks at the file again. Measured as
+/// task #71: two cells of 4.2M, "segment 2 (seq 2) is HOT, not dirty, offset 4160
+/// INSIDE the written range, promoted at ...", every other cell of the same
+/// segment fine.
+///
+/// `docs/tla/SegmentTier.tla` is the model; TLC reaches the state in twelve steps.
+///
+/// Holding the reference costs cold readers of this one segment a retry while the
+/// restore runs, which is the same shape eviction already imposes, and is safe
+/// because `CellGuard::from_guard` releases its reference and drops the cell lock
+/// before it ever calls promote -- see the livelock note there.
+///
+/// Returns the block-residency bytes released, for the caller to hand back to the
+/// tiered manager's accounting.
+pub fn promote_segment(segment: &Segment) -> usize {
     debug!(
         "[PROMOTE] Starting promotion of segment {} (chunk={}, seq_id={})",
         segment.id, segment.chunk_id, segment.seq_id
     );
 
     // Step 1: Acquire segment lock (blocks until available)
-    // This ensures only one promotion/eviction/cleaner operation at a time
-    loop {
-        let _exclusive_guard = if let Some(l) = SegmentExclusiveRefGuard::new(segment) {
+    // This ensures only one promotion/eviction/cleaner operation at a time.
+    //
+    // The guard escapes the loop with `break value`. Binding it inside the loop
+    // body instead is what left the restore unprotected; see the note above.
+    let _exclusive_guard = loop {
+        let guard = if let Some(l) = SegmentExclusiveRefGuard::new(segment) {
             l
         } else {
             // Yield to allow other threads to release their segment references
@@ -53,19 +105,23 @@ pub fn promote_segment(segment: &Segment) {
                 "[PROMOTE] Segment {} (chunk={}, seq_id={}) is already hot, skipping",
                 segment.id, segment.chunk_id, segment.seq_id
             );
-            return;
+            return 0;
         }
         if segment.lock_cold() {
-            // Locked cold, proceed with promotion
+            // Locked cold, proceed with promotion -- still holding the guard.
             debug!(
                 "[PROMOTE] Acquired cold lock on segment {} (chunk={}, seq_id={})",
                 segment.id, segment.chunk_id, segment.seq_id
             );
-            break;
+            break guard;
         }
         // Locked for any reason, wait
+        drop(guard);
         thread::yield_now();
-    }
+    };
+
+    #[cfg(test)]
+    test_hooks::wait_if_armed();
 
     debug!(
         "[PROMOTE] Proceeding with promotion of segment {} (chunk={}, seq_id={})",
@@ -249,7 +305,11 @@ pub fn promote_segment(segment: &Segment) {
         }
     }
 
-    // Step 9: Mark as hot (update tiered_lock)
+    // Step 9: The image is whole again. Say so BEFORE the segment goes hot, so
+    // that no archive can observe a hot segment still flagged as a patchwork.
+    let released_residency = segment.mark_image_restored();
+
+    // Mark as hot (update tiered_lock)
     segment.set_hot();
     segment.mark_promoted_now();
     debug!(
@@ -269,6 +329,7 @@ pub fn promote_segment(segment: &Segment) {
         "[PROMOTION COMPLETED] Segment {} (chunk={}, seq_id={}) is now hot",
         segment.id, segment.chunk_id, segment.seq_id
     );
+    released_residency
 }
 
 #[cfg(test)]
