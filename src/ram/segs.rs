@@ -1489,6 +1489,37 @@ impl Segment {
                 .take_while(|off| *off < SEGMENT_SIZE)
                 .collect();
 
+            // A SETTLED COLD segment's memory is not the truth -- its backup is.
+            //
+            // Its pages were dropped at eviction; what is resident now is only
+            // the blocks faulted back in to serve reads. Re-archiving it
+            // snapshots that patchwork and persists ZEROS over every block that
+            // happens not to be resident, destroying cells the index still
+            // points at. The TB13 guard below cannot catch it, because the
+            // resident blocks still decode into plenty of boundaries -- it only
+            // fires when the walk finds NOTHING.
+            //
+            // Measured at 16 GiB, four runs: ~130 cells per run, all in one
+            // segment, all reporting COLD + "not dirty" + INSIDE the written
+            // range, the same id failing at the same address minutes apart. The
+            // block that owns a lost offset decompresses to 4160 bytes of pure
+            // zero in 32 compressed bytes, and the id is nowhere in it, while the
+            // block index and `used_len` are byte-identical to a healthy sibling.
+            // The archive captured a hole; the restore was faithful all along.
+            //
+            // Eviction is unaffected: it archives while holding the transition
+            // bits, so `is_settled_cold` is false and its intact image still
+            // gets written.
+            if self.is_settled_cold() {
+                warn!(
+                    "REFUSING to archive settled-cold segment {} (chunk {}, seq {}): its pages \
+                     were dropped at eviction, so its image is a patchwork of faulted-in \
+                     blocks. The existing backup is authoritative.",
+                    self.id, self.chunk_id, self.seq_id
+                );
+                return Ok(false);
+            }
+
             // A segment holding appended bytes must yield at least one entry.
             // None means the walk found no decodable header at `addr` -- the
             // resident image is gone (zero-filled pages), not merely empty.
@@ -2030,6 +2061,19 @@ image, not an empty segment; archiving it would persist the damage.",
     /// Always returns false when tiered memory is disabled
     /// This is a fast check that doesn't acquire the lock (may be stale)
     #[inline]
+    /// Cold and NOT mid-transition: its backup is the truth and its memory is
+    /// not.
+    ///
+    /// `is_cold` deliberately also answers true while a segment is being evicted
+    /// or promoted (the lock bits are set), because a reader must not touch it
+    /// then either. Archiving needs the narrower question: eviction archives
+    /// while holding those bits and its image is still intact, so it must be
+    /// allowed; a segment that has settled cold has had its pages dropped and
+    /// holds only whatever blocks were faulted back in for reads.
+    pub fn is_settled_cold(&self) -> bool {
+        self.tiered_lock.load(Ordering::Acquire) == COLD_SEGMENT
+    }
+
     pub fn is_cold(&self) -> bool {
         // Check if segment is cold or being promoted (locked while cold)
         // During promotion, tiered_lock is COLD_SEGMENT | LOCKING_SEGMENT_BITS
