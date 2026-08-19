@@ -686,8 +686,22 @@ impl IndexBuilder {
         });
     }
 
-    // Wait for all pending index tasks to complete (legacy method for per-RPC call)
-    // This is called by with_indices_ensured() after each RPC to ensure indices are updated
+    /// Opportunistically drain whatever unscoped index backlog this call happens
+    /// to grab. **This is not a barrier and must not be used as one.**
+    ///
+    /// The stale comment here used to say it was "called by with_indices_ensured()
+    /// after each RPC to ensure indices are updated". It is not, and it would not
+    /// ensure that if it were: the pending list is process-global and every taker
+    /// STEALS it, including `spawn_pending_index_reaper` every 200 ms, so this
+    /// frequently takes an empty list and returns while tasks are still running.
+    /// That is the bug fixed in `await_all_indices` (task #67), and this variant
+    /// keeps the behaviour deliberately -- it sits on the transaction commit path,
+    /// where waiting for every other database's index work would be a convoy.
+    ///
+    /// What actually makes a write's indices visible is
+    /// `with_request_index_scope`, which collects the tasks THIS request created
+    /// and awaits exactly those. Callers wanting a guarantee want that, or
+    /// `await_all_indices` if they genuinely mean process-wide quiescence.
     pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), IndexError>, JoinError>>> {
         async move {
             let tasks: Vec<JoinHandle<Result<(), IndexError>>> = {
