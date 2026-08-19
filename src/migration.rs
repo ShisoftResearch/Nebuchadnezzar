@@ -3287,6 +3287,35 @@ mod cluster_tests {
                     held_in_slot(&servers[1], slot as u16).contains(id)
                 );
             }
+            // Does a FULL promotion recover them?
+            //
+            // This is the question the warning text cannot answer. A cold read
+            // faults in one block from the backup; a promotion restores the whole
+            // segment image. If the cell comes back after promotion, the block
+            // path was putting it in the wrong place or missing it. If it stays
+            // zeroed, the backup genuinely never contained it and the archiver is
+            // where to look. Everything else about this failure has been
+            // inference from a fingerprint; this is a measurement.
+            for id in lost.iter().take(3) {
+                let chunks = servers[0].chunks();
+                let chunk = chunks.locate_chunk_by_partition(id.locality() as u64);
+                let before_promotion = chunks.read_cell(id).is_ok();
+                // The address the index holds for this cell, which is what the
+                // read path is dereferencing when it finds zeros.
+                let addr = chunks.location_for_read(id).ok();
+                let promoted = match addr.and_then(|guard| chunk.locate_segment(*guard)) {
+                    Some(segment) => {
+                        crate::ram::tiered::promotion::promote_segment(&segment);
+                        true
+                    }
+                    None => false,
+                };
+                println!(
+                    "MEASUREMENT:   PROMOTION PROBE {id:?}: readable_before={before_promotion}, \
+                     promotion_attempted={promoted}, readable_after={}",
+                    chunks.read_cell(id).is_ok()
+                );
+            }
         }
         assert!(
             lost.is_empty(),
