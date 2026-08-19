@@ -1,11 +1,49 @@
 # Handoff: `PtrHashMap::remove` is not a release
 
-**Status:** Nebuchadnezzar's exposure is fixed. Lightning is unchanged, deliberately.
-This document exists so the next person meets the sharp edge with a map instead of a
-mystery.
+**Status:** Nebuchadnezzar's exposure is fixed. Lightning now offers a way out --
+`PtrHashMap::reclaim_pending()` -- but `remove` on its own still does not free, so
+everything below still applies. Read §0 first if you just want the fix.
 
-**Date:** 2026-08-18
+**Date:** 2026-08-18, updated 2026-08-19
 **Repos:** Lightning (`src/map/ptr_map.rs`), Nebuchadnezzar (consumer)
+
+---
+
+## 0. If you just need the fix: `reclaim_pending()`
+
+Lightning gained `PtrHashMap::reclaim_pending()` on 2026-08-19. Call it after
+removing something worth freeing, and the value is released instead of lingering:
+
+```rust
+runtimes.remove(&db_name);   // returns a clone; the original lingers in the node
+runtimes.reclaim_pending();  // and now it does not
+```
+
+What it does: refreshes the QSBR grace boundary, then runs the destructors that
+are safe to run right now. A value is released once the boundary proves no reader
+can still be cloning it.
+
+What you need to know before relying on it:
+
+- **Call it on the thread that did the removing.** It reclaims what the *calling
+  thread* staged, plus anything spilled to the allocator's shared pool. It cannot
+  reach another thread's staging -- those pages and the list holding them are
+  written without synchronisation by their owner, so reading them from outside
+  would be a data race. Removing on a request thread and reclaiming on the same
+  one is the natural shape and works.
+- **It releases what is releasable *now*.** A value a reader is cloning at that
+  instant is not past the grace boundary, so it survives the call and goes on the
+  next one. Call again if you need certainty.
+- **It is idempotent and free when unused.** Running it five times releases
+  nothing five times, and nothing on the insert, read, or removal paths changed to
+  support it -- verified by comparing compiled symbols, not just by timing.
+- **It is opt-in.** A consumer who does not call it gets exactly the old
+  behaviour. This does not make `remove` a release; it gives you a way to ask.
+
+For Nebuchadnezzar specifically: the two maps in §3 were moved to
+`parking_lot::RwLock<HashMap<..>>` and do not need this. It matters for the
+`PtrHashMap`s in §4 and for any new one whose values own real resources --
+`unload_runtime` / `drop_database` style paths are exactly the shape it is for.
 
 ---
 
@@ -107,6 +145,49 @@ code needs correctness AND performance A/B before it lands.** Test-only addition
 Whoever picks this up: option 1 costs nothing and removes most of the trap. Option 2 is the
 real fix and should be treated as a performance-sensitive change to the paper's subject, not
 a bug fix.
+
+**Update 2026-08-19 -- option 2 was attempted and rejected on measurements.** Four
+designs were built and benchmarked (mutex-sharded park list; park pages owning the
+nodes; staging into the allocator with the sweep walking its pages; staging plus a
+separate address index). All of them delivered prompt release. On a churn workload --
+insert-then-remove rounds sized past the 4096-object bump range, so the *baseline*
+recycles nodes and pays its own destructors, which a remove-only benchmark never
+makes it do -- they cost:
+
+| design | churn |
+|---|---|
+| mutex-sharded park | −37% |
+| park pages owning nodes | −56% |
+| staged, allocator pages as the index | **−6.2%** |
+| staged + separate address index | −45% |
+
+Every design keeping a *second* per-retirement record cost 20–58%; the only one that
+added no structure cost nothing. That is four data points and no mechanism -- the
+cost was never explained, which is the main reason to be sceptical of a fifth
+attempt. The staged design's one defect was that it could not read another thread's
+staged pages; making `ThreadLocalPage::len` atomic does *not* fix that, because the
+`VecDeque` holding the pages is non-atomic too.
+
+`reclaim_pending()` (§0) is what shipped instead: the same drop protocol, triggered
+explicitly, with no automatic sweep and therefore no path that can regress.
+
+Two findings from that attempt are worth keeping whatever anyone tries next:
+
+- **`clear` was not a deferral, it was a leak** -- it swapped the partition array and
+  quarantined the chunks without ever retiring the value nodes, so cleared values
+  outlived the map that owned them (measured 1000/1000). Fixed in Lightning by
+  unlinking each key through `Table::remove` before the swap.
+- **The grace boundary was not per-map.** `oldest_active_value` scanned a
+  process-global registry while the epochs in it are per-map clocks, so a reader in
+  any map dragged every other map's boundary down. Its only symptom without
+  drop-at-grace is worse node reuse, which is why it went unnoticed. Fixed by packing
+  a 16-bit map tag above the epoch in the same atomic store.
+- **A sweep must version-check what it drops.** Collecting node addresses during a
+  walk and dropping them afterwards destroys a value that a re-entrant recycle
+  installed in between -- a value's `Drop` is arbitrary code and can re-enter the
+  map. Loom caught this within minutes (`ptr_staged_value_sweep_races_recycle`).
+  `drop_staged_value` takes the observed `birth_ver` and re-checks it under the
+  claim.
 
 ## 6. Reproducing it in thirty seconds
 
