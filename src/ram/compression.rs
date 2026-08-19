@@ -976,3 +976,109 @@ mod tests {
         assert!(decompress_field(&compressed).is_err());
     }
 }
+
+#[cfg(test)]
+mod backup_forensics {
+    use super::*;
+
+    /// Read one cell out of a real backup file and say what is actually there.
+    ///
+    /// For task #70. The 16 GiB loss has been diagnosed from its fingerprint
+    /// three times and the measurement disagreed every time, so this looks at the
+    /// bytes. Point it at a preserved store:
+    ///
+    /// ```text
+    /// NEB_FORENSIC_BACKUP=/path/to/263-1-1.nbackup \
+    /// NEB_FORENSIC_OFFSET=4160 \
+    /// NEB_FORENSIC_EXPECT_ID=74027918875904545 \
+    ///   cargo test --release --lib backup_forensics -- --ignored --nocapture
+    /// ```
+    ///
+    /// Reports the block that covers the offset, whether that block's bytes are
+    /// all zero, and what the cell header at the offset decodes to. Zeros mean
+    /// the archive captured a hole; a real header means the restore path is
+    /// putting it somewhere else.
+    #[test]
+    #[ignore]
+    fn read_a_cell_out_of_a_backup() {
+        let path = std::env::var("NEB_FORENSIC_BACKUP")
+            .expect("set NEB_FORENSIC_BACKUP to a .nbackup file");
+        let offset: usize = std::env::var("NEB_FORENSIC_OFFSET")
+            .expect("set NEB_FORENSIC_OFFSET to the segment offset")
+            .parse()
+            .expect("offset must be a number");
+        let expect_id: Option<u64> = std::env::var("NEB_FORENSIC_EXPECT_ID")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
+        let data = std::fs::read(&path).expect("backup file must be readable");
+        println!("FORENSIC: {} is {} bytes", path, data.len());
+
+        let layout = block_layout(&data).expect("must be a block-compressed backup");
+        println!(
+            "FORENSIC: block_count={} declared_used_len={:?} raw={}",
+            layout.block_count,
+            declared_used_len(&data),
+            layout.raw
+        );
+
+        let (block_idx, within) = layout
+            .locate(&data, offset)
+            .expect("the offset must be covered by some block");
+        let (start, file_off, len) = layout
+            .entry(&data, block_idx)
+            .expect("that block must have an index entry");
+        println!(
+            "FORENSIC: offset {offset} -> block {block_idx} (start {start}, +{within} within), \
+             stored at file offset {file_off} for {len} compressed bytes"
+        );
+
+        let block = decompress_block(&data, block_idx).expect("the block must decompress");
+        println!("FORENSIC: block decompressed to {} bytes", block.len());
+
+        let all_zero = block.iter().all(|b| *b == 0);
+        let window_end = (within + 64).min(block.len());
+        let window = &block[within..window_end];
+        let window_zero = window.iter().all(|b| *b == 0);
+        println!(
+            "FORENSIC: whole block all-zero={all_zero}; first 64 bytes at the offset \
+             all-zero={window_zero}"
+        );
+        println!("FORENSIC: bytes at the offset: {:02x?}", window);
+
+        // The cell header layout is version:u64, timestamp:u32, schema:u32, id:u64,
+        // written at the entry's content position. The entry header precedes it, so
+        // scan the window for the expected id rather than guessing the alignment.
+        if let Some(id) = expect_id {
+            let needle = id.to_le_bytes();
+            let found_in_window = window
+                .windows(8)
+                .position(|w| w == needle)
+                .map(|p| within + p);
+            let found_in_block = block
+                .windows(8)
+                .position(|w| w == needle);
+            println!(
+                "FORENSIC: expected id {id} found in the 64-byte window at {:?}, \
+                 anywhere in the block at {:?}",
+                found_in_window, found_in_block
+            );
+            if found_in_block.is_none() {
+                println!(
+                    "FORENSIC: VERDICT -- the id is NOT anywhere in the block that owns its \
+                     offset. The archive captured a hole; the restore path is faithful."
+                );
+            } else if found_in_window.is_none() {
+                println!(
+                    "FORENSIC: VERDICT -- the id IS in the block but not at its indexed \
+                     offset. The restore path is putting it in the wrong place."
+                );
+            } else {
+                println!(
+                    "FORENSIC: VERDICT -- the cell is present and correctly placed in the \
+                     backup, so the loss is neither the archive nor the block mapping."
+                );
+            }
+        }
+    }
+}
