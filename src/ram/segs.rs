@@ -1573,12 +1573,28 @@ impl Segment {
             // reaches that state in a nine-state trace and loses the cell from memory
             // and backup alike. Asking about the image directly closes it, and
             // keeps every case the settled-cold test already caught.
-            if self.image_is_partial() || self.is_settled_cold() {
+            let partial_image = self.image_is_partial();
+            let settled_cold = self.is_settled_cold();
+            if partial_image || settled_cold {
+                // Name which predicate fired. The two answer differently in
+                // exactly one window -- a promotion in flight, where the
+                // segment is NOT settled-cold but its image is still a
+                // patchwork -- and that window is the one #71 was measured in.
+                // Counting refusals alone cannot tell the routes apart, so it
+                // cannot answer whether the promotion-window archive happens
+                // in production or is only reachable in the model.
+                let via = if partial_image && !settled_cold {
+                    "PROMOTION WINDOW (not settled-cold: a restore is in flight)"
+                } else if partial_image {
+                    "settled cold"
+                } else {
+                    "settled cold, image not flagged partial"
+                };
                 warn!(
-                    "REFUSING to archive segment {} (chunk {}, seq {}): its pages were dropped \
-                     and not yet restored, so its image is a patchwork of faulted-in blocks. \
-                     The existing backup is authoritative.",
-                    self.id, self.chunk_id, self.seq_id
+                    "REFUSING to archive segment {} (chunk {}, seq {}) via {}: its pages were \
+                     dropped and not yet restored, so its image is a patchwork of faulted-in \
+                     blocks. The existing backup is authoritative.",
+                    self.id, self.chunk_id, self.seq_id, via
                 );
                 return Ok(false);
             }
