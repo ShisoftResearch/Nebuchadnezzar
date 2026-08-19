@@ -1570,7 +1570,7 @@ impl Segment {
             // through promotion answers FALSE to `is_settled_cold` while its
             // image is still nothing but the blocks a reader happened to fault
             // in. A TLA+ model of this protocol (`docs/tla/SegmentTier.tla`)
-            // reaches that state in nine steps and loses the cell from memory
+            // reaches that state in a nine-state trace and loses the cell from memory
             // and backup alike. Asking about the image directly closes it, and
             // keeps every case the settled-cold test already caught.
             if self.image_is_partial() || self.is_settled_cold() {

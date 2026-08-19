@@ -21,8 +21,8 @@ counterexamples in under a second.
 
 | config | `Fixed` | result |
 |---|---|---|
-| `SegmentTier.cfg` | FALSE | **`Recoverable` violated in 9 steps.** A bystander `archive()` lands while a promotion holds the segment `COLD\|LOCKING`. `is_settled_cold()` is false there, so the d8b0039c guard does not fire, and the patchwork image is written over the one good backup. The cell is then gone from memory *and* disk. |
-| `NoBystander.cfg` | FALSE | **`HotReadable` violated in 12 steps**, with no bystander archiver at all. `try_reclaim_resident_blocks` is gated on `is_cold()`, which is true mid-promotion, and the promoter had already released its exclusive reference — so the sweeper takes the segment and `madvise`s away the image the promotion just restored. `set_hot()` then publishes the hole. |
+| `SegmentTier.cfg` | FALSE | **`Recoverable` violated, a nine-state trace.** A bystander `archive()` lands while a promotion holds the segment `COLD\|LOCKING`. `is_settled_cold()` is false there, so the d8b0039c guard does not fire, and the patchwork image is written over the one good backup. The cell is then gone from memory *and* disk. |
+| `NoBystander.cfg` | FALSE | **`HotReadable` violated, a twelve-state trace**, with no bystander archiver at all. `try_reclaim_resident_blocks` is gated on `is_cold()`, which is true mid-promotion, and the promoter had already released its exclusive reference — so the sweeper takes the segment and `madvise`s away the image the promotion just restored. `set_hot()` then publishes the hole. |
 | `Fixed.cfg` | TRUE | **No error.** Exhaustive: 42 distinct states, depth 17. |
 | `Sanity.cfg` | TRUE | `ReachesAPromotedHotSegment` is violated **on purpose**. It asserts the interesting state is unreachable, so its counterexample is a full evict → fault → promote round trip. If this one ever *passes*, the model has gone vacuous and the clean run above means nothing. |
 

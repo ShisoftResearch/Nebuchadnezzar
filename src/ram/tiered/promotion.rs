@@ -71,7 +71,7 @@ pub mod test_hooks {
 /// INSIDE the written range, promoted at ...", every other cell of the same
 /// segment fine.
 ///
-/// `docs/tla/SegmentTier.tla` is the model; TLC reaches the state in twelve steps.
+/// `docs/tla/SegmentTier.tla` is the model; TLC's counterexample is twelve states.
 ///
 /// Holding the reference costs cold readers of this one segment a retry while the
 /// restore runs, which is the same shape eviction already imposes, and is safe
