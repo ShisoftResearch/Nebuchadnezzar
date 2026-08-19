@@ -364,6 +364,48 @@ pub struct SharedCellData<'v> {
     compression_plan: Option<SchemaCompressionPlan>,
 }
 
+/// Keep the last stale-pointer verdict where a TEST can read it.
+///
+/// The verdict is otherwise only in a `warn!`, and the suite runs without
+/// `RUST_LOG`, so env_logger swallows it at error-only -- which is exactly how a
+/// residual stale pointer was caught with no explanation attached. A test that
+/// depends on the log level to explain its own failure will keep losing that
+/// race; this does not.
+///
+/// Process-global and best-effort: with tests running in parallel the verdict
+/// may belong to a different test. The COUNT each test keeps for itself is the
+/// exact number; this is context for it.
+#[cfg(test)]
+pub(crate) mod stale_pointer_record {
+    use std::sync::Mutex;
+
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    pub(crate) fn record(verdict: &str) {
+        COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut last) = LAST.lock() {
+            *last = Some(verdict.to_string());
+        }
+    }
+
+    /// `(how many stale pointers this process has seen, the most recent verdict)`.
+    pub(crate) fn snapshot() -> (usize, Option<String>) {
+        (
+            COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            LAST.lock().ok().and_then(|last| last.clone()),
+        )
+    }
+}
+
+#[cfg(test)]
+fn record_stale_pointer(verdict: &str) {
+    stale_pointer_record::record(verdict);
+}
+
+#[cfg(not(test))]
+fn record_stale_pointer(_verdict: &str) {}
+
 /// Why does the memory at `ptr` not hold the cell the index says it does?
 ///
 /// Diagnostic for the one branch that has already decided something is wrong;
@@ -380,12 +422,15 @@ fn describe_stale_pointer(ptr: usize, chunk: &Chunk) -> String {
     let offset = ptr.saturating_sub(segment.addr);
     let frontier = segment.append_header.load(Ordering::Relaxed);
     let within_written = ptr < frontier;
-    let now = clock::now() as i64;
-    let ago = |stamp: i64| {
-        if stamp <= 0 {
+    // Report the raw stamps rather than a delta. The first version subtracted
+    // them from `clock::now()`, which is a different clock base entirely, and
+    // printed "evicted -1785315233373ms ago" -- a diagnostic that lies is worse
+    // than one that says less.
+    let stamp = |value: i64| {
+        if value <= 0 {
             "never".to_string()
         } else {
-            format!("{}ms ago", now.saturating_sub(stamp))
+            format!("at {value}")
         }
     };
     format!(
@@ -398,8 +443,8 @@ fn describe_stale_pointer(ptr: usize, chunk: &Chunk) -> String {
         offset,
         frontier.saturating_sub(segment.addr),
         if within_written { "INSIDE" } else { "PAST" },
-        ago(segment.last_evicted_ms.load(Ordering::Relaxed)),
-        ago(segment.last_promoted_ms.load(Ordering::Relaxed)),
+        stamp(segment.last_evicted_ms.load(Ordering::Relaxed)),
+        stamp(segment.last_promoted_ms.load(Ordering::Relaxed)),
     )
 }
 
@@ -431,12 +476,11 @@ impl<'v> SharedCellData<'v> {
             //
             // Only reached on the mismatch branch, which already warned, so this
             // costs nothing on the read path.
+            let verdict = describe_stale_pointer(ptr, chunk);
+            record_stale_pointer(&verdict);
             warn!(
                 "stale cell read: requested id bits {} found {:?} at {:#x}; {}",
-                hash,
-                header.id,
-                ptr,
-                describe_stale_pointer(ptr, chunk)
+                hash, header.id, ptr, verdict
             );
             return Err(ReadError::StaleCellPointer);
         }

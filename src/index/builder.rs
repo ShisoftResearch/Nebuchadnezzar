@@ -797,6 +797,44 @@ impl IndexBuilder {
         });
     }
 
+    /// Wait until no index task is still running anywhere in this process.
+    ///
+    /// Joining the handle list is NOT enough, and that was a real bug. The list
+    /// is process-global and every taker STEALS it with `mem::take` -- including
+    /// `spawn_pending_index_reaper`, which drains it every 200 ms. So a caller
+    /// very often takes an EMPTY list, joins nothing, and returns while its own
+    /// index tasks are still running in the reaper's join set.
+    ///
+    /// Symptom: a test wrote six cells, awaited the indices, scanned, and found
+    /// nothing -- `wrote 6, scan found 0` -- in about 1 full-suite run in 5, and
+    /// never when run alone (alone, nothing else is draining the list).
+    ///
+    /// `INDEX_TASKS_INFLIGHT` is the honest measure: incremented where a task is
+    /// spawned, decremented by a guard that survives unwinding. Waiting on it is
+    /// correct no matter who holds the handles.
+    async fn await_index_quiescence() {
+        // Generous, because the alternative to waiting is answering a query from
+        // an index that is not built yet. Bounded anyway, and LOUD on expiry: a
+        // silent timeout would put the original bug back without the symptom.
+        const LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        loop {
+            if INDEX_TASKS_INFLIGHT.load(std::sync::atomic::Ordering::Acquire) <= 0 {
+                return;
+            }
+            if started.elapsed() > LIMIT {
+                log::warn!(
+                    "index tasks did not quiesce within {:?}: {} still in flight. Anything \
+                     read now may be missing entries.",
+                    LIMIT,
+                    INDEX_TASKS_INFLIGHT.load(std::sync::atomic::Ordering::Acquire)
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
     // Wait for ALL pending index tasks globally (for shutdown)
     // This ensures all index tasks from all threads are completed before shutdown
     pub async fn await_all_indices() -> Vec<Result<Result<(), IndexError>, JoinError>> {
@@ -827,6 +865,9 @@ impl IndexBuilder {
         } else if count > 0 {
             log::info!("All {} index tasks completed successfully", success_count);
         }
+
+        // Whatever this call managed to take, someone else may hold the rest.
+        Self::await_index_quiescence().await;
 
         results
     }

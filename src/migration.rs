@@ -2477,6 +2477,21 @@ mod cluster_tests {
 
         let after = scan_ids(&client, SCHEMA).await;
         let lost: Vec<&Id> = written.iter().filter(|id| !after.contains(id)).collect();
+        // Is this the residual stale pointer? Ranged index pages ARE cells, so a
+        // single zeroed page makes a scan return nothing -- which is exactly what
+        // this test reports when it fails. If a stale pointer was recorded in
+        // this process, that is the first thing to look at; if none was, this
+        // failure is something else and the tier is not the place to look.
+        let (stale_seen, verdict) = crate::ram::cell::stale_pointer_record::snapshot();
+        if !lost.is_empty() {
+            println!(
+                "RANGED SCAN FAILURE: {} stale pointers recorded process-wide; most recent: {}",
+                stale_seen,
+                verdict
+                    .as_deref()
+                    .unwrap_or("none -- so this is NOT the tier stale-pointer bug")
+            );
+        }
         assert!(
             lost.is_empty(),
             "{} of {} migrated cells vanished from the ranged index \
