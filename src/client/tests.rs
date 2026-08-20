@@ -1634,6 +1634,18 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
         .unwrap()
         .unwrap();
 
+    // Freeze migrations for THIS GROUP while the cluster is set up. The join
+    // fill is automatic now, so without this the watcher fills the joiner
+    // before the manual call below and the manual call's report no longer
+    // describes what moved. Frozen, the manual path is deterministic again,
+    // and the automatic path has its own test.
+    let placement = SlotsSMClient::new(crate::server::SLOTS_SM_ID, &client.raft_client);
+    let group = crate::slots::slot_group_id(server_group);
+    placement
+        .set_migration_freeze(&group, &true)
+        .await
+        .expect("freezing migrations for this group should succeed");
+
     // Cells across many distinct slots, so the fill has slots worth moving.
     let ids: Vec<Id> = (0..96u64).map(|i| Id::from_parts(i * 331, 7)).collect();
     for (seq, id) in ids.iter().enumerate() {
@@ -1678,29 +1690,52 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
     // A transfer that races it anyway fails SAFELY -- the donor keeps the
     // cells and the fill stops with the refusal -- but this test is about the
     // fill, not the race.
-    let mut schema_synced_after_ms = None;
-    for round in 0..300 {
+    let mut schema_synced = false;
+    for _ in 0..300 {
         if second.chunks().list[0].meta.schemas.get(&1401).is_some() {
-            schema_synced_after_ms = Some(round * 100);
+            schema_synced = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    println!("SCHEMA_SYNC_PROBE: {:?} ms", schema_synced_after_ms);
-    // Diagnose the miss: whose schema plane is the joiner actually on?
+    assert!(
+        schema_synced,
+        "the joiner never learned the schema -- historically this was the plane \
+         split-brain: the joiner bootstrapped its own copy of the schema plane \
+         rather than joining the existing one"
+    );
+
+    // The schema plane must be ONE cluster. Before the join fix this was
+    // permanently one-sided, and only query-routing luck decided whether
+    // anything worked -- including in runs that PASSED.
     {
         let plane_id = crate::server::database_meta_plane_id(server_group, server_group);
+        let mut expected = addresses.clone();
+        expected.sort();
         for (name, server) in [("first", &first), ("second", &second)] {
-            match server.raft_service.ensure_plane(bifrost::raft::PlaneSpec { plane_id }).await {
-                Ok(plane) => println!(
-                    "PLANE_PROBE {name}: members={:?}",
-                    plane.member_addresses().await
-                ),
-                Err(e) => println!("PLANE_PROBE {name}: no plane: {e:?}"),
-            }
+            let plane = server
+                .raft_service
+                .ensure_plane(bifrost::raft::PlaneSpec { plane_id })
+                .await
+                .unwrap_or_else(|e| panic!("{name} cannot handle the schema plane: {e:?}"));
+            let mut members = plane
+                .member_addresses()
+                .await
+                .unwrap_or_else(|e| panic!("{name} cannot read plane members: {e:?}"));
+            members.sort();
+            assert_eq!(
+                members, expected,
+                "{name} must see the schema plane as one two-member cluster"
+            );
         }
     }
-    assert!(schema_synced_after_ms.is_some(), "the joiner never learned the schema");
+
+    // Setup done: let migrations run again, so the manual fill below is the
+    // only thing that has moved anything.
+    placement
+        .set_migration_freeze(&group, &false)
+        .await
+        .expect("unfreezing migrations should succeed");
 
     // The leader runs the fill; anyone else declines and says so.
     if !second.raft_service.is_leader_for_real().await {
@@ -1741,8 +1776,6 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
     );
 
     // The placement table agrees with the counters.
-    let placement = SlotsSMClient::new(crate::server::SLOTS_SM_ID, &client.raft_client);
-    let group = crate::slots::slot_group_id(server_group);
     let joiner_slots = placement
         .slots_owned_by(&group, &second.server_id)
         .await

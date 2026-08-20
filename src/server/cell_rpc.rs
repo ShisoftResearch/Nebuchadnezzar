@@ -80,6 +80,25 @@ service! {
 
 service_with_id!(NebRPCService, DEFAULT_SERVICE_ID);
 
+/// Bytes available to an unprivileged writer under `path`, or `None` if the
+/// path cannot be interrogated. Walks up to the nearest existing ancestor: the
+/// backup directory may not have been created yet on a fresh member.
+fn available_bytes_for(path: &str) -> Option<u64> {
+    let mut probe = std::path::Path::new(path);
+    loop {
+        if probe.exists() {
+            break;
+        }
+        probe = probe.parent()?;
+    }
+    let c_path = std::ffi::CString::new(probe.to_string_lossy().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
 pub struct NebRPCService {
     database_runtime: Arc<DatabaseRuntime>,
     neb_client: Arc<AsyncClient>,
@@ -392,25 +411,50 @@ impl Service for NebRPCService {
     }
 
     fn can_admit_bytes(&self, bytes: u64) -> BoxFuture<'_, bool> {
-        // The recipient's veto. Receiving a migration costs no more hot tier
-        // than writing the same volume ordinarily (measured), and the tier
-        // exists to spill -- so ordinary pressure is not a reason to refuse.
-        // What IS a reason: hot memory already over the eviction threshold,
-        // the state where eviction is losing its race and every added byte
-        // deepens it. `bytes` is reported for the log; the answer is about
-        // the member's state, not the batch's size.
-        let admit = match self.database_runtime.chunks().tiered_manager {
-            Some(ref tiered) => {
-                let over = tiered.is_over_threshold();
-                if over {
-                    warn!(
-                        "declining a migration of {} bytes: hot memory is over the \
-                         eviction threshold",
-                        bytes
-                    );
-                }
-                !over
-            }
+        // The recipient's veto: somewhere to put the data, or "not now".
+        //
+        // Deliberately NOT gated on tier pressure, though the design sketch
+        // suggested it. Being over the tier limit is the NORMAL state at
+        // realistic limits -- measured 4x over at 256 MB and 2x at 1 GB -- and
+        // a fresh member is already over it before holding a single cell,
+        // because its per-chunk bootstrap segments alone exceed a small limit.
+        // A veto on that signal declines every recipient, always: it turned an
+        // automatic fill into a permanent RecipientDeclined the first time this
+        // ran at scale. The tier is a spilling mechanism and receiving a
+        // migration costs no more hot tier than writing the same volume
+        // ordinarily (also measured), so tier pressure is a latency question,
+        // not an admission one.
+        //
+        // Disk is different: spilling needs somewhere to spill TO, and a
+        // member whose backup volume is nearly full cannot accept data at any
+        // speed. That is a real "not now", and it is the one this answers.
+        let admit = match self.database_runtime.chunks().list.first() {
+            Some(chunk) => match chunk.backup_storage.as_deref() {
+                Some(path) => match available_bytes_for(path) {
+                    Some(available) => {
+                        // Room for the batch plus headroom, since the batch is
+                        // not the only thing that will need to spill.
+                        let needed = bytes.saturating_mul(2).saturating_add(1 << 30);
+                        if available < needed {
+                            warn!(
+                                "declining a migration of {} bytes: backup storage '{}' has \
+                                 {} MB available, short of the {} MB this needs with headroom",
+                                bytes,
+                                path,
+                                available / (1024 * 1024),
+                                needed / (1024 * 1024)
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    // Cannot tell: admit. Refusing on a failed stat would make
+                    // an unreadable mount point stop all rebalancing.
+                    None => true,
+                },
+                None => true,
+            },
             None => true,
         };
         future::ready(admit).boxed()

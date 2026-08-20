@@ -2651,6 +2651,317 @@ mod cluster_tests {
         );
     }
 
+    /// The whole distributed lifecycle at scale, in one run: a cluster under
+    /// tier pressure, a member joining and being filled AUTOMATICALLY, and a
+    /// member drained away again -- with every cell accounted for at each step.
+    ///
+    /// The unit tests prove each mechanism; this proves they compose at a size
+    /// where the tier actually spills, the reshard is disk-bound, and the
+    /// automatic fill is racing real eviction. Three members rather than two,
+    /// because the plane-join fix and the "largest current holder" donor choice
+    /// are both trivially satisfied by a pair.
+    ///
+    ///   NEB_LIFECYCLE_TIER_MB, NEB_LIFECYCLE_SLOTS, NEB_LIFECYCLE_CELLS_PER_SLOT,
+    ///   NEB_LIFECYCLE_PAYLOAD_BYTES, NEB_LIFECYCLE_DB_GB, NEB_LIFECYCLE_SAMPLE
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn the_distributed_lifecycle_holds_at_scale() {
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        let _ = env_logger::try_init();
+        let tier_limit = env_usize("NEB_LIFECYCLE_TIER_MB", 1024) * 1024 * 1024;
+        let slots = env_usize("NEB_LIFECYCLE_SLOTS", 512).min(crate::slots::SLOT_COUNT) as u16;
+        let cells_per_slot = env_usize("NEB_LIFECYCLE_CELLS_PER_SLOT", 256) as u64;
+        let payload_bytes = env_usize("NEB_LIFECYCLE_PAYLOAD_BYTES", 4096);
+        let db_size = env_usize("NEB_LIFECYCLE_DB_GB", 16) * 1024 * 1024 * 1024;
+        // Reading back every cell over RPC dominates the run at scale, so the
+        // full sweep is sampled. Set to 0 to read them all.
+        let sample_every = env_usize("NEB_LIFECYCLE_SAMPLE", 16).max(1);
+        let total_cells = slots as u64 * cells_per_slot;
+        const CHUNK_SIZE: usize = 64 * 1024 * 1024;
+
+        let group = "distributed_lifecycle";
+        let addresses: Vec<String> = (0..3)
+            .map(|_| crate::utils::test_port::unique_localhost_addr())
+            .collect();
+        // Where the tier spills to. Driven by TMPDIR, which on a developer box
+        // is very often a tmpfs -- i.e. RAM. A tier test whose "disk" is memory
+        // measures nothing and dies by OOM partway through, so say where the
+        // data is going and refuse a root that cannot hold it.
+        let storage_root = std::env::temp_dir()
+            .join(format!("neb-lifecycle-{}", std::process::id()));
+        std::fs::create_dir_all(&storage_root).expect("storage root should be creatable");
+        {
+            let path = std::ffi::CString::new(storage_root.to_string_lossy().as_bytes()).unwrap();
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::statvfs(path.as_ptr(), &mut stat) },
+                0,
+                "cannot stat the storage root {}",
+                storage_root.display()
+            );
+            let available = (stat.f_bavail as u64) * (stat.f_frsize as u64);
+            let payload_total = total_cells * payload_bytes as u64;
+            println!(
+                "LIFECYCLE: storage root {} has {} MB available for a {} MB payload",
+                storage_root.display(),
+                available / (1024 * 1024),
+                payload_total / (1024 * 1024)
+            );
+            assert!(
+                available > payload_total * 3,
+                "storage root {} has only {} MB free for a {} MB payload; set TMPDIR to a \
+                 real disk with room (a tmpfs here means the tier spills into RAM and the \
+                 run dies by OOM rather than measuring anything)",
+                storage_root.display(),
+                available / (1024 * 1024),
+                payload_total / (1024 * 1024)
+            );
+        }
+        let opts_for = |index: usize| ServerOptions {
+            chunk_size: CHUNK_SIZE,
+            db_size,
+            tiered_config: Some(crate::ram::tiered::TieredConfig {
+                threshold: 0.8,
+                lower_watermark: 0.72,
+                physical_memory_limit: tier_limit,
+                promotion_cooldown_ms: 2000,
+            }),
+            backup_storage: Some(
+                storage_root
+                    .join(format!("member-{index}/backup"))
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            wal_storage: Some(
+                storage_root
+                    .join(format!("member-{index}/wal"))
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            undo_log_storage: None,
+            raft_storage: None,
+            index_enabled: false,
+            services: vec![Service::Cell],
+            enable_recovery: false,
+            disable_storage_locks: true,
+        };
+
+        // Two members to start. The third joins later, which is the point.
+        let mut servers = Vec::new();
+        for index in 0..2 {
+            servers.push(
+                NebServer::new_cluster_from_opts(
+                    &opts_for(index),
+                    &addresses[index],
+                    &addresses,
+                    group,
+                    async |_| {},
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let client = Arc::new(
+            client::AsyncClient::new(&servers[0].rpc, &servers[0].membership, &addresses, group)
+                .await
+                .unwrap(),
+        );
+        client.reload_slot_owners().await;
+        client
+            .new_schema_with_id(Schema::new_with_id(
+                SCHEMA_ID,
+                &String::from("migration_schema"),
+                None,
+                default_fields(),
+                false,
+                false,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The payload rides in `name`: `default_fields` is id/name/score, so a
+        // separate data field would simply not be in the schema.
+        let payload = "x".repeat(payload_bytes);
+        let started = std::time::Instant::now();
+        let mut ids = Vec::with_capacity(total_cells as usize);
+        // Slot and sequence both start at 1: `Id::from_parts(0, 0)` is the unit
+        // id, which the router rejects outright.
+        for slot in 1..=slots {
+            for seq in 1..=cells_per_slot {
+                let id = Id::from_parts(slot as u64, seq);
+                let mut value = OwnedMap::new();
+                value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+                value.insert(&String::from("score"), OwnedValue::U64(seq));
+                value.insert(&String::from("name"), OwnedValue::String(payload.clone()));
+                client
+                    .write_cell(crate::ram::cell::OwnedCell::new_with_id(
+                        SCHEMA_ID,
+                        &id,
+                        OwnedValue::Map(value),
+                    ))
+                    .await
+                    .unwrap_or_else(|e| panic!("rpc writing {id:?}: {e:?}"))
+                    .unwrap_or_else(|e| panic!("writing {id:?}: {e:?}"));
+                ids.push(id);
+            }
+        }
+        let written_bytes: u64 = servers.iter().map(|s| s.chunks().total_live_bytes()).sum();
+        println!(
+            "LIFECYCLE: wrote {} cells ({} MB live) across {} slots in {:.1}s",
+            total_cells,
+            written_bytes / (1024 * 1024),
+            slots,
+            started.elapsed().as_secs_f64()
+        );
+        assert!(written_bytes > 0, "the counters saw none of the write load");
+
+        let verify = |client: Arc<AsyncClient>, ids: Vec<Id>, phase: &'static str| async move {
+            let mut unreadable = Vec::new();
+            for id in ids.iter().step_by(sample_every) {
+                match client.read_cell(*id).await {
+                    Ok(Ok(cell)) => assert_eq!(cell.header.id, *id),
+                    Ok(Err(e)) => unreadable.push((*id, format!("{e:?}"))),
+                    Err(e) => unreadable.push((*id, format!("rpc {e:?}"))),
+                }
+            }
+            assert!(
+                unreadable.is_empty(),
+                "{}: {} of {} sampled cells unreadable; first few: {:?}",
+                phase,
+                unreadable.len(),
+                ids.len() / sample_every,
+                &unreadable[..unreadable.len().min(5)]
+            );
+            println!("LIFECYCLE: {} -- all sampled cells readable", phase);
+        };
+        verify(client.clone(), ids.clone(), "after the initial load").await;
+
+        // ---- the join, and the fill nobody asks for ----
+        let joiner = NebServer::new_cluster_from_opts(
+            &opts_for(2),
+            &addresses[2],
+            &addresses,
+            group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let join_at = std::time::Instant::now();
+
+        // Converge: wait for the joiner to stop gaining bytes, which is the
+        // fill finishing rather than a fixed sleep guessing at it.
+        let mut last = 0u64;
+        let mut stable_rounds = 0;
+        let mut joiner_bytes = 0u64;
+        let settle_secs = env_usize("NEB_LIFECYCLE_SETTLE_S", 600);
+        for _ in 0..settle_secs {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            joiner_bytes = joiner.chunks().total_live_bytes();
+            if joiner_bytes > 0 && joiner_bytes == last {
+                stable_rounds += 1;
+                if stable_rounds >= 10 {
+                    break;
+                }
+            } else {
+                stable_rounds = 0;
+            }
+            last = joiner_bytes;
+        }
+        let held: Vec<u64> = servers
+            .iter()
+            .map(|s| s.chunks().total_live_bytes())
+            .chain(std::iter::once(joiner_bytes))
+            .collect();
+        let cluster_bytes: u64 = held.iter().sum();
+        let mean = cluster_bytes / held.len() as u64;
+        println!(
+            "LIFECYCLE: auto-fill settled after {:.1}s -- holdings {:?} MB, mean {} MB",
+            join_at.elapsed().as_secs_f64(),
+            held.iter().map(|b| b / (1024 * 1024)).collect::<Vec<_>>(),
+            mean / (1024 * 1024)
+        );
+        assert!(
+            joiner_bytes > 0,
+            "nobody filled the joining member: it holds nothing after the fill window"
+        );
+        assert!(
+            joiner_bytes <= mean,
+            "the automatic fill overshot the mean: joiner {joiner_bytes} vs mean {mean}"
+        );
+        client.reload_slot_owners().await;
+        verify(client.clone(), ids.clone(), "after the automatic fill").await;
+
+        // Placement and the counters must tell the same story.
+        let placement = placement_client(&client);
+        let group_id = slot_group_id(client.group_name());
+        let joiner_slots = placement
+            .slots_owned_by(&group_id, &joiner.server_id)
+            .await
+            .unwrap();
+        assert!(
+            !joiner_slots.is_empty(),
+            "the joiner holds bytes but the table says it owns no slots"
+        );
+        let joiner_slot_bytes: u64 = joiner.chunks().slot_live_bytes(&joiner_slots).iter().sum();
+        assert_eq!(
+            joiner_slot_bytes, joiner_bytes,
+            "the joiner's per-slot counters disagree with its total"
+        );
+        println!(
+            "LIFECYCLE: joiner owns {} slots holding {} MB",
+            joiner_slots.len(),
+            joiner_bytes / (1024 * 1024)
+        );
+
+        // ---- and a member leaving again ----
+        let drain_at = std::time::Instant::now();
+        let leaving = servers[1].server_id;
+        let destinations: Vec<u64> = vec![servers[0].server_id, joiner.server_id];
+        let outcome = crate::migration::drain::drain_member(
+            &client,
+            leaving,
+            &destinations,
+            &MigrationPlan::default(),
+        )
+        .await;
+        println!(
+            "LIFECYCLE: drain of {} finished in {:.1}s: {:?}",
+            leaving,
+            drain_at.elapsed().as_secs_f64(),
+            outcome.as_ref().map(|o| (o.moved.len(), o.cells_transferred, o.stranded.len()))
+        );
+        let outcome = outcome.expect("draining a live member should succeed");
+        assert!(
+            outcome.stranded.is_empty(),
+            "the drain stranded {} slots: {:?}",
+            outcome.stranded.len(),
+            &outcome.stranded[..outcome.stranded.len().min(8)]
+        );
+        assert!(
+            placement
+                .slots_owned_by(&group_id, &leaving)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a drained member still owns slots"
+        );
+        client.reload_slot_owners().await;
+        verify(client.clone(), ids.clone(), "after the drain").await;
+
+        println!(
+            "LIFECYCLE: PASSED -- {} cells survived load, an automatic fill and a drain",
+            total_cells
+        );
+    }
+
     /// Phase 5: a donor that dies mid-migration is DETECTED, not survived.
     ///
     /// This one is data loss and the plan says so: there is no replication, so a

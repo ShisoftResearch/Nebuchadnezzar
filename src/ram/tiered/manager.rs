@@ -229,13 +229,6 @@ impl TieredMemoryManager {
     }
 
     #[inline]
-    /// Whether hot memory already exceeds the eviction threshold -- the state
-    /// in which eviction is losing its race. The recipient veto asks this: a
-    /// member here should not be handed a migration on top.
-    pub fn is_over_threshold(&self) -> bool {
-        self.hot_memory_bytes(self.shared_hot_segments()) > self.threshold_limit()
-    }
-
     pub fn threshold_limit(&self) -> usize {
         self.shared_pool.threshold_limit()
     }
