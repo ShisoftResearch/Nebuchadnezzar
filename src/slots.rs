@@ -323,3 +323,87 @@ mod slot_bytes_tests {
         assert!((slot_of(&id) as usize) < SLOT_COUNT);
     }
 }
+
+#[cfg(test)]
+mod slot_bytes_contention {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
+
+    #[repr(align(64))]
+    struct Padded(AtomicI64);
+
+    /// Does packing the per-slot counters 8-to-a-cache-line cost anything when
+    /// many slots are written at once?
+    ///
+    /// A reshard works on numerically ADJACENT slots concurrently, so the
+    /// packed layout puts up to 8 writers on one line. This measures that
+    /// directly against a cache-line-padded layout, so the decision to pad (or
+    /// not) rests on a number rather than on the plausibility of the story.
+    #[test]
+    #[ignore]
+    fn packed_versus_padded_counter_contention() {
+        let threads: usize = std::env::var("NEB_CONTENTION_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let iters: usize = std::env::var("NEB_CONTENTION_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000_000);
+
+        // Adjacent slots, exactly as a reshard touches them.
+        let packed: Arc<Vec<AtomicI64>> =
+            Arc::new((0..threads).map(|_| AtomicI64::new(0)).collect());
+        let padded: Arc<Vec<Padded>> =
+            Arc::new((0..threads).map(|_| Padded(AtomicI64::new(0))).collect());
+
+        let run = |name: &str, f: Box<dyn Fn(usize) + Send + Sync>| {
+            let f = Arc::new(f);
+            let start = std::time::Instant::now();
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let f = f.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..iters {
+                            f(t);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let elapsed = start.elapsed();
+            let total = (threads * iters) as f64;
+            println!(
+                "CONTENTION {name}: {:.2}s for {} ops across {} threads = {:.1} ns/op",
+                elapsed.as_secs_f64(),
+                total as u64,
+                threads,
+                elapsed.as_nanos() as f64 / total
+            );
+            elapsed
+        };
+
+        let p = packed.clone();
+        let packed_time = run(
+            "packed  ",
+            Box::new(move |t| {
+                p[t].fetch_add(4160, Ordering::Relaxed);
+            }),
+        );
+        let q = padded.clone();
+        let padded_time = run(
+            "padded  ",
+            Box::new(move |t| {
+                q[t].0.fetch_add(4160, Ordering::Relaxed);
+            }),
+        );
+        println!(
+            "CONTENTION: padding is {:.2}x {} here",
+            packed_time.as_secs_f64() / padded_time.as_secs_f64(),
+            if padded_time < packed_time { "faster" } else { "SLOWER" }
+        );
+    }
+}
