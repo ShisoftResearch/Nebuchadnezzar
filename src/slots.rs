@@ -200,3 +200,126 @@ mod tests {
         assert_eq!(slot_group_id("alpha"), slot_group_id("alpha"));
     }
 }
+
+/// The slot of an id given only its bits, for call sites that carry the
+/// index key (`id.bits()`) rather than the `Id`.
+#[inline]
+pub fn slot_of_bits(bits: u64) -> u32 {
+    Id::from_bits(bits).locality() as u32
+}
+
+/// Live bytes per slot, maintained on the write path and read by whoever
+/// needs a placement decision.
+///
+/// This exists because slots-per-member is nearly meaningless as a balance
+/// metric: a slot is a locality, and localities are not uniformly full — a hub
+/// vertex's container and its adjacency live in one slot on purpose. Moving
+/// data sensibly needs bytes, and bytes must be a *counter*, never a scan:
+/// an inline O(cells) refresh on the write path froze shard workers for 25+
+/// minutes (the statistics-refresh wedge). Every update here is one atomic
+/// add.
+///
+/// What is counted: the **content length of the live entry** each cell
+/// currently resolves to — the same measure the dead-space accounting uses,
+/// so insert/update/remove arithmetic can be checked against it. Dead space,
+/// tombstones and abandoned race-loser entries are deliberately excluded:
+/// a balancer moves live cells, and compaction debt is the cleaner's concern,
+/// not placement's.
+///
+/// Counts are signed so a transient add/sub race cannot wrap; reads clamp at
+/// zero. All mutations of one cell serialise on its cell lock, so every add
+/// is paired with exactly one sub when the entry is superseded or removed —
+/// the counter drifts only if a hook is missed, not by racing.
+pub struct SlotLiveBytes {
+    counts: Box<[std::sync::atomic::AtomicI64]>,
+}
+
+impl SlotLiveBytes {
+    pub fn new() -> Self {
+        let counts = (0..SLOT_COUNT)
+            .map(|_| std::sync::atomic::AtomicI64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { counts }
+    }
+
+    #[inline]
+    pub fn add(&self, id_bits: u64, bytes: u32) {
+        self.counts[slot_of_bits(id_bits) as usize]
+            .fetch_add(bytes as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn sub(&self, id_bits: u64, bytes: u32) {
+        self.counts[slot_of_bits(id_bits) as usize]
+            .fetch_sub(bytes as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Live bytes in one slot. Clamped at zero: a reader racing an
+    /// update/remove can observe the sub before the add.
+    #[inline]
+    pub fn get(&self, slot: u32) -> u64 {
+        self.counts
+            .get(slot as usize)
+            .map_or(0, |c| c.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64)
+    }
+
+    /// Every slot's live bytes, indexed by slot.
+    pub fn snapshot(&self) -> Vec<u64> {
+        self.counts
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64)
+            .collect()
+    }
+
+    /// Total live bytes across all slots.
+    pub fn total(&self) -> u64 {
+        self.counts
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64)
+            .sum()
+    }
+}
+
+#[cfg(test)]
+mod slot_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn slot_arithmetic_follows_the_id_locality() {
+        let counter = SlotLiveBytes::new();
+        let a = Id::allocated(7, 0, 1);
+        let b = Id::allocated(7, 0, 2);
+        let c = Id::allocated(9, 0, 1);
+        assert_eq!(slot_of(&a), 7);
+        assert_eq!(slot_of_bits(a.bits()), 7);
+
+        counter.add(a.bits(), 100);
+        counter.add(b.bits(), 50);
+        counter.add(c.bits(), 30);
+        assert_eq!(counter.get(7), 150);
+        assert_eq!(counter.get(9), 30);
+        assert_eq!(counter.total(), 180);
+
+        counter.sub(a.bits(), 100);
+        assert_eq!(counter.get(7), 50);
+
+        // Transient underflow clamps on read instead of wrapping.
+        counter.sub(b.bits(), 80);
+        assert_eq!(counter.get(7), 0);
+        counter.add(b.bits(), 30);
+        assert_eq!(counter.get(7), 0, "the deficit must not eat later adds");
+        let snap = counter.snapshot();
+        assert_eq!(snap.len(), SLOT_COUNT);
+        assert_eq!(snap[9], 30);
+    }
+
+    #[test]
+    fn hashed_ids_land_in_slots_too() {
+        let id = Id::hashed(0xDEAD_BEEF_CAFE_F00D);
+        let counter = SlotLiveBytes::new();
+        counter.add(id.bits(), 64);
+        assert_eq!(counter.get(slot_of(&id)), 64);
+        assert!((slot_of(&id) as usize) < SLOT_COUNT);
+    }
+}

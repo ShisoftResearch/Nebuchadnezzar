@@ -221,6 +221,11 @@ pub fn is_in_transaction() -> bool {
 pub struct Chunk {
     pub id: usize,
     pub cell_index: WordMap,
+    /// Live bytes per slot, shared across every chunk of this store. See
+    /// [`crate::slots::SlotLiveBytes`] for the contract; the hooks live on the
+    /// logical transitions of `cell_index` -- insert, replace, remove -- so
+    /// dead space and abandoned race-loser entries never count.
+    pub slot_bytes: Arc<crate::slots::SlotLiveBytes>,
     pub segs: SegmentList,
     pub head_seg_id: AtomicU64,
     pub blob_head_seg_id: AtomicU64,
@@ -386,6 +391,7 @@ impl Chunk {
         wal_storage: Option<String>,
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
+        slot_bytes: Arc<crate::slots::SlotLiveBytes>,
     ) -> Chunk {
         // Call new_with_base with base_addr=0 to use old allocation behavior
         Self::new_with_base(
@@ -399,6 +405,7 @@ impl Chunk {
             tiered_manager,
             cleaner_wake,
             0,
+            slot_bytes,
         )
     }
 
@@ -413,6 +420,7 @@ impl Chunk {
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
         estimated_cells: usize,
+        slot_bytes: Arc<crate::slots::SlotLiveBytes>,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -463,6 +471,7 @@ impl Chunk {
             id,
             segs,
             cell_index: index,
+            slot_bytes,
             meta,
             backup_storage,
             wal_storage,
@@ -1138,6 +1147,8 @@ impl Chunk {
 
                 *guard = cell_loc;
                 drop(guard);
+                self.slot_bytes
+                    .add(cell.header.id.bits(), write_result.content_length);
                 let t_sec = std::time::Instant::now();
                 self.ensure_indices(cell, None, &*write_plan.schema);
                 WRITE_SECONDARY_NANOS.fetch_add(t_sec.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1203,8 +1214,17 @@ impl Chunk {
 
             let schema = &*write_plan.schema;
             let old_indices = cell_guard.old_index_res(schema)?;
+            // Old entry length, read under the cell lock while the address is
+            // still guaranteed live; used below to keep the slot counter exact.
+            let old_content_length = if cell_location != 0 {
+                Entry::decode_from(cell_location, |_, _| {}).0.content_length
+            } else {
+                0
+            };
             cell_guard.set_ptr(new_cell_loc);
             drop(cell_guard);
+            self.slot_bytes.add(hash, write_result.content_length);
+            self.slot_bytes.sub(hash, old_content_length);
             self.ensure_indices_with_res(cell, old_indices, schema);
             self.mark_dead_entry_with_cell(cell_location, cell);
             self.refresh_statistics_for_schema(schema.id);
@@ -1255,8 +1275,15 @@ impl Chunk {
                 }
 
                 let old_indices = cell_guard.old_index_res(&*write_plan.schema)?;
+                let old_content_length = if cell_location != 0 {
+                    Entry::decode_from(cell_location, |_, _| {}).0.content_length
+                } else {
+                    0
+                };
                 cell_guard.set_ptr(new_cell_loc);
                 drop(cell_guard);
+                self.slot_bytes.add(hash, write_result.content_length);
+                self.slot_bytes.sub(hash, old_content_length);
                 self.ensure_indices_with_res(cell, old_indices, &*write_plan.schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
                 self.refresh_statistics_for_schema(write_plan.schema.id);
@@ -1284,6 +1311,7 @@ impl Chunk {
 
                     *guard = new_cell_loc;
                     drop(guard);
+                    self.slot_bytes.add(hash, write_result.content_length);
                     self.ensure_indices(cell, None, &*write_plan.schema);
                     self.refresh_statistics_for_schema(write_plan.schema.id);
                     drop(write_plan);
@@ -1337,6 +1365,8 @@ impl Chunk {
                         self.assert_address_aligned_for_write(new_cell_loc, "update_cell_by", hash);
 
                         **cell_guard.word_mutex_guard() = new_cell_loc;
+                        self.slot_bytes.add(hash, write_result.content_length);
+                        self.slot_bytes.sub(hash, old_entry_size.unwrap_or(0));
                         if let Some(indexer) = &self.index_builder {
                             indexer.ensure_indices(&new_cell, &*schema, old_indices);
                         }
@@ -1385,7 +1415,8 @@ impl Chunk {
         } else {
             guard.remove_cell();
         }
-        self.put_tombstone_by_cell_loc(cell_location)?;
+        let removed_len = self.put_tombstone_by_cell_loc(cell_location)?;
+        self.slot_bytes.sub(hash, removed_len);
         Ok(())
     }
 
@@ -1413,7 +1444,8 @@ impl Chunk {
         };
         let cell_location = guard.get_ptr();
         guard.remove_cell();
-        self.put_tombstone_by_cell_loc(cell_location)?;
+        let removed_len = self.put_tombstone_by_cell_loc(cell_location)?;
+        self.slot_bytes.sub(hash, removed_len);
         Ok(())
     }
 
@@ -1435,7 +1467,8 @@ impl Chunk {
                 if predict(&cell) {
                     self.remove_indices(&cell, &schema);
                     cell.into_cell_guard().remove_cell();
-                    self.put_tombstone_by_cell_loc(cell_location)?;
+                    let removed_len = self.put_tombstone_by_cell_loc(cell_location)?;
+                    self.slot_bytes.sub(hash, removed_len);
                     return Ok(());
                 }
                 Err(WriteError::CellDoesNotExisted)
@@ -1632,7 +1665,9 @@ impl Chunk {
         Ok(())
     }
 
-    pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
+    /// Returns the removed entry's content length, so the logical remove
+    /// paths can settle the slot counter without a second decode.
+    pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<u32, WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
             self.id, cell_location
@@ -1650,7 +1685,7 @@ impl Chunk {
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
         self.put_tombstone(&header, &cell_seg)?;
         self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
-        Ok(())
+        Ok(entry_size)
     }
 
     fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> AArc<Segment> {
@@ -2013,6 +2048,9 @@ impl Drop for PendingEntry {
 
 pub struct Chunks {
     pub list: Vec<Chunk>,
+    /// Live bytes per slot across the whole store; the same instance every
+    /// chunk holds, so this is already the server-wide answer.
+    pub slot_bytes: Arc<crate::slots::SlotLiveBytes>,
     pub statistics: TTLCache<Arc<SchemaStatistics>>,
     pub tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
     /// Shared wake signal registered by the background cleaner thread.
@@ -2205,6 +2243,7 @@ impl Chunks {
         }
 
         let cleaner_wake = Arc::new(crate::ram::cleaner::CleanerWake::new());
+        let slot_bytes = Arc::new(crate::slots::SlotLiveBytes::new());
         for i in 0..count {
             let chunk_base = global_base_addr + (i * chunk_size);
             let backup_storage = backup_storage
@@ -2224,11 +2263,13 @@ impl Chunks {
                 tiered_manager.clone(),
                 cleaner_wake.clone(),
                 estimated_cells[i],
+                slot_bytes.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
         let chunks_arc = Arc::new(Chunks {
             list: chunks,
+            slot_bytes,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
             tiered_manager,
             cleaner_wake,
@@ -2377,6 +2418,18 @@ impl Chunks {
 
     /// Archive all dirty segments to backup storage across all chunks
     /// This ensures all in-memory data is persisted to backup files before shutdown
+    /// Live bytes for each named slot, from the write-path counters.
+    /// One atomic load per slot -- safe to call from anything, including an
+    /// RPC handler or a balancer's poll.
+    pub fn slot_live_bytes(&self, slots: &[u32]) -> Vec<u64> {
+        slots.iter().map(|slot| self.slot_bytes.get(*slot)).collect()
+    }
+
+    /// Total live bytes this store holds across all slots.
+    pub fn total_live_bytes(&self) -> u64 {
+        self.slot_bytes.total()
+    }
+
     pub fn archive_all(&self) {
         info!("Archiving all dirty segments to backup storage...");
         let mut total_archived = 0;

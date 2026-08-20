@@ -1386,6 +1386,15 @@ mod cluster_tests {
         assert_eq!(held_in_slot(&servers[0], MOVING), moving_ids);
         assert!(held_in_slot(&servers[1], MOVING).is_empty());
 
+        // The per-slot byte counters agree with the premise -- these are what
+        // the Phase 4 balancer will steer by, so a migration must move them
+        // exactly as it moves the cells.
+        let donor_moving_bytes = servers[0].chunks().slot_bytes.get(MOVING as u32);
+        let donor_staying_bytes = servers[0].chunks().slot_bytes.get(STAYING as u32);
+        assert!(donor_moving_bytes > 0, "the donor holds cells, so it must hold bytes");
+        assert!(donor_staying_bytes > 0);
+        assert_eq!(servers[1].chunks().slot_bytes.get(MOVING as u32), 0);
+
         // Deliberately smaller than the slot, so the batching and the settle
         // step are exercised rather than skipped.
         let plan = MigrationPlan {
@@ -1455,6 +1464,19 @@ mod cluster_tests {
             assert_eq!(cell.header.id, *id);
         }
 
+        // The transfer copied every cell, so the recipient's counter reaches
+        // exactly the donor's, and the donor's is untouched until the reclaim.
+        assert_eq!(
+            servers[1].chunks().slot_bytes.get(MOVING as u32),
+            donor_moving_bytes,
+            "the recipient's slot bytes must equal what the donor was holding"
+        );
+        assert_eq!(
+            servers[0].chunks().slot_bytes.get(MOVING as u32),
+            donor_moving_bytes,
+            "the donor's counter must not move before its copy is reclaimed"
+        );
+
         let reclaim = reclaim_donor_copy(&client, MOVING as u32, donor_id, recipient_id, &plan)
             .await
             .expect("reclaim should be allowed once the slot is stable on the recipient");
@@ -1475,6 +1497,21 @@ mod cluster_tests {
             held_in_slot(&servers[0], STAYING),
             staying_ids,
             "the reclaim must be confined to the migrated slot"
+        );
+        assert_eq!(
+            servers[0].chunks().slot_bytes.get(MOVING as u32),
+            0,
+            "reclaiming the donor copy must return its slot bytes"
+        );
+        assert_eq!(
+            servers[1].chunks().slot_bytes.get(MOVING as u32),
+            donor_moving_bytes,
+            "the reclaim must not touch the recipient's counter"
+        );
+        assert_eq!(
+            servers[0].chunks().slot_bytes.get(STAYING as u32),
+            donor_staying_bytes,
+            "the untouched slot's counter must not move at all"
         );
 
         for id in &moving_ids {

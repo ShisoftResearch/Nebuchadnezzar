@@ -40,6 +40,10 @@ pub struct WriteToChunkResult {
     pub new_timestamp: u32,
     pub new_version: u64,
     pub addr: usize,
+    /// The entry's content length as written -- the same measure the
+    /// dead-space accounting and the per-slot live-bytes counter use, handed
+    /// out here so callers do not re-decode the entry they just wrote.
+    pub content_length: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -274,6 +278,7 @@ impl OwnedCell {
             new_timestamp,
             new_version,
             addr,
+            content_length: write_plan.entry_body_size() as u32,
         });
     }
     pub fn id(&self) -> Id {

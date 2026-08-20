@@ -174,7 +174,19 @@ fn estimate_recovered_cells(files: &[SegmentFileInfo]) -> usize {
 /// here frees one large table straight back to the OS instead of leaving
 /// per-partition tables behind in an allocator arena -- it does not blow up
 /// when the estimate is short (0.53 GiB vs 2.88 GiB at 5x undersized).
-type VersionMap = HashMap<u64, u64, ahash::RandomState>;
+/// What the scan currently believes about one hash: the winning version, and
+/// the winner's content length when the winner is a live cell (zero when it is
+/// a tombstone). The size rides in the map because it CANNOT be recovered
+/// later by decoding the superseded entry -- a superseded entry can live in a
+/// cold segment whose mapping holds nothing, where a decode faults. Everything
+/// the scan reads comes from file data, so recording it here is free.
+#[derive(Clone, Copy)]
+struct VersionSeen {
+    version: u64,
+    live_size: u32,
+}
+
+type VersionMap = HashMap<u64, VersionSeen, ahash::RandomState>;
 
 fn new_version_map(files: &[SegmentFileInfo]) -> VersionMap {
     let capacity = estimate_recovered_cells(files)
@@ -738,10 +750,14 @@ fn scan_segment_from_data(
                 }
             }
 
-            let existing_version = *version_map.entry(hash).or_insert(new_version);
+            let seen = VersionSeen {
+                version: new_version,
+                live_size: entry_header.content_length,
+            };
+            let existing_version = version_map.entry(hash).or_insert(seen).version;
 
             if new_version >= existing_version {
-                version_map.insert(hash, new_version);
+                version_map.insert(hash, seen);
 
                 let mut cell_guard = chunk
                     .cell_index
@@ -781,10 +797,14 @@ fn scan_segment_from_data(
             let hash = tombstone.id.bits();
             tombstone_count += 1;
 
-            let existing_version = *version_map.entry(hash).or_insert(tombstone.version);
+            let seen = VersionSeen {
+                version: tombstone.version,
+                live_size: 0,
+            };
+            let existing_version = version_map.entry(hash).or_insert(seen).version;
 
             if tombstone.version >= existing_version {
-                version_map.insert(hash, tombstone.version);
+                version_map.insert(hash, seen);
 
                 // Tombstone is newer, delete cell from index
                 if let Some(mut cell_guard) = chunk.cell_index.lock(hash as usize) {
@@ -918,10 +938,17 @@ fn apply_stashed_tombstones(
                     }
                 }
                 *guard = 0; // Delete cell
+                // The header at this address was already read just above, so
+                // decoding the entry touches nothing new. The slot counter was
+                // seeded with this cell counted (its scan saw no newer
+                // tombstone), so the deletion must be reflected there too.
+                let (removed_entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                chunk
+                    .slot_bytes
+                    .sub(tombstone.hash, removed_entry.content_length);
                 if let Some(seg) = chunk.locate_segment(existing_addr) {
-                    let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
                     seg.dead_space
-                        .fetch_add(entry.content_length, Ordering::Relaxed);
+                        .fetch_add(removed_entry.content_length, Ordering::Relaxed);
                     seg.note_dead_bytes_change();
                 }
                 applied_count += 1;
@@ -1278,6 +1305,24 @@ pub fn recover_chunks(
                     let processed = segments_processed.fetch_add(1, Ordering::Relaxed) + 1;
                     if processed % 100 == 0 || processed == total_files {
                         info!("Recovery progress: {}/{} segments", processed, total_files);
+                    }
+                }
+
+                // Seed the per-slot live-bytes counters from what this
+                // chunk's scan resolved. The winner's size is in the version
+                // map; the index says whether that winner survived (a
+                // same-scan tombstone zeroes it). Stashed tombstones applied
+                // after this loop decrement the counter themselves.
+                use lightning::map::Map as _;
+                for (hash, seen) in version_map.iter() {
+                    if seen.live_size == 0 {
+                        continue;
+                    }
+                    match chunk.cell_index.get(&(*hash as usize)) {
+                        Some(addr) if addr != 0 => {
+                            chunk.slot_bytes.add(*hash, seen.live_size)
+                        }
+                        _ => {}
                     }
                 }
 
@@ -4274,4 +4319,165 @@ use crate::ram::types::Id;
             "shared pool accounting should match recovered hot segments across databases"
         );
     }
+
+    /// The per-slot live-bytes counters follow every logical mutation:
+    /// insert adds the entry's content length, update adjusts by the delta,
+    /// remove settles to zero. Checked against the entry actually written,
+    /// not against assumed sizes.
+    #[test]
+    fn slot_live_bytes_follow_writes_updates_and_removes() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(214, "slot_bytes_live_path", false);
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
+
+        let len_at = |id: &Id| -> u64 {
+            let (entry, _) = Entry::decode_from(chunks.address_of(id), |_, header| header);
+            entry.content_length as u64
+        };
+
+        let a = Id::allocated(50, 0, 1);
+        let b = Id::allocated(50, 0, 2);
+        let c = Id::allocated(51, 0, 1);
+
+        let mut cell_a = OwnedCell {
+            header: CellHeader::new(schema.id, &a),
+            data: data_map_value!(id: 1_i32, data: vec![0x11_u8; DATA_SIZE]),
+        };
+        chunks.write_cell(&mut cell_a).unwrap();
+        let len_a = len_at(&a);
+        assert!(len_a > 0);
+        assert_eq!(chunks.slot_bytes.get(50), len_a, "insert must add the entry length");
+
+        let mut cell_b = OwnedCell {
+            header: CellHeader::new(schema.id, &b),
+            data: data_map_value!(id: 2_i32, data: vec![0x22_u8; DATA_SIZE]),
+        };
+        chunks.write_cell(&mut cell_b).unwrap();
+        let len_b = len_at(&b);
+        assert_eq!(chunks.slot_bytes.get(50), len_a + len_b);
+
+        // Update A to a larger body: the counter moves by the delta.
+        let mut cell_a2 = OwnedCell {
+            header: CellHeader::new(schema.id, &a),
+            data: data_map_value!(id: 1_i32, data: vec![0x33_u8; DATA_SIZE * 3]),
+        };
+        chunks.update_cell(&mut cell_a2).unwrap();
+        let len_a2 = len_at(&a);
+        assert!(len_a2 > len_a, "the update was supposed to grow the entry");
+        assert_eq!(chunks.slot_bytes.get(50), len_a2 + len_b);
+
+        // Upsert into another slot counts there, not here.
+        let mut cell_c = OwnedCell {
+            header: CellHeader::new(schema.id, &c),
+            data: data_map_value!(id: 3_i32, data: vec![0x44_u8; DATA_SIZE]),
+        };
+        chunks.upsert_cell(&mut cell_c).unwrap();
+        let len_c = len_at(&c);
+        assert_eq!(chunks.slot_bytes.get(51), len_c);
+        assert_eq!(chunks.slot_bytes.get(50), len_a2 + len_b);
+
+        // Upsert over an existing cell behaves as the update it is.
+        let mut cell_c2 = OwnedCell {
+            header: CellHeader::new(schema.id, &c),
+            data: data_map_value!(id: 3_i32, data: vec![0x55_u8; DATA_SIZE * 2]),
+        };
+        chunks.upsert_cell(&mut cell_c2).unwrap();
+        let len_c2 = len_at(&c);
+        assert_eq!(chunks.slot_bytes.get(51), len_c2);
+
+        chunks.remove_cell(&b).unwrap();
+        assert_eq!(chunks.slot_bytes.get(50), len_a2, "remove must subtract what it removed");
+        chunks.remove_cell(&a).unwrap();
+        assert_eq!(chunks.slot_bytes.get(50), 0);
+        assert_eq!(
+            chunks.total_live_bytes(),
+            len_c2,
+            "only C is left, so the total is exactly its entry"
+        );
+        assert_eq!(chunks.slot_live_bytes(&[50, 51]), vec![0, len_c2]);
+    }
+
+    /// Recovery seeds the counters to exactly what the live path had --
+    /// including a cell whose newest entry in the image is a tombstone, which
+    /// must not count.
+    #[test]
+    fn slot_live_bytes_survive_recovery() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let schema = schema_with_id(215, "slot_bytes_recovery", false);
+        writer_chunk.meta.schemas.debug_only_new_schema(schema.clone());
+
+        for (locality, seq, fill) in [
+            (40_u16, 1_u64, 0x0A_u8),
+            (40, 2, 0x0B),
+            (40, 3, 0x0C),
+            (41, 1, 0x0D),
+            (41, 2, 0x0E),
+        ] {
+            let id = Id::allocated(locality, 0, seq);
+            let mut cell = OwnedCell {
+                header: CellHeader::new(schema.id, &id),
+                data: data_map_value!(id: seq as i32, data: vec![fill; DATA_SIZE]),
+            };
+            writer_chunks.write_cell(&mut cell).unwrap();
+        }
+        // One removal, so the image carries a tombstone newer than its cell.
+        writer_chunks.remove_cell(&Id::allocated(40, 0, 2)).unwrap();
+
+        let expected_40 = writer_chunks.slot_bytes.get(40);
+        let expected_41 = writer_chunks.slot_bytes.get(41);
+        assert!(expected_40 > 0 && expected_41 > 0);
+
+        // The head segment's live image, exactly as written: entries, the
+        // tombstone, real alignment.
+        let head_id = writer_chunk.get_head_seg_id();
+        let head = writer_chunk.segs.get(&(head_id as usize)).unwrap();
+        let live_len = head.append_header.load(Ordering::Relaxed) - head.addr;
+        let image =
+            unsafe { std::slice::from_raw_parts(head.addr as *const u8, live_len).to_vec() };
+        write_backup_segment(&backup_dir, 0, head_id, 1, &image);
+
+        let recovered_schemas = setup_test_schema();
+        recovered_schemas.debug_only_new_schema(schema.clone());
+        let recovered = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: recovered_schemas,
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        // Not `count_recovered_cells`: a tombstoned hash keeps its (zeroed)
+        // index key, so the length over-counts. Read the cells instead.
+        for (locality, seq) in [(40_u16, 1_u64), (40, 3), (41, 1), (41, 2)] {
+            recovered
+                .read_cell(&Id::allocated(locality, 0, seq))
+                .unwrap_or_else(|e| panic!("cell ({locality},{seq}) not recovered: {e:?}"));
+        }
+        assert!(
+            recovered.read_cell(&Id::allocated(40, 0, 2)).is_err(),
+            "the tombstoned cell must stay dead through recovery"
+        );
+        assert_eq!(
+            recovered.slot_bytes.get(40),
+            expected_40,
+            "slot 40 must recover to its pre-crash live bytes, tombstoned cell excluded"
+        );
+        assert_eq!(recovered.slot_bytes.get(41), expected_41);
+        assert_eq!(recovered.total_live_bytes(), expected_40 + expected_41);
+    }
 }
+

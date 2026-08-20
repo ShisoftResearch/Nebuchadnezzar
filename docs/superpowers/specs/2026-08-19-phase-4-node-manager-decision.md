@@ -97,6 +97,25 @@ bifrost's suite once hung 79 minutes on unscoped one-shot test hooks. A node
 manager instantiated once per process would put two databases on one host into a
 fight over the same table.
 
+## 2b. The fill policy, decided 2026-08-20
+
+Both were left open pending real byte distributions; the owner asked for a
+decision now. These are chosen to need no tuning constant, and stay revisable
+once step 1 produces distributions from a TB-scale store.
+
+**"Filled" means:** keep moving slots while
+`joiner_bytes + next_slot_bytes <= cluster_mean_bytes` — stop *before* the move
+that would push the joiner past the mean. No X% threshold to tune, and it is
+self-hysteretic: a fill can never overshoot the mean, so the fill itself can
+never trigger a follow-up rebalance. A fill ends when the gap is closed, the
+SM budget refuses, the recipient declines, or the donors are exhausted.
+
+**Slot selection:** largest slots first from the *currently* largest holder,
+skipping any slot bigger than the remaining gap. Fast convergence while the
+gap is wide, a natural shift to smaller slots as it closes, and no way to blow
+past the target. The donor is re-picked after each batch, so a fill drains the
+actually-largest holder rather than a snapshot of it.
+
 ## 3. Build order
 
 The metric gates the policy, so it goes first — and it is independently useful,
