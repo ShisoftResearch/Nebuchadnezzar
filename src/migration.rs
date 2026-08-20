@@ -800,10 +800,27 @@ async fn reclaim_slot_confirmed(
         }
     }
 
-    info!(
-        "slot {} donor copy reclaimed on {}: {} dropped, {} carried over to {}, {} retained",
-        slot, from, reclaim.dropped, reclaim.carried_over, to, reclaim.retained
-    );
+    if reclaim.retained > 0 {
+        // A retained copy means the reclaim could not establish that the new
+        // owner holds some cell, so the donor kept it. Nothing is lost -- that
+        // is the point of retaining -- but the slot now has cells the placement
+        // table does not route to, and only a re-run reclaim will converge it.
+        // An operator watching a manual reshard reads this and re-runs; an
+        // automatic balancer must treat it as a stop signal (Phase 4 decision:
+        // `retained > 0` halts the balancer rather than continuing to move
+        // slots on a cluster that cannot verify its transfers).
+        warn!(
+            "slot {} reclaim on {} RETAINED {} cell(s) it could not verify on {}: \
+             {} dropped, {} carried over. The donor keeps the unverified copies; \
+             re-run the reclaim to converge. An automatic balancer must stop here.",
+            slot, from, reclaim.retained, to, reclaim.dropped, reclaim.carried_over
+        );
+    } else {
+        info!(
+            "slot {} donor copy reclaimed on {}: {} dropped, {} carried over to {}, {} retained",
+            slot, from, reclaim.dropped, reclaim.carried_over, to, reclaim.retained
+        );
+    }
     Ok(reclaim)
 }
 
@@ -1394,6 +1411,18 @@ mod cluster_tests {
         assert!(donor_moving_bytes > 0, "the donor holds cells, so it must hold bytes");
         assert!(donor_staying_bytes > 0);
         assert_eq!(servers[1].chunks().slot_bytes.get(MOVING as u32), 0);
+
+        // And over the wire, which is the only view the node manager will
+        // ever have: positional, aligned with the asked slots, junk slot -> 0.
+        let donor_rpc = client.client_by_server_id(donor_id).await.unwrap();
+        assert_eq!(
+            donor_rpc
+                .slot_live_bytes(&vec![MOVING as u32, STAYING as u32, 999_999])
+                .await
+                .unwrap(),
+            vec![donor_moving_bytes, donor_staying_bytes, 0]
+        );
+        assert!(donor_rpc.total_live_bytes().await.unwrap() >= donor_moving_bytes + donor_staying_bytes);
 
         // Deliberately smaller than the slot, so the batching and the settle
         // step are exercised rather than skipped.

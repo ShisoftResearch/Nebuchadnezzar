@@ -65,6 +65,8 @@ service! {
     rpc receive_migrated_cells(cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>>;
     rpc push_cells_to(keys: &Vec<Id>, target: u64) -> Result<Vec<Id>, String>;
     rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
+    rpc slot_live_bytes(slots: &Vec<u32>) -> Vec<u64>;
+    rpc total_live_bytes() -> u64;
     rpc settle_bulk_receive() -> BulkReceiveReport;
     rpc note_slot_owner(slot: u32, owner: u64, applied_index: u64) -> ();
     rpc note_slot_owners(owners: &Vec<(u32, u64)>, applied_index: u64) -> ();
@@ -365,6 +367,18 @@ impl Service for NebRPCService {
             .map(|slot| *slot as u16)
             .collect();
         future::ready(self.database_runtime.chunks().cell_ids_in_slots(&wanted)).boxed()
+    }
+
+    fn slot_live_bytes(&self, slots: &Vec<u32>) -> BoxFuture<'_, Vec<u64>> {
+        // Positional, aligned with the request: a balancer asks about specific
+        // slots and wants the answer keyed by its own question. A slot too
+        // large to be a locality holds nothing and answers 0 -- same reasoning
+        // as `cell_ids_in_slots`, but positionally rather than by omission.
+        future::ready(self.database_runtime.chunks().slot_live_bytes(slots)).boxed()
+    }
+
+    fn total_live_bytes(&self) -> BoxFuture<'_, u64> {
+        future::ready(self.database_runtime.chunks().total_live_bytes()).boxed()
     }
 
     fn settle_bulk_receive(&self) -> BoxFuture<'_, BulkReceiveReport> {
