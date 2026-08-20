@@ -627,14 +627,27 @@ impl LocalSchemasCache {
         let m2 = map.clone();
         let sm =
             sm::client::SMClient::new(sm::generate_scoped_sm_id(group, database_name), raft_client);
-        let sm_data = sm.get_all().await?;
-        {
-            debug!("Importing {} schemas from cluster", sm_data.len());
-            for schema in sm_data {
-                trace!("Importing schema {}", schema.name);
-                map.new_schema(schema);
-            }
-        }
+        // SUBSCRIBE FIRST, THEN READ. The order is the correctness.
+        //
+        // `get_all` is a query, and queries round-robin across members gated
+        // only by the CLIENT's own log cursor -- which, on a member that just
+        // joined, is zero, so any stale peer (including this member's own
+        // still-catching-up raft node) answers "successfully" with a schema
+        // list from before the join. Events do not replay history, so a
+        // schema created before the join was then missing FOREVER: measured
+        // bimodal, in 0 ms or never (3 of 10 joins), as
+        // `a_joining_member_is_filled_toward_the_mean` kept demonstrating,
+        // and as Morpheus's later_cluster_member_caches_default_graph_base_schemas
+        // flake has been showing from the outside.
+        //
+        // A subscription, though, registers through the COMMAND path, and a
+        // committed command advances this client's cursor to its log index.
+        // Subscribing first therefore pins `get_all` past the subscription
+        // point: the LeftBehind protocol refuses any member that has not
+        // applied at least that far. Every schema before the subscription is
+        // then in the query answer, every one after arrives as an event, and
+        // the overlap is harmless because `new_schema` is an idempotent
+        // upsert.
         debug!("Subscribing schema events...");
         let _ = sm
             .on_schema_added(move |schema| {
@@ -652,6 +665,14 @@ impl LocalSchemasCache {
                 future::ready(()).boxed()
             })
             .await?;
+        let sm_data = sm.get_all().await?;
+        {
+            debug!("Importing {} schemas from cluster", sm_data.len());
+            for schema in sm_data {
+                trace!("Importing schema {}", schema.name);
+                map.new_schema(schema);
+            }
+        }
         let schemas = LocalSchemasCache { map };
         info!("Local schema initialization completed");
         return Ok(schemas);

@@ -67,6 +67,7 @@ service! {
     rpc cell_ids_in_slots(slots: &Vec<u32>) -> Vec<Id>;
     rpc slot_live_bytes(slots: &Vec<u32>) -> Vec<u64>;
     rpc total_live_bytes() -> u64;
+    rpc can_admit_bytes(bytes: u64) -> bool;
     rpc settle_bulk_receive() -> BulkReceiveReport;
     rpc note_slot_owner(slot: u32, owner: u64, applied_index: u64) -> ();
     rpc note_slot_owners(owners: &Vec<(u32, u64)>, applied_index: u64) -> ();
@@ -379,6 +380,31 @@ impl Service for NebRPCService {
 
     fn total_live_bytes(&self) -> BoxFuture<'_, u64> {
         future::ready(self.database_runtime.chunks().total_live_bytes()).boxed()
+    }
+
+    fn can_admit_bytes(&self, bytes: u64) -> BoxFuture<'_, bool> {
+        // The recipient's veto. Receiving a migration costs no more hot tier
+        // than writing the same volume ordinarily (measured), and the tier
+        // exists to spill -- so ordinary pressure is not a reason to refuse.
+        // What IS a reason: hot memory already over the eviction threshold,
+        // the state where eviction is losing its race and every added byte
+        // deepens it. `bytes` is reported for the log; the answer is about
+        // the member's state, not the batch's size.
+        let admit = match self.database_runtime.chunks().tiered_manager {
+            Some(ref tiered) => {
+                let over = tiered.is_over_threshold();
+                if over {
+                    warn!(
+                        "declining a migration of {} bytes: hot memory is over the \
+                         eviction threshold",
+                        bytes
+                    );
+                }
+                !over
+            }
+            None => true,
+        };
+        future::ready(admit).boxed()
     }
 
     fn settle_bulk_receive(&self) -> BoxFuture<'_, BulkReceiveReport> {

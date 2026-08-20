@@ -1563,3 +1563,197 @@ pub async fn cells_stay_addressable_when_a_member_joins_a_running_cluster() {
         "every locality the ring reassigned should be one where the table overrides it"
     );
 }
+
+/// The continuation of the join test above: a joiner owns nothing by design,
+/// and this is the machinery that stops "nothing" from being permanent. The
+/// leader fills the joining member toward the cluster's mean live bytes, using
+/// the per-slot byte counters -- and stops BEFORE the move that would push it
+/// past the mean, so a re-run moves nothing.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn a_joining_member_is_filled_toward_the_mean() {
+    use bifrost::conshash::fill::FillStop;
+    use bifrost::conshash::slots::client::SMClient as SlotsSMClient;
+
+    let _ = env_logger::try_init();
+    let server_group = "join_fill_test";
+    let addresses = vec![
+        crate::utils::test_port::unique_localhost_addr(),
+        crate::utils::test_port::unique_localhost_addr(),
+    ];
+    let opts = ServerOptions {
+        chunk_size: 16 * 1024 * 1024,
+        db_size: 16 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: None,
+        wal_storage: None,
+        undo_log_storage: None,
+        raft_storage: None,
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: false,
+        disable_storage_locks: true,
+    };
+
+    let first = NebServer::new_cluster_from_opts(
+        &opts,
+        &addresses[0],
+        &addresses,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let client = Arc::new(
+        client::AsyncClient::new(&first.rpc, &first.membership, &addresses, server_group)
+            .await
+            .unwrap(),
+    );
+    client
+        .new_schema_with_id(Schema::new_with_id(
+            1401,
+            &String::from("join_fill_schema"),
+            None,
+            default_fields(),
+            false,
+            false,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Cells across many distinct slots, so the fill has slots worth moving.
+    let ids: Vec<Id> = (0..96u64).map(|i| Id::from_parts(i * 331, 7)).collect();
+    for (seq, id) in ids.iter().enumerate() {
+        let mut value = types::OwnedMap::new();
+        value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+        value.insert(&String::from("score"), OwnedValue::U64(seq as u64));
+        value.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("fill-{seq}")),
+        );
+        client
+            .write_cell(OwnedCell::new_with_id(1401, id, OwnedValue::Map(value)))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let donor_bytes_before = first.chunks().total_live_bytes();
+    assert!(donor_bytes_before > 0);
+
+    let second = NebServer::new_cluster_from_opts(
+        &opts,
+        &addresses[1],
+        &addresses,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let mut converged = false;
+    for _ in 0..100 {
+        if first.conshash().server_count() >= 2 {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(converged, "the ring never saw the second member");
+
+    // Wait for the schema to reach the joiner. In production the watcher's
+    // stability window (10 s) absorbs exactly this: a fresh member needs a
+    // moment before it can accept cells of a schema created before it joined.
+    // A transfer that races it anyway fails SAFELY -- the donor keeps the
+    // cells and the fill stops with the refusal -- but this test is about the
+    // fill, not the race.
+    let mut schema_synced_after_ms = None;
+    for round in 0..300 {
+        if second.chunks().list[0].meta.schemas.get(&1401).is_some() {
+            schema_synced_after_ms = Some(round * 100);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!("SCHEMA_SYNC_PROBE: {:?} ms", schema_synced_after_ms);
+    // Diagnose the miss: whose schema plane is the joiner actually on?
+    {
+        let plane_id = crate::server::database_meta_plane_id(server_group, server_group);
+        for (name, server) in [("first", &first), ("second", &second)] {
+            match server.raft_service.ensure_plane(bifrost::raft::PlaneSpec { plane_id }).await {
+                Ok(plane) => println!(
+                    "PLANE_PROBE {name}: members={:?}",
+                    plane.member_addresses().await
+                ),
+                Err(e) => println!("PLANE_PROBE {name}: no plane: {e:?}"),
+            }
+        }
+    }
+    assert!(schema_synced_after_ms.is_some(), "the joiner never learned the schema");
+
+    // The leader runs the fill; anyone else declines and says so.
+    if !second.raft_service.is_leader_for_real().await {
+        let refused = second
+            .fill_joining_member(second.server_id)
+            .await
+            .expect_err("a non-leader must not run the fill");
+        assert!(refused.contains("not the placement leader"), "{refused}");
+    }
+
+    let report = first
+        .fill_joining_member(second.server_id)
+        .await
+        .expect("the leader's fill should run");
+    assert!(
+        matches!(report.stopped, FillStop::Filled),
+        "expected a completed fill, got {:?}",
+        report.stopped
+    );
+    assert!(report.moved_slots > 0, "a loaded cluster must donate slots");
+    assert!(report.moved_bytes > 0);
+
+    // The joiner now holds real bytes, and no more than the mean -- the stop
+    // rule is "never overshoot", so overshooting is the failure mode to catch.
+    let joiner_bytes = second.chunks().total_live_bytes();
+    let donor_bytes_after = first.chunks().total_live_bytes();
+    assert_eq!(joiner_bytes, report.moved_bytes);
+    let mean = (joiner_bytes + donor_bytes_after) / 2;
+    assert!(
+        joiner_bytes <= mean,
+        "the fill overshot: joiner {} vs mean {}",
+        joiner_bytes,
+        mean
+    );
+    assert!(
+        donor_bytes_after >= joiner_bytes,
+        "the donor must not end below the member it just filled"
+    );
+
+    // The placement table agrees with the counters.
+    let placement = SlotsSMClient::new(crate::server::SLOTS_SM_ID, &client.raft_client);
+    let group = crate::slots::slot_group_id(server_group);
+    let joiner_slots = placement
+        .slots_owned_by(&group, &second.server_id)
+        .await
+        .unwrap();
+    assert_eq!(joiner_slots.len(), report.moved_slots);
+
+    // Every cell is still readable through the ordinary path afterwards.
+    client.reload_slot_owners().await;
+    for id in &ids {
+        let cell = client
+            .read_cell(*id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| panic!("{id:?} unreachable after the fill: {error:?}"));
+        assert_eq!(cell.header.id, *id);
+    }
+
+    // Hysteresis is the stop rule: a second fill moves nothing.
+    let again = first
+        .fill_joining_member(second.server_id)
+        .await
+        .expect("a re-run is always legal");
+    assert_eq!(
+        again.moved_slots, 0,
+        "a filled member must not be filled again"
+    );
+}

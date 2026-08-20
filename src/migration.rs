@@ -231,7 +231,7 @@ impl From<RPCError> for MigrationError {
     }
 }
 
-fn placement_client(client: &AsyncClient) -> SlotsSMClient {
+pub(crate) fn placement_client(client: &AsyncClient) -> SlotsSMClient {
     SlotsSMClient::new(crate::server::SLOTS_SM_ID, &client.raft_client)
 }
 
@@ -2691,7 +2691,16 @@ mod cluster_tests {
         );
 
         // Placement must not claim the recipient owns this slot: it holds nothing.
-        let state = placement_client(&client)
+        //
+        // Read through the SURVIVOR's own raft client rather than the test
+        // client. The test client's freshness cursor sits at the dead leader's
+        // last acknowledgement, and in a two-member cluster the survivor can
+        // never learn that final commit -- so an honest freshness gate refuses
+        // it forever, correctly (the old gate served it by comparing log
+        // receipt instead of application, which is the stale-read bug). This
+        // assertion is a post-mortem: "what does the cluster still know" is
+        // the question, and a fresh cursor is the honest way to ask it.
+        let state = SlotsSMClient::new(crate::server::SLOTS_SM_ID, &servers[1].raft_client)
             .slot_state(&slot_group_id(client.group_name()), &(SLOT as u32))
             .await
             .unwrap();

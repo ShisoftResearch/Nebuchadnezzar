@@ -56,6 +56,7 @@ pub mod utils;
 #[macro_use]
 pub mod ram;
 pub mod client;
+pub mod fill;
 pub mod migration;
 pub mod slots;
 pub mod exec;

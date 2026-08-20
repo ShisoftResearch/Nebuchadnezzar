@@ -306,9 +306,106 @@ async fn ensure_type2_meta_plane(
             .filter(|member| type1_members.iter().any(|known| known == member))
             .collect(),
     );
+    let self_addr = canonical_member_addresses(vec![server_addr.to_string()])
+        .pop()
+        .unwrap_or_else(|| server_addr.to_string());
+    let remote_seeds: Vec<String> = requested_members
+        .iter()
+        .filter(|member| **member != self_addr)
+        .cloned()
+        .collect();
     let mut last_transient_error = None;
 
     for attempt in 0..META_PLANE_BOOTSTRAP_MAX_RETRIES {
+        // JOIN before considering a local bootstrap. `ensure_plane` promotes a
+        // fresh single-member runtime straight to leader, so a member that
+        // bootstraps locally while the plane already exists elsewhere becomes
+        // the isolated second leader of a split plane: its schema and metadata
+        // state machines then serve empty answers that no freshness gate can
+        // catch, because its own tiny log is fully applied. Measured as a
+        // joining member whose schema cache was bimodally empty -- in 0 ms or
+        // forever -- and as the long-recorded rotating cluster-formation
+        // flakes. So: if any remote already hosts this plane, join THROUGH it
+        // (routed to its leader, no self-election window), and only bootstrap
+        // when nobody has it and this member is the deterministic creator.
+        if !remote_seeds.is_empty() {
+            let remote_has_plane = match RaftClient::new(&remote_seeds, raft::DEFAULT_SERVICE_ID)
+                .await
+            {
+                Ok(remote_client) => match remote_client.plane(plane_id).cluster_info().await {
+                    Ok(info) => !info.member_addresses().is_empty(),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if remote_has_plane {
+                match raft_service.join_plane(plane_id, &remote_seeds).await {
+                    Ok(_) => {
+                        let plane = raft_service
+                            .ensure_plane(raft::PlaneSpec { plane_id })
+                            .await
+                            .map_err(|e| format!("joined {plane_label} but cannot handle it: {e}"))?;
+                        match plane.member_addresses().await {
+                            Ok(members) => {
+                                let members = canonical_member_addresses(members);
+                                if includes_all_members(&members, &requested_members) {
+                                    return Ok(plane);
+                                }
+                                last_transient_error = Some(format!(
+                                    "{plane_label} joined but membership has not converged:                                      current={members:?}, requested={requested_members:?}"
+                                ));
+                            }
+                            Err(error) => {
+                                last_transient_error = Some(format!(
+                                    "failed to verify {plane_label} membership after join: {error:?}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        last_transient_error =
+                            Some(format!("failed to join {plane_label}: {error:?}"));
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                ))
+                .await;
+                continue;
+            }
+            // Nobody hosts the plane yet. Exactly one member may create it --
+            // the canonically-first -- and everyone else waits for it, or two
+            // concurrent starters would each bootstrap their own copy and
+            // recreate the split this branch exists to prevent.
+            if requested_members.first() != Some(&self_addr) {
+                last_transient_error = Some(format!(
+                    "{plane_label} does not exist yet; waiting for its creator {:?}",
+                    requested_members.first()
+                ));
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                ))
+                .await;
+                continue;
+            }
+        }
+        // This member is the creator (or the plane already exists locally):
+        // materialize and, if the runtime is still an unseeded passive one
+        // from the pre-registration phase, promote it now. The promotion is
+        // idempotent and refuses anything already seeded.
+        if let Err(error) = raft_service.bootstrap_plane_if_unseeded(plane_id).await {
+            last_transient_error = Some(format!(
+                "failed to bootstrap {plane_label}: {error}"
+            ));
+            if attempt + 1 < META_PLANE_BOOTSTRAP_MAX_RETRIES {
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                ))
+                .await;
+                continue;
+            }
+            break;
+        }
         let plane = match raft_service
             .ensure_plane(raft::PlaneSpec { plane_id })
             .await
@@ -508,8 +605,12 @@ async fn register_schema_sms_for_known_databases(
     );
 
     for database_name in databases {
+        // Passive: registering state machines needs a runtime, but it must not
+        // BOOTSTRAP one -- on a member that is about to join an existing
+        // cluster, a fresh self-promoted runtime is the isolated second
+        // leader of a split plane. The creator promotes explicitly later.
         let plane = raft_service
-            .ensure_plane(raft::PlaneSpec {
+            .ensure_plane_passive(raft::PlaneSpec {
                 plane_id: database_meta_plane_id(group_name, database_name),
             })
             .await
@@ -526,16 +627,23 @@ async fn register_schema_sms_for_known_databases(
 }
 
 async fn recover_startup_meta_planes(group_name: &str, raft_service: &Arc<raft::RaftService>) {
-    let shared_meta_plane = raft_service
-        .ensure_plane(raft::PlaneSpec {
+    // Recovery means recovering something: only a plane with persisted state
+    // materializes here. On a fresh member this is a no-op, and the plane
+    // comes into being through the explicit bootstrap-or-join decision --
+    // `ensure_plane` here used to self-promote a fresh runtime on members
+    // that were about to JOIN the plane, splitting it in two.
+    let recovered = raft_service
+        .recover_plane(raft::PlaneSpec {
             plane_id: shared_meta_plane_id(group_name),
         })
         .await
-        .expect("shared meta plane should materialize locally during startup recovery");
-    shared_meta_plane
-        .recover_after_register()
-        .await
-        .expect("shared meta plane should recover registered state machines during startup");
+        .expect("shared meta plane recovery should not error");
+    if let Some(shared_meta_plane) = recovered {
+        shared_meta_plane
+            .recover_after_register()
+            .await
+            .expect("shared meta plane should recover registered state machines during startup");
+    }
 }
 
 async fn recover_schema_sms_for_known_databases(
@@ -549,12 +657,15 @@ async fn recover_schema_sms_for_known_databases(
     );
 
     for database_name in databases {
-        let plane = raft_service
-            .ensure_plane(raft::PlaneSpec {
+        // Same contract as `recover_startup_meta_planes`: recover what has
+        // state, never bootstrap what has none.
+        let recovered = raft_service
+            .recover_plane(raft::PlaneSpec {
                 plane_id: database_meta_plane_id(group_name, database_name),
             })
             .await
-            .expect("database meta plane should materialize locally during startup recovery");
+            .expect("database meta plane recovery should not error");
+        let Some(plane) = recovered else { continue };
         plane
             .recover_after_register()
             .await
@@ -2225,8 +2336,12 @@ impl NebServer {
         debug!("Registering Membership service before Raft start");
         Membership::new(&rpc_server, &raft_service).await;
 
+        // Passive for the same reason as the per-database planes above: the
+        // runtime must exist so the shared SMs can register ahead of replay,
+        // but promotion belongs to the explicit bootstrap-or-join decision in
+        // `ensure_type2_meta_plane`.
         let shared_meta_plane = raft_service
-            .ensure_plane(raft::PlaneSpec {
+            .ensure_plane_passive(raft::PlaneSpec {
                 plane_id: shared_meta_plane_id(group_name),
             })
             .await
