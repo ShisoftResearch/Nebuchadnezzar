@@ -1442,6 +1442,19 @@ pub async fn cells_stay_addressable_when_a_member_joins_a_running_cluster() {
         .unwrap()
         .unwrap();
 
+    // This test is about placement NOT being recomputed when a member joins.
+    // The automatic join fill would confound that by legitimately assigning
+    // slots to the joiner, so freeze migrations for THIS GROUP -- the same
+    // persistent per-group kill switch an operator uses, rather than a global
+    // flag that would leak into every other test in the process.
+    {
+        let placement = SlotsSMClient::new(crate::server::SLOTS_SM_ID, &client.raft_client);
+        placement
+            .set_migration_freeze(&crate::slots::slot_group_id(server_group), &true)
+            .await
+            .expect("freezing migrations for this group should succeed");
+    }
+
     // Spread across the slot space rather than clustered, so this cannot pass by
     // landing entirely in localities the ring happens not to reassign.
     let ids: Vec<Id> = (0..96u64).map(|i| Id::from_parts(i * 331, 1)).collect();
@@ -1756,4 +1769,128 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
         again.moved_slots, 0,
         "a filled member must not be filled again"
     );
+}
+
+/// The automatic path: nobody calls the fill, a member simply joins and the
+/// leader fills it.
+///
+/// The manual test above proves the fill is correct; this proves it is
+/// CONNECTED -- that the watcher is subscribed at startup, that the join event
+/// reaches it, that the leader gate lets exactly one member act, and that the
+/// stability window elapses rather than hanging. Shortened here through
+/// `NEB_JOIN_FILL_DELAY_MS` so the test does not sit through the production
+/// 10 s; the variable is set before either server starts and left set, since
+/// its only effect on any other test is making a fill they do not perform
+/// happen sooner.
+#[tokio::test(flavor = "multi_thread")]
+pub async fn a_joining_member_is_filled_automatically() {
+    let _ = env_logger::try_init();
+    std::env::set_var("NEB_JOIN_FILL_DELAY_MS", "500");
+
+    let server_group = "auto_join_fill_test";
+    let addresses = vec![
+        crate::utils::test_port::unique_localhost_addr(),
+        crate::utils::test_port::unique_localhost_addr(),
+    ];
+    let opts = ServerOptions {
+        chunk_size: 16 * 1024 * 1024,
+        db_size: 16 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: None,
+        wal_storage: None,
+        undo_log_storage: None,
+        raft_storage: None,
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: false,
+        disable_storage_locks: true,
+    };
+
+    let first = NebServer::new_cluster_from_opts(
+        &opts,
+        &addresses[0],
+        &addresses,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let client = Arc::new(
+        client::AsyncClient::new(&first.rpc, &first.membership, &addresses, server_group)
+            .await
+            .unwrap(),
+    );
+    client
+        .new_schema_with_id(Schema::new_with_id(
+            1402,
+            &String::from("auto_join_fill_schema"),
+            None,
+            default_fields(),
+            false,
+            false,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ids: Vec<Id> = (0..96u64).map(|i| Id::from_parts(i * 331, 11)).collect();
+    for (seq, id) in ids.iter().enumerate() {
+        let mut value = types::OwnedMap::new();
+        value.insert(&String::from("id"), OwnedValue::I64(seq as i64));
+        value.insert(&String::from("score"), OwnedValue::U64(seq as u64));
+        value.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("auto-{seq}")),
+        );
+        client
+            .write_cell(OwnedCell::new_with_id(1402, id, OwnedValue::Map(value)))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert!(first.chunks().total_live_bytes() > 0);
+
+    // Nothing below calls the fill. The join is the only trigger.
+    let second = NebServer::new_cluster_from_opts(
+        &opts,
+        &addresses[1],
+        &addresses,
+        server_group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    let mut filled_bytes = 0;
+    for _ in 0..300 {
+        filled_bytes = second.chunks().total_live_bytes();
+        if filled_bytes > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        filled_bytes > 0,
+        "the joining member was never filled: the watcher is not connected to the \
+         join event, or the leader gate let nobody act"
+    );
+
+    // Filled to the mean, not past it -- the same stop rule, reached without
+    // anyone asking.
+    let donor_bytes = first.chunks().total_live_bytes();
+    assert!(
+        filled_bytes <= (filled_bytes + donor_bytes) / 2,
+        "the automatic fill overshot: joiner {filled_bytes} vs donor {donor_bytes}"
+    );
+
+    // And the cluster still serves every cell it started with.
+    client.reload_slot_owners().await;
+    for id in &ids {
+        let cell = client
+            .read_cell(*id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{id:?} unreachable after an automatic fill: {e:?}"));
+        assert_eq!(cell.header.id, *id);
+    }
 }

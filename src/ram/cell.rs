@@ -88,6 +88,20 @@ pub enum WriteError {
 pub enum ReadError {
     SchemaDoesNotExisted(u32),
     CellDoesNotExisted,
+    /// This member does not own the cell's slot and does not hold the cell, so
+    /// "it does not exist" would be a WRONG ANSWER rather than an error.
+    ///
+    /// The read path used to be considered safe against a stale placement cache
+    /// on the grounds that a migration defers dropping the donor's copy -- true
+    /// only until the reclaim runs. After it, a client one migration behind
+    /// asked the former owner and was told the cell did not exist, which is
+    /// indistinguishable from a legitimate answer. Measured at 1 read in 6
+    /// during an automatic join fill.
+    ///
+    /// Raised only when the read would otherwise MISS: a member holding the
+    /// cell still serves it, so this costs nothing on the deferred-drop path it
+    /// is protecting.
+    NotSlotOwner { owner: u64, applied_index: u64 },
     NetworkingError,
     CellTypeIsNotMapForSelect,
     CellIdIsUnitId,

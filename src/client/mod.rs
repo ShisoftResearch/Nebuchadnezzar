@@ -305,7 +305,22 @@ impl AsyncClient {
 
     pub async fn read_cell(&self, id: Id) -> Result<Result<OwnedCell, ReadError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
-        client.read_cell(id).await
+        match client.read_cell(id).await? {
+            // A stale table sent this read to a member that no longer holds the
+            // cell. Without following, the answer is "does not exist" -- which
+            // a caller cannot tell from the truth. Same single-redirect rule as
+            // the write path: a second refusal means placement is moving faster
+            // than one read can follow, and looping would hang instead of
+            // surfacing that.
+            Err(ReadError::NotSlotOwner {
+                owner,
+                applied_index,
+            }) => {
+                let owner_client = self.redirect_to_slot_owner(&id, owner, applied_index).await?;
+                owner_client.read_cell(id).await
+            }
+            other => Ok(other),
+        }
     }
 
     pub async fn read_cell_select(
@@ -315,7 +330,16 @@ impl AsyncClient {
         need_header: bool,
     ) -> Result<Result<OwnedCell, ReadError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
-        client.read_cell_select(id, fields, need_header).await
+        match client.read_cell_select(id, fields, need_header).await? {
+            Err(ReadError::NotSlotOwner {
+                owner,
+                applied_index,
+            }) => {
+                let owner_client = self.redirect_to_slot_owner(&id, owner, applied_index).await?;
+                owner_client.read_cell_select(id, fields, need_header).await
+            }
+            other => Ok(other),
+        }
     }
 
     pub async fn read_all_cells_selected(

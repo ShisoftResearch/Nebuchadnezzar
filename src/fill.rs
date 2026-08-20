@@ -122,6 +122,26 @@ fn stability_window() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// How long to wait for a freshly joined member to start SERVING before giving
+/// up on filling it.
+fn readiness_window() -> std::time::Duration {
+    let ms = std::env::var("NEB_JOIN_FILL_READY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120_000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// How long to wait for a joining member to start SERVING before giving up on
+/// filling it.
+fn readiness_timeout() -> std::time::Duration {
+    let ms = std::env::var("NEB_JOIN_FILL_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120_000);
+    std::time::Duration::from_millis(ms)
+}
+
 impl crate::server::NebServer {
     /// Fill `joiner` toward the cluster's mean live bytes, leader-gated.
     ///
@@ -149,6 +169,33 @@ impl crate::server::NebServer {
             .collect();
         if !members.contains(&joiner) {
             return Err(format!("joiner {joiner} is not an online group member"));
+        }
+
+        // A member announces its membership BEFORE it finishes standing up its
+        // services, so the join event arrives while the joiner still answers
+        // `ServiceIdNotFound` to everything. Waiting on a fixed delay cannot
+        // fix that -- it only picks a number and hopes -- so wait for the
+        // member to actually SERVE. Asking it for its own live bytes is the
+        // right probe: it is the first thing the fill needs anyway, it is
+        // read-only, and a member that can answer it can answer the rest.
+        let deadline = std::time::Instant::now() + readiness_timeout();
+        let mut last_error = String::new();
+        loop {
+            match self.neb_client.client_by_server_id(joiner).await {
+                Ok(cells) => match cells.total_live_bytes().await {
+                    Ok(_) => break,
+                    Err(e) => last_error = format!("{e:?}"),
+                },
+                Err(e) => last_error = format!("{e:?}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "joining member {joiner} never started serving within {:?} \
+                     (last error: {last_error}); nothing was moved",
+                    readiness_timeout()
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
 
         let placement = crate::migration::placement_client(&self.neb_client);

@@ -109,7 +109,8 @@ impl Service for NebRPCService {
             self.database_runtime
                 .chunks()
                 .read_cell(&key)
-                .map(|c| c.to_owned()),
+                .map(|c| c.to_owned())
+                .map_err(|e| self.redirect_read_if_not_owner(&key, e)),
         )
         .boxed()
     }
@@ -121,6 +122,7 @@ impl Service for NebRPCService {
                         .chunks()
                         .read_cell(&id)
                         .map(|c| c.to_owned())
+                        .map_err(|e| self.redirect_read_if_not_owner(id, e))
                 })
                 .collect(),
         )
@@ -154,12 +156,19 @@ impl Service for NebRPCService {
             self.database_runtime
                 .chunks()
                 .read_selected(&id, fields.as_slice(), need_header)
-                .map(|c| c.to_owned()),
+                .map(|c| c.to_owned())
+                .map_err(|e| self.redirect_read_if_not_owner(&id, e)),
         )
         .boxed()
     }
     fn head_cell(&self, key: Id) -> BoxFuture<'_, Result<CellHeader, ReadError>> {
-        future::ready(self.database_runtime.chunks().head_cell(&key)).boxed()
+        future::ready(
+            self.database_runtime
+                .chunks()
+                .head_cell(&key)
+                .map_err(|e| self.redirect_read_if_not_owner(&key, e)),
+        )
+        .boxed()
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         async move {
@@ -855,6 +864,37 @@ impl NebRPCService {
     ///    still the serving owner and must keep accepting; only the *recipient*
     ///    would refuse, which is why migration transfers arrive through
     ///    `receive_migrated_cells` rather than as ordinary writes.
+    /// Turn a read MISS into a redirect when this member does not own the slot.
+    ///
+    /// The mirror of `refuse_if_not_owner`, and deliberately not its twin: a
+    /// write is refused up front, because writing to the wrong member loses
+    /// data, while a read is only redirected when it would otherwise answer
+    /// "does not exist". A member that still holds the cell keeps serving it,
+    /// so the deferred-drop window this protects costs no extra hop.
+    ///
+    /// Same three preconditions as the write side (a table must be installed,
+    /// the slot must have an owner, and the owner must be someone else); see
+    /// `refuse_if_not_owner` for why each is load-bearing.
+    fn redirect_read_if_not_owner(&self, id: &Id, error: ReadError) -> ReadError {
+        if !matches!(error, ReadError::CellDoesNotExisted) {
+            return error;
+        }
+        let conshash = &self.database_runtime.consh;
+        if !conshash.has_slot_overrides() {
+            return error;
+        }
+        let slot = crate::slots::slot_of(id) as u64;
+        match conshash.slot_override_with_index(slot) {
+            Some((owner, applied_index)) if owner != self.database_runtime.rpc.server_id => {
+                ReadError::NotSlotOwner {
+                    owner,
+                    applied_index,
+                }
+            }
+            _ => error,
+        }
+    }
+
     fn refuse_if_not_owner(&self, id: &Id) -> Result<(), WriteError> {
         let conshash = &self.database_runtime.consh;
         if !conshash.has_slot_overrides() {

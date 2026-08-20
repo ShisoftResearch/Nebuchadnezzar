@@ -2205,6 +2205,20 @@ impl NebServer {
             neb_client: database_runtime.neb_client.clone(),
         });
 
+        // A member that joins owns no slots -- that is the orphaning fix -- so
+        // without this a new machine stays empty forever. The watcher fires on
+        // every member and the leader gate inside picks the one that acts.
+        //
+        // Two off-switches, at the right layers. `NEB_DISABLE_JOIN_FILL=1`
+        // stops this member from even subscribing, for a deployment that wants
+        // fills operator-driven. The cluster-wide control is the slot SM's
+        // persistent freeze (`set_migration_freeze`), which is the one to
+        // reach for operationally: it stops every member at once, survives
+        // restarts, and drains in-flight transfers rather than stranding them.
+        if std::env::var("NEB_DISABLE_JOIN_FILL").as_deref() != Ok("1") {
+            server.start_join_fill_watcher().await;
+        }
+
         Ok(server)
     }
 
