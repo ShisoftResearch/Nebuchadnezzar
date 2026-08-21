@@ -305,6 +305,46 @@ struct BatchOutcome {
 /// landed; the bodies never pass through it. That matters because the byte path is
 /// what limits a transfer at realistic cell sizes — routing bodies through here
 /// would double both the wire traffic and the serialization work for no gain.
+/// Where a migration's wall time actually goes.
+///
+/// The reshard collapses from ~950 MB/s with a slack tier to single-digit
+/// MB/s when the tier is a quarter of the payload, and the totals cannot say
+/// which phase pays for it. Same idiom as the write path's per-phase timers:
+/// a phase whose per-cell cost is invariant as load rises is the one holding
+/// the rate.
+pub static MIGRATION_DONOR_READ_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MIGRATION_RECIPIENT_WRITE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MIGRATION_VERIFY_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MIGRATION_DROP_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static MIGRATION_CELLS_READ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Reset the phase timers, so a measurement covers only what follows.
+pub fn reset_migration_phase_timers() {
+    use std::sync::atomic::Ordering::Relaxed;
+    MIGRATION_DONOR_READ_NANOS.store(0, Relaxed);
+    MIGRATION_RECIPIENT_WRITE_NANOS.store(0, Relaxed);
+    MIGRATION_VERIFY_NANOS.store(0, Relaxed);
+    MIGRATION_DROP_NANOS.store(0, Relaxed);
+    MIGRATION_CELLS_READ.store(0, Relaxed);
+}
+
+/// `(donor_read, recipient_write, verify, drop, cells_read)`.
+pub fn migration_phase_timers() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        MIGRATION_DONOR_READ_NANOS.load(Relaxed),
+        MIGRATION_RECIPIENT_WRITE_NANOS.load(Relaxed),
+        MIGRATION_VERIFY_NANOS.load(Relaxed),
+        MIGRATION_DROP_NANOS.load(Relaxed),
+        MIGRATION_CELLS_READ.load(Relaxed),
+    )
+}
+
 async fn transfer_batch(
     donor: &Arc<CellServiceClient>,
     to: u64,
@@ -730,8 +770,13 @@ async fn reclaim_slot_confirmed(
         // unless one of them has since taken a write. Before that fix the
         // recipient was always one ahead and this comparison would have been
         // meaningless -- which is why an earlier version of this code did not try.
+        let t_verify = std::time::Instant::now();
         let heads = recipient.head_all_cells(&batch).await?;
         let donor_heads = donor.head_all_cells(&batch).await?;
+        MIGRATION_VERIFY_NANOS.fetch_add(
+            t_verify.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let donor_versions: std::collections::HashMap<Id, u64> = batch
             .iter()
             .zip(donor_heads.into_iter())
@@ -786,7 +831,12 @@ async fn reclaim_slot_confirmed(
         }
         // Likewise exempt: by now the slot belongs to the recipient, so the
         // donor is deliberately deleting cells it no longer owns.
+        let t_drop = std::time::Instant::now();
         let removals = donor.drop_migrated_cells(&droppable).await?;
+        MIGRATION_DROP_NANOS.fetch_add(
+            t_drop.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         for (id, removal) in droppable.iter().zip(removals.into_iter()) {
             match removal {
                 Ok(()) => reclaim.dropped += 1,
@@ -3247,6 +3297,15 @@ mod cluster_tests {
             .unwrap()
             .unwrap();
 
+        // Same reason as the memory benchmark: this drives its own drain, and
+        // the automatic join fill would be a second mover competing with it.
+        // Lifted before the measured drain, which the freeze would otherwise
+        // refuse outright.
+        placement_client(&client)
+            .set_migration_freeze(&slot_group_id(client.group_name()), &true)
+            .await
+            .expect("freezing the automatic fill for this measurement");
+
         let payload = "x".repeat(payload_bytes);
         let mut written = 0usize;
         for slot in 0..slots {
@@ -3279,6 +3338,10 @@ mod cluster_tests {
 
         let departing = servers[0].server_id;
         let remaining = servers[1].server_id;
+        placement_client(&client)
+            .set_migration_freeze(&slot_group_id(client.group_name()), &false)
+            .await
+            .expect("thawing before the measured drain");
         let started = std::time::Instant::now();
         let drain = crate::migration::drain::drain_member(
             &client,
@@ -3405,6 +3468,23 @@ mod cluster_tests {
                 .unwrap(),
         );
         client.reload_slot_owners().await;
+        // Freeze the automatic join fill FOR THE SETUP. This benchmark drives
+        // its OWN reshard, and the watcher fires when the second member joins
+        // -- two migrations then target the same slots. Measured: 28 slot
+        // failures, slots left half-transferred (donor 4096 / recipient 2048),
+        // and 771 cells transiently unreadable, none of which this test is
+        // about. The conflicts are safe (first-writer-wins per slot) but they
+        // are noise in a measurement.
+        //
+        // Lifted again immediately before the reshard below -- the freeze
+        // refuses `begin_slot_migrations`, so leaving it on would refuse the
+        // very thing being measured. The write phase runs far longer than the
+        // watcher's stability window, so by the time it lifts the automatic
+        // attempt has already happened and been refused.
+        placement_client(&client)
+            .set_migration_freeze(&slot_group_id(client.group_name()), &true)
+            .await
+            .expect("freezing the automatic fill for this measurement");
         client
             .new_schema_with_id(Schema::new_with_id(
                 1500,
@@ -3500,7 +3580,18 @@ mod cluster_tests {
         // sequential baseline, NEB_MEASURE_SETTLE=0 removes the settle.
         let concurrent_slots = env_usize("NEB_MEASURE_CONCURRENCY", default_concurrent_slots());
         let plan_batch_cells = MigrationPlan::default().batch_cells;
+        placement_client(&client)
+            .set_migration_freeze(&slot_group_id(client.group_name()), &false)
+            .await
+            .expect("thawing before the measured reshard");
         println!("MEASUREMENT: resharding with concurrent_slots={concurrent_slots}");
+        reset_migration_phase_timers();
+        let cold_before = crate::ram::segs::cold_block_counters();
+        let tier_before = servers[0]
+            .chunks()
+            .tiered_manager
+            .as_ref()
+            .map(|t| t.global_counters());
         let reshard_started = std::time::Instant::now();
         let reshard = reshard_slots(
             &client,
@@ -3515,6 +3606,54 @@ mod cluster_tests {
         )
         .await;
         let reshard_elapsed = reshard_started.elapsed();
+
+        // Where the wall time actually went. The phase totals are summed across
+        // concurrent slots, so they exceed wall time -- their RATIO is the
+        // reading, not their absolute size.
+        {
+            let (read_ns, write_ns, verify_ns, drop_ns, cells) = migration_phase_timers();
+            let total_ns = (read_ns + write_ns + verify_ns + drop_ns).max(1);
+            let pct = |n: u64| (n as f64 * 100.0) / total_ns as f64;
+            println!(
+                "MEASUREMENT: phases -- donor read {:.0}% ({:.0} us/cell), recipient write {:.0}%, \
+                 verify {:.0}%, drop {:.0}%  [over {} cell reads]",
+                pct(read_ns),
+                read_ns as f64 / 1000.0 / (cells.max(1) as f64),
+                pct(write_ns),
+                pct(verify_ns),
+                pct(drop_ns),
+                cells
+            );
+            let cold = crate::ram::segs::cold_block_counters().minus(&cold_before);
+            let useful = cells * payload_bytes as u64;
+            println!(
+                "MEASUREMENT: cold reads -- {} serves ({} hits, {} misses), {} MB read from disk, \
+                 {} MB decompressed for {} MB of cells = {:.1}x amplification",
+                cold.serves,
+                cold.hits,
+                cold.misses,
+                cold.file_bytes / (1024 * 1024),
+                cold.plain_bytes / (1024 * 1024),
+                useful / (1024 * 1024),
+                cold.plain_bytes as f64 / useful.max(1) as f64
+            );
+            if let (Some(before), Some(after)) = (
+                tier_before,
+                servers[0]
+                    .chunks()
+                    .tiered_manager
+                    .as_ref()
+                    .map(|t| t.global_counters()),
+            ) {
+                println!(
+                    "MEASUREMENT: tier -- {} promotions, {} evictions, {} churns (a churn is \
+                     eviction of data still in use: a write out and a read back, both wasted)",
+                    after.promotions.saturating_sub(before.promotions),
+                    after.evictions.saturating_sub(before.evictions),
+                    after.churns.saturating_sub(before.churns),
+                );
+            }
+        }
         println!(
             "MEASUREMENT: reshard phase {:.1}s ({:.1} MB/s, {:.0} cells/s)",
             reshard_elapsed.as_secs_f64(),

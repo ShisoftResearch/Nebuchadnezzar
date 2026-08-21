@@ -1730,8 +1730,20 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
         }
     }
 
-    // Setup done: let migrations run again, so the manual fill below is the
-    // only thing that has moved anything.
+    // Let the AUTOMATIC fill fire and be refused by the freeze before thawing.
+    //
+    // The watcher fires once per join, after its stability window. Thawing
+    // immediately leaves that pending attempt to land in the middle of the
+    // manual fill below, and the manual call's report then no longer accounts
+    // for everything the joiner gained -- a 1-in-5 failure under parallel
+    // load. Waiting out the window means the automatic attempt has already
+    // happened and been refused, so after the thaw the manual call is the only
+    // mover.
+    let auto_window_ms = std::env::var("NEB_JOIN_FILL_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10_000);
+    tokio::time::sleep(Duration::from_millis(auto_window_ms + 2_000)).await;
     placement
         .set_migration_freeze(&group, &false)
         .await
@@ -1818,8 +1830,13 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
 #[tokio::test(flavor = "multi_thread")]
 pub async fn a_joining_member_is_filled_automatically() {
     let _ = env_logger::try_init();
-    std::env::set_var("NEB_JOIN_FILL_DELAY_MS", "500");
-
+    // Deliberately does NOT shorten the stability window. That knob is a
+    // process-global env var, and setting it here changed the behaviour of
+    // whatever else was running in the same test process -- including the
+    // manual fill test, which reads it to know how long to wait out this very
+    // watcher. Two tests mutating and reading one global made each flake about
+    // one run in six. Waiting the real 10 s costs this test ten seconds and
+    // tests the production default instead of a special case.
     let server_group = "auto_join_fill_test";
     let addresses = vec![
         crate::utils::test_port::unique_localhost_addr(),
@@ -1895,7 +1912,8 @@ pub async fn a_joining_member_is_filled_automatically() {
     .unwrap();
 
     let mut filled_bytes = 0;
-    for _ in 0..300 {
+    // Generous: the production stability window is 10 s and the fill follows.
+    for _ in 0..600 {
         filled_bytes = second.chunks().total_live_bytes();
         if filled_bytes > 0 {
             break;

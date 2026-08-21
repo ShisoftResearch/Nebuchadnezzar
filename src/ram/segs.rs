@@ -131,6 +131,42 @@ pub static COLD_BLOCK_PLAIN_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static COLD_BLOCK_OPENS: AtomicU64 = AtomicU64::new(0);
 /// Block indexes loaded from disk.
 pub static COLD_INDEX_LOADS: AtomicU64 = AtomicU64::new(0);
+
+/// A snapshot of the cold-read counters, so a measurement can subtract a
+/// baseline instead of reporting process-lifetime totals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ColdBlockCounters {
+    pub serves: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub file_bytes: u64,
+    pub plain_bytes: u64,
+    pub index_loads: u64,
+}
+
+impl ColdBlockCounters {
+    pub fn minus(&self, before: &ColdBlockCounters) -> ColdBlockCounters {
+        ColdBlockCounters {
+            serves: self.serves.saturating_sub(before.serves),
+            hits: self.hits.saturating_sub(before.hits),
+            misses: self.misses.saturating_sub(before.misses),
+            file_bytes: self.file_bytes.saturating_sub(before.file_bytes),
+            plain_bytes: self.plain_bytes.saturating_sub(before.plain_bytes),
+            index_loads: self.index_loads.saturating_sub(before.index_loads),
+        }
+    }
+}
+
+pub fn cold_block_counters() -> ColdBlockCounters {
+    ColdBlockCounters {
+        serves: COLD_BLOCK_SERVES.load(Ordering::Relaxed),
+        hits: COLD_BLOCK_HITS.load(Ordering::Relaxed),
+        misses: COLD_BLOCK_MISSES.load(Ordering::Relaxed),
+        file_bytes: COLD_BLOCK_FILE_BYTES.load(Ordering::Relaxed),
+        plain_bytes: COLD_BLOCK_PLAIN_BYTES.load(Ordering::Relaxed),
+        index_loads: COLD_INDEX_LOADS.load(Ordering::Relaxed),
+    }
+}
 /// Bytes spent copying the block index inside the lookup itself. Pure overhead:
 /// it buys nothing and is paid even by calls that do no I/O.
 pub static COLD_INDEX_COPY_BYTES: AtomicU64 = AtomicU64::new(0);

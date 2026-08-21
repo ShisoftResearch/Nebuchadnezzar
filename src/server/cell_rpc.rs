@@ -564,6 +564,7 @@ impl Service for NebRPCService {
                 .map_err(|error| format!("cannot reach recipient {target}: {error:?}"))?;
 
             let mut cells = Vec::with_capacity(keys.len());
+            let t_read = std::time::Instant::now();
             for key in &keys {
                 match self.database_runtime.chunks().read_cell(key) {
                     Ok(cell) => cells.push(cell.to_owned()),
@@ -575,14 +576,27 @@ impl Service for NebRPCService {
                     }
                 }
             }
+            crate::migration::MIGRATION_DONOR_READ_NANOS.fetch_add(
+                t_read.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            crate::migration::MIGRATION_CELLS_READ.fetch_add(
+                cells.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if cells.is_empty() {
                 return Ok(Vec::new());
             }
             let landed: Vec<Id> = cells.iter().map(|cell| cell.header.id).collect();
+            let t_write = std::time::Instant::now();
             let written = recipient
                 .receive_migrated_cells(cells)
                 .await
                 .map_err(|error| format!("recipient {target} unreachable mid-push: {error:?}"))?;
+            crate::migration::MIGRATION_RECIPIENT_WRITE_NANOS.fetch_add(
+                t_write.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if let Some(error) = written
                 .iter()
                 .filter_map(|result| result.as_ref().err())
