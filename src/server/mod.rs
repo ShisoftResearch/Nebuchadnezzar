@@ -53,7 +53,12 @@ const DATABASE_SCOPED_CELL_RPC_READY_MAX_RETRIES: usize = 100;
 const DATABASE_SCOPED_CELL_RPC_READY_DELAY_MS: u64 = 100;
 const LOCAL_SCHEMA_CACHE_INIT_MAX_RETRIES: usize = 100;
 const LOCAL_SCHEMA_CACHE_INIT_RETRY_DELAY_MS: u64 = 100;
-const META_PLANE_BOOTSTRAP_MAX_RETRIES: usize = 100;
+const META_PLANE_BOOTSTRAP_MAX_RETRIES: usize = 300;
+/// How long a member that is not the preferred creator waits for that creator
+/// before making the plane itself. Long enough that an ordinary startup race
+/// is decided by preference rather than by this timeout; short enough that a
+/// creator which is never coming does not hang the cluster.
+const CREATOR_PREFERENCE_ATTEMPTS: usize = 30;
 const META_PLANE_BOOTSTRAP_RETRY_DELAY_MS: u64 = 100;
 
 fn has_recoverable_raft_state_at(raft_path: &Path) -> bool {
@@ -373,13 +378,29 @@ async fn ensure_type2_meta_plane(
                 .await;
                 continue;
             }
-            // Nobody hosts the plane yet. Exactly one member may create it --
-            // the canonically-first -- and everyone else waits for it, or two
-            // concurrent starters would each bootstrap their own copy and
-            // recreate the split this branch exists to prevent.
-            if requested_members.first() != Some(&self_addr) {
+            // Nobody hosts the plane yet, so somebody must create it, and
+            // concurrent creators would each bootstrap their own copy -- the
+            // split this whole branch exists to prevent.
+            //
+            // The canonically-first member is PREFERRED, not required. Making
+            // it required deadlocks: a database created at runtime is needed
+            // first by whichever member handled the request, and if that
+            // member is not the canonical one, it waits for a creator that was
+            // never asked to create anything. Measured as Morpheus's entire
+            // clusterwide-runtime family failing with "waiting for its creator"
+            // -- 9 failures against a baseline of 1.
+            //
+            // So: wait a bounded time for the preferred creator, then create it
+            // here and say so. In the ordinary startup race the preferred
+            // member wins well inside the window and everyone else joins; when
+            // it is simply not coming, the cluster makes progress instead of
+            // hanging. The join-if-it-exists check above still runs first every
+            // round, so a late creator is joined rather than duplicated.
+            if requested_members.first() != Some(&self_addr)
+                && attempt < CREATOR_PREFERENCE_ATTEMPTS
+            {
                 last_transient_error = Some(format!(
-                    "{plane_label} does not exist yet; waiting for its creator {:?}",
+                    "{plane_label} does not exist yet; waiting for its preferred creator {:?}",
                     requested_members.first()
                 ));
                 tokio::time::sleep(tokio::time::Duration::from_millis(
@@ -387,6 +408,15 @@ async fn ensure_type2_meta_plane(
                 ))
                 .await;
                 continue;
+            }
+            if requested_members.first() != Some(&self_addr) {
+                warn!(
+                    "{plane_label}: preferred creator {:?} has not created it after {} attempts; \
+                     creating it here ({}) instead",
+                    requested_members.first(),
+                    CREATOR_PREFERENCE_ATTEMPTS,
+                    self_addr
+                );
             }
         }
         // This member is the creator (or the plane already exists locally):
