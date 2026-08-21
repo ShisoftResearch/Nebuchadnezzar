@@ -3612,6 +3612,7 @@ mod cluster_tests {
         println!("MEASUREMENT: resharding with concurrent_slots={concurrent_slots}");
         reset_migration_phase_timers();
         let cold_before = crate::ram::segs::cold_block_counters();
+        let writes_before = crate::ram::chunk::write_phase_counters();
         let tier_before = servers[0]
             .chunks()
             .tiered_manager
@@ -3650,6 +3651,22 @@ mod cluster_tests {
                 pct(drop_ns),
                 pct(settle_ns),
                 cells
+            );
+            let w = crate::ram::chunk::write_phase_counters().minus(&writes_before);
+            let w_total = w.total_nanos().max(1);
+            let wpct = |n: u64| (n as f64 * 100.0) / w_total as f64;
+            println!(
+                "MEASUREMENT: recipient write breakdown over {} cells ({:.0} us/cell) -- \
+                 plan {:.0}%, alloc {:.0}%, copy {:.0}%, index {:.0}%, secondary {:.0}%, \
+                 stats {:.0}%",
+                w.cells,
+                w_total as f64 / 1000.0 / (w.cells.max(1) as f64),
+                wpct(w.plan),
+                wpct(w.alloc),
+                wpct(w.copy),
+                wpct(w.index),
+                wpct(w.secondary),
+                wpct(w.stats)
             );
             let cold = crate::ram::segs::cold_block_counters().minus(&cold_before);
             let useful = cells * payload_bytes as u64;

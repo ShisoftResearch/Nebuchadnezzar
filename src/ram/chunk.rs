@@ -39,6 +39,48 @@ pub static WRITE_COPY_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_INDEX_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_SECONDARY_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_STATS_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// The write path's per-phase timers, for subtracting a baseline around a
+/// measured region.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WritePhaseCounters {
+    pub cells: u64,
+    pub plan: u64,
+    pub alloc: u64,
+    pub copy: u64,
+    pub index: u64,
+    pub secondary: u64,
+    pub stats: u64,
+}
+
+impl WritePhaseCounters {
+    pub fn minus(&self, before: &WritePhaseCounters) -> WritePhaseCounters {
+        WritePhaseCounters {
+            cells: self.cells.saturating_sub(before.cells),
+            plan: self.plan.saturating_sub(before.plan),
+            alloc: self.alloc.saturating_sub(before.alloc),
+            copy: self.copy.saturating_sub(before.copy),
+            index: self.index.saturating_sub(before.index),
+            secondary: self.secondary.saturating_sub(before.secondary),
+            stats: self.stats.saturating_sub(before.stats),
+        }
+    }
+    pub fn total_nanos(&self) -> u64 {
+        self.plan + self.alloc + self.copy + self.index + self.secondary + self.stats
+    }
+}
+
+pub fn write_phase_counters() -> WritePhaseCounters {
+    WritePhaseCounters {
+        cells: WRITE_CELLS.load(Ordering::Relaxed),
+        plan: WRITE_PLAN_NANOS.load(Ordering::Relaxed),
+        alloc: WRITE_ALLOC_NANOS.load(Ordering::Relaxed),
+        copy: WRITE_COPY_NANOS.load(Ordering::Relaxed),
+        index: WRITE_INDEX_NANOS.load(Ordering::Relaxed),
+        secondary: WRITE_SECONDARY_NANOS.load(Ordering::Relaxed),
+        stats: WRITE_STATS_NANOS.load(Ordering::Relaxed),
+    }
+}
 use std::sync::Arc;
 
 pub type CellReadGuard<'a> = WordMutexGuard<'a>;
@@ -1247,8 +1289,15 @@ impl Chunk {
 
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.id.bits();
+        // Same phase timers as `write_cell`. A migration's recipient goes
+        // through here for every cell it receives, and without these the
+        // recipient's share of a reshard is one opaque number.
+        let t_plan = std::time::Instant::now();
         let write_plan = cell.plan_write(self)?;
+        WRITE_PLAN_NANOS.fetch_add(t_plan.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t_alloc = std::time::Instant::now();
         let pending_entry = write_plan.allocate(self, true)?;
+        WRITE_ALLOC_NANOS.fetch_add(t_alloc.elapsed().as_nanos() as u64, Ordering::Relaxed);
         loop {
             if let Some(mut cell_guard) = CellGuard::for_write(hash, true, self) {
                 trace!("Cell {} exists, will update for upsert", hash);
@@ -1291,16 +1340,20 @@ impl Chunk {
                 cell.header.version = write_result.new_version;
                 cell.header.timestamp = write_result.new_timestamp;
             } else {
+                let t_index = std::time::Instant::now();
                 let reservation = self.cell_index.try_insert_locked(hash as usize);
+                WRITE_INDEX_NANOS.fetch_add(t_index.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if let Some(mut guard) = reservation {
                     // New cell
                     trace!("Cell {} does not exists, will insert for upsert", hash);
+                    let t_copy = std::time::Instant::now();
                     let write_result = self.write_cell_to_chunk(
                         cell,
                         &write_plan,
                         &pending_entry,
                         cell.header.version,
                     )?;
+                    WRITE_COPY_NANOS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let new_cell_loc = write_result.addr;
                     #[cfg(debug_assertions)]
                     self.assert_address_aligned_for_write(
@@ -1312,8 +1365,15 @@ impl Chunk {
                     *guard = new_cell_loc;
                     drop(guard);
                     self.slot_bytes.add(hash, write_result.content_length);
+                    let t_sec = std::time::Instant::now();
                     self.ensure_indices(cell, None, &*write_plan.schema);
+                    WRITE_SECONDARY_NANOS
+                        .fetch_add(t_sec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let t_stats = std::time::Instant::now();
                     self.refresh_statistics_for_schema(write_plan.schema.id);
+                    WRITE_STATS_NANOS
+                        .fetch_add(t_stats.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
                     drop(write_plan);
                     cell.header.version = write_result.new_version;
                     cell.header.timestamp = write_result.new_timestamp;
