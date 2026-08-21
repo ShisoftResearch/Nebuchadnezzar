@@ -304,6 +304,25 @@ impl CombinedCleaner {
                     );
                     for entry in &dummy_seg.entries {
                         let entry_addr = entry.addr;
+                        // PROBE: a copy that would cross the destination's end
+                        // writes into whatever segment owns the NEXT address
+                        // range -- measured as a cold neighbour's resident
+                        // pages holding this segment's cells, served through
+                        // the fault-in present-block fast path. Refuse and
+                        // scream rather than corrupt.
+                        if seg_cursor + entry.size > new_seg.addr + SEGMENT_SIZE {
+                            error!(
+                                "COMBINE OVERRUN: destination segment {} (chunk {}) cursor {:#x} \
+                                 + entry {} bytes crosses bound {:#x}; entry from {:#x}",
+                                new_seg_id,
+                                chunk.id,
+                                seg_cursor,
+                                entry.size,
+                                new_seg.addr + SEGMENT_SIZE,
+                                entry_addr
+                            );
+                            break;
+                        }
                         unsafe {
                             libc::memcpy(
                                 seg_cursor as *mut libc::c_void,

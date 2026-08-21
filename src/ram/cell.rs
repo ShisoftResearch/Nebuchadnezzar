@@ -510,9 +510,23 @@ impl<'v> SharedCellData<'v> {
             // costs nothing on the read path.
             let verdict = describe_stale_pointer(ptr, chunk);
             record_stale_pointer(&verdict);
+            // The one bit that separates the two remaining families of this
+            // bug: where does the FOUND cell's own index entry point? If it
+            // points HERE too, two owners share one address (allocation-level
+            // double use). If it points elsewhere -- or nowhere -- then this
+            // segment's CONTENT is a foreign copy: something restored another
+            // segment's bytes into this address space.
+            let found_owner = {
+                use lightning::map::Map;
+                match chunk.cell_index.get(&(header.id.bits() as usize)) {
+                    Some(addr) if addr == ptr => "found id's own index points HERE TOO".to_string(),
+                    Some(addr) => format!("found id's own index points at {:#x}", addr),
+                    None => "found id has NO index entry in this chunk".to_string(),
+                }
+            };
             warn!(
-                "stale cell read: requested id bits {} found {:?} at {:#x}; {}",
-                hash, header.id, ptr, verdict
+                "stale cell read: requested id bits {} found {:?} at {:#x}; {}; {}",
+                hash, header.id, ptr, verdict, found_owner
             );
             return Err(ReadError::StaleCellPointer);
         }

@@ -245,8 +245,13 @@ struct FdShard {
     hand: usize,
 }
 
+/// (store-unique file-manager address, chunk, segment, seq). The first
+/// component is what keeps co-hosted stores from colliding; see
+/// `Segment::backup_file`.
+type FdKey = (usize, usize, u64, u64);
+
 struct FdSlot {
-    key: (usize, u64, u64),
+    key: FdKey,
     file: Arc<File>,
     /// Set on every hit, cleared when the hand passes: one second chance.
     used: bool,
@@ -271,13 +276,17 @@ impl BackupFdCache {
         }
     }
 
-    fn shard_of(&self, key: &(usize, u64, u64)) -> &parking_lot::Mutex<FdShard> {
+    fn shard_of(&self, key: &FdKey) -> &parking_lot::Mutex<FdShard> {
         // seq_id alone would cluster; mixing all three spreads segments evenly.
-        let h = key.0 as u64 ^ key.1.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ key.2;
+        let h = (key.0 as u64)
+            .wrapping_mul(0xA24B_AED4_963E_E407)
+            ^ (key.1 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ key.2
+            ^ key.3.rotate_left(17);
         &self.shards[(h as usize) % self.shards.len()]
     }
 
-    fn get(&self, key: &(usize, u64, u64)) -> Option<Arc<File>> {
+    fn get(&self, key: &FdKey) -> Option<Arc<File>> {
         let mut shard = self.shard_of(key).lock();
         for slot in shard.slots.iter_mut() {
             if let Some(entry) = slot {
@@ -290,7 +299,7 @@ impl BackupFdCache {
         None
     }
 
-    fn insert(&self, key: (usize, u64, u64), file: Arc<File>) {
+    fn insert(&self, key: FdKey, file: Arc<File>) {
         let mut shard = self.shard_of(&key).lock();
         // Already cached by a racing reader.
         if shard.slots.iter().flatten().any(|e| e.key == key) {
@@ -320,7 +329,7 @@ impl BackupFdCache {
         }
     }
 
-    fn remove(&self, key: &(usize, u64, u64)) {
+    fn remove(&self, key: &FdKey) {
         let mut shard = self.shard_of(key).lock();
         for slot in shard.slots.iter_mut() {
             if slot.as_ref().map_or(false, |e| e.key == *key) {
@@ -1173,7 +1182,26 @@ impl Segment {
     /// Reads go through `read_at`, which takes its own offset and so does not
     /// disturb a file position, making one handle safe to share across threads.
     fn backup_file(&self) -> io::Result<Arc<File>> {
-        let key = (self.chunk_id, self.id, self.seq_id);
+        // The store's identity is part of the key. The cache is process-global
+        // and (chunk_id, seg_id, seq_id) collide across CO-HOSTED STORES --
+        // every member of an in-process test cluster, and every database on a
+        // multi-database production host, has a (chunk 0, seg 1, seq 1). A
+        // colliding hit hands this segment ANOTHER STORE'S backup file, and a
+        // fault-in then decompresses foreign cells into this segment's pages,
+        // where the present-block fast path serves them forever after.
+        // Measured: 96-2080 cells unreadable per 8 GB reshard on a host whose
+        // tier actually evicts, with the verdict "requested id X, found VALID
+        // id Y" -- Y being another store's cell. The file manager Arc is
+        // per (store, chunk), so its address separates stores at zero cost.
+        let key = {
+            let state = self.file_state.lock();
+            (
+                Arc::as_ptr(&state.manager) as usize,
+                self.chunk_id,
+                self.id,
+                self.seq_id,
+            )
+        };
         if let Some(f) = BACKUP_FD_CACHE.get(&key) {
             return Ok(f);
         }
@@ -1198,7 +1226,16 @@ impl Segment {
     /// Forget this segment's cached handle. Called when the backup it refers to
     /// is no longer the right file to read.
     fn drop_cached_backup(&self) {
-        BACKUP_FD_CACHE.remove(&(self.chunk_id, self.id, self.seq_id));
+        let key = {
+            let state = self.file_state.lock();
+            (
+                Arc::as_ptr(&state.manager) as usize,
+                self.chunk_id,
+                self.id,
+                self.seq_id,
+            )
+        };
+        BACKUP_FD_CACHE.remove(&key);
     }
 
     /// Read the header and block index from this segment's backup file.
@@ -3263,7 +3300,7 @@ mod backup_fd_cache_tests {
             .sum::<usize>();
 
         for i in 0..(slots * 8) as u64 {
-            cache.insert((0, i, 0), dummy_handle());
+            cache.insert((0, 0, i, 0), dummy_handle());
         }
 
         assert_eq!(
@@ -3290,8 +3327,8 @@ mod backup_fd_cache_tests {
     #[test]
     fn used_handles_outlast_untouched_ones() {
         let cache = BackupFdCache::new(512);
-        let hot: Vec<_> = (0..32u64).map(|i| (0, 900_000 + i, 0)).collect();
-        let cold: Vec<_> = (0..32u64).map(|i| (0, 800_000 + i, 0)).collect();
+        let hot: Vec<_> = (0..32u64).map(|i| (0, 0, 900_000 + i, 0)).collect();
+        let cold: Vec<_> = (0..32u64).map(|i| (0, 0, 800_000 + i, 0)).collect();
         for k in hot.iter().chain(cold.iter()) {
             cache.insert(*k, dummy_handle());
         }
@@ -3301,7 +3338,7 @@ mod backup_fd_cache_tests {
             for k in &hot {
                 let _ = cache.get(k);
             }
-            cache.insert((1, i, 0), dummy_handle());
+            cache.insert((0, 1, i, 0), dummy_handle());
         }
 
         let hot_alive = hot.iter().filter(|k| cache.get(k).is_some()).count();
@@ -3319,7 +3356,7 @@ mod backup_fd_cache_tests {
     #[test]
     fn removal_frees_a_slot() {
         let cache = BackupFdCache::new(64);
-        let key = (7, 7, 7);
+        let key = (7, 7, 7, 7);
         cache.insert(key, dummy_handle());
         assert!(cache.get(&key).is_some());
         cache.remove(&key);
