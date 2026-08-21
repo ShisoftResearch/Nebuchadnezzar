@@ -495,17 +495,30 @@ impl Chunk {
         );
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = SegmentList::new(num_segs);
-        // Sized for the cells this chunk is about to recover, because a WordMap
+        // Sized for the cells this chunk is about to hold, because a WordMap
         // cannot be resized afterwards and each partition that outgrows itself
         // doubles, copies, and frees the old table into a per-thread allocator
-        // arena that never returns it. `num_segs * 64` assumes 128 KB cells; at
-        // ~770 B/cell that was 256x short, which is eight doublings per
-        // partition and several hundred GB of unreclaimable garbage at
-        // terabyte scale. Falls back to the old guess for a fresh chunk, where
-        // nothing better is known and eager sizing would allocate for a full
-        // chunk that may stay empty.
+        // arena that never returns it.
+        //
+        // A RECOVERED chunk gets `estimated_cells`, derived from its files via
+        // `estimated_cells_per_segment`. A FRESH chunk used to fall back to
+        // `num_segs * 64`, which is the same guess expressed as 128 KB per
+        // cell -- 128x the 1 KB default the estimator uses, and the direction
+        // the estimator's own doc calls dangerous: "set too high it means too
+        // few cells per segment, under-sizing the index and paying a doubling
+        // for every factor of two it is short; set too low it merely
+        // over-allocates, bounded and predictable."
+        //
+        // So a recovered store indexed itself correctly and a fresh one did
+        // not, which is why this only ever showed up on freshly-written
+        // stores. Measured on .239: a reshard of 2.1M cells across 768 fresh
+        // chunks spent ALL of its recipient-write time in the index insert, at
+        // 2619 us/cell, and ran at 45 MB/s; the same shape with half the cells
+        // ran at 634 MB/s. Both halves of the fallback now use one estimator,
+        // which is also the knob (`NEB_ESTIMATED_CELL_BYTES`) a workload far
+        // from 1 KB/cell is supposed to set.
         let index_capacity = estimated_cells
-            .max(num_segs.saturating_mul(64))
+            .max(num_segs.saturating_mul(crate::ram::segs::estimated_cells_per_segment()))
             .clamp(4_096, MAX_CELL_INDEX_CAPACITY)
             .next_power_of_two();
         let index = WordMap::with_capacity(index_capacity);
