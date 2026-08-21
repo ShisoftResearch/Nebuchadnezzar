@@ -322,6 +322,12 @@ pub static MIGRATION_DROP_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static MIGRATION_CELLS_READ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// The recipient's per-batch settle: an eviction pass that keeps a bulk
+/// transfer's memory bounded. Timed separately because it is the driver's
+/// call, not part of the write, and because its cost scales with the STORE
+/// rather than with the batch.
+pub static MIGRATION_SETTLE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Reset the phase timers, so a measurement covers only what follows.
 pub fn reset_migration_phase_timers() {
@@ -330,19 +336,38 @@ pub fn reset_migration_phase_timers() {
     MIGRATION_RECIPIENT_WRITE_NANOS.store(0, Relaxed);
     MIGRATION_VERIFY_NANOS.store(0, Relaxed);
     MIGRATION_DROP_NANOS.store(0, Relaxed);
+    MIGRATION_SETTLE_NANOS.store(0, Relaxed);
     MIGRATION_CELLS_READ.store(0, Relaxed);
 }
 
-/// `(donor_read, recipient_write, verify, drop, cells_read)`.
-pub fn migration_phase_timers() -> (u64, u64, u64, u64, u64) {
+/// `(donor_read, recipient_write, verify, drop, settle, cells_read)`.
+pub fn migration_phase_timers() -> (u64, u64, u64, u64, u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         MIGRATION_DONOR_READ_NANOS.load(Relaxed),
         MIGRATION_RECIPIENT_WRITE_NANOS.load(Relaxed),
         MIGRATION_VERIFY_NANOS.load(Relaxed),
         MIGRATION_DROP_NANOS.load(Relaxed),
+        MIGRATION_SETTLE_NANOS.load(Relaxed),
         MIGRATION_CELLS_READ.load(Relaxed),
     )
+}
+
+/// The recipient's per-batch settle, timed.
+///
+/// A settle is an optimisation, never a precondition -- the cells are already
+/// written and durable -- so this returns the client's result untouched and
+/// only records how long it took.
+async fn settle_recipient(
+    recipient: &Arc<CellServiceClient>,
+) -> Result<crate::server::cell_rpc::BulkReceiveReport, RPCError> {
+    let started = std::time::Instant::now();
+    let report = recipient.settle_bulk_receive().await;
+    MIGRATION_SETTLE_NANOS.fetch_add(
+        started.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    report
 }
 
 async fn transfer_batch(
@@ -398,7 +423,7 @@ async fn transfer_slot(
         handover.batches += 1;
 
         if plan.settle_recipient_per_batch {
-            match recipient.settle_bulk_receive().await {
+            match settle_recipient(recipient).await {
                 Ok(report) => {
                     let observed = if report.hot_bytes_scanned > 0 {
                         report.hot_bytes_scanned
@@ -537,7 +562,7 @@ async fn migrate_slot_prepared(
                 moved.extend(batch.iter().copied());
 
                 if plan.settle_recipient_per_batch {
-                    match recipient.settle_bulk_receive().await {
+                    match settle_recipient(&recipient).await {
                         Ok(report) => {
                             // Prefer the scanned figure when the recipient was
                             // asked to compute it: the counter is corrected by
@@ -3611,17 +3636,19 @@ mod cluster_tests {
         // concurrent slots, so they exceed wall time -- their RATIO is the
         // reading, not their absolute size.
         {
-            let (read_ns, write_ns, verify_ns, drop_ns, cells) = migration_phase_timers();
-            let total_ns = (read_ns + write_ns + verify_ns + drop_ns).max(1);
+            let (read_ns, write_ns, verify_ns, drop_ns, settle_ns, cells) =
+                migration_phase_timers();
+            let total_ns = (read_ns + write_ns + verify_ns + drop_ns + settle_ns).max(1);
             let pct = |n: u64| (n as f64 * 100.0) / total_ns as f64;
             println!(
                 "MEASUREMENT: phases -- donor read {:.0}% ({:.0} us/cell), recipient write {:.0}%, \
-                 verify {:.0}%, drop {:.0}%  [over {} cell reads]",
+                 verify {:.0}%, drop {:.0}%, settle {:.0}%  [over {} cell reads]",
                 pct(read_ns),
                 read_ns as f64 / 1000.0 / (cells.max(1) as f64),
                 pct(write_ns),
                 pct(verify_ns),
                 pct(drop_ns),
+                pct(settle_ns),
                 cells
             );
             let cold = crate::ram::segs::cold_block_counters().minus(&cold_before);

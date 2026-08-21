@@ -852,18 +852,32 @@ impl TieredMemoryManager {
                 .checked_add(SEGMENT_SIZE)
                 .unwrap_or_else(|| self.shared_pool.physical_memory_limit * 2);
             let threshold_limit = self.threshold_limit();
-            let scanned_hot_segments = self.scanned_hot_segments();
-            let shared_counter_segments = self.shared_pool.total_hot_segments();
 
-            debug!(
-                "Global eviction before allocation after forced reconcile: shared_counter={} scanned={} hot={} MB, would be {} MB after allocation, threshold {} MB, evicting {} segments",
-                shared_counter_segments,
-                scanned_hot_segments,
-                current_hot_memory / (1024 * 1024),
-                after_alloc_memory / (1024 * 1024),
-                threshold_limit / (1024 * 1024),
-                segments_to_evict
-            );
+            // `scanned_hot_segments` walks every segment of every chunk, and it
+            // exists here ONLY to make the log line below comparable with the
+            // reconciled count. Binding it to a `let` ran that walk on every
+            // call whatever the log level -- `debug!` skips formatting when the
+            // level is off, but the argument was already evaluated.
+            //
+            // This function is called once per batch by a migration's
+            // `settle_bulk_receive`, so the cost scaled with the STORE rather
+            // than with the data being moved: at a 48 GB db that is ~768 chunks
+            // walked twice per batch (once to reconcile, once for a discarded
+            // log line), thousands of times over a reshard. `settle_bulk_receive`
+            // gates the identical call behind an env var for exactly this
+            // reason, calling it "indefensible in a production transfer"; this
+            // copy was not gated.
+            if log::log_enabled!(log::Level::Debug) {
+                debug!(
+                    "Global eviction before allocation after forced reconcile: shared_counter={} scanned={} hot={} MB, would be {} MB after allocation, threshold {} MB, evicting {} segments",
+                    self.shared_pool.total_hot_segments(),
+                    self.scanned_hot_segments(),
+                    current_hot_memory / (1024 * 1024),
+                    after_alloc_memory / (1024 * 1024),
+                    threshold_limit / (1024 * 1024),
+                    segments_to_evict
+                );
+            }
 
             self.evict_globally_until_target(segments_to_evict)
         } else {
