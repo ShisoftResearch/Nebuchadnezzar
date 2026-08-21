@@ -3677,11 +3677,12 @@ mod cluster_tests {
             let ap = crate::ram::chunk::alloc_phase_counters().minus(&alloc_before);
             println!(
                 "MEASUREMENT: alloc detail -- {} rotations, rotate {:.2}s total \
-                 (drain {:.2}s, archive {:.2}s), spin-wait {:.2}s",
+                 (drain {:.2}s, archive {:.2}s, alloc_seg {:.2}s), spin-wait {:.2}s",
                 ap.rotations,
                 ap.rotate as f64 / 1e9,
                 ap.drain as f64 / 1e9,
                 ap.archive as f64 / 1e9,
+                ap.alloc_seg as f64 / 1e9,
                 ap.spin as f64 / 1e9
             );
             let wal = crate::ram::segs::wal_counters().minus(&wal_before);

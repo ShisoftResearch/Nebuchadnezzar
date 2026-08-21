@@ -51,6 +51,9 @@ pub static ROTATE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_DRAIN_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_ARCHIVE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATIONS: AtomicU64 = AtomicU64::new(0);
+/// Within rotation: allocating the fresh segment (including its WAL file
+/// creation, if that is where the time turns out to be).
+pub static ROTATE_ALLOC_SEG_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot for baseline subtraction in measurements.
 #[derive(Debug, Clone, Copy, Default)]
@@ -60,6 +63,7 @@ pub struct AllocPhaseCounters {
     pub drain: u64,
     pub archive: u64,
     pub rotations: u64,
+    pub alloc_seg: u64,
 }
 
 impl AllocPhaseCounters {
@@ -70,6 +74,7 @@ impl AllocPhaseCounters {
             drain: self.drain.saturating_sub(b.drain),
             archive: self.archive.saturating_sub(b.archive),
             rotations: self.rotations.saturating_sub(b.rotations),
+            alloc_seg: self.alloc_seg.saturating_sub(b.alloc_seg),
         }
     }
 }
@@ -89,6 +94,7 @@ pub fn alloc_phase_counters() -> AllocPhaseCounters {
         drain: ROTATE_DRAIN_NANOS.load(Ordering::Relaxed),
         archive: ROTATE_ARCHIVE_NANOS.load(Ordering::Relaxed),
         rotations: ROTATIONS.load(Ordering::Relaxed),
+        alloc_seg: ROTATE_ALLOC_SEG_NANOS.load(Ordering::Relaxed),
     }
 }
 
@@ -970,6 +976,7 @@ impl Chunk {
                 restore_to: head_seg_id,
             };
 
+            let t_alloc_seg = std::time::Instant::now();
             let new_seg_opt = match self
                 .allocator
                 .alloc_seg_for_writer(&self.file_manager, segment_class)
@@ -995,6 +1002,8 @@ impl Chunk {
                     }
                 }
             };
+            ROTATE_ALLOC_SEG_NANOS
+                .fetch_add(t_alloc_seg.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let Some(new_seg) = new_seg_opt else {
                 // Space was there when we checked, and is gone now -- another
                 // writer took the last segment between the check and here.

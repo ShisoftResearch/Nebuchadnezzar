@@ -602,18 +602,75 @@ impl CombinedCleaner {
             // in the round with it.
             let claimed_bytes: usize = segments.iter().map(|seg| seg.used_spaces() as usize).sum();
             if claimed_bytes > 0 {
-                error!(
-                    "Combine decoded 0 entries from {} segments in chunk {} that claim {} used \
-                     bytes; refusing to remove them. Their resident images are unreadable, not \
-                     empty -- removing them would delete live cells along with their backups.",
+                // Zero LIVE entries with a nonzero claim is two very different
+                // stories, and only one of them is danger:
+                //
+                //   * The image is UNREADABLE -- zeroed pages under a hot flag,
+                //     a claimed-but-never-filled span. Removing such segments
+                //     destroys every cell whose index still points there, plus
+                //     their backups; TB13 lost 15 segments to exactly that.
+                //     Refuse, loudly.
+                //
+                //   * The image is READABLE and every entry is simply DEAD --
+                //     which is what a DONOR's segments look like after a
+                //     migration's reclaim dropped every cell they held.
+                //     Removing them is not just safe, it is combine's whole
+                //     job; refusing here made drained space unreclaimable
+                //     forever, ten refusals per 8 GB reshard.
+                //
+                // One raw entry header distinguishes them: a readable image
+                // decodes its first entry whatever its liveness, a zeroed one
+                // decodes nothing.
+                let all_readable = segments.iter().all(|seg| {
+                    let frontier = seg.append_header.load(Ordering::Relaxed);
+                    frontier > seg.addr
+                        && crate::ram::segs::SegmentEntryIter {
+                            bound: frontier,
+                            cursor: seg.addr,
+                        }
+                        .next()
+                        .is_some()
+                });
+                if !all_readable {
+                    let states: Vec<String> = segments
+                        .iter()
+                        .map(|seg| {
+                            let first = unsafe { *(seg.addr as *const u64) };
+                            format!(
+                                "seg {} (seq {}) {} {} refs={} frontier={} first_word={:#x} \
+                                 evicted={} promoted={}",
+                                seg.id,
+                                seg.seq_id,
+                                if seg.is_hot() { "HOT" } else { "COLD" },
+                                if seg.is_dirty() { "dirty" } else { "clean" },
+                                seg.references_count(),
+                                seg.append_header.load(Ordering::Relaxed) - seg.addr,
+                                first,
+                                seg.last_evicted_ms.load(Ordering::Relaxed),
+                                seg.last_promoted_ms.load(Ordering::Relaxed),
+                            )
+                        })
+                        .collect();
+                    error!(
+                        "Combine decoded 0 entries from {} segments in chunk {} that claim {} \
+                         used bytes; refusing to remove them. Their resident images are \
+                         unreadable, not empty -- removing them would delete live cells along \
+                         with their backups. States: {states:?}",
+                        segments.len(),
+                        chunk.id,
+                        claimed_bytes
+                    );
+                    for seg in segments.iter() {
+                        seg.mark_clean_no_progress();
+                    }
+                    return (0, 0);
+                }
+                debug!(
+                    "Combine removing {} fully-dead segments in chunk {} ({} bytes reclaimed)",
                     segments.len(),
                     chunk.id,
                     claimed_bytes
                 );
-                for seg in segments.iter() {
-                    seg.mark_clean_no_progress();
-                }
-                return (0, 0);
             }
             debug!("No entries to work on, will remove all selected segments instead");
         }
