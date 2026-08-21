@@ -54,11 +54,6 @@ const DATABASE_SCOPED_CELL_RPC_READY_DELAY_MS: u64 = 100;
 const LOCAL_SCHEMA_CACHE_INIT_MAX_RETRIES: usize = 100;
 const LOCAL_SCHEMA_CACHE_INIT_RETRY_DELAY_MS: u64 = 100;
 const META_PLANE_BOOTSTRAP_MAX_RETRIES: usize = 300;
-/// How long a member that is not the preferred creator waits for that creator
-/// before making the plane itself. Long enough that an ordinary startup race
-/// is decided by preference rather than by this timeout; short enough that a
-/// creator which is never coming does not hang the cluster.
-const CREATOR_PREFERENCE_ATTEMPTS: usize = 30;
 const META_PLANE_BOOTSTRAP_RETRY_DELAY_MS: u64 = 100;
 
 fn has_recoverable_raft_state_at(raft_path: &Path) -> bool {
@@ -334,15 +329,76 @@ async fn ensure_type2_meta_plane(
         // (routed to its leader, no self-election window), and only bootstrap
         // when nobody has it and this member is the deterministic creator.
         if !remote_seeds.is_empty() {
-            let remote_has_plane = match RaftClient::new(&remote_seeds, raft::DEFAULT_SERVICE_ID)
-                .await
-            {
-                Ok(remote_client) => match remote_client.plane(plane_id).cluster_info().await {
-                    Ok(info) => !info.member_addresses().is_empty(),
-                    Err(_) => false,
-                },
-                Err(_) => false,
-            };
+            // Asked via the direct probe, never a round-robin client: the
+            // round-robin can answer with THIS node's own unseeded view,
+            // which reads as "no plane" and left joiners waiting for a
+            // creator that had long since created it.
+            let (remote_has_plane, already_member) =
+                match raft_service.probe_plane_members(plane_id, &remote_seeds).await {
+                    Some(info) => {
+                        let members = info.member_addresses();
+                        (
+                            true,
+                            members.iter().any(|member| *member == self_addr),
+                        )
+                    }
+                    None => (false, false),
+                };
+            // Already in the plane's membership -- above all as its CURRENT
+            // LEADER, which is exactly what the creator looks like when a
+            // later ensure (a database's membership check, a retry) runs on
+            // it. Joining again is not idempotent for a leader: it demoted
+            // itself into a follower of itself and the plane froze leaderless.
+            // `join_plane` refuses that now, and this branch does not even
+            // ask: being listed means the runtime exists here and replication
+            // (or its own leadership) will carry it -- go verify, don't join.
+            if already_member {
+                // Being listed does not mean the LOCAL runtime knows it: the
+                // admit is a command on the cluster, the import is local work
+                // that a cut-short join leaves undone -- and replication
+                // cannot start until the leader's appends find a runtime
+                // willing to follow. Re-drive the local half every round; it
+                // is idempotent and command-free.
+                if let Err(error) = raft_service
+                    .sync_plane_membership(plane_id, &remote_seeds)
+                    .await
+                {
+                    last_transient_error = Some(format!(
+                        "{plane_label}: member here, but cannot sync local membership: {error:?}"
+                    ));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                    ))
+                    .await;
+                    continue;
+                }
+                let plane = raft_service
+                    .ensure_plane(raft::PlaneSpec { plane_id })
+                    .await
+                    .map_err(|e| format!("{plane_label} membership exists but no handle: {e}"))?;
+                match plane.member_addresses().await {
+                    Ok(members) => {
+                        let members = canonical_member_addresses(members);
+                        if includes_all_members(&members, &requested_members) {
+                            return Ok(plane);
+                        }
+                        last_transient_error = Some(format!(
+                            "{plane_label}: member here, but membership has not converged: \
+                             current={members:?}, requested={requested_members:?}"
+                        ));
+                    }
+                    Err(error) => {
+                        last_transient_error = Some(format!(
+                            "failed to verify {plane_label} membership: {error:?}"
+                        ));
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
+                ))
+                .await;
+                continue;
+            }
             if remote_has_plane {
                 match raft_service.join_plane(plane_id, &remote_seeds).await {
                     Ok(_) => {
@@ -379,44 +435,43 @@ async fn ensure_type2_meta_plane(
                 continue;
             }
             // Nobody hosts the plane yet, so somebody must create it, and
-            // concurrent creators would each bootstrap their own copy -- the
+            // concurrent creators each bootstrapping their own copy is the
             // split this whole branch exists to prevent.
             //
-            // The canonically-first member is PREFERRED, not required. Making
-            // it required deadlocks: a database created at runtime is needed
-            // first by whichever member handled the request, and if that
-            // member is not the canonical one, it waits for a creator that was
-            // never asked to create anything. Measured as Morpheus's entire
-            // clusterwide-runtime family failing with "waiting for its creator"
-            // -- 9 failures against a baseline of 1.
-            //
-            // So: wait a bounded time for the preferred creator, then create it
-            // here and say so. In the ordinary startup race the preferred
-            // member wins well inside the window and everyone else joins; when
-            // it is simply not coming, the cluster makes progress instead of
-            // hanging. The join-if-it-exists check above still runs first every
-            // round, so a late creator is joined rather than duplicated.
-            if requested_members.first() != Some(&self_addr)
-                && attempt < CREATOR_PREFERENCE_ATTEMPTS
-            {
+            // The creator is the TYPE1 RAFT LEADER, because creation needs a
+            // serialization point and the leader is the one the cluster
+            // already has: unique at any instant, always present, and always
+            // among the members that run this code (startup runs it on every
+            // member, and a database's preparation fans out to every member).
+            // The two earlier tie-breaks both failed measurably. "Only the
+            // canonically-first address creates" deadlocked runtime-created
+            // databases whose canonical member was never asked. "Prefer the
+            // canonical member, create here after a grace period" raced: the
+            // ports are random, so which member waits varies per run, and two
+            // members inside the nobody-has-it window each created a
+            // single-member plane -- after which the join guard rightly
+            // refuses to demote either self-leader, and membership can never
+            // converge. Leadership has no such window: a non-leader NEVER
+            // creates, and the join-if-it-exists check above picks the
+            // leader's plane up on the next round.
+            // The CLUSTER'S view of the type1 leader, through the client bound
+            // to the meta members -- deliberately not the local runtime's
+            // leader flag. A starting member bootstraps its own raft as a
+            // single-node leader BEFORE joining the meta cluster, so the local
+            // flag says "leader" exactly when creating a plane is most wrong;
+            // the client's view names the real leader (or nobody yet, which
+            // also means wait).
+            let type1_leader = raft_client.leader_id();
+            if type1_leader == 0 || type1_leader != bifrost_hasher::hash_str(&self_addr) {
                 last_transient_error = Some(format!(
-                    "{plane_label} does not exist yet; waiting for its preferred creator {:?}",
-                    requested_members.first()
+                    "{plane_label} does not exist yet; waiting for the type1 leader to create it \
+                     (leader id {type1_leader})"
                 ));
                 tokio::time::sleep(tokio::time::Duration::from_millis(
                     META_PLANE_BOOTSTRAP_RETRY_DELAY_MS,
                 ))
                 .await;
                 continue;
-            }
-            if requested_members.first() != Some(&self_addr) {
-                warn!(
-                    "{plane_label}: preferred creator {:?} has not created it after {} attempts; \
-                     creating it here ({}) instead",
-                    requested_members.first(),
-                    CREATOR_PREFERENCE_ATTEMPTS,
-                    self_addr
-                );
             }
         }
         // This member is the creator (or the plane already exists locally):
