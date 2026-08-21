@@ -836,6 +836,22 @@ impl Segment {
         }
     }
 
+    /// Claim `size` contiguous bytes for a RUN of entries, not just one.
+    ///
+    /// Identical to `try_acquire` -- entries are contiguous in a segment, so a
+    /// run of them is one span -- but claimed with a single CAS instead of one
+    /// per entry. That matters because a migration batch's cells all share a
+    /// locality, and `locate_chunk_by_partition` maps locality to chunk, so
+    /// every cell of a batch lands in the SAME chunk and contends on the SAME
+    /// append head. A 1024-cell batch was 1024 CAS loops on one atomic.
+    ///
+    /// Returns the base address; the caller lays entries out from there and is
+    /// responsible for filling the whole span, since the append cursor has
+    /// already moved past it.
+    pub fn try_acquire_run(&self, size: u32) -> Option<usize> {
+        self.try_acquire(size)
+    }
+
     pub fn shrink(&self, size: usize) {
         // If the segment is full or larger than SEGMENT_SIZE, there's nothing to shrink
         if size >= SEGMENT_SIZE {

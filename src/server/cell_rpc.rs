@@ -264,37 +264,62 @@ impl Service for NebRPCService {
         // first failure. A migration aborts the whole slot on any failure
         // anyway, so there is nothing to gain from continuing.
         async move {
-            let mut results = Vec::with_capacity(cells.len());
+            // Land every cell on the SAME version it had on the donor.
+            //
+            // The write path assigns `old_version + 1` (`cell.rs`), so a
+            // straight upsert would move a cell and quietly renumber it. That
+            // is not cosmetic: callers derive *cell ids* from a container's
+            // version -- Morpheus's id lists compute segment ids from
+            // `(container, field, schema, root, root_version)` -- so a bumped
+            // version repoints every derived id at a cell that does not exist.
+            // The symptom appears nowhere near the cause: an edge append fails
+            // with "root segment cell does not exist" on a vertex that
+            // migrated perfectly, only under load, only after a migration.
+            //
+            // Pre-decrementing is the smallest change that survives the
+            // existing write path; `migration_preserves_cell_versions` pins the
+            // property so a future change to the increment rule fails loudly
+            // here rather than silently downstream.
+            let prepared: Vec<OwnedCell> = cells
+                .into_iter()
+                .map(|mut cell| {
+                    cell.header.version = cell.header.version.saturating_sub(1);
+                    cell
+                })
+                .collect();
+
+            // Written as ONE run. Every cell of a batch shares a slot, a slot
+            // is a locality, and a locality picks the chunk -- so they all
+            // target one append head, where each used to take its own claim,
+            // its own reference pair and its own WAL record. See
+            // `Chunk::upsert_run`.
+            // A/B switch, so the batched claim can be measured against the
+            // per-cell one in a single binary rather than across builds.
+            let results = if std::env::var("NEB_DISABLE_BATCHED_RECEIVE").as_deref() == Ok("1") {
+                let mut per_cell = Vec::with_capacity(prepared.len());
+                for cell in prepared {
+                    per_cell.push(self.upsert_cell_unchecked(cell).await);
+                }
+                per_cell
+            } else {
+                self.database_runtime.chunks().upsert_run(prepared)
+            };
+
+            // A migration aborts the whole slot on any failure, so keep the
+            // stop-at-first-failure reporting the driver expects.
             let mut aborted = false;
-            for mut cell in cells {
-                if aborted {
-                    results.push(Err(WriteError::BatchAborted));
-                    continue;
-                }
-                // Land the cell on the SAME version it had on the donor.
-                //
-                // The write path assigns `old_version + 1` (`cell.rs:226`), so a
-                // straight upsert would move a cell and quietly renumber it. That
-                // is not cosmetic: callers derive *cell ids* from a container's
-                // version -- Morpheus's id lists compute segment ids from
-                // `(container, field, schema, root, root_version)` -- so a bumped
-                // version repoints every derived id at a cell that does not exist.
-                // The symptom appears nowhere near the cause: an edge append fails
-                // with "root segment cell does not exist" on a vertex that
-                // migrated perfectly, only under load, only after a migration.
-                //
-                // Pre-decrementing is the smallest change that survives the
-                // existing write path; `migration_preserves_cell_versions` pins the
-                // property so a future change to the increment rule fails loudly
-                // here rather than silently downstream.
-                cell.header.version = cell.header.version.saturating_sub(1);
-                let result = self.upsert_cell_unchecked(cell).await;
-                if result.is_err() {
-                    aborted = true;
-                }
-                results.push(result);
-            }
             results
+                .into_iter()
+                .map(|result| {
+                    if aborted {
+                        return Err(WriteError::BatchAborted);
+                    }
+                    if result.is_err() {
+                        aborted = true;
+                    }
+                    result
+                })
+                .collect()
         }
         .boxed()
     }

@@ -613,6 +613,94 @@ impl Chunk {
         self.try_acquire_in_class(size, full_gc, SegmentClass::Regular)
     }
 
+    /// Claim one span for a run of entries whose sizes are known.
+    ///
+    /// Returns the span and how many of `sizes` it covers: a run is claimed
+    /// from ONE segment, so if the head cannot hold the whole batch this takes
+    /// the prefix that fits and the caller comes back for the rest. Refusing
+    /// the whole batch instead would need cross-segment bookkeeping for no
+    /// gain, since the second call simply rotates to a fresh head.
+    ///
+    /// Falls back to a single-entry claim when only one entry fits, which is
+    /// exactly `try_acquire_in_class` with one more atomic.
+    pub fn try_acquire_run(
+        &self,
+        sizes: &[u32],
+        segment_class: SegmentClass,
+    ) -> Result<Option<(PendingRun, usize)>, WriteError> {
+        if sizes.is_empty() {
+            return Ok(None);
+        }
+        if self.writes_closed.load(Ordering::Acquire) {
+            return Err(WriteError::ServerShuttingDown);
+        }
+        let backoff = Backoff::new();
+        let head_slot = self.head_slot(segment_class);
+        loop {
+            let head_seg_id = head_slot.load(Ordering::Acquire);
+            if head_seg_id == HEAD_SEG_ID_ALLOCATING {
+                backoff.spin();
+                continue;
+            }
+            if head_seg_id != HEAD_SEG_ID_EMPTY {
+                let head = match self.segs.get(&(head_seg_id as usize)) {
+                    Some(seg) => seg,
+                    None => {
+                        backoff.spin();
+                        continue;
+                    }
+                };
+                // Reference BEFORE claiming, for the reason spelled out in
+                // `try_acquire_in_class`: claiming first lets a rotation see
+                // zero references and seal the segment out from under a writer
+                // that has already moved the cursor.
+                if !head.incr_references() {
+                    backoff.spin();
+                    continue;
+                }
+                // How much of the batch fits in what is left of this segment.
+                let remaining = head
+                    .bound()
+                    .saturating_sub(head.append_header.load(Ordering::Acquire));
+                let mut total: u32 = 0;
+                let mut covered = 0usize;
+                for size in sizes {
+                    match total.checked_add(*size) {
+                        Some(next) if (next as usize) <= remaining => {
+                            total = next;
+                            covered += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if covered > 0 {
+                    if let Some(base) = head.try_acquire_run(total) {
+                        return Ok(Some((
+                            PendingRun {
+                                base,
+                                seg: head,
+                                size: total,
+                                skip_sync: is_in_transaction(),
+                            },
+                            covered,
+                        )));
+                    }
+                }
+                // Nothing fits, or the cursor moved under us: give the
+                // reference back before rotating, or it pins the segment
+                // against eviction forever.
+                head.decr_references();
+            }
+            // Not even one entry fits, or there is no head yet. Rotation,
+            // emergency GC and the near-capacity refusal all live in the
+            // single-entry path; rather than duplicate that (and risk the two
+            // copies drifting), say so and let the caller write one cell the
+            // ordinary way. That call rotates the head, and the next run claim
+            // finds a fresh segment.
+            return Ok(None);
+        }
+    }
+
     pub fn try_acquire_in_class(
         &self,
         size: u32,
@@ -1298,6 +1386,163 @@ impl Chunk {
             return Err(WriteError::CellDoesNotExisted);
         }
         Ok(cell.header)
+    }
+
+    /// Upsert a run of cells that all belong to this chunk, claiming ONE span
+    /// of the append log for the whole run.
+    ///
+    /// This is the batched form of `upsert_cell`, and it exists because of how
+    /// a migration batch maps onto storage: `locate_chunk_by_partition` keys
+    /// the chunk off the id's LOCALITY, and a migration batch is one slot,
+    /// which is one locality. So every cell of a batch lands in the same
+    /// chunk and contends on the same append head -- 1024 CAS loops on one
+    /// atomic, 1024 reference pairs, and 1024 WAL records that each take that
+    /// segment's `file_state` lock across a write and an fsync.
+    ///
+    /// Claiming once collapses all three: one reference, one CAS, one WAL
+    /// record per run. Nothing about the per-cell work changes -- each cell is
+    /// still encoded, indexed and accounted individually -- because that part
+    /// is not where the contention was.
+    ///
+    /// Every cell is planned BEFORE anything is claimed, so the only fallible
+    /// step happens while a partial claim is still impossible; the span is
+    /// then filled completely, which it must be, since the append cursor has
+    /// already moved past it.
+    pub fn upsert_run(&self, cells: &[OwnedCell]) -> Vec<Result<CellHeader, WriteError>> {
+        let mut results: Vec<Result<CellHeader, WriteError>> = Vec::with_capacity(cells.len());
+        if cells.is_empty() {
+            return results;
+        }
+
+        // Plan first: a planning failure must not leave a claimed span with a
+        // hole in it, and planning is the only step here that can fail. The
+        // plans borrow their cells, which is why this path takes them by
+        // reference and hands headers back rather than writing through.
+        let mut plans = Vec::with_capacity(cells.len());
+        for cell in cells.iter() {
+            match cell.plan_write(self) {
+                Ok(plan) => plans.push(plan),
+                Err(_) => {
+                    return cells
+                        .iter()
+                        .map(|cell| self.upsert_cell(&mut cell.clone()))
+                        .collect();
+                }
+            }
+        }
+        let sizes: Vec<u32> = plans.iter().map(|p| p.total_size()).collect();
+        let schema_id = plans[0].schema.id;
+
+        let mut i = 0usize;
+        while i < cells.len() {
+            let t_alloc = std::time::Instant::now();
+            let claimed = self.try_acquire_run(&sizes[i..], SegmentClass::Regular);
+            WRITE_ALLOC_NANOS.fetch_add(t_alloc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let claimed = match claimed {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    while i < cells.len() {
+                        results.push(Err(e.clone()));
+                        i += 1;
+                    }
+                    break;
+                }
+            };
+            let Some((run, covered)) = claimed else {
+                // The head cannot take even one entry. The single-entry path
+                // owns rotation, emergency GC and the capacity refusal, so let
+                // it place this cell and rotate; the next claim finds a fresh
+                // head. The clone is the price of that fallback and it is the
+                // rare path -- once per segment, not once per cell.
+                results.push(self.upsert_cell(&mut cells[i].clone()));
+                i += 1;
+                continue;
+            };
+
+            let mut addr = run.base;
+            for j in i..(i + covered) {
+                let hash = cells[j].header.id.bits();
+                // Decide the version BEFORE encoding, because it is written
+                // into the image. An existing cell continues its own version
+                // line; a new one keeps what the caller set, which is how a
+                // migration lands a cell on the version it had.
+                let t_index = std::time::Instant::now();
+                let existing = CellGuard::for_write(hash, true, self);
+                WRITE_INDEX_NANOS.fetch_add(t_index.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let (old_version, old_loc) = match &existing {
+                    Some(guard) => {
+                        let loc = guard.get_ptr();
+                        (cell_version_from_chunk_raw(loc).unwrap_or(0), Some(loc))
+                    }
+                    None => (cells[j].header.version, None),
+                };
+
+                let entry_addr = addr;
+                addr += sizes[j] as usize;
+                let t_copy = std::time::Instant::now();
+                let encoded = cells[j].write_to_addr(&plans[j], entry_addr, old_version);
+                WRITE_COPY_NANOS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                // Journalled per entry, matching `PendingEntry`; see the note
+                // on `PendingRun::journal` for why it is not coalesced.
+                if run.journal(entry_addr, sizes[j]).is_err() {
+                    results.push(Err(WriteError::CannotAllocateSpace));
+                    continue;
+                }
+                let write_result = match encoded {
+                    Ok(result) => result,
+                    Err(e) => {
+                        results.push(Err(e));
+                        continue;
+                    }
+                };
+
+                match existing {
+                    Some(mut guard) => {
+                        let old_indices = guard.old_index_res(&*plans[j].schema).ok().flatten();
+                        guard.set_ptr(write_result.addr);
+                        drop(guard);
+                        self.slot_bytes.add(hash, write_result.content_length);
+                        if let Some(loc) = old_loc.filter(|loc| *loc != 0) {
+                            let old_len = Entry::decode_from(loc, |_, _| {}).0.content_length;
+                            self.slot_bytes.sub(hash, old_len);
+                        }
+                        self.ensure_indices_with_res(&cells[j], old_indices, &*plans[j].schema);
+                        if let Some(loc) = old_loc.filter(|loc| *loc != 0) {
+                            self.mark_dead_entry_with_cell(loc, &cells[j]);
+                        }
+                    }
+                    None => match self.cell_index.try_insert_locked(hash as usize) {
+                        Some(mut guard) => {
+                            *guard = write_result.addr;
+                            drop(guard);
+                            self.slot_bytes.add(hash, write_result.content_length);
+                            self.ensure_indices(&cells[j], None, &*plans[j].schema);
+                        }
+                        None => {
+                            // Someone inserted between the check and here. The
+                            // bytes are already in the claimed span, which must
+                            // stay filled, so the loser becomes dead space --
+                            // the same outcome `write_cell` gives this race.
+                            abandon_entry_version(write_result.addr);
+                            self.mark_dead_entry_with_cell(write_result.addr, &cells[j]);
+                            results.push(Err(WriteError::CellAlreadyExisted));
+                            continue;
+                        }
+                    },
+                }
+
+                let mut header = cells[j].header;
+                header.version = write_result.new_version;
+                header.timestamp = write_result.new_timestamp;
+                results.push(Ok(header));
+                WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
+            }
+            i += covered;
+            // `run` drops here: ONE WAL record for the whole span, and the
+            // segment reference released once.
+        }
+        self.refresh_statistics_for_schema(schema_id);
+        results
     }
 
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
@@ -2096,6 +2341,51 @@ impl Chunk {
     }
 }
 
+/// A contiguous span of a segment claimed for a run of entries.
+///
+/// The batched form of [`PendingEntry`]. One reference, one CAS and one WAL
+/// record for a whole run, instead of one of each per cell -- which is the
+/// difference between 1024 of each and 3 for a default migration batch, all
+/// of them on the SAME segment because a batch shares a locality and locality
+/// picks the chunk.
+///
+/// The caller must fill the entire span: the append cursor has already moved
+/// past it, so anything left unwritten is garbage that recovery would try to
+/// parse. `receive_migrated_cells` satisfies this by planning every cell
+/// before claiming anything, so the only fallible step happens first.
+pub struct PendingRun {
+    pub seg: AArc<Segment>,
+    pub base: usize,
+    pub size: u32,
+    skip_sync: bool,
+}
+
+impl PendingRun {
+    /// Journal one entry of the run.
+    ///
+    /// Deliberately NOT coalesced into a single record for the whole span,
+    /// though the entries are contiguous and it would halve the write count.
+    /// Measured: coalescing took WAL writes from 2.0 to 1.0 per cell and made
+    /// the reshard 3.9x SLOWER (1129 -> 290 MB/s), because `write_wal` holds
+    /// the segment's `file_state` across the write AND the fsync -- so one
+    /// 4 MB record blocks every other writer on that segment for its whole
+    /// duration. Lock hold time went from 10.6s to 121.3s. Fewer, larger
+    /// critical sections only win when the lock is not shared.
+    fn journal(&self, addr: usize, size: u32) -> io::Result<()> {
+        self.seg.write_wal(addr, size, self.skip_sync)
+    }
+}
+
+impl Drop for PendingRun {
+    fn drop(&mut self) {
+        if !self.skip_sync {
+            crate::ram::segs::queue_wal_sync(&self.seg);
+        }
+        self.seg.set_dirty();
+        self.seg.decr_references();
+    }
+}
+
 pub struct PendingEntry {
     pub seg: AArc<Segment>,
     pub addr: usize,
@@ -2663,6 +2953,47 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);
     }
+    /// Upsert many cells, batching the append-log claim per chunk.
+    ///
+    /// Cells are grouped by the chunk they belong to, which for a migration
+    /// batch is ONE chunk: `locate_chunk_by_partition` keys off the id's
+    /// locality and a batch is one slot. Results come back in the caller's
+    /// order regardless of how the grouping fell out.
+    pub fn upsert_run(&self, cells: Vec<OwnedCell>) -> Vec<Result<CellHeader, WriteError>> {
+        if cells.is_empty() {
+            return Vec::new();
+        }
+        // The overwhelmingly common case, and the one this exists for: every
+        // cell of a migration batch shares a locality, so they all belong to
+        // one chunk and the slice can go straight through with no copying.
+        let first_chunk = cells[0].header.id.locality() as usize % self.list.len();
+        if cells
+            .iter()
+            .all(|cell| cell.header.id.locality() as usize % self.list.len() == first_chunk)
+        {
+            return self.list[first_chunk].upsert_run(&cells);
+        }
+
+        let mut by_chunk: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+        for (index, cell) in cells.iter().enumerate() {
+            let chunk_id = cell.header.id.locality() as usize % self.list.len();
+            by_chunk.entry(chunk_id).or_default().push(index);
+        }
+        let mut results: Vec<Option<Result<CellHeader, WriteError>>> =
+            (0..cells.len()).map(|_| None).collect();
+        for (chunk_id, indices) in by_chunk {
+            let group: Vec<OwnedCell> = indices.iter().map(|i| cells[*i].clone()).collect();
+            let group_results = self.list[chunk_id].upsert_run(&group);
+            for (slot, result) in indices.into_iter().zip(group_results.into_iter()) {
+                results[slot] = Some(result);
+            }
+        }
+        results
+            .into_iter()
+            .map(|r| r.unwrap_or(Err(WriteError::CannotAllocateSpace)))
+            .collect()
+    }
+
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.id.locality() as u64);
         return chunk.upsert_cell(cell);

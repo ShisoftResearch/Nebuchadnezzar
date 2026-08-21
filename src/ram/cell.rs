@@ -252,7 +252,20 @@ impl OwnedCell {
         pending_entry: &PendingEntry,
         old_version: u64,
     ) -> Result<WriteToChunkResult, WriteError> {
-        let addr = pending_entry.addr;
+        self.write_to_addr(write_plan, pending_entry.addr, old_version)
+    }
+
+    /// Encode this cell at `addr`, which the caller has already claimed.
+    ///
+    /// Split out so a batch can claim ONE span and lay a run of entries into
+    /// it, rather than claiming per entry. The claim and the encode are
+    /// separate concerns; only the claim was ever tied to `PendingEntry`.
+    pub fn write_to_addr(
+        &self,
+        write_plan: &WritePlan,
+        addr: usize,
+        old_version: u64,
+    ) -> Result<WriteToChunkResult, WriteError> {
         let new_version = old_version + 1;
         let new_timestamp = clock::now();
         debug_assert_eq!(align_address(8, addr), addr, "Entry address is not aligned");
