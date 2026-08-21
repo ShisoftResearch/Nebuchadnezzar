@@ -2059,3 +2059,59 @@ fn ptr_hash_map_remove_does_not_release_the_value() {
          be dropped"
     );
 }
+
+/// MEASUREMENT for task #64 (the Morpheus suite ends holding ~9100 threads
+/// across 302 in-process servers): how many OS threads does one full
+/// `NebServer` boot + `shutdown()` + drop cycle retain?
+///
+/// ```text
+/// cargo test --release --lib server_shutdown_thread_retention_probe -- --ignored --nocapture
+/// ```
+///
+/// A probe, not a gate: it prints the per-cycle retention so the fix (or the
+/// decision that production does not care -- one server per process exits
+/// anyway) can be made from numbers. The first cycle is excluded from the
+/// signal, as anything process-global initializes there.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "measurement probe; run with --ignored --nocapture"]
+async fn server_shutdown_thread_retention_probe() {
+    let _ = env_logger::try_init();
+    let opts = ServerOptions {
+        chunk_size: 16 * 1024 * 1024,
+        db_size: 16 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: None,
+        wal_storage: None,
+        undo_log_storage: None,
+        raft_storage: None,
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: false,
+        disable_storage_locks: true,
+    };
+
+    let mut after_prev = 0usize;
+    for cycle in 0..4 {
+        let before = thread_count();
+        let server = NebServer::new_from_opts(
+            &opts,
+            &crate::utils::test_port::unique_localhost_addr(),
+            "shutdown_thread_probe",
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let peak = thread_count();
+        server.shutdown().await;
+        drop(server);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let after = thread_count();
+        println!(
+            "PROBE cycle={cycle} before={before} peak={peak} after={after} \
+             retained_vs_before={} retained_vs_prev_cycle={}",
+            after.saturating_sub(before),
+            if cycle == 0 { 0 } else { after.saturating_sub(after_prev) }
+        );
+        after_prev = after;
+    }
+}
