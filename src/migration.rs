@@ -3613,6 +3613,7 @@ mod cluster_tests {
         reset_migration_phase_timers();
         let cold_before = crate::ram::segs::cold_block_counters();
         let writes_before = crate::ram::chunk::write_phase_counters();
+        let wal_before = crate::ram::segs::wal_counters();
         let tier_before = servers[0]
             .chunks()
             .tiered_manager
@@ -3667,6 +3668,21 @@ mod cluster_tests {
                 wpct(w.index),
                 wpct(w.secondary),
                 wpct(w.stats)
+            );
+            // The per-segment WAL lock is held across the write syscall AND the
+            // fsync, so concurrent writers to one segment serialise there. The
+            // rule the counters were added for: wait far above held means the
+            // lock IS the limit; comparable means it is not.
+            let wal = crate::ram::segs::wal_counters().minus(&wal_before);
+            println!(
+                "MEASUREMENT: WAL -- {} writes ({:.1} per cell), lock contended {} times, \
+                 waited {:.1}s vs held {:.1}s (wait/held {:.1}x)",
+                wal.writes,
+                wal.writes as f64 / (cells.max(1) as f64),
+                wal.contended,
+                wal.wait_nanos as f64 / 1e9,
+                wal.held_nanos as f64 / 1e9,
+                wal.wait_nanos as f64 / wal.held_nanos.max(1) as f64
             );
             let cold = crate::ram::segs::cold_block_counters().minus(&cold_before);
             let useful = cells * payload_bytes as u64;

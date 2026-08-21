@@ -102,6 +102,35 @@ pub static WAL_LOCK_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static WAL_LOCK_HELD_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static WAL_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
 
+/// A snapshot of the WAL counters, so a measurement can subtract a baseline.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalCounters {
+    pub writes: u64,
+    pub wait_nanos: u64,
+    pub held_nanos: u64,
+    pub contended: u64,
+}
+
+impl WalCounters {
+    pub fn minus(&self, before: &WalCounters) -> WalCounters {
+        WalCounters {
+            writes: self.writes.saturating_sub(before.writes),
+            wait_nanos: self.wait_nanos.saturating_sub(before.wait_nanos),
+            held_nanos: self.held_nanos.saturating_sub(before.held_nanos),
+            contended: self.contended.saturating_sub(before.contended),
+        }
+    }
+}
+
+pub fn wal_counters() -> WalCounters {
+    WalCounters {
+        writes: WAL_WRITES.load(Ordering::Relaxed),
+        wait_nanos: WAL_LOCK_WAIT_NANOS.load(Ordering::Relaxed),
+        held_nanos: WAL_LOCK_HELD_NANOS.load(Ordering::Relaxed),
+        contended: WAL_LOCK_CONTENDED.load(Ordering::Relaxed),
+    }
+}
+
 /// Records how long the WAL lock was held, on every exit path.
 struct WalHoldTimer(std::time::Instant);
 impl Drop for WalHoldTimer {
