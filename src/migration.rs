@@ -3614,6 +3614,7 @@ mod cluster_tests {
         let cold_before = crate::ram::segs::cold_block_counters();
         let writes_before = crate::ram::chunk::write_phase_counters();
         let wal_before = crate::ram::segs::wal_counters();
+        let alloc_before = crate::ram::chunk::alloc_phase_counters();
         let tier_before = servers[0]
             .chunks()
             .tiered_manager
@@ -3673,6 +3674,16 @@ mod cluster_tests {
             // fsync, so concurrent writers to one segment serialise there. The
             // rule the counters were added for: wait far above held means the
             // lock IS the limit; comparable means it is not.
+            let ap = crate::ram::chunk::alloc_phase_counters().minus(&alloc_before);
+            println!(
+                "MEASUREMENT: alloc detail -- {} rotations, rotate {:.2}s total \
+                 (drain {:.2}s, archive {:.2}s), spin-wait {:.2}s",
+                ap.rotations,
+                ap.rotate as f64 / 1e9,
+                ap.drain as f64 / 1e9,
+                ap.archive as f64 / 1e9,
+                ap.spin as f64 / 1e9
+            );
             let wal = crate::ram::segs::wal_counters().minus(&wal_before);
             println!(
                 "MEASUREMENT: WAL -- {} writes ({:.1} per cell), lock contended {} times, \

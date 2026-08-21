@@ -40,6 +40,58 @@ pub static WRITE_INDEX_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_SECONDARY_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static WRITE_STATS_NANOS: AtomicU64 = AtomicU64::new(0);
 
+/// Decomposition of the allocation phase, which is most of a bulk write's
+/// cost. `alloc` was one opaque number; these split it into what a writer
+/// spends WAITING (on the ALLOCATING slot or a busy head) versus what the one
+/// rotating writer spends doing the rotation itself -- and, within rotation,
+/// what the seal-time archive costs, since that is a full segment compress +
+/// write + fsync taken inline on the write path.
+pub static ALLOC_SPIN_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static ROTATE_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static ROTATE_DRAIN_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static ROTATE_ARCHIVE_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static ROTATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot for baseline subtraction in measurements.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllocPhaseCounters {
+    pub spin: u64,
+    pub rotate: u64,
+    pub drain: u64,
+    pub archive: u64,
+    pub rotations: u64,
+}
+
+impl AllocPhaseCounters {
+    pub fn minus(&self, b: &AllocPhaseCounters) -> AllocPhaseCounters {
+        AllocPhaseCounters {
+            spin: self.spin.saturating_sub(b.spin),
+            rotate: self.rotate.saturating_sub(b.rotate),
+            drain: self.drain.saturating_sub(b.drain),
+            archive: self.archive.saturating_sub(b.archive),
+            rotations: self.rotations.saturating_sub(b.rotations),
+        }
+    }
+}
+
+/// Accumulates rotation wall time on every exit path, panic included.
+struct RotateTimer(std::time::Instant);
+impl Drop for RotateTimer {
+    fn drop(&mut self) {
+        ROTATE_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+pub fn alloc_phase_counters() -> AllocPhaseCounters {
+    AllocPhaseCounters {
+        spin: ALLOC_SPIN_NANOS.load(Ordering::Relaxed),
+        rotate: ROTATE_NANOS.load(Ordering::Relaxed),
+        drain: ROTATE_DRAIN_NANOS.load(Ordering::Relaxed),
+        archive: ROTATE_ARCHIVE_NANOS.load(Ordering::Relaxed),
+        rotations: ROTATIONS.load(Ordering::Relaxed),
+    }
+}
+
 /// The write path's per-phase timers, for subtracting a baseline around a
 /// measured region.
 #[derive(Debug, Clone, Copy, Default)]
@@ -260,8 +312,48 @@ pub fn is_in_transaction() -> bool {
     IN_TRANSACTION.with(|flag| flag.get())
 }
 
+/// Segments waiting for their post-rotation drain/sync/archive/seal.
+///
+/// A plain locked vec, not a channel: rotations are rare (once per 8 MB of
+/// writes), the consumer is one background thread, and `enqueue` must be able
+/// to answer "no" for backpressure -- past `SEAL_QUEUE_LIMIT` the rotating
+/// writer archives inline, throttling writers to what archiving sustains.
+pub struct SealQueue {
+    pending: parking_lot::Mutex<Vec<(usize, u64)>>,
+}
+
+/// Beyond this backlog, rotation archives inline. Small on purpose: the queue
+/// exists to absorb bursts, not to let backup creation lag a sustained import
+/// without bound.
+const SEAL_QUEUE_LIMIT: usize = 64;
+
+impl SealQueue {
+    pub fn new() -> Self {
+        Self {
+            pending: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+    /// True if accepted; false means the caller must do the work inline.
+    fn enqueue(&self, chunk_id: usize, seg_id: u64) -> bool {
+        let mut pending = self.pending.lock();
+        if pending.len() >= SEAL_QUEUE_LIMIT {
+            return false;
+        }
+        pending.push((chunk_id, seg_id));
+        true
+    }
+    pub fn drain(&self) -> Vec<(usize, u64)> {
+        std::mem::take(&mut *self.pending.lock())
+    }
+    pub fn len(&self) -> usize {
+        self.pending.lock().len()
+    }
+}
+
 pub struct Chunk {
     pub id: usize,
+    /// Shared with every chunk of the store and drained by the sealer thread.
+    pub seal_queue: Arc<SealQueue>,
     pub cell_index: WordMap,
     /// Live bytes per slot, shared across every chunk of this store. See
     /// [`crate::slots::SlotLiveBytes`] for the contract; the hooks live on the
@@ -434,6 +526,7 @@ impl Chunk {
         tiered_manager: Option<Arc<crate::ram::tiered::manager::TieredMemoryManager>>,
         cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
         slot_bytes: Arc<crate::slots::SlotLiveBytes>,
+        seal_queue: Arc<SealQueue>,
     ) -> Chunk {
         // Call new_with_base with base_addr=0 to use old allocation behavior
         Self::new_with_base(
@@ -448,6 +541,7 @@ impl Chunk {
             cleaner_wake,
             0,
             slot_bytes,
+            seal_queue,
         )
     }
 
@@ -463,6 +557,7 @@ impl Chunk {
         cleaner_wake: Arc<crate::ram::cleaner::CleanerWake>,
         estimated_cells: usize,
         slot_bytes: Arc<crate::slots::SlotLiveBytes>,
+        seal_queue: Arc<SealQueue>,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -527,6 +622,7 @@ impl Chunk {
             segs,
             cell_index: index,
             slot_bytes,
+            seal_queue,
             meta,
             backup_storage,
             wal_storage,
@@ -717,7 +813,9 @@ impl Chunk {
             let head_seg_id = head_slot.load(Ordering::Acquire);
             if head_seg_id == HEAD_SEG_ID_ALLOCATING {
                 // Allocating new segment in progress, wait for it to complete
+                let t_spin = std::time::Instant::now();
                 backoff.spin();
+                ALLOC_SPIN_NANOS.fetch_add(t_spin.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 continue;
             }
             if head_seg_id != HEAD_SEG_ID_EMPTY {
@@ -864,6 +962,9 @@ impl Chunk {
             // 300% CPU forever. The guard restores the previous head on ANY
             // early exit, panic included, so the worst case is an error the
             // caller can act on.
+            let t_rotate = std::time::Instant::now();
+            ROTATIONS.fetch_add(1, Ordering::Relaxed);
+            let _rotate_timer = RotateTimer(t_rotate);
             let restore = HeadSlotGuard {
                 slot: head_slot,
                 restore_to: head_seg_id,
@@ -919,102 +1020,141 @@ impl Chunk {
             self.put_segment(new_seg);
 
             if head_seg_id != HEAD_SEG_ID_EMPTY {
-                if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
-                    // Let the writers that acquired from this segment finish
-                    // before it stops being writable.
-                    //
-                    // Rotation only publishes a new head; entries acquired from
-                    // the old one moments earlier are still in flight, and each
-                    // holds a reference until its `PendingEntry` drops (which is
-                    // where the WAL write happens). Closing its WAL and
-                    // archiving underneath them is what made the twin: the late
-                    // write found no WAL and re-created one beside a backup that
-                    // did not contain it. Sealing turned that silent corruption
-                    // into a refused write -- 3,958 failed batches in one import
-                    // -- which is the same race being reported instead of
-                    // hidden. Draining first is the actual fix.
-                    //
-                    // Bounded, because a reference can also be a long-lived read
-                    // guard and rotation runs on the write path. If it does not
-                    // drain, the archive is simply skipped: the segment stays
-                    // dirty and unsealed, so late writes still land in its WAL
-                    // and eviction, shutdown or recovery archive it later.
-                    let drain = Backoff::new();
-                    let mut drained = old_head.no_references();
-                    for _ in 0..512 {
-                        if drained {
-                            break;
-                        }
-                        // We are waiting on other threads to finish their
-                        // writes; the head slot already points at the new
-                        // segment, so nothing is blocked behind this. Yield
-                        // periodically rather than burning a core on a wait
-                        // that is normally over in microseconds.
-                        drain.spin();
-                        std::thread::yield_now();
-                        drained = old_head.no_references();
+                // The old head's drain -> WAL sync -> archive -> seal. The
+                // archive is a full segment compress + write + fsync, measured
+                // at 68% of ALL rotation time and rotation at ~95% of a bulk
+                // write's allocation cost -- taken inline, on the write path,
+                // by whichever writer happened to fill the segment. Nothing
+                // downstream needs it to be synchronous: the WAL already makes
+                // the data durable, and the skip path below has always left
+                // un-drained segments dirty and unsealed for eviction,
+                // shutdown or recovery to archive later. So hand the work to
+                // the background sealer, which runs the identical sequence.
+                //
+                // Backpressure instead of an unbounded queue: archiving
+                // sustains ~190 MB/s per thread while the write path bursts
+                // past 1 GB/s, so a long import could outrun the sealer. Past
+                // a small backlog the rotating writer archives inline again,
+                // which throttles the writers to what archiving keeps up
+                // with -- the exact behaviour before this change, only now it
+                // costs the write path nothing until the sealer is actually
+                // behind.
+                let sealed_in_background = std::env::var("NEB_SYNC_SEAL_ARCHIVE").as_deref()
+                    != Ok("1")
+                    && self.seal_queue.enqueue(self.id, head_seg_id);
+                if !sealed_in_background {
+                    self.finish_rotated_head(head_seg_id);
+                }
+            }
+        }
+    }
+
+    /// Drain, sync, archive and seal a segment that has just stopped being the
+    /// head. Runs inline from rotation (under backpressure or the
+    /// NEB_SYNC_SEAL_ARCHIVE toggle) or on the background sealer; the sequence
+    /// is identical either way.
+    pub(crate) fn finish_rotated_head(&self, head_seg_id: u64) {
+            if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
+                // Let the writers that acquired from this segment finish
+                // before it stops being writable.
+                //
+                // Rotation only publishes a new head; entries acquired from
+                // the old one moments earlier are still in flight, and each
+                // holds a reference until its `PendingEntry` drops (which is
+                // where the WAL write happens). Closing its WAL and
+                // archiving underneath them is what made the twin: the late
+                // write found no WAL and re-created one beside a backup that
+                // did not contain it. Sealing turned that silent corruption
+                // into a refused write -- 3,958 failed batches in one import
+                // -- which is the same race being reported instead of
+                // hidden. Draining first is the actual fix.
+                //
+                // Bounded, because a reference can also be a long-lived read
+                // guard and rotation runs on the write path. If it does not
+                // drain, the archive is simply skipped: the segment stays
+                // dirty and unsealed, so late writes still land in its WAL
+                // and eviction, shutdown or recovery archive it later.
+                let t_drain = std::time::Instant::now();
+                let drain = Backoff::new();
+                let mut drained = old_head.no_references();
+                for _ in 0..512 {
+                    if drained {
+                        break;
                     }
-                    if !drained {
-                        debug!(
-                            "Segment {} (chunk {}) still has {} references at rotation; leaving it \
-                             dirty and unsealed rather than archiving under an active writer",
-                            head_seg_id,
-                            self.id,
-                            old_head.references_count()
-                        );
-                        continue;
-                    }
-                    if let Err(e) = old_head.force_wal_sync() {
+                    // We are waiting on other threads to finish their
+                    // writes; the head slot already points at the new
+                    // segment, so nothing is blocked behind this. Yield
+                    // periodically rather than burning a core on a wait
+                    // that is normally over in microseconds.
+                    drain.spin();
+                    std::thread::yield_now();
+                    drained = old_head.no_references();
+                }
+                ROTATE_DRAIN_NANOS
+                    .fetch_add(t_drain.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if !drained {
+                    debug!(
+                        "Segment {} (chunk {}) still has {} references at rotation; leaving it \
+                         dirty and unsealed rather than archiving under an active writer",
+                        head_seg_id,
+                        self.id,
+                        old_head.references_count()
+                    );
+                    return;
+                }
+                if let Err(e) = old_head.force_wal_sync() {
+                    warn!(
+                        "Failed to sync WAL for old head segment {}: {}",
+                        head_seg_id, e
+                    );
+                }
+                let mut state = old_head.file_state.lock();
+                if let Some(wal) = state.wal.take() {
+                    if let Err(e) = wal.sync_all() {
                         warn!(
-                            "Failed to sync WAL for old head segment {}: {}",
+                            "Failed to sync WAL during close for old head segment {}: {}",
                             head_seg_id, e
                         );
                     }
-                    let mut state = old_head.file_state.lock();
-                    if let Some(wal) = state.wal.take() {
-                        if let Err(e) = wal.sync_all() {
-                            warn!(
-                                "Failed to sync WAL during close for old head segment {}: {}",
-                                head_seg_id, e
-                            );
-                        }
-                        drop(wal);
-                        debug!(
-                            "Closed WAL file for old head segment {} (freed file descriptor)",
-                            head_seg_id
-                        );
-                    }
-                    drop(state);
-
-                    // Seal-time archive. A segment stops being head exactly
-                    // once, and from then on it is immutable, so this is the
-                    // one place its durable copy should be written -- and the
-                    // only place that makes "sealed implies archived" an
-                    // invariant the rest of the system can rely on.
-                    //
-                    // Without it, archiving only happened incidentally: from
-                    // eviction, from combine, or from archive_all at
-                    // shutdown. A sealed segment that was never evicted stayed
-                    // durable only in its WAL, so a restart restored it from
-                    // WAL with no backup at all -- and everything downstream
-                    // (the tier believing it droppable, the cleaner freeing
-                    // it, the archiver later writing a zero-filled image over
-                    // it) followed from that. The 2016 boundary snapshot shows
-                    // 977 such segments against 20,697 archived ones; TB13
-                    // carried 18,336 of them into the restart that lost data.
-                    match old_head.archive() {
-                        Ok(true) => debug!("Sealed and archived segment {}", head_seg_id),
-                        // Already archived: re-sealing must never rewrite an
-                        // immutable segment.
-                        Ok(false) => {}
-                        Err(e) => error!(
-                            "SEAL ARCHIVE FAILED for segment {} (chunk {}): {}. It stays dirty \
-                             and resident; its only durable copy is its WAL.",
-                            head_seg_id, self.id, e
-                        ),
-                    }
+                    drop(wal);
+                    debug!(
+                        "Closed WAL file for old head segment {} (freed file descriptor)",
+                        head_seg_id
+                    );
                 }
-            }
+                drop(state);
+
+                // Seal-time archive. A segment stops being head exactly
+                // once, and from then on it is immutable, so this is the
+                // one place its durable copy should be written -- and the
+                // only place that makes "sealed implies archived" an
+                // invariant the rest of the system can rely on.
+                //
+                // Without it, archiving only happened incidentally: from
+                // eviction, from combine, or from archive_all at
+                // shutdown. A sealed segment that was never evicted stayed
+                // durable only in its WAL, so a restart restored it from
+                // WAL with no backup at all -- and everything downstream
+                // (the tier believing it droppable, the cleaner freeing
+                // it, the archiver later writing a zero-filled image over
+                // it) followed from that. The 2016 boundary snapshot shows
+                // 977 such segments against 20,697 archived ones; TB13
+                // carried 18,336 of them into the restart that lost data.
+                let t_archive = std::time::Instant::now();
+                let archive_result = old_head.archive();
+                ROTATE_ARCHIVE_NANOS
+                    .fetch_add(t_archive.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                match archive_result {
+                    Ok(true) => debug!("Sealed and archived segment {}", head_seg_id),
+                    // Already archived: re-sealing must never rewrite an
+                    // immutable segment.
+                    Ok(false) => {}
+                    Err(e) => error!(
+                        "SEAL ARCHIVE FAILED for segment {} (chunk {}): {}. It stays dirty \
+                         and resident; its only durable copy is its WAL.",
+                        head_seg_id, self.id, e
+                    ),
+                }
         }
     }
 
@@ -1797,6 +1937,26 @@ impl Chunk {
 
     #[inline(always)]
     pub fn put_segment(&self, segment: Segment) {
+        // PROBE: no two live segments may overlap in address space. If the
+        // allocator ever double-hands an address range, every write and every
+        // cold fault-in for one segment lands inside the other -- which reads
+        // as "requested id X, found valid id Y at the same offsets", the
+        // 20-second reshard loss signature. Cheap relative to rotation.
+        {
+            let base = segment.addr;
+            let bound = segment.addr + SEGMENT_SIZE;
+            for existing in self.segs.iter_front_values() {
+                let eb = existing.addr;
+                let ee = existing.addr + SEGMENT_SIZE;
+                if base < ee && eb < bound {
+                    error!(
+                        "SEGMENT ADDRESS OVERLAP in chunk {}: publishing segment {} (seq {}) \
+                         at {:#x} overlapping live segment {} (seq {}) at {:#x}",
+                        self.id, segment.id, segment.seq_id, base, existing.id, existing.seq_id, eb
+                    );
+                }
+            }
+        }
         debug!(
             "Putting segment for chunk {} with id {}",
             self.id, segment.id
@@ -2607,6 +2767,7 @@ impl Chunks {
 
         let cleaner_wake = Arc::new(crate::ram::cleaner::CleanerWake::new());
         let slot_bytes = Arc::new(crate::slots::SlotLiveBytes::new());
+        let seal_queue = Arc::new(SealQueue::new());
         for i in 0..count {
             let chunk_base = global_base_addr + (i * chunk_size);
             let backup_storage = backup_storage
@@ -2627,6 +2788,7 @@ impl Chunks {
                 cleaner_wake.clone(),
                 estimated_cells[i],
                 slot_bytes.clone(),
+                seal_queue.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
@@ -2649,6 +2811,36 @@ impl Chunks {
 
         if let Some(ref manager) = chunks_arc.tiered_manager {
             manager.register_chunks(&chunks_arc);
+        }
+
+        // Sealer: drains the post-rotation archive queue. Same lifetime rules
+        // as the stats sweeper below -- weak, so the thread never keeps the
+        // store alive, and it exits on stop_background or drop. A 10 ms poll
+        // adds nothing to durability (the WAL is what makes writes durable;
+        // the archive is the tier's backup copy) and is invisible against the
+        // ~43 ms an archive itself takes.
+        //
+        // Anything still queued when the store shuts down is covered by
+        // `archive_all`, which archives every dirty segment at shutdown and
+        // always has.
+        {
+            let weak = Arc::downgrade(&chunks_arc);
+            let stopped = chunks_arc.background_stopped.clone();
+            std::thread::Builder::new()
+                .name("seal-archiver".into())
+                .spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let Some(chunks) = weak.upgrade() else { break };
+                    for (chunk_id, seg_id) in chunks.seal_queue().drain() {
+                        if let Some(chunk) = chunks.list.get(chunk_id) {
+                            chunk.finish_rotated_head(seg_id);
+                        }
+                    }
+                })
+                .expect("spawn seal-archiver");
         }
 
         // Statistics sweeper: the only place chunk statistics are rebuilt.
@@ -2784,6 +2976,10 @@ impl Chunks {
     /// Live bytes for each named slot, from the write-path counters.
     /// One atomic load per slot -- safe to call from anything, including an
     /// RPC handler or a balancer's poll.
+    pub fn seal_queue(&self) -> &Arc<SealQueue> {
+        &self.list[0].seal_queue
+    }
+
     pub fn slot_live_bytes(&self, slots: &[u32]) -> Vec<u64> {
         slots.iter().map(|slot| self.slot_bytes.get(*slot)).collect()
     }
