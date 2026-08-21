@@ -76,14 +76,13 @@
 //!   with the racing-write failure model that proves it.
 
 use crate::client::AsyncClient;
-use crate::ram::cell::{OwnedCell, ReadError, WriteError};
+use crate::ram::cell::{ReadError, WriteError};
 use crate::server::cell_rpc::AsyncServiceClient as CellServiceClient;
 use crate::slots::{slot_group_id, SLOT_COUNT};
 use bifrost::conshash::slots::client::SMClient as SlotsSMClient;
 use bifrost::conshash::slots::SlotState;
 use bifrost::rpc::RPCError;
 use dovahkiin::types::Id;
-use futures::stream::{self, StreamExt};
 use std::fmt;
 use std::sync::Arc;
 
@@ -597,14 +596,47 @@ async fn migrate_slot_prepared(
     .await;
 
     if let Err(error) = outcome {
-        // Give the slot back to its donor. Whatever reached the recipient is
-        // harmless: nothing routes to it, and a retry upserts over it.
+        // Give the slot back to its donor.
         if let Err(abort_error) = placement.abort_slot_migration(&group, &slot).await {
             warn!(
                 "slot {slot} transfer failed ({error}) and the migration could not be aborted \
                  ({abort_error:?}); the slot stays with donor {from} but its table entry still \
                  reads as migrating"
             );
+        }
+        // And take back what already landed on the recipient. Routing-wise
+        // those copies are harmless -- nothing points at them -- but they are
+        // NOT free: they sit in the recipient's storage and its live-byte
+        // accounting for a slot it does not own, forever if no retry comes.
+        // Measured: an aborted fill left a joiner whose per-slot counters
+        // disagreed with its total by exactly the orphaned megabytes.
+        // `drop_migrated_cells` removes bodies and keeps the cluster-global
+        // index entries, which the donor's still-live copies need. Best
+        // effort: a copy that survives an unreachable recipient is the same
+        // benign orphan as before, just rarer, and a retried migration
+        // upserts over it.
+        if let Ok(recipient) = client.client_by_server_id(to).await {
+            if let Ok(orphaned) = recipient.cell_ids_in_slots(&vec![slot]).await {
+                if !orphaned.is_empty() {
+                    match recipient.drop_migrated_cells(&orphaned).await {
+                        Ok(results) => {
+                            let dropped =
+                                results.iter().filter(|result| result.is_ok()).count();
+                            warn!(
+                                "slot {slot} transfer aborted; removed {dropped} of {} cells \
+                                 already landed on recipient {to}",
+                                orphaned.len()
+                            );
+                        }
+                        Err(rpc_error) => warn!(
+                            "slot {slot} transfer aborted but recipient {to} kept {} orphaned \
+                             cells (cleanup failed: {rpc_error:?}); a retried migration will \
+                             upsert over them",
+                            orphaned.len()
+                        ),
+                    }
+                }
+            }
         }
         return Err(error);
     }
@@ -1125,6 +1157,49 @@ pub async fn reshard_slots(
                 handover.slot,
                 format!("transferred but committed to {other:?} rather than {to}"),
             )),
+        }
+    }
+
+    // Take back what landed on the recipient for slots that will not commit:
+    // everything aborted, plus anything that transferred but was not in the
+    // commit's own answer. Those copies are invisible to routing but sit in
+    // the recipient's storage and live-byte accounting forever if no retry
+    // comes -- measured as a joiner whose per-slot counters disagreed with
+    // its total by exactly the orphaned batches. `drop_migrated_cells` keeps
+    // the cluster-global index entries the donor's live copies still need.
+    // Best effort: a leftover copy is the same benign orphan as before, and
+    // a retried migration upserts over it. Slots committed to a THIRD member
+    // are deliberately not touched -- those cells are somebody's live data.
+    let mut orphaned_slots: Vec<u32> = aborted.iter().copied().collect();
+    orphaned_slots.extend(ready.iter().filter(|slot| !committed_map.contains_key(slot)));
+    if !orphaned_slots.is_empty() {
+        match recipient.cell_ids_in_slots(&orphaned_slots).await {
+            Ok(orphaned) if !orphaned.is_empty() => {
+                match recipient.drop_migrated_cells(&orphaned).await {
+                    Ok(results) => {
+                        let dropped = results.iter().filter(|result| result.is_ok()).count();
+                        warn!(
+                            "{} slots did not commit to {to}; removed {dropped} of {} cells \
+                             already landed there",
+                            orphaned_slots.len(),
+                            orphaned.len()
+                        );
+                    }
+                    Err(rpc_error) => warn!(
+                        "{} slots did not commit to {to} and its {} landed cells could not \
+                         be removed ({rpc_error:?}); a retried migration will upsert over \
+                         them",
+                        orphaned_slots.len(),
+                        orphaned.len()
+                    ),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => warn!(
+                "{} slots did not commit to {to} and what landed there could not be \
+                 enumerated for cleanup: {error:?}",
+                orphaned_slots.len()
+            ),
         }
     }
 
@@ -4192,59 +4267,64 @@ pub mod drain {
             // instead of finishing. Find out why the bulk `reassign_slots` pass
             // stops making progress under it before changing this again, and A/B
             // on a machine with few enough cores to see it.
-            let concurrency = plan.concurrent_slots.max(1);
-            type SlotOutcome = (u32, u64, Result<(SlotHandover, Result<Reclaim, MigrationError>), MigrationError>);
-            let outcomes: Vec<SlotOutcome> = stream::iter(
-                assign(&with_data, &sorted).into_iter().map(|(slot, destination)| {
-                    let ids = held.get(&slot).cloned().unwrap_or_default();
-                    async move {
-                        match migrate_slot_prepared(client, slot, departing, destination, plan, ids)
-                            .await
-                        {
-                            Ok(handover) => {
-                                // Reclaimed per slot, not deferred to the end: a
-                                // drain exists so a member can leave, and it
-                                // cannot leave while it still holds the data.
-                                // `reshard_slots` defers every drop because there
-                                // the donor is staying; here that would defeat
-                                // the purpose.
-                                let reclaim = reclaim_donor_copy(
-                                    client, slot, departing, destination, plan,
-                                )
-                                .await;
-                                (slot, destination, Ok((handover, reclaim)))
-                            }
-                            Err(error) => (slot, destination, Err(error)),
-                        }
-                    }
-                }),
-            )
-            .buffer_unordered(concurrency)
-            .collect()
+            // Bucketed by destination and moved with `reshard_slots`, so the
+            // consensus cost is two raft commands per DESTINATION rather than
+            // two per slot. Measured before this: ~108 ms of serialized
+            // consensus per slot put a 2048-slot drain at 9.2 MB/s while the
+            // same store reshard ran at 1.3 GB/s. The destinations hold
+            // disjoint slot sets from one donor, so they proceed together.
+            let mut by_destination: std::collections::HashMap<u64, Vec<u32>> =
+                Default::default();
+            for (slot, destination) in assign(&with_data, &sorted) {
+                by_destination.entry(destination).or_default().push(slot);
+            }
+            let outcomes = futures::future::join_all(by_destination.into_iter().map(
+                |(destination, slots)| async move {
+                    (
+                        destination,
+                        reshard_slots(client, &slots, departing, destination, plan).await,
+                    )
+                },
+            ))
             .await;
 
-            for (slot, destination, outcome) in outcomes {
-                match outcome {
-                    Ok((handover, reclaim)) => {
-                        drain.cells_transferred += handover.cells_transferred;
-                        match reclaim {
-                            Ok(reclaim) if reclaim.retained == 0 => {
-                                drain.moved.push((slot, destination))
-                            }
-                            Ok(reclaim) => failed.push((
-                                slot,
+            for (destination, reshard) in outcomes {
+                let mut failed_slots: std::collections::HashSet<u32> =
+                    reshard.failed.iter().map(|(slot, _)| *slot).collect();
+                for (slot, reason) in reshard.failed {
+                    failed.push((slot, reason));
+                }
+                let retained_by_slot: std::collections::HashMap<u32, usize> = reshard
+                    .reclaims
+                    .iter()
+                    .map(|reclaim| (reclaim.slot, reclaim.retained))
+                    .collect();
+                for handover in reshard.handovers {
+                    drain.cells_transferred += handover.cells_transferred;
+                    match retained_by_slot.get(&handover.slot) {
+                        // A drain exists so a member can leave, and it cannot
+                        // leave while it still holds the data: a slot only
+                        // counts as moved once its donor copy is fully gone.
+                        Some(0) => drain.moved.push((handover.slot, destination)),
+                        Some(retained) => failed.push((
+                            handover.slot,
+                            format!(
+                                "handed over to {destination} but {retained} cells could \
+                                 not be dropped"
+                            ),
+                        )),
+                        None if failed_slots.contains(&handover.slot) => {}
+                        None => {
+                            failed_slots.insert(handover.slot);
+                            failed.push((
+                                handover.slot,
                                 format!(
-                                    "handed over to {destination} but {} cells could not be dropped",
-                                    reclaim.retained
+                                    "migrated to {destination} but its reclaim never \
+                                     reported"
                                 ),
-                            )),
-                            Err(error) => failed.push((
-                                slot,
-                                format!("migrated to {destination}, reclaim failed: {error}"),
-                            )),
+                            ));
                         }
                     }
-                    Err(error) => failed.push((slot, error.to_string())),
                 }
             }
 

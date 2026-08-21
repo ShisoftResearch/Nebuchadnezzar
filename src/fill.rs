@@ -210,10 +210,22 @@ impl crate::server::NebServer {
             group,
         );
         let report = filler.fill_joiner(joiner, &members).await?;
-        info!(
-            "join fill for {joiner}: moved {} slots ({} bytes) in {} rounds, stopped: {:?}",
-            report.moved_slots, report.moved_bytes, report.rounds, report.stopped
-        );
+        // A fill that ends any way but Filled is an OPERATIONAL event -- the
+        // balancer stopped itself -- and one that only speaks at info is a
+        // balancer that stops silently. Measured: a scale fill moved 64 MB of
+        // a 1.3 GB gap and nothing said why, because the reason was an info
+        // line under a warn-level filter.
+        match report.stopped {
+            bifrost::conshash::fill::FillStop::Filled => info!(
+                "join fill for {joiner}: moved {} slots ({} bytes) in {} rounds, stopped: {:?}",
+                report.moved_slots, report.moved_bytes, report.rounds, report.stopped
+            ),
+            ref stopped => warn!(
+                "join fill for {joiner} STOPPED EARLY after {} slots ({} bytes) in {} rounds: \
+                 {:?}",
+                report.moved_slots, report.moved_bytes, report.rounds, stopped
+            ),
+        }
         Ok(report)
     }
 
@@ -224,15 +236,48 @@ impl crate::server::NebServer {
     /// alive forever.
     pub async fn start_join_fill_watcher(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
+        // One fill per joiner at a time, no matter how many times the join
+        // event arrives. Notification delivery is at-least-once, and two
+        // fills for the same joiner race each other's slot handovers: both
+        // begin the same migration (the begin is idempotent for retries),
+        // both transfer, and one's abort or commit lands under the other --
+        // measured as CellAlreadyExisted batch rejections and slots
+        // "committed to None". A duplicate event during the stability window
+        // coalesces into the pending fill, which reads the placement fresh
+        // when it fires anyway.
+        let inflight: Arc<std::sync::Mutex<std::collections::HashSet<u64>>> =
+            Default::default();
         let subscription = self
             .membership
             .on_group_member_joined(
                 move |(member, _version)| {
                     let weak = weak.clone();
+                    let inflight = inflight.clone();
                     async move {
                         let Some(server) = weak.upgrade() else { return };
+                        if !inflight.lock().unwrap().insert(member.id) {
+                            debug!(
+                                "join fill for {} already pending; coalescing the duplicate \
+                                 join event",
+                                member.id
+                            );
+                            return;
+                        }
                         tokio::spawn(async move {
                             tokio::time::sleep(stability_window()).await;
+                            // Release on every exit, panic included: a leaked
+                            // entry would silently disable fills for this
+                            // joiner until restart.
+                            struct Release(
+                                Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+                                u64,
+                            );
+                            impl Drop for Release {
+                                fn drop(&mut self) {
+                                    self.0.lock().unwrap().remove(&self.1);
+                                }
+                            }
+                            let _release = Release(inflight.clone(), member.id);
                             match server.fill_joining_member(member.id).await {
                                 Ok(report) => {
                                     if report.moved_slots > 0 {
