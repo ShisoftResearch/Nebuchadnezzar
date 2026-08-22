@@ -2265,7 +2265,12 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         disable_storage_locks: true,
     };
     let group = "secondary_index_restart_group";
-    const SCHEMA: u32 = 9180;
+    // NEB_IDX_RESTART_SCHEMA overrides to probe encoding-sensitive ranges;
+    // the live sidecar system schemas live at 0xF013..0xF019.
+    let schema_id: u32 = std::env::var("NEB_IDX_RESTART_SCHEMA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9180);
     // Enough by default to catch presence; NEB_IDX_RESTART_CELLS=300000
     // forces a height>=2 reconstruction, which is where a reconstructed
     // tree's SCAN can break while its keys all load (measured live:
@@ -2276,7 +2281,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         .unwrap_or(64);
     let schema = || {
         Schema::new_with_id(
-            SCHEMA,
+            schema_id,
             "secondary_index_restart_schema",
             None,
             Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
@@ -2288,12 +2293,12 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
     const CELLS_SENTINEL: u64 = 0; // silences the const references below
     let _ = CELLS_SENTINEL;
 
-    async fn scan_count(runtime: &Arc<DatabaseRuntime>) -> usize {
+    async fn scan_count(runtime: &Arc<DatabaseRuntime>, schema_id: u32) -> usize {
         let mut count = 0usize;
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(SCHEMA, 64)
+            .scan_schema(schema_id, 64)
             .await
             .expect("scan should not error")
         {
@@ -2320,21 +2325,66 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         .expect("dynamic database should load");
     dynamic.meta().schemas.register_internal_schema(schema());
 
-    for index in 0..cells {
+    // NEB_IDX_RESTART_MULTI mirrors the live sidecar shape: one TINY schema
+    // (a single header cell) sorted before a large neighbor in the same
+    // tree, which is exactly the prefix a post-reconstruction seek must
+    // still land inside.
+    let multi = std::env::var("NEB_IDX_RESTART_MULTI").is_ok();
+    let tiny_schema_id = schema_id;
+    let big_schema_id = schema_id + 4;
+    if multi {
+        dynamic.meta().schemas.register_internal_schema(Schema::new_with_id(
+            big_schema_id,
+            "secondary_index_restart_big_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            true,
+        ));
+        server.meta().schemas.register_internal_schema(Schema::new_with_id(
+            big_schema_id,
+            "secondary_index_restart_big_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            true,
+        ));
+    }
+    let tiny_count: u64 = if multi { 1 } else { cells };
+    for index in 0..tiny_count {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value["DATA"] = OwnedValue::U64(index);
-        let mut cell = OwnedCell::new_with_id(SCHEMA, &cell_id(index), value);
+        let mut cell = OwnedCell::new_with_id(tiny_schema_id, &cell_id(index), value);
         dynamic
             .chunks()
             .write_cell(&mut cell)
             .expect("secondary write");
     }
+    if multi {
+        for index in 0..cells {
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value["DATA"] = OwnedValue::U64(index);
+            let mut cell =
+                OwnedCell::new_with_id(big_schema_id, &cell_id(index + 1_000_000), value);
+            dynamic
+                .chunks()
+                .write_cell(&mut cell)
+                .expect("secondary big write");
+        }
+    }
     let _ = IndexBuilder::await_all_indices().await;
     assert_eq!(
-        scan_count(&dynamic).await,
-        cells as usize,
+        scan_count(&dynamic, tiny_schema_id).await,
+        tiny_count as usize,
         "the scan must see every cell before the restart"
     );
+    if multi {
+        assert_eq!(
+            scan_count(&dynamic, big_schema_id).await,
+            cells as usize,
+            "the big schema must scan before the restart"
+        );
+    }
 
     server.shutdown().await;
     drop(dynamic);
@@ -2353,11 +2403,24 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         .await
         .expect("dynamic database should reload");
     dynamic.meta().schemas.register_internal_schema(schema());
-    let recovered = scan_count(&dynamic).await;
+    if multi {
+        dynamic.meta().schemas.register_internal_schema(Schema::new_with_id(
+            big_schema_id,
+            "secondary_index_restart_big_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            true,
+        ));
+        let big = scan_count(&dynamic, big_schema_id).await;
+        assert_eq!(big, cells as usize, "big schema lost cells: {big} of {cells}");
+    }
+    let tiny_count: u64 = if multi { 1 } else { cells };
+    let recovered = scan_count(&dynamic, tiny_schema_id).await;
     assert_eq!(
-        recovered, cells as usize,
+        recovered, tiny_count as usize,
         "the dynamic database's ranged index lost cells across a graceful restart: \
-         scan sees {recovered} of {cells}"
+         scan sees {recovered} of {tiny_count}"
     );
     server.shutdown().await;
 }

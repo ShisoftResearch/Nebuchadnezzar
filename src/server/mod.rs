@@ -2186,30 +2186,42 @@ impl NebServer {
         for (database_name, _) in &secondary_runtimes {
             info!("Flushing dynamically-loaded database {database_name} before shutdown");
             let dummy_id = Id::allocated(0, 0, 1);
-            match ranged::tree::service::locate_tree_server_from_conshash(
-                &dummy_id,
-                &self.consh,
-                &self.group_name,
-                database_name,
-            )
-            .await
-            {
-                Ok(lsm_client) => match lsm_client.flush_all().await {
-                    Ok(_) => {
-                        info!("LSM trees flushed for dynamically-loaded database {database_name}");
-                        flushed_secondary_trees = true;
-                    }
-                    // A failed flush here IS data loss at the next recovery:
-                    // index inserts still in memory never become page cells.
-                    Err(error) => error!(
-                        "LSM flush FAILED for dynamically-loaded database {database_name} at \
-                         shutdown; its ranged index will lose recent inserts: {error:?}"
-                    ),
-                },
-                Err(error) => error!(
-                    "could not locate the LSM tree service for dynamically-loaded database \
-                     {database_name} at shutdown; its ranged index will lose recent inserts: \
-                     {error:?}"
+            // Bounded: the locate and the flush are RPCs, and a shutdown in
+            // a cluster whose peer died first must not hang on network
+            // retries -- an unbounded wait here turned two-node cluster
+            // tests' teardown into a wedge. Ten seconds dwarfs a healthy
+            // local flush (measured in the hundreds of milliseconds) while
+            // keeping a sick one from holding the whole shutdown hostage.
+            let flush_attempt = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let lsm_client = ranged::tree::service::locate_tree_server_from_conshash(
+                    &dummy_id,
+                    &self.consh,
+                    &self.group_name,
+                    database_name,
+                )
+                .await
+                .map_err(|error| format!("locate: {error:?}"))?;
+                lsm_client
+                    .flush_all()
+                    .await
+                    .map_err(|error| format!("flush_all: {error:?}"))?;
+                Ok::<(), String>(())
+            })
+            .await;
+            match flush_attempt {
+                Ok(Ok(())) => {
+                    info!("LSM trees flushed for dynamically-loaded database {database_name}");
+                    flushed_secondary_trees = true;
+                }
+                // A failed flush here IS data loss at the next recovery:
+                // index inserts still in memory never become page cells.
+                Ok(Err(error)) => error!(
+                    "LSM flush FAILED for dynamically-loaded database {database_name} at \
+                     shutdown; its ranged index will lose recent inserts: {error}"
+                ),
+                Err(_) => error!(
+                    "LSM flush for dynamically-loaded database {database_name} timed out at \
+                     shutdown (10s); its ranged index may lose recent inserts"
                 ),
             }
         }
