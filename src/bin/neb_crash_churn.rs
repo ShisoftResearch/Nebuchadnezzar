@@ -781,12 +781,23 @@ async fn child_async(
                     continue;
                 }
                 let id = Id::from_parts(9 + (cursor % 64), cursor);
+                // Publish the INTENT, before the delete, so the reported
+                // cursor is an upper bound on what has actually been
+                // removed.
+                //
+                // Reporting after the fact made it a lower bound, and the
+                // reporter only publishes every 100 ms: a SIGKILL landing
+                // between a delete and its report left the store with fewer
+                // keys than the parent's bar allowed for, which read as a
+                // 7-key durability regression across 1.1 million. An
+                // over-reported delete is harmless in the other direction --
+                // the store simply holds MORE than expected, and the
+                // invariant is one-sided.
+                deleted.store(cursor + 1, std::sync::atomic::Ordering::Relaxed);
                 match client.remove_cell(id).await {
                     // Gone is gone: a key an earlier incarnation deleted
                     // before dying is still progress for this cursor.
-                    Ok(Ok(())) | Ok(Err(_)) => {
-                        deleted.store(cursor + 1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    Ok(Ok(())) | Ok(Err(_)) => {}
                     Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
                 }
                 if delete_rate < 100 {
