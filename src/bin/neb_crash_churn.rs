@@ -83,7 +83,6 @@ fn parent_main(args: &[String]) -> ExitCode {
         let first = cycle == 0;
         if mutilated_last {
             println!("    (previous cycle damaged files: loss is allowed, a crash is not)");
-            mutilated_last = false;
         }
         // Identity is deployment identity: the same addr and group every
         // cycle, exactly like a real server restarting. Rotating the group
@@ -101,7 +100,10 @@ fn parent_main(args: &[String]) -> ExitCode {
         };
         // Damage files on some hard-kill cycles: a kill alone leaves clean
         // files, which is not what a power cut leaves behind.
-        let mutilate = !graceful && cycle > 0 && rand() % 3 == 0;
+        let mutilate = std::env::var("NEB_CHURN_NO_MUTILATE").is_err()
+            && !graceful
+            && cycle > 0
+            && rand() % 3 == 0;
 
         println!(
             "=== cycle {}/{} addr={} churn={}s kill={} delete_rate={} best_verified={} \
@@ -230,6 +232,25 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // read as "index lost entries" or "store lost cells"
                         // without a second run.
                         println!("    cells present (sampled): {}", rest.trim());
+                    } else if line.starts_with("SCAN_ERROR") && mutilated_last {
+                        // Refusing to scan a deliberately-damaged store is
+                        // the CORRECT answer -- better than serving whatever
+                        // the damaged bytes decode into. What it also shows
+                        // is that there is no way back: the index stays
+                        // unscannable for every later cycle, because nothing
+                        // can rebuild it. That is the case for the
+                        // reindex/scrub tool, not a fault in this cycle.
+                        println!(
+                            "    scan REFUSED after file damage (correct, but the index \
+                             cannot be rebuilt): {}",
+                            line.trim()
+                        );
+                        failed = Some(
+                            "index unrecoverable after file damage -- no reindex path exists"
+                                .to_string(),
+                        );
+                        unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                        break;
                     } else if line.starts_with("SCAN_ERROR") || line.starts_with("FATAL") {
                         failed = Some(line);
                         unsafe { libc::kill(child_pid, libc::SIGKILL) };
@@ -256,10 +277,12 @@ fn parent_main(args: &[String]) -> ExitCode {
         let _ = child.wait();
         let _ = reader.join();
 
+        let mut mutilated_this_cycle_was_empty = false;
         if mutilate {
             let victims = mutilate_files(&base_dir, &mut rand);
             if victims.is_empty() {
                 println!("    (nothing to mutilate this cycle)");
+                mutilated_this_cycle_was_empty = true;
             } else {
                 for victim in &victims {
                     println!("    MUTILATED {}", victim);
@@ -270,10 +293,10 @@ fn parent_main(args: &[String]) -> ExitCode {
                 // and it never hands back a corrupt cell. So the no-regression
                 // bar is lifted, and the next scan sets a new one.
                 state.best_verified = 0;
-                mutilated_last = true;
             }
         }
 
+        mutilated_last = mutilate && !mutilated_this_cycle_was_empty;
         exhausted_last = exhausted_this_cycle;
         // THIS cycle's cursor, not the highest ever seen.
         //
