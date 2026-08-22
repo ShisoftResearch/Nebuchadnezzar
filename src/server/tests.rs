@@ -1,3 +1,5 @@
+use crate::index::builder::IndexBuilder;
+use crate::server::DatabaseRuntime;
 use crate::ram::schema::Field;
 use crate::ram::schema::Schema;
 use crate::ram::types::*;
@@ -2230,6 +2232,123 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
         missing.is_empty(),
         "the dynamic database lost {} of {CELLS} cells across a graceful restart: {missing:?}",
         missing.len()
+    );
+    server.shutdown().await;
+}
+
+/// The indexed sibling of the restart test above: the RANGED INDEX of a
+/// dynamically-loaded database must also survive a graceful restart, so a
+/// schema scan finds every cell afterwards.
+///
+/// This is the shape the chunk-level test cannot see. Enumeration-index
+/// inserts live in the per-database LSM trees until a flush writes their
+/// pages back as cells; a shutdown that flushes chunks but not the dynamic
+/// database's trees (or flushes them after closing writes) loses exactly the
+/// index while every data cell survives. Measured live as sidecar scans
+/// coming back empty ('headers=0') on an intact store.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
+        undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().to_string()),
+        raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: true,
+        services: vec![Service::Cell, Service::RangedIndexer],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let group = "secondary_index_restart_group";
+    const SCHEMA: u32 = 9180;
+    const CELLS: u64 = 32;
+    let schema = || {
+        Schema::new_with_id(
+            SCHEMA,
+            "secondary_index_restart_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            true, // scannable: the enumeration index is the subject here
+        )
+    };
+    let cell_id = |index: u64| Id::allocated((index % 4) as u16, 9, index + 1);
+
+    async fn scan_count(runtime: &Arc<DatabaseRuntime>) -> usize {
+        let mut count = 0usize;
+        let mut cursor = match runtime
+            .neb_client
+            .ranged()
+            .scan_schema(SCHEMA, 64)
+            .await
+            .expect("scan should not error")
+        {
+            Some(cursor) => cursor,
+            None => return 0,
+        };
+        while let Ok(Some(_)) = cursor.next().await {
+            count += 1;
+        }
+        count
+    }
+
+    let server = NebServer::new_from_opts(
+        &opts,
+        &crate::utils::test_port::unique_localhost_addr(),
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let dynamic = server
+        .ensure_database_runtime("brains/indexed")
+        .await
+        .expect("dynamic database should load");
+    dynamic.meta().schemas.register_internal_schema(schema());
+
+    for index in 0..CELLS {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value["DATA"] = OwnedValue::U64(index);
+        let mut cell = OwnedCell::new_with_id(SCHEMA, &cell_id(index), value);
+        dynamic
+            .chunks()
+            .write_cell(&mut cell)
+            .expect("secondary write");
+    }
+    let _ = IndexBuilder::await_all_indices().await;
+    assert_eq!(
+        scan_count(&dynamic).await,
+        CELLS as usize,
+        "the scan must see every cell before the restart"
+    );
+
+    server.shutdown().await;
+    drop(dynamic);
+    drop(server);
+
+    let server = NebServer::new_from_opts(
+        &opts,
+        &crate::utils::test_port::unique_localhost_addr(),
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let dynamic = server
+        .ensure_database_runtime("brains/indexed")
+        .await
+        .expect("dynamic database should reload");
+    dynamic.meta().schemas.register_internal_schema(schema());
+    let recovered = scan_count(&dynamic).await;
+    assert_eq!(
+        recovered, CELLS as usize,
+        "the dynamic database's ranged index lost cells across a graceful restart: \
+         scan sees {recovered} of {CELLS}"
     );
     server.shutdown().await;
 }
