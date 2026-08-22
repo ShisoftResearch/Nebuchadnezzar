@@ -49,6 +49,8 @@ pub static WRITE_STATS_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ALLOC_SPIN_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_DRAIN_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Entries whose WAL journal failed at PendingEntry drop (sealed underneath).
+pub static WAL_JOURNAL_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_ARCHIVE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATIONS: AtomicU64 = AtomicU64::new(0);
 /// Within rotation: allocating the fresh segment (including its WAL file
@@ -2565,9 +2567,27 @@ pub struct PendingEntry {
 impl Drop for PendingEntry {
     // dealing with entry write ahead log
     fn drop(&mut self) {
-        self.seg
-            .write_wal(self.addr, self.size, self.skip_sync)
-            .unwrap();
+        if let Err(error) = self.seg.write_wal(self.addr, self.size, self.skip_sync) {
+            // A straggler whose segment was sealed (archived) between its
+            // append and this journal write cannot journal -- the recorded
+            // seal-vs-pending-writer race. The entry's durability is already
+            // decided at this point (the archive that sealed the segment
+            // either carried the bytes or did not), and this Drop runs on
+            // WHATEVER thread holds the last handle: unwrap here took down
+            // the b-tree write-back workers, which silently ended index
+            // durability for the whole process -- every insert after the
+            // panic lived only in memory, and the next restart lost them
+            // all. Scream, count, survive.
+            crate::ram::chunk::WAL_JOURNAL_FAILURES.fetch_add(1, Ordering::Relaxed);
+            error!(
+                "WAL journal failed for segment {} (chunk of addr {:#x}, size {}): {error}; \
+                 the entry rides the segment's archive if one carried it, and the caller's \
+                 next write-back supersedes it -- but this indicates the seal/pending-writer \
+                 race and must stay loud",
+                self.seg.id, self.addr, self.size
+            );
+            return;
+        }
         if !self.skip_sync {
             // Timer-based group commit rides the WAL syncer thread now;
             // transactional entries keep syncing at commit instead.
