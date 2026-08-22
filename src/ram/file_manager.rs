@@ -86,10 +86,39 @@ impl SegmentFileManager {
             // preserve more history, and a seq id is never reused (segments
             // that have a backup are sealed, and dispense deletes both files),
             // so there is nothing here that truncation was protecting against.
-            let file = std::fs::OpenOptions::new()
+            let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&wal_path)?;
+            // A framed log opens with a file header naming the incarnation
+            // it belongs to. Write it exactly once, when the file is new.
+            let existing_len = file.metadata()?.len();
+            if existing_len == 0 {
+                use std::io::Write;
+                file.write_all(&crate::ram::wal_format::wal_file_header(seq_id))?;
+                file.sync_data()?;
+            } else {
+                // Appending framed records to an unframed log would leave one
+                // file holding two formats, and recovery would have to guess
+                // where the second began. Refuse instead: the caller reports
+                // a journal failure, which is loud and recoverable, rather
+                // than writing something no reader can arbitrate.
+                let mut opening = [0u8; 4];
+                use std::io::Read;
+                let mut probe = File::open(&wal_path)?;
+                probe.read_exact(&mut opening)?;
+                if opening != crate::ram::wal_format::FILE_MAGIC {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "WAL {} predates record framing; it cannot be appended to. Its \
+                             segment must be archived (or recovered and left sealed) rather \
+                             than resumed.",
+                            wal_path
+                        ),
+                    ));
+                }
+            }
             Ok(Some(file))
         } else {
             Ok(None)
@@ -295,7 +324,33 @@ impl SegmentFileManager {
             }
         }
 
-        // WAL files are not compressed, return as-is
+        // A framed log is decoded into the segment image it describes, with
+        // every record CRC-verified and the scan stopping at the first torn
+        // one. Unlike an unframed log it can also declare its live extent,
+        // so recovery can tell "nothing was written here" from "the tail is
+        // damaged" -- the distinction an unframed log could never make.
+        if crate::ram::wal_format::is_framed(&buffer) {
+            let outcome = crate::ram::wal_format::scan_framed(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
+            if let crate::ram::wal_format::TailStop::Torn {
+                at_file_offset,
+                reason,
+            } = &outcome.stop
+            {
+                warn!(
+                    "WAL {} has a torn tail at byte {}: {}. Replaying the {} record(s) before \
+                     it and dropping the rest; those writes were never acknowledged as durable.",
+                    path.display(),
+                    at_file_offset,
+                    reason,
+                    outcome.records
+                );
+            }
+            let used_len = outcome.used_len;
+            return Ok((outcome.image, Some(used_len)));
+        }
+
+        // Unframed logs predate record framing: the file IS the segment
+        // image, offset for offset. Read as-is, with no way to verify it.
         Ok((buffer, None))
     }
 

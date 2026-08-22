@@ -2043,11 +2043,16 @@ image, not an empty segment; archiving it would persist the damage.",
         }
 
         if let Some(ref mut file) = state.wal {
-            unsafe {
+            // Framed: the record carries the segment offset it belongs at and
+            // a CRC over both. One write_all keeps the frame and its payload
+            // in a single syscall, so a torn record can only ever be torn at
+            // the tail -- never interleaved with another writer's.
+            let framed = unsafe {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
-                file.write_all(data_block)?; // Use write_all to ensure all bytes are written
-            }
-            WAL_BYTES.fetch_add(size as u64, Relaxed);
+                crate::ram::wal_format::frame_record((addr - self.addr) as u64, data_block)
+            };
+            file.write_all(&framed)?;
+            WAL_BYTES.fetch_add(framed.len() as u64, Relaxed);
             WAL_WRITES.fetch_add(1, Relaxed);
             // Transactions control their own sync at commit time
             // For non-transactional writes, use group commit batching

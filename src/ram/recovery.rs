@@ -1848,7 +1848,7 @@ use crate::ram::types::Id;
         // its seq id already has a complete image and appending to it would
         // re-create a WAL alongside that backup. See `Segment::sealed`.
         assert!(segment.is_sealed());
-        assert_ne!(regular_head, segment.id);
+        assert_ne!(regular_head, Some(segment.id));
         assert_eq!(blob_head, None);
         assert_eq!(chunk.segments().len(), 1);
         assert_eq!(segment.segment_class(), SegmentClass::Regular);
@@ -2460,7 +2460,7 @@ use crate::ram::types::Id;
 
         // Resident but sealed, as for any backup-recovered segment.
         assert!(segment.is_sealed());
-        assert_ne!(regular_head, segment.id);
+        assert_ne!(regular_head, Some(segment.id));
         assert_eq!(blob_head, None);
         assert_eq!(segment.segment_class(), SegmentClass::Regular);
         assert_eq!(segment.tombstones.load(Ordering::Acquire), 1);
@@ -2639,7 +2639,8 @@ use crate::ram::types::Id;
                 "a segment recovered from a backup must come back sealed"
             );
             assert_ne!(
-                regular_head, regular_segments[0].id,
+                regular_head,
+                Some(regular_segments[0].id),
                 "an archived segment was resumed as the write head"
             );
             // The recovered segment keeps its append position -- its cells are
@@ -2654,6 +2655,184 @@ use crate::ram::types::Id;
             let blob_cell = chunks.read_cell(&blob_id).unwrap();
             assert_eq!(*blob_cell.data["id"].i32().unwrap(), 2);
         }
+    }
+
+    /// The crash this format exists for: a record's frame reached disk, its
+    /// body did not.
+    ///
+    /// Unframed, the zeros an allocated-but-unwritten tail block reads back
+    /// as were indistinguishable from a real entry -- the 8-byte entry
+    /// header parsed, the length looked sane, and recovery ingested a cell
+    /// whose header was all zeros. Framed, the record fails its CRC and the
+    /// scan stops there, so the cells written BEFORE it still recover and
+    /// the torn one simply never existed.
+    #[test]
+    fn a_torn_wal_record_is_refused_and_earlier_cells_still_recover() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let schema = schema_with_id(413, "recovery_torn_wal_record", false);
+        let durable_id = Id::allocated(13, 0, 1);
+        let torn_id = Id::allocated(13, 0, 2);
+
+        let wal_path: String;
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(schema.clone());
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(raft_path.clone()),
+            );
+            let mut durable = OwnedCell {
+                header: CellHeader::new(schema.id, &durable_id),
+                data: data_map_value!(id: 1_i32, data: vec![0x41_u8; 64]),
+            };
+            let mut torn = OwnedCell {
+                header: CellHeader::new(schema.id, &torn_id),
+                data: data_map_value!(id: 2_i32, data: vec![0x42_u8; 64]),
+            };
+            chunks.write_cell(&mut durable).unwrap();
+            chunks.write_cell(&mut torn).unwrap();
+            chunks.sync_all();
+
+            let chunk = &chunks.list[0];
+            let segment = chunk
+                .locate_segment(chunks.address_of(&durable_id))
+                .expect("the write should land in a segment");
+            wal_path = chunk
+                .file_manager
+                .wal_path(chunk.id, segment.id, segment.seq_id)
+                .expect("the test configures WAL storage");
+        }
+
+        // Tear the last record's body, the way a power cut does.
+        let bytes = std::fs::read(&wal_path).unwrap();
+        assert_eq!(
+            &bytes[..4],
+            &crate::ram::wal_format::FILE_MAGIC,
+            "the WAL should be written framed"
+        );
+        std::fs::write(&wal_path, &bytes[..bytes.len() - 8]).unwrap();
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        let durable = chunks
+            .read_cell(&durable_id)
+            .expect("the record before the tear must recover");
+        assert_eq!(*durable.data["id"].i32().unwrap(), 1);
+        drop(durable);
+        assert!(
+            chunks.read_cell(&torn_id).is_err(),
+            "a torn record must never be replayed as a cell"
+        );
+    }
+
+    /// Scribbled bytes INSIDE a record, with its length left intact.
+    ///
+    /// This is the case length-based scanning can never catch: every
+    /// structural check passes, so an unframed log hands recovery a cell
+    /// built from corrupt bytes and it is served as real data. Only a
+    /// checksum can tell the difference, which is why one is now stored.
+    #[test]
+    fn a_scribbled_wal_record_is_refused_rather_than_served_as_data() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let schema = schema_with_id(414, "recovery_scribbled_wal_record", false);
+        let durable_id = Id::allocated(14, 0, 1);
+        let scribbled_id = Id::allocated(14, 0, 2);
+        let wal_path: String;
+
+        {
+            let schemas = LocalSchemasCache::new_local("");
+            schemas.debug_only_new_schema(schema.clone());
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                false,
+                Some(raft_path.clone()),
+            );
+            let mut durable = OwnedCell {
+                header: CellHeader::new(schema.id, &durable_id),
+                data: data_map_value!(id: 1_i32, data: vec![0x41_u8; 64]),
+            };
+            let mut scribbled = OwnedCell {
+                header: CellHeader::new(schema.id, &scribbled_id),
+                data: data_map_value!(id: 2_i32, data: vec![0x42_u8; 64]),
+            };
+            chunks.write_cell(&mut durable).unwrap();
+            chunks.write_cell(&mut scribbled).unwrap();
+            chunks.sync_all();
+
+            let chunk = &chunks.list[0];
+            let segment = chunk
+                .locate_segment(chunks.address_of(&durable_id))
+                .expect("the write should land in a segment");
+            wal_path = chunk
+                .file_manager
+                .wal_path(chunk.id, segment.id, segment.seq_id)
+                .expect("the test configures WAL storage");
+        }
+
+        // Flip bytes in the last record's payload, leaving every length and
+        // magic exactly as written.
+        let mut bytes = std::fs::read(&wal_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        bytes[last - 3] ^= 0xFF;
+        std::fs::write(&wal_path, &bytes).unwrap();
+
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        let durable = chunks
+            .read_cell(&durable_id)
+            .expect("the intact record must recover");
+        assert_eq!(*durable.data["id"].i32().unwrap(), 1);
+        drop(durable);
+        assert!(
+            chunks.read_cell(&scribbled_id).is_err(),
+            "a record that fails its checksum must not be served as a cell"
+        );
     }
 
     #[test]
@@ -2753,12 +2932,24 @@ use crate::ram::types::Id;
                 .segs
                 .get(&(blob_segment_id as usize))
                 .expect("WAL-only recovery should restore the blob segment in place");
+            let recovered_seg_ids: Vec<u64> = chunk
+                .segments()
+                .iter()
+                .map(|segment| segment.seq_id)
+                .collect();
 
             assert_eq!(blob_segment.seq_id, blob_seq_id);
             assert_eq!(blob_head, None, "recovery should leave the blob head empty");
-            assert!(
-                chunk.segs.get(&(regular_head as usize)).unwrap().is_hot(),
-                "recovery should still keep a regular write head ready"
+            // Recovery resumes NOTHING. A recovered segment is a closed
+            // incarnation whether it came from a backup or a WAL: resuming a
+            // WAL-recovered one reopens its log in append mode against a
+            // rewound append_header, which breaks the offset invariant the
+            // log depends on and silently makes every later write to it
+            // unrecoverable. The first write allocates a fresh segment
+            // instead, which the next assertion exercises.
+            assert_eq!(
+                regular_head, None,
+                "recovery should leave the regular head empty too"
             );
             assert_eq!(blob_segment.segment_class(), SegmentClass::Blob);
             assert!(
@@ -2781,6 +2972,26 @@ use crate::ram::types::Id;
             assert!(
                 blob_segment.is_hot(),
                 "reading a cold WAL-only blob segment should later promote it"
+            );
+
+            // The point of resuming nothing: the next write must land
+            // somewhere NEW. A segment recovered from a WAL has a log whose
+            // length no longer matches its append cursor, so appending to it
+            // writes records that describe the wrong offsets -- unnoticeably,
+            // until the next crash tries to replay them.
+            let mut fresh = OwnedCell {
+                header: CellHeader::new(blob_schema.id, &Id::allocated(12, 0, 3)),
+                data: data_map_value!(id: 3_i32, data: vec![0x99_u8; DATA_SIZE]),
+            };
+            chunks.write_cell(&mut fresh).expect("post-recovery write");
+            let landed_seq = chunk
+                .locate_segment(chunks.address_of(&Id::allocated(12, 0, 3)))
+                .expect("the post-recovery write must land in a segment")
+                .seq_id;
+            assert!(
+                !recovered_seg_ids.contains(&landed_seq),
+                "the write landed in a recovered incarnation (seq {landed_seq}); recovered \
+                 segments are closed and must never be appended to"
             );
         }
     }

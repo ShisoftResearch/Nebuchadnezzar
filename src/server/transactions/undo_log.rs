@@ -76,6 +76,90 @@ const ENTRY_TYPE_UNDO: u8 = 1;
 const ENTRY_TYPE_COMMIT: u8 = 2;
 const ENTRY_TYPE_ABORT: u8 = 3;
 
+/// ASCII "NEBU": a framed undo log opens with this, and no unframed log can
+/// (their first byte is an entry type, 1..=3).
+pub(crate) const UNDO_FILE_MAGIC: [u8; 4] = *b"NEBU";
+const UNDO_FORMAT_VERSION: u8 = 1;
+const UNDO_FILE_HEADER_SIZE: usize = 8;
+const UNDO_RECORD_MAGIC: u32 = 0x554E_4452; // "UNDR"
+const UNDO_RECORD_HEADER_SIZE: usize = 12;
+
+fn undo_file_header() -> [u8; UNDO_FILE_HEADER_SIZE] {
+    let mut header = [0u8; UNDO_FILE_HEADER_SIZE];
+    header[..4].copy_from_slice(&UNDO_FILE_MAGIC);
+    header[4] = UNDO_FORMAT_VERSION;
+    header
+}
+
+fn undo_crc32c(parts: &[&[u8]]) -> u32 {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+    for part in parts {
+        digest.update(part);
+    }
+    digest.finalize() as u32
+}
+
+/// Wrap one record in `[magic][len][crc]`, so a torn or scribbled record is
+/// detected rather than decoded.
+///
+/// Without this, a garbage-but-in-bounds `txn_id_len` made `decode_txn_id`
+/// fail, which aborted the WHOLE of `recover()` -- and its caller only logs
+/// the error and continues. One bad byte in the tail therefore disabled
+/// rollback for every transaction in the log, which is the opposite of what
+/// an undo log is for. Framed, a bad record truncates the tail and every
+/// record before it still rolls back.
+fn frame_undo_record(payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u32;
+    let len_bytes = len.to_le_bytes();
+    let crc = undo_crc32c(&[&len_bytes, payload]);
+    let mut framed = Vec::with_capacity(UNDO_RECORD_HEADER_SIZE + payload.len());
+    framed.extend_from_slice(&UNDO_RECORD_MAGIC.to_le_bytes());
+    framed.extend_from_slice(&len_bytes);
+    framed.extend_from_slice(&crc.to_le_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// One verified record, or the reason the scan stopped.
+enum FramedRecord<'a> {
+    Record { payload: &'a [u8], next: usize },
+    Stop(String),
+}
+
+fn read_undo_record(buffer: &[u8], offset: usize) -> FramedRecord<'_> {
+    if offset + UNDO_RECORD_HEADER_SIZE > buffer.len() {
+        return FramedRecord::Stop(format!(
+            "partial record header ({} of {UNDO_RECORD_HEADER_SIZE} bytes)",
+            buffer.len() - offset
+        ));
+    }
+    let magic = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
+    if magic != UNDO_RECORD_MAGIC {
+        return FramedRecord::Stop(format!("bad record magic 0x{magic:08x}"));
+    }
+    let len_bytes: [u8; 4] = buffer[offset + 4..offset + 8].try_into().unwrap();
+    let stored_crc = u32::from_le_bytes(buffer[offset + 8..offset + 12].try_into().unwrap());
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    let start = offset + UNDO_RECORD_HEADER_SIZE;
+    if len == 0 || start + len > buffer.len() {
+        return FramedRecord::Stop(format!(
+            "record claims {len} bytes, {} remain",
+            buffer.len().saturating_sub(start)
+        ));
+    }
+    let payload = &buffer[start..start + len];
+    let crc = undo_crc32c(&[&len_bytes, payload]);
+    if crc != stored_crc {
+        return FramedRecord::Stop(format!(
+            "CRC mismatch (stored 0x{stored_crc:08x}, computed 0x{crc:08x})"
+        ));
+    }
+    FramedRecord::Record {
+        payload,
+        next: start + len,
+    }
+}
+
 /// Decode a serialized transaction id from the bytes stored in the undo log.
 ///
 /// Before the HLC migration, `TxnId` was `bifrost::vector_clock::StandardVectorClock`,
@@ -326,10 +410,35 @@ impl UndoLogger {
 
         debug!("Rotating undo log to: {}", log_file_path);
 
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_file_path)?;
+
+        // A framed log opens with a file header. If this seq already holds
+        // an UNFRAMED log (written by a build that predates framing), do not
+        // append to it: one file cannot hold two formats and still be
+        // arbitrated at recovery. Skip to the next seq instead -- the legacy
+        // file stays exactly as it is, and recovery still reads it.
+        let existing_len = file.metadata()?.len();
+        if existing_len == 0 {
+            file.write_all(&undo_file_header())?;
+            file.sync_data()?;
+        } else {
+            let mut opening = [0u8; 4];
+            let framed = File::open(&log_file_path)
+                .and_then(|mut probe| probe.read_exact(&mut opening).map(|_| opening))
+                .map(|opening| opening == UNDO_FILE_MAGIC)
+                .unwrap_or(false);
+            if !framed {
+                warn!(
+                    "Undo log {} predates record framing; leaving it intact for recovery and                      rotating to a fresh log rather than mixing formats in one file.",
+                    log_file_path
+                );
+                drop(file);
+                return self.rotate_log();
+            }
+        }
 
         let writer = BufWriter::with_capacity(4096, file);
 
@@ -347,7 +456,7 @@ impl UndoLogger {
 
     /// Write an undo entry to the log
     pub fn write_undo_entry(&self, entry: UndoLogEntry) -> io::Result<()> {
-        let bytes = entry.to_bytes()?;
+        let bytes = frame_undo_record(&entry.to_bytes()?);
 
         let mut log_file_guard = self.log_file.lock();
         if let Some(writer) = log_file_guard.as_mut() {
@@ -389,6 +498,7 @@ impl UndoLogger {
         bytes.push(ENTRY_TYPE_COMMIT);
         bytes.extend_from_slice(&txn_id_len.to_le_bytes());
         bytes.extend_from_slice(&txn_id_bytes);
+        let bytes = frame_undo_record(&bytes);
 
         let mut log_file_guard = self.log_file.lock();
         if let Some(writer) = log_file_guard.as_mut() {
@@ -419,6 +529,7 @@ impl UndoLogger {
         bytes.push(ENTRY_TYPE_ABORT);
         bytes.extend_from_slice(&txn_id_len.to_le_bytes());
         bytes.extend_from_slice(&txn_id_bytes);
+        let bytes = frame_undo_record(&bytes);
 
         let mut log_file_guard = self.log_file.lock();
         if let Some(writer) = log_file_guard.as_mut() {
@@ -866,42 +977,66 @@ impl UndoLogger {
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)?;
 
-            let mut offset = 0;
+            let framed = buffer.len() >= UNDO_FILE_HEADER_SIZE
+                && buffer[..4] == UNDO_FILE_MAGIC;
+            let mut offset = if framed { UNDO_FILE_HEADER_SIZE } else { 0 };
             while offset < buffer.len() {
-                if buffer.len() < offset + 5 {
+                // A framed record is verified whole before anything inside
+                // it is decoded; an unframed one (legacy log) is decoded in
+                // place, exactly as before, since there is nothing to verify.
+                let (record, next_offset) = if framed {
+                    match read_undo_record(&buffer, offset) {
+                        FramedRecord::Record { payload, next } => (payload, next),
+                        FramedRecord::Stop(reason) => {
+                            warn!(
+                                "Undo log {} has a torn tail at byte {}: {}. Keeping the records                                  before it; anything after is dropped.",
+                                path.display(),
+                                offset,
+                                reason
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    (&buffer[offset..], buffer.len())
+                };
+
+                if record.len() < 5 {
                     break;
                 }
-
-                let entry_type = buffer[offset];
-                let txn_id_len = u32::from_le_bytes([
-                    buffer[offset + 1],
-                    buffer[offset + 2],
-                    buffer[offset + 3],
-                    buffer[offset + 4],
-                ]) as usize;
-
-                if buffer.len() < offset + 5 + txn_id_len {
+                let entry_type = record[0];
+                let txn_id_len =
+                    u32::from_le_bytes([record[1], record[2], record[3], record[4]]) as usize;
+                if record.len() < 5 + txn_id_len {
                     break;
                 }
-
-                let txn_id: TxnId =
-                    decode_txn_id(&buffer[offset + 5..offset + 5 + txn_id_len])?;
+                // A record that passed its CRC is INTACT: if its transaction
+                // id still will not decode, the log is a format the reader
+                // does not speak (a pre-HLC log), not a torn tail. That stays
+                // a hard error -- silently skipping it would drop rollback
+                // data while reporting success. Torn tails are caught above,
+                // by the frame, and cost only themselves.
+                let txn_id: TxnId = decode_txn_id(&record[5..5 + txn_id_len])?;
 
                 match entry_type {
                     ENTRY_TYPE_UNDO => {
-                        if let Ok((entry, size)) = UndoLogEntry::from_bytes(&buffer[offset..]) {
+                        if let Ok((entry, size)) = UndoLogEntry::from_bytes(record) {
                             txn_index
                                 .entry(txn_id.clone())
                                 .or_insert_with(Vec::new)
                                 .push(entry);
-                            offset += size;
+                            offset = if framed { next_offset } else { offset + size };
                         } else {
                             break;
                         }
                     }
                     ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
                         txn_index.remove(&txn_id);
-                        offset += 5 + txn_id_len;
+                        offset = if framed {
+                            next_offset
+                        } else {
+                            offset + 5 + txn_id_len
+                        };
                     }
                     _ => break,
                 }
@@ -968,6 +1103,203 @@ mod tests {
         assert_eq!(recovered.version, entry.version);
         assert_eq!(recovered.chunk_id, entry.chunk_id);
         assert_eq!(recovered.seq_id, entry.seq_id);
+    }
+
+    /// A torn tail must cost only the torn record.
+    ///
+    /// Before framing, a garbage-but-in-bounds `txn_id_len` made
+    /// `decode_txn_id` fail, which returned `Err` from the WHOLE of
+    /// `recover()`; the only caller logs that error and boots anyway, so one
+    /// bad byte disabled rollback for every transaction in the log. The
+    /// rollback of durable, in-flight transactions is exactly what must not
+    /// depend on the integrity of the byte after them.
+    #[test]
+    fn a_torn_tail_costs_only_the_torn_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_str().unwrap().to_string();
+
+        let survivor = test_hlc(1, 1);
+        let torn = test_hlc(1, 2);
+        {
+            let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
+            undo_log
+                .write_undo_entry(UndoLogEntry::new(
+                    survivor.clone(),
+                    Id::allocated(1, 0, 1),
+                    UndoOpType::Update,
+                    3,
+                    0,
+                    1000,
+                    50,
+                ))
+                .unwrap();
+            undo_log
+                .write_undo_entry(UndoLogEntry::new(
+                    torn.clone(),
+                    Id::allocated(1, 0, 2),
+                    UndoOpType::Update,
+                    4,
+                    0,
+                    1000,
+                    99,
+                ))
+                .unwrap();
+        }
+
+        // Tear the tail the way a power cut does: the last record's bytes
+        // are there, but not all of them.
+        let log_path = format!("{}/undo-0.nlog", log_dir);
+        let len = std::fs::metadata(&log_path).unwrap().len();
+        let file = OpenOptions::new().write(true).open(&log_path).unwrap();
+        file.set_len(len - 6).unwrap();
+        drop(file);
+
+        let undo_log = UndoLogger::new(log_dir).unwrap();
+        let txn_index = undo_log.recover().unwrap();
+        assert_eq!(
+            txn_index.get(&survivor).map(|entries| entries.len()),
+            Some(1),
+            "the record before the tear must still roll back"
+        );
+        assert!(
+            !txn_index.contains_key(&torn),
+            "the torn record must not be recovered"
+        );
+    }
+
+    /// A flipped byte inside a record must be refused, not decoded: the
+    /// values it carries are segment locations that rollback writes to.
+    #[test]
+    fn a_scribbled_record_is_refused_not_applied() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_str().unwrap().to_string();
+
+        let good = test_hlc(2, 1);
+        {
+            let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
+            undo_log
+                .write_undo_entry(UndoLogEntry::new(
+                    good.clone(),
+                    Id::allocated(1, 0, 1),
+                    UndoOpType::Update,
+                    3,
+                    0,
+                    1000,
+                    50,
+                ))
+                .unwrap();
+            undo_log
+                .write_undo_entry(UndoLogEntry::new(
+                    test_hlc(2, 2),
+                    Id::allocated(1, 0, 2),
+                    UndoOpType::Remove,
+                    4,
+                    0,
+                    2000,
+                    77,
+                ))
+                .unwrap();
+        }
+
+        let log_path = format!("{}/undo-0.nlog", log_dir);
+        let mut bytes = std::fs::read(&log_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&log_path, &bytes).unwrap();
+
+        let undo_log = UndoLogger::new(log_dir).unwrap();
+        let txn_index = undo_log.recover().unwrap();
+        assert_eq!(
+            txn_index.len(),
+            1,
+            "only the intact record should survive: {txn_index:?}"
+        );
+        assert!(txn_index.contains_key(&good));
+    }
+
+    /// Logs written before framing must still roll back after an upgrade.
+    #[test]
+    fn a_legacy_unframed_log_still_recovers() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_str().unwrap().to_string();
+
+        let legacy_txn = test_hlc(3, 1);
+        let entry = UndoLogEntry::new(
+            legacy_txn.clone(),
+            Id::allocated(1, 0, 7),
+            UndoOpType::Update,
+            9,
+            0,
+            1234,
+            56,
+        );
+        // Exactly what the pre-framing writer produced: raw record bytes,
+        // no file header, no frame.
+        std::fs::write(
+            format!("{}/undo-0.nlog", log_dir),
+            entry.to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let undo_log = UndoLogger::new(log_dir).unwrap();
+        let txn_index = undo_log.recover().unwrap();
+        assert_eq!(
+            txn_index.get(&legacy_txn).map(|entries| entries.len()),
+            Some(1),
+            "a pre-framing log must still be readable"
+        );
+    }
+
+    /// The upgrade must not append framed records into a legacy file: one
+    /// file holding two formats cannot be arbitrated at recovery.
+    #[test]
+    fn an_upgrade_rotates_past_a_legacy_log_instead_of_mixing_formats() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_str().unwrap().to_string();
+
+        let legacy_txn = test_hlc(4, 1);
+        let legacy_bytes = UndoLogEntry::new(
+            legacy_txn.clone(),
+            Id::allocated(1, 0, 7),
+            UndoOpType::Update,
+            9,
+            0,
+            1234,
+            56,
+        )
+        .to_bytes()
+        .unwrap();
+        std::fs::write(format!("{}/undo-0.nlog", log_dir), &legacy_bytes).unwrap();
+
+        let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
+        let fresh_txn = test_hlc(4, 2);
+        undo_log
+            .write_undo_entry(UndoLogEntry::new(
+                fresh_txn.clone(),
+                Id::allocated(1, 0, 8),
+                UndoOpType::Update,
+                10,
+                0,
+                4321,
+                65,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(format!("{}/undo-0.nlog", log_dir)).unwrap(),
+            legacy_bytes,
+            "the legacy log must be left byte-for-byte alone"
+        );
+
+        let txn_index = undo_log.recover().unwrap();
+        assert!(
+            txn_index.contains_key(&legacy_txn),
+            "the legacy log's transaction must still recover"
+        );
+        assert!(
+            txn_index.contains_key(&fresh_txn),
+            "the framed log's transaction must recover too"
+        );
     }
 
     #[test]

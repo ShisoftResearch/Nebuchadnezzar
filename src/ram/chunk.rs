@@ -1170,15 +1170,14 @@ impl Chunk {
     }
 
     #[cfg(test)]
-    pub fn head_seg_ids_for_test(&self) -> (u64, Option<u64>) {
-        let blob_head_id = self.blob_head_seg_id.load(Ordering::Acquire);
+    /// Both heads, with `None` for "no head yet". An empty regular head is
+    /// an ordinary state now, not just a blob one: recovery leaves both
+    /// empty, and the first write of each class allocates a fresh segment.
+    pub fn head_seg_ids_for_test(&self) -> (Option<u64>, Option<u64>) {
+        let head_or_none = |id: u64| (id != HEAD_SEG_ID_EMPTY).then_some(id);
         (
-            self.get_head_seg_id(),
-            if blob_head_id == HEAD_SEG_ID_EMPTY {
-                None
-            } else {
-                Some(blob_head_id)
-            },
+            head_or_none(self.get_head_seg_id()),
+            head_or_none(self.blob_head_seg_id.load(Ordering::Acquire)),
         )
     }
 
@@ -1186,27 +1185,29 @@ impl Chunk {
         self.blob_head_seg_id
             .store(HEAD_SEG_ID_EMPTY, Ordering::Release);
 
-        let regular_head_id = self
-            .segments()
-            .into_iter()
-            .filter(|segment| {
-                segment.segment_class() == SegmentClass::Regular
-                    && segment.is_hot()
-                    && segment.append_header.load(Ordering::Acquire) < segment.bound()
-                    // A segment recovered from a backup is a CLOSED incarnation
-                    // (see `Segment::sealed`). Resuming one as the head is what
-                    // created backup/WAL twins at a single seq id: shutdown
-                    // archives the open head, the next run appends to it, and a
-                    // crash then loses everything written after the archive.
-                    // Its unfilled tail is given up on purpose; the next write
-                    // allocates a fresh segment with a fresh seq id.
-                    && !segment.is_sealed()
-            })
-            .max_by_key(|segment| segment.seq_id)
-            .map(|segment| segment.id)
-            .unwrap_or(HEAD_SEG_ID_EMPTY);
-
-        self.head_seg_id.store(regular_head_id, Ordering::Release);
+        // EVERY recovered segment is a closed incarnation, whether it was
+        // rebuilt from a backup or from a WAL. Backup-recovered ones were
+        // already excluded (resuming one produced backup/WAL twins at a
+        // single seq id). WAL-recovered ones were not, and that was worse:
+        // recovery rewinds `append_header` past a torn tail but the WAL is
+        // reopened in APPEND mode, so the next write lands at file offset
+        // "old file length" while describing segment offset "append_header".
+        // The positional invariant the log depended on is broken from that
+        // moment, and every write to that segment is unrecoverable at the
+        // next crash -- silently, because nothing checks.
+        //
+        // So recovery resumes nothing. Each recovered segment is sealed and
+        // archived by `archive_unarchived_after_recovery` below, and the
+        // first write allocates a fresh segment with a fresh seq id. The
+        // cost is the unfilled tail of the segments that were open when the
+        // process stopped: at most one per chunk, bounded by the segment
+        // size, and reclaimed by the cleaner like any other dead space.
+        for segment in self.segments() {
+            if !segment.is_sealed() {
+                segment.seal();
+            }
+        }
+        self.head_seg_id.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
 
         Ok(())
     }

@@ -680,7 +680,7 @@ fn test_active_blob_head_is_not_evicted_by_clock() {
         "CLOCK must not evict an active blob head when only heads exist"
     );
 
-    assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
+    assert!(chunk.segs.get(&(regular_head.unwrap() as usize)).unwrap().is_hot());
     assert!(chunk.segs.get(&(blob_head as usize)).unwrap().is_hot());
 }
 
@@ -727,7 +727,7 @@ fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
             .segment_class(),
         SegmentClass::Blob
     );
-    assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
+    assert!(chunk.segs.get(&(regular_head.unwrap() as usize)).unwrap().is_hot());
     assert!(chunk
         .segs
         .get(&(regular_candidate_id as usize))
@@ -818,7 +818,7 @@ fn test_blob_segments_evict_before_regular_segments() {
     let regular_non_head = regular_segments
         .iter()
         .copied()
-        .find(|segment_id| *segment_id != regular_head)
+        .find(|segment_id| Some(*segment_id) != regular_head)
         .expect("setup should create a non-head regular segment");
     let blob_non_head = blob_segments
         .iter()
@@ -887,7 +887,7 @@ fn test_blob_segments_evict_before_regular_segments() {
             .is_hot(),
         "regular hot segments should remain hot while a blob victim exists"
     );
-    assert!(chunk.segs.get(&(regular_head as usize)).unwrap().is_hot());
+    assert!(chunk.segs.get(&(regular_head.unwrap() as usize)).unwrap().is_hot());
     assert!(chunk.segs.get(&(blob_head as usize)).unwrap().is_hot());
 
     let _ = std::fs::remove_dir_all(&schema_dir);

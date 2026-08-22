@@ -16,6 +16,7 @@ pub mod schema;
 pub mod segment_list;
 pub mod segs;
 pub mod tombstone;
+pub mod wal_format;
 pub mod types;
 
 pub mod clock;

@@ -229,7 +229,7 @@ fn blob_schema_chunk_keeps_independent_blob_and_regular_heads() {
         .debug_only_new_schema(blob_schema.clone());
 
     let (initial_regular_head, initial_blob_head) = chunk.head_seg_ids_for_test();
-    assert_eq!(chunk.get_head_seg_id(), initial_regular_head);
+    assert_eq!(Some(chunk.get_head_seg_id()), initial_regular_head);
     assert_eq!(initial_blob_head, None);
 
     let regular_id = Id::allocated(46, 0, 1);
@@ -250,9 +250,9 @@ fn blob_schema_chunk_keeps_independent_blob_and_regular_heads() {
     let blob_segment_id = chunk.locate_segment(blob_addr).unwrap().id;
 
     assert_eq!(regular_head, initial_regular_head);
-    assert_eq!(chunk.get_head_seg_id(), regular_head);
+    assert_eq!(Some(chunk.get_head_seg_id()), regular_head);
     assert_eq!(blob_head, Some(blob_segment_id));
-    assert_ne!(blob_head, Some(regular_head));
+    assert_ne!(blob_head, regular_head);
 }
 
 #[test]
@@ -322,7 +322,7 @@ fn blob_schema_partial_cleaner_candidates_stay_class_aware_in_mixed_workloads() 
     let (regular_head, _) = chunk.head_seg_ids_for_test();
     let regular_candidate = regular_segments
         .into_iter()
-        .find(|segment_id| *segment_id != regular_head)
+        .find(|segment_id| Some(*segment_id) != regular_head)
         .expect("setup should create a non-head regular segment");
 
     let mut kept_regular = false;
