@@ -140,9 +140,14 @@ fn crc32_checksum(data: &[u8]) -> u32 {
 /// Decompress a backup, or return the data unchanged if it carries no magic.
 ///
 /// Block-indexed backups are the only compressed form; a buffer without the
-/// magic is stored plain and passes through. The per-block CRCs are verified
-/// during decompression, so a corrupt backup fails here rather than surfacing
-/// as silently wrong cells.
+/// magic is stored plain and passes through.
+///
+/// The checksum verified here covers the WHOLE uncompressed image, and it is
+/// checked only on this full-read path. There are no per-block CRCs -- a
+/// claim this comment used to make -- so a single block served directly to a
+/// cold read is not verified by anything in this module. That gap is covered
+/// one level up instead: every entry carries a checksum of its own content
+/// (see `ram::entry`), and the cold-read path verifies it before serving.
 pub fn decompress_if_compressed(data: &[u8]) -> io::Result<Vec<u8>> {
     if data.len() >= BLOCK_HEADER_SIZE && data[..4] == BLOCK_COMPRESSION_MAGIC {
         return decompress_all_blocks(data);

@@ -3528,6 +3528,30 @@ impl<'a> CellGuard<'a> {
                         }
                         match seg.fault_in_block_for(*guard) {
                             Ok(Some(newly_resident)) => {
+                                // These bytes just came off disk through the
+                                // one path that verifies nothing: the
+                                // whole-file CRC is checked only on a full
+                                // read, so a block served directly was never
+                                // checked against anything. Now the entry's
+                                // own checksum answers for it.
+                                //
+                                // Returning None on a mismatch is not a
+                                // silent drop: it falls through to promotion
+                                // below, which reads the whole backup and
+                                // DOES verify its CRC, so a genuinely
+                                // corrupt file is refused there with the
+                                // full diagnosis.
+                                if crate::ram::entry::verify_entry_at(*guard) == Some(false) {
+                                    error!(
+                                        "Cold block read of segment {} (chunk {}) produced an \
+                                         entry that fails its content checksum at {:#x}. \
+                                         Refusing to serve it; falling back to a full read of \
+                                         the backup, which verifies the whole image.",
+                                        seg.id, chunk.id, *guard
+                                    );
+                                    seg.decr_references();
+                                    return None;
+                                }
                                 seg.mark_referenced();
                                 if let Some(ref tiered) = chunk.tiered_manager {
                                     tiered.add_cold_resident(newly_resident);
