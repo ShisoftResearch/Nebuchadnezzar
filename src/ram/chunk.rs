@@ -777,6 +777,13 @@ impl Chunk {
                         _ => break,
                     }
                 }
+                // A sealing head takes the same route as in the
+                // single-entry path: return None so the caller writes one
+                // cell the ordinary way, which rotates to a fresh segment.
+                if covered > 0 && !head.begin_pending_journal() {
+                    head.decr_references();
+                    return Ok(None);
+                }
                 if covered > 0 {
                     if let Some(base) = head.try_acquire_run(total) {
                         return Ok(Some((
@@ -789,6 +796,9 @@ impl Chunk {
                             covered,
                         )));
                     }
+                    // The claim was taken before the cursor was tried; give
+                    // it back, or this segment can never seal.
+                    head.end_pending_journal();
                 }
                 // Nothing fits, or the cursor moved under us: give the
                 // reference back before rotating, or it pins the segment
@@ -872,25 +882,40 @@ impl Chunk {
                     backoff.spin();
                     continue;
                 }
-                if let Some(addr) = head.try_acquire(size) {
-                    trace!(
-                        "Chunk {} acquired address {} for size {} in segment {} ({:?})",
-                        self.id,
-                        addr,
-                        size,
-                        head.id,
-                        segment_class
-                    );
-                    return Ok(PendingEntry {
-                        addr,
-                        seg: head,
-                        size,
-                        skip_sync: is_in_transaction(),
-                    });
+                // Claimed BEFORE the cursor moves. A writer that has taken
+                // space but not yet claimed is invisible to a seal's drain,
+                // and that is precisely the entry that ends up with nowhere
+                // to journal.
+                if head.begin_pending_journal() {
+                    if let Some(addr) = head.try_acquire(size) {
+                        trace!(
+                            "Chunk {} acquired address {} for size {} in segment {} ({:?})",
+                            self.id,
+                            addr,
+                            size,
+                            head.id,
+                            segment_class
+                        );
+                        return Ok(PendingEntry {
+                            addr,
+                            seg: head,
+                            size,
+                            skip_sync: is_in_transaction(),
+                        });
+                    }
+                    // No space in this segment: give the claim and the
+                    // reference back, or they pin the segment against
+                    // sealing, eviction and reclamation forever.
+                    head.end_pending_journal();
+                    head.decr_references();
+                } else {
+                    // This head is sealing. Fall THROUGH to rotation rather
+                    // than spinning here: retrying the same head would spin
+                    // for as long as the seal takes, and under a busy
+                    // archiver that is indefinitely -- writers would starve
+                    // on a segment that is never going to accept them again.
+                    head.decr_references();
                 }
-                // No space in this segment: give the reference back, or it
-                // pins the segment against eviction and reclamation forever.
-                head.decr_references();
             }
 
             let total_space = self.segs.len() * SEGMENT_SIZE;
@@ -2550,6 +2575,7 @@ impl PendingRun {
 
 impl Drop for PendingRun {
     fn drop(&mut self) {
+        self.seg.end_pending_journal();
         if !self.skip_sync {
             crate::ram::segs::queue_wal_sync(&self.seg);
         }
@@ -2568,7 +2594,12 @@ pub struct PendingEntry {
 impl Drop for PendingEntry {
     // dealing with entry write ahead log
     fn drop(&mut self) {
-        if let Err(error) = self.seg.write_wal(self.addr, self.size, self.skip_sync) {
+        let journal_result = self.seg.write_wal(self.addr, self.size, self.skip_sync);
+        // Release the journal slot as soon as the attempt is over, whatever
+        // its outcome: a seal waiting on this segment must not be held up by
+        // a writer that has already finished trying.
+        self.seg.end_pending_journal();
+        if let Err(error) = journal_result {
             // A straggler whose segment was sealed (archived) between its
             // append and this journal write cannot journal -- the recorded
             // seal-vs-pending-writer race. The entry's durability is already
@@ -2587,6 +2618,11 @@ impl Drop for PendingEntry {
                  race and must stay loud",
                 self.seg.id, self.addr, self.size
             );
+            // Give the reference back even here. Returning early used to skip
+            // it, so every straggler pinned its segment against eviction and
+            // reclamation permanently -- a leak that grew with exactly the
+            // race this counter exists to close.
+            self.seg.decr_references();
             return;
         }
         if !self.skip_sync {

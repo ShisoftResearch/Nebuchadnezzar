@@ -361,6 +361,10 @@ fn rlimit_nofile() -> Option<usize> {
     }
 }
 
+/// Top bit of `Segment::pending_journals`: set while a seal is pending, so
+/// no new journal claim can start while a drain is trying to reach zero.
+const JOURNAL_GATE_CLOSED: usize = 1 << (usize::BITS - 1);
+
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
@@ -527,6 +531,22 @@ pub struct Segment {
     pub wal_sync_queued: std::sync::atomic::AtomicBool,
     /// Per-read reference count; the hottest atomic in the struct.
     references: AtomicUsize,
+    /// Entries that have taken space in this segment but have not yet written
+    /// their WAL record, with the top bit set while a seal is pending.
+    ///
+    /// One word, not two: `Segment` is per-segment state and segments scale
+    /// with the dataset, so the struct is held to five cache lines (see
+    /// `segment_struct_stays_lean`). Packing also makes claiming a slot a
+    /// single compare-and-swap against the gate, instead of a check that a
+    /// concurrent close could slip past.
+    ///
+    /// A reference is not the same thing: readers hold those for as long as
+    /// they like, which is why archiving deliberately does not wait for them.
+    /// A pending journal is bounded and short -- it lives only between the
+    /// append and the log write -- so sealing CAN wait for it, and must:
+    /// sealing underneath one leaves an entry that is in memory and in the
+    /// index with no durable home at all.
+    pending_journals: AtomicUsize,
 
     // --- cleaner bookkeeping ---
     pub dead_space: AtomicU32,
@@ -717,6 +737,21 @@ pub struct SegmentFileState {
     pub wal: Option<File>,
 }
 
+/// Reopens a segment's journal gate unless the archive actually sealed it.
+///
+/// `archive` has many exits -- nothing to do, not dirty, an I/O error -- and
+/// a gate left shut on a segment that stays writable would refuse every
+/// later write to it.
+struct JournalGateGuard<'a> {
+    segment: &'a Segment,
+}
+
+impl Drop for JournalGateGuard<'_> {
+    fn drop(&mut self) {
+        self.segment.reopen_journal_gate();
+    }
+}
+
 impl Segment {
     pub fn new(
         id: u64,
@@ -778,6 +813,7 @@ impl Segment {
             dead_bytes_generation: AtomicU64::new(0),
             last_no_progress_clean_generation: AtomicU64::new(0),
             references: AtomicUsize::new(0),
+            pending_journals: AtomicUsize::new(0),
             file_state: parking_lot::Mutex::new(SegmentFileState {
                 manager: file_manager,
                 wal: wal_file_opt,
@@ -1567,6 +1603,36 @@ impl Segment {
     // archive this segment and write the data to backup storage
     // Backup files are opened on demand and closed immediately after use
     pub fn archive(&self) -> Result<bool, io::Error> {
+        // Let in-flight journal writes land before this takes `file_state`.
+        //
+        // This is the seal-vs-pending-writer race, at its source. A writer
+        // that has taken space but not yet written its WAL record blocks on
+        // this very lock, so if the archive seals and unlinks the log while
+        // holding it, that writer wakes to a sealed segment, is refused, and
+        // its entry -- already in memory and in the cell index -- has no
+        // durable home. It fired about 40 times per 17M-edge import.
+        //
+        // Waiting here is safe precisely because it happens BEFORE the lock:
+        // the writers being waited on need the lock to finish, and nothing
+        // that holds it is waited on. It is bounded for the same reason the
+        // reference count is NOT waited on (see below): a pending journal is
+        // microseconds of work, not an open-ended reader.
+        // Shut the gate first, or the drain chases a moving target: this
+        // segment may still be the write head, and new claims would arrive
+        // as fast as old ones retire.
+        self.close_journal_gate();
+        let _gate = JournalGateGuard { segment: self };
+        if !self.drain_pending_journals(std::time::Duration::from_millis(250)) {
+            warn!(
+                "Segment {} (chunk {}, seq {}) still has {} un-journaled entr(ies) after \
+                 waiting; archiving anyway. Those entries ride this archive if it carried \
+                 their bytes, and are counted as journal failures if it did not.",
+                self.id,
+                self.chunk_id,
+                self.seq_id,
+                self.pending_journal_count()
+            );
+        }
         let mut state = self.file_state.lock();
         let backup_path_opt = state
             .manager
@@ -2112,6 +2178,81 @@ image, not an empty segment; archiving it would persist the damage.",
             trace!("Forced WAL sync for segment {}", self.id);
         }
         Ok(())
+    }
+
+    /// Claim a journal slot, or refuse if the segment is closing.
+    ///
+    /// Claiming has to happen BEFORE the space is taken, not after: a writer
+    /// that has moved the append cursor but not yet claimed is invisible to
+    /// the drain, and that is exactly the entry that ends up with nowhere to
+    /// journal. The gate is re-read after the increment so a close that
+    /// lands concurrently is never missed.
+    pub fn begin_pending_journal(&self) -> bool {
+        let mut current = self.pending_journals.load(Ordering::Acquire);
+        loop {
+            if current & JOURNAL_GATE_CLOSED != 0 {
+                return false;
+            }
+            match self.pending_journals.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Refuse new journal claims, so a drain can actually reach zero.
+    pub fn close_journal_gate(&self) {
+        self.pending_journals
+            .fetch_or(JOURNAL_GATE_CLOSED, Ordering::AcqRel);
+    }
+
+    /// Accept claims again: for an archive that decided not to seal after
+    /// all. A sealed segment's gate stays shut -- nothing may append to it.
+    pub fn reopen_journal_gate(&self) {
+        if !self.is_sealed() {
+            self.pending_journals
+                .fetch_and(!JOURNAL_GATE_CLOSED, Ordering::AcqRel);
+        }
+    }
+
+    pub fn end_pending_journal(&self) {
+        // Subtracting one never disturbs the gate bit: the count is only
+        // decremented by a holder, so it is at least one here.
+        self.pending_journals.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn pending_journal_count(&self) -> usize {
+        self.pending_journals.load(Ordering::Acquire) & !JOURNAL_GATE_CLOSED
+    }
+
+    /// Wait for in-flight journal writes to land, briefly.
+    ///
+    /// Callers hold NO locks here -- in particular not `file_state`, which
+    /// the journal write itself needs -- so this must run before the archive
+    /// takes it. The wait is short by construction: a pending journal is the
+    /// gap between an append and its log write, microseconds of work, not a
+    /// reader that may sit on a segment indefinitely.
+    ///
+    /// Returns false if the wait timed out, which is the old behaviour
+    /// (seal anyway, count the straggler) rather than a stall.
+    pub fn drain_pending_journals(&self, timeout: std::time::Duration) -> bool {
+        if self.pending_journal_count() == 0 {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let backoff = crossbeam::utils::Backoff::new();
+        while std::time::Instant::now() < deadline {
+            if self.pending_journal_count() == 0 {
+                return true;
+            }
+            backoff.snooze();
+        }
+        self.pending_journal_count() == 0
     }
 
     pub fn no_references(&self) -> bool {
@@ -3366,5 +3507,102 @@ mod backup_fd_cache_tests {
         assert!(cache.get(&key).is_some());
         cache.remove(&key);
         assert!(cache.get(&key).is_none(), "removed handle should be gone");
+    }
+}
+
+#[cfg(test)]
+mod seal_race_tests {
+    use crate::ram::cell::{CellHeader, OwnedCell};
+    use crate::ram::chunk::{Chunks, WAL_JOURNAL_FAILURES};
+    use crate::ram::schema::{Field, LocalSchemasCache, Schema};
+    use crate::ram::types::*;
+    use crate::ram::types::Id;
+    use crate::server::ServerMeta;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// The seal-vs-pending-writer race, driven directly.
+    ///
+    /// A writer that has taken space but not yet written its WAL record
+    /// blocks on the segment's `file_state` lock. If an archive takes that
+    /// lock first and seals plus unlinks the log while holding it, the
+    /// writer wakes to a sealed segment and is refused -- leaving an entry
+    /// that is in memory and in the cell index with no durable home. It fired
+    /// ~40 times per 17M-edge import.
+    ///
+    /// Archiving now waits for in-flight journals BEFORE taking the lock,
+    /// which is safe precisely because the writers being waited on need that
+    /// lock to finish.
+    #[test]
+    fn archiving_waits_for_in_flight_journals_instead_of_sealing_under_them() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+
+        let schema = Schema::new_with_id(
+            991,
+            "seal_race_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            crate::ram::segs::SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+        );
+
+        let before = WAL_JOURNAL_FAILURES.load(Ordering::Relaxed);
+        let chunk = &chunks.list[0];
+
+        // Enough churn that archives and writes genuinely overlap: each
+        // round writes cells while a second thread archives every segment.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let archived = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let archiver_stop = stop.clone();
+        let archiver_count = archived.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !archiver_stop.load(Ordering::Relaxed) {
+                    for segment in chunk.segs.iter_values() {
+                        if let Ok(true) = segment.archive() {
+                            archiver_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+
+            for index in 0..4_000u64 {
+                let mut value = OwnedValue::Map(OwnedMap::new());
+                value["DATA"] = OwnedValue::U64(index);
+                let mut cell = OwnedCell {
+                    header: CellHeader::new(schema.id, &Id::allocated(21, 0, index + 1)),
+                    data: value,
+                };
+                chunks.write_cell(&mut cell).expect("write during archiving");
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        // Without real archives racing real writes this test proves nothing.
+        assert!(
+            archived.load(Ordering::Relaxed) > 0,
+            "no segment was archived during the run; the race was never exercised"
+        );
+
+        let failures = WAL_JOURNAL_FAILURES.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            failures, 0,
+            "{failures} entries could not be journaled because their segment sealed \
+             underneath them; archiving must drain in-flight journals first"
+        );
     }
 }
