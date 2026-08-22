@@ -182,6 +182,7 @@ where
     // restart, scan_schema returned nothing while the head page still held
     // the keys on disk.
     let mut kept_pages = Vec::with_capacity(page_cells.len());
+    let mut first_empty_page = None;
     let mut skipped_empty = 0usize;
     for cell in page_cells {
         page_count += 1;
@@ -195,10 +196,34 @@ where
                 page.next_id,
                 page.prev_id
             );
+            if first_empty_page.is_none() {
+                first_empty_page = Some(page);
+            }
             skipped_empty += 1;
             continue;
         }
         kept_pages.push(page);
+    }
+    if kept_pages.is_empty() {
+        // Every page is empty. That is a legal empty tree (a fresh tree's
+        // head persists this way before its first flush, and a genesis tree
+        // is reloaded in exactly this state on every fresh store), and with
+        // no non-empty page in the chain there is no separator ordering to
+        // poison. Keep the first page as the lone leaf so the tree goes
+        // through the same construction path as every other reload -- a
+        // bespoke shape here measurably diverged (persisted flag, link
+        // wiring) and broke the very next burst of inserts.
+        if let Some(page) = first_empty_page {
+            skipped_empty -= 1;
+            kept_pages.push(page);
+        } else {
+            // No pages at all: the chain was empty. Refuse like a missing
+            // page would -- the head id came from metadata that names it.
+            return Err(ReconstructError::MissingPage {
+                page_id: resolved_head_id,
+                pages_read: 0,
+            });
+        }
     }
     if skipped_empty > 0 {
         info!(
@@ -206,21 +231,6 @@ where
              them (their cells stay on disk until the chain is rewritten around them)",
             resolved_head_id, skipped_empty, page_count
         );
-    }
-    if kept_pages.is_empty() {
-        // Every page was emptied by tombstones: a legal empty tree. Rebuild
-        // it in the fresh-tree shape, keeping the stored head id so the
-        // metadata pointing at this tree stays valid.
-        info!(
-            "[B-TREE LOAD] All {} page(s) from head {:?} are empty; reconstructing an \
-             empty tree",
-            page_count, resolved_head_id
-        );
-        let root = NodeCellRef::new(Node::<KS, PS>::new_external(
-            resolved_head_id,
-            max_entry_key(),
-        ));
-        return Ok(BPlusTree::from_root(root, resolved_head_id, 0, 1, deletion));
     }
     let effective_head_id = kept_pages[0].node.id;
     let last_page_index = kept_pages.len() - 1;
