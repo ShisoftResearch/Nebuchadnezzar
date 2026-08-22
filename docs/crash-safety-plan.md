@@ -277,6 +277,41 @@ uncommitted updates and removes fall back to the prior version the
 append-only store still holds. No markers, no separate file, no second
 fsync, no cross-file ordering dependency.
 
+THE WATERMARK IS ITSELF AN ENTRY TYPE (decided 2026-08-22, user).
+A COMMIT_WATERMARK entry rather than a side file, because as an entry it
+inherits the CRC framing, torn-tail truncation, WAL/backup duality and
+quarantine path that Phase 1 just built -- a side file would need its own
+fsync ordering, its own torn-write handling and its own corruption story,
+i.e. every problem solved again, worse. It also travels with a copied
+backup set.
+
+The obstacle is timing: pass 1 needs the watermark to decide install vs
+pending, but an entry-borne watermark is only found BY scanning, and
+deferring everything to pass 2 makes the pending list O(live
+transactional cells) instead of O(recent). Fixed with a targeted
+pre-pass: the watermark is monotonic, so the newest lives in the
+highest-seq segment of some chunk; recovery already enumerates files by
+(chunk, seg, seq), so scan the highest-seq file per chunk first, take the
+max watermark found, then run the full parallel scan with it in hand.
+One file per chunk, parsed twice at worst.
+
+What makes this comfortable: A STALE WATERMARK IS ALWAYS SAFE; ONLY AN
+OVER-ADVANCED ONE IS DANGEROUS. Staleness costs only extra counting, and
+taking the max of what is actually found durably can never exceed the
+true watermark. So the pre-pass may miss, the write may fail, and a fresh
+store may have none at all (start at zero, count everything). The
+watermark therefore never sits on a critical path -- which a half-written
+side file could not offer, being ambiguous where a missing entry is not.
+
+Two rules it imposes:
+- The cleaner must retain the highest watermark entry per store (it
+  references no cell, so it looks like garbage); older ones are
+  reclaimable.
+- Advancing it allocates an entry, which can fail when the store is full
+  or shutting down. Best-effort and silent, precisely because staleness
+  is safe.
+
+
 TO MODEL IN TLA+ BEFORE ANY CODE:
 1. Safety: an installed transaction is exactly one whose commit was
    reported; never a partial install.
