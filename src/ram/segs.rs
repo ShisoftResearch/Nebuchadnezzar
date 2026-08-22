@@ -1977,10 +1977,16 @@ image, not an empty segment; archiving it would persist the damage.",
                     // one directory either fully installs the new image or
                     // leaves the previous state -- there is no torn middle.
                     fs::rename(&tmp_backup_file, &backup_file)?;
+                    // The rename must be DURABLE before the WAL that covers
+                    // these bytes is unlinked below, and only the directory's
+                    // own fsync makes it so. This was best-effort -- opened,
+                    // synced, result discarded -- which left a window where a
+                    // crash could find the rename not yet committed and the
+                    // WAL already gone: the segment would be lost entirely,
+                    // despite two files having held it moments earlier.
                     if let Some(parent) = Path::new(&backup_file).parent() {
-                        if let Ok(dir) = File::open(parent) {
-                            let _ = dir.sync_all();
-                        }
+                        let dir = File::open(parent)?;
+                        dir.sync_all()?;
                     }
 
                     // Sanity check: verify backup file actually exists before marking archived
@@ -2044,12 +2050,31 @@ image, not an empty segment; archiving it would persist the damage.",
                     }
 
                     // Delete the WAL file from disk
+                    let wal_path = state.manager.wal_path(self.chunk_id, self.id, self.seq_id);
                     if let Err(e) = state
                         .manager
                         .delete_wal(self.chunk_id, self.id, self.seq_id)
                     {
                         warn!("Failed to delete WAL file for segment {}: {}", self.id, e);
                     } else {
+                        // Make the unlink durable too. Left unsynced, a crash
+                        // can resurrect a WAL whose segment has since been
+                        // archived and re-used -- a log and an image for one
+                        // seq id, which is the twin-file state recovery
+                        // cannot arbitrate.
+                        if let Some(parent) = wal_path
+                            .as_ref()
+                            .and_then(|path| Path::new(path).parent())
+                        {
+                            match File::open(parent).and_then(|dir| dir.sync_all()) {
+                                Ok(()) => {}
+                                Err(e) => warn!(
+                                    "Could not sync the WAL directory after unlinking segment \
+                                     {}'s log: {}. The unlink may not survive a crash.",
+                                    self.id, e
+                                ),
+                            }
+                        }
                         debug!("Deleted WAL file for archived segment {}", self.id);
                     }
 

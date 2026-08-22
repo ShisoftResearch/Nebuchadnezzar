@@ -526,18 +526,26 @@ pub fn decompress_all_blocks(data: &[u8]) -> io::Result<Vec<u8>> {
     }
     let computed = crc32_checksum(&out);
     if computed != layout.checksum {
-        panic!(
-            "BACKUP DATA CORRUPTION DETECTED!\n\
-             CRC32 mismatch on block-compressed backup:\n\
-               Stored:   0x{:08X}\n\
-               Computed: 0x{:08X}\n\
-               Size:     {} bytes in {} blocks\n\
-             Recovery cannot proceed safely.",
-            layout.checksum,
-            computed,
-            out.len(),
-            layout.block_count
-        );
+        // An ERROR, not a panic.
+        //
+        // Recovery has machinery for exactly this: a backup that cannot be
+        // read is quarantined and its WAL twin is used instead, and a
+        // segment that can be read from neither is left absent rather than
+        // installed empty. Panicking here jumped over all of it and took
+        // the whole process down, so one corrupt backup file cost the
+        // entire store its startup -- including the databases that were
+        // perfectly intact.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "backup image fails its CRC32C: stored 0x{:08X}, computed 0x{:08X}, \
+                 {} bytes in {} blocks. The file is corrupt on disk.",
+                layout.checksum,
+                computed,
+                out.len(),
+                layout.block_count
+            ),
+        ));
     }
     Ok(out)
 }
@@ -822,16 +830,26 @@ mod tests {
         assert!(decompress_block(&packed, layout.block_count).is_err());
     }
 
+    /// Corruption must be reported, not thrown.
+    ///
+    /// This used to panic, which jumped over recovery's quarantine and
+    /// WAL-twin fallback entirely and took the process down -- one corrupt
+    /// file cost the whole store its startup, intact databases included.
     #[test]
-    #[should_panic(expected = "BACKUP DATA CORRUPTION DETECTED")]
-    fn corrupted_block_payload_is_caught_by_the_checksum() {
+    fn corrupted_block_payload_is_an_error_not_a_panic() {
         let data = segment_like(256 * 1024);
         let mut packed = compress_blocks(&data).unwrap();
         let layout = block_layout(&packed).unwrap();
         let (_, off, _) = layout.entry(&packed, 1).unwrap();
         // Flip a byte inside a block's payload, past its length prefix.
         packed[off + 8] ^= 0xFF;
-        let _ = decompress_all_blocks(&packed);
+        let error = decompress_all_blocks(&packed)
+            .expect_err("a corrupt image must not be returned as data");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("CRC32C"),
+            "the error should name the check that failed: {error}"
+        );
     }
 
     /// Prints the ratio-versus-amplification curve so block size can be chosen

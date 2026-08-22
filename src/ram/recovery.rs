@@ -227,7 +227,14 @@ fn group_files_by_chunk(
         grouped[file.chunk_id].push(file);
     }
     for chunk_files in &mut grouped {
-        chunk_files.sort_unstable_by_key(|file| (file.seg_id, file.seq_id));
+        // CHRONOLOGICAL, not by address. Two images of one cell at the same
+        // version are reconciled by "last one scanned wins" (`>=` below), so
+        // the scan order decides which survives -- and ordering by seg_id
+        // first made that decision by segment address, which is arbitrary.
+        // seq_id is the incarnation counter and increases with time, so
+        // ordering by it means the most recently written image wins a tie,
+        // which is the only answer that is ever right.
+        chunk_files.sort_unstable_by_key(|file| (file.seq_id, file.seg_id));
     }
     grouped
 }
