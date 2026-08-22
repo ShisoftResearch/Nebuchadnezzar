@@ -161,6 +161,71 @@ participant-led termination protocol), then implement. Explicitly out of
 scope until the single-node story is proven by Phase 5 — DECIDED
 2026-08-22 (user): design-only this campaign.
 
+### Phase 6a: retire the undo log from the write path (Zen-style)
+
+Prompted by the user pointing at Zen (Liu, Chen & Chen, VLDB 14(5), 2021),
+whose LP ("Last Persisted") bit is the MSB of a 63-bit per-tuple Tx-CTS:
+a transaction persists its tuples, fences once, then sets LP on the LAST
+tuple. Recovery groups tuples by Tx-CTS and treats a group as committed
+iff one member carries LP; otherwise the previous versions (never
+overwritten) stand. No logs, no checkpoints.
+
+What we take, and what changes because we are NOT on PMEM:
+
+- TAKE the architecture: stamp transactional entries with a commit
+  timestamp, keep the commit evidence in the SAME log as the data, and
+  fall back to the previous version. That is what removes the undo log's
+  marker, its separate file, its second fsync, and the ordering
+  dependency between them.
+- DROP the bit as the mechanism. On PMEM the LP bit exists to avoid one
+  extra 64B line write; in an append log an extra record costs nothing we
+  were not already fsyncing. Commit evidence is a COMMIT ENTRY, not a
+  stolen bit -- and a record can carry what a bit cannot (below).
+- REPLACE ordering with completeness. Zen's sfence guarantees
+  data-before-LP; fsync gives no such ordering, since until it returns any
+  subset may be durable. So the commit record names the transaction's
+  ENTRY COUNT and recovery accepts it only on finding all N. The CRC
+  record framing from Phase 1.1 is what makes that count trustworthy.
+- ADD a global reduction. Zen's per-thread regions make a local scan
+  conclusive; our transactions scatter across chunks, so the commit set
+  must be reduced across all of them. Recovery already does a global
+  second pass for tombstones, so the shape exists.
+
+DECIDED 2026-08-22 (user): the stamp does NOT widen the entry header.
+Growing the 8-byte header to 16 would charge every cell and tombstone
+(~29 GB at TB19 scale) for a minority of writes -- the same arithmetic
+that kept the checksum out of CellHeader. Instead one spare bit in the
+type byte marks "carries a Tx-CTS", and only tagged entries pay 8 bytes,
+in their CONTENT:
+
+    bits 0..4    entry type        (UNDECIDED/CELL/TOMBSTONE, + COMMIT)
+    bits 4..8    flags             (bit 4 = carries Tx-CTS)
+    bits 8..32   content checksum  (unchanged; covers the stamp for free)
+
+Non-transactional writes -- the bulk, imports included -- are untouched.
+Alignment holds (8-byte stamp, 8-byte aligned entries). The cost is that
+`content_pos` becomes flag-dependent, so every site decoding content from
+an entry address must agree; a missed one reads a cell header out of a
+Tx-CTS, which is why entry checksum verification wants to be live on
+those paths while the change beds in.
+
+OPEN: 8-byte local commit sequence vs the full 16-byte HLC. Recovery only
+needs to group entries and order watermarks, which 8 bytes does for
+decades at a million transactions a second. The full HLC is only needed
+if the distributed protocol later resolves in-doubt transactions by
+reading a participant's store directly.
+
+The cleaner constraint this creates has teeth: a version whose only
+successor is an UNDECIDED transaction must not be reclaimed, or the
+fallback target is gone, and commit evidence must survive until its
+transaction's entries are superseded. Bound both with a durable "every
+transaction below CTS X is decided" watermark -- Zen's global minimum
+Tx-CTS.
+
+Portability: the entry stamp is the durable investment and is identical
+on either memory technology. Only the evidence form changes -- a COMMIT
+entry on block storage, Zen's LP bit if the store ever moves to PMEM.
+
 ## Sequencing and dependencies
 
 Phase 1 and Phase 3.1 first (they close active corruption/loss windows and
