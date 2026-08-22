@@ -63,7 +63,10 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
         };
 
         // Validate entry type bits before attempting decode
-        if let None = EntryType::from_bits(entry_type_bits) {
+        if matches!(
+            crate::ram::entry::unpack_type_word(entry_type_bits),
+            crate::ram::entry::TypeWord::Invalid
+        ) {
             // Invalid entry type - likely corrupted data
             warn!(
                 "Corrupted entry header detected at offset {} (address 0x{:016x}): \
@@ -649,7 +652,10 @@ fn scan_segment_from_data(
             let mut reader = Cursor::new(std::slice::from_raw_parts(cursor as *const u8, 8));
             reader.read_u32::<LittleEndian>().unwrap()
         };
-        if EntryType::from_bits(entry_type_bits).is_none() {
+        if matches!(
+            crate::ram::entry::unpack_type_word(entry_type_bits),
+            crate::ram::entry::TypeWord::Invalid
+        ) {
             if append_header > data_base {
                 warn!(
                     "Recovered segment {} scan stopped at a malformed tail (offset {}, invalid entry type bits {})",
@@ -716,6 +722,31 @@ fn scan_segment_from_data(
                     "recovery cannot scan segment {}: invalid entry size {} at offset {}",
                     seg_id,
                     entry_size,
+                    cursor - data_base
+                ),
+            ));
+        }
+
+        // Content integrity, where a length check cannot reach: an entry
+        // whose header is perfectly well-formed can still hold bytes that
+        // were never written by any writer. Entries from before checksums
+        // report `None` and are taken on trust, as they always were.
+        if crate::ram::entry::verify_entry_at(cursor) == Some(false) {
+            if append_header > data_base {
+                warn!(
+                    "Recovered segment {} scan stopped at offset {}: the entry's content does \
+                     not match its checksum. Everything before it is intact and is kept.",
+                    seg_id,
+                    cursor - data_base
+                );
+                break;
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "recovery cannot scan segment {}: the FIRST entry (offset {}) fails its \
+                     content checksum, so nothing in this segment can be trusted",
+                    seg_id,
                     cursor - data_base
                 ),
             ));
