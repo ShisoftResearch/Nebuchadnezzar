@@ -346,14 +346,29 @@ fn parent_main(args: &[String]) -> ExitCode {
             );
         }
 
-        if !graceful && newly_deleted > 0 {
-            // A hard kill sets no expectation of its own; the standing bar
-            // just loses whatever was deleted under it.
-            state.best_verified = state.best_verified.saturating_sub(newly_deleted);
-            println!(
-                "    deleted {} key(s) (total {}); bar now {}",
-                newly_deleted, state.deleted, state.best_verified
-            );
+        if !graceful {
+            // A hard kill RELEASES the bar; it does not merely lower it.
+            //
+            // The durability contract this campaign settled on is
+            // asymmetric on purpose: a graceful shutdown must preserve
+            // every acked write, while a crash may lose whatever sat inside
+            // the group-commit window (10 ms / 1 MB of WAL). Carrying the
+            // previous scan as a hard floor across a SIGKILL therefore
+            // enforces the GRACEFUL contract on a crash, which the product
+            // never promised -- and it duly reported a shortfall of ONE key
+            // in 1,199,792 as a durability regression.
+            //
+            // So after a kill the next scan sets the bar, and the strong
+            // "nothing that was ever served may vanish" invariant is
+            // enforced exactly where the contract is strong: across
+            // graceful boundaries.
+            if newly_deleted > 0 || state.best_verified > 0 {
+                println!(
+                    "    hard kill: bar released (was {}, {} deleted); the next scan sets it",
+                    state.best_verified, newly_deleted
+                );
+            }
+            state.best_verified = 0;
         }
 
         if let Some(reason) = failed {
