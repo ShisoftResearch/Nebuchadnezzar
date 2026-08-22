@@ -308,11 +308,43 @@ pub fn get_segment_for_fault(
 // When true, WAL writes will skip fsync (will be synced at commit instead)
 thread_local! {
     static IN_TRANSACTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Segments this thread appended to while inside a transaction.
+    ///
+    /// Transactional writes skip the group-commit sync deliberately -- the
+    /// promise is that the commit syncs them instead. Keeping the list here,
+    /// where the skip happens, is what makes that promise keepable: the
+    /// commit path used to sync segments derived from the OLD addresses of
+    /// updated and removed cells, which are not where the new entries went,
+    /// and a transaction of pure inserts recorded nothing at all and so
+    /// synced nothing.
+    static TXN_TOUCHED_SEGMENTS: std::cell::RefCell<Vec<AArc<Segment>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Set the transaction context for the current thread
 pub fn set_transaction_context(in_txn: bool) {
     IN_TRANSACTION.with(|flag| flag.set(in_txn));
+}
+
+/// Record a segment whose transactional entry is not yet durable.
+fn note_transactional_write(segment: &AArc<Segment>) {
+    TXN_TOUCHED_SEGMENTS.with(|segments| {
+        let mut segments = segments.borrow_mut();
+        // Runs are common and land in one segment; a linear scan over a
+        // handful of entries beats hashing them.
+        if !segments.iter().any(|held| held.id == segment.id
+            && held.chunk_id == segment.chunk_id
+            && held.seq_id == segment.seq_id)
+        {
+            segments.push(segment.clone());
+        }
+    });
+}
+
+/// Take the segments this thread wrote to under a transaction, leaving the
+/// list empty for the next one.
+pub fn take_transactional_segments() -> Vec<AArc<Segment>> {
+    TXN_TOUCHED_SEGMENTS.with(|segments| std::mem::take(&mut *segments.borrow_mut()))
 }
 
 /// Check if the current thread is in a transaction context
@@ -2578,6 +2610,8 @@ impl Drop for PendingRun {
         self.seg.end_pending_journal();
         if !self.skip_sync {
             crate::ram::segs::queue_wal_sync(&self.seg);
+        } else {
+            note_transactional_write(&self.seg);
         }
         self.seg.set_dirty();
         self.seg.decr_references();
@@ -2629,6 +2663,8 @@ impl Drop for PendingEntry {
             // Timer-based group commit rides the WAL syncer thread now;
             // transactional entries keep syncing at commit instead.
             crate::ram::segs::queue_wal_sync(&self.seg);
+        } else {
+            note_transactional_write(&self.seg);
         }
         self.seg.set_dirty();
         self.seg.decr_references();

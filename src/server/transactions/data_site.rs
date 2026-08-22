@@ -1147,29 +1147,65 @@ impl DataManager {
         crate::ram::chunk::set_transaction_context(false);
 
         if let Some((id, error)) = write_error {
+            // Drop what this attempt recorded: the next transaction on this
+            // thread must not inherit segments (nor pin them alive).
+            drop(crate::ram::chunk::take_transactional_segments());
             return Self::map_commit_write_error(&txn, id, error);
         }
 
         txn.state = TxnState::Committed;
-        for guard in &txn.segment_guards {
-            let chunk_idx = guard.chunk_id();
-            let seg_id = guard.segment_id();
-            let chunk = &self.chunks().list[chunk_idx];
-            if let Some(segment) = chunk.segs.get(&(seg_id as usize)) {
-                if let Err(error) = segment.force_wal_sync() {
-                    error!(
-                        "Failed to sync WAL for segment {} during commit: {:?}",
-                        seg_id, error
-                    );
-                } else {
-                    debug!(
-                        "Synced segment {} (chunk {}) WAL to disk for transaction commit",
-                        seg_id, chunk_idx
-                    );
-                }
+
+        // Sync the segments this transaction actually APPENDED to.
+        //
+        // The old loop walked `segment_guards`, which hold the segments of
+        // the OLD versions of updated and removed cells -- not where the new
+        // entries went. A transaction of pure inserts pushed no guard at all
+        // and so synced nothing, while its writes had skipped group commit
+        // on the promise that commit would sync them. Both halves of that
+        // promise were broken. The list now comes from the write path
+        // itself, recorded at the point where the sync was skipped.
+        let mut sync_failure = None;
+        for segment in crate::ram::chunk::take_transactional_segments() {
+            if let Err(error) = segment.force_wal_sync() {
+                error!(
+                    "Failed to sync WAL for segment {} (chunk {}) during commit: {:?}",
+                    segment.id, segment.chunk_id, error
+                );
+                sync_failure.get_or_insert(error);
+            } else {
+                debug!(
+                    "Synced segment {} (chunk {}) WAL to disk for transaction commit",
+                    segment.id, segment.chunk_id
+                );
             }
         }
+        if let Some(error) = sync_failure {
+            // Reporting success here would promise durability that does not
+            // exist: the writes are in memory and in the index, but their
+            // log is not on disk, so a crash loses a committed transaction.
+            // The undo entries are still there and still incomplete, so
+            // recovery rolls this transaction back -- which is the outcome
+            // the caller is now told about.
+            error!(
+                "Transaction {:?} could not be made durable at commit: {:?}. Reporting failure \
+                 so it is not treated as committed.",
+                tid, error
+            );
+            txn.state = TxnState::Aborted;
+            return DMCommitResult::NotDurable(format!("WAL sync failed: {error:?}"));
+        }
 
+        // NO commit marker here, deliberately.
+        //
+        // Despite its name, this runs in the coordinator's PREPARE phase
+        // (`manager::sites_commit`, whose success becomes
+        // `TMPrepareResult::Success`): it applies the writes and records the
+        // undo entries that let them be taken back. The commit DECISION
+        // comes later, in `end`, and the marker belongs with the decision --
+        // writing it here marks the transaction complete before anyone has
+        // decided to commit it, so a crash in between leaves writes that
+        // recovery will never roll back. That is durability for something
+        // that was never agreed.
         DMCommitResult::Success
     }
 
@@ -4257,7 +4293,15 @@ impl Service for DataManager {
             };
             drop(guards_to_drop); // Drop guards, releasing all segment references
 
-            // Write commit/abort marker to undo log based on transaction state
+            // The markers belong here, with the decision: this is where a
+            // transaction is actually committed or aborted, whereas the
+            // misleadingly named `commit` above runs in the PREPARE phase.
+            //
+            // A participant that crashes between the coordinator's decision
+            // and this marker still comes back in-doubt and is rolled back,
+            // which is a coordinator-durability problem (the coordinator
+            // keeps no durable record of its decision) and is tracked as
+            // such -- it cannot be fixed by moving this write earlier.
             if let Some(undo_log) = self.undo_log() {
                 let log_result = match txn_state {
                     TxnState::Committed => undo_log.write_commit_marker(&tid),

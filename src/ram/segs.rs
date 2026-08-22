@@ -40,6 +40,9 @@ pub static ARCHIVE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static ARCHIVE_REWRITES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
+/// Explicit `force_wal_sync` calls that actually reached `fsync`: the
+/// durability a transaction commit promises, made countable.
+pub static FORCED_WAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Dirty registry for the WAL syncer: segments with unsynced non-transactional
 /// WAL bytes, each enqueued at most once per pass (`wal_sync_queued`). One
@@ -2169,6 +2172,7 @@ image, not an empty segment; archiving it would persist the damage.",
         let mut state = self.file_state.lock();
         if let Some(ref mut file) = state.wal {
             file.sync_all()?;
+            FORCED_WAL_SYNCS.fetch_add(1, Relaxed);
 
             // Reset counters after forced sync
             let current_time = get_time();

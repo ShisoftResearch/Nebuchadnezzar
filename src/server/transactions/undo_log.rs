@@ -2341,6 +2341,106 @@ mod tests {
     // E2E Tests with Real Transactions
     // =====================================================================
 
+    /// A transaction of pure INSERTS must make its writes durable.
+    ///
+    /// Transactional writes skip group commit on the promise that the
+    /// transaction syncs them instead. That promise was broken twice over:
+    /// the sync loop walked segment guards, which hold the segments of the
+    /// OLD versions of updated and removed cells rather than where the new
+    /// entries went, and an insert-only transaction pushed no guard at all,
+    /// so it synced nothing whatsoever. Its cells were in memory and in the
+    /// index, with a WAL record that no one had committed to disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transaction_of_pure_inserts_syncs_its_wal() {
+        let _ = env_logger::try_init();
+
+        use crate::ram::segs::{FORCED_WAL_SYNCS, SEGMENT_SIZE};
+        use crate::ram::tests::default_fields;
+        use crate::server::transactions;
+        use crate::server::{NebServer, ServerOptions, Service};
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let raft_path = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_path).unwrap();
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: SEGMENT_SIZE * 4,
+                db_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
+                backup_storage: Some(
+                    temp_dir.path().join("backup").to_str().unwrap().to_string(),
+                ),
+                wal_storage: Some(temp_dir.path().join("wal").to_str().unwrap().to_string()),
+                index_enabled: false,
+                services: vec![Service::Cell, Service::Transaction],
+                enable_recovery: false,
+                disable_storage_locks: true,
+                undo_log_storage: Some(
+                    temp_dir.path().join("undo").to_str().unwrap().to_string(),
+                ),
+                raft_storage: Some(raft_path.to_str().unwrap().to_string()),
+            },
+            &server_addr,
+            "test",
+            async |_| {},
+        )
+        .await
+        .unwrap();
+
+        let schema = crate::ram::schema::Schema::new_with_id(
+            77,
+            "pure_insert_durability",
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        server.meta().schemas.debug_only_new_schema(schema.clone());
+
+        let txn = transactions::new_async_client_for_database(&server_addr, "test", "test")
+            .await
+            .unwrap();
+        let txn_id = txn.begin().await.unwrap().unwrap();
+
+        // Inserts only: no update, no remove, so nothing pushes a segment
+        // guard and the old sync loop had nothing to walk.
+        for value in 0..4i64 {
+            let mut data_map = OwnedMap::new();
+            data_map.insert(&String::from("id"), OwnedValue::I64(value));
+            data_map.insert(
+                &String::from("name"),
+                OwnedValue::String(format!("insert_{value}")),
+            );
+            data_map.insert(&String::from("score"), OwnedValue::U64(value as u64));
+            let cell =
+                OwnedCell::new_with_id(schema.id, &random_id(), OwnedValue::Map(data_map));
+            match txn.write(txn_id.clone(), cell).await.unwrap().unwrap() {
+                TxnExecResult::Accepted(()) => {}
+                other => panic!("write should be accepted, got {other:?}"),
+            }
+        }
+
+        let before = FORCED_WAL_SYNCS.load(AtomicOrdering::Relaxed);
+        match txn.prepare(txn_id.clone()).await.unwrap().unwrap() {
+            TMPrepareResult::Success => {}
+            other => panic!("prepare should succeed, got {other:?}"),
+        }
+        let synced = FORCED_WAL_SYNCS.load(AtomicOrdering::Relaxed) - before;
+        assert!(
+            synced > 0,
+            "an insert-only transaction reached its prepare vote without syncing any WAL; \
+             its writes had skipped group commit and nothing made them durable"
+        );
+
+        match txn.commit(txn_id.clone()).await.unwrap().unwrap() {
+            EndResult::Success => {}
+            other => panic!("commit should succeed, got {other:?}"),
+        }
+    }
+
     /// E2E test: Write operation rollback with real transactions
     /// Tests that a transaction that writes a new cell but doesn't commit
     /// will have the cell deleted during recovery

@@ -130,6 +130,14 @@ pub enum DMCommitResult {
     WriteError(Id, WriteError),
     CellChanged(Id),
     CheckFailed(CheckError),
+    /// The writes were applied but could not be made durable: their WAL
+    /// could not be synced, or the commit marker could not be written.
+    ///
+    /// Reporting success in that state would promise a durability that does
+    /// not exist -- the data is in memory and in the index, but a crash
+    /// would take it. The transaction is left for recovery to roll back,
+    /// which is what its still-incomplete undo entries ask for.
+    NotDurable(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
