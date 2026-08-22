@@ -51,6 +51,14 @@ pub static ROTATE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_DRAIN_NANOS: AtomicU64 = AtomicU64::new(0);
 /// Entries whose WAL journal failed at PendingEntry drop (sealed underneath).
 pub static WAL_JOURNAL_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Allocation refusals because the chunk had no room left.
+///
+/// A full store is not a durability failure, but it looks exactly like one
+/// from the outside: index write-back cannot allocate, its batches are
+/// abandoned, the barrier is never established, and entries go missing. Any
+/// harness judging durability has to be able to tell the two apart, so the
+/// refusal is counted where it happens.
+pub static ALLOCATION_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static ROTATE_ARCHIVE_NANOS: AtomicU64 = AtomicU64::new(0);
 pub static ROTATIONS: AtomicU64 = AtomicU64::new(0);
 /// Within rotation: allocating the fresh segment (including its WAL file
@@ -990,6 +998,7 @@ impl Chunk {
                         segment_class
                     );
                     error!("No space left for chunk {}, cannot allocate space", self.id);
+                    ALLOCATION_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                     return Err(WriteError::CannotAllocateSpace);
                 } else if full_gc {
                     warn!("No space left for chunk {}, emergency full GC", self.id);

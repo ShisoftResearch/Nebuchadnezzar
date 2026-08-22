@@ -78,6 +78,7 @@ fn parent_main(args: &[String]) -> ExitCode {
     };
 
     let mut mutilated_last = false;
+    let mut exhausted_last = false;
     for cycle in 0..cycles {
         let first = cycle == 0;
         if mutilated_last {
@@ -140,6 +141,7 @@ fn parent_main(args: &[String]) -> ExitCode {
         let mut scanned: Option<u64> = None;
         let mut acked_high: u64 = state.next_key;
         let mut deleted_high: u64 = state.deleted;
+        let mut exhausted_this_cycle = false;
         let mut failed: Option<String> = None;
 
         // Reader thread streams child lines; main thread enforces deadline.
@@ -198,8 +200,17 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // The two invariants that define the corpse class.
                         if n < state.best_verified {
                             failed = Some(format!(
-                                "REGRESSION: scanned {} < best verified {}",
-                                n, state.best_verified
+                                "REGRESSION: scanned {} < best verified {}{}",
+                                n,
+                                state.best_verified,
+                                if exhausted_last {
+                                    " -- BUT the previous cycle ran the store OUT OF SPACE, \
+                                     which stops index write-back and loses entries by \
+                                     design. Re-run with a larger NEB_CHURN_DB_GB before \
+                                     reading this as a durability bug."
+                                } else {
+                                    ""
+                                }
                             ));
                             unsafe { libc::kill(child_pid, libc::SIGKILL) };
                             break;
@@ -211,6 +222,9 @@ fn parent_main(args: &[String]) -> ExitCode {
                         acked_high = rest.trim().parse().unwrap_or(acked_high);
                     } else if let Some(rest) = line.strip_prefix("DELETED_TO ") {
                         deleted_high = rest.trim().parse().unwrap_or(deleted_high);
+                    } else if line.starts_with("STORE_EXHAUSTED") {
+                        exhausted_this_cycle = true;
+                        println!("    STORE RAN OUT OF SPACE during the previous cycle");
                     } else if let Some(rest) = line.strip_prefix("CELLS_PRESENT ") {
                         // Printed for every cycle, so a regression can be
                         // read as "index lost entries" or "store lost cells"
@@ -260,6 +274,7 @@ fn parent_main(args: &[String]) -> ExitCode {
             }
         }
 
+        exhausted_last = exhausted_this_cycle;
         state.next_key = acked_high.max(state.next_key);
         // Every key the store was told to delete is one fewer the next scan
         // owes us. A delete lost to a SIGKILL only leaves the key in place,
@@ -494,8 +509,31 @@ async fn child_async(
 
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_size: 64 * 1024 * 1024,
-            db_size: 2 * 1024 * 1024 * 1024,
+            // Sized for the INDEX, not the cells.
+            //
+            // Half a million padded cells is only ~120 MB, but each one also
+            // writes ranged-index pages, and every flush rewrites the dirty
+            // ones -- so page versions accumulate far faster than the cells
+            // do, and the cleaner cannot always keep up under continuous
+            // kill-and-restart churn. At 2 GB a run reliably hit "No space
+            // left for chunk N" (5,982 times in one soak), which made index
+            // write-back batches fail, which left the barrier unestablished,
+            // which lost index entries -- and the harness reported that as a
+            // durability REGRESSION when it was really the store being full.
+            // Configurable so a deliberately-small run can still study that.
+            chunk_size: std::env::var("NEB_CHURN_CHUNK_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(256)
+                * 1024
+                * 1024,
+            db_size: std::env::var("NEB_CHURN_DB_GB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(16)
+                * 1024
+                * 1024
+                * 1024,
             tiered_config: None,
             backup_storage: Some(dir.join("backup").to_string_lossy().into_owned()),
             wal_storage: Some(dir.join("wal").to_string_lossy().into_owned()),
@@ -572,6 +610,15 @@ async fn child_async(
     }
     println!("SCANNED n={}", count);
     flush_stdout();
+    // A store that ran out of room is a CONFIGURATION outcome, not a
+    // durability one. Index write-back cannot allocate, its batches are
+    // abandoned, the barrier is never established and entries are lost --
+    // all correct behaviour for a full store, and all indistinguishable
+    // from real loss unless the harness is told which it is looking at.
+    if neb::ram::chunk::ALLOCATION_EXHAUSTED.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        println!("STORE_EXHAUSTED");
+        flush_stdout();
+    }
 
     // Which layer lost it?
     //
