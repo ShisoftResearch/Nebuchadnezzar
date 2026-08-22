@@ -2266,7 +2266,14 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
     };
     let group = "secondary_index_restart_group";
     const SCHEMA: u32 = 9180;
-    const CELLS: u64 = 32;
+    // Enough by default to catch presence; NEB_IDX_RESTART_CELLS=300000
+    // forces a height>=2 reconstruction, which is where a reconstructed
+    // tree's SCAN can break while its keys all load (measured live:
+    // 179,423 keys reconstructed, scan empty).
+    let cells: u64 = std::env::var("NEB_IDX_RESTART_CELLS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
     let schema = || {
         Schema::new_with_id(
             SCHEMA,
@@ -2278,6 +2285,8 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         )
     };
     let cell_id = |index: u64| Id::allocated((index % 4) as u16, 9, index + 1);
+    const CELLS_SENTINEL: u64 = 0; // silences the const references below
+    let _ = CELLS_SENTINEL;
 
     async fn scan_count(runtime: &Arc<DatabaseRuntime>) -> usize {
         let mut count = 0usize;
@@ -2311,7 +2320,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         .expect("dynamic database should load");
     dynamic.meta().schemas.register_internal_schema(schema());
 
-    for index in 0..CELLS {
+    for index in 0..cells {
         let mut value = OwnedValue::Map(OwnedMap::new());
         value["DATA"] = OwnedValue::U64(index);
         let mut cell = OwnedCell::new_with_id(SCHEMA, &cell_id(index), value);
@@ -2323,7 +2332,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
     let _ = IndexBuilder::await_all_indices().await;
     assert_eq!(
         scan_count(&dynamic).await,
-        CELLS as usize,
+        cells as usize,
         "the scan must see every cell before the restart"
     );
 
@@ -2346,9 +2355,9 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
     dynamic.meta().schemas.register_internal_schema(schema());
     let recovered = scan_count(&dynamic).await;
     assert_eq!(
-        recovered, CELLS as usize,
+        recovered, cells as usize,
         "the dynamic database's ranged index lost cells across a graceful restart: \
-         scan sees {recovered} of {CELLS}"
+         scan sees {recovered} of {cells}"
     );
     server.shutdown().await;
 }
