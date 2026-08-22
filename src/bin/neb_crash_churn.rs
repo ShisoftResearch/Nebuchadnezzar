@@ -298,26 +298,39 @@ fn parent_main(args: &[String]) -> ExitCode {
         // the bar by the acked deletions keeps the invariant one-sided.
         let newly_deleted = deleted_high.saturating_sub(state.deleted);
         if newly_deleted > 0 {
-            state.best_verified = state.best_verified.saturating_sub(newly_deleted);
             state.deleted = deleted_high;
-            println!(
-                "    deleted {} more key(s) (total {}); expecting >= {} on next load",
-                newly_deleted, state.deleted, state.best_verified
-            );
         }
         if graceful && failed.is_none() {
             // The next cycle's scan must cover every acked key: record the
             // expectation now; enforcement happens when that scan reports.
-            // Deletions this cycle are already netted out above, so the
-            // cursor alone is the expectation.
-            let live = state.next_key;
-            if live > state.best_verified {
-                state.best_verified = live;
-                println!(
-                    "    graceful shutdown: expecting >= {} on next load",
-                    state.best_verified
-                );
-            }
+            // ONE expression, and it must include the deletions.
+            //
+            // Computing the delete-adjusted bar and then letting the
+            // graceful branch overwrite it with the bare cursor put the
+            // deletions back: cycle 3 of a soak lowered the bar to
+            // 1,193,864 for 1,038 deletes and then raised it again to
+            // 1,194,902, and cycle 4's scan of 1,193,881 -- which CLEARS
+            // the correct bar -- was reported as a regression.
+            //
+            // The child rebases numbering on its scan count, so keys added
+            // this cycle is cursor minus that base, and the base cancels:
+            // live at the end of a graceful cycle is cursor - deletions.
+            let live = state.next_key.saturating_sub(newly_deleted);
+            state.best_verified = live;
+            println!(
+                "    graceful shutdown: expecting >= {} on next load ({} written, {} deleted)",
+                state.best_verified, state.next_key, newly_deleted
+            );
+        }
+
+        if !graceful && newly_deleted > 0 {
+            // A hard kill sets no expectation of its own; the standing bar
+            // just loses whatever was deleted under it.
+            state.best_verified = state.best_verified.saturating_sub(newly_deleted);
+            println!(
+                "    deleted {} key(s) (total {}); bar now {}",
+                newly_deleted, state.deleted, state.best_verified
+            );
         }
 
         if let Some(reason) = failed {
