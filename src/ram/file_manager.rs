@@ -310,12 +310,12 @@ impl SegmentFileManager {
 
         // Scan backup storage recursively
         if let Some(backup_dir) = &self.backup_storage {
-            self.scan_dir_recursive(Path::new(backup_dir), &mut files, true)?;
+            self.scan_storage_root(Path::new(backup_dir), &mut files, true)?;
         }
 
         // Scan WAL storage recursively
         if let Some(wal_dir) = &self.wal_storage {
-            self.scan_dir_recursive(Path::new(wal_dir), &mut files, false)?;
+            self.scan_storage_root(Path::new(wal_dir), &mut files, false)?;
         }
 
         // Deduplicate by (chunk_id, seg_id), keeping only the highest seq_id
@@ -446,6 +446,45 @@ impl SegmentFileManager {
             let path = entry.path();
             if path.is_dir() {
                 // Recursively scan subdirectories
+                self.scan_dir_recursive(&path, files, is_backup_scan)?;
+            } else if path.is_file() {
+                if let Some(info) = SegmentFileInfo::parse_filename(&path) {
+                    if info.is_backup == is_backup_scan {
+                        files.push(info);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Scan one storage ROOT, skipping the reserved `databases/` child.
+    ///
+    /// `<root>/databases/<scoped_name>/` is where the server scopes every
+    /// dynamically-bound database's storage (see the server's storage-root
+    /// scoping), and each of those stores has its OWN file manager rooted
+    /// there. Descending into it from the unscoped root ingested every other
+    /// database's segments into this one's recovery: files are named only
+    /// `{chunk}-{seg}-{seq}` with no database identity, so the dedup treated
+    /// another store's WAL as a twin of this store's backup -- measured as a
+    /// dynamic database's WAL being shadowed (its writes unrecoverable) and
+    /// cross-database cells surfacing under the wrong schemas.
+    fn scan_storage_root(
+        &self,
+        root: &Path,
+        files: &mut Vec<SegmentFileInfo>,
+        is_backup_scan: bool,
+    ) -> io::Result<()> {
+        if !root.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("databases") {
+                    continue;
+                }
                 self.scan_dir_recursive(&path, files, is_backup_scan)?;
             } else if path.is_file() {
                 if let Some(info) = SegmentFileInfo::parse_filename(&path) {

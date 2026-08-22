@@ -2115,3 +2115,121 @@ async fn server_shutdown_thread_retention_probe() {
         after_prev = after;
     }
 }
+
+/// A dynamically-loaded database must keep its writes across a graceful
+/// restart.
+///
+/// It did not: `NebServer::shutdown` flushed exactly one runtime -- the
+/// default's (`self.chunks()`): WAL sync, write close, dirty-segment archive
+/// and the LSM flush all named it explicitly, and every runtime in
+/// `database_runtimes` was dropped with its dirty head segments unarchived.
+/// Whatever background eviction happened to have archived survived; the most
+/// recent writes did not. Found on FlyWire connectome databases (created via
+/// /v1/admin/databases): after a SIGTERM restart the sidecar cells written
+/// since the last tier-pressure archive were unreadable while older graph
+/// cells read fine -- the classic shape of a missing shutdown flush.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
+        undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().to_string()),
+        raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: false,
+        services: vec![Service::Cell],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let group = "secondary_db_restart_group";
+    const SCHEMA: u32 = 9179;
+    const CELLS: u64 = 64;
+    let schema = || {
+        Schema::new_with_id(
+            SCHEMA,
+            "secondary_db_restart_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            false,
+        )
+    };
+    let cell_id = |index: u64| Id::allocated((index % 4) as u16, 7, index + 1);
+
+    let address = crate::utils::test_port::unique_localhost_addr();
+    let server = NebServer::new_from_opts(&opts, &address, group, async |_| {})
+        .await
+        .unwrap();
+
+    let dynamic = server
+        .ensure_database_runtime("brains/fly")
+        .await
+        .expect("dynamic database should load");
+    dynamic.meta().schemas.register_internal_schema(schema());
+    // A control write into the DEFAULT database, which shutdown always
+    // flushed correctly -- if this one vanishes too, the failure is not the
+    // secondary-runtime gap this test pins.
+    server.meta().schemas.register_internal_schema(schema());
+    let mut control = {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value["DATA"] = OwnedValue::U64(u64::MAX);
+        OwnedCell::new_with_id(SCHEMA, &cell_id(1_000_000), value)
+    };
+    server.chunks().write_cell(&mut control).expect("control write");
+
+    for index in 0..CELLS {
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value["DATA"] = OwnedValue::U64(index);
+        let mut cell = OwnedCell::new_with_id(SCHEMA, &cell_id(index), value);
+        dynamic
+            .chunks()
+            .write_cell(&mut cell)
+            .expect("secondary write");
+    }
+    for index in 0..CELLS {
+        assert!(
+            dynamic.chunks().read_cell(&cell_id(index)).is_ok(),
+            "cell {index} must be readable before the restart"
+        );
+    }
+
+    server.shutdown().await;
+    drop(dynamic);
+    drop(server);
+
+    let server = NebServer::new_from_opts(
+        &opts,
+        &crate::utils::test_port::unique_localhost_addr(),
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    server.meta().schemas.register_internal_schema(schema());
+    assert!(
+        server.chunks().read_cell(&cell_id(1_000_000)).is_ok(),
+        "the DEFAULT database's control cell must survive the restart"
+    );
+    let dynamic = server
+        .ensure_database_runtime("brains/fly")
+        .await
+        .expect("dynamic database should reload");
+    dynamic.meta().schemas.register_internal_schema(schema());
+    let mut missing = Vec::new();
+    for index in 0..CELLS {
+        if dynamic.chunks().read_cell(&cell_id(index)).is_err() {
+            missing.push(index);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the dynamic database lost {} of {CELLS} cells across a graceful restart: {missing:?}",
+        missing.len()
+    );
+    server.shutdown().await;
+}

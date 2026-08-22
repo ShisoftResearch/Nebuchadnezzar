@@ -1843,6 +1843,15 @@ impl NebServer {
         }
 
         runtime.cleaner().stop();
+        // Flush BEFORE the background threads stop: an unloaded database must
+        // be reloadable with everything it held, and until this ran, unload
+        // dropped the runtime with its dirty head segments unarchived -- the
+        // same silent loss the shutdown path had for dynamically-loaded
+        // databases. Writes are closed first so nothing lands after its
+        // segment is archived.
+        runtime.chunks().sync_all();
+        runtime.chunks().close_writes();
+        runtime.chunks().archive_all();
         // Stop the store's background work EXPLICITLY rather than letting the
         // store's drop do it. Thread lifetime should not be coupled to a
         // refcount reaching zero: a service, an in-flight request or a future
@@ -2150,6 +2159,57 @@ impl NebServer {
         info!("Archiving all dirty segments to backup storage...");
         self.chunks().archive_all();
         info!("Segment archiving completed");
+
+        // Step 1.7: every runtime in `database_runtimes` gets the same
+        // treatment the default just got. This block used to not exist, and
+        // dynamically-loaded databases lost every write since their last
+        // tier-pressure archive across a graceful restart: steps 0-1.6 all
+        // name `self.chunks()` -- the DEFAULT runtime -- and the secondaries
+        // were dropped with dirty head segments unarchived. Measured on the
+        // FlyWire connectome databases: after a SIGTERM restart the recently
+        // written sidecar cells were unreadable while older, already-evicted
+        // cells read fine.
+        let secondary_runtimes: Vec<(String, Arc<DatabaseRuntime>)> = self
+            .database_runtimes
+            .read()
+            .iter()
+            .map(|(name, runtime)| (name.clone(), runtime.clone()))
+            .collect();
+        let mut flushed_secondary_trees = false;
+        for (database_name, runtime) in &secondary_runtimes {
+            info!("Flushing dynamically-loaded database {database_name} before shutdown");
+            let dummy_id = Id::allocated(0, 0, 1);
+            if let Ok(lsm_client) = ranged::tree::service::locate_tree_server_from_conshash(
+                &dummy_id,
+                &self.consh,
+                &self.group_name,
+                database_name,
+            )
+            .await
+            {
+                let _ = lsm_client.flush_all().await;
+                flushed_secondary_trees = true;
+            }
+            runtime.chunks().sync_all();
+            runtime.chunks().close_writes();
+            runtime.chunks().archive_all();
+        }
+        if flushed_secondary_trees {
+            // Same write-back barrier the default's flush takes above; one
+            // barrier covers every tree flushed in the loop.
+            if !crate::index::ranged::tree::btree::storage::wait_until_updated().await {
+                error!(
+                    "B-tree write-back barrier NOT established for dynamically-loaded \
+                     databases at shutdown; their archives may miss index pages"
+                );
+            }
+            // The pages the write-back just persisted are cells in the
+            // secondaries' chunks; archive again so they reach the backups.
+            for (_, runtime) in &secondary_runtimes {
+                runtime.chunks().sync_all();
+                runtime.chunks().archive_all();
+            }
+        }
 
         // Step 2: Shutdown Raft (triggers backup creation)
         info!("Shutting down Raft service (will create backups)");
