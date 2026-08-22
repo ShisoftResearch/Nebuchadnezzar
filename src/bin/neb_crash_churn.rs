@@ -275,7 +275,23 @@ fn parent_main(args: &[String]) -> ExitCode {
         }
 
         exhausted_last = exhausted_this_cycle;
-        state.next_key = acked_high.max(state.next_key);
+        // THIS cycle's cursor, not the highest ever seen.
+        //
+        // The child rebases its key numbering on the count its own scan
+        // reported (`next = AtomicU64::new(count)`), so the cursor it ends
+        // with is measured from that base. Carrying a global maximum across
+        // cycles silently assumed the key space stays dense -- but an
+        // ungraceful kill legitimately loses acked keys, leaving holes that
+        // are never refilled, and the expectation then sits permanently
+        // above anything the store can hold. That produced a "REGRESSION:
+        // scanned 910,521 < best verified 1,197,420" on cycle 19 of a soak
+        // whose three preceding cycles had all agreed on ~910k, with the
+        // cells intact: the store was consistent and the harness was not.
+        //
+        // Rebased each cycle, `acked_high - newly_deleted` is exact whether
+        // or not the space is dense, because the base cancels: keys added
+        // this cycle = cursor - scan-at-start.
+        state.next_key = acked_high;
         // Every key the store was told to delete is one fewer the next scan
         // owes us. A delete lost to a SIGKILL only leaves the key in place,
         // which shows up as MORE than expected -- never less -- so lowering
@@ -292,7 +308,9 @@ fn parent_main(args: &[String]) -> ExitCode {
         if graceful && failed.is_none() {
             // The next cycle's scan must cover every acked key: record the
             // expectation now; enforcement happens when that scan reports.
-            let live = state.next_key.saturating_sub(state.deleted);
+            // Deletions this cycle are already netted out above, so the
+            // cursor alone is the expectation.
+            let live = state.next_key;
             if live > state.best_verified {
                 state.best_verified = live;
                 println!(
