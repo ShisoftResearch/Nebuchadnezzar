@@ -383,6 +383,20 @@ impl WriteBackHub {
                                          retrying the whole batch",
                                         attempt, e
                                     );
+                                    // A destination that no longer exists cannot
+                                    // come back by retrying: the service was
+                                    // unregistered (its database unloaded or its
+                                    // server shut down). Waiting out the full
+                                    // budget serialized 20s stalls per dead
+                                    // batch on the one worker every database
+                                    // shares.
+                                    let permanent = format!("{e:?}");
+                                    if attempt >= 5
+                                        && (permanent.contains("ServiceIdNotFound")
+                                            || permanent.contains("ConnectionRefused"))
+                                    {
+                                        attempt = WRITE_BACK_MAX_ATTEMPTS;
+                                    }
                                     retry = pending;
                                 }
                             }
@@ -428,12 +442,19 @@ impl WriteBackHub {
                                     attempt
                                 );
                                 hub.barrier_failed.store(true, Ordering::SeqCst);
-                                // Stop the worker outright. Continuing would
-                                // let later pages land on top of the hole
-                                // these abandoned cells leave, and a referrer
-                                // above a hole is exactly the unreadable
-                                // chain this design exists to prevent.
-                                hub.should_stop.store(true, Ordering::SeqCst);
+                                // The worker LIVES ON. It used to stop here,
+                                // and the hub is process-global: one dead
+                                // database's abandoned batch (its server gone,
+                                // ServiceIdNotFound forever) stopped write-back
+                                // for every LIVE database in the process --
+                                // measured as a cluster test wedging for an
+                                // hour inside with_indices_ensured, and in
+                                // production it would have ended index
+                                // durability server-wide after any unload with
+                                // pending pages. The hole these cells leave is
+                                // already fenced: barrier_failed makes every
+                                // publisher treat the barrier as unestablished
+                                // and no head pointer is published over them.
                                 break;
                             }
                             pending = retry;
