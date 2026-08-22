@@ -860,6 +860,15 @@ impl Chunk {
         let backoff = Backoff::new();
         let head_slot = self.head_slot(segment_class);
         loop {
+            // Re-checked every pass, not just on entry. A writer already
+            // inside this loop when shutdown begins would otherwise keep
+            // looking for a home: `archive_all` seals each head in turn, so
+            // every fresh segment this loop allocates is closed behind it,
+            // and the writer walks the chunk to capacity instead of
+            // stopping. Shutdown means stop writing, from wherever you are.
+            if self.writes_closed.load(Ordering::Acquire) {
+                return Err(WriteError::ServerShuttingDown);
+            }
             let head_seg_id = head_slot.load(Ordering::Acquire);
             if head_seg_id == HEAD_SEG_ID_ALLOCATING {
                 // Allocating new segment in progress, wait for it to complete
@@ -2192,15 +2201,57 @@ impl Chunk {
         cell_header: &CellHeader,
         cell_seg: &AArc<Segment>,
     ) -> Result<(), WriteError> {
-        let pending_entry = (|| loop {
-            if let Ok(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true) {
-                return pending_entry;
+        // Bounded, and never retried when retrying cannot possibly work.
+        //
+        // This used to loop forever on ANY acquire error. Two ways that
+        // wedges: a delete arriving during shutdown retries
+        // `ServerShuttingDown` -- an answer that will never change -- and
+        // holds the shutdown open for as long as the caller lives; and a
+        // genuinely full chunk spins at full speed printing the same line,
+        // instead of telling the caller its delete did not happen. The
+        // crash-churn fuzzer found the first one within three cycles: a
+        // graceful shutdown that never completed, with this message
+        // repeating thousands of times.
+        //
+        // `try_acquire` already runs emergency GC internally, so a handful
+        // of attempts is all that can help; past that the honest answer is
+        // the error.
+        const TOMBSTONE_ACQUIRE_ATTEMPTS: usize = 16;
+        let backoff = Backoff::new();
+        let mut acquired = None;
+        let mut last_error = WriteError::CannotAllocateSpace;
+        for attempt in 0..TOMBSTONE_ACQUIRE_ATTEMPTS {
+            match self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32, true) {
+                Ok(pending_entry) => {
+                    acquired = Some(pending_entry);
+                    break;
+                }
+                Err(WriteError::ServerShuttingDown) => {
+                    return Err(WriteError::ServerShuttingDown);
+                }
+                Err(error) => {
+                    last_error = error;
+                    if attempt + 1 < TOMBSTONE_ACQUIRE_ATTEMPTS {
+                        warn!(
+                            "Chunk {} is too full to put a tombstone (attempt {}/{}). Retrying.",
+                            self.id,
+                            attempt + 1,
+                            TOMBSTONE_ACQUIRE_ATTEMPTS
+                        );
+                        backoff.spin();
+                    }
+                }
             }
-            warn!(
-                "Chunk {} is too full to put a tombstone. Will retry.",
-                self.id
-            )
-        })();
+        }
+        let Some(pending_entry) = acquired else {
+            error!(
+                "Chunk {} could not place a tombstone for {:?} after {} attempts: {:?}. The \
+                 delete is REFUSED rather than retried forever, so the caller learns it did \
+                 not happen.",
+                self.id, cell_header.id, TOMBSTONE_ACQUIRE_ATTEMPTS, last_error
+            );
+            return Err(last_error);
+        };
         Tombstone::put(
             pending_entry.addr,
             cell_seg.seq_id,

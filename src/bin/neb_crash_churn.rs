@@ -37,7 +37,7 @@ fn main() -> ExitCode {
         Some("child") => child_main(&args[2..]),
         Some("parent") => parent_main(&args[2..]),
         _ => {
-            eprintln!("usage: neb_crash_churn child <addr> <group> <base_dir> <first|recover> <churn_secs>");
+            eprintln!("usage: neb_crash_churn child <addr> <group> <base_dir> <first|recover> <churn_secs> [delete_rate] [delete_from]");
             eprintln!("       neb_crash_churn parent <base_dir> <cycles>");
             ExitCode::from(64)
         }
@@ -49,6 +49,8 @@ fn main() -> ExitCode {
 struct ParentState {
     next_key: u64,
     best_verified: u64,
+    /// Contiguous prefix of keys the store has been told to delete.
+    deleted: u64,
 }
 
 fn parent_main(args: &[String]) -> ExitCode {
@@ -61,6 +63,7 @@ fn parent_main(args: &[String]) -> ExitCode {
     let mut state = ParentState {
         next_key: 0,
         best_verified: 0,
+        deleted: 0,
     };
     // Deterministic-ish per-run seed without wall-clock dependence beyond
     // the pid; each cycle derives its choices from this.
@@ -74,8 +77,13 @@ fn parent_main(args: &[String]) -> ExitCode {
         seed
     };
 
+    let mut mutilated_last = false;
     for cycle in 0..cycles {
         let first = cycle == 0;
+        if mutilated_last {
+            println!("    (previous cycle damaged files: loss is allowed, a crash is not)");
+            mutilated_last = false;
+        }
         // Identity is deployment identity: the same addr and group every
         // cycle, exactly like a real server restarting. Rotating the group
         // name here once "found" a schema-recovery bug that was actually
@@ -84,16 +92,28 @@ fn parent_main(args: &[String]) -> ExitCode {
         let group = "crash-churn".to_string();
         let churn_secs = 2 + rand() % 6;
         let graceful = rand() % 2 == 0;
+        // Deletes on most cycles once there is a backlog worth retiring.
+        let delete_rate = if state.next_key > 5_000 && rand() % 4 != 0 {
+            20 + rand() % 60
+        } else {
+            0
+        };
+        // Damage files on some hard-kill cycles: a kill alone leaves clean
+        // files, which is not what a power cut leaves behind.
+        let mutilate = !graceful && cycle > 0 && rand() % 3 == 0;
 
         println!(
-            "=== cycle {}/{} addr={} churn={}s kill={} best_verified={} next_key={}",
+            "=== cycle {}/{} addr={} churn={}s kill={} delete_rate={} best_verified={} \
+             next_key={} deleted={}",
             cycle + 1,
             cycles,
             addr,
             churn_secs,
             if graceful { "TERM" } else { "KILL" },
+            delete_rate,
             state.best_verified,
             state.next_key,
+            state.deleted,
         );
 
         let mut child = Command::new(&exe)
@@ -104,6 +124,8 @@ fn parent_main(args: &[String]) -> ExitCode {
                 &base_dir,
                 if first { "first" } else { "recover" },
                 &churn_secs.to_string(),
+                &delete_rate.to_string(),
+                &state.deleted.to_string(),
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -116,6 +138,7 @@ fn parent_main(args: &[String]) -> ExitCode {
         let deadline = Duration::from_secs(180);
         let mut scanned: Option<u64> = None;
         let mut acked_high: u64 = state.next_key;
+        let mut deleted_high: u64 = state.deleted;
         let mut failed: Option<String> = None;
 
         // Reader thread streams child lines; main thread enforces deadline.
@@ -185,6 +208,8 @@ fn parent_main(args: &[String]) -> ExitCode {
                         kill_at = Some(Instant::now() + Duration::from_secs(churn_secs));
                     } else if let Some(rest) = line.strip_prefix("ACK_TO ") {
                         acked_high = rest.trim().parse().unwrap_or(acked_high);
+                    } else if let Some(rest) = line.strip_prefix("DELETED_TO ") {
+                        deleted_high = rest.trim().parse().unwrap_or(deleted_high);
                     } else if line.starts_with("SCAN_ERROR") || line.starts_with("FATAL") {
                         failed = Some(line);
                         unsafe { libc::kill(child_pid, libc::SIGKILL) };
@@ -204,17 +229,51 @@ fn parent_main(args: &[String]) -> ExitCode {
         while let Ok(line) = rx.recv_timeout(Duration::from_millis(500)) {
             if let Some(rest) = line.strip_prefix("ACK_TO ") {
                 acked_high = rest.trim().parse().unwrap_or(acked_high);
+            } else if let Some(rest) = line.strip_prefix("DELETED_TO ") {
+                deleted_high = rest.trim().parse().unwrap_or(deleted_high);
             }
         }
         let _ = child.wait();
         let _ = reader.join();
 
+        if mutilate {
+            let victims = mutilate_files(&base_dir, &mut rand);
+            if victims.is_empty() {
+                println!("    (nothing to mutilate this cycle)");
+            } else {
+                for victim in &victims {
+                    println!("    MUTILATED {}", victim);
+                }
+                // Damaged files may legitimately cost data: the contract for
+                // this cycle is that the store SURVIVES and serves only what
+                // it can vouch for -- it starts, it scans, it does not panic,
+                // and it never hands back a corrupt cell. So the no-regression
+                // bar is lifted, and the next scan sets a new one.
+                state.best_verified = 0;
+                mutilated_last = true;
+            }
+        }
+
         state.next_key = acked_high.max(state.next_key);
+        // Every key the store was told to delete is one fewer the next scan
+        // owes us. A delete lost to a SIGKILL only leaves the key in place,
+        // which shows up as MORE than expected -- never less -- so lowering
+        // the bar by the acked deletions keeps the invariant one-sided.
+        let newly_deleted = deleted_high.saturating_sub(state.deleted);
+        if newly_deleted > 0 {
+            state.best_verified = state.best_verified.saturating_sub(newly_deleted);
+            state.deleted = deleted_high;
+            println!(
+                "    deleted {} more key(s) (total {}); expecting >= {} on next load",
+                newly_deleted, state.deleted, state.best_verified
+            );
+        }
         if graceful && failed.is_none() {
             // The next cycle's scan must cover every acked key: record the
             // expectation now; enforcement happens when that scan reports.
-            if state.next_key > state.best_verified {
-                state.best_verified = state.next_key;
+            let live = state.next_key.saturating_sub(state.deleted);
+            if live > state.best_verified {
+                state.best_verified = live;
                 println!(
                     "    graceful shutdown: expecting >= {} on next load",
                     state.best_verified
@@ -236,6 +295,99 @@ fn parent_main(args: &[String]) -> ExitCode {
         cycles, state.best_verified
     );
     ExitCode::SUCCESS
+}
+
+/// Damage the tail of some on-disk files, the way a power cut does.
+///
+/// A kill leaves clean files: the process stops, but every byte it wrote
+/// is intact. Real power loss does not do that -- it leaves half-written
+/// records, tails of zeros where blocks were allocated but never written,
+/// and occasionally bytes from nowhere. Those are precisely the inputs the
+/// record checksums and truncate-at-tear rules exist for, and nothing in a
+/// SIGKILL harness ever produces them.
+///
+/// Returns a description of what was damaged, for the cycle log.
+fn mutilate_files(base_dir: &str, rand: &mut impl FnMut() -> u64) -> Vec<String> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut victims = Vec::new();
+    for sub in ["wal", "undo", "backup"] {
+        let dir = std::path::Path::new(base_dir).join(sub);
+        let mut files = Vec::new();
+        collect_files(&dir, &mut files);
+        if files.is_empty() {
+            continue;
+        }
+        let file = files[(rand() % files.len() as u64) as usize].clone();
+        let Ok(len) = std::fs::metadata(&file).map(|m| m.len()) else {
+            continue;
+        };
+        if len < 64 {
+            continue;
+        }
+        let how = rand() % 3;
+        let result = match how {
+            // Truncate the tail: the record that was mid-write is cut off.
+            0 => {
+                let cut = 1 + rand() % (len / 4).max(1);
+                OpenOptions::new()
+                    .write(true)
+                    .open(&file)
+                    .and_then(|f| f.set_len(len - cut))
+                    .map(|_| format!("truncated {} bytes", cut))
+            }
+            // Zero the tail: what an allocated-but-unwritten block reads back
+            // as, and what a length-only check cannot tell from real data.
+            1 => {
+                let zeros = ((rand() % (len / 4).max(1)) + 1).min(len) as usize;
+                OpenOptions::new()
+                    .write(true)
+                    .open(&file)
+                    .and_then(|mut f| {
+                        f.seek(SeekFrom::End(-(zeros as i64)))?;
+                        f.write_all(&vec![0u8; zeros])
+                    })
+                    .map(|_| format!("zeroed last {} bytes", zeros))
+            }
+            // Scribble inside: same lengths, wrong bytes. Only a checksum
+            // catches this one.
+            _ => {
+                let at = rand() % len;
+                OpenOptions::new()
+                    .write(true)
+                    .open(&file)
+                    .and_then(|mut f| {
+                        f.seek(SeekFrom::Start(at))?;
+                        f.write_all(&[0x5A, 0xA5, 0x5A, 0xA5])
+                    })
+                    .map(|_| format!("scribbled 4 bytes at {}", at))
+            }
+        };
+        match result {
+            Ok(what) => victims.push(format!(
+                "{}: {}",
+                file.file_name().unwrap_or_default().to_string_lossy(),
+                what
+            )),
+            Err(e) => victims.push(format!("{}: mutilation failed: {}", sub, e)),
+        }
+    }
+    victims
+}
+
+fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else if path.extension().map(|e| e == "nlog" || e == "nbackup").unwrap_or(false) {
+            out.push(path);
+        }
+    }
 }
 
 // ----------------------------------------------------------------- child --
@@ -278,13 +430,23 @@ fn child_main(args: &[String]) -> ExitCode {
     let base_dir = args.get(2).expect("base_dir").clone();
     let first = args.get(3).map(|s| s == "first").unwrap_or(false);
     let churn_secs: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3600);
+    let delete_rate: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let delete_from: u64 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .expect("tokio runtime");
-    match runtime.block_on(child_async(addr, group, base_dir, first, churn_secs)) {
+    match runtime.block_on(child_async(
+        addr,
+        group,
+        base_dir,
+        first,
+        churn_secs,
+        delete_rate,
+        delete_from,
+    )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             println!("FATAL {}", e);
@@ -303,6 +465,8 @@ async fn child_async(
     base_dir: String,
     first: bool,
     churn_secs: u64,
+    delete_rate: u64,
+    delete_from: u64,
 ) -> Result<(), String> {
     use neb::index::ranged::tree::btree::Ordering as TreeOrdering;
     use neb::query::data_client::{ValueRange, ValueRangeTerm};
@@ -449,17 +613,74 @@ async fn child_async(
             }
         }));
     }
+    // Delete lane: retire a contiguous prefix of the keys that already
+    // exist, well behind the write cursor.
+    //
+    // Deletions are the shape no durability test had: a page whose keys are
+    // all tombstoned persists with ZERO keys, and a run of those inside the
+    // page chain is a legal on-disk state that reconstruction has to
+    // tolerate. That exact state made a complete 179,423-key tree serve
+    // nothing after a restart, and nothing here would have produced it,
+    // because every writer only ever appended.
+    //
+    // The cursor is contiguous like the ack cursor, so the parent can do
+    // exact arithmetic: live keys = acked writes - deleted prefix.
+    let deleted = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(delete_from));
+    let mut delete_handles = Vec::new();
+    if delete_rate > 0 {
+        let client = client.clone();
+        let deleted = deleted.clone();
+        let acked_for_delete = acked.clone();
+        delete_handles.push(tokio::spawn(async move {
+            loop {
+                let cursor = deleted.load(std::sync::atomic::Ordering::Relaxed);
+                // Stay a safe distance behind the durable write cursor:
+                // deleting a key whose write has not been acked would race
+                // its own creation.
+                let safe_limit = acked_for_delete
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(1_000);
+                if cursor >= safe_limit {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                let id = Id::from_parts(9 + (cursor % 64), cursor);
+                match client.remove_cell(id).await {
+                    // Gone is gone: a key an earlier incarnation deleted
+                    // before dying is still progress for this cursor.
+                    Ok(Ok(())) | Ok(Err(_)) => {
+                        deleted.store(cursor + 1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+                if delete_rate < 100 {
+                    tokio::time::sleep(Duration::from_millis(
+                        ((100 - delete_rate) / 10).max(1) as u64,
+                    ))
+                    .await;
+                }
+            }
+        }));
+    }
+
     let acked_reporter = acked.clone();
+    let deleted_reporter = deleted.clone();
     tokio::spawn(async move {
         let mut last = 0;
+        let mut last_deleted = u64::MAX;
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let now = acked_reporter.load(std::sync::atomic::Ordering::Relaxed);
             if now != last {
                 println!("ACK_TO {}", now);
-                flush_stdout();
                 last = now;
             }
+            let gone = deleted_reporter.load(std::sync::atomic::Ordering::Relaxed);
+            if gone != last_deleted {
+                println!("DELETED_TO {}", gone);
+                last_deleted = gone;
+            }
+            flush_stdout();
         }
     });
 
@@ -475,7 +696,10 @@ async fn child_async(
             // Ingress stops first, as it does on a real server where RPC
             // teardown precedes the flush; writers left running would grow
             // the write-back backlog faster than the drain barrier closes.
-            for handle in &writer_handles {
+            // Deleters are ingress too: leaving them running through the
+            // shutdown keeps issuing writes at a server that is trying to
+            // stop, which is not what a real deployment does.
+            for handle in writer_handles.iter().chain(delete_handles.iter()) {
                 handle.abort();
             }
             server.shutdown().await;
