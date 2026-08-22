@@ -226,6 +226,70 @@ Portability: the entry stamp is the durable investment and is identical
 on either memory technology. Only the evidence form changes -- a COMMIT
 entry on block storage, Zen's LP bit if the store ever moves to PMEM.
 
+#### Recovery with commit entries
+
+Three passes, and only the first touches data -- reading the files stays
+exactly as expensive as it is today.
+
+PASS 1, scan (parallel per chunk, as now). Untagged entries install into
+the cell index immediately, unchanged. Tagged entries do NOT install:
+they go on a per-chunk pending list keyed by Tx-CTS, while each chunk
+accumulates `cts -> entries_seen` and any COMMIT entries it finds.
+Tagged tombstones defer too -- an uncommitted delete must not delete.
+
+PASS 2, global reduction (metadata only, cheap). Merge the per-chunk
+maps. The rule:
+
+    committed  iff  a COMMIT entry exists for this CTS
+                AND entries found across ALL chunks == the count it declares
+
+No COMMIT entry means not committed -- presumed abort, and sound because
+the commit entry is written last and fsynced, so its absence means no
+success was reported. A COMMIT entry with a short count means the fsync
+did not finish; that completeness check is what stands in for the
+data-before-commit ordering an sfence would give on PMEM.
+
+PASS 3, install (parallel again). Committed transactions' pending
+entries install with the normal version reconciliation. Uncommitted ones
+are skipped, which by itself leaves the previous version standing --
+that version was installed in pass 1 and nothing higher supersedes it.
+Skipped entries are marked dead so the cleaner reclaims them.
+
+THE WATERMARK IS LOAD-BEARING FOR CORRECTNESS, NOT SPEED. A durable
+"every transaction below CTS X is decided" mark lets entries below it
+install directly with no counting. That is not just a way to bound the
+pending set: the cleaner legitimately compacts away superseded entries
+of old committed transactions, so re-running the count check on them
+would find fewer entries than declared and wrongly abort a transaction
+that committed long ago. Hence the count rule applies ONLY above the
+watermark, and the cleaner's rule is its mirror -- do not touch entries
+above it, and neutralise aborted entries before advancing past them.
+
+THE COMMIT ENTRY CARRIES: the CTS, the entry count, and a per-chunk
+breakdown. The breakdown costs a few bytes and turns a silent failure
+loud: a missing chunk file reports "expected 12 entries in chunk 7,
+scanned 0" instead of quietly counting short and aborting a transaction
+that really committed.
+
+WHAT THIS RETIRES: the undo log leaves the write path entirely.
+Uncommitted inserts are never installed, so there is nothing to delete;
+uncommitted updates and removes fall back to the prior version the
+append-only store still holds. No markers, no separate file, no second
+fsync, no cross-file ordering dependency.
+
+TO MODEL IN TLA+ BEFORE ANY CODE:
+1. Safety: an installed transaction is exactly one whose commit was
+   reported; never a partial install.
+2. No resurrection: skipping an uncommitted entry leaves precisely the
+   prior version, including across tombstones.
+3. Idempotence: recovery re-run after a crash mid-recovery converges.
+4. Watermark advance: no interleaving of cleaner, abort neutralisation
+   and watermark advance can leave a committed transaction unprovable
+   or an aborted one installed.
+5. The distributed generalisation: "all N of my entries present" becomes
+   "every participant reports its entries present" -- Parallel Commits,
+   reusing this machinery rather than adding a second commit path.
+
 ## Sequencing and dependencies
 
 Phase 1 and Phase 3.1 first (they close active corruption/loss windows and
