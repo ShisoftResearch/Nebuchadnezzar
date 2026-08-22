@@ -2424,3 +2424,178 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
     );
     server.shutdown().await;
 }
+
+/// A page whose keys were ALL deleted persists with zero keys -- that write
+/// is what makes its tombstones durable -- so a run of empty pages inside
+/// the persisted chain is a legal on-disk state. Reconstruction used to feed
+/// those pages to the tree constructor, whose `key_at(0)` fabricated an
+/// all-zero separator that mis-sorted the parent level and stranded every
+/// key to its LEFT. Measured live at FlyWire scale: after sidecar repair
+/// cycles deleted early entries and the server restarted gracefully, the
+/// head page still held its keys on disk while every scan of the schemas in
+/// it returned nothing.
+///
+/// Shape: three scannable schemas sorted low/mid/high, delete ALL of mid so
+/// whole pages between the survivors empty, restart, and require both
+/// survivors to scan complete.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart() {
+    let _ = env_logger::try_init();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let opts = ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 64 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
+        undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().to_string()),
+        raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: true,
+        services: vec![Service::Cell, Service::RangedIndexer],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let group = "tombstone_emptied_pages_group";
+    // Three schema ids in sort order; at BTREE_NODE_SIZE=128 keys per leaf,
+    // 1000 cells each guarantees several pages holding ONLY the middle
+    // schema, which all empty when it is deleted.
+    const LOW_SCHEMA: u32 = 9300;
+    const MID_SCHEMA: u32 = 9304;
+    const HIGH_SCHEMA: u32 = 9308;
+    const CELLS_PER_SCHEMA: u64 = 1000;
+    let schema_for = |id: u32, name: &str| {
+        Schema::new_with_id(
+            id,
+            name,
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            true, // scannable: enumeration entries are the subject
+        )
+    };
+    let register_schemas = |runtime: &Arc<DatabaseRuntime>| {
+        runtime
+            .meta()
+            .schemas
+            .register_internal_schema(schema_for(LOW_SCHEMA, "tombstone_low_schema"));
+        runtime
+            .meta()
+            .schemas
+            .register_internal_schema(schema_for(MID_SCHEMA, "tombstone_mid_schema"));
+        runtime
+            .meta()
+            .schemas
+            .register_internal_schema(schema_for(HIGH_SCHEMA, "tombstone_high_schema"));
+    };
+    let cell_id = |schema: u32, index: u64| {
+        Id::allocated((index % 4) as u16, 11, (schema as u64) * 1_000_000 + index + 1)
+    };
+
+    async fn scan_count(runtime: &Arc<DatabaseRuntime>, schema_id: u32) -> usize {
+        let mut count = 0usize;
+        let mut cursor = match runtime
+            .neb_client
+            .ranged()
+            .scan_schema(schema_id, 64)
+            .await
+            .expect("scan should not error")
+        {
+            Some(cursor) => cursor,
+            None => return 0,
+        };
+        while let Ok(Some(_)) = cursor.next().await {
+            count += 1;
+        }
+        count
+    }
+
+    let server = NebServer::new_from_opts(
+        &opts,
+        &crate::utils::test_port::unique_localhost_addr(),
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let dynamic = server
+        .ensure_database_runtime("brains/tombstoned")
+        .await
+        .expect("dynamic database should load");
+    register_schemas(&dynamic);
+
+    for schema in [LOW_SCHEMA, MID_SCHEMA, HIGH_SCHEMA] {
+        for index in 0..CELLS_PER_SCHEMA {
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value["DATA"] = OwnedValue::U64(index);
+            let mut cell = OwnedCell::new_with_id(schema, &cell_id(schema, index), value);
+            dynamic
+                .chunks()
+                .write_cell(&mut cell)
+                .expect("tombstone-test write");
+        }
+    }
+    let _ = IndexBuilder::await_all_indices().await;
+    for schema in [LOW_SCHEMA, MID_SCHEMA, HIGH_SCHEMA] {
+        assert_eq!(
+            scan_count(&dynamic, schema).await,
+            CELLS_PER_SCHEMA as usize,
+            "schema {schema} must scan complete before any deletion"
+        );
+    }
+
+    // Delete EVERY middle-schema cell: the leaf pages holding only that
+    // schema go structurally empty, and the shutdown flush persists them
+    // that way -- the exact chain shape the reconstruction must tolerate.
+    for index in 0..CELLS_PER_SCHEMA {
+        dynamic
+            .chunks()
+            .remove_cell(&cell_id(MID_SCHEMA, index))
+            .expect("tombstone-test delete");
+    }
+    let _ = IndexBuilder::await_all_indices().await;
+    assert_eq!(
+        scan_count(&dynamic, MID_SCHEMA).await,
+        0,
+        "the deleted schema must scan empty before the restart"
+    );
+    assert_eq!(
+        scan_count(&dynamic, LOW_SCHEMA).await,
+        CELLS_PER_SCHEMA as usize,
+        "the low schema must still scan complete before the restart"
+    );
+
+    server.shutdown().await;
+    drop(dynamic);
+    drop(server);
+
+    let server = NebServer::new_from_opts(
+        &opts,
+        &crate::utils::test_port::unique_localhost_addr(),
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+    let dynamic = server
+        .ensure_database_runtime("brains/tombstoned")
+        .await
+        .expect("dynamic database should reload");
+    register_schemas(&dynamic);
+
+    let low = scan_count(&dynamic, LOW_SCHEMA).await;
+    let mid = scan_count(&dynamic, MID_SCHEMA).await;
+    let high = scan_count(&dynamic, HIGH_SCHEMA).await;
+    assert_eq!(
+        low, CELLS_PER_SCHEMA as usize,
+        "keys LEFT of the tombstone-emptied pages must survive reconstruction: \
+         scan sees {low} of {CELLS_PER_SCHEMA}"
+    );
+    assert_eq!(mid, 0, "deleted keys must NOT resurrect: scan sees {mid}");
+    assert_eq!(
+        high, CELLS_PER_SCHEMA as usize,
+        "keys RIGHT of the tombstone-emptied pages must survive reconstruction: \
+         scan sees {high} of {CELLS_PER_SCHEMA}"
+    );
+    server.shutdown().await;
+}

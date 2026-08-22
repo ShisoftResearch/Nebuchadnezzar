@@ -172,22 +172,77 @@ where
     let page_cells = fetch_page_chain_cells(page_ids, neb).await?;
     let mut len = 0;
     let mut page_count = 0;
+    // Decode the whole chain first and drop structurally-empty pages. A page
+    // whose keys were all tombstoned persists with zero keys -- that write is
+    // what makes its deletions durable -- so an empty page in the chain is a
+    // legal on-disk state, not corruption. It cannot be fed to the
+    // constructor, though: `key_at(0)` of an empty page fabricates an
+    // all-zero separator, which lands out of sorted order in the parent
+    // level and strands every key to its left. Found live: after a graceful
+    // restart, scan_schema returned nothing while the head page still held
+    // the keys on disk.
+    let mut kept_pages = Vec::with_capacity(page_cells.len());
+    let mut skipped_empty = 0usize;
+    for cell in page_cells {
+        page_count += 1;
+        let page = ExtNode::<KS, PS>::from_cell(&cell)?;
+        if page.node.len == 0 {
+            debug!(
+                "[B-TREE LOAD] Page {} ({:?}) is empty; skipping it structurally \
+                 (next={:?}, prev={:?})",
+                page_count,
+                cell.id(),
+                page.next_id,
+                page.prev_id
+            );
+            skipped_empty += 1;
+            continue;
+        }
+        kept_pages.push(page);
+    }
+    if skipped_empty > 0 {
+        info!(
+            "[B-TREE LOAD] Chain from {:?} carries {} empty page(s) out of {}; skipped \
+             them (their cells stay on disk until the chain is rewritten around them)",
+            resolved_head_id, skipped_empty, page_count
+        );
+    }
+    if kept_pages.is_empty() {
+        // Every page was emptied by tombstones: a legal empty tree. Rebuild
+        // it in the fresh-tree shape, keeping the stored head id so the
+        // metadata pointing at this tree stays valid.
+        info!(
+            "[B-TREE LOAD] All {} page(s) from head {:?} are empty; reconstructing an \
+             empty tree",
+            page_count, resolved_head_id
+        );
+        let root = NodeCellRef::new(Node::<KS, PS>::new_external(
+            resolved_head_id,
+            max_entry_key(),
+        ));
+        return Ok(BPlusTree::from_root(root, resolved_head_id, 0, 1, deletion));
+    }
+    let effective_head_id = kept_pages[0].node.id;
+    let last_page_index = kept_pages.len() - 1;
     let (root, height) = {
         let mut constructor = TreeConstructor::<KS, PS>::new();
         let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
-        for cell in page_cells {
-            page_count += 1;
-            let page = ExtNode::<KS, PS>::from_cell(&cell)?;
+        for (page_index, page) in kept_pages.into_iter().enumerate() {
             let next_id = page.next_id;
             let prev_id = page.prev_id;
             let mut node = page.node;
 
             debug!(
                 "[B-TREE LOAD] Page {} has {} keys, next_id={:?}, prev_id={:?}",
-                page_count, node.len, next_id, prev_id
+                page_index + 1,
+                node.len,
+                next_id,
+                prev_id
             );
 
-            let at_end = next_id.is_unit_id();
+            // Position in the kept sequence, not next_id: the pages after
+            // this one may all have been dropped as empty above.
+            let at_end = page_index == last_page_index;
             if !at_end {
                 debug!("[B-TREE LOAD] Will read next page: {:?}", next_id);
             } else {
@@ -197,7 +252,6 @@ where
                 node.next = NodeCellRef::new_none::<KS, PS>();
             }
             let mut prev_lock = write_node::<KS, PS>(&prev_ref);
-            debug_assert!(prev_ref.is_default() || node.len != 0);
             let first_key = node.keys.key_at(0);
             len += node.len;
             node.prev = prev_ref.clone();
@@ -225,7 +279,7 @@ where
         "[B-TREE LOAD] Completed reconstruction of tree {:?} at level {} with {} keys, height {}",
         resolved_head_id, level, len, height
     );
-    let tree = BPlusTree::from_root(root, resolved_head_id, len, height, deletion);
+    let tree = BPlusTree::from_root(root, effective_head_id, len, height, deletion);
     debug!("[B-TREE LOAD] Verifying reconstruction at level {}", level);
     // debug_assert!(verification::tree_has_no_empty_node(&tree));
     debug_assert!(verification::is_tree_in_order(&tree, level));
