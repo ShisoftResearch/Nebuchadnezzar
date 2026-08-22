@@ -126,6 +126,7 @@ fn parent_main(args: &[String]) -> ExitCode {
                 &churn_secs.to_string(),
                 &delete_rate.to_string(),
                 &state.deleted.to_string(),
+                &state.next_key.to_string(),
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -210,6 +211,11 @@ fn parent_main(args: &[String]) -> ExitCode {
                         acked_high = rest.trim().parse().unwrap_or(acked_high);
                     } else if let Some(rest) = line.strip_prefix("DELETED_TO ") {
                         deleted_high = rest.trim().parse().unwrap_or(deleted_high);
+                    } else if let Some(rest) = line.strip_prefix("CELLS_PRESENT ") {
+                        // Printed for every cycle, so a regression can be
+                        // read as "index lost entries" or "store lost cells"
+                        // without a second run.
+                        println!("    cells present (sampled): {}", rest.trim());
                     } else if line.starts_with("SCAN_ERROR") || line.starts_with("FATAL") {
                         failed = Some(line);
                         unsafe { libc::kill(child_pid, libc::SIGKILL) };
@@ -432,6 +438,7 @@ fn child_main(args: &[String]) -> ExitCode {
     let churn_secs: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3600);
     let delete_rate: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
     let delete_from: u64 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let probe_high: u64 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -446,6 +453,7 @@ fn child_main(args: &[String]) -> ExitCode {
         churn_secs,
         delete_rate,
         delete_from,
+        probe_high,
     )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -467,6 +475,7 @@ async fn child_async(
     churn_secs: u64,
     delete_rate: u64,
     delete_from: u64,
+    probe_high: u64,
 ) -> Result<(), String> {
     use neb::index::ranged::tree::btree::Ordering as TreeOrdering;
     use neb::query::data_client::{ValueRange, ValueRangeTerm};
@@ -563,6 +572,32 @@ async fn child_async(
     }
     println!("SCANNED n={}", count);
     flush_stdout();
+
+    // Which layer lost it?
+    //
+    // The scan above counts RANGED INDEX entries. If keys go missing, that
+    // alone cannot say whether the index lost entries for cells that are
+    // still there, or the store lost the cells themselves -- two different
+    // bugs with two different fixes. So sample the cell store directly for
+    // keys the parent believes are durable, and report both numbers.
+    if probe_high > delete_from + 1 {
+        const SAMPLES: u64 = 400;
+        let span = probe_high - delete_from;
+        let stride = (span / SAMPLES).max(1);
+        let mut present = 0u64;
+        let mut probed = 0u64;
+        let mut seq = delete_from;
+        while seq < probe_high && probed < SAMPLES {
+            let id = Id::from_parts(9 + (seq % 64), seq);
+            if let Ok(Ok(_)) = client.read_cell(id).await {
+                present += 1;
+            }
+            probed += 1;
+            seq += stride;
+        }
+        println!("CELLS_PRESENT {}/{} below {}", present, probed, probe_high);
+        flush_stdout();
+    }
 
     // Churn: writers append monotone keys; a reporter streams the acked
     // high-water mark. Padding gives pages realistic weight so splits come
