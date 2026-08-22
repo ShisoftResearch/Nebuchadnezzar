@@ -2175,8 +2175,15 @@ impl NebServer {
             .iter()
             .map(|(name, runtime)| (name.clone(), runtime.clone()))
             .collect();
+        // Order matters and mirrors the default's steps exactly: flush every
+        // tree FIRST, take the write-back barrier, and only then close and
+        // archive the chunks. The first version of this block closed writes
+        // before the barrier, and the write-back's tree pages -- which are
+        // cells in these same chunks -- were refused by the closed store:
+        // the ranged index died at shutdown while every data cell survived,
+        // which read as "cells fine, sidecar scans empty" after restart.
         let mut flushed_secondary_trees = false;
-        for (database_name, runtime) in &secondary_runtimes {
+        for (database_name, _) in &secondary_runtimes {
             info!("Flushing dynamically-loaded database {database_name} before shutdown");
             let dummy_id = Id::allocated(0, 0, 1);
             if let Ok(lsm_client) = ranged::tree::service::locate_tree_server_from_conshash(
@@ -2190,9 +2197,6 @@ impl NebServer {
                 let _ = lsm_client.flush_all().await;
                 flushed_secondary_trees = true;
             }
-            runtime.chunks().sync_all();
-            runtime.chunks().close_writes();
-            runtime.chunks().archive_all();
         }
         if flushed_secondary_trees {
             // Same write-back barrier the default's flush takes above; one
@@ -2203,12 +2207,11 @@ impl NebServer {
                      databases at shutdown; their archives may miss index pages"
                 );
             }
-            // The pages the write-back just persisted are cells in the
-            // secondaries' chunks; archive again so they reach the backups.
-            for (_, runtime) in &secondary_runtimes {
-                runtime.chunks().sync_all();
-                runtime.chunks().archive_all();
-            }
+        }
+        for (_, runtime) in &secondary_runtimes {
+            runtime.chunks().sync_all();
+            runtime.chunks().close_writes();
+            runtime.chunks().archive_all();
         }
 
         // Step 2: Shutdown Raft (triggers backup creation)
