@@ -826,6 +826,10 @@ impl Chunk {
                 }
                 if covered > 0 {
                     if let Some(base) = head.try_acquire_run(total) {
+                        // Same reason as the single-entry path, and it matters
+                        // more here: a run reserves the whole batch at once,
+                        // so an unfilled one leaves a much larger hole.
+                        crate::ram::entry::stamp_reservation_padding(base, total);
                         return Ok(Some((
                             PendingRun {
                                 base,
@@ -937,6 +941,12 @@ impl Chunk {
                 // to journal.
                 if head.begin_pending_journal() {
                     if let Some(addr) = head.try_acquire(size) {
+                        // Describe the reservation before filling it. A crash
+                        // between here and the entry write would otherwise
+                        // leave zeros mid-segment, and a scan that stops at
+                        // zeros in the MIDDLE discards every entry appended
+                        // after them. The real header overwrites this one.
+                        crate::ram::entry::stamp_reservation_padding(addr, size);
                         trace!(
                             "Chunk {} acquired address {} for size {} in segment {} ({:?})",
                             self.id,

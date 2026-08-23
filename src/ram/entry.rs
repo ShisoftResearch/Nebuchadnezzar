@@ -113,6 +113,38 @@ pub fn stamp_padding(buf: &mut [u8], at: usize, span: usize) -> bool {
     true
 }
 
+/// Stamp a bare PADDING header over a just-reserved span, in place.
+///
+/// Called immediately after the append cursor is advanced and before the
+/// entry itself is written, so a crash in that window leaves a VALID entry
+/// that a scan can step over instead of a run of zeros that stops it dead.
+/// The real entry header overwrites this one moments later, so nothing
+/// survives when the write completes.
+///
+/// Deliberately unchecked (a bare type word): computing a checksum here
+/// would mean reading the whole reserved span on every acquire, on the
+/// hottest path in the store, to protect bytes that carry no data. A scan
+/// only needs the type and the length to step over it.
+pub fn stamp_reservation_padding(addr: usize, span: u32) {
+    if (span as usize) < ENTRY_HEAD_SIZE || addr % 8 != 0 {
+        return;
+    }
+    let content_len = span - ENTRY_HEAD_SIZE as u32;
+    let word = EntryType::PADDING.bits();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            word.to_le_bytes().as_ptr(),
+            addr as *mut u8,
+            mem::size_of::<u32>(),
+        );
+        std::ptr::copy_nonoverlapping(
+            content_len.to_le_bytes().as_ptr(),
+            (addr + mem::size_of::<u32>()) as *mut u8,
+            mem::size_of::<u32>(),
+        );
+    }
+}
+
 /// What a type word says about its entry.
 pub enum TypeWord {
     /// Written before checksums existed: the word is the bare type, which is
@@ -330,6 +362,49 @@ impl EntryContent {
 #[cfg(test)]
 mod checksum_tests {
     use super::*;
+
+    /// A reservation that is never filled must still be walkable.
+    ///
+    /// This is the archive case: segment memory is what gets snapshotted
+    /// into a backup, and a backup carries no WAL records, so a hole baked
+    /// into one has an extent nothing can ever recover. Stamping at
+    /// reservation time means the snapshot contains a valid padding entry
+    /// instead of zeros.
+    #[test]
+    fn an_unfilled_reservation_leaves_a_walkable_entry() {
+        let mut buffer = vec![0u8; 256];
+        let base = buffer.as_mut_ptr() as usize;
+        assert_eq!(base % 8, 0, "test buffer must be 8-byte aligned");
+
+        // Reserve 64 bytes and crash: nothing else is written.
+        stamp_reservation_padding(base, 64);
+
+        let (header, _) = Entry::decode_from(base, |_, header| header);
+        assert_eq!(header.entry_type, EntryType::PADDING);
+        assert_eq!(
+            ENTRY_HEAD_SIZE + header.content_length as usize,
+            64,
+            "the padding must span exactly the reservation, so a scan lands on what follows"
+        );
+    }
+
+    /// And when the write DOES complete, no trace of the padding remains.
+    #[test]
+    fn a_completed_write_overwrites_its_reservation_padding() {
+        let mut buffer = vec![0u8; 256];
+        let base = buffer.as_mut_ptr() as usize;
+        stamp_reservation_padding(base, 64);
+
+        let content = b"the real entry";
+        Entry::encode_to(base, EntryType::CELL, content.len() as u32, |content_pos| unsafe {
+            std::ptr::copy_nonoverlapping(content.as_ptr(), content_pos as *mut u8, content.len());
+        });
+
+        let (header, _) = Entry::decode_from(base, |_, header| header);
+        assert_eq!(header.entry_type, EntryType::CELL);
+        assert_eq!(header.content_length as usize, content.len());
+        assert_eq!(verify_entry_at(base), Some(true));
+    }
 
     /// Backwards compatibility is the whole reason the type word is split
     /// the way it is: every entry ever written by an older build carries a
