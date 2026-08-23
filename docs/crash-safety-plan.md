@@ -277,40 +277,47 @@ uncommitted updates and removes fall back to the prior version the
 append-only store still holds. No markers, no separate file, no second
 fsync, no cross-file ordering dependency.
 
-THE WATERMARK IS ITSELF AN ENTRY TYPE (decided 2026-08-22, user).
-A COMMIT_WATERMARK entry rather than a side file, because as an entry it
-inherits the CRC framing, torn-tail truncation, WAL/backup duality and
-quarantine path that Phase 1 just built -- a side file would need its own
-fsync ordering, its own torn-write handling and its own corruption story,
-i.e. every problem solved again, worse. It also travels with a copied
-backup set.
+THE WATERMARK LIVES IN THE FILE HEADERS, STAMPED AT SEAL (decided
+2026-08-22, user; supersedes the COMMIT_WATERMARK entry sketched first).
 
-The obstacle is timing: pass 1 needs the watermark to decide install vs
-pending, but an entry-borne watermark is only found BY scanning, and
-deferring everything to pass 2 makes the pending list O(live
-transactional cells) instead of O(recent). Fixed with a targeted
-pre-pass: the watermark is monotonic, so the newest lives in the
-highest-seq segment of some chunk; recovery already enumerates files by
-(chunk, seg, seq), so scan the highest-seq file per chunk first, take the
-max watermark found, then run the full parallel scan with it in hand.
-One file per chunk, parsed twice at worst.
+Recovery ALREADY parses these headers before touching content --
+`declared_used_len` reads the backup header without decompressing, and
+`is_framed` reads the WAL header before any record scan. So a watermark
+field arrives in pass 0 for free: no targeted pre-pass, no double
+parsing, no guessing which chunk holds the newest. Recovery takes the max
+across discovered files. It also removes two rules the entry form needed:
+no cleaner retention rule (the header dies with its file), and no
+"references no cell, looks like garbage" special case.
 
-What makes this comfortable: A STALE WATERMARK IS ALWAYS SAFE; ONLY AN
-OVER-ADVANCED ONE IS DANGEROUS. Staleness costs only extra counting, and
-taking the max of what is actually found durably can never exceed the
-true watermark. So the pre-pass may miss, the write may fail, and a fresh
-store may have none at all (start at zero, count everything). The
-watermark therefore never sits on a critical path -- which a half-written
-side file could not offer, being ambiguous where a missing entry is not.
+Safety: each header records the watermark that was durable when that file
+was sealed, and decidedness is permanent, so a value true at seal time
+stays true. Max-over-headers can never exceed the true watermark; if the
+file carrying the highest stamp is reclaimed, the max drops -- staler,
+still safe.
 
-Two rules it imposes:
-- The cleaner must retain the highest watermark entry per store (it
-  references no cell, so it looks like garbage); older ones are
-  reclaimable.
-- Advancing it allocates an entry, which can fail when the store is full
-  or shutting down. Best-effort and silent, precisely because staleness
-  is safe.
+Cost: freshness is bounded by SEAL cadence, not watermark cadence -- a
+live head's WAL header was written at creation, so the freshest stamp
+comes from the last seal. Self-limiting, though: few seals means few
+writes means few transactions above the watermark to count. An idle store
+has both an old watermark and almost nothing above it.
 
+Format mechanics:
+- WAL: the header already carries a version byte and 3 reserved bytes.
+  Bump v1 -> v2, 16 -> 24 bytes, watermark in the tail; v1 files read as
+  watermark 0, safe by construction.
+- BACKUP: BLOCK_HEADER_SIZE is 20 with fixed offsets, so growing it needs
+  a magic bump (NEB\x03 -> NEB\x04); old backups report no watermark.
+  This is the one that matters long-term, because WAL files are DELETED
+  at archive -- a store recovered from backups alone would otherwise
+  carry no watermark at all and count everything forever.
+- CONSOLIDATE: Phase 4.1 already wants a backup format bump for per-block
+  CRCs. Do both in one version increment, not two. They are
+  complementary: per-block CRCs make cold reads verifiable, the watermark
+  makes recovery cheap.
+
+Kept in reserve: a COMMIT_WATERMARK entry is the only way to advance the
+mark WITHOUT sealing a segment. Not needed while staleness self-limits,
+but that is the reason to keep the idea rather than delete it.
 
 TO MODEL IN TLA+ BEFORE ANY CODE:
 1. Safety: an installed transaction is exactly one whose commit was
