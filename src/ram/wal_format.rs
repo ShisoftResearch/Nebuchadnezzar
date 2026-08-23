@@ -104,6 +104,8 @@ pub struct ScanOutcome {
     /// extent, which unframed logs could never declare.
     pub used_len: usize,
     pub records: usize,
+    /// Abandoned-reservation gaps that were filled with PADDING entries.
+    pub gaps: usize,
     pub stop: TailStop,
     /// Seq id recorded in the file header.
     pub seq_id: u64,
@@ -135,6 +137,10 @@ pub fn scan_framed(data: &[u8], segment_size: usize) -> io::Result<ScanOutcome> 
     let mut image = vec![0u8; segment_size];
     let mut used_len = 0usize;
     let mut records = 0usize;
+    let mut gaps = 0usize;
+    // Where the next record is expected to start, so a gap can be named
+    // exactly rather than guessed at. See the gap handling below.
+    let mut expected_next = 0usize;
     let mut cursor = FILE_HEADER_SIZE;
     let stop = loop {
         if cursor == data.len() {
@@ -192,16 +198,52 @@ pub fn scan_framed(data: &[u8], segment_size: usize) -> io::Result<ScanOutcome> 
                 ),
             };
         }
-        image[seg_offset as usize..end].copy_from_slice(payload);
+        // A gap here is an abandoned reservation: `try_acquire` moves the
+        // append cursor before the entry bytes are written, so a crash in
+        // that window leaves zeros in the middle of the image. Left alone
+        // they are fatal -- a forward scan stops at zeros, and stopping in
+        // the MIDDLE discards every entry other writers durably appended
+        // afterwards, which is unbounded loss from a one-entry window.
+        //
+        // This is the only place that can fix it, because it is the only
+        // place that knows where the gap ENDS: record N declares its extent
+        // and record N+1 declares its offset, so the hole is exactly
+        // [end of N, start of N+1). A checksum could confirm a guess at that
+        // boundary but could never produce one.
+        let start = seg_offset as usize;
+        if start > expected_next {
+            let span = start - expected_next;
+            if crate::ram::entry::stamp_padding(&mut image, expected_next, span) {
+                gaps += 1;
+            } else {
+                warn!(
+                    "WAL record at segment offset {} leaves a {}-byte gap that cannot hold a \
+                     padding header; a scan of this image will stop there",
+                    start, span
+                );
+            }
+        }
+        image[start..end].copy_from_slice(payload);
         used_len = used_len.max(end);
+        expected_next = expected_next.max(end);
         records += 1;
         cursor = payload_start + len;
     };
+
+    if gaps > 0 {
+        info!(
+            "WAL rebuild filled {} gap(s) left by abandoned reservations; the image is \
+             contiguous, so the entries after them survive and the archive of this segment \
+             carries no hole",
+            gaps
+        );
+    }
 
     Ok(ScanOutcome {
         image,
         used_len,
         records,
+        gaps,
         stop,
         seq_id,
     })
@@ -219,6 +261,91 @@ mod tests {
             file.extend_from_slice(&frame_record(*offset, payload));
         }
         file
+    }
+
+    /// The abandoned-reservation case, which is fatal if left alone.
+    ///
+    /// `try_acquire` moves the append cursor before the entry bytes are
+    /// written, so a crash in that window leaves zeros mid-image. A forward
+    /// scan stops at zeros, and stopping in the MIDDLE loses every entry
+    /// other writers durably appended after the gap -- unbounded loss from
+    /// a one-entry window.
+    #[test]
+    fn a_gap_from_an_abandoned_reservation_is_filled_so_later_records_survive() {
+        // Records at 0 and 256: the writer that reserved [8, 256) never got
+        // to write, and the writer after it did.
+        let file = log_with(&[(0, b"before the hole"), (256, b"after the hole")]);
+        let outcome = scan_framed(&file, SEG).unwrap();
+
+        assert_eq!(outcome.stop, TailStop::Clean);
+        assert_eq!(outcome.records, 2);
+        assert_eq!(outcome.gaps, 1, "the hole should have been filled");
+        assert_eq!(&outcome.image[..15], b"before the hole");
+        assert_eq!(&outcome.image[256..270], b"after the hole");
+
+        // The point of the padding: a sequential walk must REACH the second
+        // record instead of stopping at the zeros.
+        let mut cursor = 15usize;
+        // Round up to the padding header the filler placed.
+        let mut hops = 0;
+        let mut reached_second = false;
+        while cursor + crate::ram::entry::ENTRY_HEAD_SIZE <= 256 && hops < 8 {
+            let word = u32::from_le_bytes(outcome.image[cursor..cursor + 4].try_into().unwrap());
+            let len =
+                u32::from_le_bytes(outcome.image[cursor + 4..cursor + 8].try_into().unwrap());
+            match crate::ram::entry::unpack_type_word(word) {
+                crate::ram::entry::TypeWord::Checked(entry_type, _)
+                | crate::ram::entry::TypeWord::Unchecked(entry_type) => {
+                    assert_eq!(
+                        entry_type,
+                        crate::ram::entry::EntryType::PADDING,
+                        "the gap should be spanned by padding, not garbage"
+                    );
+                    cursor += crate::ram::entry::ENTRY_HEAD_SIZE + len as usize;
+                    if cursor == 256 {
+                        reached_second = true;
+                        break;
+                    }
+                }
+                crate::ram::entry::TypeWord::Invalid => break,
+            }
+            hops += 1;
+        }
+        assert!(
+            reached_second,
+            "a scan must walk the padding and land exactly on the next record"
+        );
+    }
+
+    /// Padding must verify like any other entry, so nothing downstream has
+    /// to make an exception for it.
+    #[test]
+    fn filled_padding_carries_a_valid_checksum() {
+        let file = log_with(&[(0, b"first"), (128, b"second")]);
+        let outcome = scan_framed(&file, SEG).unwrap();
+        assert_eq!(outcome.gaps, 1);
+        let pad_at = 5usize;
+        let word = u32::from_le_bytes(outcome.image[pad_at..pad_at + 4].try_into().unwrap());
+        match crate::ram::entry::unpack_type_word(word) {
+            crate::ram::entry::TypeWord::Checked(entry_type, _) => {
+                assert_eq!(entry_type, crate::ram::entry::EntryType::PADDING)
+            }
+            other => panic!("padding should be checksummed, got a different form: {:?}",
+                matches!(other, crate::ram::entry::TypeWord::Invalid)),
+        }
+    }
+
+    /// A log without gaps must not grow phantom padding.
+    #[test]
+    fn contiguous_records_produce_no_padding() {
+        let mut file = wal_file_header(11).to_vec();
+        // Two records that abut exactly.
+        file.extend_from_slice(&frame_record(0, b"aaaaaaaa"));
+        file.extend_from_slice(&frame_record(8, b"bbbbbbbb"));
+        let outcome = scan_framed(&file, SEG).unwrap();
+        assert_eq!(outcome.records, 2);
+        assert_eq!(outcome.gaps, 0, "abutting records leave nothing to fill");
+        assert_eq!(outcome.used_len, 16);
     }
 
     #[test]

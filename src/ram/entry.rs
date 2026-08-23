@@ -14,6 +14,16 @@ pub enum EntryType {
     UNDECIDED = 0,
     CELL = 1,
     TOMBSTONE = 2,
+    /// Occupies space that holds no data, so a scan can step over it.
+    ///
+    /// Written by WAL recovery over the gap an abandoned reservation left:
+    /// `try_acquire` moves the append cursor before the entry bytes are
+    /// written, so a crash in that window leaves zeros in the middle of the
+    /// image. UNDECIDED cannot express that -- it means "nothing was ever
+    /// written here", which is why a scan stops at it, and stopping in the
+    /// MIDDLE discards every entry that other writers durably appended
+    /// after the gap.
+    PADDING = 3,
 }
 
 impl EntryType {
@@ -22,6 +32,7 @@ impl EntryType {
             0 => Some(Self::UNDECIDED),
             1 => Some(Self::CELL),
             2 => Some(Self::TOMBSTONE),
+            3 => Some(Self::PADDING),
             _ => None,
         }
     }
@@ -68,6 +79,38 @@ fn content_checksum(content_pos: usize, content_len: u32) -> u32 {
     } else {
         folded
     }
+}
+
+/// Checksum of a slice, for callers holding a buffer rather than a mapped
+/// address (WAL recovery builds an image before it is installed).
+fn content_checksum_slice(bytes: &[u8]) -> u32 {
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+    digest.update(bytes);
+    let folded = (digest.finalize() as u32) >> ENTRY_TYPE_BITS;
+    if folded == 0 {
+        1
+    } else {
+        folded
+    }
+}
+
+/// Write a PADDING entry covering `span` bytes at `at` within `buf`.
+///
+/// `span` must be at least `ENTRY_HEAD_SIZE`; entries are 8-byte aligned so
+/// any gap between two of them already is. Returns false if it will not fit,
+/// which leaves the gap as it was -- the caller decides how loud to be.
+pub fn stamp_padding(buf: &mut [u8], at: usize, span: usize) -> bool {
+    if span < ENTRY_HEAD_SIZE || at + span > buf.len() {
+        return false;
+    }
+    let content_len = (span - ENTRY_HEAD_SIZE) as u32;
+    // Checksummed like any other entry, so nothing downstream has to make an
+    // exception for it.
+    let checksum = content_checksum_slice(&buf[at + ENTRY_HEAD_SIZE..at + span]);
+    let word = pack_type_word(EntryType::PADDING, checksum);
+    buf[at..at + 4].copy_from_slice(&word.to_le_bytes());
+    buf[at + 4..at + ENTRY_HEAD_SIZE].copy_from_slice(&content_len.to_le_bytes());
+    true
 }
 
 /// What a type word says about its entry.
