@@ -368,6 +368,18 @@ fn rlimit_nofile() -> Option<usize> {
 /// no new journal claim can start while a drain is trying to reach zero.
 const JOURNAL_GATE_CLOSED: usize = 1 << (usize::BITS - 1);
 
+/// Second-from-top bit of `pending_journals`: set while a writer OWNS this
+/// segment as its head. Under the head pool a segment accepts writes from
+/// exactly one writer at a time, which is what makes mid-segment holes
+/// impossible by construction: the append cursor never runs ahead of another
+/// writer's unwritten bytes, so a crash can only tear the tail. Riding the
+/// counter word keeps `Segment` inside its five-cache-line budget and makes
+/// acquisition a single fetch_or.
+const HEAD_OWNED: usize = 1 << (usize::BITS - 2);
+
+/// Bits of `pending_journals` that are flags, not count.
+const JOURNAL_META_MASK: usize = JOURNAL_GATE_CLOSED | HEAD_OWNED;
+
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
@@ -2273,7 +2285,23 @@ image, not an empty segment; archiving it would persist the damage.",
     }
 
     pub fn pending_journal_count(&self) -> usize {
-        self.pending_journals.load(Ordering::Acquire) & !JOURNAL_GATE_CLOSED
+        self.pending_journals.load(Ordering::Acquire) & !JOURNAL_META_MASK
+    }
+
+    /// Claim exclusive head ownership. One fetch_or: acquired iff the bit was
+    /// clear before. On failure the bit was already set by the current owner
+    /// and is left exactly as it was.
+    #[inline]
+    pub fn try_own(&self) -> bool {
+        self.pending_journals.fetch_or(HEAD_OWNED, Ordering::AcqRel) & HEAD_OWNED == 0
+    }
+
+    /// Release head ownership. The RELEASE ORDERING here is the journal-in-
+    /// window invariant's other half: everything the owner wrote and
+    /// journaled happens-before the next owner's acquire.
+    #[inline]
+    pub fn release_own(&self) {
+        self.pending_journals.fetch_and(!HEAD_OWNED, Ordering::Release);
     }
 
     /// Wait for in-flight journal writes to land, briefly.
@@ -3553,6 +3581,187 @@ mod backup_fd_cache_tests {
         assert!(cache.get(&key).is_some());
         cache.remove(&key);
         assert!(cache.get(&key).is_none(), "removed handle should be gone");
+    }
+}
+
+#[cfg(test)]
+mod head_pool_tests {
+    use crate::ram::cell::{CellHeader, OwnedCell};
+    use crate::ram::chunk::Chunks;
+    use crate::ram::schema::{Field, LocalSchemasCache, Schema};
+    use crate::ram::types::*;
+    use crate::server::ServerMeta;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn test_store(wal_dir: &TempDir, backup_dir: &TempDir) -> (Arc<Chunks>, Schema) {
+        let schema = Schema::new_with_id(
+            881,
+            "head_pool_schema",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("DATA", Type::U64)]),
+            false,
+            false,
+        );
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new(
+            1,
+            crate::ram::segs::SEGMENT_SIZE * 24,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+        );
+        (chunks, schema)
+    }
+
+    /// The design's core claim: one writer per segment, so every WAL is
+    /// offset-ordered. Hammer the pool from many threads, then decode every
+    /// WAL file and require each record's segment offset to be strictly
+    /// increasing in FILE order. Under the shared head this fails
+    /// immediately -- journal order was drop order, not offset order.
+    #[test]
+    fn every_wal_is_offset_ordered_under_concurrency() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (chunks, schema) = test_store(&wal_dir, &backup_dir);
+
+        std::thread::scope(|scope| {
+            for t in 0..16u64 {
+                let chunks = &chunks;
+                let schema = &schema;
+                scope.spawn(move || {
+                    for i in 0..2_000u64 {
+                        let mut value = OwnedValue::Map(OwnedMap::new());
+                        value["DATA"] = OwnedValue::U64(t * 1_000_000 + i);
+                        let mut cell = OwnedCell {
+                            header: CellHeader::new(
+                                schema.id,
+                                &Id::allocated(31, 0, t * 1_000_000 + i + 1),
+                            ),
+                            data: value,
+                        };
+                        chunks.write_cell(&mut cell).expect("pool write");
+                    }
+                });
+            }
+        });
+
+        let mut wal_files = 0;
+        for entry in walk(wal_dir.path()) {
+            let bytes = std::fs::read(&entry).unwrap();
+            if !crate::ram::wal_format::is_framed(&bytes) {
+                continue;
+            }
+            wal_files += 1;
+            let mut cursor = crate::ram::wal_format::FILE_HEADER_SIZE;
+            let mut last_offset: Option<u64> = None;
+            while cursor + crate::ram::wal_format::RECORD_HEADER_SIZE <= bytes.len() {
+                let magic =
+                    u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+                if magic != crate::ram::wal_format::RECORD_MAGIC {
+                    break;
+                }
+                let seg_offset =
+                    u64::from_le_bytes(bytes[cursor + 4..cursor + 12].try_into().unwrap());
+                let len =
+                    u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap())
+                        as usize;
+                if let Some(last) = last_offset {
+                    assert!(
+                        seg_offset > last,
+                        "{}: record at file offset {} has segment offset {} after {} -- \
+                         the WAL is not offset-ordered, so a writer journaled outside \
+                         its ownership window",
+                        entry.display(),
+                        cursor,
+                        seg_offset,
+                        last
+                    );
+                }
+                last_offset = Some(seg_offset);
+                cursor += crate::ram::wal_format::RECORD_HEADER_SIZE + len;
+            }
+        }
+        assert!(
+            wal_files >= 1,
+            "the run must have produced at least one framed WAL"
+        );
+
+        // And every cell must read back.
+        for t in 0..16u64 {
+            for i in (0..2_000u64).step_by(199) {
+                let id = Id::allocated(31, 0, t * 1_000_000 + i + 1);
+                chunks.read_cell(&id).expect("every written cell reads back");
+            }
+        }
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if let Ok(entries) = std::fs::read_dir(&d) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.extension().map(|x| x == "nlog").unwrap_or(false) {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Ownership must actually spread writers across the pool: with more
+    /// threads than one head can serve, several slots fill.
+    #[test]
+    fn contention_grows_the_pool() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (chunks, schema) = test_store(&wal_dir, &backup_dir);
+
+        std::thread::scope(|scope| {
+            for t in 0..12u64 {
+                let chunks = &chunks;
+                let schema = &schema;
+                scope.spawn(move || {
+                    for i in 0..3_000u64 {
+                        let mut value = OwnedValue::Map(OwnedMap::new());
+                        value["DATA"] = OwnedValue::U64(i);
+                        let mut cell = OwnedCell {
+                            header: CellHeader::new(
+                                schema.id,
+                                &Id::allocated(32, 0, t * 1_000_000 + i + 1),
+                            ),
+                            data: value,
+                        };
+                        chunks.write_cell(&mut cell).expect("pool write");
+                    }
+                });
+            }
+        });
+
+        let live_slots = chunks.list[0]
+            .head_pool
+            .iter()
+            .filter(|slot| {
+                let id = slot.load(Ordering::Acquire);
+                id != u64::MAX && id != u64::MAX - 1
+            })
+            .count();
+        assert!(
+            live_slots >= 2,
+            "12 threads hammering one chunk left only {live_slots} live head(s); \
+             the pool is not absorbing contention"
+        );
     }
 }
 

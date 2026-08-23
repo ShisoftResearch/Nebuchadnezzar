@@ -666,9 +666,7 @@ fn test_active_blob_head_is_not_evicted_by_clock() {
         .expect("should allocate a blob head for the test");
     let blob_head_id = blob_head.id;
     chunk.put_segment(blob_head);
-    chunk
-        .blob_head_seg_id
-        .store(blob_head_id, AtomicOrdering::Relaxed);
+    chunk.blob_head_pool[0].store(blob_head_id, AtomicOrdering::Relaxed);
 
     let (regular_head, blob_head) = chunk.head_seg_ids_for_test();
     let blob_head = blob_head.expect("blob head should be installed for the test");

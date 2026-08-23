@@ -31,6 +31,12 @@ pub fn cell_rw() {
         .write_cell_to_chunk(&cell, &write_plan, &pending_entry, cell.header.version)
         .unwrap();
     let cell_1_ptr = write_result.addr;
+    // Under the head pool a PendingEntry OWNS its head until dropped, and
+    // this dummy store has room for exactly one segment -- holding the
+    // first entry across the second allocation would force a second head
+    // the store cannot provide. Production paths never overlap entries;
+    // this test only did so by keeping them in scope for convenience.
+    drop(pending_entry);
     {
         let (stored_cell, _) =
             SharedCellData::from_chunk_raw(id1.bits(), cell_1_ptr, &chunk).unwrap();

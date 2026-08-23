@@ -205,6 +205,46 @@ impl<'a> Drop for HeadSlotGuard<'a> {
 const HEAD_SEG_ID_EMPTY: u64 = u64::MAX;
 const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 
+/// Pool sizes per class. Elastic in USE (slots fill only under real
+/// contention), fixed in CAPACITY. The .239 contention spike showed K=4
+/// degrading badly at 96-192 threads and K=8-16 behaving well; blobs see a
+/// fraction of the traffic and 8 MiB per resident head is real money.
+fn head_pool_len(segment_class: SegmentClass) -> usize {
+    static REGULAR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static BLOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let read = |var: &str, default: usize| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            // Floor of 2, not 1: with a single slot, a thread that ever
+            // needed a second entry while holding its first would spin on
+            // its own ownership forever.
+            .map(|v| v.clamp(2, 64))
+            .unwrap_or(default)
+    };
+    match segment_class {
+        SegmentClass::Regular => *REGULAR.get_or_init(|| read("NEB_HEAD_POOL", 8)),
+        SegmentClass::Blob => *BLOB.get_or_init(|| read("NEB_BLOB_HEAD_POOL", 2)),
+    }
+}
+
+/// Stable per-thread starting slot, so threads spread across the pool and a
+/// thread keeps returning to "its" head while uncontended -- the affinity
+/// shape the contention spike validated.
+fn head_affinity() -> usize {
+    use std::cell::Cell;
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static AFFINITY: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    AFFINITY.with(|a| {
+        if a.get() == usize::MAX {
+            a.set(NEXT.fetch_add(1, Ordering::Relaxed));
+        }
+        a.get()
+    })
+}
+
 /// Get the current global chunk base address
 pub fn get_global_chunk_base() -> usize {
     GLOBAL_CHUNK_BASE.load(Ordering::Acquire)
@@ -409,8 +449,21 @@ pub struct Chunk {
     /// dead space and abandoned race-loser entries never count.
     pub slot_bytes: Arc<crate::slots::SlotLiveBytes>,
     pub segs: SegmentList,
-    pub head_seg_id: AtomicU64,
-    pub blob_head_seg_id: AtomicU64,
+    /// Head POOLS, one slot array per segment class. Every slot is EMPTY,
+    /// ALLOCATING, or a live segment id, exactly as the single head slot
+    /// was -- the rotation machinery (HeadSlotGuard, the ALLOCATING
+    /// sentinel, the seal queue) is slot-generic and unchanged. What is new
+    /// is that a writer must OWN a head (Segment::try_own) before touching
+    /// its cursor, and holds that ownership through its journal write, so
+    /// each segment has a single writer at a time: mid-segment holes become
+    /// impossible by construction, and each segment's WAL is offset-ordered
+    /// and prefix-complete.
+    ///
+    /// Slots fill lazily: a writer only claims an EMPTY slot when it found
+    /// no ownable head, so the pool grows exactly with real contention and
+    /// an idle chunk keeps one head, as before.
+    pub head_pool: Box<[AtomicU64]>,
+    pub blob_head_pool: Box<[AtomicU64]>,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
@@ -679,8 +732,22 @@ impl Chunk {
             index_builder,
             capacity: size,
             total_space: AtomicUsize::new(0),
-            head_seg_id: AtomicU64::new(bootstrap_segment.id),
-            blob_head_seg_id: AtomicU64::new(HEAD_SEG_ID_EMPTY),
+            head_pool: {
+                let pool: Vec<AtomicU64> = (0..head_pool_len(SegmentClass::Regular))
+                    .map(|i| {
+                        AtomicU64::new(if i == 0 {
+                            bootstrap_segment.id
+                        } else {
+                            HEAD_SEG_ID_EMPTY
+                        })
+                    })
+                    .collect();
+                pool.into_boxed_slice()
+            },
+            blob_head_pool: (0..head_pool_len(SegmentClass::Blob))
+                .map(|_| AtomicU64::new(HEAD_SEG_ID_EMPTY))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             gc_lock: Mutex::new(()),
             statistics: ChunkStatistics::new(),
             tiered_manager,
@@ -693,15 +760,24 @@ impl Chunk {
     }
 
     #[inline]
-    fn head_slot(&self, segment_class: SegmentClass) -> &AtomicU64 {
+    fn head_slots(&self, segment_class: SegmentClass) -> &[AtomicU64] {
         match segment_class {
-            SegmentClass::Regular => &self.head_seg_id,
-            SegmentClass::Blob => &self.blob_head_seg_id,
+            SegmentClass::Regular => &self.head_pool,
+            SegmentClass::Blob => &self.blob_head_pool,
         }
     }
 
+    /// First live regular head, for logging and single-threaded tests. With
+    /// a pool there is no single "the head"; callers that need the full
+    /// picture scan the pools themselves.
     pub fn get_head_seg_id(&self) -> u64 {
-        self.head_seg_id.load(Ordering::Acquire)
+        for slot in self.head_pool.iter() {
+            let id = slot.load(Ordering::Acquire);
+            if id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING {
+                return id;
+            }
+        }
+        HEAD_SEG_ID_EMPTY
     }
 
     /// Re-establish "sealed implies archived" after recovery.
@@ -744,13 +820,17 @@ impl Chunk {
     }
 
     pub fn is_active_head(&self, seg_id: u64) -> bool {
-        self.head_seg_id.load(Ordering::Acquire) == seg_id
-            || self.blob_head_seg_id.load(Ordering::Acquire) == seg_id
+        self.head_pool
+            .iter()
+            .chain(self.blob_head_pool.iter())
+            .any(|slot| slot.load(Ordering::Acquire) == seg_id)
     }
 
     #[inline]
     pub fn has_blob_head(&self) -> bool {
-        self.blob_head_seg_id.load(Ordering::Acquire) != HEAD_SEG_ID_EMPTY
+        self.blob_head_pool
+            .iter()
+            .any(|slot| slot.load(Ordering::Acquire) != HEAD_SEG_ID_EMPTY)
     }
 
     pub fn try_acquire(&self, size: u32, full_gc: bool) -> Result<PendingEntry, WriteError> {
@@ -778,28 +858,39 @@ impl Chunk {
         if self.writes_closed.load(Ordering::Acquire) {
             return Err(WriteError::ServerShuttingDown);
         }
-        let backoff = Backoff::new();
-        let head_slot = self.head_slot(segment_class);
-        loop {
-            let head_seg_id = head_slot.load(Ordering::Acquire);
-            if head_seg_id == HEAD_SEG_ID_ALLOCATING {
-                backoff.spin();
+        let slots = self.head_slots(segment_class);
+        let start = head_affinity();
+        // One pass over the pool: the first head this writer can OWN gets
+        // the run. Anything unownable (owned by another writer, allocating,
+        // or empty) is someone else's business -- the caller falls back to
+        // the single-entry path, which owns the rotation machinery.
+        for i in 0..slots.len() {
+            let slot = &slots[(start + i) % slots.len()];
+            let head_seg_id = slot.load(Ordering::Acquire);
+            if head_seg_id == HEAD_SEG_ID_ALLOCATING || head_seg_id == HEAD_SEG_ID_EMPTY {
                 continue;
             }
-            if head_seg_id != HEAD_SEG_ID_EMPTY {
+            {
                 let head = match self.segs.get(&(head_seg_id as usize)) {
                     Some(seg) => seg,
                     None => {
-                        backoff.spin();
                         continue;
                     }
                 };
+                // OWN the head before anything else: under the pool, a
+                // segment has one writer at a time, and the ownership window
+                // (through the last journal write, released in
+                // PendingRun::drop) is what makes its WAL offset-ordered and
+                // its image hole-free by construction.
+                if !head.try_own() {
+                    continue;
+                }
                 // Reference BEFORE claiming, for the reason spelled out in
                 // `try_acquire_in_class`: claiming first lets a rotation see
                 // zero references and seal the segment out from under a writer
                 // that has already moved the cursor.
                 if !head.incr_references() {
-                    backoff.spin();
+                    head.release_own();
                     continue;
                 }
                 // How much of the batch fits in what is left of this segment.
@@ -822,6 +913,7 @@ impl Chunk {
                 // cell the ordinary way, which rotates to a fresh segment.
                 if covered > 0 && !head.begin_pending_journal() {
                     head.decr_references();
+                    head.release_own();
                     return Ok(None);
                 }
                 if covered > 0 {
@@ -845,19 +937,18 @@ impl Chunk {
                     // it back, or this segment can never seal.
                     head.end_pending_journal();
                 }
-                // Nothing fits, or the cursor moved under us: give the
-                // reference back before rotating, or it pins the segment
-                // against eviction forever.
+                // Nothing fits in this head: give everything back and try
+                // the next slot.
                 head.decr_references();
+                head.release_own();
             }
-            // Not even one entry fits, or there is no head yet. Rotation,
-            // emergency GC and the near-capacity refusal all live in the
-            // single-entry path; rather than duplicate that (and risk the two
-            // copies drifting), say so and let the caller write one cell the
-            // ordinary way. That call rotates the head, and the next run claim
-            // finds a fresh segment.
-            return Ok(None);
         }
+        // No ownable head fits the run. Rotation, emergency GC and the
+        // near-capacity refusal all live in the single-entry path; rather
+        // than duplicate that (and risk the two copies drifting), say so and
+        // let the caller write one cell the ordinary way. That call rotates
+        // or fills a slot, and the next run claim finds a fresh segment.
+        Ok(None)
     }
 
     pub fn try_acquire_in_class(
@@ -871,7 +962,8 @@ impl Chunk {
         }
         let mut tried_gc = false;
         let backoff = Backoff::new();
-        let head_slot = self.head_slot(segment_class);
+        let slots = self.head_slots(segment_class);
+        let start = head_affinity();
         loop {
             // Re-checked every pass, not just on entry. A writer already
             // inside this loop when shutdown begins would otherwise keep
@@ -882,28 +974,44 @@ impl Chunk {
             if self.writes_closed.load(Ordering::Acquire) {
                 return Err(WriteError::ServerShuttingDown);
             }
-            let head_seg_id = head_slot.load(Ordering::Acquire);
-            if head_seg_id == HEAD_SEG_ID_ALLOCATING {
-                // Allocating new segment in progress, wait for it to complete
-                let t_spin = std::time::Instant::now();
-                backoff.spin();
-                ALLOC_SPIN_NANOS.fetch_add(t_spin.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                continue;
-            }
-            if head_seg_id != HEAD_SEG_ID_EMPTY {
-                // Try to get the head segment. If it's been removed (e.g., by cleaner after
-                // a new head was allocated), retry with the updated head_seg_id.
+            // Scan the pool from this thread's affinity slot. The head this
+            // writer can OWN takes the entry; a full one becomes the
+            // rotation target; an EMPTY slot is the fallback target so the
+            // pool grows exactly when contention demands it.
+            let mut rotate_target: Option<(&AtomicU64, u64)> = None;
+            let mut empty_slot: Option<&AtomicU64> = None;
+            for i in 0..slots.len() {
+                let slot = &slots[(start + i) % slots.len()];
+                let head_seg_id = slot.load(Ordering::Acquire);
+                if head_seg_id == HEAD_SEG_ID_ALLOCATING {
+                    continue;
+                }
+                if head_seg_id == HEAD_SEG_ID_EMPTY {
+                    if empty_slot.is_none() {
+                        empty_slot = Some(slot);
+                    }
+                    continue;
+                }
                 let head = match self.segs.get(&(head_seg_id as usize)) {
                     Some(seg) => seg,
                     None => {
                         debug!(
-                            "Head segment {} was removed, retrying with current head",
+                            "Head segment {} was removed, trying the next slot",
                             head_seg_id
                         );
-                        backoff.spin();
                         continue;
                     }
                 };
+                // OWN the head first. Under the pool a segment has ONE
+                // writer at a time, from here through the journal write
+                // (released in PendingEntry::drop): the cursor can never run
+                // ahead of another writer's unwritten bytes, so mid-segment
+                // holes are impossible by construction and the WAL is
+                // offset-ordered. A head someone else owns is simply the
+                // next slot's problem.
+                if !head.try_own() {
+                    continue;
+                }
                 // Take the reference BEFORE claiming space, not after.
                 //
                 // The reference is what rotation waits on before it archives a
@@ -931,9 +1039,9 @@ impl Chunk {
                 // eviction active, intermittent because it needs the exclusive
                 // CAS to land inside this window.
                 if !head.incr_references() {
-                    // Someone owns this segment exclusively. Do not write into
-                    // it; wait for the head to rotate or the owner to finish.
-                    backoff.spin();
+                    // An evictor/promoter/cleaner holds this segment
+                    // exclusively. Not our head; next slot.
+                    head.release_own();
                     continue;
                 }
                 // Claimed BEFORE the cursor moves. A writer that has taken
@@ -963,20 +1071,39 @@ impl Chunk {
                             skip_sync: is_in_transaction(),
                         });
                     }
-                    // No space in this segment: give the claim and the
-                    // reference back, or they pin the segment against
-                    // sealing, eviction and reclamation forever.
+                    // No space in this segment: give everything back and
+                    // make THIS slot the rotation target.
                     head.end_pending_journal();
                     head.decr_references();
+                    head.release_own();
+                    rotate_target = Some((slot, head_seg_id));
+                    break;
                 } else {
-                    // This head is sealing. Fall THROUGH to rotation rather
-                    // than spinning here: retrying the same head would spin
-                    // for as long as the seal takes, and under a busy
-                    // archiver that is indefinitely -- writers would starve
-                    // on a segment that is never going to accept them again.
+                    // This head is sealing; it will never accept another
+                    // write. Next slot.
                     head.decr_references();
+                    head.release_own();
+                    continue;
                 }
             }
+
+            // Decide where the allocation work goes: a full head's slot
+            // rotates; failing that, an EMPTY slot gets its first segment;
+            // failing THAT, every slot is owned or allocating -- spin
+            // briefly and rescan.
+            let (head_slot, head_seg_id) = match rotate_target {
+                Some(target) => target,
+                None => match empty_slot {
+                    Some(slot) => (slot, HEAD_SEG_ID_EMPTY),
+                    None => {
+                        let t_spin = std::time::Instant::now();
+                        backoff.spin();
+                        ALLOC_SPIN_NANOS
+                            .fetch_add(t_spin.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        continue;
+                    }
+                },
+            };
 
             let total_space = self.segs.len() * SEGMENT_SIZE;
             // Trigger emergency cleaning one segment early: a moving combine
@@ -985,6 +1112,27 @@ impl Chunk {
             // itself is refused only at the original wall, so usable capacity
             // is unchanged.
             let reserve_boundary = self.capacity.saturating_sub(2 * SEGMENT_SIZE);
+
+            // GROWTH IS OPTIONAL; a wait is not a failure. This allocation
+            // fills an EMPTY slot when every live head was owned by someone
+            // else -- parallelism, not capacity. Near the wall, the right
+            // trade is the one the single-head design always made: queue on
+            // an existing head until its owner releases (microseconds), and
+            // never refuse a write that yesterday's store would have
+            // absorbed just because the pool WANTED another segment. Without
+            // this, every small store failed under concurrency with
+            // CannotAllocateSpace the moment writers outnumbered segments.
+            let growing = head_seg_id == HEAD_SEG_ID_EMPTY;
+            let any_live_head = || {
+                slots.iter().any(|slot| {
+                    let id = slot.load(Ordering::Acquire);
+                    id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING
+                })
+            };
+            if growing && total_space >= reserve_boundary && any_live_head() {
+                backoff.spin();
+                continue;
+            }
             if total_space >= reserve_boundary && !tried_gc {
                 if full_gc {
                     warn!("Chunk {} near capacity, emergency full GC", self.id);
@@ -1095,8 +1243,13 @@ impl Chunk {
             let Some(new_seg) = new_seg_opt else {
                 // Space was there when we checked, and is gone now -- another
                 // writer took the last segment between the check and here.
-                // Hand the caller a refusal; the guard puts the head back.
                 drop(restore);
+                // A failed GROWTH still is not a failed write while live
+                // heads exist: put the slot back and queue on one of them.
+                if growing && any_live_head() {
+                    backoff.spin();
+                    continue;
+                }
                 error!(
                     "chunk-allocation-failure: chunk={}, segment_class={:?}, seg_count={}, \
                      capacity={}: the allocator has no segment left after GC",
@@ -1260,16 +1413,21 @@ impl Chunk {
     /// an ordinary state now, not just a blob one: recovery leaves both
     /// empty, and the first write of each class allocates a fresh segment.
     pub fn head_seg_ids_for_test(&self) -> (Option<u64>, Option<u64>) {
-        let head_or_none = |id: u64| (id != HEAD_SEG_ID_EMPTY).then_some(id);
-        (
-            head_or_none(self.get_head_seg_id()),
-            head_or_none(self.blob_head_seg_id.load(Ordering::Acquire)),
-        )
+        let head_or_none = |id: u64| {
+            (id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING).then_some(id)
+        };
+        let first_blob = self
+            .blob_head_pool
+            .iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .find(|id| *id != HEAD_SEG_ID_EMPTY && *id != HEAD_SEG_ID_ALLOCATING);
+        (head_or_none(self.get_head_seg_id()), first_blob)
     }
 
     pub(crate) fn reset_write_heads_after_recovery(&self) -> io::Result<()> {
-        self.blob_head_seg_id
-            .store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        for slot in self.blob_head_pool.iter() {
+            slot.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        }
 
         // EVERY recovered segment is a closed incarnation, whether it was
         // rebuilt from a backup or from a WAL. Backup-recovered ones were
@@ -1293,7 +1451,9 @@ impl Chunk {
                 segment.seal();
             }
         }
-        self.head_seg_id.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        for slot in self.head_pool.iter() {
+            slot.store(HEAD_SEG_ID_EMPTY, Ordering::Release);
+        }
 
         Ok(())
     }
@@ -2724,6 +2884,11 @@ impl Drop for PendingRun {
             );
         }
         self.seg.end_pending_journal();
+        // Same ordering as PendingEntry::drop: the run's journal writes all
+        // happened inside the ownership window (run.journal is called by the
+        // writer loop before this drop), so releasing here keeps the WAL
+        // offset-ordered.
+        self.seg.release_own();
         if !self.skip_sync {
             crate::ram::segs::queue_wal_sync(&self.seg);
         } else {
@@ -2749,6 +2914,13 @@ impl Drop for PendingEntry {
         // its outcome: a seal waiting on this segment must not be held up by
         // a writer that has already finished trying.
         self.seg.end_pending_journal();
+        // Ownership ends HERE, after the journal write -- that ordering IS
+        // the invariant. Released earlier, the next owner could append and
+        // journal before this record reached the log, and the segment's WAL
+        // would no longer be offset-ordered: a crash would then leave a gap
+        // the "torn tail = end of segment" rule mistakes for the end,
+        // silently dropping every later owner's durable entries.
+        self.seg.release_own();
         if let Err(error) = journal_result {
             // A straggler whose segment was sealed (archived) between its
             // append and this journal write cannot journal -- the recorded
@@ -4096,10 +4268,12 @@ mod tests {
             refusal.is_some(),
             "overflowing the head with an empty allocator must fail, not succeed"
         );
-        assert_ne!(
-            chunk.head_seg_id.load(Ordering::Acquire),
-            HEAD_SEG_ID_ALLOCATING,
-            "the failed allocation left the head slot poisoned; every later writer would spin on it"
+        assert!(
+            chunk
+                .head_pool
+                .iter()
+                .all(|slot| slot.load(Ordering::Acquire) != HEAD_SEG_ID_ALLOCATING),
+            "the failed allocation left a head slot poisoned; every later writer would spin on it"
         );
 
         // And the chunk still answers instead of spinning.

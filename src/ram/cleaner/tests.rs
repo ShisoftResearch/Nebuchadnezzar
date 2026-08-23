@@ -86,9 +86,7 @@ pub fn full_clean_cycle_without_compact() {
     // combine only (compact cleaner removed)
     {
         // Cleaner refuses to work on head segment; set head to dummy to include both segments
-        chunk
-            .head_seg_id
-            .store(1234, std::sync::atomic::Ordering::Relaxed);
+        chunk.head_pool[0].store(1234, std::sync::atomic::Ordering::Relaxed);
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
