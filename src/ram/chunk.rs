@@ -2532,6 +2532,15 @@ impl Chunk {
                         } else {
                             trace!("Tombstone target at seq_id {} have been removed, will be ditched", tombstone.segment_seq_id)
                         }
+                } else if entry_header.entry_type == EntryType::PADDING {
+                    // Space that holds no data: recovery stamps it over the
+                    // gap an abandoned reservation left, and the writer
+                    // stamps it over a span it has claimed but not yet
+                    // filled. Never live, always skipped -- but it MUST be
+                    // walked past rather than treated as impossible, or the
+                    // cleaner panics the first time it meets a recovered
+                    // segment.
+                    trace!("Entry at {} is padding; skipping", entry_meta.entry_pos);
                 } else {
                     unreachable!(
                         "Unexpected cell type on getting live entries at {}: type {:?}, size {}, append header {}, ends at {}",
