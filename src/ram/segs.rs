@@ -1626,15 +1626,32 @@ impl Segment {
         self.close_journal_gate();
         let _gate = JournalGateGuard { segment: self };
         if !self.drain_pending_journals(std::time::Duration::from_millis(250)) {
-            warn!(
+            // REFUSE, rather than archiving a hole nothing can ever skip.
+            //
+            // A reservation advances the append cursor before the entry
+            // bytes are written, so an in-flight writer means the image may
+            // contain a gap. In the WAL that is recoverable -- the next
+            // record declares its offset, so the gap's bounds are known. A
+            // BACKUP has no records, so a gap baked into one is
+            // unskippable forever, and it takes down every entry after it,
+            // including ones other writers completed durably.
+            //
+            // The claim is taken BEFORE the cursor advance precisely so this
+            // wait covers that window. Timing out and archiving anyway threw
+            // that away. Keeping the WAL instead is always safe: recovery
+            // reads it, fills the gap from the declared offsets, and the
+            // segment is archived cleanly next time.
+            error!(
                 "Segment {} (chunk {}, seq {}) still has {} un-journaled entr(ies) after \
-                 waiting; archiving anyway. Those entries ride this archive if it carried \
-                 their bytes, and are counted as journal failures if it did not.",
+                 waiting; NOT archiving it. Its WAL stays, which recovery can read and \
+                 repair; a backup written now could contain a gap no reader could skip. \
+                 A count that does not fall means a writer is wedged.",
                 self.id,
                 self.chunk_id,
                 self.seq_id,
                 self.pending_journal_count()
             );
+            return Ok(false);
         }
         let mut state = self.file_state.lock();
         let backup_path_opt = state
