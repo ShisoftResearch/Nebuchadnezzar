@@ -132,6 +132,32 @@ pub struct RecoveryConfig {
 }
 
 const DEFAULT_RECOVERY_THREADS: usize = 64;
+
+/// Autopsy tracing for ranged-index page cells during recovery, gated by
+/// NEB_RECOVERY_TRACE_PAGES=1. Names every page image the scan judges --
+/// winner or loser -- so a corrupted tree can be traced back to the exact
+/// file and decision that shaped it. Off, it costs one atomic load.
+fn trace_pages_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var("NEB_RECOVERY_TRACE_PAGES").map_or(false, |v| v == "1");
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    /// Must match `index::ranged::tree::btree::external::PAGE_SCHEMA_ID`,
+    /// computed here because that module is private to the btree.
+    static ref TRACED_PAGE_SCHEMA_ID: u32 =
+        dovahkiin::types::key_hash("NEB_BTREE_PAGE") as u32;
+}
+
 const MIN_RECOVERY_WORD_MAP_CAPACITY: usize = 4_096;
 /// Ceiling on a single chunk's version map. A chunk holds at most
 /// `chunk_size / SEGMENT_SIZE` segments, so this only has to stay above the
@@ -794,6 +820,17 @@ fn scan_segment_from_data(
             };
             let existing_version = version_map.entry(hash).or_insert(seen).version;
 
+            if trace_pages_enabled() && cell_header.schema == *TRACED_PAGE_SCHEMA_ID {
+                warn!(
+                    "PAGE-TRACE cell id={:?} ver={} seg={} off={} prior_ver={} {}",
+                    cell_header.id,
+                    new_version,
+                    seg_id,
+                    offset,
+                    existing_version,
+                    if new_version >= existing_version { "WIN" } else { "LOSE" }
+                );
+            }
             if new_version >= existing_version {
                 version_map.insert(hash, seen);
 
@@ -1127,9 +1164,13 @@ pub fn recover_chunks(
 
                 for file_info in chunk_files {
                     if newer_resident_segment(chunk, file_info.seg_id, file_info.seq_id).is_some() {
-                        debug!(
-                            "Skipping stale recovery file for chunk {} seg {} seq {}",
-                            chunk_id, file_info.seg_id, file_info.seq_id
+                        // warn, not debug: a skipped file is a whole segment's
+                        // worth of entries deliberately not read, and every
+                        // autopsy of index loss starts by asking whether one
+                        // of these fired.
+                        warn!(
+                            "Skipping stale recovery file for chunk {} seg {} seq {} ({} bytes, backup={})",
+                            chunk_id, file_info.seg_id, file_info.seq_id, file_info.size, file_info.is_backup
                         );
                         continue;
                     }
