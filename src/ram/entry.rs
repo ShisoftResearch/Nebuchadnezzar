@@ -3,7 +3,7 @@ use std::{io::Cursor, mem};
 
 use crate::ram::cell::CellHeader;
 use crate::ram::tombstone::Tombstone;
-use byteorder::{ReadBytesExt, WriteBytesExt};
+use byteorder::ReadBytesExt;
 
 use super::mem_cursor::{release_cursor, Endian};
 
@@ -231,31 +231,35 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn encode_to<W>(mut pos: usize, entry_type: EntryType, content_len: u32, write_content: W)
+    pub fn encode_to<W>(pos: usize, entry_type: EntryType, content_len: u32, write_content: W)
     where
         W: Fn(usize),
     {
-        let head_pos = pos;
-        let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut [u8; 8] as *mut [u8]) });
-        cursor.write_u32::<Endian>(entry_type.bits()).unwrap();
-        cursor.write_u32::<Endian>(content_len).unwrap();
-        pos += ENTRY_HEAD_SIZE;
-        write_content(pos);
-        release_cursor(cursor);
-        // The checksum can only be taken once the content is there, so the
-        // type word is stamped a second time. Until that store lands the
-        // entry reads as an ordinary unchecked one, which is what a reader
-        // racing this write should see: the allocator has not published the
-        // entry yet, and an entry that is torn HERE is torn in memory, where
-        // no checksum was ever going to survive it either.
-        let checksum = content_checksum(pos, content_len);
+        // PUBLISH LAST, in one store. The old order -- bare type word, then
+        // length, then content, then the checksummed word -- opened a
+        // window where the span read as a LEGACY entry (bare words carry no
+        // checksum, so nothing questions them) over content that was not
+        // written yet. A panic inside `write_content` froze that state, and
+        // the unwind still journals the span (`PendingEntry::drop`), so
+        // recovery would install garbage it had every reason to trust.
+        //
+        // Now nothing in the header changes until the content is complete
+        // and checksummed; then the whole 8-byte header -- word and length
+        // together -- is published as a single aligned store. Entries are
+        // 8-byte aligned, so the store cannot tear. Until it lands, the
+        // span reads as whatever the allocator stamped over it (PADDING),
+        // which every walker steps over and recovery discards: an entry is
+        // either absent or whole, never half.
+        write_content(Self::content_pos(pos));
+        let checksum = content_checksum(Self::content_pos(pos), content_len);
         let word = pack_type_word(entry_type, checksum);
+        let mut header = [0u8; ENTRY_HEAD_SIZE];
+        header[..4].copy_from_slice(&word.to_le_bytes());
+        header[4..].copy_from_slice(&content_len.to_le_bytes());
+        debug_assert!(pos % 8 == 0, "entry headers are 8-byte aligned");
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                word.to_le_bytes().as_ptr(),
-                head_pos as *mut u8,
-                mem::size_of::<u32>(),
-            );
+            (*(pos as *const std::sync::atomic::AtomicU64))
+                .store(u64::from_le_bytes(header), std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -362,6 +366,45 @@ impl EntryContent {
 #[cfg(test)]
 mod checksum_tests {
     use super::*;
+
+    /// Nothing about the header may change until the content is complete.
+    ///
+    /// The old order published a bare CELL word before the content existed,
+    /// and bare words carry no checksum, so nothing questioned them: a panic
+    /// mid-content froze a trusted-looking entry over garbage, and the
+    /// unwind still journaled it. The closure here runs exactly where that
+    /// panic would, and the header must still read as the allocator's
+    /// padding at that instant.
+    #[test]
+    fn the_header_is_published_only_after_the_content_is_written() {
+        let mut buffer = vec![0u8; 128];
+        let base = buffer.as_mut_ptr() as usize;
+        stamp_reservation_padding(base, 64);
+
+        let content = b"published all at once or not at all";
+        Entry::encode_to(base, EntryType::CELL, content.len() as u32, |content_pos| {
+            // Mid-write: the reservation's padding must still be standing.
+            let word = unsafe { *(base as *const u32) };
+            match unpack_type_word(word) {
+                TypeWord::Unchecked(entry_type) => assert_eq!(
+                    entry_type,
+                    EntryType::PADDING,
+                    "the header changed before the content was complete"
+                ),
+                other => panic!(
+                    "the header changed before the content was complete (invalid: {})",
+                    matches!(other, TypeWord::Invalid)
+                ),
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(content.as_ptr(), content_pos as *mut u8, content.len());
+            }
+        });
+
+        let (header, _) = Entry::decode_from(base, |_, header| header);
+        assert_eq!(header.entry_type, EntryType::CELL);
+        assert_eq!(verify_entry_at(base), Some(true));
+    }
 
     /// A reservation that is never filled must still be walkable.
     ///

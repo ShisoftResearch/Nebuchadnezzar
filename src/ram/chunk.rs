@@ -836,6 +836,7 @@ impl Chunk {
                                 seg: head,
                                 size: total,
                                 skip_sync: is_in_transaction(),
+                                consumed: std::cell::Cell::new(0),
                             },
                             covered,
                         )));
@@ -2438,6 +2439,16 @@ impl Chunk {
                     && (full || *utilization < dead_bar)
                     && !self.is_active_head(seg.id)
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
+                    // A reservation in flight means the image may hold a gap:
+                    // the cursor moves before the bytes land, and the combine
+                    // walks segment memory FORWARD, so a gap makes it
+                    // under-enumerate and then free a source that still held
+                    // live entries past the zeros. The claim strictly
+                    // brackets that window (taken before the cursor moves,
+                    // released after fill+journal), and no new claims land on
+                    // a rotated segment, so a zero reading here is stable --
+                    // this is an invariant, not a heuristic.
+                    && seg.pending_journal_count() == 0
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
                     && !seg.cleaned_without_progress()
             })
@@ -2666,6 +2677,12 @@ pub struct PendingRun {
     pub base: usize,
     pub size: u32,
     skip_sync: bool,
+    /// High-water mark of journaled bytes within the run, so Drop knows how
+    /// much of the reservation was actually used. Whatever was reserved but
+    /// never journaled is re-stamped as padding on the way out: an unwind
+    /// mid-run must not leave bytes that walk like entries but exist in no
+    /// log, nor zeros that stop a walk dead.
+    consumed: std::cell::Cell<u32>,
 }
 
 impl PendingRun {
@@ -2680,12 +2697,32 @@ impl PendingRun {
     /// duration. Lock hold time went from 10.6s to 121.3s. Fewer, larger
     /// critical sections only win when the lock is not shared.
     fn journal(&self, addr: usize, size: u32) -> io::Result<()> {
-        self.seg.write_wal(addr, size, self.skip_sync)
+        let result = self.seg.write_wal(addr, size, self.skip_sync);
+        if result.is_ok() {
+            let end = (addr - self.base) as u32 + size;
+            self.consumed.set(self.consumed.get().max(end));
+        }
+        result
     }
 }
 
 impl Drop for PendingRun {
     fn drop(&mut self) {
+        // Repair the reservation before releasing the claim. The claim is
+        // what stops the archive and the cleaner consuming this segment
+        // while the run is open; the moment it drops, the image must stand
+        // on its own. Everything past the journaled high-water mark is
+        // therefore stamped back to padding: on a clean run that is zero
+        // bytes, and on an unwind it covers both the never-written tail and
+        // any entry that was encoded but failed to journal -- bytes that
+        // exist in no log must not walk like data.
+        if self.consumed.get() < self.size {
+            let from = self.base + self.consumed.get() as usize;
+            crate::ram::entry::stamp_reservation_padding(
+                from,
+                self.size - self.consumed.get(),
+            );
+        }
         self.seg.end_pending_journal();
         if !self.skip_sync {
             crate::ram::segs::queue_wal_sync(&self.seg);

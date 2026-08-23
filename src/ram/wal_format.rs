@@ -137,10 +137,8 @@ pub fn scan_framed(data: &[u8], segment_size: usize) -> io::Result<ScanOutcome> 
     let mut image = vec![0u8; segment_size];
     let mut used_len = 0usize;
     let mut records = 0usize;
-    let mut gaps = 0usize;
-    // Where the next record is expected to start, so a gap can be named
-    // exactly rather than guessed at. See the gap handling below.
-    let mut expected_next = 0usize;
+    // Extent of every verified record, for the gap fill after the loop.
+    let mut covered: Vec<(usize, usize)> = Vec::new();
     let mut cursor = FILE_HEADER_SIZE;
     let stop = loop {
         if cursor == data.len() {
@@ -198,38 +196,45 @@ pub fn scan_framed(data: &[u8], segment_size: usize) -> io::Result<ScanOutcome> 
                 ),
             };
         }
-        // A gap here is an abandoned reservation: `try_acquire` moves the
-        // append cursor before the entry bytes are written, so a crash in
-        // that window leaves zeros in the middle of the image. Left alone
-        // they are fatal -- a forward scan stops at zeros, and stopping in
-        // the MIDDLE discards every entry other writers durably appended
-        // afterwards, which is unbounded loss from a one-entry window.
-        //
-        // This is the only place that can fix it, because it is the only
-        // place that knows where the gap ENDS: record N declares its extent
-        // and record N+1 declares its offset, so the hole is exactly
-        // [end of N, start of N+1). A checksum could confirm a guess at that
-        // boundary but could never produce one.
         let start = seg_offset as usize;
-        if start > expected_next {
-            let span = start - expected_next;
-            if crate::ram::entry::stamp_padding(&mut image, expected_next, span) {
-                gaps += 1;
-            } else {
-                warn!(
-                    "WAL record at segment offset {} leaves a {}-byte gap that cannot hold a \
-                     padding header; a scan of this image will stop there",
-                    start, span
-                );
-            }
-        }
         image[start..end].copy_from_slice(payload);
+        covered.push((start, end));
         used_len = used_len.max(end);
-        expected_next = expected_next.max(end);
         records += 1;
         cursor = payload_start + len;
     };
 
+    // Fill the gaps abandoned reservations left, AFTER every record is
+    // placed -- and only then, because records arrive in JOURNAL order, not
+    // offset order. Stamping gaps in-loop broke on exactly that: a slow
+    // writer's low-offset record, journaled after a fast writer's
+    // high-offset one, landed inside an already-stamped gap and overwrote
+    // the padding header, leaving the rest of the gap as bare zeros that
+    // stopped the forward walk and lost every entry after it.
+    //
+    // Working from the union of verified extents is order-independent: a
+    // gap is a maximal uncovered span below `used_len`, whose bounds come
+    // entirely from records that passed their CRC. Nothing inside the gap
+    // is read, sized or trusted. Alignment makes every gap stampable:
+    // entries are 8-byte aligned, so gaps are multiples of 8 and at least
+    // ENTRY_HEAD_SIZE wide.
+    let mut gaps = 0usize;
+    covered.sort_unstable();
+    let mut fill_from = 0usize;
+    for &(start, end) in &covered {
+        if start > fill_from {
+            let span = start - fill_from;
+            if crate::ram::entry::stamp_padding(&mut image, fill_from, span) {
+                gaps += 1;
+            } else {
+                warn!(
+                    "WAL rebuild found a {span}-byte gap at offset {fill_from} that cannot \
+                     hold a padding header; a scan of this image will stop there"
+                );
+            }
+        }
+        fill_from = fill_from.max(end);
+    }
     if gaps > 0 {
         info!(
             "WAL rebuild filled {} gap(s) left by abandoned reservations; the image is \
@@ -314,6 +319,63 @@ mod tests {
         assert!(
             reached_second,
             "a scan must walk the padding and land exactly on the next record"
+        );
+    }
+
+    /// The preemption scenario, with the journal order it actually produces.
+    ///
+    /// Records reach the WAL in JOURNAL order, not offset order: writer C
+    /// reserves a low span, gets scheduled out, and journals AFTER writer B
+    /// journaled a higher span. In-loop gap stamping breaks on this: when
+    /// B's record arrives, the gap [C..B) is stamped as one padding entry
+    /// headed at C's offset -- and when C's record then lands inside it, it
+    /// overwrites that header, leaving the REST of the gap as bare zeros.
+    /// A forward walk stops there and B is lost, exactly the loss the fill
+    /// existed to prevent.
+    #[test]
+    fn out_of_order_journaling_still_leaves_a_walkable_image() {
+        let mut file = wal_file_header(9).to_vec();
+        file.extend_from_slice(&frame_record(0, b"aaaaaaaa")); // [0,16)
+        // A reserved [16,208) and died un-journaled.
+        file.extend_from_slice(&frame_record(208, b"bbbbbbbb")); // B, journaled early
+        file.extend_from_slice(&frame_record(8, b"cccccccc")); // C, journaled LATE
+        let outcome = scan_framed(&file, SEG).unwrap();
+
+        assert_eq!(outcome.stop, TailStop::Clean);
+        assert_eq!(outcome.records, 3);
+        assert_eq!(&outcome.image[208..216], b"bbbbbbbb");
+
+        // The payloads are raw test bytes, not entries; the walkability that
+        // matters is the GAP's. Walk from the end of the covered prefix
+        // ([0,16)) and require the padding to carry us exactly to B at 208.
+        let mut cursor = 16usize;
+        let mut reached = false;
+        for _ in 0..16 {
+            if cursor == 208 {
+                reached = true;
+                break;
+            }
+            if cursor > 208 {
+                break;
+            }
+            let word =
+                u32::from_le_bytes(outcome.image[cursor..cursor + 4].try_into().unwrap());
+            let len =
+                u32::from_le_bytes(outcome.image[cursor + 4..cursor + 8].try_into().unwrap());
+            match crate::ram::entry::unpack_type_word(word) {
+                crate::ram::entry::TypeWord::Checked(t, _)
+                | crate::ram::entry::TypeWord::Unchecked(t)
+                    if t == crate::ram::entry::EntryType::PADDING =>
+                {
+                    cursor += crate::ram::entry::ENTRY_HEAD_SIZE + len as usize;
+                }
+                _ => break, // zeros or garbage: the walk is dead
+            }
+        }
+        assert!(
+            reached,
+            "padding must carry a forward walk exactly to the record at 208; it stopped \
+             inside the gap instead"
         );
     }
 
