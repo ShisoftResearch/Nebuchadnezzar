@@ -209,58 +209,52 @@ an entry address must agree; a missed one reads a cell header out of a
 Tx-CTS, which is why entry checksum verification wants to be live on
 those paths while the change beds in.
 
-DECIDED 2026-08-22 (user, superseding the per-entry stamp): BRACKET the
-transaction with a BEGIN entry and a COMMIT entry. Entries belong to a
-transaction BY POSITION, so they carry NOTHING -- no stamp, and not even
-a flag bit. The entry header is unchanged; we only add entry types.
+DECIDED 2026-08-22 (user): 8-byte LOCAL COMMIT SEQUENCE per transactional
+entry, flagged by one spare bit in the type byte; the full 16-byte
+`bifrost::hlc::Hlc` recorded ONCE PER TRANSACTION in the COMMIT entry.
+Non-transactional writes pay nothing.
 
-Bracketing is sound here because the span can be reserved: transactional
-writes are applied in one loop by `DataManager::commit`, and
-`try_acquire_run` already claims a contiguous span atomically for a
-batch. A transaction takes one run per chunk and writes
-`BEGIN ... entries ...` into it, so no other writer can land inside.
+Considered and REJECTED: bracketing the transaction with BEGIN/COMMIT
+entries so membership is positional and entries carry nothing. It is
+attractive -- zero bytes per entry, no flag bit, and it would have kept
+`content_pos` uniform, removing the stamped design's sharpest hazard --
+and it is reservable in principle, since `try_acquire_run` already claims
+a contiguous span and transactional writes are applied in one loop.
 
-Why this beats stamping every entry: it deletes the flag-dependent
-`content_pos`, which was the single most dangerous part of the stamped
-design -- a call site that missed the flag would decode a cell header
-out of a transaction id. That risk is removed rather than managed.
+It loses on holes. Reservation advances the append cursor BEFORE any
+bytes are written, so a crash in that window leaves a zero gap that no
+BEGIN yet describes. Writing BEGIN first narrows the window but cannot
+close it. And a hole in the MIDDLE of a segment is not like a hole at the
+tail: the forward scan stops dead there, losing every entry other writers
+appended after it. Bracketing turns a microsecond-wide, one-entry hazard
+into a transaction-wide one. Secondarily, the cleaner would have to skip
+any segment containing an undecided bracket, coupling reclamation to
+transaction lifetime at segment granularity.
 
-THREE REQUIREMENTS, one non-obvious:
-1. BEGIN CARRIES THE BRACKET'S BYTE SPAN, not just the transaction id. A
-   crash mid-run leaves a zero hole, and the forward scan cannot parse
-   past a hole -- it would stop there and silently drop every entry
-   written AFTER the run by other writers. With the span recorded,
-   recovery jumps to `begin + span` and continues. This is what makes
-   reservation safe, and it is easy to miss.
-2. ONE BRACKET PER (transaction, chunk), and more if the transaction
-   outgrows a segment's remainder; each opens with its own BEGIN naming
-   the transaction. The COMMIT entry therefore still carries the
-   per-chunk breakdown -- now to confirm every expected bracket is
-   present and complete, rather than to count individual entries.
-3. THE CLEANER MUST NOT COMPACT BRACKETS ABOVE THE WATERMARK, since
-   relocation destroys positional membership. Same rule already required
-   for a different reason, so it costs nothing new.
+Rejected earlier in the same discussion: 16 bytes per entry (doubles a
+permanent per-cell cost for identity needed once per transaction -- 29 GB
+vs 58 GB on a 3.6B-cell all-transactional store); a squeezed 8-byte HLC
+(32 bits of `ts` cannot hold a usable millisecond range alongside the
+16-bit logical counter); `(node32, per-node seq32)` (globally unique in 8
+bytes and viable, but coordinator sequences are not mutually comparable,
+so the watermark becomes a per-node vector inside a fixed-size file
+header). Node-id truncation to 32 bits is itself fine and DETECTABLE at
+join -- check the truncated id against current members, re-salt on
+collision -- far lighter than a dense member-id scheme.
 
-COST, honestly: a transaction touching many chunks with few cells in
-each pays one BEGIN per chunk. At ~24 bytes per BEGIN, 100 cells spread
-over 32 chunks is ~770 bytes of brackets vs ~800 bytes of 8-byte stamps
--- a wash. It wins clearly when cells cluster by locality, and loses for
-single-cell transactions (24 bytes vs 8). Taken for the format
-simplification.
+FUTURE COMPRESSION, not for v1: only transactions ABOVE the watermark
+need distinguishing, so a 2-byte slot suffices if reuse is forbidden
+while a slot's transactions remain above it (29 GB -> ~7 GB in the
+all-transactional case). Deferred because it couples correctness to
+watermark LIVENESS: a stalled watermark stops issuing slots and stalls
+transactions, where the 8-byte version merely gets slower. An 8-BIT slot
+would cap in-flight undecided transactions at 256 and throttle a
+192-core box; 16 bits is the floor for that variant.
 
-The transaction id in BEGIN stays an 8-byte local commit sequence
-(dense, ordered, exactly what the watermark needs); the full 16-byte
-`bifrost::hlc::Hlc` is recorded once per transaction in COMMIT for
-global identity. Rejected: 16 bytes per entry (doubles a permanent
-per-cell cost for identity needed once per transaction -- 29 GB vs 58 GB
-on a 3.6B-cell all-transactional store); a squeezed 8-byte HLC (32 bits
-of `ts` cannot hold a usable millisecond range alongside the 16-bit
-logical counter); `(node32, per-node seq32)` (viable and globally unique,
-but coordinator sequences are not mutually comparable, so the watermark
-becomes a per-node vector inside a fixed-size file header). Node-id
-truncation to 32 bits is itself fine and DETECTABLE at join -- check the
-truncated id against current members and re-salt on collision -- which is
-far lighter than the dense member-id scheme first sketched here.
+IMPLEMENTATION HAZARD to pin with tests: `content_pos` becomes
+flag-dependent, so every site decoding content from an entry address must
+agree. A missed one reads a cell header out of a transaction id. Keep
+entry checksum verification live on those paths while the change beds in.
 
 The cleaner constraint this creates has teeth: a version whose only
 successor is an UNDECIDED transaction must not be reclaimed, or the
@@ -365,6 +359,23 @@ Format mechanics:
 Kept in reserve: a COMMIT_WATERMARK entry is the only way to advance the
 mark WITHOUT sealing a segment. Not needed while staleness self-limits,
 but that is the reason to keep the idea rather than delete it.
+
+SEPARATE FINDING, worth fixing on its own (surfaced while evaluating
+bracketing): A MID-IMAGE HOLE TRUNCATES RECOVERY TODAY. `try_acquire`
+advances the append cursor before the entry bytes are written, so a crash
+in that window leaves a gap with no WAL record. The framed WAL rebuilds
+the image by offset, so later records land correctly past the gap -- but
+`scan_segment_from_data` then walks the image FORWARD and stops at the
+zeros, discarding entries that were fully durable. The window is small
+(one entry, microseconds) but it is not zero, and the loss is unbounded:
+everything after the hole in that segment.
+
+The fix falls out of the framing already landed: recovery can iterate the
+VERIFIED WAL RECORDS directly -- each declares its own `seg_offset` and
+length -- instead of forward-parsing the reconstructed image. That is
+immune to holes by construction. Backups still need the sequential scan
+(they carry no frames), but a backup is written from a complete image, so
+it has no holes to begin with.
 
 TO MODEL IN TLA+ BEFORE ANY CODE:
 1. Safety: an installed transaction is exactly one whose commit was
