@@ -47,3 +47,29 @@ the two-cell hole that was actually measured.
 `Recoverable` is the bytes existing *somewhere*; `HotReadable` is the bytes
 being in memory once the segment reads as hot, because at that point a reader
 goes straight to the mapping and there is nowhere else to look.
+
+## TxnChainRecovery — the head-pool / bracket-chain commit protocol
+
+Models the settled Phase 6a design (docs/crash-safety-plan.md): chain
+members with volatile/durable states, the settled commit sequencing
+(members durable → COMMIT written → COMMIT durable → ack), physical
+abort by rewind, the cleaner (dissolving members to plain data and
+dropping old COMMIT records), the decided-watermark, and crash+recovery
+with the reduction rule.
+
+| Config | Gates | Expected |
+|---|---|---|
+| `TxnChainFixed.cfg` | both on | **Passes.** NoPartialInstall, AckedSurvives, MarkIsDecided, InstalledWasCommitted. |
+| `TxnChainNoCleanerGate.cfg` | cleaner gate off | `InstalledWasCommitted` violated: the cleaner dissolves an undecided member into plain data, which recovery installs at face value. |
+| `TxnChainNoWatermarkGate.cfg` | watermark gate off | `InstalledWasCommitted` violated: the mark covers an undecided transaction and the marked rule surfaces its members — a COMPLETE install of an uncommitted transaction, which is why NoPartialInstall alone cannot catch it. |
+| `TxnChainSanity.cfg` | both on | `NeverAckedThenRecovered` violated **on purpose** — its counterexample is a full write → sync → commit → ack → crash → install round trip. If this ever passes, the model has gone vacuous. |
+
+Two lessons TLC taught while the model was being written, both real:
+
+1. **The rewind path must key on transaction state, never on the log.**
+   Guarding abort on "no COMMIT record present" let a committed, acked
+   transaction abort after the cleaner legitimately dropped its record
+   below the watermark.
+2. **"Installed implies committed" is a separate invariant from "no
+   partial install."** The watermark-gate bug installs transactions
+   atomically — completely, and completely wrongly.
