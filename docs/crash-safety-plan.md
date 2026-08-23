@@ -209,11 +209,45 @@ an entry address must agree; a missed one reads a cell header out of a
 Tx-CTS, which is why entry checksum verification wants to be live on
 those paths while the change beds in.
 
-OPEN: 8-byte local commit sequence vs the full 16-byte HLC. Recovery only
-needs to group entries and order watermarks, which 8 bytes does for
-decades at a million transactions a second. The full HLC is only needed
-if the distributed protocol later resolves in-doubt transactions by
-reading a participant's store directly.
+DECIDED 2026-08-22 (user): 8-byte LOCAL COMMIT SEQUENCE per entry; the
+full 16-byte HLC is recorded ONCE PER TRANSACTION in the COMMIT entry,
+never on the cells.
+
+Recovery only needs to group a transaction's entries and order the
+watermark, and both are local facts -- a dense per-store counter does
+them exactly, with no truncation, no collision risk and no effect on
+MVCC (TxnId stays `bifrost::hlc::Hlc`, unmodified, wherever it is used
+in memory).
+
+Rejected alternatives and why:
+- 16 bytes per entry: doubles a permanent per-cell cost to obtain global
+  identity that is only ever needed once per transaction. On a
+  3.6B-cell store, 8 B/cell is 2.9 GB at 10% transactional (0.17% of a
+  1.7 TB store) and 29 GB if everything is transactional; 16 doubles
+  both.
+- A squeezed 8-byte HLC: 32 bits of `ts` cannot hold both a usable
+  millisecond range and the 16-bit logical counter, so it wraps or
+  collides within a millisecond. (The node half IS fine at 32 bits --
+  collision is ~1 in 870k at 100 nodes -- and is anyway DETECTABLE at
+  join: check the truncated id against current members and re-salt on
+  collision. That is much lighter than the dense member-id scheme first
+  proposed here.)
+- `(node32, per-node seq32)`: globally unique in 8 bytes and viable, but
+  sequences from different coordinators are not mutually comparable, so
+  the watermark stops being a scalar and becomes a per-node vector --
+  inside a fixed-size file header. Same bytes, more structure in the one
+  place we just made simple.
+
+FUTURE COMPRESSION, not for v1: only transactions ABOVE the watermark
+ever need distinguishing, so the stamp need not be permanently unique --
+a 2-byte slot suffices if reuse is forbidden while a slot's transactions
+remain above the watermark. Takes the all-transactional case from 29 GB
+to ~7 GB. Deferred because it couples correctness to watermark
+LIVENESS: a stalled watermark stops issuing slots and stalls
+transactions, where the 8-byte version merely gets slower. Revisit only
+if a measured workload shows transactional writes dominating the store.
+(An 8-BIT slot would cap in-flight undecided transactions at 256, which
+would throttle a 192-core box; 16 bits is the floor for that variant.)
 
 The cleaner constraint this creates has teeth: a version whose only
 successor is an UNDECIDED transaction must not be reclaimed, or the
