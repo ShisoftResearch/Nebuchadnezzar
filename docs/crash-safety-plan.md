@@ -161,6 +161,106 @@ participant-led termination protocol), then implement. Explicitly out of
 scope until the single-node story is proven by Phase 5 — DECIDED
 2026-08-22 (user): design-only this campaign.
 
+### Phase 6a SETTLED (2026-08-23): the head-pool / bracket-chain design
+
+Everything below this header is the FINAL design, settled with the user
+over 2026-08-22/23. The subsections after it (stamps, per-entry local
+sequences, the three-pass counting recovery, the earlier bracket
+discussion) are kept as the decision record but are SUPERSEDED where
+they conflict. What carries over unchanged: the decided-watermark in
+file headers, the cleaner rule bound to it, and the COMMIT cross-chunk
+manifest check.
+
+THE CORE: each chunk has a POOL of head segments per class
+(regular/blob) instead of one. Whoever writes holds a head exclusively;
+hold DURATION is the only difference between writer kinds:
+
+    plain write   one cell
+    batch         one run
+    transaction   its whole bracket chain, UNTIL THE 2PC DECISION
+
+Single writer per segment means a crash can only tear a segment's TAIL,
+and a torn tail (CRC fail) simply means end-of-segment -- the case
+recovery has always handled. Mid-segment holes are impossible BY
+CONSTRUCTION. The journal (WAL append, not fsync) happens INSIDE the
+ownership window, so each segment's WAL is offset-ordered and
+prefix-complete; group commit is unchanged.
+
+TRANSACTIONS. The write set is exactly known at apply time (ops list +
+write plans), so the footprint per chunk is EXACT, not an estimate:
+
+- Fits the claimed head's remainder: single bracket
+  `BEGIN .. entries ..`, held until the decision. The common case.
+- Larger: PRE-ALLOCATE the whole chain of fresh segments up front.
+  Allocation failure happens before any byte is written. Big
+  transactions barely touch the pool.
+
+CHAIN LAYOUT (the user's fixed-tail-link design):
+
+    part 1 (pooled head): [others][BEGIN(T)][entries][zeros..][TXN_CONT @ end]
+    parts 2..k-1 (fresh): [entries...........][zeros........][TXN_CONT @ end]
+    part k (fresh, open): [entries][COMMIT(T, manifest)][free -> pool]
+
+`TXN_CONT(txn, prev_seq)` ALWAYS occupies the last 24 bytes of a full
+chain segment; plain zeros pad from the last entry that fit. The fit
+check reserves those 24 bytes whenever more entries remain. Zeros are
+safe here precisely because the fixed-position link bounds the segment
+from the outside -- the ambiguity that required PADDING entries in
+shared segments does not exist. seq ids, never segment ids (seq is the
+identity that survives recovery).
+
+Recovery reads the fixed tail of each file: chain membership is O(1)
+per segment, no scan -- and an aborted or torn chain's segments are
+DISCARDED WITHOUT EVER BEING SCANNED. Part k carries no link; the
+COMMIT manifest (chunk -> [seq1..seqk], exact from pre-allocation) is
+the authoritative chain order, links are the cross-check.
+
+DECISION:
+- COMMIT: fsync all chain WALs -> write COMMIT into each chunk's tail
+  bracket -> fsync those -> ack. Bracket committed iff it ends with its
+  COMMIT (single-chunk fully local); multi-chunk: any COMMIT found +
+  every manifest member present, else loud discard (safe: ack had not
+  happened).
+- ABORT: physically vanish. Part 1 rewinds to its pre-transaction
+  cursor (ownership means nobody wrote after it; journaled padding over
+  the bracket, cursor back); fresh parts recycle whole. No undo log, no
+  junk, no cleaner debt. Chained and unchained alike.
+- CRASH before decision: chain has no COMMIT -> discarded, parts
+  unscanned. Same outcome as abort.
+- IN-DOUBT (coordinator gone): heads are hostages; after a timeout,
+  release and fall back to discard-unless-COMMIT semantics for that
+  transaction. Timeout policy is a real open knob, coupled to the
+  Phase 6 termination-protocol gap.
+
+POOL ACCOUNTING IS CONSERVED: commit-with-chain swaps the now-full
+part-1 head out (to seal/archive) and the half-used tail in; plain
+commit returns the same head fuller; abort restores the exact
+pre-transaction state. The pool never shrinks and has no refill path.
+A recycled tail carries a committed bracket with ordinary entries after
+its COMMIT -- the mirror of part 1, already a handled shape.
+
+WHAT THIS RETIRES: the undo log from the write path, per-entry
+transaction stamps, the flag bit, local sequences, and the END entry
+entirely (it only existed for release-before-decision). Entry types:
+BEGIN, TXN_CONT, COMMIT (+ PADDING, already landed).
+
+COSTS, honestly: K x 8 MiB x chunks x classes resident (K elastic with
+a cap); K WAL fds per chunk (multiplied by dynamic databases -- the
+EMFILE lesson applies); the pool caps SMALL-transaction concurrency per
+chunk at K / decision-latency (big ones pre-allocate outside the pool);
+padding waste bounded by one entry per chain boundary. Footnote: the
+O(1) tail read works on backups (block index reaches the last block);
+WAL frames are forward-only, but chain middles are full the moment they
+are written, so they archive almost immediately -- crash-fresh chains
+in WALs get scanned normally.
+
+VERIFICATION PLAN: TLA+ model of the recovery reduction (manifest x
+missing member x cleaner x watermark x abort) with non-vacuity runs
+that EXPECT violations when the cleaner/watermark gates are disabled;
+then the pool-contention spike on .239 against the shared-cursor
+baseline (ALLOC_SPIN_NANOS) before implementation.
+
+
 ### Phase 6a: retire the undo log from the write path (Zen-style)
 
 Prompted by the user pointing at Zen (Liu, Chen & Chen, VLDB 14(5), 2021),
