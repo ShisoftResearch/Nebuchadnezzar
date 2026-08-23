@@ -254,11 +254,39 @@ WAL frames are forward-only, but chain middles are full the moment they
 are written, so they archive almost immediately -- crash-fresh chains
 in WALs get scanned normally.
 
-VERIFICATION PLAN: TLA+ model of the recovery reduction (manifest x
-missing member x cleaner x watermark x abort) with non-vacuity runs
-that EXPECT violations when the cleaner/watermark gates are disabled;
-then the pool-contention spike on .239 against the shared-cursor
-baseline (ALLOC_SPIN_NANOS) before implementation.
+VERIFICATION, done 2026-08-23:
+
+TLA+: docs/tla/TxnChainRecovery.tla (`8c8bc38d`). Fixed config passes
+four invariants; disabling either the cleaner gate or the watermark
+gate violates InstalledWasCommitted (both gates proven load-bearing);
+the Sanity config fails on purpose (vacuity guard). Implementation
+lessons from TLC: the abort/rewind path must key on TRANSACTION STATE,
+never on the presence of a COMMIT record (the cleaner legitimately
+drops it below the watermark); and "installed implies committed" is a
+separate invariant from "no partial install", because the
+watermark-gate failure mode installs uncommitted transactions
+COMPLETELY.
+
+CONTENTION SPIKE (.239, 192 cores, ~/poolspike/results.txt): the pool
+is viable, and the spike corrected the baseline mental model. The
+"shared cursor" baseline modeled holds (journal work) as parallel --
+but TODAY's system serializes ALL journal writes to a head on that
+segment's file_state mutex (WAL_LOCK_CONTENDED exists precisely because
+of this), so today is really K=1 per chunk for the hold. Correctly
+read:
+
+- Pool ceiling = K / hold. Measured: K=16, hold=2us -> ~6.1M ops/s per
+  chunk (76% of theoretical). Today's equivalent ceiling: 1/hold ~
+  0.5M. The pool is ~16x today PER CHUNK on the axis that matters.
+- Real per-chunk load at import peak is ~6K entries/s (380K/s across
+  64 chunks): the pool ceiling leaves 300-1000x headroom even at K=4.
+- With K >= active writers, the acquire path is UNCONTENDED and beats
+  the shared CAS by an order of magnitude (affinity scanning works).
+- K=4 degrades badly at 96-192 threads (contended slot scan); K must
+  be elastic, 8-16 under load. Confirms the elastic-K decision.
+
+Caveat: allocator-only microbench. The binding gate remains the full
+import A/B when the implementation lands, per house rule.
 
 
 ### Phase 6a: retire the undo log from the write path (Zen-style)
