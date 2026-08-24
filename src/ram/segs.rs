@@ -2366,6 +2366,19 @@ image, not an empty segment; archiving it would persist the damage.",
         self.pending_journals.load(Ordering::Acquire) & !JOURNAL_META_MASK
     }
 
+    /// Whether some writer currently owns this head.
+    ///
+    /// A snapshot, and that is enough for its one use: deciding whether
+    /// queueing on this head could ever succeed. A plain writer owns a head
+    /// for microseconds, but a TRANSACTION owns one until its decision, and a
+    /// writer that queues on a leased head near capacity waits for something
+    /// that will not happen until the transaction ends -- which, when the
+    /// transaction is itself waiting on that writer, is never.
+    #[inline]
+    pub fn is_head_owned(&self) -> bool {
+        self.pending_journals.load(Ordering::Acquire) & HEAD_OWNED != 0
+    }
+
     /// Claim exclusive head ownership. One fetch_or: acquired iff the bit was
     /// clear before. On failure the bit was already set by the current owner
     /// and is left exactly as it was.

@@ -431,6 +431,10 @@ lazy_static! {
 /// Guard acquisitions abandoned at the deadline. Non-zero means a cell index
 /// entry outlived its segment: real damage, and previously a hang.
 pub static CELL_GUARD_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// Transactional writes that could not be bracketed because their chunk had
+/// no head to spare. Non-zero means some transaction's entries are outside
+/// its own atomicity, so it is worth seeing rather than inferring.
+pub static UNBRACKETED_TXN_WRITES: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_OPENED: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_EXPIRED: AtomicU64 = AtomicU64::new(0);
@@ -1209,10 +1213,67 @@ impl Chunk {
     /// The extra reference is the point: `PendingEntry::drop` gives back the
     /// per-entry one, and without a second the segment could be reclaimed
     /// while the transaction still means to write into it.
+    /// Whether this chunk can spare a head for a transaction to hold.
+    ///
+    /// A lease is held until the DECISION, so whatever it takes is gone from
+    /// the pool for that whole time. If it takes the last usable head, every
+    /// other writer in this chunk queues on it -- including the secondary
+    /// index writes that the committing transaction is itself waiting for.
+    /// Both sides then wait forever. That is not hypothetical: it wedged a
+    /// server whose chunk held exactly one segment.
+    ///
+    /// A chunk sized to one segment (common in tests, and the degenerate case
+    /// in production) has `reserve_boundary` saturate to zero, so the pool can
+    /// never grow either. There, a transaction simply cannot be given a head
+    /// of its own.
+    fn can_spare_a_head_for_lease(&self, segment_class: SegmentClass) -> bool {
+        let slots = self.head_slots(segment_class);
+        let mut usable_or_growable = 0usize;
+        for slot in slots.iter() {
+            let id = slot.load(Ordering::Acquire);
+            if id == HEAD_SEG_ID_EMPTY {
+                // An empty slot only helps if the chunk has room to fill it.
+                if self.segs.len() * SEGMENT_SIZE < self.capacity.saturating_sub(SEGMENT_SIZE) {
+                    usable_or_growable += 1;
+                }
+                continue;
+            }
+            if id == HEAD_SEG_ID_ALLOCATING {
+                continue;
+            }
+            if self
+                .segs
+                .get(&(id as usize))
+                .map(|seg| !seg.is_head_owned())
+                .unwrap_or(false)
+            {
+                usable_or_growable += 1;
+            }
+        }
+        // Strictly more than one: the head being claimed right now is one of
+        // them, and something has to be left behind for everyone else.
+        usable_or_growable > 1
+    }
+
     fn lease_head_for_current_txn(&self, head: &AArc<Segment>, addr: usize) -> bool {
         let Some(txn) = current_txn() else {
             return false;
         };
+        if !self.can_spare_a_head_for_lease(head.segment_class()) {
+            // Write it as an ordinary entry instead. The transaction loses its
+            // bracket in this chunk -- and with it, atomicity for these
+            // entries -- which is a real cost and is why this is a warning
+            // rather than a silent fallback. Deadlocking every writer in the
+            // chunk, including the ones this transaction is waiting on, is
+            // the alternative.
+            debug!(
+                "chunk {} cannot spare a head for transaction {:?}; its entries here are written \
+                 unbracketed and are NOT covered by the transaction's atomicity",
+                self.id, txn
+            );
+            UNBRACKETED_TXN_WRITES.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         if !head.incr_references() {
             // Being reclaimed underneath us: do not lease it, and let this
             // entry finish as an ordinary one.
@@ -1439,7 +1500,9 @@ impl Chunk {
             // contiguous and an abort can rewind them.
             match self.try_place_in_leased_head(size, segment_class) {
                 LeasedPlacement::Placed(entry) => return Ok(entry),
-                LeasedPlacement::NoLease | LeasedPlacement::Full => {
+                LeasedPlacement::NoLease | LeasedPlacement::Full
+                    if self.can_spare_a_head_for_lease(segment_class) =>
+                {
                     // No head here yet, or the one we have is out of room.
                     // Both open a new bracket PART: claim a head, link the
                     // full one behind it, and put BEGIN in first so every
@@ -1469,9 +1532,14 @@ impl Chunk {
                     );
                     return Err(WriteError::CannotAllocateSpace);
                 }
-                LeasedPlacement::Unusable => {
-                    // Busy, not full. Leave it alone and take the ordinary
-                    // path, which claims and leases a head of its own.
+                LeasedPlacement::Unusable
+                | LeasedPlacement::NoLease
+                | LeasedPlacement::Full => {
+                    // Either the head is merely busy, or this chunk cannot
+                    // spare one to hold. Both take the ordinary path: a
+                    // transaction that cannot be given a head of its own
+                    // writes unbracketed rather than failing, which is what
+                    // it did before leases existed.
                 }
             }
         }
@@ -1743,10 +1811,30 @@ impl Chunk {
             // this, every small store failed under concurrency with
             // CannotAllocateSpace the moment writers outnumbered segments.
             let growing = head_seg_id == HEAD_SEG_ID_EMPTY;
+            // A head worth QUEUEING on: live, and not already owned.
+            //
+            // Counting owned heads here deadlocked the server. A plain writer
+            // holds a head for microseconds, so queueing on one is the right
+            // trade near capacity -- but a TRANSACTION holds its head until
+            // the decision, and the writes a commit is waiting on (its own
+            // secondary index updates) are ordinary writes that need a head in
+            // the same chunk. In a chunk with one segment they queued on the
+            // very head the transaction was holding, while the transaction
+            // waited on them: neither could move, and the process sat there.
+            //
+            // If every live head is owned, queueing cannot succeed. Fall
+            // through instead and let the code below grow, collect, or refuse
+            // -- all of which end.
             let any_live_head = || {
                 slots.iter().any(|slot| {
                     let id = slot.load(Ordering::Acquire);
-                    id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING
+                    if id == HEAD_SEG_ID_EMPTY || id == HEAD_SEG_ID_ALLOCATING {
+                        return false;
+                    }
+                    self.segs
+                        .get(&(id as usize))
+                        .map(|seg| !seg.is_head_owned())
+                        .unwrap_or(false)
                 })
             };
             if growing && total_space >= reserve_boundary && any_live_head() {
@@ -4869,6 +4957,13 @@ mod tests {
     use env_logger;
 
     const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+    /// A chunk with room for several segments.
+    ///
+    /// The lease tests need one: a transaction may only hold a head when the
+    /// chunk can spare it, and a chunk sized to a SINGLE segment can never --
+    /// its one head is everybody's head. Testing leases in that shape would be
+    /// testing the fallback, not the lease.
+    const TEST_CHUNK_SIZE_MULTI: usize = 8 * TEST_CHUNK_SIZE;
 
     fn test_txn_id(n: u64) -> crate::server::transactions::TxnId {
         crate::server::transactions::test_hlc(n, n)
@@ -4886,7 +4981,7 @@ mod tests {
     #[test]
     fn a_transaction_keeps_one_head_across_its_writes() {
         let _ = env_logger::try_init();
-        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
         let chunk = &chunks.list[0];
         let txn = test_txn_id(41);
 
@@ -4935,7 +5030,7 @@ mod tests {
     #[test]
     fn an_aborted_transaction_leaves_no_entries_behind() {
         let _ = env_logger::try_init();
-        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
         let chunk = &chunks.list[0];
         let txn = test_txn_id(77);
 
@@ -5001,7 +5096,7 @@ mod tests {
     #[test]
     fn an_undecided_transaction_has_its_heads_reclaimed() {
         let _ = env_logger::try_init();
-        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
         let chunk = &chunks.list[0];
         let txn = test_txn_id(42);
 
