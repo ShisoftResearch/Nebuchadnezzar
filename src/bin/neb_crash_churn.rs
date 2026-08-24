@@ -183,6 +183,26 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // A graceful shutdown that hangs is also a finding.
                         let term_deadline = Instant::now() + Duration::from_secs(120);
                         loop {
+                            // Keep READING while waiting. This used to sleep
+                            // on try_wait alone, so every line the child
+                            // printed during shutdown -- the phase where the
+                            // index flush, the write-back barrier and the
+                            // final sync all happen -- went into a pipe
+                            // nobody drained. Shutdown-time diagnostics were
+                            // invisible by construction, which is a poor
+                            // property for the half of the cycle whose whole
+                            // job is to make things durable.
+                            while let Ok(line) = rx.try_recv() {
+                                if let Some(rest) = line.strip_prefix("PRESHUTDOWN_SCRUB ") {
+                                    println!("    scrub BEFORE shutdown: {}", rest.trim());
+                                } else if let Some(rest) =
+                                    line.strip_prefix("PRESHUTDOWN_SCRUB_ERROR ")
+                                {
+                                    println!("    scrub BEFORE shutdown FAILED: {}", rest.trim());
+                                } else if line.starts_with("FATAL") {
+                                    failed = Some(line);
+                                }
+                            }
                             match child.try_wait() {
                                 Ok(Some(_)) => break,
                                 Ok(None) if Instant::now() > term_deadline => {
@@ -191,6 +211,12 @@ fn parent_main(args: &[String]) -> ExitCode {
                                     break;
                                 }
                                 _ => std::thread::sleep(Duration::from_millis(50)),
+                            }
+                        }
+                        // Anything printed between the last drain and exit.
+                        while let Ok(line) = rx.try_recv() {
+                            if let Some(rest) = line.strip_prefix("PRESHUTDOWN_SCRUB ") {
+                                println!("    scrub BEFORE shutdown: {}", rest.trim());
                             }
                         }
                     } else {
