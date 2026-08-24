@@ -322,6 +322,29 @@ fn parent_main(args: &[String]) -> ExitCode {
                             continue;
                         }
                         state.best_verified = n;
+                        // REBASE THE CURSOR TOO, downward included.
+                        //
+                        // The child rebases its own numbering on this scan
+                        // (`next = AtomicU64::new(count)`), so the parent's
+                        // cursor has to follow or the two disagree about what
+                        // "written" means. It only ever rose, and that is a
+                        // one-way ratchet across a SIGKILL: a kill may lose
+                        // acked writes BY CONTRACT, the store legitimately
+                        // comes back lower, the bar is correctly released --
+                        // and then the stale high-water is still sitting in
+                        // next_key, so the NEXT graceful shutdown computes its
+                        // floor from writes a contracted crash already took.
+                        //
+                        // That is what "scanned 1663118 < best verified
+                        // 1663162" was: three consecutive cycles all held
+                        // exactly 1663118, nothing was lost at the graceful
+                        // boundary at all, and the 44 missing keys had been
+                        // dropped by a SIGKILL two cycles earlier.
+                        //
+                        // Same shape as the global-monotonic-next_key bug this
+                        // harness was already burned by; that fix rebased the
+                        // CHILD and left the parent ratcheting.
+                        acked_high = n;
                         println!("    scanned n={} (best={})", n, state.best_verified);
                         kill_at = Some(Instant::now() + Duration::from_secs(churn_secs));
                     } else if let Some(rest) = line.strip_prefix("ACK_TO ") {
