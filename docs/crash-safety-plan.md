@@ -8,7 +8,30 @@ never silent.
 
 Grounded in a full audit of the WAL/recovery/undo paths (2026-08-22).
 Sixteen crash windows were identified with file:line evidence; they are
-numbered #1–#16 throughout and listed in the appendix.
+numbered #1–#16 throughout and listed in the appendix, along with three
+more (#17–#19) the fuzzer found afterwards.
+
+## READ THIS FIRST — where the campaign stands (2026-08-24)
+
+**The current plan is "Phase 6a IMPLEMENTATION PLAN" below.** Everything
+above it is either DONE or the decision record that produced it.
+
+| Phase | State |
+|---|---|
+| 0 Contract | DECIDED, unchanged |
+| 1 Recovery correctness | DONE — framing+CRC, entry checksums, publish-last, ordering |
+| 2 Transaction atomicity (single node) | DONE — commit-point, sync-what-was-appended, framed undo log |
+| 3 Write-path failures | DONE — journal failures loud, seal-race drained, refusals honoured |
+| 4 Integrity of the durable | PARTIAL — per-block CRCs and the reindex/scrub tool NOT built |
+| 5 Verification | DONE — crash-churn fuzzer with delete + mutilation lanes; the TRANSACTIONAL lane arrives with Step 1 below |
+| 6 Distributed 2PC | DESIGN ONLY, by decision; the in-doubt timeout in Step 1 is coupled to it |
+| 6a Head pool | BUILT (`feat/head-pool`) — pool, exclusive ownership, gates green |
+| 6a Brackets/chains | NOT BUILT — this is the current work, planned below |
+
+The head pool is the FIRST HALF of Phase 6a: whoever writes holds a head
+exclusively. The second half — a transaction holding its head until the 2PC
+decision, and the bracket/chain format that makes abort physical — is what
+the implementation plan covers.
 
 ## The contract (Phase 0 — decide, then everything serves it)
 
@@ -289,7 +312,17 @@ Caveat: allocator-only microbench. The binding gate remains the full
 import A/B when the implementation lands, per house rule.
 
 
-### Phase 6a: retire the undo log from the write path (Zen-style)
+### SUPERSEDED decision record (kept deliberately): the road to the design above
+
+Everything from here until "Phase 6a IMPLEMENTATION PLAN" is the exploration
+that produced the settled design — per-entry stamps, local commit sequences,
+the three-pass counting recovery, the earlier bracket discussion, and the
+Zen-style undo-log retirement below. It is kept because it carries the
+reasoning and the rejected alternatives, and re-deriving them is how a
+settled decision gets quietly reopened. Where it conflicts with the settled
+design or the implementation plan, BOTH of those win.
+
+#### Retiring the undo log from the write path (Zen-style)
 
 Prompted by the user pointing at Zen (Liu, Chen & Chen, VLDB 14(5), 2021),
 whose LP ("Last Persisted") bit is the MSB of a 63-bit per-tuple Tx-CTS:
@@ -660,13 +693,36 @@ present; otherwise discard, which is safe because the ack had not happened.
 
 ## Sequencing and dependencies
 
-Phase 1 and Phase 3.1 first (they close active corruption/loss windows and
-the seal race is already firing 40×/import). Phase 2 rides on Phase 1.3.
-Phase 5's fuzzer lanes get built EARLY (right after Phase 1) so every
-subsequent phase lands with its crash-lane already watching. Phases 4 and
-6 trail.
+Superseded by the implementation plan above, and recorded here for why the
+order came out that way. The original sequencing (Phases 1 and 3.1 first to
+close active corruption windows, 2 riding on 1.3, the fuzzer lanes built
+early so every later phase landed with a crash lane already watching) held
+and is complete.
 
-## Appendix: the 16 audited crash windows
+What remains, in order:
+
+1. **Step 1, the transaction head lease.** First because every later step is
+   expressed in it, and because recovery is unchanged at that step — so the
+   lease is validated on its own, against the fuzzer's transactional lane.
+2. **Steps 2 and 3, brackets then chains.** Writer and reader together, one
+   shape at a time: the single-segment bracket is the common case and the
+   chain is the rare one.
+3. **Step 4, abort by rewind**, which is the only thing that lets the undo
+   log leave the write path.
+4. **Step 5, watermark and cleaner gate**, last because it constrains the
+   cleaner against a format that must already exist.
+
+Running beside that, and NOT blocked by it:
+
+- The **reindex/scrub tool** (Phase 4). After deliberate file damage the
+  store correctly refuses and there is no path back — the only failure class
+  the fuzzer still cannot survive, and arguably the thing to do first.
+- **Index-durability backpressure**: a full store keeps accepting writes it
+  cannot index durably, and a graceful shutdown then loses the index tail.
+- **Per-block backup CRCs** (Phase 4), bundled with the watermark header
+  change in Step 5 so the format moves once.
+
+## Appendix: the crash windows (16 audited, 3 found later)
 
 | # | Window | Where |
 |---|---|---|
