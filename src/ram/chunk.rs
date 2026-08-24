@@ -209,6 +209,14 @@ const HEAD_SEG_ID_ALLOCATING: u64 = u64::MAX - 1;
 /// contention), fixed in CAPACITY. The .239 contention spike showed K=4
 /// degrading badly at 96-192 threads and K=8-16 behaving well; blobs see a
 /// fraction of the traffic and 8 MiB per resident head is real money.
+///
+/// The blob pool is 4 rather than 2 because a transaction leases a head for
+/// its whole lifetime, and `can_spare_a_head_for_lease` will not hand out
+/// the second-to-last one. At 2 exactly one blob transaction per chunk could
+/// be bracketed and the rest wrote unbracketed. The extra slots cost nothing
+/// resident until blob traffic actually contends -- an EMPTY slot counts as
+/// available to a lease without a segment behind it -- so this buys blob
+/// atomicity at zero cost in the quiet case, which is the common one.
 fn head_pool_len(segment_class: SegmentClass) -> usize {
     static REGULAR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     static BLOB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -224,7 +232,7 @@ fn head_pool_len(segment_class: SegmentClass) -> usize {
     };
     match segment_class {
         SegmentClass::Regular => *REGULAR.get_or_init(|| read("NEB_HEAD_POOL", 8)),
-        SegmentClass::Blob => *BLOB.get_or_init(|| read("NEB_BLOB_HEAD_POOL", 2)),
+        SegmentClass::Blob => *BLOB.get_or_init(|| read("NEB_BLOB_HEAD_POOL", 4)),
     }
 }
 
@@ -1341,9 +1349,6 @@ impl Chunk {
             return Err(WriteError::CannotAllocateSpace);
         }
         for head in heads {
-            if head.segment_class() != SegmentClass::Regular {
-                continue;
-            }
             if !head.incr_references() {
                 return Err(WriteError::CannotAllocateSpace);
             }
@@ -1390,14 +1395,22 @@ impl Chunk {
         Ok(())
     }
 
-    /// The newest head this transaction holds in this chunk, if any.
-    fn newest_leased_head(&self) -> Option<AArc<Segment>> {
+    /// The newest head of `segment_class` this transaction holds in this
+    /// chunk, if any.
+    ///
+    /// Class-scoped because a transaction can hold one head per class here,
+    /// and the two are separate chains: a TXN_CONT link names the previous
+    /// part of the SAME chain, so stamping one across classes would join two
+    /// runs that were never contiguous.
+    fn newest_leased_head(&self, segment_class: SegmentClass) -> Option<AArc<Segment>> {
         let txn = current_txn()?;
         let held = TXN_LEASES.lock();
         held.get(&txn)?
             .per_chunk
             .get(&self.lease_key())?
-            .last()
+            .iter()
+            .rev()
+            .find(|lease| lease.seg.segment_class() == segment_class)
             .map(|lease| lease.seg.clone())
     }
 
@@ -1406,7 +1419,8 @@ impl Chunk {
         (self.allocator.base_addr(), self.id)
     }
 
-    /// Whether the calling thread's transaction holds a head in this chunk.
+    /// Whether the calling thread's transaction holds a head of
+    /// `segment_class` in this chunk.
     ///
     /// Used to refuse a wait that can never end: the acquire loop queues on
     /// live heads when it cannot grow, and a head held by THIS transaction
@@ -1414,7 +1428,13 @@ impl Chunk {
     /// call is still blocking. Waiting on yourself is the shape that
     /// livelocked cold reads, and it is worth refusing explicitly rather
     /// than discovering it as a hang.
-    fn current_txn_holds_head_here(&self) -> bool {
+    ///
+    /// Scoped to the class, because the pools are: the acquire loop only ever
+    /// queues on slots of the class it was asked for, so a regular head this
+    /// transaction holds is not something a blob write can be waiting on.
+    /// Answering the question class-blind refused writes that were in no
+    /// danger at all.
+    fn current_txn_holds_head_here(&self, segment_class: SegmentClass) -> bool {
         let Some(txn) = current_txn() else {
             return false;
         };
@@ -1422,7 +1442,11 @@ impl Chunk {
             .lock()
             .get(&txn)
             .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
-            .map(|heads| !heads.is_empty())
+            .map(|heads| {
+                heads
+                    .iter()
+                    .any(|lease| lease.seg.segment_class() == segment_class)
+            })
             .unwrap_or(false)
     }
 
@@ -1444,15 +1468,17 @@ impl Chunk {
             match held
                 .get(&txn)
                 .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
-                .and_then(|heads| heads.last())
+                .and_then(|heads| {
+                    heads
+                        .iter()
+                        .rev()
+                        .find(|lease| lease.seg.segment_class() == segment_class)
+                })
             {
                 Some(lease) => lease.seg.clone(),
                 None => return LeasedPlacement::NoLease,
             }
         };
-        if head.segment_class() != segment_class {
-            return LeasedPlacement::Unusable;
-        }
         // Ownership is NOT re-taken -- this transaction already holds it.
         // Everything else is exactly the ordinary path: the per-entry
         // reference and journal claim still bracket this write, because
@@ -1495,13 +1521,14 @@ impl Chunk {
         full_gc: bool,
         segment_class: SegmentClass,
     ) -> Result<PendingEntry, WriteError> {
-        // Brackets cover the REGULAR class. A blob cell is a different
-        // segment class with its own pool, so bracketing it would mean a
-        // second lease of a different kind per transaction; until that is
-        // designed, blob writes take the ordinary path and are outside the
-        // bracket. Stated here rather than left implicit, because it is a
-        // real gap in a transaction's atomicity.
-        if current_txn().is_some() && segment_class == SegmentClass::Regular {
+        // Brackets cover BOTH segment classes. A transaction that writes a
+        // blob cell and a regular cell into the same chunk holds one head in
+        // each pool and opens one bracket chain in each; every lookup below
+        // is scoped to the class so the two never reach for each other's
+        // head. The COMMIT is written into every part of both chains, and
+        // the manifest names them all, so the transaction is decided as a
+        // whole -- which is what "outside the bracket" used to cost.
+        if current_txn().is_some() {
             // A transaction writes behind its own head, so its entries stay
             // contiguous and an abort can rewind them.
             match self.try_place_in_leased_head(size, segment_class) {
@@ -1574,7 +1601,7 @@ impl Chunk {
         // Link ONLY a head with no room left. Anything else is still in use
         // by this transaction, and stamping a tail link into it would zero
         // space the segment still owns.
-        if let Some(previous) = self.newest_leased_head().filter(|head| {
+        if let Some(previous) = self.newest_leased_head(segment_class).filter(|head| {
             head.bound().saturating_sub(head.append_header.load(Ordering::Acquire))
                 < crate::ram::bracket::TXN_CONT_ENTRY_SIZE * 2
         }) {
@@ -1782,7 +1809,7 @@ impl Chunk {
                 None => match empty_slot {
                     Some(slot) => (slot, HEAD_SEG_ID_EMPTY),
                     None => {
-                        if self.current_txn_holds_head_here() {
+                        if self.current_txn_holds_head_here(segment_class) {
                             error!(
                                 "chunk {} has no head this write can take, and one of them is \
                                  held by this very transaction: waiting would wait on ourselves. \
@@ -1839,7 +1866,7 @@ impl Chunk {
                 })
             };
             if growing && total_space >= reserve_boundary && any_live_head() {
-                if self.current_txn_holds_head_here() {
+                if self.current_txn_holds_head_here(segment_class) {
                     error!(
                         "chunk {} is at capacity and the live head(s) this write would queue on \
                          include one held by this very transaction; refusing rather than waiting \
@@ -5103,6 +5130,129 @@ mod tests {
             plain.addr, before,
             "the reclaimed span is reused, so an abort costs no space at all"
         );
+    }
+
+    /// A transaction that writes both segment classes gets a bracket in EACH,
+    /// and neither chain reaches for the other's head.
+    ///
+    /// Blob cells used to sit outside the bracket entirely. The reason was
+    /// mechanical rather than principled: the lease lookup asked for "the
+    /// newest head this transaction holds in this chunk", which after a blob
+    /// write would hand the next regular write a blob head -- so the gate
+    /// simply refused to bracket blobs at all. Every lookup is scoped to the
+    /// class now, which is what lets the two chains exist side by side, and
+    /// the COMMIT goes into both.
+    #[test]
+    fn a_transaction_brackets_both_segment_classes() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(91);
+
+        set_transaction_id(Some(txn.clone()));
+        let regular = chunk
+            .try_acquire_in_class(64, false, SegmentClass::Regular)
+            .expect("regular entry");
+        assert!(regular.leased, "a transactional regular claim takes a lease");
+        let regular_seg = regular.seg.id;
+        let regular_seg_ref = regular.seg.clone();
+        drop(regular);
+
+        let blob = chunk
+            .try_acquire_in_class(64, false, SegmentClass::Blob)
+            .expect("blob entry");
+        assert!(
+            blob.leased,
+            "a blob write inside a transaction must be bracketed too"
+        );
+        assert_eq!(blob.seg.segment_class(), SegmentClass::Blob);
+        assert_ne!(
+            blob.seg.id, regular_seg,
+            "the classes must not share a segment"
+        );
+        let blob_seg_ref = blob.seg.clone();
+        drop(blob);
+        assert_eq!(
+            transaction_lease_count(&txn),
+            2,
+            "one head per class, not one per chunk"
+        );
+
+        // Back to the regular class: it must find its OWN head, not the blob
+        // head that happens to have been leased more recently.
+        let regular_again = chunk
+            .try_acquire_in_class(64, false, SegmentClass::Regular)
+            .expect("second regular entry");
+        assert!(regular_again.leased);
+        assert_eq!(
+            regular_again.seg.id, regular_seg,
+            "the newer blob lease must not displace the regular chain"
+        );
+        drop(regular_again);
+        assert_eq!(
+            transaction_lease_count(&txn),
+            2,
+            "and continuing a chain opens no further lease"
+        );
+
+        // Both parts are named by the manifest, so the transaction is decided
+        // as a whole rather than one class at a time.
+        let manifest = transaction_manifest(&txn);
+        assert_eq!(
+            manifest.len(),
+            2,
+            "the manifest must name the blob part as well: {:?}",
+            manifest
+        );
+        chunk
+            .close_transaction_bracket(&txn, &manifest)
+            .expect("close both brackets");
+
+        // What actually makes an entry transactional is the pair of markers
+        // around it, NOT the lease -- a leased head with no BEGIN recovers as
+        // ordinary entries, so an uncommitted transaction's blob cells would
+        // come back visible. Assert the markers, in both classes.
+        for (class, seg) in [
+            (SegmentClass::Regular, regular_seg_ref),
+            (SegmentClass::Blob, blob_seg_ref),
+        ] {
+            let types = entry_types_in(&seg);
+            assert_eq!(
+                types.first(),
+                Some(&crate::ram::entry::EntryType::BEGIN),
+                "{:?} part must open with a BEGIN, got {:?}",
+                class,
+                types
+            );
+            assert_eq!(
+                types.last(),
+                Some(&crate::ram::entry::EntryType::COMMIT),
+                "{:?} part must close with a COMMIT, got {:?}",
+                class,
+                types
+            );
+        }
+
+        set_transaction_id(None);
+        assert_eq!(release_transaction_leases(&txn), 2);
+    }
+
+    /// Walk a segment's live extent and report what kind of entry sits where.
+    /// Only the shape matters here, so the content read is a no-op.
+    fn entry_types_in(seg: &AArc<Segment>) -> Vec<crate::ram::entry::EntryType> {
+        let end = seg.append_header.load(Ordering::Acquire);
+        let mut cursor = seg.addr;
+        let mut types = Vec::new();
+        while cursor < end {
+            let (header, _) = crate::ram::entry::Entry::decode_from(cursor, |_, _| {});
+            let size = crate::ram::entry::ENTRY_HEAD_SIZE + header.content_length as usize;
+            if size == 0 {
+                break;
+            }
+            types.push(header.entry_type);
+            cursor += size;
+        }
+        types
     }
 
     /// A head held past its transaction is a writer slot gone from the pool,
