@@ -18,6 +18,7 @@ use bifrost::raft::client::RaftClient;
 use bifrost_hasher::hash_str;
 use dovahkiin::types::custom_types::id::ID_LOCALITY_MASK;
 use dovahkiin::types::Id;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Number of distinct slots, which is the number of distinct localities.
@@ -95,6 +96,66 @@ pub async fn adopt_from_ring(
         }
     }
     Ok(adopted)
+}
+
+/// Re-point every slot owned by identities this ring does not know at the
+/// group's sole member, durably.
+///
+/// Reopen a store under a new identity -- a re-addressed or reprovisioned
+/// node -- and the persisted table still names the identity that wrote it, so
+/// every slot is owned by a server id the ring has no address for. The data
+/// did not go anywhere; it came with the files. Routing honours the table, so
+/// without this every read and write to those slots fails permanently, which
+/// in practice means the whole ranged index: no tree metadata cell is
+/// readable, so no tree loads and every seek errors.
+///
+/// Done as a durable reassignment rather than a routing-time fallback because
+/// the table must stay authoritative WHERE IT APPLIES -- an entry naming a
+/// live member always wins -- and because every consumer has to see one
+/// answer. Guarded on a single-member group, where there is no ambiguity
+/// about where the data can be; with more members, a departed owner's slots
+/// belong to the fill/reconcile machinery, not to whoever happens to boot.
+pub async fn adopt_orphaned_slots(
+    group_name: &str,
+    conshash: &Arc<ConsistentHashing>,
+    raft_client: &Arc<RaftClient>,
+    slots_sm_id: u64,
+    table: &[u64],
+) -> Result<usize, String> {
+    if conshash.server_count() != 1 {
+        return Ok(0);
+    }
+    let Some(heir) = conshash.rand_server_id() else {
+        return Ok(0);
+    };
+    // Group the orphans by their old owner: reassignment is keyed on the
+    // owner it moves FROM, which is what keeps it from stealing a slot that
+    // changed hands while this ran.
+    let mut by_owner: HashMap<u64, Vec<(u32, u64)>> = HashMap::new();
+    for (slot, owner) in table.iter().enumerate() {
+        if *owner == 0 || *owner == heir || conshash.try_server_name(*owner).is_some() {
+            continue;
+        }
+        by_owner
+            .entry(*owner)
+            .or_default()
+            .push((slot as u32, heir));
+    }
+    if by_owner.is_empty() {
+        return Ok(0);
+    }
+    let client = SlotsSMClient::new(slots_sm_id, raft_client);
+    let group = slot_group_id(group_name);
+    let mut moved = 0usize;
+    for (from, assignments) in by_owner {
+        for batch in assignments.chunks(ADOPT_CHUNK) {
+            moved += client
+                .reassign_slots(&group, &batch.to_vec(), &from)
+                .await
+                .map_err(|error| format!("slot reassignment command failed: {error:?}"))?;
+        }
+    }
+    Ok(moved)
 }
 
 /// The table as a slot-indexed vector plus the command's applied Raft log index,

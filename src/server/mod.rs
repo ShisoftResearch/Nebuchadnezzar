@@ -1254,6 +1254,64 @@ pub async fn init_conshash(
             match crate::slots::load_owner_vec(group_name, raft_client, SLOTS_SM_ID).await {
                 Ok((owners, applied_index)) => {
                     let has_table = owners.is_some();
+                    // A table whose every placed slot is owned by an
+                    // identity this ring does not know describes a cluster
+                    // that no longer exists: the store was reopened under a
+                    // new identity and the data came with the files. Re-point
+                    // those slots at this member, durably, so every consumer
+                    // sees one answer -- see `slots::adopt_orphaned_slots` for
+                    // why this is a reassignment rather than a routing-time
+                    // fallback.
+                    let owners = match owners {
+                        Some(table) => {
+                            match crate::slots::adopt_orphaned_slots(
+                                group_name,
+                                &ch,
+                                raft_client,
+                                SLOTS_SM_ID,
+                                &table,
+                            )
+                            .await
+                            {
+                                Ok(0) => Some(table),
+                                Ok(moved) => {
+                                    warn!(
+                                        "re-pointed {} orphaned slot(s) at this member: the \
+                                         placement table named identities this ring does not \
+                                         know, which is what reopening a store under a new \
+                                         address leaves behind",
+                                        moved
+                                    );
+                                    match crate::slots::load_owner_vec(
+                                        group_name,
+                                        raft_client,
+                                        SLOTS_SM_ID,
+                                    )
+                                    .await
+                                    {
+                                        Ok((refreshed, _)) => refreshed,
+                                        Err(reason) => {
+                                            warn!(
+                                                "could not re-read the placement table after \
+                                                 adopting orphaned slots ({}); routing by the ring",
+                                                reason
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(reason) => {
+                                    warn!(
+                                        "could not adopt orphaned slots ({}); those slots stay \
+                                         unreachable until placement is reconciled",
+                                        reason
+                                    );
+                                    Some(table)
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     ch.set_slot_overrides(owners, applied_index);
                     if !has_table {
                         debug!("no slot placement table for this group; routing by the ring");
