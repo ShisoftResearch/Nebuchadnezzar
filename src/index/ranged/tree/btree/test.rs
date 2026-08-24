@@ -665,3 +665,68 @@ fn retaining_at_any_pivot_keeps_the_left_side() {
         );
     }
 }
+
+/// A structural split leaves the SOURCE tree unwritable. REPRODUCTION, NOT
+/// A REGRESSION -- this fails on `develop` too, and is `#[ignore]`d so the
+/// suite stays honest about what it is asserting.
+///
+/// `split_off` / `split_off_spine` (the production tree-split path, reached
+/// from `RangedTree::split_off` when a tree goes oversized) collapse a root
+/// left with a single child into a bypass `Empty`. That node is neither
+/// External nor Internal, and `apply_top_level_split` calls `is_ext()` on the
+/// root directly on every insert that grows the tree -- so the source tree
+/// reads and writes fine until the first write that splits a leaf, and then
+/// panics at `node.rs:86`. Same shape as the retain bug fixed in `e68a72df`,
+/// reached through a different function.
+///
+/// NOT FIXED HERE, deliberately. Rebuilding the root as a real internal node
+/// with one child makes this test pass -- and makes three audit tests fail,
+/// because `is_tree_in_order` stops descending at an `Empty` root and so had
+/// never checked the levels below it. Underneath sits a second, older defect:
+/// when the root keeps exactly one child (`kept_ptrs.len() == 1`) the kept
+/// child's sibling links are never severed, so they dangle into the subtree
+/// that moved to the new tree. The bypass root was hiding that from the
+/// verifier. Fixing the panic without fixing the links just moves which
+/// invariant is broken, so both want doing together, with the link rules
+/// understood first.
+#[test]
+#[ignore = "reproduces an unfixed defect in split_off; see the comment"]
+fn splitting_off_at_any_pivot_leaves_the_source_writable() {    let _ = env_logger::try_init();
+    let total = PAGE_SIZE as u64 * 4;
+    for pivot_at in 2..=total {
+        let tree = LevelBPlusTree::new(&deletion_set());
+        for i in (1..=total).map(|i| i * 2) {
+            tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
+        }
+        let pivot = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2));
+        let moved = super::split_off::split_off_spine(&tree, &pivot);
+
+        // Whatever moved, the source keeps only keys below the pivot...
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut seen = Vec::new();
+        while let Some(key) = cursor.next() {
+            seen.push(key);
+        }
+        assert!(
+            seen.iter().all(|key| key < &pivot),
+            "pivot {} (moved {}): source kept {:?} at or past the pivot",
+            pivot_at,
+            moved.is_some(),
+            seen.last()
+        );
+        // ...and still takes writes inside its own range. Odd sequence
+        // numbers were never inserted, so this key is fresh.
+        let key = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2 - 1));
+        assert!(
+            tree.insert(&key),
+            "pivot {}: the source tree must still accept a key in its range",
+            pivot_at
+        );
+        assert_eq!(
+            tree.seek(&key, Ordering::Forward).current(),
+            Some(&key),
+            "pivot {}: and must find it again",
+            pivot_at
+        );
+    }
+}
