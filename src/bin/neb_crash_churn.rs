@@ -354,7 +354,11 @@ fn parent_main(args: &[String]) -> ExitCode {
                         deleted_high = rest.trim().parse().unwrap_or(deleted_high);
                     } else if line.starts_with("STORE_EXHAUSTED") {
                         exhausted_this_cycle = true;
-                        println!("    STORE RAN OUT OF SPACE during the previous cycle");
+                        println!(
+                            "    STORE RAN OUT OF SPACE -- index write-back cannot allocate, so \
+                             entries after this point are lost BY DESIGN. Raise NEB_CHURN_DB_GB \
+                             before reading anything below as a durability bug."
+                        );
                     } else if let Some(rest) = line.strip_prefix("TXN_COMMITTED_TO ") {
                         if let Ok(round) = rest.trim().parse::<u64>() {
                             txn_high = txn_high.max(round);
@@ -1083,10 +1087,35 @@ async fn child_async(
     // abandoned, the barrier is never established and entries are lost --
     // all correct behaviour for a full store, and all indistinguishable
     // from real loss unless the harness is told which it is looking at.
-    if neb::ram::chunk::ALLOCATION_EXHAUSTED.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-        println!("STORE_EXHAUSTED");
-        flush_stdout();
-    }
+    // WATCHED, not sampled once.
+    //
+    // This used to be a single read taken here, during startup -- before the
+    // child had written anything. A fresh process's counter is zero at that
+    // point, so exhaustion occurring during the CHURN phase, which is when it
+    // actually occurs, was never reported at all. The one arm that ever did
+    // report it only did so because a startup reconciliation allocated hard
+    // enough to exhaust the store before this line ran.
+    //
+    // The cost of that blind spot: a full store abandons index write-back,
+    // never establishes the barrier, publishes no head pointer, and comes
+    // back with entries missing -- correct behaviour, and identical to a
+    // durability bug from outside. Whole soaks were read as durability
+    // findings because nothing said "out of space".
+    tokio::spawn(async move {
+        let mut reported = false;
+        loop {
+            if !reported
+                && neb::ram::chunk::ALLOCATION_EXHAUSTED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+            {
+                println!("STORE_EXHAUSTED");
+                flush_stdout();
+                reported = true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
 
     // Which layer lost it?
     //
