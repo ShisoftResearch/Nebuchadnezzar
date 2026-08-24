@@ -119,6 +119,9 @@ struct RecoveryScanResult {
     append_offset: usize,
     dead_space: u32,
     tombstones: u32,
+    /// Set when the segment's fixed tail holds a chain link: the short
+    /// transaction id and the previous part's seq id.
+    chain_link: Option<(u64, u64)>,
 }
 
 /// Recovery configuration
@@ -435,6 +438,11 @@ pub struct BracketLedger {
     present: std::collections::HashSet<(u16, u64)>,
     pending: Mutex<HashMap<crate::server::transactions::TxnId, Vec<PendingBracketCell>>>,
     commits: Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
+    /// The oldest undecided transaction any file was written with. A bracket
+    /// older than this was DECIDED before that file existed, so a missing
+    /// COMMIT means the cleaner dropped the marker -- not that the
+    /// transaction was in flight.
+    watermark: Mutex<Option<(u64, u64)>>,
 }
 
 struct PendingBracketCell {
@@ -465,6 +473,20 @@ impl BracketLedger {
                 .collect(),
             pending: Mutex::new(HashMap::new()),
             commits: Mutex::new(HashMap::new()),
+            watermark: Mutex::new(None),
+        }
+    }
+
+    /// Take the LOWEST watermark any file names: the most conservative claim
+    /// about what was already decided.
+    fn observe_watermark(&self, watermark: Option<(u64, u64)>) {
+        let Some(seen) = watermark else {
+            return;
+        };
+        let mut current = self.watermark.lock();
+        match *current {
+            Some(existing) if existing <= seen => {}
+            _ => *current = Some(seen),
         }
     }
 
@@ -522,14 +544,46 @@ impl BracketLedger {
             }
             BRACKETS_APPLIED.fetch_add(applied as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        // Whatever is left never had a COMMIT anywhere: uncommitted at the
-        // instant of the crash, so it never happened.
+        // What is left has no COMMIT anywhere. Whether that means "in flight
+        // when we stopped" or "decided long ago and the marker was cleaned"
+        // is exactly what the watermark answers -- and getting it wrong in
+        // either direction is a corruption: discard a decided transaction and
+        // committed data disappears; apply an in-flight one and uncommitted
+        // data appears.
+        let watermark = *self.watermark.lock();
         for (txn, cells) in pending {
+            // No watermark anywhere means no claim about what was decided, and
+            // the safe reading of "no claim" is "assume not decided": failing
+            // to apply a decided transaction loses data the cleaner was going
+            // to keep anyway, while applying an undecided one INVENTS data.
+            // Only one of those two mistakes is recoverable.
+            let decided_before_the_files = watermark
+                .map(|(ts, node)| (txn.ts, txn.node) < (ts, node))
+                .unwrap_or(false);
+            if decided_before_the_files {
+                // Older than anything in flight when these files were
+                // written, so it was decided. A decided bracket that survives
+                // WITH its cells and WITHOUT its COMMIT is the shape a
+                // compaction leaves behind, and its cells are the ones the
+                // index kept -- i.e. committed.
+                let applied = cells.len();
+                for cell in cells {
+                    apply_bracketed_cell(chunks, &cell);
+                }
+                BRACKETS_APPLIED.fetch_add(applied as u64, std::sync::atomic::Ordering::Relaxed);
+                debug!(
+                    "transaction {:?} predates the recovery watermark {:?}; its {} cell(s) were \
+                     decided before these files were written and are applied",
+                    txn, watermark, applied
+                );
+                continue;
+            }
             info!(
-                "transaction {:?} left {} bracketed cell(s) with no COMMIT; it was in flight when \
-                 the store stopped and is discarded",
+                "transaction {:?} left {} bracketed cell(s) with no COMMIT and is at or above the \
+                 watermark {:?}; it was in flight when the store stopped and is discarded",
                 txn,
-                cells.len()
+                cells.len(),
+                watermark
             );
             BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -578,6 +632,54 @@ fn apply_bracketed_cell(chunks: &[Chunk], cell: &PendingBracketCell) {
 pub static RECOVERY_DAMAGED_ENTRIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Read a segment image's fixed tail link, if it has one.
+///
+/// One read, no scanning: that is the point of putting the link at a FIXED
+/// position. A segment that answers Some is a chain part, so its live entries
+/// stop before the link and the zeros between are expected rather than
+/// suspicious -- which is exactly the ambiguity that forces PADDING entries in
+/// shared segments and does not exist here, because the link bounds the live
+/// region from outside.
+fn read_chain_link(data: &[u8], usable_len: usize) -> Option<(usize, u64, u64)> {
+    let tail = usable_len.saturating_sub(crate::ram::bracket::TXN_CONT_ENTRY_SIZE);
+    let tail = tail - (tail % ENTRY_HEAD_SIZE);
+    if tail + crate::ram::bracket::TXN_CONT_ENTRY_SIZE > data.len() || tail == 0 {
+        return None;
+    }
+    let addr = data.as_ptr() as usize + tail;
+    let word = u32::from_le_bytes(data[tail..tail + 4].try_into().ok()?);
+    match crate::ram::entry::unpack_type_word(word) {
+        crate::ram::entry::TypeWord::Checked(EntryType::TXN_CONT, _) => {}
+        _ => return None,
+    }
+    // A link is only a link if it vouches for itself; anything else at that
+    // offset is ordinary data that happens to sit there.
+    if crate::ram::entry::verify_entry_at(addr) != Some(true) {
+        return None;
+    }
+    let (header, _) = Entry::decode_from(addr, |_, _| {});
+    let content = unsafe {
+        std::slice::from_raw_parts(
+            Entry::content_pos(addr) as *const u8,
+            header.content_length as usize,
+        )
+    };
+    let (short, prev_seq) = crate::ram::bracket::decode_txn_cont(content)?;
+    Some((tail, short, prev_seq))
+}
+
+/// The decided watermark a log file names, read straight from its header.
+fn file_header_watermark(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::io::Read;
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; crate::ram::wal_format::FILE_HEADER_SIZE];
+    file.read_exact(&mut header).ok()?;
+    if !crate::ram::wal_format::is_framed(&header) {
+        return None;
+    }
+    crate::ram::wal_format::header_watermark(&header)
+}
+
 /// Whether the entry at `addr` stands on its own: aligned, a well-formed
 /// header, a length that fits inside the scanned extent, and either a
 /// checksum that verifies or a padding stamp.
@@ -617,6 +719,11 @@ fn entry_stands_alone(addr: usize, bound: usize) -> bool {
     }
 }
 
+/// Whether everything from `start_offset` to the LIVE end is zero.
+///
+/// Bounded by the live extent, not by the buffer: a chain part's link sits
+/// past that extent, and reading it as "non-zero bytes after the padding"
+/// turns an expected layout into a damage report -- and stops the walk.
 fn has_only_zero_padding(data: &[u8], start_offset: usize) -> bool {
     data[start_offset..].iter().all(|byte| *byte == 0)
 }
@@ -854,6 +961,19 @@ fn scan_segment_from_data(
     let live_len = declared_used_len
         .map(|len| len.min(data.len()))
         .unwrap_or(data.len());
+    // A chain part's live entries stop before its link. Read that first, so
+    // the walk never meets the zeros between the last entry and the tail.
+    let chain_link = read_chain_link(data, live_len);
+    let live_len = match chain_link {
+        Some((tail, short, prev_seq)) => {
+            debug!(
+                "segment {} is a chain part (txn {:#x}, previous seq {}); its entries end at {}",
+                seg_id, short, prev_seq, tail
+            );
+            tail
+        }
+        None => live_len,
+    };
     let bound = data_base + live_len;
 
     let mut cursor = data_base;
@@ -930,7 +1050,7 @@ fn scan_segment_from_data(
         let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
         if entry_header.entry_type == EntryType::UNDECIDED || entry_header.content_length == 0 {
             let padding_offset = cursor - data_base;
-            if !has_only_zero_padding(data, padding_offset) {
+            if !has_only_zero_padding(&data[..live_len], padding_offset) {
                 if append_header > data_base {
                     warn!(
                         "Recovered segment {} scan stopped at a non-zero truncated tail (offset {})",
@@ -1359,6 +1479,7 @@ fn scan_segment_from_data(
         append_offset: final_append_offset,
         dead_space: dead_space_u32,
         tombstones: tombstone_count,
+        chain_link: chain_link.map(|(_, short, prev)| (short, prev)),
     })
 }
 
@@ -1603,6 +1724,10 @@ pub fn recover_chunks(
                     let mut attempt = |path: &std::path::Path,
                                        version_map: &mut VersionMap|
                      -> io::Result<(Vec<u8>, Option<usize>, RecoveryScanResult)> {
+                        // From the FILE, before it is decoded: a framed log is
+                        // rebuilt into the segment image it describes, so the
+                        // header is gone by the time the image exists.
+                        bracket_ledger.observe_watermark(file_header_watermark(path));
                         let (file_data, declared_used_len) = load_file_with_used_len(path)?;
                         if file_data.len() > SEGMENT_SIZE {
                             return Err(io::Error::new(
@@ -2963,6 +3088,87 @@ use crate::ram::types::Id;
                 );
             }
         }
+    }
+
+    /// A chain part's link bounds its live region, and the zeros before the
+    /// link are expected rather than damage.
+    ///
+    /// Without the fixed-tail read, the walk meets those zeros mid-image,
+    /// finds non-zero bytes after them (the link itself), and reports the
+    /// segment unscannable -- which would take out every entry in the part.
+    #[test]
+    fn a_chain_part_is_bounded_by_its_link_not_by_zeros() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(220, "recovery_chain_part", false);
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
+
+        let txn = crate::server::transactions::test_hlc(909, 3);
+        let begin = bracket_entry_bytes(
+            EntryType::BEGIN,
+            &crate::ram::bracket::encode_begin(&txn),
+        );
+        let id = Id::allocated(30, 0, 1);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data: data_map_value!(id: 1_i32, data: vec![0x77_u8; DATA_SIZE]),
+        };
+        chunks.write_cell(&mut cell).unwrap();
+        let cell_entry = entry_bytes_at(chunks.address_of(&id));
+
+        // [BEGIN][cell][zeros...................][TXN_CONT]
+        let mut image = empty_segment_bytes();
+        let mut at = 0usize;
+        image[at..at + begin.len()].copy_from_slice(&begin);
+        at += begin.len();
+        image[at..at + cell_entry.len()].copy_from_slice(&cell_entry);
+        at += cell_entry.len();
+        let link_content = crate::ram::bracket::encode_txn_cont(&txn, 41);
+        let link = bracket_entry_bytes(EntryType::TXN_CONT, &link_content);
+        let tail = {
+            let raw = image.len() - crate::ram::bracket::TXN_CONT_ENTRY_SIZE;
+            raw - (raw % ENTRY_HEAD_SIZE)
+        };
+        assert!(tail > at, "the fixture must leave a gap before the link");
+        image[tail..tail + link.len()].copy_from_slice(&link);
+
+        let scanned = scan_segment_for_recovery_test(chunk, &image)
+            .expect("a chain part must scan, zeros and all");
+        assert_eq!(
+            scanned.chain_link,
+            Some((crate::ram::bracket::short_txn_id(&txn), 41)),
+            "the fixed tail must identify this segment as a chain part without scanning for it"
+        );
+        assert_eq!(
+            scanned.append_offset, at,
+            "the walk must stop at the last real entry, not run into the zeros"
+        );
+
+        // And the part alone commits nothing: no COMMIT lives here.
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        write_backup_segment(&backup_dir, 0, 0, 0, &image);
+        let reader_schemas = setup_test_schema();
+        reader_schemas.debug_only_new_schema(schema.clone());
+        let recovered = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: reader_schemas,
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+        assert!(
+            recovered.read_cell(&id).is_err(),
+            "a chain part whose transaction never committed must contribute nothing"
+        );
     }
 
     /// An abandoned image must not take the rest of its segment with it.

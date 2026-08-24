@@ -43,8 +43,11 @@ use crc_fast::{CrcAlgorithm, Digest};
 use std::io;
 
 pub const FILE_MAGIC: [u8; 4] = *b"NEBW";
-pub const FORMAT_VERSION: u8 = 1;
-pub const FILE_HEADER_SIZE: usize = 16;
+/// Bumped for the decided-watermark field. There is no earlier format to
+/// read, so a version mismatch is refused loudly rather than interpreted --
+/// which is the whole benefit of not carrying compatibility.
+pub const FORMAT_VERSION: u8 = 2;
+pub const FILE_HEADER_SIZE: usize = 32;
 
 pub const RECORD_MAGIC: u32 = 0x5741_4C52; // "WALR"
 pub const RECORD_HEADER_SIZE: usize = 20;
@@ -63,12 +66,50 @@ pub fn is_framed(data: &[u8]) -> bool {
     data.len() >= FILE_HEADER_SIZE && data[..4] == FILE_MAGIC
 }
 
-pub fn wal_file_header(seq_id: u64) -> [u8; FILE_HEADER_SIZE] {
+/// The file header, carrying the DECIDED WATERMARK alongside the seq id.
+///
+/// The watermark is the oldest transaction that had NOT yet reached a
+/// decision when this file was written. Everything older than it is decided,
+/// which is what lets a compaction drop bracket markers without making the
+/// cells it keeps ambiguous: below the watermark, an absent COMMIT means
+/// "decided and cleaned", not "still in flight". TLC showed both this gate
+/// and the cleaner's are load-bearing -- disabling either lets an
+/// uncommitted transaction be installed.
+///
+/// `None` means nothing was in flight, so everything in the file is decided.
+pub fn wal_file_header_with_watermark(
+    seq_id: u64,
+    watermark: Option<(u64, u64)>,
+) -> [u8; FILE_HEADER_SIZE] {
     let mut header = [0u8; FILE_HEADER_SIZE];
     header[..4].copy_from_slice(&FILE_MAGIC);
     header[4] = FORMAT_VERSION;
     header[8..16].copy_from_slice(&seq_id.to_le_bytes());
+    // All-ones rather than zero for "nothing in flight": zero is a legal
+    // transaction id, and a field that cannot distinguish "unset" from a real
+    // value is the kind of ambiguity this campaign keeps finding.
+    let (ts, node) = watermark.unwrap_or((u64::MAX, u64::MAX));
+    header[16..24].copy_from_slice(&ts.to_le_bytes());
+    header[24..32].copy_from_slice(&node.to_le_bytes());
     header
+}
+
+pub fn wal_file_header(seq_id: u64) -> [u8; FILE_HEADER_SIZE] {
+    wal_file_header_with_watermark(seq_id, None)
+}
+
+/// The decided watermark a file was written with, if it names one.
+pub fn header_watermark(data: &[u8]) -> Option<(u64, u64)> {
+    if data.len() < FILE_HEADER_SIZE {
+        return None;
+    }
+    let ts = u64::from_le_bytes(data[16..24].try_into().ok()?);
+    let node = u64::from_le_bytes(data[24..32].try_into().ok()?);
+    if ts == u64::MAX && node == u64::MAX {
+        None
+    } else {
+        Some((ts, node))
+    }
 }
 
 /// Frame one record. The payload is copied in, so the caller's buffer (a

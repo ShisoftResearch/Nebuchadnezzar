@@ -369,6 +369,20 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// What happened when a write tried the head its transaction already holds.
+///
+/// The distinction between FULL and UNUSABLE is load-bearing: only a full
+/// head may be closed and continued in a fresh part. A head that is merely
+/// busy -- being reclaimed, sealing, or of the wrong class -- must be left
+/// exactly as it is, because closing it stamps a tail link over space the
+/// segment still owns.
+enum LeasedPlacement {
+    Placed(PendingEntry),
+    Full,
+    Unusable,
+    NoLease,
+}
+
 /// One transaction's exclusive hold on a chunk write head.
 ///
 /// The pool already gives every writer exclusive ownership of a head; a
@@ -435,6 +449,53 @@ pub fn set_transaction_context(in_txn: bool) {
 pub fn set_transaction_id(txn: Option<crate::server::transactions::TxnId>) {
     IN_TRANSACTION.with(|flag| flag.set(txn.is_some()));
     CURRENT_TXN.with(|t| *t.borrow_mut() = txn);
+}
+
+/// Make an aborted transaction's writes vanish.
+///
+/// Ownership is what makes this expressible: nobody appended behind the
+/// transaction's entries, so its span can be padded over and the cursor put
+/// back. No undo records to replay, no junk for the cleaner to collect, and
+/// -- because the padding is journaled with everything else -- recovery walks
+/// straight over the span instead of reading entries the store has disowned.
+///
+/// Keyed on the transaction's STATE, never on whether a COMMIT record exists:
+/// TLC found that the cleaner legitimately drops COMMIT records below the
+/// decided watermark, so "no COMMIT present" is not the same question as "not
+/// committed" and deciding an abort on it rolls back committed work.
+pub fn rewind_transaction_writes(txn: &crate::server::transactions::TxnId) -> usize {
+    let leases = {
+        let mut held = TXN_LEASES.lock();
+        held.remove(txn)
+    };
+    let Some(leases) = leases else {
+        return 0;
+    };
+    let mut rewound = 0usize;
+    for (chunk_id, heads) in leases.per_chunk {
+        // Newest first: a chain's later parts are rewound before the part
+        // that points at them, so no moment exists where a link names a span
+        // that has already been disowned.
+        for lease in heads.into_iter().rev() {
+            if lease.seg.rewind_to(lease.pre_cursor) {
+                rewound += 1;
+            } else {
+                // The span could not be reclaimed -- it is already sealed, or
+                // the cursor moved past it. The entries stay, uncommitted,
+                // and recovery discards them for want of a COMMIT: correct,
+                // just not free.
+                debug!(
+                    "chunk {} could not rewind segment {} for aborted transaction {:?}; its \
+                     entries stay as dead space and recover as uncommitted",
+                    chunk_id, lease.seg.id, txn
+                );
+            }
+            lease.seg.release_own();
+            lease.seg.decr_references();
+        }
+    }
+    TXN_LEASES_RELEASED.fetch_add(rewound as u64, Ordering::Relaxed);
+    rewound
 }
 
 /// Release every head a transaction holds. Called at the decision -- commit
@@ -527,6 +588,21 @@ pub fn transaction_manifest(
 /// anything that needs a bracket closed.
 pub fn transaction_has_leases(txn: &crate::server::transactions::TxnId) -> bool {
     TXN_LEASES.lock().contains_key(txn)
+}
+
+/// The oldest transaction that has not yet reached a decision, or `None` when
+/// nothing is in flight.
+///
+/// Stamped into a file's header when it is written, so a reader knows which
+/// brackets could still be undecided. Taken from the leases because a lease
+/// exists exactly while a transaction is undecided: it is opened by the first
+/// write and released by the decision.
+pub fn undecided_watermark() -> Option<(u64, u64)> {
+    TXN_LEASES
+        .lock()
+        .keys()
+        .map(|txn| (txn.ts, txn.node))
+        .min()
 }
 
 /// How many heads a transaction currently holds; for tests and metrics.
@@ -1122,7 +1198,6 @@ impl Chunk {
     /// per-entry one, and without a second the segment could be reclaimed
     /// while the transaction still means to write into it.
     fn lease_head_for_current_txn(&self, head: &AArc<Segment>, addr: usize) -> bool {
-        if std::env::var("NEB_DISABLE_TXN_LEASE").is_ok() { return false; }
         let Some(txn) = current_txn() else {
             return false;
         };
@@ -1166,7 +1241,12 @@ impl Chunk {
         // Must land in the LEASED head. A COMMIT anywhere else closes
         // nothing: recovery reads a bracket within one segment, so a record
         // in a different segment leaves the entries looking uncommitted.
-        let Some(pending) = self.try_place_in_leased_head(size, SegmentClass::Regular) else {
+        let LeasedPlacement::Placed(pending) =
+            self.try_place_in_leased_head(size, SegmentClass::Regular)
+        else {
+            // A COMMIT that cannot go into the leased head closes nothing, so
+            // the caller must refuse the commit rather than write it
+            // elsewhere and call the transaction done.
             return Err(WriteError::CannotAllocateSpace);
         };
         crate::ram::entry::Entry::encode_to(
@@ -1183,6 +1263,17 @@ impl Chunk {
         );
         drop(pending);
         Ok(())
+    }
+
+    /// The newest head this transaction holds in this chunk, if any.
+    fn newest_leased_head(&self) -> Option<AArc<Segment>> {
+        let txn = current_txn()?;
+        let held = TXN_LEASES.lock();
+        held.get(&txn)?
+            .per_chunk
+            .get(&self.id)?
+            .last()
+            .map(|lease| lease.seg.clone())
     }
 
     /// Whether the calling thread's transaction holds a head in this chunk.
@@ -1212,32 +1303,45 @@ impl Chunk {
         &self,
         size: u32,
         segment_class: SegmentClass,
-    ) -> Option<PendingEntry> {
-        let txn = current_txn()?;
+    ) -> LeasedPlacement {
+        let Some(txn) = current_txn() else {
+            return LeasedPlacement::NoLease;
+        };
         let head = {
             let held = TXN_LEASES.lock();
             // Newest first: a rotation appended a fresh head, and that is
             // where the write set continues.
-            held.get(&txn)?.per_chunk.get(&self.id)?.last()?.seg.clone()
+            match held
+                .get(&txn)
+                .and_then(|leases| leases.per_chunk.get(&self.id))
+                .and_then(|heads| heads.last())
+            {
+                Some(lease) => lease.seg.clone(),
+                None => return LeasedPlacement::NoLease,
+            }
         };
         if head.segment_class() != segment_class {
-            return None;
+            return LeasedPlacement::Unusable;
         }
         // Ownership is NOT re-taken -- this transaction already holds it.
         // Everything else is exactly the ordinary path: the per-entry
         // reference and journal claim still bracket this write, because
         // sealing still has to see it.
         if !head.incr_references() {
-            return None;
+            // Being reclaimed or held exclusively: not full, just not usable
+            // right now. Sealing it as a chain part here would zero space it
+            // still owns and hand a live segment a tail link it never asked
+            // for -- which is how the first version of this corrupted stores.
+            return LeasedPlacement::Unusable;
         }
         if !head.begin_pending_journal() {
             head.decr_references();
-            return None;
+            return LeasedPlacement::Unusable;
         }
         match head.try_acquire(size) {
             Some(addr) => {
                 crate::ram::entry::stamp_reservation_padding(addr, size);
-                Some(PendingEntry {
+                LeasedPlacement::Placed(PendingEntry {
                     addr,
                     seg: head,
                     size,
@@ -1246,11 +1350,11 @@ impl Chunk {
                 })
             }
             None => {
-                // The leased head is full. Give the per-entry claims back and
-                // let the caller take a fresh head, which it will lease too.
                 head.end_pending_journal();
                 head.decr_references();
-                None
+                // Genuinely out of room: THIS is the only case that may
+                // continue the transaction in a fresh part.
+                LeasedPlacement::Full
             }
         }
     }
@@ -1261,37 +1365,104 @@ impl Chunk {
         full_gc: bool,
         segment_class: SegmentClass,
     ) -> Result<PendingEntry, WriteError> {
-        // Open the bracket before the first entry of a transaction lands in
-        // this chunk, so BEGIN really is the first thing in the run. Doing it
-        // when the lease is taken would put it AFTER the entry that took the
-        // lease, and recovery would then read that entry as ordinary.
-        if current_txn().is_some() && !self.current_txn_holds_head_here() {
-            self.open_transaction_bracket(full_gc, segment_class)?;
-        }
-        // A transaction writes behind its own head, so its entries stay
-        // contiguous and an abort can rewind them.
-        if let Some(entry) = self.try_place_in_leased_head(size, segment_class) {
-            return Ok(entry);
+        // Brackets cover the REGULAR class. A blob cell is a different
+        // segment class with its own pool, so bracketing it would mean a
+        // second lease of a different kind per transaction; until that is
+        // designed, blob writes take the ordinary path and are outside the
+        // bracket. Stated here rather than left implicit, because it is a
+        // real gap in a transaction's atomicity.
+        if current_txn().is_some() && segment_class == SegmentClass::Regular {
+            // A transaction writes behind its own head, so its entries stay
+            // contiguous and an abort can rewind them.
+            match self.try_place_in_leased_head(size, segment_class) {
+                LeasedPlacement::Placed(entry) => return Ok(entry),
+                LeasedPlacement::NoLease | LeasedPlacement::Full => {
+                    // No head here yet, or the one we have is out of room.
+                    // Both open a new bracket PART: claim a head, link the
+                    // full one behind it, and put BEGIN in first so every
+                    // part is self-describing.
+                    //
+                    // Bounded retry, because the head that had room for a
+                    // 24-byte BEGIN need not have room for the entry that
+                    // follows it. When that happens the part just opened is
+                    // by definition nearly full, so the next round links it
+                    // and moves to a genuinely fresh segment. Without the
+                    // retry this failed the write outright -- and a
+                    // transaction whose writes fail for want of 40 bytes is
+                    // an outage, not a safety property.
+                    const PART_ATTEMPTS: usize = 3;
+                    for _ in 0..PART_ATTEMPTS {
+                        self.open_transaction_bracket(full_gc, segment_class, size)?;
+                        match self.try_place_in_leased_head(size, segment_class) {
+                            LeasedPlacement::Placed(entry) => return Ok(entry),
+                            LeasedPlacement::Full => continue,
+                            LeasedPlacement::Unusable | LeasedPlacement::NoLease => break,
+                        }
+                    }
+                    error!(
+                        "chunk {} could not place a {}-byte transactional entry after {} fresh \
+                         bracket part(s)",
+                        self.id, size, PART_ATTEMPTS
+                    );
+                    return Err(WriteError::CannotAllocateSpace);
+                }
+                LeasedPlacement::Unusable => {
+                    // Busy, not full. Leave it alone and take the ordinary
+                    // path, which claims and leases a head of its own.
+                }
+            }
         }
         self.try_acquire_claim(size, full_gc, segment_class)
     }
 
     /// Claim space for a transaction's BEGIN and write it, taking the lease.
+    /// `first_entry_size` is what the caller is about to write. The part is
+    /// claimed with room for BEGIN *and* that entry, because a head that fits
+    /// a 24-byte marker need not fit the entry behind it -- and a bracket part
+    /// whose first entry does not fit is a part that has to be abandoned
+    /// immediately.
     fn open_transaction_bracket(
         &self,
         full_gc: bool,
         segment_class: SegmentClass,
+        first_entry_size: u32,
     ) -> Result<(), WriteError> {
         let Some(txn) = current_txn() else {
             return Ok(());
         };
+        // Link the part being left behind, at its fixed tail, BEFORE the new
+        // one exists: the link names the PREVIOUS part's seq, so it is
+        // verifiable the moment it is written and needs no forward reference
+        // to something not yet durable.
+        // Link ONLY a head with no room left. Anything else is still in use
+        // by this transaction, and stamping a tail link into it would zero
+        // space the segment still owns.
+        if let Some(previous) = self.newest_leased_head().filter(|head| {
+            head.bound().saturating_sub(head.append_header.load(Ordering::Acquire))
+                < crate::ram::bracket::TXN_CONT_ENTRY_SIZE * 2
+        }) {
+            let link = crate::ram::bracket::encode_txn_cont(&txn, previous.seq_id);
+            if !previous.seal_as_chain_part(&link) {
+                warn!(
+                    "chunk {} could not stamp a chain link in segment {}; the transaction \
+                     continues in a fresh head and its parts are joined by the manifest alone",
+                    self.id, previous.id
+                );
+            }
+        }
         let content = crate::ram::bracket::encode_begin(&txn);
-        let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
-        let pending = self.try_acquire_claim(size, full_gc, segment_class)?;
-        debug_assert!(
-            pending.leased,
-            "the claim that opens a bracket must be the one that takes the lease"
-        );
+        let begin_size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
+        // Claim both, so the head chosen can hold the entry that follows.
+        let mut pending =
+            self.try_acquire_claim(begin_size + first_entry_size, full_gc, segment_class)?;
+        if !pending.leased {
+            // The claim could not take a lease -- the head was being
+            // reclaimed underneath it. Without a lease there is no bracket to
+            // open: writing a BEGIN nobody owns would leave a marker with no
+            // COMMIT and make ordinary entries after it look transactional.
+            drop(pending);
+            return Ok(());
+        }
         crate::ram::entry::Entry::encode_to(
             pending.addr,
             crate::ram::entry::EntryType::BEGIN,
@@ -1304,6 +1475,19 @@ impl Chunk {
                 );
             },
         );
+        // Hand the rest of the claim back so the caller's entry lands
+        // immediately behind the BEGIN. Rewinding is safe for the same reason
+        // an abort's rewind is: the head is leased, so nothing else can have
+        // taken the space between the claim and here.
+        let entry_start = pending.addr + begin_size as usize;
+        pending.size = begin_size;
+        if first_entry_size > 0 && !pending.seg.rewind_to(entry_start) {
+            warn!(
+                "chunk {} could not hand back the tail of a bracket claim in segment {}; the \
+                 caller's entry takes fresh space and these bytes become padding",
+                self.id, pending.seg.id
+            );
+        }
         // Dropping it journals the BEGIN, exactly like any other entry.
         drop(pending);
         Ok(())
@@ -3045,7 +3229,15 @@ impl Chunk {
                 // Validate entry type is a known valid type (CELL or TOMBSTONE)
                 // Invalid types indicate we're reading garbage (possibly from inside another entry)
                 // which can happen if append_header was set incorrectly by a previous operation
-                debug_assert!(entry_header.entry_type == EntryType::CELL || entry_header.entry_type == EntryType::TOMBSTONE);
+                debug_assert!(matches!(
+                    entry_header.entry_type,
+                    EntryType::CELL
+                        | EntryType::TOMBSTONE
+                        | EntryType::PADDING
+                        | EntryType::BEGIN
+                        | EntryType::COMMIT
+                        | EntryType::TXN_CONT
+                ));
 
                 // Validate that entry size is reasonable (must be at least header size and 8-byte aligned)
                 // Real entries are always 8-byte aligned; non-aligned sizes indicate corruption
@@ -3094,6 +3286,33 @@ impl Chunk {
                         } else {
                             trace!("Tombstone target at seq_id {} have been removed, will be ditched", tombstone.segment_seq_id)
                         }
+                } else if matches!(
+                    entry_header.entry_type,
+                    EntryType::BEGIN | EntryType::COMMIT | EntryType::TXN_CONT
+                ) {
+                    // Bracket markers are never live, and DROPPING them is
+                    // the correct thing for a compaction to do rather than an
+                    // omission.
+                    //
+                    // A compacted segment no longer contains the bracket: the
+                    // cells that survive are the ones the index still points
+                    // at, which are exactly the committed ones, and they come
+                    // out the far side as ordinary entries that recovery
+                    // applies unconditionally. Carrying a BEGIN across would
+                    // be worse than useless -- it would make whatever cells
+                    // follow it in the new segment look like they belonged to
+                    // a transaction that has no COMMIT there.
+                    //
+                    // This is safe only because an UNDECIDED bracket cannot
+                    // be compacted at all: its segment is still leased by the
+                    // transaction, and the cleaner skips leased heads (they
+                    // are active heads and they hold a reference). The lease
+                    // is what gates the cleaner, structurally, rather than a
+                    // check that could be forgotten.
+                    trace!(
+                        "Entry at {} is a bracket marker; dropped by compaction",
+                        entry_meta.entry_pos
+                    );
                 } else if entry_header.entry_type == EntryType::PADDING {
                     // Space that holds no data: recovery stamps it over the
                     // gap an abandoned reservation left, and the writer
@@ -3779,12 +3998,29 @@ impl Chunks {
 
     pub fn sync_all(&self) {
         info!("Syncing WAL for all chunks...");
+        let mut failures = 0usize;
         for chunk in &self.list {
             for segment in chunk.segs.iter_values() {
-                segment.force_wal_sync();
+                // A swallowed sync failure here is a store that reports
+                // itself synced while its log is not on disk -- the exact
+                // shape of promise this campaign exists to stop making.
+                if let Err(error) = segment.force_wal_sync() {
+                    error!(
+                        "sync_all could not sync segment {} (chunk {}): {:?}",
+                        segment.id, segment.chunk_id, error
+                    );
+                    failures += 1;
+                }
             }
         }
-        info!("All WAL data synced to disk.");
+        if failures > 0 {
+            error!(
+                "sync_all left {} segment(s) unsynced; their most recent writes are NOT durable",
+                failures
+            );
+        } else {
+            info!("All WAL data synced to disk.");
+        }
     }
 
     /// Refuse further entry allocation, everywhere, before shutdown archives.
@@ -4558,6 +4794,76 @@ mod tests {
         assert_eq!(
             plain.seg.id, first_seg,
             "the released head returns to the pool rather than being stranded"
+        );
+    }
+
+    /// An aborted transaction's writes VANISH: the cursor goes back and the
+    /// span becomes padding a walk steps over.
+    ///
+    /// Only ownership makes this expressible. If another writer could have
+    /// appended behind the transaction, its bytes would sit inside the span
+    /// being disowned -- so the lease running to the decision is not a
+    /// convenience here, it is the precondition.
+    #[test]
+    fn an_aborted_transaction_leaves_no_entries_behind() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(77);
+
+        set_transaction_id(Some(txn.clone()));
+        let first = chunk.try_acquire(64, false).expect("first entry");
+        let seg = first.seg.clone();
+        // Where the transaction found the cursor. Its BEGIN is the first
+        // thing in the run, so the span to disown starts at the BEGIN.
+        let before = {
+            let leases = TXN_LEASES.lock();
+            leases
+                .get(&txn)
+                .unwrap()
+                .per_chunk
+                .get(&chunk.id)
+                .unwrap()
+                .first()
+                .unwrap()
+                .pre_cursor
+        };
+        drop(first);
+        let second = chunk.try_acquire(64, false).expect("second entry");
+        drop(second);
+        let after = seg.append_header.load(Ordering::Acquire);
+        assert!(
+            after > before,
+            "the transaction must have advanced the cursor before we undo it"
+        );
+        set_transaction_id(None);
+
+        assert_eq!(rewind_transaction_writes(&txn), 1);
+        assert_eq!(
+            seg.append_header.load(Ordering::Acquire),
+            before,
+            "the cursor must be back where the transaction found it"
+        );
+        // The bytes are still in the WAL, so what matters is that a walk over
+        // them finds padding rather than entries.
+        let (header, _) = crate::ram::entry::Entry::decode_from(before, |_, _| {});
+        assert_eq!(
+            header.entry_type,
+            crate::ram::entry::EntryType::PADDING,
+            "the disowned span must read as padding, not as the entries it used to hold"
+        );
+        assert_eq!(
+            crate::ram::entry::verify_entry_at(before),
+            Some(true),
+            "and that padding must vouch for itself like any other entry"
+        );
+        // The head is back in circulation.
+        assert_eq!(transaction_lease_count(&txn), 0);
+        let plain = chunk.try_acquire(64, false).expect("plain entry after abort");
+        assert_eq!(plain.seg.id, seg.id);
+        assert_eq!(
+            plain.addr, before,
+            "the reclaimed span is reused, so an abort costs no space at all"
         );
     }
 

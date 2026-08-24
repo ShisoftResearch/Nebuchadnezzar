@@ -860,6 +860,84 @@ impl Segment {
         self.segment_class
     }
 
+    /// Undo a transaction's writes physically: stamp padding over them and
+    /// put the cursor back.
+    ///
+    /// Safe only because of the lease. One writer owns a segment while a
+    /// transaction writes into it, so there is nothing after the
+    /// transaction's entries to disturb -- which is what lets an abort make
+    /// the writes VANISH instead of recording undo entries that a later
+    /// rollback has to replay.
+    ///
+    /// The padding matters as much as the cursor: the bytes are already in
+    /// the WAL, so recovery will rebuild an image containing them. Padding
+    /// makes that image walk straight over the span; rewinding the cursor
+    /// alone would leave entries a scan still reads.
+    pub fn rewind_to(&self, cursor: usize) -> bool {
+        let current = self.append_header.load(Ordering::Acquire);
+        if cursor < self.addr || cursor > current {
+            return false;
+        }
+        let span = current - cursor;
+        if span == 0 {
+            return true;
+        }
+        if span < crate::ram::entry::ENTRY_HEAD_SIZE {
+            return false;
+        }
+        crate::ram::entry::stamp_checked_padding(cursor, span as u32);
+        self.append_header.store(cursor, Ordering::Release);
+        true
+    }
+
+    /// Where a chain link lives: the last `TXN_CONT_ENTRY_SIZE` bytes of the
+    /// segment's usable space.
+    ///
+    /// A FIXED position is the whole point. Recovery reads it without
+    /// scanning, so deciding whether a segment belongs to a chain -- and
+    /// discarding an aborted chain's parts without ever walking them -- costs
+    /// one read per segment instead of a full pass.
+    pub fn chain_link_offset(&self) -> usize {
+        let usable = self.bound() - self.addr;
+        let tail = usable.saturating_sub(crate::ram::bracket::TXN_CONT_ENTRY_SIZE);
+        // Entries are 8-byte aligned and so is the link.
+        tail - (tail % crate::ram::entry::ENTRY_HEAD_SIZE)
+    }
+
+    /// Close this segment as a full chain part: zero the gap, stamp the link
+    /// at the fixed tail, and take the segment out of use.
+    ///
+    /// Zeros are safe here in a way they are not in a shared segment: the
+    /// link bounds the live region from OUTSIDE, so recovery knows where the
+    /// entries stop before it reads a single one. That is what removes the
+    /// ambiguity that forces PADDING entries elsewhere.
+    ///
+    /// Only the transaction that owns this head may call this.
+    pub fn seal_as_chain_part(&self, link: &[u8]) -> bool {
+        let tail_offset = self.chain_link_offset();
+        let tail_addr = self.addr + tail_offset;
+        let cursor = self.append_header.load(Ordering::Acquire);
+        if cursor > tail_addr {
+            // No room for the link. The caller must not chain from here.
+            return false;
+        }
+        unsafe {
+            std::ptr::write_bytes(cursor as *mut u8, 0, tail_addr - cursor);
+        }
+        crate::ram::entry::Entry::encode_to(
+            tail_addr,
+            crate::ram::entry::EntryType::TXN_CONT,
+            link.len() as u32,
+            |content_addr| unsafe {
+                std::ptr::copy_nonoverlapping(link.as_ptr(), content_addr as *mut u8, link.len());
+            },
+        );
+        // Nothing may follow the link, so the segment is full from here.
+        self.append_header
+            .store(self.addr + tail_offset + crate::ram::bracket::TXN_CONT_ENTRY_SIZE, Ordering::Release);
+        true
+    }
+
     pub fn try_acquire(&self, size: u32) -> Option<usize> {
         // A sealed segment is out of append space by definition, whatever its
         // cursor says: it has a backup at its seq id, so an append here could

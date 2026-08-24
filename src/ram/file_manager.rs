@@ -95,7 +95,14 @@ impl SegmentFileManager {
             let existing_len = file.metadata()?.len();
             if existing_len == 0 {
                 use std::io::Write;
-                file.write_all(&crate::ram::wal_format::wal_file_header(seq_id))?;
+                // Stamp the watermark as of NOW. Anything older than it was
+                // already decided when this file began, so a bracket in here
+                // that is missing its COMMIT and sits below the watermark was
+                // cleaned rather than abandoned.
+                file.write_all(&crate::ram::wal_format::wal_file_header_with_watermark(
+                    seq_id,
+                    crate::ram::chunk::undecided_watermark(),
+                ))?;
                 file.sync_data()?;
             } else {
                 // Appending framed records to an unframed log would leave one

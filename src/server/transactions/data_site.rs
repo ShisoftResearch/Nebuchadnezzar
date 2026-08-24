@@ -4259,6 +4259,31 @@ impl Service for DataManager {
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
 
+        // Now that the rollback has taken the index off this transaction's
+        // entries, the entries themselves can go: padding over the span and
+        // the cursor back where it started, so an abort leaves no trace to
+        // scan, collect or recover.
+        //
+        // Order is the safety property. Rewinding BEFORE the rollback would
+        // pad over bytes the index still points at, and a read would land on
+        // padding where a cell used to be. Only a transaction that still
+        // owns its heads can do this at all, which is why the lease runs to
+        // the decision.
+        //
+        // A rollback that partly failed keeps its span: those cells are still
+        // referenced, so disowning the bytes underneath them is exactly the
+        // hazard this ordering avoids.
+        if rollback_failures.is_none() {
+            let rewound = crate::ram::chunk::rewind_transaction_writes(&tid);
+            if rewound > 0 {
+                debug!(
+                    "aborted transaction {:?}: rewound {} segment span(s); its writes leave no \
+                     dead space behind",
+                    tid, rewound
+                );
+            }
+        }
+
         drop(cell_guards);
         drop(txn);
         drop(guards_to_drop);

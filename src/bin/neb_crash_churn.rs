@@ -803,9 +803,25 @@ async fn child_async(
                 missing += 1;
             } else {
                 torn += 1;
+                // WHICH cells are gone matters more than how many: the four
+                // land in four different partitions, so the pattern says
+                // whether one chunk lost a bracket or one position always
+                // loses.
+                let mut lost = Vec::new();
+                for i in 0..TXN_CELLS {
+                    let seq = base + i;
+                    let id = Id::from_parts(72 + (seq % 8), seq);
+                    if !matches!(client.read_cell(id).await, Ok(Ok(_))) {
+                        lost.push(format!("i={} part={} seq={}", i, 72 + (seq % 8), seq));
+                    }
+                }
                 println!(
-                    "TXN_TORN round={} found={}/{} -- a committed transaction came back in pieces",
-                    round, found, TXN_CELLS
+                    "TXN_TORN round={} found={}/{} missing[{}] -- a committed transaction came \
+                     back in pieces",
+                    round,
+                    found,
+                    TXN_CELLS,
+                    lost.join(", ")
                 );
             }
             round += stride;
