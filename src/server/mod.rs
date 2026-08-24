@@ -2213,7 +2213,21 @@ impl NebServer {
         // the ranged index died at shutdown while every data cell survived,
         // which read as "cells fine, sidecar scans empty" after restart.
         let mut flushed_secondary_trees = false;
-        for (database_name, _) in &secondary_runtimes {
+        for (database_name, secondary_runtime) in &secondary_runtimes {
+            // A database with no index builder has no ranged index, so there
+            // are no in-memory index inserts for a flush to save and nothing
+            // for a failed flush to lose. Attempting anyway produced a loud
+            // "its ranged index will lose recent inserts" on EVERY shutdown
+            // of every such database -- which is most of the test suite --
+            // and an error that is always present is an error nobody reads.
+            // The point of keeping the message loud below is that it means
+            // something; that only holds if it stays quiet here.
+            if secondary_runtime.indexer.is_none() {
+                debug!(
+                    "Skipping LSM flush for {database_name}: no index builder, so no                      ranged index to flush"
+                );
+                continue;
+            }
             info!("Flushing dynamically-loaded database {database_name} before shutdown");
             let dummy_id = Id::allocated(0, 0, 1);
             // Bounded: the locate and the flush are RPCs, and a shutdown in
