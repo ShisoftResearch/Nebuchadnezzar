@@ -276,7 +276,6 @@ fn benchmark_server_options() -> ServerOptions {
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
-        undo_log_storage: None,
         raft_storage: None,
         services: vec![Service::Cell, Service::Transaction],
         index_enabled: false,

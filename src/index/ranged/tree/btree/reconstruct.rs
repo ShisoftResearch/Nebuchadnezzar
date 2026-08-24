@@ -507,7 +507,6 @@ mod test {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None, // No persistence for regular tests
                 index_enabled: false,
                 services: vec![Service::Cell],

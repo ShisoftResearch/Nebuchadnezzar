@@ -653,7 +653,6 @@ async fn child_async(
             tiered_config: None,
             backup_storage: Some(dir.join("backup").to_string_lossy().into_owned()),
             wal_storage: Some(dir.join("wal").to_string_lossy().into_owned()),
-            undo_log_storage: Some(dir.join("undo").to_string_lossy().into_owned()),
             raft_storage: Some(dir.join("raft").to_string_lossy().into_owned()),
             index_enabled: true,
             services: vec![
@@ -730,6 +729,17 @@ async fn child_async(
             return Err("scan failed to open".into());
         }
     }
+    // What recovery decided about transactions, every run. These counters
+    // existed but nothing read them, which is the same as not having them:
+    // the torn-transaction hunt would have been far shorter with this line.
+    println!(
+        "RECOVERY brackets_applied={} brackets_discarded={} damaged_entries={} leases_expired={}",
+        neb::ram::recovery::BRACKETS_APPLIED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::ram::recovery::BRACKETS_DISCARDED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::ram::recovery::RECOVERY_DAMAGED_ENTRIES.load(std::sync::atomic::Ordering::Relaxed),
+        neb::ram::chunk::TXN_LEASES_EXPIRED.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    flush_stdout();
     println!("SCANNED n={}", count);
     flush_stdout();
     // A store that ran out of room is a CONFIGURATION outcome, not a

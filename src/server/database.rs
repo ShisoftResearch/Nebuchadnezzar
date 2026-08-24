@@ -37,7 +37,6 @@ pub struct DatabaseCatalogSM {
 pub struct DatabaseStorageLayout {
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
-    pub undo_log_storage: Option<String>,
     pub raft_storage: Option<String>,
 }
 
@@ -125,11 +124,6 @@ impl DatabaseStorageLayout {
         DatabaseStorageLayout {
             backup_storage: scoped_storage_path(&opts.backup_storage, database_name, should_scope),
             wal_storage: scoped_storage_path(&opts.wal_storage, database_name, should_scope),
-            undo_log_storage: scoped_storage_path(
-                &opts.undo_log_storage,
-                database_name,
-                should_scope,
-            ),
             raft_storage: scoped_storage_path(&opts.raft_storage, database_name, should_scope),
         }
     }
@@ -190,7 +184,6 @@ mod tests {
             tiered_config: None,
             backup_storage: Some(temp_path("backup")),
             wal_storage: Some(temp_path("wal")),
-            undo_log_storage: Some(temp_path("undo")),
             raft_storage: Some(temp_path("raft")),
             services: vec![],
             index_enabled: false,
@@ -206,7 +199,6 @@ mod tests {
 
         assert_eq!(layout.backup_storage, opts.backup_storage);
         assert_eq!(layout.wal_storage, opts.wal_storage);
-        assert_eq!(layout.undo_log_storage, opts.undo_log_storage);
         assert_eq!(layout.raft_storage, opts.raft_storage);
     }
 

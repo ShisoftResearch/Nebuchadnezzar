@@ -2102,7 +2102,6 @@ async fn create_alignment_test_server(port: u16) -> Arc<NebServer> {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![Service::Cell, Service::Query],

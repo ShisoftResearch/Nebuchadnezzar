@@ -1470,7 +1470,6 @@ mod cluster_tests {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services,
@@ -2605,7 +2604,6 @@ mod cluster_tests {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             // The whole point: every other migration test leaves this off.
             index_enabled: true,
@@ -2893,7 +2891,6 @@ mod cluster_tests {
                     .to_string_lossy()
                     .to_string(),
             ),
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell],
@@ -3362,7 +3359,6 @@ mod cluster_tests {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell],
@@ -3547,7 +3543,6 @@ mod cluster_tests {
                 // measurement would be of nothing.
                 backup_storage: Some(member_root.join("backup").to_string_lossy().to_string()),
                 wal_storage: Some(member_root.join("wal").to_string_lossy().to_string()),
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: false,
                 services: vec![Service::Cell],

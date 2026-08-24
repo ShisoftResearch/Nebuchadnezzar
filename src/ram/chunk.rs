@@ -394,9 +394,8 @@ enum LeasedPlacement {
 pub struct HeadLease {
     seg: AArc<Segment>,
     /// Where this segment's cursor stood before the transaction wrote into
-    /// it. Recorded now, used by abort-by-rewind later: the value has to be
-    /// captured at claim time or it cannot be reconstructed at all.
-    #[allow(dead_code)]
+    /// it. This is what an abort rewinds to, and it can only be captured at
+    /// claim time -- after the fact it cannot be reconstructed.
     pre_cursor: usize,
 }
 

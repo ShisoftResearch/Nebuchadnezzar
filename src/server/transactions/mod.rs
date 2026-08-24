@@ -16,7 +16,6 @@ mod occ_tests;
 pub mod phase_profile;
 #[cfg(test)]
 mod tests;
-pub mod undo_log;
 
 pub type TxnId = bifrost::hlc::Hlc;
 

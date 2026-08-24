@@ -1378,7 +1378,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![crate::server::Service::Cell],
@@ -1502,7 +1501,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![crate::server::Service::Cell],
@@ -1668,7 +1666,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![crate::server::Service::Cell],
@@ -1869,7 +1866,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![crate::server::Service::Cell],
@@ -2022,7 +2018,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![
@@ -2132,7 +2127,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![
@@ -2242,7 +2236,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![
@@ -2328,7 +2321,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![
@@ -2407,7 +2399,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true, // Enable indexing
                 services: vec![crate::server::Service::Cell],
@@ -2617,7 +2608,6 @@ mod tests {
                     tiered_config: None,
                     backup_storage: None,
                     wal_storage: None,
-                    undo_log_storage: None,
                     raft_storage: None,
                     index_enabled: true,
                     services: vec![crate::server::Service::Cell],
@@ -2838,7 +2828,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
-                undo_log_storage: None,
                 raft_storage: Some(raft_path.clone()),
                 index_enabled: true,
                 services: vec![
@@ -3159,7 +3148,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
-                undo_log_storage: None,
                 raft_storage: Some(raft_path.clone()),
                 index_enabled: true,
                 services: vec![
@@ -3333,7 +3321,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
-                undo_log_storage: None,
                 raft_storage: Some(raft_path.clone()),
                 index_enabled: true,
                 services: vec![
@@ -3445,7 +3432,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: Some(backup_path.clone()),
                 wal_storage: Some(wal_path.clone()),
-                undo_log_storage: None,
                 raft_storage: Some(raft_path.clone()),
                 index_enabled: true,
                 services: vec![
@@ -3570,7 +3556,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![crate::server::Service::Cell],
@@ -3731,7 +3716,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: true,
                 services: vec![crate::server::Service::Cell],

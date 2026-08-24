@@ -443,6 +443,11 @@ pub struct BracketLedger {
 struct PendingBracketCell {
     chunk_id: usize,
     hash: u64,
+    /// A transaction can DELETE as well as write, and a committed delete has
+    /// to land as surely as a committed write. Buffering only the writes made
+    /// a transaction's deletes vanish -- the cell stayed alive, which is the
+    /// same class of wrongness as a lost write and harder to notice.
+    tombstone: bool,
     /// The virtual address the entry occupies once its segment is installed,
     /// which stays valid after the scan -- the cells live in the segment's
     /// mapped memory, not in the scan's buffer.
@@ -574,6 +579,21 @@ fn apply_bracketed_cell(chunks: &[Chunk], cell: &PendingBracketCell) {
         );
         return;
     };
+    if cell.tombstone {
+        // A committed delete: clear the index if nothing newer has claimed
+        // the id since. Same version rule as a write, opposite effect.
+        if let Some(mut guard) = chunk.cell_index.lock(cell.hash as usize) {
+            let existing = *guard;
+            if existing != 0 {
+                let existing_version =
+                    crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+                if cell.version >= existing_version {
+                    *guard = 0;
+                }
+            }
+        }
+        return;
+    }
     let mut guard = chunk
         .cell_index
         .lock_or_insert(cell.hash as usize, cell.addr);
@@ -1243,8 +1263,22 @@ fn scan_segment_from_data(
                     PendingBracketCell {
                         chunk_id: chunk.id,
                         hash: cell_header.id.bits(),
+                        tombstone: false,
                         addr: virtual_cursor,
                         version: cell_header.version,
+                        content_length: entry_header.content_length,
+                    },
+                );
+            } else if entry_header.entry_type == EntryType::TOMBSTONE {
+                let tombstone = Tombstone::read(cursor);
+                ledger.note_pending(
+                    txn,
+                    PendingBracketCell {
+                        chunk_id: chunk.id,
+                        hash: tombstone.id.bits(),
+                        tombstone: true,
+                        addr: virtual_cursor,
+                        version: tombstone.version,
                         content_length: entry_header.content_length,
                     },
                 );
@@ -1801,7 +1835,7 @@ pub fn recover_chunks(
                     let segment_class = scan_result.segment_class;
                     if trace_pages_enabled() {
                         warn!(
-                            "FILE-TRACE scanned chunk={} seg={} seq={} backup={} append_offset={} dead={} tombstones={} class={:?}",
+                            "FILE-TRACE scanned chunk={} seg={} seq={} backup={} append_offset={} dead={} tombstones={} class={:?} chain_link={:?}",
                             chunk_id,
                             file_info.seg_id,
                             file_info.seq_id,
@@ -1809,7 +1843,8 @@ pub fn recover_chunks(
                             scan_result.append_offset,
                             scan_result.dead_space,
                             scan_result.tombstones,
-                            segment_class
+                            segment_class,
+                            scan_result.chain_link
                         );
                     }
 

@@ -90,7 +90,6 @@ impl StorageDirectoryLocks {
         let mut directories = BTreeSet::new();
         directories.extend(layout.backup_storage.iter().cloned());
         directories.extend(layout.wal_storage.iter().cloned());
-        directories.extend(layout.undo_log_storage.iter().cloned());
         directories.extend(layout.raft_storage.iter().cloned());
 
         let mut guards = Vec::with_capacity(directories.len());
@@ -243,7 +242,6 @@ mod tests {
         DatabaseStorageLayout {
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: Some(path.to_string_lossy().to_string()),
         }
     }

@@ -953,7 +953,6 @@ pub struct ServerOptions {
     pub tiered_config: Option<crate::ram::tiered::TieredConfig>,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
-    pub undo_log_storage: Option<String>,
     pub raft_storage: Option<String>,
     pub services: Vec<Service>,
     pub index_enabled: bool,
@@ -983,7 +982,6 @@ pub struct DatabaseRuntime {
     pub meta: Arc<ServerMeta>,
     pub cleaner: Arc<Cleaner>,
     pub indexer: Option<Arc<IndexBuilder>>,
-    pub undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
     pub txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
@@ -1005,7 +1003,6 @@ impl DatabaseRuntime {
         meta: Arc<ServerMeta>,
         cleaner: Arc<Cleaner>,
         indexer: Option<Arc<IndexBuilder>>,
-        undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
         txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
         rpc: Arc<rpc::Server>,
         consh: Arc<ConsistentHashing>,
@@ -1021,7 +1018,6 @@ impl DatabaseRuntime {
             meta,
             cleaner,
             indexer,
-            undo_log,
             txn_manager,
             rpc,
             consh,
@@ -1113,9 +1109,6 @@ impl DatabaseRuntime {
         self.indexer.as_ref()
     }
 
-    pub fn undo_log(&self) -> Option<&Arc<transactions::undo_log::UndoLogger>> {
-        self.undo_log.as_ref()
-    }
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.txn_manager.as_ref()
@@ -1539,7 +1532,6 @@ impl NebServer {
         let effective_opts = ServerOptions {
             backup_storage: storage_layout.backup_storage,
             wal_storage: storage_layout.wal_storage,
-            undo_log_storage: storage_layout.undo_log_storage,
             raft_storage: storage_layout.raft_storage,
             ..opts.clone()
         };
@@ -1637,35 +1629,6 @@ impl NebServer {
             index_builder.initialize_inverted_indexer(&chunks);
         }
 
-        let undo_log = if let Some(ref undo_log_path) = effective_opts.undo_log_storage {
-            match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
-                Ok(log) => {
-                    if effective_opts.enable_recovery {
-                        match log.recover() {
-                            Ok(txn_index) => {
-                                if let Err(e) =
-                                    log.rollback_incomplete_transactions(txn_index, &chunks)
-                                {
-                                    error!("Failed to rollback incomplete transactions: {:?}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to recover undo log: {:?}", e);
-                            }
-                        }
-                    }
-
-                    Some(log)
-                }
-                Err(e) => {
-                    error!("Failed to initialize undo log: {:?}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         let cleaner = if effective_opts.enable_recovery {
             debug!(
                 "Recovery enabled: Starting cleaner in PAUSED state for database {}",
@@ -1684,7 +1647,6 @@ impl NebServer {
             meta_rc.clone(),
             cleaner.clone(),
             index_builder.clone(),
-            undo_log.clone(),
             None,
             rpc_server.clone(),
             conshasing.clone(),
@@ -1717,7 +1679,6 @@ impl NebServer {
             meta_rc.clone(),
             cleaner,
             index_builder.clone(),
-            undo_log,
             transaction_manager,
             rpc_server.clone(),
             conshasing.clone(),
@@ -2033,7 +1994,6 @@ impl NebServer {
         let mut storage_roots = HashSet::new();
         storage_roots.extend(layout.backup_storage);
         storage_roots.extend(layout.wal_storage);
-        storage_roots.extend(layout.undo_log_storage);
         storage_roots.extend(layout.raft_storage);
 
         for storage_root in storage_roots {
@@ -2072,9 +2032,6 @@ impl NebServer {
         self.database_runtime.indexer()
     }
 
-    pub fn undo_log(&self) -> Option<&Arc<transactions::undo_log::UndoLogger>> {
-        self.database_runtime.undo_log()
-    }
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.database_runtime.txn_manager()
@@ -2411,7 +2368,6 @@ impl NebServer {
                     &[
                         opts.backup_storage.as_deref(),
                         opts.wal_storage.as_deref(),
-                        opts.undo_log_storage.as_deref(),
                     ],
                     database_name,
                 )
@@ -2562,7 +2518,6 @@ impl NebServer {
             &[
                 opts.backup_storage.as_deref(),
                 opts.wal_storage.as_deref(),
-                opts.undo_log_storage.as_deref(),
             ],
             database_name,
         );

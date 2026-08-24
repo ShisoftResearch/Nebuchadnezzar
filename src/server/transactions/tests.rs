@@ -33,7 +33,6 @@ pub async fn workspace_wr() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             disable_storage_locks: true,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
         },
         &server_addr,
@@ -178,7 +177,6 @@ pub async fn data_site_wr() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             disable_storage_locks: true,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
         },
         &server_addr,
@@ -286,7 +284,6 @@ pub async fn data_site_commit_waits_for_hashed_indices() {
             ],
             enable_recovery: false,
             disable_storage_locks: true,
-            undo_log_storage: None,
             raft_storage: None,
         },
         &server_addr,
@@ -364,7 +361,6 @@ pub async fn multi_transaction() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             disable_storage_locks: true,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
         },
         &server_addr,
@@ -488,7 +484,6 @@ pub async fn smoke_rw() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             disable_storage_locks: true,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
         },
         &server_addr,
@@ -572,7 +567,6 @@ pub async fn head_then_remove_commits() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             disable_storage_locks: true,
-            undo_log_storage: None,
             raft_storage: None,
         },
         &server_addr,

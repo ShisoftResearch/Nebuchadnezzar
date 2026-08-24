@@ -372,23 +372,6 @@ impl DataManager {
             }
         });
 
-        // Spawn undo log trimming task if undo log is enabled
-        if manager.undo_log().is_some() {
-            let manager_clone = manager.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(300)).await; // Trim every 5 minutes
-                    if let Some(undo_log) = manager_clone.undo_log() {
-                        if let Err(e) = undo_log.trim_old_logs() {
-                            error!("Failed to trim undo logs: {:?}", e);
-                        } else {
-                            debug!("Successfully trimmed old undo logs");
-                        }
-                    }
-                }
-            });
-        }
-
         return manager;
     }
     fn update_clock(&self, clock: Hlc) {
@@ -525,9 +508,6 @@ impl DataManager {
     }
 
     #[inline]
-    fn undo_log(&self) -> Option<&Arc<super::undo_log::UndoLogger>> {
-        self.database_runtime.undo_log()
-    }
 
     /// Create a segment reference guard to prevent eviction during transaction.
     /// Returns None if the segment is not found (already freed/evicted) or is
@@ -981,19 +961,6 @@ impl DataManager {
 
                         match self.chunks().write_cell(&mut cell) {
                             Ok(header) => {
-                                if let Some(undo_log) = self.undo_log() {
-                                    let undo_entry = super::undo_log::UndoLogEntry::new_write(
-                                        tid.clone(),
-                                        cell_id,
-                                        header.version,
-                                    );
-                                    if let Err(error) = undo_log.write_undo_entry(undo_entry) {
-                                        error!(
-                                            "Failed to write undo log entry for new cell: {:?}",
-                                            error
-                                        );
-                                    }
-                                }
                                 txn.history
                                     .insert(cell_id, CellHistory::new(None, header.version));
                                 meta.write = effective_ts.clone();
@@ -1056,20 +1023,6 @@ impl DataManager {
                             }
                         };
 
-                        if let Some(undo_log) = self.undo_log() {
-                            let undo_entry = super::undo_log::UndoLogEntry::new_restore(
-                                tid.clone(),
-                                *cell_id,
-                                super::undo_log::UndoOpType::Remove,
-                                expected_version,
-                                chunk_idx as u64,
-                                seq_id,
-                                cell_offset,
-                            );
-                            if let Err(error) = undo_log.write_undo_entry(undo_entry) {
-                                error!("Failed to write undo log entry: {:?}", error);
-                            }
-                        }
 
                         match self
                             .chunks()
@@ -1138,20 +1091,6 @@ impl DataManager {
                             }
                         };
 
-                        if let Some(undo_log) = self.undo_log() {
-                            let undo_entry = super::undo_log::UndoLogEntry::new_restore(
-                                tid.clone(),
-                                cell_id,
-                                super::undo_log::UndoOpType::Update,
-                                expected_version,
-                                chunk_idx as u64,
-                                seq_id,
-                                cell_offset,
-                            );
-                            if let Err(error) = undo_log.write_undo_entry(undo_entry) {
-                                error!("Failed to write undo log entry: {:?}", error);
-                            }
-                        }
                         let mut old_cell_ref = None;
                         match self.chunks().update_cell_by(&cell_id, |cell_to_update| {
                             if cell_to_update.header.version == expected_version {
@@ -1604,7 +1543,6 @@ mod tests {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: false,
                 services: vec![NebService::Cell, NebService::Transaction],
@@ -4411,16 +4349,6 @@ impl Service for DataManager {
             // which is a coordinator-durability problem (the coordinator
             // keeps no durable record of its decision) and is tracked as
             // such -- it cannot be fixed by moving this write earlier.
-            if let Some(undo_log) = self.undo_log() {
-                let log_result = match txn_state {
-                    TxnState::Committed => undo_log.write_commit_marker(&tid),
-                    TxnState::Aborted => undo_log.write_abort_marker(&tid),
-                    _ => Ok(()), // No marker needed for other states
-                };
-                if let Err(e) = log_result {
-                    error!("Failed to write transaction completion marker: {:?}", e);
-                }
-            }
 
             self.wipe_out_transaction(&tid);
             self.cleanup_signal.store(true, Relaxed);

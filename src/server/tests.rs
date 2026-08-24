@@ -45,7 +45,6 @@ pub async fn init() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
             index_enabled: false,
             services: vec![],
@@ -66,7 +65,6 @@ pub async fn explicit_database_binding_scopes_storage_roots() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let backup_root = temp_dir.path().join("backup");
     let wal_root = temp_dir.path().join("wal");
-    let undo_root = temp_dir.path().join("undo");
     let raft_root = temp_dir.path().join("raft");
     let database_name = "analytics/db";
     let scoped_db_dir = "analytics_db";
@@ -78,7 +76,6 @@ pub async fn explicit_database_binding_scopes_storage_roots() {
             tiered_config: None,
             backup_storage: Some(backup_root.to_string_lossy().to_string()),
             wal_storage: Some(wal_root.to_string_lossy().to_string()),
-            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
             raft_storage: Some(raft_root.to_string_lossy().to_string()),
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -103,10 +100,6 @@ pub async fn explicit_database_binding_scopes_storage_roots() {
         "wal path should be scoped per database"
     );
     assert!(
-        undo_root.join("databases").join(scoped_db_dir).exists(),
-        "undo path should be scoped per database"
-    );
-    assert!(
         raft_root.join("databases").join(scoped_db_dir).exists(),
         "raft path should be scoped per database"
     );
@@ -126,7 +119,6 @@ pub async fn resolves_bound_database_runtime_by_name() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell],
@@ -179,7 +171,6 @@ pub async fn ensure_database_runtime_creates_new_database_runtime_on_live_host()
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -257,7 +248,6 @@ pub async fn unload_database_runtime_evicts_non_default_runtime() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction, Service::RangedIndexer],
@@ -308,7 +298,6 @@ pub async fn delete_database_storage_removes_scoped_paths() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let backup_root = temp_dir.path().join("backup");
     let wal_root = temp_dir.path().join("wal");
-    let undo_root = temp_dir.path().join("undo");
     let raft_root = temp_dir.path().join("raft");
 
     let server = NebServer::new_from_opts_in_database(
@@ -318,7 +307,6 @@ pub async fn delete_database_storage_removes_scoped_paths() {
             tiered_config: None,
             backup_storage: Some(backup_root.to_string_lossy().to_string()),
             wal_storage: Some(wal_root.to_string_lossy().to_string()),
-            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
             raft_storage: Some(raft_root.to_string_lossy().to_string()),
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -342,17 +330,14 @@ pub async fn delete_database_storage_removes_scoped_paths() {
     let scoped_db_dir = "analytics_db";
     let backup_path = backup_root.join("databases").join(scoped_db_dir);
     let wal_path = wal_root.join("databases").join(scoped_db_dir);
-    let undo_path = undo_root.join("databases").join(scoped_db_dir);
     let raft_path = raft_root.join("databases").join(scoped_db_dir);
 
     std::fs::create_dir_all(&backup_path).unwrap();
     std::fs::create_dir_all(&wal_path).unwrap();
-    std::fs::create_dir_all(&undo_path).unwrap();
     std::fs::create_dir_all(&raft_path).unwrap();
 
     assert!(backup_path.exists());
     assert!(wal_path.exists());
-    assert!(undo_path.exists());
     assert!(raft_path.exists());
 
     server
@@ -361,7 +346,6 @@ pub async fn delete_database_storage_removes_scoped_paths() {
 
     assert!(!backup_path.exists());
     assert!(!wal_path.exists());
-    assert!(!undo_path.exists());
     assert!(!raft_path.exists());
 
     server.shutdown().await;
@@ -378,7 +362,6 @@ pub async fn unload_database_runtime_unchecked_allows_default() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -425,7 +408,6 @@ pub async fn delete_database_storage_unchecked_allows_default() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let backup_root = temp_dir.path().join("backup");
     let wal_root = temp_dir.path().join("wal");
-    let undo_root = temp_dir.path().join("undo");
     let raft_root = temp_dir.path().join("raft");
 
     let group = "default_storage_unchecked_group";
@@ -436,7 +418,6 @@ pub async fn delete_database_storage_unchecked_allows_default() {
             tiered_config: None,
             backup_storage: Some(backup_root.to_string_lossy().to_string()),
             wal_storage: Some(wal_root.to_string_lossy().to_string()),
-            undo_log_storage: Some(undo_root.to_string_lossy().to_string()),
             raft_storage: Some(raft_root.to_string_lossy().to_string()),
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -505,7 +486,6 @@ pub async fn smoke_test() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
             index_enabled: false,
             services: vec![Service::Cell],
@@ -588,7 +568,6 @@ pub async fn smoke_test_parallel() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
             index_enabled: false,
             services: vec![Service::Cell],
@@ -690,7 +669,6 @@ pub async fn txn() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
             index_enabled: false,
             services: vec![Service::Cell, Service::Transaction],
@@ -753,7 +731,6 @@ pub async fn indexed_parallel_rpc_writes_complete_without_global_index_barrier()
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![Service::Cell],
@@ -855,7 +832,6 @@ pub async fn schema_wal_recovery_test() {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: Some(raft_path_str.clone()),
                 index_enabled: false,
                 services: vec![Service::Cell],
@@ -971,7 +947,6 @@ pub async fn schema_wal_recovery_test() {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: Some(raft_path_str.clone()),
                 index_enabled: false,
                 services: vec![Service::Cell],
@@ -1063,7 +1038,6 @@ pub async fn schema_snapshot_recovery_test() {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: Some(raft_path_str.clone()), // Enable persistence for this test
                 index_enabled: false,
                 services: vec![Service::Cell],
@@ -1200,7 +1174,6 @@ pub async fn schema_snapshot_recovery_test() {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: Some(raft_path_str.clone()), // Resume from persisted state
                 index_enabled: false,
                 services: vec![Service::Cell],
@@ -1313,7 +1286,6 @@ pub async fn schema_persistence_multiple_restarts() {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: Some(raft_path_str.clone()), // Enable persistence for this test
                 index_enabled: false,
                 services: vec![Service::Cell],
@@ -1384,7 +1356,6 @@ pub async fn schema_persistence_multiple_restarts() {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: Some(raft_path_str.clone()), // Enable persistence for this test
                 index_enabled: false,
                 services: vec![Service::Cell],
@@ -1441,7 +1412,6 @@ pub async fn memory_status_test() {
             )),
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             services: vec![],
             index_enabled: false,
@@ -1537,7 +1507,6 @@ pub async fn compact_id_allocator_end_to_end() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell],
@@ -1612,7 +1581,6 @@ pub async fn dynamic_tail_layout_roundtrip_across_array_lengths() {
             services: vec![Service::Cell],
             enable_recovery: false,
             disable_storage_locks: true,
-            undo_log_storage: None,
             raft_storage: None,
         },
         &server_addr,
@@ -1731,7 +1699,6 @@ async fn a_server_that_goes_away_gives_its_threads_back() {
                 tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
-                undo_log_storage: None,
                 raft_storage: None,
                 index_enabled: false,
                 services: vec![Service::Cell],
@@ -1864,7 +1831,6 @@ async fn unloading_a_database_gives_its_threads_back() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: false,
             services: vec![Service::Cell],
@@ -2084,7 +2050,6 @@ async fn server_shutdown_thread_retention_probe() {
         tiered_config: None,
         backup_storage: None,
         wal_storage: None,
-        undo_log_storage: None,
         raft_storage: None,
         index_enabled: false,
         services: vec![Service::Cell],
@@ -2141,7 +2106,6 @@ async fn a_secondary_database_keeps_its_writes_across_a_graceful_restart() {
         tiered_config: None,
         backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
         wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
-        undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().to_string()),
         raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
         index_enabled: false,
         services: vec![Service::Cell],
@@ -2257,7 +2221,6 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         tiered_config: None,
         backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
         wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
-        undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().to_string()),
         raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
         index_enabled: true,
         services: vec![Service::Cell, Service::RangedIndexer],
@@ -2449,7 +2412,6 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         tiered_config: None,
         backup_storage: Some(temp_dir.path().join("backup").to_string_lossy().to_string()),
         wal_storage: Some(temp_dir.path().join("wal").to_string_lossy().to_string()),
-        undo_log_storage: Some(temp_dir.path().join("undo").to_string_lossy().to_string()),
         raft_storage: Some(temp_dir.path().join("raft").to_string_lossy().to_string()),
         index_enabled: true,
         services: vec![Service::Cell, Service::RangedIndexer],

@@ -219,7 +219,6 @@ async fn scan_all() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
             index_enabled: true,
             services: vec![Service::Cell, Service::Query],
@@ -448,7 +447,6 @@ async fn range_query_scan() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
             index_enabled: true,
             services: vec![Service::Cell, Service::Query],
@@ -533,7 +531,6 @@ async fn create_test_server(port: u16) -> Arc<NebServer> {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![Service::Cell, Service::Query],
@@ -3544,7 +3541,6 @@ async fn hashed_query_test() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None, // No persistence for regular tests
             index_enabled: true,
             services: vec![
@@ -3758,7 +3754,6 @@ async fn hashed_query_supports_array_values() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -3923,7 +3918,6 @@ async fn ranged_query_supports_array_values() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![Service::Cell, Service::Transaction, Service::Query],
@@ -4011,7 +4005,6 @@ async fn hashed_query_rejects_map_values() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -4089,7 +4082,6 @@ async fn bm25_search_returns_ranked_results() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -4197,7 +4189,6 @@ async fn query_ids_supports_text_match_operator_with_residual_filter() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -4305,7 +4296,6 @@ async fn query_ids_supports_text_match_operator_in_or_predicate() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -4413,7 +4403,6 @@ async fn query_ids_with_options_orders_text_match_results_by_ranged_field() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -4517,7 +4506,6 @@ async fn query_ids_preserves_bm25_order_for_plain_text_match() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -4616,7 +4604,6 @@ async fn query_ids_supports_nested_and_or_with_text_match_and_residual() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -4754,7 +4741,6 @@ async fn query_ids_with_options_supports_nested_or_and_order_limit() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -4883,7 +4869,6 @@ async fn query_ids_supports_embedding_similarity_operator_with_and_filter() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -5013,7 +4998,6 @@ async fn query_ids_supports_embedding_similarity_with_nested_or_and_residual() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -5153,7 +5137,6 @@ async fn query_ids_returns_error_when_embedding_similarity_search_fails() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![
@@ -5951,7 +5934,6 @@ async fn a_limited_scan_reads_cells_in_proportion_to_its_limit() {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![Service::Cell, Service::Query],

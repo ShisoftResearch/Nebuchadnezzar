@@ -75,7 +75,6 @@ async fn probe(addr: String, group: String, base_dir: String, max_seq: u64) -> R
             tiered_config: None,
             backup_storage: Some(dir.join("backup").to_string_lossy().into_owned()),
             wal_storage: Some(dir.join("wal").to_string_lossy().into_owned()),
-            undo_log_storage: Some(dir.join("undo").to_string_lossy().into_owned()),
             raft_storage: Some(dir.join("raft").to_string_lossy().into_owned()),
             index_enabled: true,
             services: vec![Service::Cell, Service::Query, Service::RangedIndexer],

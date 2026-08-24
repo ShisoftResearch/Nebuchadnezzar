@@ -11,7 +11,6 @@ struct ProbeArgs {
     database_name: String,
     backup_storage: String,
     wal_storage: String,
-    undo_log_storage: String,
     raft_storage: String,
     hold_secs: u64,
 }
@@ -34,9 +33,6 @@ impl ProbeArgs {
         let wal_storage = args
             .next()
             .ok_or_else(|| "missing wal_storage".to_string())?;
-        let undo_log_storage = args
-            .next()
-            .ok_or_else(|| "missing undo_log_storage".to_string())?;
         let raft_storage = args
             .next()
             .ok_or_else(|| "missing raft_storage".to_string())?;
@@ -52,7 +48,6 @@ impl ProbeArgs {
             database_name,
             backup_storage,
             wal_storage,
-            undo_log_storage,
             raft_storage,
             hold_secs,
         })
@@ -107,7 +102,6 @@ async fn async_main(args: ProbeArgs) -> Result<(), String> {
             tiered_config: None,
             backup_storage: Some(args.backup_storage.clone()),
             wal_storage: Some(args.wal_storage.clone()),
-            undo_log_storage: Some(args.undo_log_storage.clone()),
             raft_storage: Some(args.raft_storage.clone()),
             index_enabled: false,
             services: vec![],

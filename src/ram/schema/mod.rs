@@ -1039,7 +1039,6 @@ mod tests {
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            undo_log_storage: None,
             raft_storage: None,
             index_enabled: true,
             services: vec![Service::Cell],
