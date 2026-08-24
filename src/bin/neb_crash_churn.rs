@@ -258,6 +258,10 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // kill caught in flight are allowed to be missing.
                         // The number's SIZE is the signal.
                         println!("    scrub: {}", rest.trim());
+                    } else if let Some(rest) = line.strip_prefix("SCRUB_REPAIRED ") {
+                        println!("    scrub REPAIRED: {}", rest.trim());
+                    } else if let Some(rest) = line.strip_prefix("RESCANNED n=") {
+                        println!("    rescan after repair: n={}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("SCRUB_ERROR ") {
                         println!("    scrub FAILED: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("CELLS_PRESENT ") {
@@ -787,6 +791,46 @@ async fn child_async(
             ),
             Err(e) => println!("SCRUB_ERROR {}", e),
         }
+        flush_stdout();
+    }
+
+    // The end-to-end proof, on demand: do the entries the verify pass called
+    // missing actually come BACK from the cells? A repair that reports
+    // filling N holes has only proved it inserted N keys; what matters is
+    // whether a subsequent scan -- the same path a reader uses -- then
+    // returns them. Off by default because it mutates the store, and a
+    // fuzzer that repaired every cycle would be grading its own work.
+    if std::env::var("NEB_CHURN_SCRUB").as_deref() == Ok("repair") {
+        match client.scrub_ranged_index(true).await {
+            Ok(report) => println!(
+                "SCRUB_REPAIRED filled={} unreachable={} derived={}",
+                report.entries_repaired, report.entries_unreachable, report.entries_derived
+            ),
+            Err(e) => println!("SCRUB_ERROR {}", e),
+        }
+        flush_stdout();
+        let mut recount: u64 = 0;
+        let val_range = ValueRange {
+            start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(0).shared()),
+            end: ValueRangeTerm::inclusive_from(&OwnedValue::U64(u64::MAX).shared()),
+        };
+        if let Ok(mut cursor) = idx_client
+            .range_index_scan(
+                CHURN_SCHEMA_ID,
+                field_id,
+                val_range,
+                vec![],
+                Expr::nothing(),
+                Expr::nothing(),
+                TreeOrdering::Forward,
+            )
+            .await
+        {
+            while let Ok(Some(_)) = cursor.next().await {
+                recount += 1;
+            }
+        }
+        println!("RESCANNED n={}", recount);
         flush_stdout();
     }
     // A store that ran out of room is a CONFIGURATION outcome, not a
