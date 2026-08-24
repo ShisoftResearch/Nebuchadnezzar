@@ -252,6 +252,14 @@ fn parent_main(args: &[String]) -> ExitCode {
                         failed = Some(format!("TORN TRANSACTION: {}", line.trim()));
                     } else if let Some(rest) = line.strip_prefix("TXN_ATOMIC ") {
                         println!("    transactions: {}", rest.trim());
+                    } else if let Some(rest) = line.strip_prefix("SCRUB ") {
+                        // Reported, never failed on: see the child's comment.
+                        // Indexes are rebuildable by contract, so entries a
+                        // kill caught in flight are allowed to be missing.
+                        // The number's SIZE is the signal.
+                        println!("    scrub: {}", rest.trim());
+                    } else if let Some(rest) = line.strip_prefix("SCRUB_ERROR ") {
+                        println!("    scrub FAILED: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("CELLS_PRESENT ") {
                         // Printed for every cycle, so a regression can be
                         // read as "index lost entries" or "store lost cells"
@@ -262,16 +270,24 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // the CORRECT answer -- better than serving whatever
                         // the damaged bytes decode into. What it also shows
                         // is that there is no way back: the index stays
-                        // unscannable for every later cycle, because nothing
-                        // can rebuild it. That is the case for the
-                        // reindex/scrub tool, not a fault in this cycle.
+                        // unscannable for every later cycle.
+                        //
+                        // A scrub now EXISTS (neb::index::scrub) and can
+                        // refill a tree that still loads. It cannot help
+                        // here: damage to the page chain leaves the tree
+                        // unloadable, and repair inserts into a tree that
+                        // must first load. Closing this needs the reset --
+                        // pointing the metadata cell at a fresh chain --
+                        // which is the operation that cost 31 of 40 trees on
+                        // TB14 and is deliberately not built yet.
                         println!(
                             "    scan REFUSED after file damage (correct, but the index \
                              cannot be rebuilt): {}",
                             line.trim()
                         );
                         failed = Some(
-                            "index unrecoverable after file damage -- no reindex path exists"
+                            "index unrecoverable after file damage -- the scrub cannot \
+                             reset an unloadable tree"
                                 .to_string(),
                         );
                         unsafe { libc::kill(child_pid, libc::SIGKILL) };
