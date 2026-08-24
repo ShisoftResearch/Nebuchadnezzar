@@ -1972,6 +1972,27 @@ pub fn recover_chunks(
         }
     }
 
+    // Give back the addresses recovery bumped past but never restored.
+    //
+    // Segments are allocated AT an id taken from a filename, which drags the
+    // bump pointer over every lower slot whether or not anything lives there.
+    // Without this a chunk loses those slots for the life of the process and
+    // refuses writes while sitting at half capacity -- worse after every
+    // restart. Safe here and nowhere earlier: recovery has restored
+    // everything it is going to, so "not in segs" finally means "nobody owns
+    // this".
+    for chunk in chunks.iter() {
+        let reclaimed = chunk
+            .allocator
+            .reclaim_skipped_slots(|id| chunk.segs.get(&id).is_some());
+        if reclaimed > 0 {
+            info!(
+                "Chunk {}: returned {} segment slot(s) recovery bumped past but never used",
+                chunk.id, reclaimed
+            );
+        }
+    }
+
     for chunk in chunks {
         chunk.reset_write_heads_after_recovery()?;
     }

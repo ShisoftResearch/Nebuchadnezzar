@@ -2013,7 +2013,7 @@ impl Chunk {
                 error!(
                     "chunk-allocation-failure: chunk={}, segment_class={:?}, live={}, \
                      capacity_segments={}, free_list={}, never_bumped={}, retired_pending={}, \
-                     unaccounted={}: the allocator has no segment left after GC",
+                     unaccounted={}, returned_ever={}: the allocator has no segment left after GC",
                     self.id,
                     segment_class,
                     self.segs.len(),
@@ -2026,6 +2026,7 @@ impl Chunk {
                         .saturating_sub(free_segs)
                         .saturating_sub(unbumped)
                         .saturating_sub(self.retired_segment_count()),
+                    self.allocator.segments_returned(),
                 );
                 // COUNTED HERE TOO, and that omission cost a day.
                 //

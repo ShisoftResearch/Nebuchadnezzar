@@ -2948,6 +2948,10 @@ pub struct SegmentAllocator {
     free_count: AtomicUsize,
     pub next_seq_id: AtomicUsize,
     chunk_id: usize,
+    /// Lifetime returns, for the one question the point-in-time accounting
+    /// cannot answer: whether the addresses that are neither live, free, nor
+    /// retired were ever given back at all.
+    returned: AtomicUsize,
 }
 
 impl SegmentAllocator {
@@ -2995,6 +2999,7 @@ impl SegmentAllocator {
             free_count: AtomicUsize::new(0),
             next_seq_id: AtomicUsize::new(0),
             chunk_id,
+            returned: AtomicUsize::new(0),
         }
     }
 
@@ -3022,6 +3027,52 @@ impl SegmentAllocator {
     /// retired and awaiting quiescence, handed out and still live under a
     /// name the chunk map does not show, or simply bumped past. Those want
     /// different fixes.
+    /// How many segment addresses have EVER been returned to this allocator.
+    pub fn segments_returned(&self) -> usize {
+        self.returned.load(Relaxed)
+    }
+
+    /// Put every bumped-past address nobody owns back on the free list.
+    ///
+    /// `alloc_seg_at_id_with` allocates at an address DERIVED FROM THE
+    /// SEGMENT ID and drags the bump pointer past it, because the id comes
+    /// from a filename and the allocator has to guarantee the slot. Restoring
+    /// a single segment with id 31 therefore consumes all 32 slots of a
+    /// 256 MiB chunk, and the 31 that recovery did not restore are gone for
+    /// the life of the process: never live, never retired, never freed, and
+    /// so never on the free list either.
+    ///
+    /// That is what "the allocator has no segment left after GC" was on a
+    /// chunk holding 18 live segments of a possible 32, with free_list=0,
+    /// retired_pending=0 and returned_ever=0 -- 14 addresses simply skipped
+    /// over. It gets worse every restart, which is exactly the workload a
+    /// crash soak generates.
+    ///
+    /// Called ONCE, after recovery has restored every segment it is going to,
+    /// and never while allocation is running. Doing it inside
+    /// `alloc_seg_at_id_with` would race: a later restore of a lower id finds
+    /// the offset already past it, allocates the address directly, and would
+    /// hand out an address this had already published as free.
+    pub fn reclaim_skipped_slots<F>(&self, is_live: F) -> usize
+    where
+        F: Fn(usize) -> bool,
+    {
+        let bumped_to = self.offset.load(Relaxed);
+        let mut reclaimed = 0usize;
+        let mut addr = self.base;
+        while addr + SEGMENT_SIZE <= bumped_to {
+            let id = (addr - self.base) >> SEGMENT_BITS_SHIFT;
+            if !is_live(id) {
+                self.free.push_front(addr);
+                self.free_count.fetch_add(1, Relaxed);
+                self.returned.fetch_add(1, Relaxed);
+                reclaimed += 1;
+            }
+            addr += SEGMENT_SIZE;
+        }
+        reclaimed
+    }
+
     pub fn segment_accounting(&self) -> (usize, usize, usize) {
         let bump_left = self
             .limit
@@ -3264,6 +3315,7 @@ impl SegmentAllocator {
         debug!("Segment {} freed", seg_addr);
         self.free.push_front(seg_addr);
         self.free_count.fetch_add(1, Relaxed);
+        self.returned.fetch_add(1, Relaxed);
     }
 
     /// The segment id owning `addr`, or `None` if the address is not in this
@@ -3997,6 +4049,91 @@ mod seal_race_tests {
             failures, 0,
             "{failures} entries could not be journaled because their segment sealed \
              underneath them; archiving must drain in-flight journals first"
+        );
+    }
+}
+
+#[cfg(test)]
+mod skipped_slot_tests {
+    use super::*;
+    use crate::ram::file_manager::SegmentFileManager;
+    use std::collections::HashSet;
+
+    fn allocator_of(segments: usize) -> (SegmentAllocator, Arc<SegmentFileManager>) {
+        (
+            SegmentAllocator::new(0, SEGMENT_SIZE * segments),
+            Arc::new(SegmentFileManager::new(None, None)),
+        )
+    }
+
+    /// Allocating AT an id drags the bump pointer over every lower slot,
+    /// because the id comes from a filename and the slot has to be
+    /// guaranteed. Those skipped slots are not live, not retired and not
+    /// free -- they are simply gone, and they compound on every restart.
+    ///
+    /// A chunk was found refusing writes with 18 live segments of a possible
+    /// 32, free_list=0, retired_pending=0 and returned_ever=0: fourteen
+    /// addresses bumped past and never handed back.
+    #[test]
+    fn allocating_at_a_high_id_strands_every_slot_below_it() {
+        let (alloc, fm) = allocator_of(8);
+        assert_eq!(alloc.available_segments(), 8);
+
+        let seg = alloc
+            .alloc_seg_at_id_with(6, 0, &fm, true, SegmentClass::Regular)
+            .expect("allocate at id 6");
+        assert_eq!(seg.id, 6);
+
+        assert_eq!(
+            alloc.available_segments(),
+            1,
+            "ids 0..=5 were bumped past to reach id 6, leaving only id 7"
+        );
+        assert_eq!(
+            alloc.segments_returned(),
+            0,
+            "and nothing was handed back, so they are not on the free list either"
+        );
+    }
+
+    /// The repair: after recovery has restored everything it is going to,
+    /// every bumped-past address nobody owns goes back on the free list.
+    #[test]
+    fn reclaiming_returns_the_stranded_slots_and_only_those() {
+        let (alloc, fm) = allocator_of(8);
+        let live: HashSet<usize> = [6].into_iter().collect();
+        alloc
+            .alloc_seg_at_id_with(6, 0, &fm, true, SegmentClass::Regular)
+            .expect("allocate at id 6");
+
+        let reclaimed = alloc.reclaim_skipped_slots(|id| live.contains(&id));
+        assert_eq!(reclaimed, 6, "ids 0..=5 come back; id 6 is in use");
+        assert_eq!(
+            alloc.available_segments(),
+            7,
+            "six reclaimed plus the one never bumped"
+        );
+
+        // And the reclaimed addresses are genuinely usable, not just counted.
+        let mut handed = Vec::new();
+        for _ in 0..7 {
+            handed.push(
+                alloc
+                    .alloc_seg_with_class(&fm, SegmentClass::Regular)
+                    .expect("a reclaimed slot must allocate")
+                    .id,
+            );
+        }
+        handed.sort_unstable();
+        assert_eq!(
+            handed,
+            vec![0, 1, 2, 3, 4, 5, 7],
+            "every slot except the live one comes back exactly once"
+        );
+        assert!(
+            alloc.alloc_seg_with_class(&fm, SegmentClass::Regular).is_none(),
+            "and the chunk is genuinely full afterwards -- reclaiming must not \
+             invent capacity"
         );
     }
 }
