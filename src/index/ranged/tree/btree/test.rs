@@ -582,3 +582,86 @@ fn reconstruct() {
         assert_eq!(&key, cursor.current().unwrap());
     }
 }
+
+/// Retaining everything away must not leave the tree unwritable.
+///
+/// `retain` cuts a level at a pivot. When the pivot falls at or before the
+/// FIRST key of the leftmost leaf, nothing is kept: the leaf is replaced by a
+/// bypass `Empty` node whose `right` is the default ref, and the whole right
+/// chain behind it is emptied the same way. A bypass node exists to forward a
+/// traversal to its right sibling -- so one with no right sibling forwards
+/// nowhere, and every walker that reaches it is stuck: `mut_search` retries
+/// forever on the default ref it hands back, and `write_targeted` returns the
+/// unwritable node to a caller that immediately asks `is_ext()`.
+#[test]
+fn retaining_every_key_away_leaves_a_writable_tree() {
+    let _ = env_logger::try_init();
+    let tree = LevelBPlusTree::new(&deletion_set());
+    for i in 1..=(PAGE_SIZE as u64 * 3) {
+        tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
+    }
+    // A pivot below every key in the tree: nothing is retained.
+    tree.retain_by_key(&*MIN_ENTRY_KEY);
+
+    // The tree is now empty, which is fine. What must still hold is that it
+    // takes a write -- a retained-to-nothing tree is reused, not discarded.
+    let key = EntryKey::from_id(&Id::from_parts(2, 1));
+    assert!(tree.insert(&key), "a retained-to-nothing tree must accept a key");
+    assert_eq!(
+        tree.seek(&key, Ordering::Forward).current(),
+        Some(&key),
+        "and must be able to find it again"
+    );
+}
+
+/// A cut anywhere keeps the left side, drops the right, and stays usable.
+///
+/// Swept across the whole key space rather than tested at one pivot: the
+/// retain walk descends a SINGLE path, so which case it hits depends entirely
+/// on where the pivot falls -- at a leaf boundary it empties a node, in the
+/// middle it truncates one, past the end it does nothing. A single pivot
+/// exercises one of those and silently misses the rest.
+///
+/// The writes are all BELOW the pivot on purpose. Retention is the left half
+/// of a tree split, so the retained tree's range ends at the pivot and keys
+/// at or past it belong to the new right tree; asserting anything about them
+/// here would be testing a contract the router never offers.
+#[test]
+fn retaining_at_any_pivot_keeps_the_left_side() {
+    let _ = env_logger::try_init();
+    let total = PAGE_SIZE as u64 * 4;
+    for pivot_at in 2..=total {
+        let tree = LevelBPlusTree::new(&deletion_set());
+        for i in (1..=total).map(|i| i * 2) {
+            tree.insert(&EntryKey::from_id(&Id::from_parts(1, i)));
+        }
+        let pivot = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2));
+        tree.retain_by_key(&pivot);
+
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
+        let mut seen = Vec::new();
+        while let Some(key) = cursor.next() {
+            seen.push(key);
+        }
+        assert!(
+            seen.iter().all(|key| key < &pivot),
+            "pivot {}: nothing at or past the pivot may survive, last kept {:?}",
+            pivot_at,
+            seen.last()
+        );
+        // Odd sequence numbers were never inserted, so this is a fresh key
+        // strictly inside the retained range.
+        let key = EntryKey::from_id(&Id::from_parts(1, pivot_at * 2 - 1));
+        assert!(
+            tree.insert(&key),
+            "pivot {}: a retained tree must accept a key inside its range",
+            pivot_at
+        );
+        assert_eq!(
+            tree.seek(&key, Ordering::Forward).current(),
+            Some(&key),
+            "pivot {}: and must find it again",
+            pivot_at
+        );
+    }
+}

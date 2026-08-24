@@ -36,14 +36,29 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let _ = retain_by_node::<KS, PS>(tree, &tree.get_root(), mid_key, 0);
+    // The root is the head of its level by definition, and the walk carries
+    // that down the leftmost path.
+    let _ = retain_by_node::<KS, PS>(tree, &tree.get_root(), mid_key, 0, true);
 }
 
+/// Retain the keys left of `mid_key` in the subtree at `node_ref`.
+///
+/// `is_level_head` says this node is the LEFTMOST of its level, which is what
+/// makes it undestroyable. Everything else the cut empties becomes a bypass
+/// `Empty` node -- a node that forwards a traversal to its right sibling --
+/// and that is correct for a node in the middle of a level. The head has no
+/// right sibling once the cut takes the rest of the level, so a bypass there
+/// forwards NOWHERE: `mut_search` follows the default ref into `NodeData::None`
+/// and panics, and `write_targeted` hands the unwritable node to a caller that
+/// immediately asks `is_ext()`. A pivot below every key in the tree hits
+/// exactly this, and turned a retained-to-nothing tree into one that could
+/// never be read or written again.
 fn retain_by_node<KS, PS>(
     tree: &BPlusTree<KS, PS>,
     node_ref: &NodeCellRef,
     mid_key: &EntryKey,
     level: usize,
+    is_level_head: bool,
 ) -> bool
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -77,13 +92,16 @@ where
             );
             let mut right_node_ref = mem::take(&mut n.next);
             let mut num_removed_keys = origin_node_len - key_index;
-            if key_index == 0 {
+            // Emptied rather than destroyed when this is the level head: an
+            // external node with no keys is exactly what a fresh tree's root
+            // is, so the tree stays readable and writable with nothing in it.
+            if key_index == 0 && !is_level_head {
                 *node = NodeData::Empty(Box::new(Default::default()));
             } else {
                 n.len = key_index; // All others will be ignored
             }
             drop(node);
-            if key_index == 0 {
+            if key_index == 0 && !is_level_head {
                 // Unlink BEFORE enqueueing the delete: extnode_mut marks the
                 // predecessor dirty, and the write-back hub fences deletions
                 // behind modifications enqueued before them, so the severed
@@ -117,6 +135,7 @@ where
                 &n.ptrs.as_slice_immute()[index],
                 mid_key,
                 level + 1,
+                is_level_head && index == 0,
             );
             if index >= n.len && child_kept {
                 return true;
@@ -132,12 +151,26 @@ where
             let mut right_node_ref = {
                 let innode = node.innode_mut();
                 let original_len = innode.len;
-                let kept_children = if child_kept { index + 1 } else { index };
+                let mut kept_children = if child_kept { index + 1 } else { index };
+                // The leftmost child survived as the level below's head, even
+                // though it kept no keys. Keep the pointer to it: a head with
+                // no child to descend into is a dead end.
+                if kept_children == 0 && is_level_head {
+                    kept_children = 1;
+                }
                 for ptr in innode.ptrs.as_slice()[kept_children..=original_len].iter_mut() {
                     *ptr = Default::default();
                 }
                 let right_node_ref = mem::take(&mut innode.right);
-                if kept_children == 0 {
+                if kept_children == 1 && is_level_head {
+                    // Stays a REAL internal node, with no separator keys and
+                    // one child. The bypass `Empty` used below is neither
+                    // External nor Internal, and the root is asked which one
+                    // it is on every path that grows the tree --
+                    // `apply_top_level_split` calls `is_ext()` on it directly,
+                    // which is how a retained-to-one-child root panicked.
+                    innode.len = 0;
+                } else if kept_children == 0 {
                     *node = NodeData::Empty(Box::new(Default::default()));
                 } else if kept_children == 1 {
                     // This internal node now has a single live child and no separator
@@ -161,7 +194,9 @@ where
             }
             child_kept || index > 0
         }
-        &NodeData::Empty(ref n) => retain_by_node::<KS, PS>(tree, &n.right, mid_key, level),
+        &NodeData::Empty(ref n) => {
+            retain_by_node::<KS, PS>(tree, &n.right, mid_key, level, is_level_head)
+        }
         &NodeData::None => unreachable!(),
     }
 }
