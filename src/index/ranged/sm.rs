@@ -510,20 +510,43 @@ impl MasterTreeSM {
                 "[RANGED INDEX LOAD] Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}, epoch={}",
                 id, lower, upper, epoch
             );
-            let client = self.locate_tree_server(&id).await.unwrap();
+            // Neither step may panic. This runs from `recover`, so the whole
+            // placement map is being replayed: a server that has not
+            // registered yet, an address the membership no longer knows (a
+            // store opened on a different address makes EVERY placement name
+            // an unknown server), or a transient RPC failure took the process
+            // down at startup with the store perfectly intact. The tree is
+            // left unloaded instead, exactly as an unreadable metadata cell
+            // leaves it -- the range reports errors and the load is retried,
+            // which is recoverable; a panicked server is not.
+            let client = match self.locate_tree_server(&id).await {
+                Ok(client) => client,
+                Err(e) => {
+                    warn!(
+                        "[RANGED INDEX LOAD] Cannot locate a server for sub tree {:?}: {:?}.                          Leaving it unloaded; the load is retried.",
+                        id, e
+                    );
+                    return;
+                }
+            };
             info!(
                 "[RANGED INDEX LOAD] Located tree {:?} at server {:?}",
                 id,
                 client.server_id()
             );
-            client
+            match client
                 .load_tree(id, Boundary::new(lower.clone(), upper.clone()), epoch)
                 .await
-                .unwrap();
-            info!(
-                "[RANGED INDEX LOAD] Successfully loaded tree {:?} into LSM service",
-                id
-            );
+            {
+                Ok(_) => info!(
+                    "[RANGED INDEX LOAD] Successfully loaded tree {:?} into LSM service",
+                    id
+                ),
+                Err(e) => warn!(
+                    "[RANGED INDEX LOAD] Sub tree {:?} could not be loaded: {:?}. Leaving it                      unloaded; the load is retried.",
+                    id, e
+                ),
+            }
         } else {
             info!(
                 "[RANGED INDEX LOAD] Not leader, skipping load_sub_tree for {:?}",
