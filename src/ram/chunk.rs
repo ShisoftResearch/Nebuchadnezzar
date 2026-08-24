@@ -1085,6 +1085,7 @@ impl Chunk {
     /// per-entry one, and without a second the segment could be reclaimed
     /// while the transaction still means to write into it.
     fn lease_head_for_current_txn(&self, head: &AArc<Segment>, addr: usize) -> bool {
+        if std::env::var("NEB_DISABLE_TXN_LEASE").is_ok() { return false; }
         let Some(txn) = current_txn() else {
             return false;
         };

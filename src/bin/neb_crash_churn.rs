@@ -49,6 +49,7 @@ fn main() -> ExitCode {
 struct ParentState {
     next_key: u64,
     best_verified: u64,
+    txn_committed_high: u64,
     /// Contiguous prefix of keys the store has been told to delete.
     deleted: u64,
 }
@@ -63,6 +64,7 @@ fn parent_main(args: &[String]) -> ExitCode {
     let mut state = ParentState {
         next_key: 0,
         best_verified: 0,
+        txn_committed_high: 0,
         deleted: 0,
     };
     // Deterministic-ish per-run seed without wall-clock dependence beyond
@@ -98,6 +100,10 @@ fn parent_main(args: &[String]) -> ExitCode {
         } else {
             0
         };
+        // Transactions on most cycles: the lane that puts kills inside an
+        // apply burst and inside the decision window, which is where a head
+        // lease changes behaviour.
+        let txn_rate = if rand() % 5 != 0 { 40 + rand() % 60 } else { 0 };
         // Damage files on some hard-kill cycles: a kill alone leaves clean
         // files, which is not what a power cut leaves behind.
         let mutilate = std::env::var("NEB_CHURN_NO_MUTILATE").is_err()
@@ -106,14 +112,15 @@ fn parent_main(args: &[String]) -> ExitCode {
             && rand() % 3 == 0;
 
         println!(
-            "=== cycle {}/{} addr={} churn={}s kill={} delete_rate={} best_verified={} \
-             next_key={} deleted={}",
+            "=== cycle {}/{} addr={} churn={}s kill={} delete_rate={} txn_rate={} \
+             best_verified={} next_key={} deleted={}",
             cycle + 1,
             cycles,
             addr,
             churn_secs,
             if graceful { "TERM" } else { "KILL" },
             delete_rate,
+            txn_rate,
             state.best_verified,
             state.next_key,
             state.deleted,
@@ -130,6 +137,8 @@ fn parent_main(args: &[String]) -> ExitCode {
                 &delete_rate.to_string(),
                 &state.deleted.to_string(),
                 &state.next_key.to_string(),
+                &txn_rate.to_string(),
+                &state.txn_committed_high.to_string(),
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -142,6 +151,7 @@ fn parent_main(args: &[String]) -> ExitCode {
         let deadline = Duration::from_secs(180);
         let mut scanned: Option<u64> = None;
         let mut acked_high: u64 = state.next_key;
+        let mut txn_high: u64 = state.txn_committed_high;
         let mut deleted_high: u64 = state.deleted;
         let mut exhausted_this_cycle = false;
         let mut failed: Option<String> = None;
@@ -227,6 +237,18 @@ fn parent_main(args: &[String]) -> ExitCode {
                     } else if line.starts_with("STORE_EXHAUSTED") {
                         exhausted_this_cycle = true;
                         println!("    STORE RAN OUT OF SPACE during the previous cycle");
+                    } else if let Some(rest) = line.strip_prefix("TXN_COMMITTED_TO ") {
+                        if let Ok(round) = rest.trim().parse::<u64>() {
+                            txn_high = txn_high.max(round);
+                        }
+                    } else if line.starts_with("TXN_TORN ") {
+                        // A committed transaction that came back in pieces.
+                        // Nothing about a kill excuses this: the contract is
+                        // all-or-nothing, and unlike a lost tail it cannot be
+                        // written off as "not yet durable".
+                        failed = Some(format!("TORN TRANSACTION: {}", line.trim()));
+                    } else if let Some(rest) = line.strip_prefix("TXN_ATOMIC ") {
+                        println!("    transactions: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("CELLS_PRESENT ") {
                         // Printed for every cycle, so a regression can be
                         // read as "index lost entries" or "store lost cells"
@@ -266,12 +288,18 @@ fn parent_main(args: &[String]) -> ExitCode {
                 }
             }
         }
-        // Drain any remaining lines (ACK_TO sent right before death).
+        // Drain any remaining lines (the last cursor reports are sent right
+        // before death, and dropping them UNDERSTATES what the child got
+        // done -- which for the transaction lane means verifying nothing).
         while let Ok(line) = rx.recv_timeout(Duration::from_millis(500)) {
             if let Some(rest) = line.strip_prefix("ACK_TO ") {
                 acked_high = rest.trim().parse().unwrap_or(acked_high);
             } else if let Some(rest) = line.strip_prefix("DELETED_TO ") {
                 deleted_high = rest.trim().parse().unwrap_or(deleted_high);
+            } else if let Some(rest) = line.strip_prefix("TXN_COMMITTED_TO ") {
+                if let Ok(round) = rest.trim().parse::<u64>() {
+                    txn_high = txn_high.max(round);
+                }
             }
         }
         let _ = child.wait();
@@ -314,6 +342,7 @@ fn parent_main(args: &[String]) -> ExitCode {
         // Rebased each cycle, `acked_high - newly_deleted` is exact whether
         // or not the space is dense, because the base cancels: keys added
         // this cycle = cursor - scan-at-start.
+        state.txn_committed_high = txn_high;
         state.next_key = acked_high;
         // Every key the store was told to delete is one fewer the next scan
         // owes us. A delete lost to a SIGKILL only leaves the key in place,
@@ -523,6 +552,8 @@ fn child_main(args: &[String]) -> ExitCode {
     let delete_rate: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
     let delete_from: u64 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(0);
     let probe_high: u64 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let txn_rate: u64 = args.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let txn_verify_to: u64 = args.get(9).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -538,6 +569,8 @@ fn child_main(args: &[String]) -> ExitCode {
         delete_rate,
         delete_from,
         probe_high,
+        txn_rate,
+        txn_verify_to,
     )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -560,6 +593,8 @@ async fn child_async(
     delete_rate: u64,
     delete_from: u64,
     probe_high: u64,
+    txn_rate: u64,
+    txn_verify_to: u64,
 ) -> Result<(), String> {
     use neb::index::ranged::tree::btree::Ordering as TreeOrdering;
     use neb::query::data_client::{ValueRange, ValueRangeTerm};
@@ -609,7 +644,13 @@ async fn child_async(
             undo_log_storage: Some(dir.join("undo").to_string_lossy().into_owned()),
             raft_storage: Some(dir.join("raft").to_string_lossy().into_owned()),
             index_enabled: true,
-            services: vec![Service::Cell, Service::Query, Service::RangedIndexer],
+            services: vec![
+                Service::Cell,
+                Service::Query,
+                Service::RangedIndexer,
+                // The transaction lane needs a participant to talk to.
+                Service::Transaction,
+            ],
             enable_recovery: !first,
             disable_storage_locks: true,
         },
@@ -715,6 +756,51 @@ async fn child_async(
         flush_stdout();
     }
 
+    // Atomicity, which is the whole reason the transaction lane exists.
+    //
+    // Every round the previous cycle reported committed must come back with
+    // ALL of its cells; a round that was cut off mid-apply must come back
+    // with NONE. A round that returns some but not all is a torn
+    // transaction -- the one failure the plain lanes structurally cannot
+    // produce, because a single-cell write has no partial state.
+    if txn_verify_to > 0 {
+        const TXN_CELLS: u64 = 4;
+        const TXN_SAMPLES: u64 = 200;
+        let stride = (txn_verify_to / TXN_SAMPLES).max(1);
+        let mut whole = 0u64;
+        let mut torn = 0u64;
+        let mut missing = 0u64;
+        let mut round = 1u64;
+        while round <= txn_verify_to {
+            let base = round * TXN_CELLS;
+            let mut found = 0u64;
+            for i in 0..TXN_CELLS {
+                let seq = base + i;
+                let id = Id::from_parts(72 + (seq % 8), seq);
+                if let Ok(Ok(_)) = client.read_cell(id).await {
+                    found += 1;
+                }
+            }
+            if found == TXN_CELLS {
+                whole += 1;
+            } else if found == 0 {
+                missing += 1;
+            } else {
+                torn += 1;
+                println!(
+                    "TXN_TORN round={} found={}/{} -- a committed transaction came back in pieces",
+                    round, found, TXN_CELLS
+                );
+            }
+            round += stride;
+        }
+        println!(
+            "TXN_ATOMIC whole={} torn={} absent={} verified_to={}",
+            whole, torn, missing, txn_verify_to
+        );
+        flush_stdout();
+    }
+
     // Churn: writers append monotone keys; a reporter streams the acked
     // high-water mark. Padding gives pages realistic weight so splits come
     // fast. Keys continue from the scanned count -- duplicates with an
@@ -764,6 +850,93 @@ async fn child_async(
             }
         }));
     }
+    // Transaction lane: multi-cell transactions, so kills land inside an
+    // apply burst and inside the decision window.
+    //
+    // The plain writers above only ever exercise single-cell writes, which
+    // is the one shape that needs no atomicity: nothing can be half-applied.
+    // A transaction holds a write head from its first entry until its
+    // decision, so this lane is what puts kills in the windows that lease
+    // actually changes -- between two entries of one transaction, and
+    // between the last entry and the commit.
+    //
+    // Keys live in their OWN partition range (72+) and are never counted
+    // toward the contiguous ack cursor: a transaction is all-or-nothing, so
+    // its keys are not a contiguous prefix of anything, and the parent's
+    // arithmetic must not see them. What the lane asserts instead is the
+    // property that matters and that no other lane can see: every committed
+    // transaction's cells are ALL present after recovery, and an
+    // uncommitted one leaves NONE.
+    let txn_committed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut txn_handles = Vec::new();
+    if txn_rate > 0 {
+        const TXN_CELLS: u64 = 4;
+        let client = client.clone();
+        let txn_committed = txn_committed.clone();
+        // Start well ABOVE anything a previous cycle could have written.
+        //
+        // Continuing from the last REPORTED round is not enough: reports are
+        // sampled, so a cycle commits rounds past its last report and a kill
+        // drops the rest. The next cycle then re-attempts rounds whose cells
+        // already exist, and those transactions abort against committed data
+        // -- which makes any residue look like a torn transaction when it is
+        // really the harness colliding with itself. A gap costs nothing here
+        // and keeps "torn" meaning exactly one thing.
+        let start_round = txn_verify_to + 10_000;
+        txn_handles.push(tokio::spawn(async move {
+            let mut round: u64 = start_round;
+            loop {
+                round += 1;
+                let base = round * TXN_CELLS;
+                let cells: Vec<OwnedCell> = (0..TXN_CELLS)
+                    .map(|i| {
+                        let seq = base + i;
+                        let id = Id::from_parts(72 + (seq % 8), seq);
+                        let mut value = OwnedValue::Map(OwnedMap::new());
+                        value[KEY_FIELD] = OwnedValue::U64(seq);
+                        value[PAD_FIELD] = OwnedValue::String(format!("txn-{:0>200}", seq));
+                        OwnedCell::new_with_id(CHURN_SCHEMA_ID, &id, value)
+                    })
+                    .collect();
+                let result = client
+                    .transaction(move |txn| {
+                        let cells = cells.clone();
+                        async move {
+                            for cell in cells {
+                                txn.write(cell).await?;
+                            }
+                            Ok(())
+                        }
+                    })
+                    .await;
+                if let Err(ref e) = result {
+                    if round % 50 == 1 {
+                        println!("TXN_FAILED round={} {:?}", round, e);
+                        flush_stdout();
+                    }
+                }
+                if result.is_ok() {
+                    // Published AFTER the commit returns, so the count is a
+                    // lower bound on what is durable -- the same one-sided
+                    // discipline the ack cursor uses. A transaction whose
+                    // commit was cut off by the kill is simply not counted,
+                    // and its cells are expected to be absent.
+                    let done = txn_committed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    // A high-water mark, so reporting every commit is just
+                    // noise the parent has to keep up with. Every eighth is
+                    // frequent enough to lose almost nothing to a kill.
+                    if done <= 4 || done % 8 == 0 {
+                        println!("TXN_COMMITTED_TO {}", round);
+                        flush_stdout();
+                    }
+                }
+                if txn_rate < 100 {
+                    tokio::time::sleep(Duration::from_millis(100 - txn_rate)).await;
+                }
+            }
+        }));
+    }
+
     // Delete lane: retire a contiguous prefix of the keys that already
     // exist, well behind the write cursor.
     //
@@ -861,7 +1034,11 @@ async fn child_async(
             // Deleters are ingress too: leaving them running through the
             // shutdown keeps issuing writes at a server that is trying to
             // stop, which is not what a real deployment does.
-            for handle in writer_handles.iter().chain(delete_handles.iter()) {
+            for handle in writer_handles
+                .iter()
+                .chain(delete_handles.iter())
+                .chain(txn_handles.iter())
+            {
                 handle.abort();
             }
             server.shutdown().await;

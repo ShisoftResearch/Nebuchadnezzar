@@ -24,6 +24,24 @@ pub enum EntryType {
     /// MIDDLE discards every entry that other writers durably appended
     /// after the gap.
     PADDING = 3,
+    /// Opens a transaction's bracket. Everything after it in this segment
+    /// belongs to that transaction until its COMMIT, and a scan that reaches
+    /// the end of the segment without one discards the lot.
+    ///
+    /// A marker is needed rather than inferring the bracket from the COMMIT
+    /// alone, because ordinary entries can precede it in the same segment
+    /// and those apply unconditionally.
+    BEGIN = 4,
+    /// Closes a transaction's bracket and IS the commit point: a bracket is
+    /// committed if and only if this entry is present. Carries the manifest,
+    /// which names every chunk and seq id the transaction wrote, so a
+    /// multi-chunk transaction can be judged from any one of its parts.
+    COMMIT = 5,
+    /// Links a full chain segment to the next one, at a FIXED position: the
+    /// last 24 bytes of the segment. Recovery reads it without scanning, so
+    /// chain membership costs one read and an aborted chain is discarded
+    /// without ever being walked.
+    TXN_CONT = 6,
 }
 
 impl EntryType {
@@ -33,8 +51,20 @@ impl EntryType {
             1 => Some(Self::CELL),
             2 => Some(Self::TOMBSTONE),
             3 => Some(Self::PADDING),
+            4 => Some(Self::BEGIN),
+            5 => Some(Self::COMMIT),
+            6 => Some(Self::TXN_CONT),
             _ => None,
         }
+    }
+
+    /// Whether a bare (checksum-free) type word is legal for this kind.
+    ///
+    /// Only the two kinds with no content to vouch for. Everything else --
+    /// cells, tombstones, and every bracket marker -- carries data, so a
+    /// bare word for one of them is a header that lost its checksum.
+    pub fn may_be_bare(self) -> bool {
+        matches!(self, Self::PADDING | Self::UNDECIDED)
     }
 
     pub fn bits(self) -> u32 {
@@ -201,9 +231,10 @@ pub enum TypeWord {
 /// checksum.
 pub fn unpack_type_word(word: u32) -> TypeWord {
     if let Some(entry_type) = EntryType::from_bits(word) {
-        return match entry_type {
-            EntryType::PADDING | EntryType::UNDECIDED => TypeWord::Bare(entry_type),
-            _ => TypeWord::Invalid,
+        return if entry_type.may_be_bare() {
+            TypeWord::Bare(entry_type)
+        } else {
+            TypeWord::Invalid
         };
     }
     let checksum = (word & ENTRY_CHECKSUM_MASK) >> ENTRY_TYPE_BITS;
