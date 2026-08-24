@@ -351,6 +351,42 @@ node must not become a storm of false findings.
 
 Not yet wired to an RPC or a startup hook; it is a library call today.
 
+## Blob writes are inside the bracket now (2026-08-24)
+
+`3abde75c`. Recorded because the gap was worse than the name suggested and
+the fix is a rule, not a patch.
+
+A transaction's blob cells were LEASED but never BRACKETED. The lease
+machinery took a head in the blob pool like any other — the head was held
+across the write set, the manifest named it, an abort rewound it — but no
+BEGIN went in front of the run and `close_transaction_bracket` explicitly
+skipped the part when it wrote COMMITs. A segment holding entries and no
+markers recovers as ORDINARY entries, so a crash between a transactional
+blob write and its decision brought those cells back as committed data.
+What makes an entry transactional is the pair of markers around it, not the
+lease; the test asserts the markers for that reason.
+
+The exclusion was mechanical rather than principled. Every lease lookup
+asked for "the newest head this transaction holds in this chunk" against a
+flat list, so after a blob write the next regular write would have been
+handed a blob head — and the gate refused to bracket blobs at all rather
+than face that. Three lookups are scoped to the class now (placement, the
+chain tail-link, and the holds-a-head-here check), so a transaction holds
+one head per class and runs two independent chains side by side, each
+self-contained with its own COMMIT.
+
+Scoping the third fixed a separate live bug. `current_txn_holds_head_here`
+refuses a wait that would wait on a head this very transaction holds. It was
+class-blind while the loop it guards scans one class's slots, so at capacity
+a transaction already holding a regular head had its blob write refused with
+`CannotAllocateSpace` — refusing a write that was in no danger at all.
+
+Blob head pool 2 → 4. `can_spare_a_head_for_lease` will not hand out the
+second-to-last head, so at 2 exactly one blob transaction per chunk could be
+bracketed and the rest wrote unbracketed. An EMPTY slot counts as available
+to a lease without a segment behind it, so the extra capacity costs nothing
+resident until blob traffic actually contends.
+
 ## Phase 5 — Verification: make crashes boring
 
 1. **Crash-churn fuzzer, delete-heavy + transactional lanes.** The
@@ -876,17 +912,43 @@ present; otherwise discard, which is safe because the ack had not happened.
 
 ### What this plan does NOT cover, and must not silently absorb
 
-- **Reindex/scrub tool.** After deliberate file damage the store correctly
-  refuses, and there is no path back — the only failure class the fuzzer
-  still cannot survive. It is now the highest-value item outside Phase 6a.
-- **Index-durability backpressure.** A full store keeps accepting writes it
-  cannot index durably; a graceful shutdown then loses the index tail.
-  Re-queuing abandoned pages (`669de71b`) removes the PERMANENT poisoning but
-  cannot place pages into a store with no room. The missing piece is
-  backpressure from index durability to the write path.
-- **The b-tree `Empty` node panic** reachable from `write_targeted` at a
-  level's right edge under exhaustion. Contained (the RPC layer catches it)
-  but it means exhaustion degrades into a malformed tree.
+- **Reindex/scrub tool** — BUILT (`30c45d2c`, `f65a1d6d`). See "The index
+  scrub" above. It still cannot reset an UNLOADABLE tree, which stays open.
+- **Index-durability backpressure** — REFRAMED, not built, and deliberately
+  so (`8ecca751`). The original entry asked for backpressure from index
+  durability to the write path. Two things now argue against that:
+
+  Index entries are DERIVABLE. `scrub_ranged_index` rebuilds them from the
+  cells through the write path's own `probe_cell_indices`. Refusing a write
+  to protect an artifact the store can regenerate from that very write
+  trades a recoverable gap for an outage.
+
+  And `barrier_failed` is process-global. Gating the write path on it would
+  refuse writes for every database in the process because one chunk in one
+  database filled — exactly the overreach `669de71b` removed for publishers.
+  Any real backpressure needs per-tree scoping first.
+
+  What landed instead is the signal, which every policy needs: failed index
+  tasks are counted (`INDEX_TASKS_FAILED`) rather than logged and dropped,
+  and shutdown reports the debt at ERROR with the two ways to settle it.
+  Reporting is rate-limited to the first failure and each order of magnitude
+  after — one crash-churn run produced 193,360 lines of this.
+
+  The open piece is closing the loop WITHOUT an operator: recovery should
+  run the repair scrub when the store knows entries are owed, instead of
+  requiring `NEB_SCRUB_ON_RECOVERY=repair`. That needs a durable
+  "index dirty" marker, and no clean-shutdown marker exists today — so it is
+  a format change, and it is not being made silently.
+- **The b-tree `Empty` node panic** — FIXED (`e68a72df`). It was not an
+  exhaustion-only, concurrency-only hazard: both panics reproduce in
+  milliseconds on a single thread. `retain` replaces what it cuts with bypass
+  `Empty` nodes — correct in the middle of a level, where a bypass forwards
+  to its right sibling — but the cut also takes the right chain, so the node
+  it empties at the LEFT edge forwards nowhere. A pivot below every key sends
+  `mut_search` into `NodeData::None`; a pivot on a leaf boundary that leaves
+  the root one child makes `apply_top_level_split` ask `is_ext()` of a node
+  that is neither External nor Internal. The rule now is that the leftmost
+  node of a level is emptied, never destroyed.
 - **Distributed 2PC (Phase 6)** — still needs the termination-protocol
   decision, and the in-doubt timeout in Step 1 is coupled to it.
 
