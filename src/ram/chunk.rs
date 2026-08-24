@@ -435,6 +435,12 @@ pub static CELL_GUARD_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 /// no head to spare. Non-zero means some transaction's entries are outside
 /// its own atomicity, so it is worth seeing rather than inferring.
 pub static UNBRACKETED_TXN_WRITES: AtomicU64 = AtomicU64::new(0);
+/// Writes refused because no head came free in time.
+pub static HEAD_QUEUE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+/// How long a write may queue for a head before refusing. Generous next to
+/// the microseconds an ordinary writer holds one, and short next to a
+/// transaction that is never going to let go.
+const HEAD_QUEUE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 pub static TXN_LEASES_OPENED: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_EXPIRED: AtomicU64 = AtomicU64::new(0);
@@ -1634,6 +1640,7 @@ impl Chunk {
             return Err(WriteError::ServerShuttingDown);
         }
         let mut tried_gc = false;
+        let mut queueing_since: Option<std::time::Instant> = None;
         let backoff = Backoff::new();
         let slots = self.head_slots(segment_class);
         let start = head_affinity();
@@ -1811,30 +1818,24 @@ impl Chunk {
             // this, every small store failed under concurrency with
             // CannotAllocateSpace the moment writers outnumbered segments.
             let growing = head_seg_id == HEAD_SEG_ID_EMPTY;
-            // A head worth QUEUEING on: live, and not already owned.
+            // Any live head is worth queueing on, INCLUDING an owned one.
             //
-            // Counting owned heads here deadlocked the server. A plain writer
-            // holds a head for microseconds, so queueing on one is the right
-            // trade near capacity -- but a TRANSACTION holds its head until
-            // the decision, and the writes a commit is waiting on (its own
-            // secondary index updates) are ordinary writes that need a head in
-            // the same chunk. In a chunk with one segment they queued on the
-            // very head the transaction was holding, while the transaction
-            // waited on them: neither could move, and the process sat there.
+            // Ownership is normally measured in microseconds, and with a
+            // single-segment chunk under concurrency the one head is owned by
+            // somebody almost always -- refusing to wait for it turned
+            // ordinary contention into CannotAllocateSpace and failed 48
+            // concurrent transactions that used to succeed.
             //
-            // If every live head is owned, queueing cannot succeed. Fall
-            // through instead and let the code below grow, collect, or refuse
-            // -- all of which end.
+            // The wait is BOUNDED instead. A head held for longer than any
+            // writer could plausibly hold one is a head held by a transaction
+            // lease, and waiting on that can deadlock: the writes a commit
+            // waits for need a head in the same chunk. A lease can no longer
+            // take the last head (`can_spare_a_head_for_lease`), so this is
+            // the second line of defence rather than the first.
             let any_live_head = || {
                 slots.iter().any(|slot| {
                     let id = slot.load(Ordering::Acquire);
-                    if id == HEAD_SEG_ID_EMPTY || id == HEAD_SEG_ID_ALLOCATING {
-                        return false;
-                    }
-                    self.segs
-                        .get(&(id as usize))
-                        .map(|seg| !seg.is_head_owned())
-                        .unwrap_or(false)
+                    id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING
                 })
             };
             if growing && total_space >= reserve_boundary && any_live_head() {
@@ -1845,6 +1846,20 @@ impl Chunk {
                          on ourselves.",
                         self.id
                     );
+                    return Err(WriteError::CannotAllocateSpace);
+                }
+                if queueing_since
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed()
+                    >= HEAD_QUEUE_DEADLINE
+                {
+                    error!(
+                        "chunk {} waited {:?} for a head and none came free; the live head(s) are \
+                         held by something that is not releasing them. Refusing the write rather \
+                         than waiting forever.",
+                        self.id, HEAD_QUEUE_DEADLINE
+                    );
+                    HEAD_QUEUE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                     return Err(WriteError::CannotAllocateSpace);
                 }
                 backoff.spin();
