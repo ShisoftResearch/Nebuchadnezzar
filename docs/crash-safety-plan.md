@@ -229,6 +229,47 @@ the walk sees them. Nothing filters them by id: their schemas declare no
 indexed fields, so they derive nothing. Structure, not a blocklist, pinned by
 a test.
 
+### What the scrub measured: the crash window never heals itself
+
+Wiring the scrub into the crash fuzzer answered a question nobody could ask
+before -- "is the ranged index complete?" -- and the answer changed what the
+problem is.
+
+**A graceful shutdown loses nothing.** Scrubbing on both sides of one, the
+numbers are identical:
+
+| cycle (TERM) | before shutdown | after restart |
+|---|---|---|
+| 3 | missing=292, present=361,203 | missing=292, present=361,203 |
+| 5 | missing=649, present=608,004 | missing=649, present=608,004 |
+
+**A SIGKILL does**, and that is contracted: the ranged tree lives in memory
+and a kill never flushes it, so the entries for recently-written cells are
+gone (measured 7,706 / 9,818 / 6,708 / 20,665 across kill cycles). Nothing
+here is a durability bug.
+
+**The defect is that it never heals.** `ensure_indices_` re-asserts a ranged
+entry when a cell is written AGAIN -- deliberately, since "a ranged tree lost
+to a crash is rebuilt lazily by the writes that follow". That heals hot data
+and nothing else. A cell written once and never touched again keeps its lost
+entry lost for the life of the store, which is why the missing set is stable
+across restarts (728, 728, 737) and accumulates one crash at a time. On an
+append-mostly graph load -- which is what an import is -- almost every cell is
+in that category.
+
+So the entries are invisible to range scans, invisible to the scanned-count
+invariant (which only catches a drop below the previous best), and invisible
+to the lazy re-assert. **The scrub is the only thing that finds or fixes
+them**, which is the argument for running `scrub_ranged_index(repair)` after
+any unclean start rather than treating it as an occasional maintenance tool.
+
+Two earlier readings of this data were WRONG and are recorded so they are not
+re-derived: the loss does not correlate with deletes (it reproduces at
+delete_rate=0), and graceful shutdown is not lossy (the pre-shutdown
+measurement above was what disproved it; before that, a post-recovery number
+inherited from the PREVIOUS kill cycle was being read as loss caused by the
+graceful one).
+
 ### What it does NOT do: resetting an unloadable tree
 
 A tree whose page chain is damaged answers neither `contains` nor `insert`.
