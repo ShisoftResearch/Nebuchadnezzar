@@ -33,11 +33,30 @@ pub struct WriteBackHub {
     alive: AtomicUsize,
     spawning: AtomicBool,
     should_stop: AtomicBool,
-    // Latched when a worker abandons cells it could not persist. The ids
-    // still complete (so waiters resolve), but the barrier must report
-    // failure: those pages are NOT durable and nothing may publish a head
-    // that names them. Cleared by reset().
+    // Set when a worker abandons cells it could not persist. The ids still
+    // complete (so waiters resolve), but the barrier must report failure:
+    // those pages are NOT durable and nothing may publish a head that names
+    // them.
+    //
+    // This is a CONDITION, not a verdict on the process. A store that is
+    // momentarily out of space abandons a batch, and the cells go back on
+    // the queue; once they land, every page ever enqueued is durable again
+    // and the barrier is honest once more. Latching it until shutdown meant
+    // one full chunk permanently disabled index flushing AND tree splitting
+    // for every database in the process -- and splitting into a new tree
+    // (fresh locality, different chunk) is exactly how a hot chunk is
+    // relieved, so the escape hatch was gated on the thing that was broken.
     barrier_failed: AtomicBool,
+    // Cells that can NEVER be persisted -- their destination is gone, not
+    // busy. Nothing re-queues those, so the barrier stays failed for the
+    // rest of the process, which is the old behaviour and the right one:
+    // pages are genuinely missing and no head may be published over them.
+    permanent_loss: AtomicBool,
+    // Built page images a worker could not place, kept for a later attempt
+    // instead of dropped. Outside the id accounting on purpose: their ids
+    // already completed, so what gates safety is `barrier_failed`, which
+    // stays set until this lane drains.
+    retry_lane: Mutex<Vec<(Arc<client::AsyncClient>, Vec<crate::ram::cell::OwnedCell>)>>,
     // Completions that finished ahead of earlier queue ids.
     completions: Mutex<BTreeSet<usize>>,
 }
@@ -88,6 +107,8 @@ pub fn hub_for(client: &Arc<client::AsyncClient>) -> Arc<WriteBackHub> {
         spawning: AtomicBool::new(false),
         should_stop: AtomicBool::new(false),
         barrier_failed: AtomicBool::new(false),
+        permanent_loss: AtomicBool::new(false),
+        retry_lane: Mutex::new(Vec::new()),
         completions: Mutex::new(BTreeSet::new()),
     });
     hubs.push((Arc::downgrade(client), hub.clone()));
@@ -346,6 +367,7 @@ impl WriteBackHub {
                         // still being retried.
                         let mut pending: Vec<crate::ram::cell::OwnedCell> = cells;
                         let mut attempt: u32 = 0;
+                        let mut permanently_lost = false;
                         loop {
                             attempt += 1;
                             let pending_len = pending.len();
@@ -396,6 +418,11 @@ impl WriteBackHub {
                                             || permanent.contains("ConnectionRefused"))
                                     {
                                         attempt = WRITE_BACK_MAX_ATTEMPTS;
+                                        // Re-queueing cannot help a destination
+                                        // that no longer exists, so these pages
+                                        // are lost for good and the barrier must
+                                        // stay failed.
+                                        permanently_lost = true;
                                     }
                                     retry = pending;
                                 }
@@ -442,6 +469,29 @@ impl WriteBackHub {
                                     attempt
                                 );
                                 hub.barrier_failed.store(true, Ordering::SeqCst);
+                                if permanently_lost {
+                                    hub.permanent_loss.store(true, Ordering::SeqCst);
+                                } else {
+                                    // The store was busy, not gone. Put the
+                                    // images back on the queue -- the SAME
+                                    // images, so the flush stream stays
+                                    // prefix-closed -- and let a later drain
+                                    // place them once the cleaner has freed
+                                    // room. The barrier clears itself when the
+                                    // queue runs dry, so the tree can split
+                                    // again and relieve the chunk that caused
+                                    // this in the first place.
+                                    let requeued = retry.len();
+                                    hub.retry_lane
+                                        .lock()
+                                        .expect("write-back retry lane poisoned")
+                                        .push((client.clone(), std::mem::take(&mut retry)));
+                                    warn!(
+                                        "write-back worker {} re-queued {} abandoned cell(s) for a \
+                                         later drain; the barrier stays unestablished until they land",
+                                        worker_id, requeued
+                                    );
+                                }
                                 // The worker LIVES ON. It used to stop here,
                                 // and the hub is process-global: one dead
                                 // database's abandoned batch (its server gone,
@@ -486,6 +536,14 @@ impl WriteBackHub {
                     }
 
                     if !flushed_mods && !flushed_dels {
+                        // Idle: the moment to retry what could not be placed
+                        // earlier. Once the lane drains, every page ever
+                        // enqueued is durable again and the barrier is honest,
+                        // so flushing and -- crucially -- tree splitting work
+                        // again. Splitting is what relieves the full chunk
+                        // that caused the abandonment, so leaving the barrier
+                        // latched kept the store from digging itself out.
+                        hub.retry_abandoned(worker_id).await;
                         tokio::time::sleep(Duration::from_millis(25)).await;
                         continue;
                     }
@@ -494,6 +552,89 @@ impl WriteBackHub {
             });
         }
         self.spawning.store(false, Ordering::SeqCst);
+    }
+
+    /// Retry page images abandoned earlier, and clear the barrier if they
+    /// all land.
+    ///
+    /// One attempt per idle tick, deliberately: these are pages a full chunk
+    /// refused, and hammering them adds load to a store that is already out
+    /// of room. Cells that fail go back in the lane and the barrier stays
+    /// unestablished, which is exactly the state the caller must see while
+    /// any page is missing.
+    async fn retry_abandoned(self: &Arc<Self>, worker_id: usize) {
+        let batches = {
+            let mut lane = self
+                .retry_lane
+                .lock()
+                .expect("write-back retry lane poisoned");
+            if lane.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *lane)
+        };
+        let mut still_failing: Vec<(Arc<client::AsyncClient>, Vec<crate::ram::cell::OwnedCell>)> =
+            Vec::new();
+        let mut landed = 0usize;
+        for (client, cells) in batches {
+            let attempted = cells.len();
+            match client.upsert_all_cells(cells.clone()).await {
+                Ok(results) => {
+                    let mut retry: Vec<crate::ram::cell::OwnedCell> = Vec::new();
+                    for (r, cell) in results.into_iter().zip(cells.into_iter()) {
+                        match r {
+                            Ok(_) => landed += 1,
+                            Err(
+                                crate::ram::cell::WriteError::CannotAllocateSpace
+                                | crate::ram::cell::WriteError::BatchAborted,
+                            ) => retry.push(cell),
+                            Err(e) => {
+                                // Not retryable, and not coming back: the page
+                                // is genuinely lost, so the barrier must stay
+                                // failed rather than clear underneath it.
+                                warn!(
+                                    "write-back retry: cell update rejected (not retryable): {:?}",
+                                    e
+                                );
+                                self.permanent_loss.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    if !retry.is_empty() {
+                        still_failing.push((client, retry));
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "write-back retry: batch of {} still cannot be placed: {:?}",
+                        attempted, e
+                    );
+                    still_failing.push((client, cells));
+                }
+            }
+        }
+        let drained = still_failing.is_empty();
+        if !drained {
+            let mut lane = self
+                .retry_lane
+                .lock()
+                .expect("write-back retry lane poisoned");
+            lane.extend(still_failing);
+        }
+        if landed > 0 {
+            info!(
+                "write-back worker {} placed {} previously-abandoned cell(s)",
+                worker_id, landed
+            );
+        }
+        if drained && !self.permanent_loss.load(Ordering::SeqCst) {
+            if self.barrier_failed.swap(false, Ordering::SeqCst) {
+                info!(
+                    "write-back barrier RE-ESTABLISHED: every abandoned page has been placed, so \
+                     flushing and tree splitting can proceed again"
+                );
+            }
+        }
     }
 
     /// Returns true when every change enqueued before the call is durable.
@@ -557,6 +698,24 @@ impl WriteBackHub {
             .clear();
         self.counter.store(0, Ordering::SeqCst);
         self.barrier_failed.store(false, Ordering::SeqCst);
+        self.permanent_loss.store(false, Ordering::SeqCst);
+        let abandoned = {
+            let mut lane = self
+                .retry_lane
+                .lock()
+                .expect("write-back retry lane poisoned");
+            let count: usize = lane.iter().map(|(_, cells)| cells.len()).sum();
+            lane.clear();
+            count
+        };
+        if abandoned > 0 {
+            error!(
+                "write-back reset DISCARDED {} page image(s) still awaiting retry; they were \
+                 never durable and the barrier reported so, but say it once more at the point \
+                 the memory goes away",
+                abandoned
+            );
+        }
         // Anything still queued here is a page write that will NEVER become
         // durable, while a head pointer published during shutdown may
         // already name it. That is the MissingPage corpse, so say so
@@ -622,6 +781,163 @@ mod tests {
     use super::*;
     use crate::ram::types::Id;
     use crate::server::{NebServer, ServerOptions, Service};
+
+    /// An abandoned batch must not disable the barrier forever.
+    ///
+    /// A worker that cannot place a page sets `barrier_failed`, and every
+    /// publisher then refuses -- including the tree balancer's seam barrier,
+    /// which is what makes an oversized tree SPLIT into a new tree with a
+    /// fresh locality, i.e. a different chunk. Latching the flag until
+    /// shutdown therefore disabled the one mechanism that relieves the full
+    /// chunk that caused the abandonment: measured as 7 consecutive
+    /// rolled-back splits of a tree whose own chunk was healthy, while a
+    /// single hot chunk logged 193,360 allocation failures.
+    ///
+    /// The flag is a condition, not a verdict: once the abandoned images are
+    /// placed, every page is durable again and the barrier must say so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_batch_stops_gating_once_its_pages_land() {
+        let _ = env_logger::try_init();
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "writeback_barrier_heals";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 8 * 1024 * 1024,
+                db_size: 8 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                disable_storage_locks: true,
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            crate::client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client
+            .new_schema_with_id(super::super::external::page_schema())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let hub = hub_for(&client);
+        hub.ensure_workers();
+
+        // A worker gave up on a page it could not place: the barrier is down
+        // and stays down while the image is outstanding.
+        hub.barrier_failed.store(true, Ordering::SeqCst);
+        hub.retry_lane
+            .lock()
+            .unwrap()
+            .push((client.clone(), vec![page_cell_for_test(Id::from_parts(7, 7))]));
+        assert!(
+            !hub.wait_until_updated().await,
+            "the barrier must stay unestablished while a page is outstanding"
+        );
+
+        // The store can take it now. One idle tick places it, and the
+        // barrier must come back -- otherwise no tree can ever split again.
+        for _ in 0..40 {
+            hub.retry_abandoned(0).await;
+            if hub.retry_lane.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            hub.retry_lane.lock().unwrap().is_empty(),
+            "the abandoned image should have been placed once the store could take it"
+        );
+        assert!(
+            hub.wait_until_updated().await,
+            "with every abandoned page placed, the barrier must be established again"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// A page whose destination is GONE is not retryable, and the barrier
+    /// must stay down: those pages are missing and no head may be published
+    /// over them, however long the process runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permanent_loss_keeps_the_barrier_down() {
+        let _ = env_logger::try_init();
+        let server_addr = crate::utils::test_port::unique_localhost_addr();
+        let server_group = "writeback_permanent_loss";
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_size: 8 * 1024 * 1024,
+                db_size: 8 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell],
+                disable_storage_locks: true,
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await
+        .unwrap();
+        let client = Arc::new(
+            crate::client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let hub = hub_for(&client);
+        hub.barrier_failed.store(true, Ordering::SeqCst);
+        hub.permanent_loss.store(true, Ordering::SeqCst);
+        hub.retry_abandoned(0).await;
+        assert!(
+            !hub.wait_until_updated().await,
+            "a permanently lost page must keep the barrier down for the life of the process"
+        );
+
+        server.shutdown().await;
+    }
+
+    /// An empty page image, shaped exactly like `ExtNode::to_cell` writes
+    /// one, so the retry path exercises a real page write.
+    fn page_cell_for_test(id: Id) -> crate::ram::cell::OwnedCell {
+        use super::super::external::{
+            KEYS_KEY_HASH, NEXT_PAGE_KEY_HASH, PAGE_SCHEMA_ID, PREV_PAGE_KEY_HASH,
+        };
+        use crate::ram::types::{Map, OwnedMap, OwnedValue};
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[*NEXT_PAGE_KEY_HASH] = OwnedValue::Id(Id::unit_id());
+        value[*PREV_PAGE_KEY_HASH] = OwnedValue::Id(Id::unit_id());
+        value[*KEYS_KEY_HASH] = OwnedValue::PrimArray(
+            dovahkiin::types::OwnedPrimArray::SmallBytes(Vec::new()),
+        );
+        crate::ram::cell::OwnedCell::new_with_id(*PAGE_SCHEMA_ID, &id, value)
+    }
 
     /// The deletion lane must hold a page removal until every change
     /// enqueued before it has completed. This is the fence that keeps a
