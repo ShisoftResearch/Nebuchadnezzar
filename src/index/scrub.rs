@@ -153,6 +153,7 @@ pub async fn scrub_ranged_index(
     mode: ScrubMode,
 ) -> ScrubReport {
     UNREACHABLE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
+    MISSING_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut total = ScrubReport::default();
     for chunk in &chunks.list {
         for segment in chunk.segments() {
@@ -215,6 +216,33 @@ fn derive_into(
 /// ever counts up would silently stop explaining itself after the first run.
 static UNREACHABLE_LOGGED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Examples of MISSING keys logged this pass. Same reset discipline.
+static MISSING_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Name a few of the cells whose entries are absent.
+///
+/// A count alone says how bad it is and nothing about what it is. Once a
+/// missing set proves STABLE across restarts -- the same number surviving
+/// every recovery -- it stops being a durability window and becomes a set of
+/// specific cells to go and look at, and then their ids are the whole
+/// investigation. Capped like the unreachable examples, for the same reason.
+fn report_missing(key: &EntryKey) {
+    const EXAMPLES: usize = 12;
+    let n = MISSING_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < EXAMPLES {
+        warn!(
+            "Index scrub: no entry for cell {:?} (key {:?}){}",
+            key.id(),
+            key,
+            if n + 1 == EXAMPLES {
+                " (further missing entries will not be logged; see the report counts)"
+            } else {
+                ""
+            }
+        );
+    }
+}
 
 /// Log the first few unreachable keys and then stop.
 ///
@@ -314,7 +342,10 @@ async fn check_one(
 ) -> KeyOutcome {
     if mode.repairs() {
         match indexers.ranged_client.insert(key).await {
-            Ok(true) => KeyOutcome::Repaired,
+            Ok(true) => {
+                report_missing(key);
+                KeyOutcome::Repaired
+            }
             Ok(false) => KeyOutcome::Present,
             Err(error) => {
                 report_unreachable(key, &error);
@@ -324,7 +355,10 @@ async fn check_one(
     } else {
         match indexers.ranged_client.contains(key).await {
             Ok(true) => KeyOutcome::Present,
-            Ok(false) => KeyOutcome::Missing,
+            Ok(false) => {
+                report_missing(key);
+                KeyOutcome::Missing
+            }
             Err(error) => {
                 // The tree covering this key is absent or unreadable --
                 // exactly the condition this tool is for. Not a missing

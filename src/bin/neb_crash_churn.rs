@@ -258,6 +258,8 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // kill caught in flight are allowed to be missing.
                         // The number's SIZE is the signal.
                         println!("    scrub: {}", rest.trim());
+                    } else if let Some(rest) = line.strip_prefix("PRESHUTDOWN_SCRUB ") {
+                        println!("    scrub BEFORE shutdown: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("SCRUB_REPAIRED ") {
                         println!("    scrub REPAIRED: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("RESCANNED n=") {
@@ -1180,6 +1182,26 @@ async fn child_async(
                 .chain(txn_handles.iter())
             {
                 handle.abort();
+            }
+            // Measure the index BEFORE the shutdown flush as well as after
+            // the next recovery. The two numbers separate the only two
+            // stories that can explain a missing entry: one that is already
+            // missing here was never inserted (or its insert failed), while
+            // one that appears only after restart was inserted and then lost
+            // on the way to disk. Reported either way -- the harness does not
+            // decide which is acceptable.
+            if std::env::var("NEB_CHURN_SCRUB").as_deref() != Ok("0") {
+                match client.scrub_ranged_index(false).await {
+                    Ok(r) => println!(
+                        "PRESHUTDOWN_SCRUB missing={} unreachable={} present={} derived={}",
+                        r.entries_missing,
+                        r.entries_unreachable,
+                        r.entries_present,
+                        r.entries_derived
+                    ),
+                    Err(e) => println!("PRESHUTDOWN_SCRUB_ERROR {}", e),
+                }
+                flush_stdout();
             }
             server.shutdown().await;
             println!("SHUTDOWN_COMPLETE");
