@@ -313,6 +313,41 @@ needs, and does not yet have:
 DECISION NEEDED before building it: whether (1) is satisfied by a durable
 recovery-complete marker, or by requiring the operator to assert it.
 
+## Next: half-edge detection (specified, not built)
+
+The ingest path (`morpheus/src/graph/idlist_coordinator.rs`) updates each
+endpoint's adjacency list in a SEPARATE call with no atomicity between them,
+so a crash can leave an edge in A's out-list and not B's in-list. Traversals
+then disagree by direction, silently. This cannot be PREVENTED without the
+distributed termination protocol -- A and B are different vertices on
+different nodes -- but it can be DETECTED, in the same shape as the index
+scrub, and detection is what turns a guess into a number.
+
+The pieces already exist:
+
+- `LocalIdList` (`local.rs`) reads a vertex's lists from `Chunks` with no RPC,
+  so the walk over local vertices is cheap.
+- `EdgeDirection::reversed()` gives the list to check on the far side.
+- `body_edge_dest_vertex()` (`graph/mod.rs`, currently private) resolves an
+  edge-body cell to its other endpoint, handling directed and undirected.
+- `AtomicIdList::contains()` answers the far side, routed by conshash.
+
+Shape: for each local vertex V, each direction D, each schema S, and each
+entry X in V's (D, S) list -- resolve X to the neighbour N (X itself for a
+simple edge; `body_edge_dest_vertex` for a body edge), then check N's
+`reversed(D)` list contains X. Report only; never repair.
+
+**Why report-only.** Repair direction is genuinely ambiguous: an edge in A
+and not B can be completed or removed, and which is right depends on whether
+the write was acked -- which the store does not record. That is a decision
+for whoever reads the report, not for the tool.
+
+**The trap to avoid**, learned from the index scrub: getting simple-vs-body
+or undirected resolution subtly wrong produces FALSE half-edges, and a
+detector that cries wolf is worse than none -- see the shutdown LSM flush
+warning that fired on every database that had no index at all. Build the
+single-vertex check first, with a test per edge shape, before any driver.
+
 ## Phase 5 — Verification: make crashes boring
 
 1. **Crash-churn fuzzer, delete-heavy + transactional lanes.** The
