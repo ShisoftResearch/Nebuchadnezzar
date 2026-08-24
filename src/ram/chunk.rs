@@ -400,13 +400,22 @@ pub struct HeadLease {
 }
 
 struct TransactionLeases {
-    /// chunk id -> heads this transaction holds there, oldest first.
+    /// chunk KEY -> heads this transaction holds there, oldest first.
+    ///
+    /// The key is (allocator base address, chunk id), not the id alone: ids
+    /// restart at 0 in every `Chunks` instance, and a process holds several
+    /// -- one per database, and one per server in any test that starts more
+    /// than one. Keyed by id alone, two unrelated stores shared a lease, so a
+    /// write meant for one landed in the other's segment and put a foreign
+    /// address into this chunk's cell index. That address is outside this
+    /// allocator's range, so every later lookup failed and the caller's retry
+    /// loop spun forever.
     ///
     /// A Vec rather than one entry because a write set that outgrows its
     /// head rotates onto a fresh one, and a rewind has to undo both. Until
     /// brackets land (Step 2) a rotation is harmless: nothing yet depends on
     /// a transaction's entries sharing one segment.
-    per_chunk: std::collections::HashMap<usize, Vec<HeadLease>>,
+    per_chunk: std::collections::HashMap<(usize, usize), Vec<HeadLease>>,
     opened_at: std::time::Instant,
 }
 
@@ -419,6 +428,9 @@ lazy_static! {
         Mutex::new(std::collections::HashMap::new());
 }
 
+/// Guard acquisitions abandoned at the deadline. Non-zero means a cell index
+/// entry outlived its segment: real damage, and previously a hang.
+pub static CELL_GUARD_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_OPENED: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
 pub static TXN_LEASES_EXPIRED: AtomicU64 = AtomicU64::new(0);
@@ -486,7 +498,7 @@ pub fn rewind_transaction_writes(txn: &crate::server::transactions::TxnId) -> us
                 debug!(
                     "chunk {} could not rewind segment {} for aborted transaction {:?}; its \
                      entries stay as dead space and recover as uncommitted",
-                    chunk_id, lease.seg.id, txn
+                    chunk_id.1, lease.seg.id, txn
                 );
             }
             lease.seg.release_own();
@@ -570,7 +582,7 @@ pub fn transaction_manifest(
         .iter()
         .flat_map(|(chunk_id, heads)| {
             heads.iter().map(move |lease| crate::ram::bracket::ManifestEntry {
-                chunk_id: *chunk_id as u16,
+                chunk_id: chunk_id.1 as u16,
                 seq_id: lease.seg.seq_id,
             })
         })
@@ -1215,7 +1227,7 @@ impl Chunk {
             });
         leases
             .per_chunk
-            .entry(self.id)
+            .entry(self.lease_key())
             .or_insert_with(Vec::new)
             .push(HeadLease {
                 seg: head.clone(),
@@ -1252,7 +1264,7 @@ impl Chunk {
         let heads: Vec<AArc<Segment>> = {
             let txn_now = current_txn();
             let held = TXN_LEASES.lock();
-            match txn_now.as_ref().and_then(|t| held.get(t)).and_then(|l| l.per_chunk.get(&self.id))
+            match txn_now.as_ref().and_then(|t| held.get(t)).and_then(|l| l.per_chunk.get(&self.lease_key()))
             {
                 Some(heads) => heads.iter().map(|lease| lease.seg.clone()).collect(),
                 None => Vec::new(),
@@ -1317,9 +1329,14 @@ impl Chunk {
         let held = TXN_LEASES.lock();
         held.get(&txn)?
             .per_chunk
-            .get(&self.id)?
+            .get(&self.lease_key())?
             .last()
             .map(|lease| lease.seg.clone())
+    }
+
+    /// This chunk's lease key: unique across every store in the process.
+    fn lease_key(&self) -> (usize, usize) {
+        (self.allocator.base_addr(), self.id)
     }
 
     /// Whether the calling thread's transaction holds a head in this chunk.
@@ -1337,7 +1354,7 @@ impl Chunk {
         TXN_LEASES
             .lock()
             .get(&txn)
-            .and_then(|leases| leases.per_chunk.get(&self.id))
+            .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
             .map(|heads| !heads.is_empty())
             .unwrap_or(false)
     }
@@ -1359,7 +1376,7 @@ impl Chunk {
             // where the write set continues.
             match held
                 .get(&txn)
-                .and_then(|leases| leases.per_chunk.get(&self.id))
+                .and_then(|leases| leases.per_chunk.get(&self.lease_key()))
                 .and_then(|heads| heads.last())
             {
                 Some(lease) => lease.seg.clone(),
@@ -2980,7 +2997,10 @@ impl Chunk {
     }
 
     pub fn locate_segment(&self, addr: usize) -> Option<AArc<Segment>> {
-        let seg_id = self.allocator.id_by_addr(addr);
+        // An address outside this chunk's range names no segment. Zero is the
+        // common case -- it is how the cell index spells "no cell here" -- and
+        // it used to underflow the id arithmetic rather than answer.
+        let seg_id = self.allocator.try_id_by_addr(addr)?;
         let res = self.segs.get(&seg_id);
         if res.is_none() {
             // Segment doesn't exist - this can happen when the cleaner combines segments
@@ -4599,12 +4619,46 @@ impl<'a> CellGuard<'a> {
         })
     }
 
+    /// How long acquiring a cell guard may retry before giving up.
+    ///
+    /// The retry loop exists for states that RESOLVE: a cold segment being
+    /// promoted, or one briefly held exclusively by an evictor, promoter or
+    /// the cleaner. `from_guard` answers None for those and the next pass
+    /// succeeds.
+    ///
+    /// It also covers one that NEVER resolves -- a cell index entry pointing
+    /// at a segment that no longer exists -- and there the loop spun forever,
+    /// burning a core and holding whatever the caller held. Found with gdb on
+    /// a transaction suite that had made no progress in over an hour: one
+    /// thread inside `DataManager::rollback` -> `update_cell_by` ->
+    /// `for_write`, sched_yield'ing in `Backoff::spin`, with 88 other threads
+    /// parked behind the abort it never finished.
+    ///
+    /// A deadline turns that from a wedge into an error the caller already
+    /// knows how to report: `update_cell_by` maps None to
+    /// `CellDoesNotExisted`, and a stale pointer really is a cell this chunk
+    /// can no longer produce.
+    const GUARD_ACQUIRE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
     pub fn for_read(hash: u64, chunk: &'a Chunk) -> Result<Self, ReadError> {
         let backoff = Backoff::new();
+        let started = std::time::Instant::now();
         loop {
             let guard = chunk.location_for_read(hash)?;
             if let Some(guard) = CellGuard::from_guard(hash, guard, chunk) {
                 return Ok(guard);
+            }
+            if started.elapsed() >= Self::GUARD_ACQUIRE_DEADLINE {
+                error!(
+                    "read guard for cell {} in chunk {} could not be acquired in {:?}; the index \
+                     entry names a segment this chunk cannot produce. Reporting a stale pointer \
+                     rather than spinning forever.",
+                    hash,
+                    chunk.id,
+                    Self::GUARD_ACQUIRE_DEADLINE
+                );
+                CELL_GUARD_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                return Err(ReadError::StaleCellPointer);
             }
             backoff.spin();
         }
@@ -4612,10 +4666,24 @@ impl<'a> CellGuard<'a> {
 
     pub fn for_write(hash: u64, has_read: bool, chunk: &'a Chunk) -> Option<Self> {
         let backoff = Backoff::new();
+        let started = std::time::Instant::now();
         loop {
             let guard = chunk.location_for_write(hash, has_read)?;
             if let Some(guard) = CellGuard::from_guard(hash, guard, chunk) {
                 return Some(guard);
+            }
+            if started.elapsed() >= Self::GUARD_ACQUIRE_DEADLINE {
+                error!(
+                    "write guard for cell {} in chunk {} could not be acquired in {:?}; the index \
+                     entry names a segment this chunk cannot produce. Refusing the write rather \
+                     than spinning forever -- a wedged writer takes its caller with it, and this \
+                     one wedged an abort.",
+                    hash,
+                    chunk.id,
+                    Self::GUARD_ACQUIRE_DEADLINE
+                );
+                CELL_GUARD_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                return None;
             }
             backoff.spin();
         }
@@ -4882,7 +4950,7 @@ mod tests {
                 .get(&txn)
                 .unwrap()
                 .per_chunk
-                .get(&chunk.id)
+                .get(&chunk.lease_key())
                 .unwrap()
                 .first()
                 .unwrap()

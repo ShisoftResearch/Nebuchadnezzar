@@ -4160,6 +4160,23 @@ impl Service for DataManager {
         // cannot be reclaimed between validation and the storage mutations.
         let guards_to_drop = std::mem::take(&mut txn.segment_guards);
 
+        // Give the write heads back BEFORE rolling back.
+        //
+        // The lease keeps a transaction's entries contiguous until its
+        // decision, so that a COMMIT closes a bracket containing nothing but
+        // its own entries. This IS the decision and it is an abort: no COMMIT
+        // will ever be written, the bracket stays uncommitted, and recovery
+        // discards it whatever lands after it. There is nothing left to
+        // protect.
+        //
+        // Holding on, meanwhile, starves the rollback that must run right
+        // now: restoring old versions and writing tombstones are ordinary
+        // writes, and in a chunk whose heads this transaction owns they have
+        // nowhere to go. That is a participant deadlocking itself -- found
+        // with gdb on a transaction suite stuck for over an hour, one thread
+        // spinning for a head its own aborting transaction still held.
+        crate::ram::chunk::release_transaction_leases(&tid);
+
         let rollback_failures = {
             debug!(
                 ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
@@ -4176,30 +4193,17 @@ impl Service for DataManager {
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
 
-        // Now that the rollback has taken the index off this transaction's
-        // entries, the entries themselves can go: padding over the span and
-        // the cursor back where it started, so an abort leaves no trace to
-        // scan, collect or recover.
+        // NO physical rewind here any more.
         //
-        // Order is the safety property. Rewinding BEFORE the rollback would
-        // pad over bytes the index still points at, and a read would land on
-        // padding where a cell used to be. Only a transaction that still
-        // owns its heads can do this at all, which is why the lease runs to
-        // the decision.
+        // Padding over the transaction's span and resetting the cursor was
+        // only safe while the transaction still OWNED the segment, and the
+        // lease now ends above, before rollback, because holding it that long
+        // deadlocked the rollback. Rewinding after the release would pad over
+        // whatever another writer appended in between.
         //
-        // A rollback that partly failed keeps its span: those cells are still
-        // referenced, so disowning the bytes underneath them is exactly the
-        // hazard this ordering avoids.
-        if rollback_failures.is_none() {
-            let rewound = crate::ram::chunk::rewind_transaction_writes(&tid);
-            if rewound > 0 {
-                debug!(
-                    "aborted transaction {:?}: rewound {} segment span(s); its writes leave no \
-                     dead space behind",
-                    tid, rewound
-                );
-            }
-        }
+        // Nothing is lost but the space: an aborted transaction writes no
+        // COMMIT, so recovery discards its bracket, and its entries are dead
+        // space the cleaner reclaims like any other.
 
         drop(cell_guards);
         drop(txn);

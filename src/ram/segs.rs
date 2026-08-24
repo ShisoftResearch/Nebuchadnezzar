@@ -3232,10 +3232,37 @@ impl SegmentAllocator {
         self.free_count.fetch_add(1, Relaxed);
     }
 
+    /// The segment id owning `addr`, or `None` if the address is not in this
+    /// allocator's range at all.
+    ///
+    /// The subtraction used to be unchecked, so an address BELOW the base --
+    /// most commonly 0, which is how the cell index spells "no cell here" --
+    /// underflowed to a colossal id. In release that silently looked up a
+    /// nonsense segment; in debug it panicked with "attempt to subtract with
+    /// overflow", which is how this was found: an abort's rollback asked for
+    /// a guard on a cell whose index entry had been zeroed, and the caller's
+    /// retry loop then spun forever because the lookup could never answer.
+    ///
+    /// An address outside the range can never name a segment, so `None` is
+    /// the honest answer and callers already treat it as "stale pointer".
+    /// This allocator's base address, which is unique per chunk in a process:
+    /// each one mmaps its own range. Used as the identity half of a lease key,
+    /// because a chunk's `id` alone is only unique within ONE store and a
+    /// process can hold several (multi-database servers, and every test that
+    /// starts more than one server).
+    pub fn base_addr(&self) -> usize {
+        self.base
+    }
+
+    pub fn try_id_by_addr(&self, addr: usize) -> Option<usize> {
+        if addr < self.base || addr >= self.limit {
+            return None;
+        }
+        Some((addr - self.base) >> SEGMENT_BITS_SHIFT)
+    }
+
     pub fn id_by_addr(&self, addr: usize) -> usize {
-        let offset = addr - self.base;
-        let id = offset >> SEGMENT_BITS_SHIFT;
-        id
+        self.try_id_by_addr(addr).unwrap_or(usize::MAX)
     }
 
     #[inline]
