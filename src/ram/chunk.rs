@@ -4656,52 +4656,50 @@ impl<'a> CellGuard<'a> {
                                 // one path that verifies nothing: the
                                 // whole-file CRC is checked only on a full
                                 // read, so a block served directly was never
-                                // checked against anything. Now the entry's
-                                // own checksum answers for it.
+                                // checked against anything. The entry's own
+                                // checksum answers for it here.
                                 //
-                                // Returning None on a mismatch is not a
-                                // silent drop: it falls through to promotion
-                                // below, which reads the whole backup and
-                                // DOES verify its CRC, so a genuinely
-                                // corrupt file is refused there with the
-                                // full diagnosis.
-                                // A POSITIVE verdict, not merely the absence
-                                // of a negative one. `None` means "no content
-                                // to vouch for" -- padding, or a reservation
-                                // never filled -- and the cell index only ever
-                                // points at CELL entries, which always carry a
-                                // checksum. So `None` here is not an entry
-                                // exempt from checking, it is the wrong entry
-                                // at this address, and serving it unverified
-                                // is the one outcome this check exists to
-                                // prevent.
-                                if crate::ram::entry::verify_entry_at(*guard) != Some(true) {
-                                    error!(
-                                        "Cold block read of segment {} (chunk {}) produced an \
-                                         entry that does not vouch for itself at {:#x} \
-                                         (verdict {:?}). Refusing to serve it; falling back to a \
-                                         full read of the backup, which verifies the whole image.",
-                                        seg.id,
-                                        chunk.id,
-                                        *guard,
-                                        crate::ram::entry::verify_entry_at(*guard)
-                                    );
-                                    seg.decr_references();
-                                    return None;
+                                // A refusal FALLS THROUGH to promotion below,
+                                // which reads the whole backup and does verify
+                                // its CRC -- so a genuinely corrupt file is
+                                // refused there with the full diagnosis, and a
+                                // block that merely came in wrong is re-read
+                                // properly. It must not `return None` on its
+                                // own: that signals "retry" to the caller
+                                // without promoting anything, so the retry
+                                // lands on the same cold block and fails the
+                                // same way, forever.
+                                let verdict = crate::ram::entry::verify_entry_at(*guard);
+                                if verdict == Some(true) {
+                                    seg.mark_referenced();
+                                    if let Some(ref tiered) = chunk.tiered_manager {
+                                        tiered.add_cold_resident(newly_resident);
+                                        tiered.note_cold_block_read();
+                                    }
+                                    return Some(CellGuard {
+                                        _qsbr: crate::ram::qsbr::QsbrSection::new(),
+                                        hash,
+                                        guard: Some(guard),
+                                        chunk,
+                                        segment,
+                                        version,
+                                    });
                                 }
-                                seg.mark_referenced();
-                                if let Some(ref tiered) = chunk.tiered_manager {
-                                    tiered.add_cold_resident(newly_resident);
-                                    tiered.note_cold_block_read();
-                                }
-                                return Some(CellGuard {
-                                _qsbr: crate::ram::qsbr::QsbrSection::new(),
-                                    hash,
-                                    guard: Some(guard),
-                                    chunk,
-                                    segment,
-                                    version,
-                                });
+                                // `None` is not an entry exempt from checking.
+                                // It means "no content to vouch for" -- padding,
+                                // or a reservation never filled -- and the cell
+                                // index only ever points at CELL entries, which
+                                // always carry a checksum. `None` at a cell
+                                // address is the WRONG ENTRY there, which is
+                                // exactly what this check exists to catch.
+                                error!(
+                                    "Cold block read of segment {} (chunk {}) produced an entry \
+                                     that does not vouch for itself at {:#x} (verdict {:?}). \
+                                     Refusing to serve it; promoting and reading the whole \
+                                     backup, which verifies the image end to end.",
+                                    seg.id, chunk.id, *guard, verdict
+                                );
+                                seg.decr_references();
                             }
                             Ok(None) => {
                                 seg.decr_references();
