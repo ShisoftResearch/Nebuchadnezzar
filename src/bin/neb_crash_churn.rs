@@ -366,6 +366,8 @@ fn parent_main(args: &[String]) -> ExitCode {
                         failed = Some(format!("TORN TRANSACTION: {}", line.trim()));
                     } else if let Some(rest) = line.strip_prefix("TXN_ATOMIC ") {
                         println!("    transactions: {}", rest.trim());
+                    } else if let Some(rest) = line.strip_prefix("RECONCILE ") {
+                        println!("    startup reconcile: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("SCRUB ") {
                         // Reported, never failed on: see the child's comment.
                         // Indexes are rebuildable by contract, so entries a
@@ -386,6 +388,16 @@ fn parent_main(args: &[String]) -> ExitCode {
                     } else if let Some(rest) = line.strip_prefix("SCAN_AFTER_SCRUB n=") {
                         let again: u64 = rest.trim().parse().unwrap_or(0);
                         println!("    scan after scrub: n={}", again);
+                        if std::env::var("NEB_CHURN_SCRUB").as_deref() == Ok("repair")
+                            && pending_regression.is_some()
+                        {
+                            // Repair runs next, and its rescan answers a better
+                            // question than this one. Keep holding.
+                            if let Some(reason) = pending_regression.as_mut() {
+                                reason.push_str(&format!(" -- scan after verify: {}", again));
+                            }
+                            continue;
+                        }
                         if let Some(reason) = pending_regression.take() {
                             // THE discriminator. The first scan ran against a
                             // freshly loaded store; the scrub has since walked
@@ -418,6 +430,33 @@ fn parent_main(args: &[String]) -> ExitCode {
                         }
                     } else if let Some(rest) = line.strip_prefix("RESCANNED n=") {
                         println!("    rescan after repair: n={}", rest.trim());
+                        if let Some(reason) = pending_regression.take() {
+                            // The question the contract actually asks. Indexes
+                            // are DERIVABLE -- the scrub rebuilds them from the
+                            // cells in the segments, through the write path's
+                            // own probe -- so an entry that is missing after a
+                            // restart is a repair job, and only an entry the
+                            // cells can no longer produce is a loss. Say which.
+                            let healed: u64 = rest.trim().parse().unwrap_or(0);
+                            failed = Some(if healed >= state.best_verified {
+                                format!(
+                                    "RECOVERABLE (index rebuilt from cells): {} -- repair from \
+                                     the segments restored the count to {} >= {}. The cells kept \
+                                     everything; only the index tail was missing, and it came \
+                                     back.",
+                                    reason, healed, state.best_verified
+                                )
+                            } else {
+                                format!(
+                                    "UNRECOVERABLE: {} -- repair from the segments only reached \
+                                     {} < {}, so the CELLS no longer imply those entries. This \
+                                     is data loss, not an index that needs rebuilding.",
+                                    reason, healed, state.best_verified
+                                )
+                            });
+                            unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                            break;
+                        }
                     } else if let Some(rest) = line.strip_prefix("SCRUB_ERROR ") {
                         println!("    scrub FAILED: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("CELLS_PRESENT ") {
@@ -917,6 +956,20 @@ async fn child_async(
     );
     flush_stdout();
     println!("SCANNED n={}", count);
+    flush_stdout();
+
+    // What the startup reconciliation cost, every cycle. A blocking pass on
+    // the startup path is a price, and a price nobody measures is one that
+    // grows.
+    println!(
+        "RECONCILE ms={} scanned={} skipped={} noidx={} repaired={} bounded={}",
+        neb::index::scrub::LAST_RECONCILE_MS.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_SCANNED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_NOIDX.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_REPAIRED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::scrub::LAST_RECONCILE_BOUNDED.load(std::sync::atomic::Ordering::Relaxed),
+    );
     flush_stdout();
 
     // A different question than the scanned count asks. That count only

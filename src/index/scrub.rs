@@ -67,6 +67,16 @@ impl ScrubMode {
 pub struct ScrubReport {
     /// Live cells walked.
     pub cells_scanned: u64,
+    /// Live cells whose schema declares no indexed field, so nothing is
+    /// derivable from them and they are not read at all. Mostly the b-tree's
+    /// own pages.
+    pub cells_no_indices: u64,
+    /// Live cells the durability mark said were already indexed, so this pass
+    /// did not derive them. Reported rather than hidden: it is the difference
+    /// between "the index agrees with the cells" and "the index agrees with
+    /// the cells this pass bothered to look at", and only the first is a claim
+    /// worth making.
+    pub cells_skipped: u64,
     /// Cells whose entry the index still pointed at, but which could not be
     /// read. A nonzero count here is a CELL-level problem, not an index one,
     /// and this pass cannot fix it.
@@ -110,6 +120,8 @@ impl ScrubReport {
     /// node's cells is a complete account of what the index should hold.
     pub fn merge(&mut self, other: &ScrubReport) {
         self.cells_scanned += other.cells_scanned;
+        self.cells_skipped += other.cells_skipped;
+        self.cells_no_indices += other.cells_no_indices;
         self.cells_unreadable += other.cells_unreadable;
         self.cells_schema_missing += other.cells_schema_missing;
         self.entries_derived += other.entries_derived;
@@ -125,9 +137,11 @@ impl std::fmt::Display for ScrubReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cells={} (unreadable={}, schema-missing={}) entries={} \
+            "cells={} (skipped={}, no-indices={}, unreadable={}, schema-missing={}) entries={} \
              present={} missing={} repaired={} unreachable={} repair-failed={}",
             self.cells_scanned,
+            self.cells_skipped,
+            self.cells_no_indices,
             self.cells_unreadable,
             self.cells_schema_missing,
             self.entries_derived,
@@ -149,11 +163,19 @@ impl std::fmt::Display for ScrubReport {
 /// billions. A default that silently adds hours to every restart is worse
 /// than the problem it fixes, so the deployment that knows its size chooses.
 ///
-/// **Why it runs in the background rather than blocking startup.** A store
-/// that has just crashed should serve as soon as it can. Reads during the
-/// pass still miss the entries it has not reached yet -- but that is exactly
-/// the status quo without it, so serving early costs nothing that was not
-/// already lost, while delaying startup costs availability outright.
+/// **Why it BLOCKS rather than running in the background.** The index is a
+/// cache of the cells, and a cache that has not caught up answers queries
+/// with fewer rows and no error. Serving during the pass therefore does not
+/// merely inherit the status quo -- it hands out wrong answers that look
+/// right, at the one moment the store is most likely to be wrong. Reconciling
+/// first costs startup latency, which is visible and bounded; serving first
+/// costs correctness, which is neither.
+///
+/// **Why it is affordable.** The durability mark says where every segment's
+/// cursor stood at the last successful index flush, so the pass re-derives
+/// only what was written after that -- the crash window, not the store. With
+/// no mark it reconciles everything, which is correct and slow, and that is
+/// the right way round for a fallback.
 ///
 /// **Why it is worth running at all.** A crash leaves ranged entries missing
 /// for cells written since the tree's last flush, and the write path only
@@ -161,32 +183,113 @@ impl std::fmt::Display for ScrubReport {
 /// heals itself and everything else does not: a cell written once keeps its
 /// lost entry for the life of the store. On an append-mostly load almost
 /// every cell is in that category.
-pub fn spawn_post_recovery_scrub(
+/// What the last reconciliation cost, for anything that wants to report it.
+///
+/// A blocking pass on the startup path has to be answerable about its price,
+/// and a number that only exists inside a log line at whatever level happened
+/// to be enabled is not an answer.
+pub static LAST_RECONCILE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static LAST_RECONCILE_SCANNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static LAST_RECONCILE_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static LAST_RECONCILE_NOIDX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static LAST_RECONCILE_REPAIRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Whether a durability mark bounded the pass, or it had to walk everything.
+pub static LAST_RECONCILE_BOUNDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub async fn reconcile_index_before_serving(
     chunks: &Arc<Chunks>,
     indexers: &Arc<IndexerClients>,
     group: &str,
     database: &str,
 ) {
-    let Some(mode) = mode_from_env() else {
+    let mode = mode_from_env().unwrap_or(ScrubMode::Repair);
+    if matches!(mode_from_env(), None) && std::env::var("NEB_SCRUB_ON_RECOVERY").is_ok() {
+        // An explicit "off" is honoured -- someone who has measured their
+        // store and decided to take the risk should be able to.
+        info!("Index reconciliation disabled by NEB_SCRUB_ON_RECOVERY; the index may be \
+               behind the cells until those cells are written again");
         return;
-    };
-    let chunks = chunks.clone();
-    let indexers = indexers.clone();
+    }
     let label = format!("{}/{}", group, database);
-    tokio::spawn(async move {
+    let backup = chunks.file_manager_backup_path();
+    // UNBOUNDED BY DEFAULT, and the reason is a soundness hole in the mark
+    // rather than caution.
+    //
+    // The mark says where each segment's cursor stood at the last successful
+    // index flush, and the bounded pass reads that as "entries for everything
+    // below here are durable". That inference does not hold. A cell whose
+    // index task was lost to a crash is OLD -- its offset is far below any
+    // later cursor -- so the mark calls it covered and the next start skips
+    // it. The mark therefore hides precisely the holes this pass exists to
+    // fill, and hides them permanently, because every later mark is further
+    // ahead still.
+    //
+    // Measured, not theorised: a soak cycle repaired 1,296,034 entries, shut
+    // down gracefully, and the next start -- bounded by the mark that
+    // shutdown wrote -- came back missing 732,163 of them. Unbounded, the
+    // same workload reconciles clean.
+    //
+    // For the mark to be honest it has to mean "the index was VERIFIED
+    // complete up to here, and then made durable", which only a completed
+    // reconcile plus flush plus barrier can establish. Until it is written
+    // that way, trusting it is opt-in and the default pays for correctness.
+    let mark = if std::env::var("NEB_INDEX_MARK").as_deref() == Ok("trust") {
+        backup.as_deref().and_then(crate::index::index_mark::IndexMark::load)
+    } else {
+        None
+    };
+    match &mark {
+        Some(m) => info!(
+            "Reconciling {}'s index against its cells, bounded by {} recorded segment \
+             position(s)",
+            label,
+            m.len()
+        ),
+        None => info!(
+            "Reconciling ALL of {}'s index against its cells: no usable durability mark, so \
+             nothing can be assumed already indexed",
+            label
+        ),
+    }
+    let began = std::time::Instant::now();
+    let report = scrub_ranged_index_since(chunks, indexers, mode, mark.as_ref()).await;
+    let elapsed = began.elapsed();
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    LAST_RECONCILE_MS.store(elapsed.as_millis() as u64, AtomicOrdering::Relaxed);
+    LAST_RECONCILE_SCANNED.store(report.cells_scanned, AtomicOrdering::Relaxed);
+    LAST_RECONCILE_SKIPPED.store(report.cells_skipped, AtomicOrdering::Relaxed);
+    LAST_RECONCILE_NOIDX.store(report.cells_no_indices, AtomicOrdering::Relaxed);
+    LAST_RECONCILE_REPAIRED.store(report.entries_repaired, AtomicOrdering::Relaxed);
+    LAST_RECONCILE_BOUNDED.store(mark.is_some(), AtomicOrdering::Relaxed);
+    if report.is_clean() {
         info!(
-            "Index scrub ({:?}) starting for {} after recovery; the store is already serving",
-            mode, label
+            "Index reconciliation for {} found nothing missing in {:?}: {}",
+            label,
+            began.elapsed(),
+            report
         );
-        let report = scrub_ranged_index(&chunks, &indexers, mode).await;
-        if report.is_clean() {
-            info!("Index scrub for {} found nothing missing: {}", label, report);
-        } else {
-            // Loud even after a successful repair: the operator wants to know
-            // the crash cost entries, not only that they were put back.
-            warn!("Index scrub for {}: {}", label, report);
-        }
-    });
+    } else {
+        // Loud even after a successful repair: the operator wants to know the
+        // crash cost entries, not only that they were put back.
+        warn!(
+            "Index reconciliation for {} took {:?}: {}",
+            label,
+            began.elapsed(),
+            report
+        );
+    }
+    // The mark described the state before this pass. It is now either
+    // satisfied or superseded, and leaving it would let a LATER start skip
+    // cells this one could not repair.
+    if let Some(backup) = backup {
+        crate::index::index_mark::IndexMark::clear(&backup);
+    }
 }
 
 fn mode_from_env() -> Option<ScrubMode> {
@@ -222,6 +325,27 @@ pub async fn scrub_ranged_index(
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
 ) -> ScrubReport {
+    scrub_ranged_index_since(chunks, indexers, mode, None).await
+}
+
+/// The same reconciliation, bounded by how far the index is known to be durable.
+///
+/// With `Some(mark)`, a cell whose entry sits below its segment's recorded
+/// cursor is skipped: it was already in the flush that wrote the mark, so
+/// deriving it again would cost an index lookup to learn something already
+/// known. With `None`, everything is reconciled -- which is what an absent,
+/// unreadable or unrecognised mark means, and is always correct.
+///
+/// The skip is the ONLY difference. Same walk, same derivation through the
+/// write path's own probe, same never-delete rule; a bounded pass that
+/// reported differently from a full one would be a second implementation of
+/// the thing whose job is to not drift.
+pub async fn scrub_ranged_index_since(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    mode: ScrubMode,
+    mark: Option<&crate::index::index_mark::IndexMark>,
+) -> ScrubReport {
     UNREACHABLE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     MISSING_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut total = ScrubReport::default();
@@ -234,7 +358,40 @@ pub async fn scrub_ranged_index(
                 let EntryContent::Cell(header) = entry.content else {
                     continue;
                 };
+                if let Some(mark) = mark {
+                    let offset = entry.meta.entry_pos.saturating_sub(segment.addr) as u64;
+                    if mark.covers(chunk.id, segment.seq_id, offset) {
+                        derived_report.cells_skipped += 1;
+                        continue;
+                    }
+                }
                 derived_report.cells_scanned += 1;
+                // The entry header already names the schema, so check the
+                // catalog BEFORE asking for the cell. `read_cell` treats a
+                // missing schema as "this shall never happen" and panics in a
+                // debug build, which is a fair rule for the write path and the
+                // wrong one here: this pass walks whatever the store contains,
+                // including cells whose schema the catalog has not registered
+                // yet or has dropped. Reading first turned a countable
+                // condition into a crash at startup.
+                match chunk.meta.schemas.get(&header.schema) {
+                    None => {
+                        derived_report.cells_schema_missing += 1;
+                        continue;
+                    }
+                    Some(schema) if schema.index_fields.is_empty() => {
+                        // Derives nothing, so reading it can only confirm
+                        // that. This is not a rare case: the b-tree's own
+                        // pages are cells in these very chunks, and a flush
+                        // writes a great many of them right before the
+                        // shutdown whose mark bounds the next pass -- so
+                        // without this the cheap bounded pass spends most of
+                        // its time reading the index it is there to check.
+                        derived_report.cells_no_indices += 1;
+                        continue;
+                    }
+                    Some(_) => {}
+                }
                 derive_into(chunk, header.id(), &mut batch, &mut derived_report);
             }
             derived_report.entries_derived += batch.len() as u64;

@@ -1756,19 +1756,22 @@ impl NebServer {
             // livelocks on CannotAllocateSpace.
             database_runtime.cleaner().resume();
 
-            // A crash leaves ranged entries missing for cells written since
-            // the tree's last flush, and the write path re-asserts an entry
-            // only when its cell is written again -- so hot data heals and
-            // nothing else does. Opt-in and backgrounded; see
-            // `spawn_post_recovery_scrub` for why it is neither automatic
-            // nor blocking.
+            // The cells are authoritative and the index is a cache of them,
+            // so bring the cache up to date BEFORE anything can read it. A
+            // crash leaves ranged entries missing for cells written since the
+            // tree's last flush, and the write path re-asserts an entry only
+            // when its cell is written again -- so hot data heals and nothing
+            // else does. Bounded by the durability mark, so this costs the
+            // crash window and not the store; see
+            // `reconcile_index_before_serving`.
             if let Some(indexer) = database_runtime.indexer.as_ref() {
-                crate::index::scrub::spawn_post_recovery_scrub(
+                crate::index::scrub::reconcile_index_before_serving(
                     &database_runtime.chunks,
                     &indexer.clients,
                     database_runtime.group_name(),
                     database_runtime.database_name(),
-                );
+                )
+                .await;
             }
         }
 
@@ -2113,6 +2116,13 @@ impl NebServer {
         // CRITICAL: Index tasks (especially enumeration index inserts) must complete
         // before we flush LSM trees, otherwise the flush will have incomplete data!
         // This fixes the bug where index tasks spawned on different threads were lost.
+        // Taken BEFORE the drain, because that is the position the drain and
+        // the flush below are about to make durable. Snapshotting after them
+        // would name cells the flush never saw, and the mark would then tell
+        // the next start to skip re-deriving entries that never reached disk.
+        // Recorded only if everything below succeeds.
+        let index_mark = crate::index::index_mark::IndexMark::snapshot(&self.chunks());
+
         info!("Waiting for all pending index tasks to complete...");
         if self.indexer().is_some() {
             use crate::index::builder::IndexBuilder;
@@ -2171,8 +2181,34 @@ impl NebServer {
                     "B-tree write-back barrier NOT established at shutdown; the archive \
                      below may miss index pages and recovery will refuse affected trees"
                 );
+                // The mark is a claim that everything below those cursors is
+                // durably indexed. The barrier just said it is not, so the
+                // claim would be a lie -- and a lie in exactly the direction
+                // that makes the next start SKIP the cells it most needs to
+                // re-derive. Clear it and pay for a full reconcile instead.
+                if let Some(backup) = self.chunks().file_manager_backup_path() {
+                    crate::index::index_mark::IndexMark::clear(&backup);
+                }
             } else {
                 info!("B-tree nodes write-back completed");
+                if let Some(backup) = self.chunks().file_manager_backup_path() {
+                    match index_mark.save(&backup) {
+                        Ok(()) => info!(
+                            "Index durability mark written: {} segment position(s). The next \
+                             start re-derives only what was written after them.",
+                            index_mark.len()
+                        ),
+                        Err(e) => {
+                            // Not fatal: no mark means the next start
+                            // reconciles everything, which is correct and only
+                            // slower.
+                            warn!("Could not write the index durability mark: {e}");
+                            if let Some(backup) = self.chunks().file_manager_backup_path() {
+                                crate::index::index_mark::IndexMark::clear(&backup);
+                            }
+                        }
+                    }
+                }
             }
             // The hub itself is stopped inside flush_all_trees (service
             // side, where the owning client handle lives) so no worker

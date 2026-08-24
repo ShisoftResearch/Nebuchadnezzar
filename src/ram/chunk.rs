@@ -2017,6 +2017,24 @@ impl Chunk {
                     self.segs.len(),
                     self.capacity
                 );
+                // COUNTED HERE TOO, and that omission cost a day.
+                //
+                // There are two ways to run out, and they are not the same
+                // shape: the chunk hitting its own capacity (above), and the
+                // shared allocator having no segment left for a chunk that is
+                // nowhere near its capacity (here -- seg_count 17 against a
+                // 256 MiB chunk). Only the first was counted, so a store that
+                // exhausted the ALLOCATOR reported nothing.
+                //
+                // What that silence looks like from outside is a durability
+                // bug. A full store cannot place index pages, so write-back
+                // abandons them, the barrier is never established, no head
+                // pointer is published, and the next start reconstructs the
+                // tree from its old head with every recent entry gone. That
+                // is correct behaviour for a full store and identical to data
+                // loss from any distance -- which is exactly why the counter
+                // has to fire on BOTH paths.
+                ALLOCATION_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                 return Err(WriteError::CannotAllocateSpace);
             };
             let new_seg_id = new_seg.id;
@@ -4241,6 +4259,17 @@ impl Chunks {
     /// see `WriteError::ServerShuttingDown`, which is honest and retryable --
     /// the alternative is accepting the cell and losing it silently at the
     /// next crash.
+    /// Where this store's backup files live, if it has any.
+    ///
+    /// The index durability mark is written beside them on purpose: recovery
+    /// reads the store from the backups, so a mark that outlived them would
+    /// describe positions in files that no longer exist.
+    pub fn file_manager_backup_path(&self) -> Option<String> {
+        self.list
+            .first()
+            .and_then(|chunk| chunk.file_manager.backup_storage().map(|s| s.to_string()))
+    }
+
     pub fn close_writes(&self) {
         for chunk in &self.list {
             chunk.writes_closed.store(true, Ordering::Release);
