@@ -518,6 +518,146 @@ TO MODEL IN TLA+ BEFORE ANY CODE:
    "every participant reports its entries present" -- Parallel Commits,
    reusing this machinery rather than adding a second commit path.
 
+## Phase 6a IMPLEMENTATION PLAN (2026-08-24) — build order, formats, gates
+
+Written after the pool landed and its gates went green. NO BACKWARD
+COMPATIBILITY: the bracket format REPLACES what came before. Recovery reads
+one format, refuses anything else loudly, and no store written by an earlier
+build is expected to open. That is a simplification, not a regret — every
+compatibility path we deleted this week turned out to be a way to trust
+bytes nothing had verified.
+
+**The rule that sets the build order:** recovery must be able to read exactly
+what the writer produces, at every commit. So writer and reader for a given
+shape land TOGETHER, and every step ends with the fuzzer able to kill the
+process at any point in that shape.
+
+### Step 1 — the transaction head lease (ownership until the decision)
+
+The one thing that makes everything else expressible. Today a transaction
+acquires and releases a head per entry; only `skip_sync` distinguishes it.
+
+- A lease registry keyed by transaction id holds, per chunk, the leased
+  segment and the **pre-transaction append cursor**. That cursor is what
+  makes abort physical later.
+- First write in a chunk under T claims a head and records the lease;
+  subsequent writes REUSE it. `PendingEntry::drop` stops releasing ownership
+  when the entry belongs to a leased head.
+- The lease is released at the decision (`end`), not at apply. The apply
+  burst is one synchronous region (`set_transaction_context(true..false)`),
+  but the decision arrives in a LATER RPC, so the lease cannot be
+  thread-local — it must hang off the transaction object / a registry keyed
+  by txn id.
+- **In-doubt is a first-class case from day one**, not a later knob: a lease
+  timeout releases the head and marks the transaction discard-unless-COMMIT.
+  Without it a vanished coordinator holds a head hostage forever, and the
+  pool has no refill path.
+- Recovery is UNCHANGED at this step: entries still look exactly as they do
+  today; the only difference is that a transaction's entries are contiguous.
+  That is deliberate — it lets the lease be validated on its own.
+- Gate: the fuzzer's transactional lane (kill mid-apply, mid-decision, and
+  with a coordinator that never returns), plus a metric for leases held and
+  leases timed out.
+
+### Step 2 — brackets within ONE segment (BEGIN/COMMIT)
+
+Most transactions fit a segment (8 MiB), so chains are the rare case, not the
+common one. Handle the common case completely first.
+
+- If the write set does not fit the leased head's remainder, ROTATE to a
+  fresh head and put the whole bracket there. Only a transaction larger than
+  a whole segment needs a chain, and that is Step 3.
+- Entry formats (entry header stays 8 bytes: 4-byte type word carrying the
+  24-bit content CRC, 4-byte content length):
+  - `BEGIN`   content = 16-byte HLC transaction id.
+  - `COMMIT`  content = 16-byte HLC + manifest (`u16` count, then
+    `(u16 chunk_id, u64 seq_id)` per member). Single-chunk transactions carry
+    a one-entry manifest; it is not special-cased.
+- Recovery changes here, and this is the whole reader story for Step 2: the
+  scan becomes a small state machine. Entries seen after a `BEGIN` are held
+  PENDING; a `COMMIT` for that id applies them; end-of-segment without a
+  COMMIT discards them. Pending entries never touch the cell index, so an
+  uncommitted bracket costs nothing and leaves nothing.
+- Because one writer owns the segment, a bracket cannot be interleaved with
+  another writer's entries — the state machine needs no per-entry stamps,
+  which is exactly what bracketing bought.
+- Gate: recovery tests for committed, uncommitted, and torn-mid-bracket, each
+  with ORDINARY entries after the bracket that must survive (the lesson from
+  the abandoned-image bug: a test that puts the interesting entry last proves
+  nothing).
+
+### Step 3 — chains for transactions larger than a segment
+
+- Pre-allocate the entire chain up front, so allocation failure happens
+  before a single byte is written.
+- `TXN_CONT` occupies the LAST 24 BYTES of every full chain segment: 8-byte
+  entry header + content = 8-byte short transaction id (low 64 bits of the
+  HLC) + 8-byte previous seq id. Zeros pad from the last entry that fit. The
+  short id is safe here because the manifest in COMMIT is authoritative and
+  the link is only a cross-check; collisions are bounded by in-flight
+  transactions, not by history.
+- Chain identity is by **seq id, never segment id** — seq is what survives
+  recovery.
+- Recovery for chains: read the fixed 24-byte tail FIRST. A segment carrying
+  `TXN_CONT` is a chain member and is NOT scanned standalone. Members are
+  assembled by the manifest in the final part's COMMIT; the links cross-check
+  it. A chain with no COMMIT anywhere is DISCARDED WITHOUT BEING SCANNED —
+  which is the whole point of the fixed-position link, and it means an
+  aborted or torn chain costs zero scan time.
+- Gate: kill mid-chain (after part 1, after part k-1, between COMMIT and its
+  fsync), and verify the discarded members were never scanned (count them).
+
+### Step 4 — abort by rewind, and retiring the undo log from the write path
+
+- Abort restores the pre-transaction cursor on part 1, journals padding over
+  the bracket, and recycles fresh parts whole. Ownership is what makes this
+  safe: nobody wrote after us.
+- TLA+ lesson, load-bearing: the abort path must key on TRANSACTION STATE,
+  never on the presence of a COMMIT record — the cleaner legitimately drops
+  COMMIT records below the watermark.
+- Only once abort is physical does the undo log leave the write path.
+
+### Step 5 — decided-watermark in file headers, and the cleaner gate
+
+- The watermark is stamped into the FILE HEADER at seal, not written as an
+  entry. Both gates (cleaner gate and watermark gate) are proven load-bearing
+  by TLC: disabling either violates `InstalledWasCommitted`.
+- The WAL/backup file header gains the watermark field. With no
+  compatibility to keep, the format version simply moves and a mismatch is a
+  loud refusal — the behaviour `scan_framed` already has.
+- Cleaner rule: never compact a bracket above the watermark.
+
+### Recovery, stated once, for the finished format
+
+A segment is read in exactly one of three ways, decided before any scanning:
+
+1. Its tail holds `TXN_CONT` → chain member. Not scanned standalone; joined
+   via the manifest of the chain's COMMIT, or discarded unscanned if there
+   is none.
+2. Otherwise → scanned forward as today, with the bracket state machine
+   applying committed brackets and dropping uncommitted ones.
+3. Header version mismatch → refused, loudly, per file. There is no second
+   format to try.
+
+Cross-chunk commit is decided as: any COMMIT found AND every manifest member
+present; otherwise discard, which is safe because the ack had not happened.
+
+### What this plan does NOT cover, and must not silently absorb
+
+- **Reindex/scrub tool.** After deliberate file damage the store correctly
+  refuses, and there is no path back — the only failure class the fuzzer
+  still cannot survive. It is now the highest-value item outside Phase 6a.
+- **Index-durability backpressure.** A full store keeps accepting writes it
+  cannot index durably; a graceful shutdown then loses the index tail.
+  Re-queuing abandoned pages (`669de71b`) removes the PERMANENT poisoning but
+  cannot place pages into a store with no room. The missing piece is
+  backpressure from index durability to the write path.
+- **The b-tree `Empty` node panic** reachable from `write_targeted` at a
+  level's right edge under exhaustion. Contained (the RPC layer catches it)
+  but it means exhaustion degrades into a malformed tree.
+- **Distributed 2PC (Phase 6)** — still needs the termination-protocol
+  decision, and the in-doubt timeout in Step 1 is coupled to it.
+
 ## Sequencing and dependencies
 
 Phase 1 and Phase 3.1 first (they close active corruption/loss windows and
