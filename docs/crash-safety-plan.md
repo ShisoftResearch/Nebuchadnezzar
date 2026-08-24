@@ -263,6 +263,18 @@ to the lazy re-assert. **The scrub is the only thing that finds or fixes
 them**, which is the argument for running `scrub_ranged_index(repair)` after
 any unclean start rather than treating it as an occasional maintenance tool.
 
+**Repair recovers them, proven on a real crashed store.** Eight kill/restart
+cycles, then one repair pass:
+
+    SCANNED   n=771669          <- what a reader could see
+    SCRUB     missing=8359 present=771669 derived=780028
+    REPAIRED  filled=8359
+    RESCANNED n=780028          <- 771669 + 8359, exactly
+
+8,359 edges were present as cells, absent from every range scan, and
+unreachable by any existing mechanism; after the pass the reader sees all of
+them. That is the whole tool working on damage it did not manufacture.
+
 Two earlier readings of this data were WRONG and are recorded so they are not
 re-derived: the loss does not correlate with deletes (it reproduces at
 delete_rate=0), and graceful shutdown is not lossy (the pre-shutdown
