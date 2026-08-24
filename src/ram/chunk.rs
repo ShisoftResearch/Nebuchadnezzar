@@ -2009,13 +2009,23 @@ impl Chunk {
                     backoff.spin();
                     continue;
                 }
+                let (cap_segs, free_segs, unbumped) = self.allocator.segment_accounting();
                 error!(
-                    "chunk-allocation-failure: chunk={}, segment_class={:?}, seg_count={}, \
-                     capacity={}: the allocator has no segment left after GC",
+                    "chunk-allocation-failure: chunk={}, segment_class={:?}, live={}, \
+                     capacity_segments={}, free_list={}, never_bumped={}, retired_pending={}, \
+                     unaccounted={}: the allocator has no segment left after GC",
                     self.id,
                     segment_class,
                     self.segs.len(),
-                    self.capacity
+                    cap_segs,
+                    free_segs,
+                    unbumped,
+                    self.retired_segment_count(),
+                    cap_segs
+                        .saturating_sub(self.segs.len())
+                        .saturating_sub(free_segs)
+                        .saturating_sub(unbumped)
+                        .saturating_sub(self.retired_segment_count()),
                 );
                 // COUNTED HERE TOO, and that omission cost a day.
                 //

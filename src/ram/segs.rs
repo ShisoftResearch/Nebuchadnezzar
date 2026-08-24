@@ -3013,6 +3013,27 @@ impl SegmentAllocator {
         (self.limit - self.base) >> SEGMENT_BITS_SHIFT
     }
 
+    /// Where this allocator's segments have gone: total, on the free list,
+    /// and still unbumped.
+    ///
+    /// Exists because "the allocator has no segment left" is not a diagnosis.
+    /// A chunk reporting 17 live segments against a 32-segment capacity and
+    /// no free ones has 15 somewhere, and the error could not say where --
+    /// retired and awaiting quiescence, handed out and still live under a
+    /// name the chunk map does not show, or simply bumped past. Those want
+    /// different fixes.
+    pub fn segment_accounting(&self) -> (usize, usize, usize) {
+        let bump_left = self
+            .limit
+            .saturating_sub(self.offset.load(Relaxed))
+            >> SEGMENT_BITS_SHIFT;
+        (
+            self.capacity_segments(),
+            self.free_count.load(Relaxed),
+            bump_left,
+        )
+    }
+
     pub fn meet_gc_threshold(&self) -> bool {
         self.offset.load(Relaxed) > self.gc_threshold
     }
