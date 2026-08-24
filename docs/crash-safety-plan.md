@@ -949,6 +949,26 @@ present; otherwise discard, which is safe because the ack had not happened.
   the root one child makes `apply_top_level_split` ask `is_ext()` of a node
   that is neither External nor Internal. The rule now is that the leftmost
   node of a level is emptied, never destroyed.
+- **Per-block backup CRCs (Phase 4)** — SATISFIED IN SUBSTANCE, by something
+  stronger, and the item should not be built as written. A block served
+  straight to a cold read is not covered by the whole-file CRC, which is
+  checked only on a full read. But it is covered one level up and at a FINER
+  grain: every entry carries a checksum of its own content, and the cold-read
+  path (`chunk.rs`, `fault_in_block_for`) verifies it before serving. A
+  mismatch is not a silent drop -- it falls through to promotion, which reads
+  the whole backup and does check the file CRC, so a genuinely corrupt file is
+  refused there with the full diagnosis.
+
+  Tightened while confirming this: the check demanded the absence of a
+  negative verdict (`!= Some(false)`) rather than a positive one. `None` means
+  "no content to vouch for" -- padding, or a reservation never filled -- and
+  the cell index only ever points at CELL entries, which always carry a
+  checksum. `None` at a cell address is therefore not an exempt entry, it is
+  the WRONG entry, and serving it unverified is precisely what the check
+  exists to prevent. Now `!= Some(true)`.
+
+  Per-block CRCs would add a coarser second check over bytes an entry
+  checksum already covers. Not worth the format change.
 - **Distributed 2PC (Phase 6)** — still needs the termination-protocol
   decision, and the in-doubt timeout in Step 1 is coupled to it.
 

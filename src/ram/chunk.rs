@@ -4665,13 +4665,26 @@ impl<'a> CellGuard<'a> {
                                 // DOES verify its CRC, so a genuinely
                                 // corrupt file is refused there with the
                                 // full diagnosis.
-                                if crate::ram::entry::verify_entry_at(*guard) == Some(false) {
+                                // A POSITIVE verdict, not merely the absence
+                                // of a negative one. `None` means "no content
+                                // to vouch for" -- padding, or a reservation
+                                // never filled -- and the cell index only ever
+                                // points at CELL entries, which always carry a
+                                // checksum. So `None` here is not an entry
+                                // exempt from checking, it is the wrong entry
+                                // at this address, and serving it unverified
+                                // is the one outcome this check exists to
+                                // prevent.
+                                if crate::ram::entry::verify_entry_at(*guard) != Some(true) {
                                     error!(
                                         "Cold block read of segment {} (chunk {}) produced an \
-                                         entry that fails its content checksum at {:#x}. \
-                                         Refusing to serve it; falling back to a full read of \
-                                         the backup, which verifies the whole image.",
-                                        seg.id, chunk.id, *guard
+                                         entry that does not vouch for itself at {:#x} \
+                                         (verdict {:?}). Refusing to serve it; falling back to a \
+                                         full read of the backup, which verifies the whole image.",
+                                        seg.id,
+                                        chunk.id,
+                                        *guard,
+                                        crate::ram::entry::verify_entry_at(*guard)
                                     );
                                     seg.decr_references();
                                     return None;
