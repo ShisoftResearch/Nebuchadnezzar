@@ -25,13 +25,37 @@ above it is either DONE or the decision record that produced it.
 | 4 Integrity of the durable | PARTIAL — per-block CRCs and the reindex/scrub tool NOT built |
 | 5 Verification | DONE — crash-churn fuzzer with delete + mutilation lanes; the TRANSACTIONAL lane arrives with Step 1 below |
 | 6 Distributed 2PC | DESIGN ONLY, by decision; the in-doubt timeout in Step 1 is coupled to it |
-| 6a Head pool | BUILT (`feat/head-pool`) — pool, exclusive ownership, gates green |
-| 6a Brackets/chains | NOT BUILT — this is the current work, planned below |
+| 6a Head pool | BUILT — pool, exclusive ownership, gates green |
+| 6a Brackets/chains | BUILT (Steps 1–5, 2026-08-24) — see the status note below |
 
 The head pool is the FIRST HALF of Phase 6a: whoever writes holds a head
 exclusively. The second half — a transaction holding its head until the 2PC
-decision, and the bracket/chain format that makes abort physical — is what
-the implementation plan covers.
+decision, and the bracket/chain format that makes abort physical — is now
+built as well.
+
+### Phase 6a build status (2026-08-24)
+
+| Step | State | Commit |
+|---|---|---|
+| 1 Transaction head lease (+ in-doubt sweeper) | DONE | `38ebce31` |
+| 2 Brackets in one segment (BEGIN/COMMIT) | DONE | `b9bd13c4` |
+| — cross-chunk manifest rule + commit ordering | DONE | `b9bd13c4` |
+| 3 Chains (TXN_CONT at the fixed tail) | DONE | `6421ebda` |
+| 4 Abort by physical rewind | DONE | `6421ebda` |
+| 5 Decided watermark + cleaner gate | DONE | `6421ebda` |
+
+What the fuzzer's transaction lane (built as Step 1's gate) found and forced
+along the way, all fixed: entries and COMMITs must be fsynced in TWO rounds
+or a surviving COMMIT proves nothing about the other chunks; a busy head is
+not a full head, and sealing it as a chain part stamps a link over space the
+segment still owns; a bracket part must be claimed with room for BEGIN *and*
+its first entry; and `live_entries` would have panicked on a bracket marker.
+
+STILL OPEN, deliberately: the undo log has NOT left the write path (abort is
+physical now, so it can — but that retirement needs its own validation);
+blob-class writes are outside the bracket (they are a separate segment class
+with its own pool); and the reindex/scrub tool remains the only failure class
+the fuzzer cannot survive.
 
 ## The contract (Phase 0 — decide, then everything serves it)
 
