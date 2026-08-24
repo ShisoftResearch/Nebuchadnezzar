@@ -37,6 +37,7 @@
 //! never "the index holds entries it should not"; the latter needs a
 //! cluster-wide pass and is not attempted here.
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 
 use crate::index::builder::probe_cell_indices;
@@ -218,35 +219,88 @@ async fn reconcile(
     mode: ScrubMode,
 ) -> ScrubReport {
     let mut report = ScrubReport::default();
-    for key in keys {
-        if mode.repairs() {
-            match indexers.ranged_client.insert(key).await {
-                Ok(true) => {
-                    // The tree did not have it. That is the hole.
-                    report.entries_missing += 1;
-                    report.entries_repaired += 1;
-                }
-                Ok(false) => report.entries_present += 1,
-                Err(error) => {
-                    warn!("Index scrub could not repair {:?}: {:?}", key.id(), error);
-                    report.entries_unreachable += 1;
-                }
+    let mut in_flight = FuturesUnordered::new();
+    let mut pending = keys.iter();
+
+    // Bounded concurrency, not one-at-a-time and not all-at-once. Serially,
+    // a scrub costs one network round trip per derived entry, which on a
+    // store with billions of them is not a maintenance command anybody can
+    // run. Unbounded, it becomes a self-inflicted load spike against an
+    // index that may already be the sick part of the system -- and this is a
+    // tool for sick systems.
+    for key in pending.by_ref().take(concurrency()) {
+        in_flight.push(check_one(indexers, key, mode));
+    }
+    while let Some(outcome) = in_flight.next().await {
+        match outcome {
+            KeyOutcome::Present => report.entries_present += 1,
+            KeyOutcome::Missing => report.entries_missing += 1,
+            KeyOutcome::Repaired => {
+                report.entries_missing += 1;
+                report.entries_repaired += 1;
             }
-        } else {
-            match indexers.ranged_client.contains(key).await {
-                Ok(true) => report.entries_present += 1,
-                Ok(false) => report.entries_missing += 1,
-                Err(error) => {
-                    // The tree covering this key is absent or unreadable --
-                    // exactly the condition this tool is for. Not a missing
-                    // entry: we do not know what the tree holds.
-                    debug!("Index scrub could not reach {:?}: {:?}", key.id(), error);
-                    report.entries_unreachable += 1;
-                }
-            }
+            KeyOutcome::Unreachable => report.entries_unreachable += 1,
+        }
+        if let Some(key) = pending.next() {
+            in_flight.push(check_one(indexers, key, mode));
         }
     }
     report
+}
+
+enum KeyOutcome {
+    Present,
+    Missing,
+    Repaired,
+    Unreachable,
+}
+
+/// How many index round trips are outstanding at once.
+///
+/// Tunable because the right number depends on the cluster, not on this
+/// code, and an operator scrubbing a struggling store needs to be able to
+/// turn it down without a rebuild.
+fn concurrency() -> usize {
+    std::env::var("NEB_SCRUB_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(32)
+        .min(1024)
+}
+
+/// Repair inserts unconditionally rather than checking first: `insert`
+/// already returns whether the key was absent, so a check would double the
+/// RPCs to learn what the insert reports anyway -- and worse, it would open
+/// a window in which a concurrent writer inserts between the check and the
+/// repair, making the count wrong in the one mode where it must be exact.
+async fn check_one(
+    indexers: &Arc<IndexerClients>,
+    key: &EntryKey,
+    mode: ScrubMode,
+) -> KeyOutcome {
+    if mode.repairs() {
+        match indexers.ranged_client.insert(key).await {
+            Ok(true) => KeyOutcome::Repaired,
+            Ok(false) => KeyOutcome::Present,
+            Err(error) => {
+                warn!("Index scrub could not repair {:?}: {:?}", key.id(), error);
+                KeyOutcome::Unreachable
+            }
+        }
+    } else {
+        match indexers.ranged_client.contains(key).await {
+            Ok(true) => KeyOutcome::Present,
+            Ok(false) => KeyOutcome::Missing,
+            Err(error) => {
+                // The tree covering this key is absent or unreadable --
+                // exactly the condition this tool is for. Not a missing
+                // entry: we do not know what the tree holds.
+                debug!("Index scrub could not reach {:?}: {:?}", key.id(), error);
+                KeyOutcome::Unreachable
+            }
+        }
+    }
 }
 
 #[cfg(test)]
