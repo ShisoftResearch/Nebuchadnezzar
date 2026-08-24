@@ -1171,37 +1171,16 @@ impl DataManager {
                 );
             }
         }
-        // Entries are durable; now the brackets that commit them.
-        if sync_failure.is_none() {
-            crate::ram::chunk::set_transaction_id(Some(tid.clone()));
-            let bracket_result = self.chunks().commit_transaction_brackets(tid);
-            crate::ram::chunk::set_transaction_id(None);
-            match bracket_result {
-                Ok(()) => {
-                    // The COMMIT records themselves, and only then the ack.
-                    for segment in crate::ram::chunk::take_transactional_segments() {
-                        if let Err(error) = segment.force_wal_sync() {
-                            error!(
-                                "Failed to sync the COMMIT bracket for segment {} (chunk {}): {:?}",
-                                segment.id, segment.chunk_id, error
-                            );
-                            sync_failure.get_or_insert(error);
-                        }
-                    }
-                }
-                Err(error) => {
-                    // An unclosed bracket recovers as uncommitted, so a
-                    // caller told "committed" would be told a lie the next
-                    // restart corrects.
-                    error!(
-                        "transaction {:?} could not close its bracket: {:?}; refusing the commit",
-                        tid, error
-                    );
-                    drop(crate::ram::chunk::take_transactional_segments());
-                    return Self::map_commit_write_error(&txn, Id::unit_id(), error);
-                }
-            }
-        }
+        // NO bracket COMMIT here, for the same reason there is no commit
+        // marker here: despite its name this runs in the coordinator's
+        // PREPARE phase, and a durable COMMIT is the participant saying "this
+        // transaction happened". Writing it now would make the transaction
+        // recoverable-as-committed before anyone decided to commit it, so a
+        // crash in the window would install a transaction the coordinator
+        // might have been about to abort -- and an abort that could not
+        // physically rewind (a sealed segment) would leave the COMMIT
+        // standing. Prepare makes the ENTRIES durable; `end` closes the
+        // bracket.
         if let Some(error) = sync_failure {
             // Reporting success here would promise durability that does not
             // exist: the writes are in memory and in the index, but their
@@ -4340,15 +4319,42 @@ impl Service for DataManager {
             };
             drop(guards_to_drop); // Drop guards, releasing all segment references
 
-            // The markers belong here, with the decision: this is where a
-            // transaction is actually committed or aborted, whereas the
-            // misleadingly named `commit` above runs in the PREPARE phase.
+            // The bracket closes HERE, with the decision.
             //
-            // A participant that crashes between the coordinator's decision
-            // and this marker still comes back in-doubt and is rolled back,
-            // which is a coordinator-durability problem (the coordinator
-            // keeps no durable record of its decision) and is tracked as
-            // such -- it cannot be fixed by moving this write earlier.
+            // This is where a transaction is actually committed or aborted;
+            // the misleadingly named `commit` above runs in the PREPARE phase
+            // and only makes the ENTRIES durable. Writing the COMMIT there
+            // would make the participant recoverable-as-committed before
+            // anyone decided to commit -- and an abort that then could not
+            // physically rewind (a sealed segment) would leave that COMMIT
+            // standing, installing a transaction that was explicitly
+            // refused.
+            //
+            // So a durable COMMIT now means exactly what 2PC needs it to
+            // mean: this participant was told to commit. A participant that
+            // crashes before its `end` arrives has no COMMIT, and recovery
+            // discards its bracket -- the presumed-abort outcome, which is
+            // safe on its own only while no OTHER participant has committed.
+            // Closing that last gap needs the coordinator's decision to be
+            // durable, or the participant set to be resolvable; both are
+            // Phase 6 and neither is fixed by moving this write.
+            if txn_state == TxnState::Committed {
+                crate::ram::chunk::set_transaction_id(Some(tid.clone()));
+                let bracket_result = self.chunks().commit_transaction_brackets(&tid);
+                crate::ram::chunk::set_transaction_id(None);
+                if let Err(error) = bracket_result {
+                    // Refusing is the honest answer: without a durable COMMIT
+                    // the next restart discards this transaction, so telling
+                    // the coordinator "ended" would be telling it something
+                    // recovery will contradict.
+                    error!(
+                        "transaction {:?} could not close its bracket at the decision: {:?}",
+                        tid, error
+                    );
+                    self.cleanup_signal.store(true, Relaxed);
+                    return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd)).await;
+                }
+            }
 
             self.wipe_out_transaction(&tid);
             self.cleanup_signal.store(true, Relaxed);

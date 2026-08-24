@@ -589,6 +589,22 @@ pub fn transaction_has_leases(txn: &crate::server::transactions::TxnId) -> bool 
     TXN_LEASES.lock().contains_key(txn)
 }
 
+/// The segments a transaction holds, for syncing its brackets at the decision.
+pub fn transaction_leased_segments(
+    txn: &crate::server::transactions::TxnId,
+) -> Vec<AArc<Segment>> {
+    let held = TXN_LEASES.lock();
+    held.get(txn)
+        .map(|leases| {
+            leases
+                .per_chunk
+                .values()
+                .flat_map(|heads| heads.iter().map(|lease| lease.seg.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// How many heads a transaction currently holds; for tests and metrics.
 pub fn transaction_lease_count(txn: &crate::server::transactions::TxnId) -> usize {
     TXN_LEASES
@@ -4022,6 +4038,20 @@ impl Chunks {
                 return Err(WriteError::CannotAllocateSpace);
             };
             chunk.close_transaction_bracket(txn, &manifest)?;
+        }
+        // Make the COMMIT records durable HERE, not through the thread-local
+        // touched-segment list: this runs at the decision, on whatever thread
+        // delivered it, and that list belongs to the thread that applied the
+        // writes. Reading it here would sync nothing and report success.
+        let segments = transaction_leased_segments(txn);
+        for segment in segments {
+            if let Err(error) = segment.force_wal_sync() {
+                error!(
+                    "could not sync the COMMIT bracket for segment {} (chunk {}): {:?}",
+                    segment.id, segment.chunk_id, error
+                );
+                return Err(WriteError::CannotAllocateSpace);
+            }
         }
         Ok(())
     }
