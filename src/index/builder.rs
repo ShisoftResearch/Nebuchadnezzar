@@ -390,6 +390,58 @@ std::thread_local! {
 /// backlog. The global path takes one mutex per task, so if writes land there
 /// it is a single lock on the hot path of every cell written.
 pub static INDEX_TASK_LOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Index tasks that FAILED -- the cell is durable, its index entries are not.
+///
+/// This number is the whole reason it exists as a counter rather than a log
+/// line. A write is acked on the cell alone: the index task is spawned and
+/// nobody waits for it, so a tree that cannot take an insert costs the store
+/// entries nobody is told about, and a scan then returns fewer rows with no
+/// error anywhere. The entries are DERIVABLE -- `scrub_ranged_index` rebuilds
+/// them from the cells through the write path's own probe -- so this is a
+/// repair job, not data loss. What was missing was any way to know a repair
+/// was owed.
+pub static INDEX_TASKS_FAILED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Failures already reported, so the log carries the first one loudly and
+/// then a periodic total instead of one line per cell. A full chunk produced
+/// 193,360 lines in a single crash-churn run, which is how a real signal
+/// becomes something operators filter out.
+static INDEX_FAILURES_REPORTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record index-entry failures and say so at a rate a human can read.
+///
+/// Returns nothing: callers report, they do not decide. Whether a degraded
+/// index should also stop the write path is a policy question this does not
+/// answer -- but no policy can be built on a signal that does not exist.
+fn note_index_failures(failed: u64, context: &str) {
+    if failed == 0 {
+        return;
+    }
+    let total = INDEX_TASKS_FAILED.fetch_add(failed, std::sync::atomic::Ordering::Relaxed) + failed;
+    let reported = INDEX_FAILURES_REPORTED.load(std::sync::atomic::Ordering::Relaxed);
+    // The first failure, then every order of magnitude. Enough to see it start
+    // and to see it keep going; not enough to bury the log.
+    let should_report = reported == 0 || total >= reported.saturating_mul(10);
+    if should_report {
+        INDEX_FAILURES_REPORTED.store(total, std::sync::atomic::Ordering::Relaxed);
+        log::error!(
+            "INDEX DEGRADED: {} index task(s) have failed in this process ({}). Those cells are \
+             durable but their index entries are NOT, so scans over them return fewer rows with \
+             no error. Run a repair scrub (client.scrub_ranged_index(true), or \
+             NEB_SCRUB_ON_RECOVERY=repair at next start) to rebuild them from the cells.",
+            total,
+            context
+        );
+    }
+}
+
+/// How many index entries this process knows it failed to write.
+pub fn index_entries_owed() -> u64 {
+    INDEX_TASKS_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Breakdown of the secondary-index phase, which dominates write cost and is
 /// the only phase whose per-cell price grows with concurrency (5.1us at 64
 /// in-flight, 39.2us at 256). Splitting it says whether that is the probe
@@ -813,13 +865,28 @@ impl IndexBuilder {
                     .collect::<FuturesUnordered<JoinHandle<Result<(), IndexError>>>>()
                     .collect::<Vec<Result<Result<(), IndexError>, JoinError>>>()
                     .await;
+                let mut failed = 0u64;
+                let mut first_error = None;
                 for result in results {
                     match result {
                         Ok(Ok(())) => {}
-                        Ok(Err(e)) => log::warn!("Background index task failed: {:?}", e),
-                        Err(e) => log::warn!("Background index task join failed: {:?}", e),
+                        Ok(Err(e)) => {
+                            failed += 1;
+                            first_error.get_or_insert_with(|| format!("{:?}", e));
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            first_error.get_or_insert_with(|| format!("join: {:?}", e));
+                        }
                     }
                 }
+                note_index_failures(
+                    failed,
+                    &format!(
+                        "background reaper, first error: {}",
+                        first_error.as_deref().unwrap_or("none")
+                    ),
+                );
             }
         });
     }
@@ -884,11 +951,7 @@ impl IndexBuilder {
         let success_count = results.iter().filter(|r| matches!(r, Ok(Ok(_)))).count();
         let error_count = results.len() - success_count;
         if error_count > 0 {
-            log::warn!(
-                "Index tasks completed: {} succeeded, {} failed",
-                success_count,
-                error_count
-            );
+            note_index_failures(error_count as u64, "shutdown drain");
         } else if count > 0 {
             log::info!("All {} index tasks completed successfully", success_count);
         }
@@ -1366,5 +1429,29 @@ mod tests {
             completed.load(Ordering::SeqCst),
             "the original drained task should still complete successfully"
         );
+    }
+
+    /// A failed index task must be COUNTED, not just logged.
+    ///
+    /// The write is acked on the cell alone, so a failure here is invisible
+    /// everywhere else: no error reaches the writer, the store shuts down
+    /// clean, and the only symptom is a scan that returns fewer rows. The
+    /// counter is what turns that into something an operator -- or the
+    /// shutdown path -- can act on.
+    #[test]
+    fn a_failed_index_task_is_counted_and_owed() {
+        let before = index_entries_owed();
+        note_index_failures(3, "unit test");
+        assert_eq!(
+            index_entries_owed(),
+            before + 3,
+            "three failures must be owed three repairs"
+        );
+        // Reporting is rate-limited, but the debt is not: every failure counts.
+        note_index_failures(1, "unit test");
+        assert_eq!(index_entries_owed(), before + 4);
+        // A pass with nothing to report must not move it.
+        note_index_failures(0, "unit test");
+        assert_eq!(index_entries_owed(), before + 4);
     }
 }

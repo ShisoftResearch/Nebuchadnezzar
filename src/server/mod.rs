@@ -2119,6 +2119,22 @@ impl NebServer {
             let _ = IndexBuilder::await_all_indices().await;
             info!("All pending index tasks completed");
 
+            // "Completed" is not "succeeded". A task that could not place its
+            // entries still completes, and the cell it belonged to was acked
+            // long ago -- so a store can shut down perfectly cleanly and come
+            // back with a scan that quietly returns fewer rows. Say it here,
+            // at the last moment anyone is watching, and say what fixes it.
+            let owed = crate::index::builder::index_entries_owed();
+            if owed > 0 {
+                error!(
+                    "Shutting down with {} index task(s) that never landed. The cells are \
+                     durable; their index entries are not, and nothing rebuilds them on its own. \
+                     Start with NEB_SCRUB_ON_RECOVERY=repair, or run \
+                     client.scrub_ranged_index(true) once this server is back.",
+                    owed
+                );
+            }
+
             // IndexBuilder::await_all_indices() joins the spawned index tasks, and ranged
             // tree inserts are applied directly by TreeService before the RPC resolves.
             // There is no separate Raft commit barrier to wait on here, so a fixed sleep
