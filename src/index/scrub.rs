@@ -339,11 +339,7 @@ fn report_unreachable(key: &EntryKey, error: &impl std::fmt::Debug) {
     }
 }
 
-/// Repair inserts unconditionally rather than checking first: `insert`
-/// already returns whether the key was absent, so a check would double the
-/// RPCs to learn what the insert reports anyway -- and worse, it would open
-/// a window in which a concurrent writer inserts between the check and the
-/// repair, making the count wrong in the one mode where it must be exact.
+/// Ask the index about each key, in bounded-concurrency batches.
 async fn reconcile(
     indexers: &Arc<IndexerClients>,
     keys: &[EntryKey],
@@ -400,42 +396,53 @@ fn concurrency() -> usize {
         .min(1024)
 }
 
-/// Repair inserts unconditionally rather than checking first: `insert`
-/// already returns whether the key was absent, so a check would double the
-/// RPCs to learn what the insert reports anyway -- and worse, it would open
-/// a window in which a concurrent writer inserts between the check and the
-/// repair, making the count wrong in the one mode where it must be exact.
+/// Ask whether the index holds `key`, and in `Repair` mode insert it if not.
+///
+/// **Checked first, even in repair mode.** `insert` reports whether the key
+/// was absent, so repairing by inserting unconditionally looked like the
+/// cheaper design -- one round trip per key instead of two. It is not, and
+/// the difference is not small: `contains` is a read, while `insert`
+/// descends the B+ tree taking WRITE latches whether or not it ends up
+/// changing anything. Measured on an 800k-cell store, a verify pass took
+/// 5.7s and an unconditional-insert repair had not finished after three
+/// minutes, because it was write-latching all 780,028 entries to fix 26,269.
+///
+/// Checking first costs a second round trip only for keys that are actually
+/// missing, which is the rare case in every store worth repairing.
+///
+/// The count stays exact because the INSERT's return value decides it, not
+/// the check: if a concurrent writer inserts between the two, `insert`
+/// returns false and this reports the key as present, which is what it then
+/// is. The check only decides whether to attempt the write.
 async fn check_one(
     indexers: &Arc<IndexerClients>,
     key: &EntryKey,
     mode: ScrubMode,
 ) -> KeyOutcome {
-    if mode.repairs() {
-        match indexers.ranged_client.insert(key).await {
+    match indexers.ranged_client.contains(key).await {
+        Ok(true) => KeyOutcome::Present,
+        Ok(false) if mode.repairs() => match indexers.ranged_client.insert(key).await {
             Ok(true) => {
                 report_missing(key);
                 KeyOutcome::Repaired
             }
+            // Someone else inserted it in between; it is present now.
             Ok(false) => KeyOutcome::Present,
             Err(error) => {
                 report_unreachable(key, &error);
                 KeyOutcome::Unreachable
             }
+        },
+        Ok(false) => {
+            report_missing(key);
+            KeyOutcome::Missing
         }
-    } else {
-        match indexers.ranged_client.contains(key).await {
-            Ok(true) => KeyOutcome::Present,
-            Ok(false) => {
-                report_missing(key);
-                KeyOutcome::Missing
-            }
-            Err(error) => {
-                // The tree covering this key is absent or unreadable --
-                // exactly the condition this tool is for. Not a missing
-                // entry: we do not know what the tree holds.
-                report_unreachable(key, &error);
-                KeyOutcome::Unreachable
-            }
+        Err(error) => {
+            // The tree covering this key is absent or unreadable -- exactly
+            // the condition this tool is for. Not a missing entry: we do not
+            // know what the tree holds.
+            report_unreachable(key, &error);
+            KeyOutcome::Unreachable
         }
     }
 }
