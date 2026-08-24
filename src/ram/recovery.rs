@@ -438,11 +438,6 @@ pub struct BracketLedger {
     present: std::collections::HashSet<(u16, u64)>,
     pending: Mutex<HashMap<crate::server::transactions::TxnId, Vec<PendingBracketCell>>>,
     commits: Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
-    /// The oldest undecided transaction any file was written with. A bracket
-    /// older than this was DECIDED before that file existed, so a missing
-    /// COMMIT means the cleaner dropped the marker -- not that the
-    /// transaction was in flight.
-    watermark: Mutex<Option<(u64, u64)>>,
 }
 
 struct PendingBracketCell {
@@ -473,20 +468,6 @@ impl BracketLedger {
                 .collect(),
             pending: Mutex::new(HashMap::new()),
             commits: Mutex::new(HashMap::new()),
-            watermark: Mutex::new(None),
-        }
-    }
-
-    /// Take the LOWEST watermark any file names: the most conservative claim
-    /// about what was already decided.
-    fn observe_watermark(&self, watermark: Option<(u64, u64)>) {
-        let Some(seen) = watermark else {
-            return;
-        };
-        let mut current = self.watermark.lock();
-        match *current {
-            Some(existing) if existing <= seen => {}
-            _ => *current = Some(seen),
         }
     }
 
@@ -521,22 +502,34 @@ impl BracketLedger {
                 .filter(|member| !self.present.contains(&(member.chunk_id, member.seq_id)))
                 .collect();
             let cells = pending.remove(&txn).unwrap_or_default();
+            // A missing member means COMPACTED, not lost -- and the
+            // transaction still applies.
+            //
+            // Two facts make that sound. Entries are fsynced BEFORE any
+            // COMMIT is written, so a durable COMMIT already proves every
+            // entry of that transaction was durable; the manifest adds
+            // nothing to that proof. And the cleaner can only touch a segment
+            // whose bracket is DECIDED, because an undecided one is still
+            // leased and leased heads are skipped -- so a member that is gone
+            // was compacted after the decision, with its live cells carried
+            // into a new segment (under a new seq id) and its bracket markers
+            // dropped.
+            //
+            // Discarding on a missing member is what TORE transactions: the
+            // compacted halves came back as ordinary entries while the intact
+            // halves were thrown away, so a four-cell transaction recovered
+            // 2/4. The rule the design started with predates the two-round
+            // fsync that made the manifest redundant.
             if !missing.is_empty() {
-                // A COMMIT naming a segment that is not here: the transaction
-                // was acknowledged only after every member was durable, so
-                // this cannot be a committed transaction -- it is a COMMIT
-                // that outlived its own manifest. Discarding is safe because
-                // the ack never happened.
-                warn!(
-                    "transaction {:?} has a COMMIT but {} of its {} manifest member(s) are \
-                     missing; discarding its {} buffered cell(s)",
+                debug!(
+                    "transaction {:?} has a COMMIT and {} of its {} manifest member(s) are no \
+                     longer present; they were compacted after the decision, so its {} buffered \
+                     cell(s) still apply",
                     txn,
                     missing.len(),
                     manifest.len(),
                     cells.len()
                 );
-                BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                continue;
             }
             let applied = cells.len();
             for cell in cells {
@@ -544,46 +537,23 @@ impl BracketLedger {
             }
             BRACKETS_APPLIED.fetch_add(applied as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        // What is left has no COMMIT anywhere. Whether that means "in flight
-        // when we stopped" or "decided long ago and the marker was cleaned"
-        // is exactly what the watermark answers -- and getting it wrong in
-        // either direction is a corruption: discard a decided transaction and
-        // committed data disappears; apply an in-flight one and uncommitted
-        // data appears.
-        let watermark = *self.watermark.lock();
+        // What is left has no COMMIT anywhere, and that now means exactly one
+        // thing: the transaction was in flight when the store stopped.
+        //
+        // It used to mean two things, which is why the design carried a
+        // decided-watermark to tell them apart -- a bracket could also lose
+        // its COMMIT to the cleaner. That ambiguity is gone: every bracket
+        // carries its own COMMIT, and compaction drops a segment's BEGIN and
+        // COMMIT together, so a compacted transaction's cells come back as
+        // ordinary entries rather than as a bracket missing its closer. With
+        // nothing left for the watermark to decide, deciding on it would be
+        // resting correctness on a quantity nothing exercises.
         for (txn, cells) in pending {
-            // No watermark anywhere means no claim about what was decided, and
-            // the safe reading of "no claim" is "assume not decided": failing
-            // to apply a decided transaction loses data the cleaner was going
-            // to keep anyway, while applying an undecided one INVENTS data.
-            // Only one of those two mistakes is recoverable.
-            let decided_before_the_files = watermark
-                .map(|(ts, node)| (txn.ts, txn.node) < (ts, node))
-                .unwrap_or(false);
-            if decided_before_the_files {
-                // Older than anything in flight when these files were
-                // written, so it was decided. A decided bracket that survives
-                // WITH its cells and WITHOUT its COMMIT is the shape a
-                // compaction leaves behind, and its cells are the ones the
-                // index kept -- i.e. committed.
-                let applied = cells.len();
-                for cell in cells {
-                    apply_bracketed_cell(chunks, &cell);
-                }
-                BRACKETS_APPLIED.fetch_add(applied as u64, std::sync::atomic::Ordering::Relaxed);
-                debug!(
-                    "transaction {:?} predates the recovery watermark {:?}; its {} cell(s) were \
-                     decided before these files were written and are applied",
-                    txn, watermark, applied
-                );
-                continue;
-            }
             info!(
-                "transaction {:?} left {} bracketed cell(s) with no COMMIT and is at or above the \
-                 watermark {:?}; it was in flight when the store stopped and is discarded",
+                "transaction {:?} left {} bracketed cell(s) with no COMMIT; it was in flight when \
+                 the store stopped and is discarded",
                 txn,
-                cells.len(),
-                watermark
+                cells.len()
             );
             BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -666,18 +636,6 @@ fn read_chain_link(data: &[u8], usable_len: usize) -> Option<(usize, u64, u64)> 
     };
     let (short, prev_seq) = crate::ram::bracket::decode_txn_cont(content)?;
     Some((tail, short, prev_seq))
-}
-
-/// The decided watermark a log file names, read straight from its header.
-fn file_header_watermark(path: &std::path::Path) -> Option<(u64, u64)> {
-    use std::io::Read;
-    let mut file = File::open(path).ok()?;
-    let mut header = [0u8; crate::ram::wal_format::FILE_HEADER_SIZE];
-    file.read_exact(&mut header).ok()?;
-    if !crate::ram::wal_format::is_framed(&header) {
-        return None;
-    }
-    crate::ram::wal_format::header_watermark(&header)
 }
 
 /// Whether the entry at `addr` stands on its own: aligned, a well-formed
@@ -1724,10 +1682,6 @@ pub fn recover_chunks(
                     let mut attempt = |path: &std::path::Path,
                                        version_map: &mut VersionMap|
                      -> io::Result<(Vec<u8>, Option<usize>, RecoveryScanResult)> {
-                        // From the FILE, before it is decoded: a framed log is
-                        // rebuilt into the segment image it describes, so the
-                        // header is gone by the time the image exists.
-                        bracket_ledger.observe_watermark(file_header_watermark(path));
                         let (file_data, declared_used_len) = load_file_with_used_len(path)?;
                         if file_data.len() > SEGMENT_SIZE {
                             return Err(io::Error::new(

@@ -590,21 +590,6 @@ pub fn transaction_has_leases(txn: &crate::server::transactions::TxnId) -> bool 
     TXN_LEASES.lock().contains_key(txn)
 }
 
-/// The oldest transaction that has not yet reached a decision, or `None` when
-/// nothing is in flight.
-///
-/// Stamped into a file's header when it is written, so a reader knows which
-/// brackets could still be undecided. Taken from the leases because a lease
-/// exists exactly while a transaction is undecided: it is opened by the first
-/// write and released by the decision.
-pub fn undecided_watermark() -> Option<(u64, u64)> {
-    TXN_LEASES
-        .lock()
-        .keys()
-        .map(|txn| (txn.ts, txn.node))
-        .min()
-}
-
 /// How many heads a transaction currently holds; for tests and metrics.
 pub fn transaction_lease_count(txn: &crate::server::transactions::TxnId) -> usize {
     TXN_LEASES
@@ -1238,30 +1223,76 @@ impl Chunk {
     ) -> Result<(), WriteError> {
         let content = crate::ram::bracket::encode_commit(txn, manifest);
         let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
-        // Must land in the LEASED head. A COMMIT anywhere else closes
-        // nothing: recovery reads a bracket within one segment, so a record
-        // in a different segment leaves the entries looking uncommitted.
-        let LeasedPlacement::Placed(pending) =
-            self.try_place_in_leased_head(size, SegmentClass::Regular)
-        else {
-            // A COMMIT that cannot go into the leased head closes nothing, so
-            // the caller must refuse the commit rather than write it
-            // elsewhere and call the transaction done.
-            return Err(WriteError::CannotAllocateSpace);
+        // EVERY bracket this transaction opened here gets its own COMMIT, not
+        // just the newest part.
+        //
+        // A bracket that has to look elsewhere for its COMMIT is a bracket the
+        // cleaner can orphan: parts are decided together but compacted
+        // INDEPENDENTLY, so compacting the part that held the only COMMIT
+        // leaves the earlier parts' BEGINs with nothing to close them, and
+        // their committed cells are then read as an in-flight transaction and
+        // dropped. Repeating the record per part costs 40-odd bytes and makes
+        // each bracket self-contained -- which is also what removes the need
+        // for a watermark to tell "cleaned" from "undecided".
+        let heads: Vec<AArc<Segment>> = {
+            let txn_now = current_txn();
+            let held = TXN_LEASES.lock();
+            match txn_now.as_ref().and_then(|t| held.get(t)).and_then(|l| l.per_chunk.get(&self.id))
+            {
+                Some(heads) => heads.iter().map(|lease| lease.seg.clone()).collect(),
+                None => Vec::new(),
+            }
         };
-        crate::ram::entry::Entry::encode_to(
-            pending.addr,
-            crate::ram::entry::EntryType::COMMIT,
-            content.len() as u32,
-            |content_addr| unsafe {
-                std::ptr::copy_nonoverlapping(
-                    content.as_ptr(),
-                    content_addr as *mut u8,
-                    content.len(),
+        if heads.is_empty() {
+            return Err(WriteError::CannotAllocateSpace);
+        }
+        for head in heads {
+            if head.segment_class() != SegmentClass::Regular {
+                continue;
+            }
+            if !head.incr_references() {
+                return Err(WriteError::CannotAllocateSpace);
+            }
+            if !head.begin_pending_journal() {
+                head.decr_references();
+                return Err(WriteError::CannotAllocateSpace);
+            }
+            let Some(addr) = head.try_acquire(size) else {
+                // A full part cannot hold its own COMMIT. Its entries are
+                // still committed -- a later part's COMMIT names them through
+                // the manifest -- but this part is not self-contained, so say
+                // so rather than pretend.
+                head.end_pending_journal();
+                head.decr_references();
+                warn!(
+                    "chunk {} could not place a COMMIT in segment {} for transaction {:?}; that \
+                     part relies on another part's record",
+                    self.id, head.id, txn
                 );
-            },
-        );
-        drop(pending);
+                continue;
+            };
+            crate::ram::entry::stamp_reservation_padding(addr, size);
+            let pending = PendingEntry {
+                addr,
+                seg: head,
+                size,
+                skip_sync: true,
+                leased: true,
+            };
+            crate::ram::entry::Entry::encode_to(
+                pending.addr,
+                crate::ram::entry::EntryType::COMMIT,
+                content.len() as u32,
+                |content_addr| unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        content.as_ptr(),
+                        content_addr as *mut u8,
+                        content.len(),
+                    );
+                },
+            );
+            drop(pending);
+        }
         Ok(())
     }
 
