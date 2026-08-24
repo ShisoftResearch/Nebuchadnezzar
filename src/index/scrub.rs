@@ -140,6 +140,76 @@ impl std::fmt::Display for ScrubReport {
     }
 }
 
+/// Start a scrub after recovery, if this deployment asked for one.
+///
+/// `NEB_SCRUB_ON_RECOVERY`: `off` (default), `verify`, or `repair`.
+///
+/// **Why this is not on by default.** The pass walks every live cell, which
+/// measured 5.7s for 800k cells -- fine there, hours on a store with
+/// billions. A default that silently adds hours to every restart is worse
+/// than the problem it fixes, so the deployment that knows its size chooses.
+///
+/// **Why it runs in the background rather than blocking startup.** A store
+/// that has just crashed should serve as soon as it can. Reads during the
+/// pass still miss the entries it has not reached yet -- but that is exactly
+/// the status quo without it, so serving early costs nothing that was not
+/// already lost, while delaying startup costs availability outright.
+///
+/// **Why it is worth running at all.** A crash leaves ranged entries missing
+/// for cells written since the tree's last flush, and the write path only
+/// re-asserts an entry when its cell is written AGAIN. Hot data therefore
+/// heals itself and everything else does not: a cell written once keeps its
+/// lost entry for the life of the store. On an append-mostly load almost
+/// every cell is in that category.
+pub fn spawn_post_recovery_scrub(
+    chunks: &Arc<Chunks>,
+    indexers: &Arc<IndexerClients>,
+    group: &str,
+    database: &str,
+) {
+    let Some(mode) = mode_from_env() else {
+        return;
+    };
+    let chunks = chunks.clone();
+    let indexers = indexers.clone();
+    let label = format!("{}/{}", group, database);
+    tokio::spawn(async move {
+        info!(
+            "Index scrub ({:?}) starting for {} after recovery; the store is already serving",
+            mode, label
+        );
+        let report = scrub_ranged_index(&chunks, &indexers, mode).await;
+        if report.is_clean() {
+            info!("Index scrub for {} found nothing missing: {}", label, report);
+        } else {
+            // Loud even after a successful repair: the operator wants to know
+            // the crash cost entries, not only that they were put back.
+            warn!("Index scrub for {}: {}", label, report);
+        }
+    });
+}
+
+fn mode_from_env() -> Option<ScrubMode> {
+    match std::env::var("NEB_SCRUB_ON_RECOVERY")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "verify" => Some(ScrubMode::Verify),
+        "repair" => Some(ScrubMode::Repair),
+        "" | "off" | "0" | "false" => None,
+        other => {
+            // Refusing beats guessing: a typo silently meaning "off" is how a
+            // store runs for months believing it is being scrubbed.
+            warn!(
+                "NEB_SCRUB_ON_RECOVERY={:?} is not one of off/verify/repair; not scrubbing",
+                other
+            );
+            None
+        }
+    }
+}
+
 /// Walk every live cell in `chunks` and reconcile its ranged index entries.
 ///
 /// Batched by segment: the derivation half holds cell read guards and the
@@ -551,6 +621,38 @@ mod tests {
         println!("after re-verify: {}", after);
         assert!(after.is_clean(), "index still holed after repair: {}", after);
         assert_eq!(after.entries_present, baseline.entries_present);
+    }
+
+    /// A typo must not silently mean "off". A store running for months in
+    /// the belief that it is being scrubbed is the failure this guards.
+    #[test]
+    fn the_recovery_knob_refuses_what_it_does_not_understand() {
+        // Serialised with the other env test by using distinct values only;
+        // std::env is process-global, so this test owns the variable.
+        let restore = std::env::var("NEB_SCRUB_ON_RECOVERY").ok();
+
+        for (value, expected) in [
+            ("verify", Some(ScrubMode::Verify)),
+            ("repair", Some(ScrubMode::Repair)),
+            ("REPAIR", Some(ScrubMode::Repair)),
+            ("off", None),
+            ("", None),
+            ("0", None),
+            // Anything else is refused rather than guessed at.
+            ("repare", None),
+            ("true", None),
+            ("yes", None),
+        ] {
+            std::env::set_var("NEB_SCRUB_ON_RECOVERY", value);
+            assert_eq!(mode_from_env(), expected, "for {:?}", value);
+        }
+
+        std::env::remove_var("NEB_SCRUB_ON_RECOVERY");
+        assert_eq!(mode_from_env(), None, "unset must mean off");
+
+        if let Some(v) = restore {
+            std::env::set_var("NEB_SCRUB_ON_RECOVERY", v);
+        }
     }
 
     /// The rule that keeps the tool honest about what it could not check.

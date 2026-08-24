@@ -1755,6 +1755,21 @@ impl NebServer {
             // dead index-page versions and the graceful-shutdown flush
             // livelocks on CannotAllocateSpace.
             database_runtime.cleaner().resume();
+
+            // A crash leaves ranged entries missing for cells written since
+            // the tree's last flush, and the write path re-asserts an entry
+            // only when its cell is written again -- so hot data heals and
+            // nothing else does. Opt-in and backgrounded; see
+            // `spawn_post_recovery_scrub` for why it is neither automatic
+            // nor blocking.
+            if let Some(indexer) = database_runtime.indexer.as_ref() {
+                crate::index::scrub::spawn_post_recovery_scrub(
+                    &database_runtime.chunks,
+                    &indexer.clients,
+                    database_runtime.group_name(),
+                    database_runtime.database_name(),
+                );
+            }
         }
 
         debug!(
