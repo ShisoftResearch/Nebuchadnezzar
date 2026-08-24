@@ -546,3 +546,34 @@ subsequent phase lands with its crash-lane already watching. Phases 4 and
 | 14 | Dir fsyncs best-effort/one-sided around archive+unlink | segs.rs:1913, 1978 |
 | 15 | Archive doesn't drain writers ⇒ sealed-seg straggler homeless | segs.rs:1598, 2024 |
 | 16 | Cold per-block reads bypass the only real CRC | compression.rs:487-510 |
+
+### Windows 17-19: found by the fuzzer AFTER the audit (2026-08-23/24)
+
+The audit was static; these three were found by running the thing. All are
+fixed, with non-vacuous regression tests.
+
+| # | Window | Where | Fix |
+|---|---|---|---|
+| 17 | Abandoned image mutated in place breaks its content checksum, so the scan stops there and DISCARDS the rest of the segment | cell.rs `abandon_entry_version`, recovery.rs verify | `1dbdea86` — retire an entry by stamping CHECKSUMMED padding over its span; never edit published content |
+| 18 | One damaged entry ends the segment walk, so mid-segment damage costs every entry behind it | recovery.rs `verify_entry_at == Some(false)` | `855890e0` — resync onto a successor that vouches for itself; unreadable tails still stop |
+| 19 | Replaying a placement panics the server when the target is unknown (any address change makes every placement unknown) | ranged/sm.rs `load_sub_tree` | warn + leave unloaded, retried |
+
+Also fixed in bifrost, same hunt: replay deferred forever at holes the WAL
+legitimately contains (entries skipped for non-recoverable state machines),
+wedging every state machine on the plane behind the first hole — which lost
+the ranged index's placements wholesale (`tree placement was not found`).
+bifrost `66a2606`.
+
+**The lesson that generalises past these three.** Every one of them turned a
+LOCAL fault into a TOTAL one: one entry cost a segment, one segment cost an
+index, one missing log id cost a plane, one unknown server cost the process.
+The store had every byte on disk in all four cases. When adding recovery
+code, the question is not only "is this fault handled" but "what is the
+blast radius when it is" — and the answer must be the smallest unit that
+actually failed.
+
+**And the testing lesson.** The pre-existing test for abandoned images put
+the ghost LAST in the segment, where truncating at it costs nothing: it
+passed for four months while the bug was live. A test for damaged or
+retired entries MUST place live entries AFTER them, or it asserts nothing.
+
