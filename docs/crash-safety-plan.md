@@ -313,40 +313,43 @@ needs, and does not yet have:
 DECISION NEEDED before building it: whether (1) is satisfied by a durable
 recovery-complete marker, or by requiring the operator to assert it.
 
-## Next: half-edge detection (specified, not built)
+## Half-edge detection (BUILT 2026-08-24)
 
-The ingest path (`morpheus/src/graph/idlist_coordinator.rs`) updates each
-endpoint's adjacency list in a SEPARATE call with no atomicity between them,
-so a crash can leave an edge in A's out-list and not B's in-list. Traversals
-then disagree by direction, silently. This cannot be PREVENTED without the
-distributed termination protocol -- A and B are different vertices on
-different nodes -- but it can be DETECTED, in the same shape as the index
-scrub, and detection is what turns a guess into a number.
+`morpheus::graph::symmetry`. `GraphEngine::verify_vertex_symmetry(id, &mut
+found)` for one vertex, `verify_store_symmetry(limit)` for the node.
 
-The pieces already exist:
+**What it finds.** A bilateral edge is two writes, and the non-transactional
+ingest path makes them as SEPARATE calls with no atomicity between them. A
+crash in between leaves an edge visible from one endpoint and not the other,
+and a traversal then returns different neighbours depending on which way it
+walks. Cannot be PREVENTED without the distributed termination protocol --
+the two vertices are usually on different nodes -- but now it is counted.
 
-- `LocalIdList` (`local.rs`) reads a vertex's lists from `Chunks` with no RPC,
-  so the walk over local vertices is cheap.
-- `EdgeDirection::reversed()` gives the list to check on the far side.
-- `body_edge_dest_vertex()` (`graph/mod.rs`, currently private) resolves an
-  edge-body cell to its other endpoint, handling directed and undirected.
-- `AtomicIdList::contains()` answers the far side, routed by conshash.
+**Report-only, deliberately.** An edge in A and not B can be completed or
+removed, and which is right depends on whether the write was acked, which the
+store does not record. That is the operator's call, not the tool's.
 
-Shape: for each local vertex V, each direction D, each schema S, and each
-entry X in V's (D, S) list -- resolve X to the neighbour N (X itself for a
-simple edge; `body_edge_dest_vertex` for a body edge), then check N's
-`reversed(D)` list contains X. Report only; never repair.
+**The asymmetry that makes it easy to get wrong.** An edge WITH A BODY stores
+the body cell's id on BOTH endpoints; a SIMPLE edge stores the OTHER VERTEX's
+id on each. So the counterpart to look for on the far side is the body id in
+one case and the near vertex's own id in the other. Confusing them makes every
+simple edge in a healthy store look broken.
 
-**Why report-only.** Repair direction is genuinely ambiguous: an edge in A
-and not B can be completed or removed, and which is right depends on whether
-the write was acked -- which the store does not record. That is a decision
-for whoever reads the report, not for the tool.
+That is why the load-bearing test is the HEALTHY one -- simple, bodied and
+undirected edges, checked from both endpoints, all clean -- and why it is
+verified non-vacuous by making exactly that confusion, which fails it at once.
+The same lesson as the shutdown flush warning fixed this session: a check that
+cries wolf is worse than no check, because it trains its reader to ignore it.
 
-**The trap to avoid**, learned from the index scrub: getting simple-vs-body
-or undirected resolution subtly wrong produces FALSE half-edges, and a
-detector that cries wolf is worse than none -- see the shutdown LSM flush
-warning that fired on every database that had no index at all. Build the
-single-vertex check first, with a test per edge shape, before any driver.
+**Scope.** One node's pass sees edges listed by LOCAL vertices; an edge whose
+only surviving side is remote is invisible to it. Sound the same way the index
+scrub is -- an asymmetry found HERE is real regardless of what other nodes
+hold, so findings are trustworthy while their absence is not proof. Run per
+node. Entries it cannot judge (unknown schema, unreadable body, unreachable
+neighbour) are counted `unresolvable`, never as half-edges: an unreachable
+node must not become a storm of false findings.
+
+Not yet wired to an RPC or a startup hook; it is a library call today.
 
 ## Phase 5 — Verification: make crashes boring
 
