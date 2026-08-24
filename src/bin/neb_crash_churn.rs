@@ -742,6 +742,37 @@ async fn child_async(
     flush_stdout();
     println!("SCANNED n={}", count);
     flush_stdout();
+
+    // A different question than the scanned count asks. That count only
+    // notices loss that drops BELOW the previous best, so a hole refilled by
+    // later inserts is invisible to it; this asks whether every cell still
+    // in the store has the index entry its contents imply.
+    //
+    // REPORTED, NOT ENFORCED, deliberately. The Phase 0 contract makes
+    // indexes rebuildable and never authoritative, so a crash is ALLOWED to
+    // leave cells whose entries had not been inserted yet -- index insertion
+    // is async and outside the bracket. Failing on missing>0 would therefore
+    // manufacture failures out of contracted behaviour. What the line is for
+    // is the size of the number: a handful after a kill is the expected lag,
+    // thousands is a bug, and nothing in the harness could tell those apart
+    // before. Same reasoning as the RECOVERY counters above -- a number
+    // nothing reads is a number nobody has.
+    if std::env::var("NEB_CHURN_SCRUB").as_deref() != Ok("0") {
+        let began = std::time::Instant::now();
+        match client.scrub_ranged_index(false).await {
+            Ok(report) => println!(
+                "SCRUB missing={} unreachable={} present={} derived={} cells={} took_ms={}",
+                report.entries_missing,
+                report.entries_unreachable,
+                report.entries_present,
+                report.entries_derived,
+                report.cells_scanned,
+                began.elapsed().as_millis()
+            ),
+            Err(e) => println!("SCRUB_ERROR {}", e),
+        }
+        flush_stdout();
+    }
     // A store that ran out of room is a CONFIGURATION outcome, not a
     // durability one. Index write-back cannot allocate, its batches are
     // abandoned, the barrier is never established and entries are lost --
