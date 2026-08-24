@@ -42,7 +42,8 @@ built as well.
 | — cross-chunk manifest rule + commit ordering | DONE | `b9bd13c4` |
 | 3 Chains (TXN_CONT at the fixed tail) | DONE | `6421ebda` |
 | 4 Abort by physical rewind | DONE | `6421ebda` |
-| 5 Decided watermark + cleaner gate | DONE | `6421ebda` |
+| 5 Cleaner gate | DONE | `6421ebda` |
+| — COMMIT per bracket; watermark REMOVED | DONE | `2fbc0e5b` |
 
 What the fuzzer's transaction lane (built as Step 1's gate) found and forced
 along the way, all fixed: entries and COMMITs must be fsynced in TWO rounds
@@ -50,6 +51,17 @@ or a surviving COMMIT proves nothing about the other chunks; a busy head is
 not a full head, and sealing it as a chain part stamps a link over space the
 segment still owns; a bracket part must be claimed with room for BEGIN *and*
 its first entry; and `live_entries` would have panicked on a bracket marker.
+
+**The watermark is gone, and that is a design change worth stating.** It
+existed to tell "no COMMIT because the cleaner dropped it" from "no COMMIT
+because the transaction was undecided". Giving every bracket its own COMMIT
+makes each one self-contained, so the first case cannot arise -- compaction
+drops a segment's BEGIN and COMMIT together and its cells come back as
+ordinary entries. The manifest's member check went the same way: entries are
+fsynced before any COMMIT is written, so a durable COMMIT already proves the
+entries were durable, and a missing member means compacted rather than lost.
+Both were written before the two-round fsync ordering was settled, and the
+soak showed the member check was itself tearing transactions.
 
 STILL OPEN, deliberately: the undo log has NOT left the write path (abort is
 physical now, so it can — but that retirement needs its own validation);
