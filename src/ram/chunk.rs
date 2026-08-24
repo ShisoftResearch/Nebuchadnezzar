@@ -492,6 +492,43 @@ pub fn expire_transaction_leases(idle: std::time::Duration) -> Vec<crate::server
     expired
 }
 
+/// The manifest of a transaction's brackets: every chunk it wrote and the
+/// seq id of the segment holding that chunk's bracket.
+///
+/// Exact rather than estimated, which is what lets any single part decide
+/// the whole transaction: a COMMIT is honoured only when every member it
+/// names is present.
+pub fn transaction_manifest(
+    txn: &crate::server::transactions::TxnId,
+) -> Vec<crate::ram::bracket::ManifestEntry> {
+    let held = TXN_LEASES.lock();
+    let Some(leases) = held.get(txn) else {
+        return Vec::new();
+    };
+    let mut manifest: Vec<_> = leases
+        .per_chunk
+        .iter()
+        .flat_map(|(chunk_id, heads)| {
+            heads.iter().map(move |lease| crate::ram::bracket::ManifestEntry {
+                chunk_id: *chunk_id as u16,
+                seq_id: lease.seg.seq_id,
+            })
+        })
+        .collect();
+    // Sorted so the same transaction produces the same manifest bytes in
+    // every chunk it wrote; a reader comparing two parts should not have to
+    // treat ordering as meaningful.
+    manifest.sort_unstable_by_key(|member| (member.chunk_id, member.seq_id));
+    manifest.dedup();
+    manifest
+}
+
+/// Whether this transaction holds any lease at all -- i.e. whether it wrote
+/// anything that needs a bracket closed.
+pub fn transaction_has_leases(txn: &crate::server::transactions::TxnId) -> bool {
+    TXN_LEASES.lock().contains_key(txn)
+}
+
 /// How many heads a transaction currently holds; for tests and metrics.
 pub fn transaction_lease_count(txn: &crate::server::transactions::TxnId) -> usize {
     TXN_LEASES
@@ -1113,6 +1150,41 @@ impl Chunk {
         true
     }
 
+    /// Close this transaction's bracket in this chunk by writing its COMMIT.
+    ///
+    /// The bracket is committed IF AND ONLY IF this record is present, so
+    /// this is the commit point for everything the transaction wrote here.
+    /// It goes into the leased head, behind the transaction's own entries and
+    /// with nobody else's in between -- which is what the lease bought.
+    pub fn close_transaction_bracket(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+        manifest: &[crate::ram::bracket::ManifestEntry],
+    ) -> Result<(), WriteError> {
+        let content = crate::ram::bracket::encode_commit(txn, manifest);
+        let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
+        // Must land in the LEASED head. A COMMIT anywhere else closes
+        // nothing: recovery reads a bracket within one segment, so a record
+        // in a different segment leaves the entries looking uncommitted.
+        let Some(pending) = self.try_place_in_leased_head(size, SegmentClass::Regular) else {
+            return Err(WriteError::CannotAllocateSpace);
+        };
+        crate::ram::entry::Entry::encode_to(
+            pending.addr,
+            crate::ram::entry::EntryType::COMMIT,
+            content.len() as u32,
+            |content_addr| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    content.as_ptr(),
+                    content_addr as *mut u8,
+                    content.len(),
+                );
+            },
+        );
+        drop(pending);
+        Ok(())
+    }
+
     /// Whether the calling thread's transaction holds a head in this chunk.
     ///
     /// Used to refuse a wait that can never end: the acquire loop queues on
@@ -1189,13 +1261,62 @@ impl Chunk {
         full_gc: bool,
         segment_class: SegmentClass,
     ) -> Result<PendingEntry, WriteError> {
-        if self.writes_closed.load(Ordering::Acquire) {
-            return Err(WriteError::ServerShuttingDown);
+        // Open the bracket before the first entry of a transaction lands in
+        // this chunk, so BEGIN really is the first thing in the run. Doing it
+        // when the lease is taken would put it AFTER the entry that took the
+        // lease, and recovery would then read that entry as ordinary.
+        if current_txn().is_some() && !self.current_txn_holds_head_here() {
+            self.open_transaction_bracket(full_gc, segment_class)?;
         }
-        // A transaction writes behind its own head first, so its entries stay
+        // A transaction writes behind its own head, so its entries stay
         // contiguous and an abort can rewind them.
         if let Some(entry) = self.try_place_in_leased_head(size, segment_class) {
             return Ok(entry);
+        }
+        self.try_acquire_claim(size, full_gc, segment_class)
+    }
+
+    /// Claim space for a transaction's BEGIN and write it, taking the lease.
+    fn open_transaction_bracket(
+        &self,
+        full_gc: bool,
+        segment_class: SegmentClass,
+    ) -> Result<(), WriteError> {
+        let Some(txn) = current_txn() else {
+            return Ok(());
+        };
+        let content = crate::ram::bracket::encode_begin(&txn);
+        let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
+        let pending = self.try_acquire_claim(size, full_gc, segment_class)?;
+        debug_assert!(
+            pending.leased,
+            "the claim that opens a bracket must be the one that takes the lease"
+        );
+        crate::ram::entry::Entry::encode_to(
+            pending.addr,
+            crate::ram::entry::EntryType::BEGIN,
+            content.len() as u32,
+            |content_addr| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    content.as_ptr(),
+                    content_addr as *mut u8,
+                    content.len(),
+                );
+            },
+        );
+        // Dropping it journals the BEGIN, exactly like any other entry.
+        drop(pending);
+        Ok(())
+    }
+
+    fn try_acquire_claim(
+        &self,
+        size: u32,
+        full_gc: bool,
+        segment_class: SegmentClass,
+    ) -> Result<PendingEntry, WriteError> {
+        if self.writes_closed.load(Ordering::Acquire) {
+            return Err(WriteError::ServerShuttingDown);
         }
         let mut tried_gc = false;
         let backoff = Backoff::new();
@@ -3617,6 +3738,45 @@ impl Chunks {
     }
 
     /// Sync all buffered WAL data to disk across all chunks
+    /// Close every bracket this transaction opened, in every chunk it wrote.
+    ///
+    /// Called at commit BEFORE the transactional segments are fsynced, so the
+    /// COMMIT records ride the same sync as the entries they commit. Written
+    /// after them and synced with them is the ordering that makes "committed"
+    /// mean "durable": a COMMIT that reached disk while an entry it commits
+    /// did not would be a bracket claiming more than the log holds.
+    ///
+    /// A failure here is a failed commit, not a warning: the caller must not
+    /// acknowledge a transaction whose bracket could not be closed.
+    pub fn commit_transaction_brackets(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+    ) -> Result<(), WriteError> {
+        if !transaction_has_leases(txn) {
+            // A read-only transaction, or one whose writes all failed. There
+            // is no bracket to close and nothing to commit.
+            return Ok(());
+        }
+        let manifest = transaction_manifest(txn);
+        let chunk_ids: Vec<u16> = {
+            let mut ids: Vec<u16> = manifest.iter().map(|member| member.chunk_id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        for chunk_id in chunk_ids {
+            let Some(chunk) = self.list.get(chunk_id as usize) else {
+                error!(
+                    "transaction {:?} leased a head in chunk {} which this store does not have",
+                    txn, chunk_id
+                );
+                return Err(WriteError::CannotAllocateSpace);
+            };
+            chunk.close_transaction_bracket(txn, &manifest)?;
+        }
+        Ok(())
+    }
+
     pub fn sync_all(&self) {
         info!("Syncing WAL for all chunks...");
         for chunk in &self.list {

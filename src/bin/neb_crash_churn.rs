@@ -50,6 +50,7 @@ struct ParentState {
     next_key: u64,
     best_verified: u64,
     txn_committed_high: u64,
+    txn_verify_from: u64,
     /// Contiguous prefix of keys the store has been told to delete.
     deleted: u64,
 }
@@ -65,6 +66,7 @@ fn parent_main(args: &[String]) -> ExitCode {
         next_key: 0,
         best_verified: 0,
         txn_committed_high: 0,
+        txn_verify_from: 0,
         deleted: 0,
     };
     // Deterministic-ish per-run seed without wall-clock dependence beyond
@@ -139,6 +141,7 @@ fn parent_main(args: &[String]) -> ExitCode {
                 &state.next_key.to_string(),
                 &txn_rate.to_string(),
                 &state.txn_committed_high.to_string(),
+                &state.txn_verify_from.to_string(),
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -342,6 +345,12 @@ fn parent_main(args: &[String]) -> ExitCode {
         // Rebased each cycle, `acked_high - newly_deleted` is exact whether
         // or not the space is dense, because the base cancels: keys added
         // this cycle = cursor - scan-at-start.
+        // What the child just wrote is what the next cycle verifies: its
+        // range starts one past the child's own start_round, which mirrors
+        // the child's `txn_verify_to + 10_000`.
+        if txn_rate > 0 {
+            state.txn_verify_from = state.txn_committed_high + 10_000 + 1;
+        }
         state.txn_committed_high = txn_high;
         state.next_key = acked_high;
         // Every key the store was told to delete is one fewer the next scan
@@ -554,6 +563,7 @@ fn child_main(args: &[String]) -> ExitCode {
     let probe_high: u64 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
     let txn_rate: u64 = args.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);
     let txn_verify_to: u64 = args.get(9).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let txn_verify_from: u64 = args.get(10).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -571,6 +581,7 @@ fn child_main(args: &[String]) -> ExitCode {
         probe_high,
         txn_rate,
         txn_verify_to,
+        txn_verify_from,
     )) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -595,6 +606,7 @@ async fn child_async(
     probe_high: u64,
     txn_rate: u64,
     txn_verify_to: u64,
+    txn_verify_from: u64,
 ) -> Result<(), String> {
     use neb::index::ranged::tree::btree::Ordering as TreeOrdering;
     use neb::query::data_client::{ValueRange, ValueRangeTerm};
@@ -763,14 +775,18 @@ async fn child_async(
     // with NONE. A round that returns some but not all is a torn
     // transaction -- the one failure the plain lanes structurally cannot
     // produce, because a single-cell write has no partial state.
-    if txn_verify_to > 0 {
+    if txn_verify_to >= txn_verify_from && txn_verify_from > 0 {
         const TXN_CELLS: u64 = 4;
         const TXN_SAMPLES: u64 = 200;
-        let stride = (txn_verify_to / TXN_SAMPLES).max(1);
+        // Only rounds a previous cycle actually reported as committed. Probing
+        // outside that range counts never-attempted rounds as absent, which
+        // looks exactly like lost transactions and is the harness lying.
+        let span = txn_verify_to - txn_verify_from + 1;
+        let stride = (span / TXN_SAMPLES).max(1);
         let mut whole = 0u64;
         let mut torn = 0u64;
         let mut missing = 0u64;
-        let mut round = 1u64;
+        let mut round = txn_verify_from;
         while round <= txn_verify_to {
             let base = round * TXN_CELLS;
             let mut found = 0u64;
@@ -795,8 +811,8 @@ async fn child_async(
             round += stride;
         }
         println!(
-            "TXN_ATOMIC whole={} torn={} absent={} verified_to={}",
-            whole, torn, missing, txn_verify_to
+            "TXN_ATOMIC whole={} torn={} absent={} range={}..={}",
+            whole, torn, missing, txn_verify_from, txn_verify_to
         );
         flush_stdout();
     }
@@ -885,6 +901,7 @@ async fn child_async(
         let start_round = txn_verify_to + 10_000;
         txn_handles.push(tokio::spawn(async move {
             let mut round: u64 = start_round;
+            let mut reporting = true;
             loop {
                 round += 1;
                 let base = round * TXN_CELLS;
@@ -915,7 +932,13 @@ async fn child_async(
                         flush_stdout();
                     }
                 }
-                if result.is_ok() {
+                if result.is_err() {
+                    // Stop advancing the mark: it must mean "every round up
+                    // to here committed", or the parent cannot tell a lost
+                    // transaction from one that was never attempted.
+                    reporting = false;
+                }
+                if result.is_ok() && reporting {
                     // Published AFTER the commit returns, so the count is a
                     // lower bound on what is durable -- the same one-sided
                     // discipline the ack cursor uses. A transaction whose

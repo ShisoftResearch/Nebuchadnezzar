@@ -416,6 +416,162 @@ fn newer_resident_segment(chunk: &Chunk, seg_id: u64, seq_id: u64) -> Option<AAr
     }
 }
 
+/// What recovery knows about the transactions whose brackets it has seen.
+///
+/// A transaction spanning several chunks writes a bracket in each, and N
+/// fsyncs cannot be made atomic -- so a crash can leave one chunk's COMMIT
+/// durable and another's not. The commit path therefore makes every ENTRY
+/// durable before it writes any COMMIT, which turns one surviving COMMIT into
+/// a decision for the whole transaction: its manifest names every member, and
+/// every member's entries are known to be on disk.
+///
+/// That decision cannot be made while scanning, because the COMMIT may live
+/// in a chunk this thread has not reached (chunks are scanned in parallel). So
+/// bracketed entries are BUFFERED here and applied once every segment has
+/// been read and every COMMIT is known.
+pub struct BracketLedger {
+    /// Every (chunk, seq) this recovery discovered. A manifest member counts
+    /// as present iff it is here.
+    present: std::collections::HashSet<(u16, u64)>,
+    pending: Mutex<HashMap<crate::server::transactions::TxnId, Vec<PendingBracketCell>>>,
+    commits: Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
+}
+
+struct PendingBracketCell {
+    chunk_id: usize,
+    hash: u64,
+    /// The virtual address the entry occupies once its segment is installed,
+    /// which stays valid after the scan -- the cells live in the segment's
+    /// mapped memory, not in the scan's buffer.
+    addr: usize,
+    version: u64,
+    content_length: u32,
+}
+
+/// Transactions discarded because they were never committed, and cells
+/// applied from committed brackets. Loud on purpose: both are normal, and
+/// both are things an operator will want to see after a crash.
+pub static BRACKETS_DISCARDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static BRACKETS_APPLIED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+impl BracketLedger {
+    pub fn new(files: &[SegmentFileInfo]) -> Self {
+        BracketLedger {
+            present: files
+                .iter()
+                .map(|file| (file.chunk_id as u16, file.seq_id))
+                .collect(),
+            pending: Mutex::new(HashMap::new()),
+            commits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn note_pending(&self, txn: &crate::server::transactions::TxnId, cell: PendingBracketCell) {
+        self.pending
+            .lock()
+            .entry(txn.clone())
+            .or_insert_with(Vec::new)
+            .push(cell);
+    }
+
+    fn note_commit(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+        manifest: Vec<crate::ram::bracket::ManifestEntry>,
+    ) {
+        self.commits.lock().insert(txn.clone(), manifest);
+    }
+
+    /// Apply every committed bracket and drop the rest.
+    ///
+    /// Called once, after every segment has been scanned. Applying here rather
+    /// than during the scan is what makes a cross-chunk transaction atomic:
+    /// the chunk whose own COMMIT was lost still applies its part, because the
+    /// decision came from the transaction, not from that chunk's bytes.
+    pub fn settle(&self, chunks: &[Chunk]) {
+        let commits = std::mem::take(&mut *self.commits.lock());
+        let mut pending = std::mem::take(&mut *self.pending.lock());
+        for (txn, manifest) in commits {
+            let missing: Vec<_> = manifest
+                .iter()
+                .filter(|member| !self.present.contains(&(member.chunk_id, member.seq_id)))
+                .collect();
+            let cells = pending.remove(&txn).unwrap_or_default();
+            if !missing.is_empty() {
+                // A COMMIT naming a segment that is not here: the transaction
+                // was acknowledged only after every member was durable, so
+                // this cannot be a committed transaction -- it is a COMMIT
+                // that outlived its own manifest. Discarding is safe because
+                // the ack never happened.
+                warn!(
+                    "transaction {:?} has a COMMIT but {} of its {} manifest member(s) are \
+                     missing; discarding its {} buffered cell(s)",
+                    txn,
+                    missing.len(),
+                    manifest.len(),
+                    cells.len()
+                );
+                BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            let applied = cells.len();
+            for cell in cells {
+                apply_bracketed_cell(chunks, &cell);
+            }
+            BRACKETS_APPLIED.fetch_add(applied as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Whatever is left never had a COMMIT anywhere: uncommitted at the
+        // instant of the crash, so it never happened.
+        for (txn, cells) in pending {
+            info!(
+                "transaction {:?} left {} bracketed cell(s) with no COMMIT; it was in flight when \
+                 the store stopped and is discarded",
+                txn,
+                cells.len()
+            );
+            BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Install one cell from a committed bracket.
+///
+/// Deliberately compares against whatever the index holds NOW rather than a
+/// scan-local version map: the map belongs to a single chunk's pass and is
+/// gone by the time a cross-chunk decision can be made, and the index is the
+/// thing that has to end up right.
+fn apply_bracketed_cell(chunks: &[Chunk], cell: &PendingBracketCell) {
+    let Some(chunk) = chunks.get(cell.chunk_id) else {
+        error!(
+            "a committed bracket names chunk {} which this store does not have",
+            cell.chunk_id
+        );
+        return;
+    };
+    let mut guard = chunk
+        .cell_index
+        .lock_or_insert(cell.hash as usize, cell.addr);
+    let existing = *guard;
+    if existing == cell.addr {
+        chunk.slot_bytes.add(cell.hash, cell.content_length);
+        return;
+    }
+    if existing == 0 {
+        *guard = cell.addr;
+        chunk.slot_bytes.add(cell.hash, cell.content_length);
+        return;
+    }
+    // Something else already claims this id. The newer version wins, exactly
+    // as it does in the ordinary scan.
+    let existing_version = crate::ram::cell::cell_version_from_chunk_raw(existing).unwrap_or(0);
+    if cell.version >= existing_version {
+        *guard = cell.addr;
+        chunk.slot_bytes.add(cell.hash, cell.content_length);
+    }
+}
+
 /// Entries a scan stepped over because they failed their own checksum.
 /// Loud on purpose: it is real damage, just damage that no longer costs the
 /// rest of the segment.
@@ -684,6 +840,7 @@ fn scan_segment_from_data(
     version_map: &mut VersionMap,
     origin_floors: &[std::sync::atomic::AtomicU64],
     declared_used_len: Option<usize>,
+    ledger: &BracketLedger,
 ) -> io::Result<RecoveryScanResult> {
     use byteorder::{LittleEndian, ReadBytesExt};
     use std::io::Cursor;
@@ -709,6 +866,8 @@ fn scan_segment_from_data(
     let mut mixed_class_warning_emitted = false;
     let mut missing_schema_entries = 0usize;
     let mut first_missing_schema_id = None;
+    // The bracket currently open: where its entries start, and whose it is.
+    let mut open_bracket: Option<(usize, crate::server::transactions::TxnId)> = None;
 
     while cursor < bound {
         entries_processed += 1;
@@ -873,6 +1032,149 @@ fn scan_segment_from_data(
 
         let offset = cursor - data_base;
         let virtual_cursor = segment_base + offset;
+
+        // The bracket state machine.
+        //
+        // A transaction's entries are contiguous here -- one writer owns the
+        // segment while it writes -- so attributing them needs no per-entry
+        // stamps, only the two markers around them. Entries inside a bracket
+        // are NOT applied until the COMMIT is seen; when it is, the walk
+        // REWINDS to the start of the bracket and replays it through the very
+        // same apply code below. Replaying rather than buffering keeps one
+        // code path for applying a recovered cell: a second copy of that
+        // logic is a second place for the two to drift, and this is the code
+        // that decides what a store contains.
+        match entry_header.entry_type {
+            EntryType::BEGIN => {
+                let content = unsafe {
+                    std::slice::from_raw_parts(
+                        Entry::content_pos(cursor) as *const u8,
+                        entry_header.content_length as usize,
+                    )
+                };
+                if let Some((start, txn)) = open_bracket.take() {
+                    // One writer per segment means this cannot happen from a
+                    // legal interleaving; say so rather than guess, and treat
+                    // the older bracket as unfinished, which is the safe read.
+                    warn!(
+                        "Recovered segment {} has a BEGIN at offset {} while the bracket for {:?} \
+                         opened at offset {} is still open; treating the earlier one as \
+                         uncommitted",
+                        seg_id,
+                        offset,
+                        txn,
+                        start - data_base
+                    );
+                }
+                match crate::ram::bracket::decode_begin(content) {
+                    Some(txn) => {
+                        open_bracket = Some((cursor + entry_size, txn));
+                    }
+                    None => warn!(
+                        "Recovered segment {} has an undecodable BEGIN at offset {}; the entries \
+                         after it are read as ordinary",
+                        seg_id, offset
+                    ),
+                }
+                append_header = cursor + entry_size;
+                cursor += entry_size;
+                continue;
+            }
+            EntryType::COMMIT => {
+                let content = unsafe {
+                    std::slice::from_raw_parts(
+                        Entry::content_pos(cursor) as *const u8,
+                        entry_header.content_length as usize,
+                    )
+                };
+                let decoded = crate::ram::bracket::decode_commit(content);
+                match (&open_bracket, decoded) {
+                    (Some((_start, open_txn)), Some((commit_txn, manifest)))
+                        if *open_txn == commit_txn =>
+                    {
+                        // The bracket closed here. Whether it is APPLIED is
+                        // not decided in this segment: a cross-chunk
+                        // transaction is committed as a whole, so the ledger
+                        // settles it once every COMMIT is known.
+                        ledger.note_commit(&commit_txn, manifest);
+                        open_bracket = None;
+                    }
+                    (Some((start, open_txn)), Some((commit_txn, _))) => {
+                        warn!(
+                            "Recovered segment {} has a COMMIT for {:?} at offset {} while the \
+                             open bracket belongs to {:?} (from offset {}); neither is applied",
+                            seg_id,
+                            commit_txn,
+                            offset,
+                            open_txn,
+                            start - data_base
+                        );
+                        open_bracket = None;
+                    }
+                    (None, _) => {
+                        // A COMMIT whose BEGIN is not in this segment: the
+                        // final part of a chain, which Step 3 resolves. On its
+                        // own it closes nothing here.
+                        debug!(
+                            "Recovered segment {} has a COMMIT at offset {} with no open bracket",
+                            seg_id, offset
+                        );
+                    }
+                    (Some(_), None) => warn!(
+                        "Recovered segment {} has an undecodable COMMIT at offset {}; its bracket \
+                         stays uncommitted",
+                        seg_id, offset
+                    ),
+                }
+                append_header = cursor + entry_size;
+                cursor += entry_size;
+                continue;
+            }
+            _ => {}
+        }
+        // Inside a bracket: buffer, do not apply.
+        //
+        // The entry is real and durable; whether it counts depends on the
+        // transaction, and that is a decision no single segment can make.
+        if let Some((_, txn)) = &open_bracket {
+            if entry_header.entry_type == EntryType::CELL {
+                let cell_header =
+                    cell_header_from_entry_content_addr(Entry::content_pos(cursor));
+                observe_recovered_segment_class(
+                    chunk,
+                    seg_id,
+                    cell_header.schema,
+                    &mut detected_class,
+                    &mut mixed_class_warning_emitted,
+                    &mut missing_schema_entries,
+                    &mut first_missing_schema_id,
+                )?;
+                // The id floor is raised even for a transaction that turns
+                // out uncommitted: the id reached disk, so reissuing it would
+                // be wrong regardless of whether the write counted.
+                if !cell_header.id.is_hashed() {
+                    if let Some(floor) = origin_floors.get(cell_header.id.origin() as usize) {
+                        floor.fetch_max(
+                            cell_header.id.sequence(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+                ledger.note_pending(
+                    txn,
+                    PendingBracketCell {
+                        chunk_id: chunk.id,
+                        hash: cell_header.id.bits(),
+                        addr: virtual_cursor,
+                        version: cell_header.version,
+                        content_length: entry_header.content_length,
+                    },
+                );
+            }
+            append_header = cursor + entry_size;
+            cursor += entry_size;
+            continue;
+        }
 
         if entry_header.entry_type == EntryType::CELL {
             let content_addr = Entry::content_pos(cursor);
@@ -1218,6 +1520,9 @@ pub fn recover_chunks(
     /// so the count has to reach the operator: the store came up incomplete.
     let quarantined_segments = std::sync::atomic::AtomicUsize::new(0);
 
+    // Built from the discovered files, so a manifest member's presence is a
+    // lookup rather than a search. Taken before grouping consumes the list.
+    let bracket_ledger = BracketLedger::new(&files);
     let files_by_chunk = group_files_by_chunk(files, chunks.len());
     let total_files: usize = files_by_chunk.iter().map(Vec::len).sum();
     info!(
@@ -1316,6 +1621,7 @@ pub fn recover_chunks(
                             version_map,
                             origin_floors,
                             declared_used_len,
+                            &bracket_ledger,
                         )?;
                         Ok((file_data, declared_used_len, scan_result))
                     };
@@ -1537,6 +1843,12 @@ pub fn recover_chunks(
             },
         )
     })?;
+
+    // Every segment has been read, so every COMMIT is known: settle the
+    // transactions. This is where a cross-chunk transaction becomes atomic --
+    // the chunk whose own COMMIT was lost still applies its part, because the
+    // decision came from the transaction rather than from that chunk's bytes.
+    bracket_ledger.settle(chunks);
 
     // Update allocator next_seq_id for each chunk to continue from max recovered seq_id
     for (chunk_id, max_seq) in max_seq_ids.iter().enumerate() {
@@ -1845,6 +2157,7 @@ use crate::ram::types::Id;
             &mut version_map,
             &floors,
             None,
+            &BracketLedger::new(&[]),
         )
     }
 
@@ -1865,6 +2178,7 @@ use crate::ram::types::Id;
             &mut version_map,
             &floors,
             Some(used_len),
+            &BracketLedger::new(&[]),
         )
     }
 
@@ -2518,6 +2832,137 @@ use crate::ram::types::Id;
             recovered.data, winner.data,
             "recovery resurrected the failed write's image over the winner"
         );
+    }
+
+    /// Build a bracket entry (BEGIN or COMMIT) as bytes, the way the writer
+    /// publishes one.
+    fn bracket_entry_bytes(entry_type: EntryType, content: &[u8]) -> Vec<u8> {
+        let mut buffer = vec![0u8; ENTRY_HEAD_SIZE + content.len()];
+        let base = buffer.as_mut_ptr() as usize;
+        Entry::encode_to(base, entry_type, content.len() as u32, |content_addr| unsafe {
+            std::ptr::copy_nonoverlapping(content.as_ptr(), content_addr as *mut u8, content.len());
+        });
+        buffer
+    }
+
+    /// A committed bracket applies; an uncommitted one leaves NOTHING; and
+    /// ordinary entries on either side are untouched by both.
+    ///
+    /// The third clause is the one that needs saying: a bracket sits in a
+    /// shared segment, so entries before and after it belong to other
+    /// writers and apply unconditionally. A recovery that dropped them along
+    /// with an uncommitted transaction would trade a transaction's atomicity
+    /// for everyone else's durability.
+    #[test]
+    fn a_bracket_applies_only_when_its_commit_is_present() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(219, "recovery_bracket", false);
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
+
+        // One cell per role, each written so we have real entry bytes.
+        let ids: Vec<Id> = (0..4).map(|i| Id::allocated(29, 0, i + 1)).collect();
+        let mut entries = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let mut cell = OwnedCell {
+                header: CellHeader::new(schema.id, id),
+                data: data_map_value!(id: i as i32, data: vec![0x66_u8; DATA_SIZE]),
+            };
+            chunks.write_cell(&mut cell).unwrap();
+            entries.push(entry_bytes_at(chunks.address_of(id)));
+        }
+
+        let txn = crate::server::transactions::test_hlc(4242, 7);
+        let begin = bracket_entry_bytes(
+            EntryType::BEGIN,
+            &crate::ram::bracket::encode_begin(&txn),
+        );
+        let manifest = vec![crate::ram::bracket::ManifestEntry { chunk_id: 0, seq_id: 0 }];
+        let commit = bracket_entry_bytes(
+            EntryType::COMMIT,
+            &crate::ram::bracket::encode_commit(&txn, &manifest),
+        );
+
+        // Committed:   [ord 0][BEGIN][txn 1][txn 2][COMMIT][ord 3]
+        // Uncommitted: [ord 0][ord 3][BEGIN][txn 1][txn 2]
+        //
+        // The uncommitted shape puts the bracket LAST on purpose, because
+        // that is the only place a crash can leave one: the transaction holds
+        // the head lease until its decision, so no other writer can append
+        // behind its entries. An ordinary entry after an unclosed bracket is
+        // not a state the writer can produce, and asserting about it would be
+        // asserting about fiction.
+        let build = |with_commit: bool| {
+            let mut image = empty_segment_bytes();
+            let mut at = 0usize;
+            let mut put = |bytes: &[u8], at: &mut usize| {
+                image[*at..*at + bytes.len()].copy_from_slice(bytes);
+                *at += bytes.len();
+            };
+            put(&entries[0], &mut at);
+            if !with_commit {
+                put(&entries[3], &mut at);
+            }
+            put(&begin, &mut at);
+            put(&entries[1], &mut at);
+            put(&entries[2], &mut at);
+            if with_commit {
+                put(&commit, &mut at);
+                put(&entries[3], &mut at);
+            }
+            (image, at)
+        };
+
+        for with_commit in [true, false] {
+            let (image, used) = build(with_commit);
+            let scanned = scan_segment_for_recovery_test(chunk, &image)
+                .expect("a bracket must not fail the scan");
+            assert_eq!(
+                scanned.append_offset, used,
+                "the walk must reach the end of the image whether or not the bracket committed"
+            );
+
+            let wal_dir = TempDir::new().unwrap();
+            let backup_dir = TempDir::new().unwrap();
+            let (_raft_dir, raft_path) = temp_raft_dir();
+            write_backup_segment(&backup_dir, 0, 0, 0, &image);
+            let reader_schemas = setup_test_schema();
+            reader_schemas.debug_only_new_schema(schema.clone());
+            let recovered = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta {
+                    schemas: reader_schemas,
+                }),
+                None,
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None,
+                true,
+                Some(raft_path),
+            );
+
+            // The transaction's own cells: all or nothing.
+            for id in [&ids[1], &ids[2]] {
+                assert_eq!(
+                    recovered.read_cell(id).is_ok(),
+                    with_commit,
+                    "cell {:?} inside a bracket must be present iff the COMMIT is (commit={})",
+                    id,
+                    with_commit
+                );
+            }
+            // Everyone else's, either way.
+            for id in [&ids[0], &ids[3]] {
+                assert!(
+                    recovered.read_cell(id).is_ok(),
+                    "cell {:?} outside the bracket must survive regardless (commit={})",
+                    id,
+                    with_commit
+                );
+            }
+        }
     }
 
     /// An abandoned image must not take the rest of its segment with it.

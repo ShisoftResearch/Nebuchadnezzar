@@ -88,7 +88,19 @@ pub fn encode_commit(txn: &TxnId, manifest: &[ManifestEntry]) -> Vec<u8> {
         out.extend_from_slice(&member.chunk_id.to_le_bytes());
         out.extend_from_slice(&member.seq_id.to_le_bytes());
     }
+    // Entries are 8-byte aligned, and an entry's size is its header plus its
+    // content -- so the content itself has to be a multiple of 8 or the NEXT
+    // entry starts misaligned and cannot be decoded at all. Trailing zeros
+    // are free to add and ignored on the way back in, since the manifest
+    // count says where the data ends.
+    pad_to_alignment(&mut out);
     out
+}
+
+fn pad_to_alignment(out: &mut Vec<u8>) {
+    while out.len() % crate::ram::entry::ENTRY_HEAD_SIZE != 0 {
+        out.push(0);
+    }
 }
 
 pub fn decode_commit(content: &[u8]) -> Option<(TxnId, Vec<ManifestEntry>)> {
@@ -165,9 +177,9 @@ mod tests {
     #[test]
     fn a_commit_that_cannot_hold_its_manifest_is_refused() {
         let txn = test_hlc(7, 7);
+        // Cut into the manifest itself, not the alignment padding behind it.
         let mut bytes = encode_commit(&txn, &[ManifestEntry { chunk_id: 3, seq_id: 9 }]);
-        let full = bytes.len();
-        bytes.truncate(full - 1);
+        bytes.truncate(TXN_ID_SIZE + 2 + 1);
         assert!(
             decode_commit(&bytes).is_none(),
             "a manifest cut short must not decode"
@@ -177,6 +189,33 @@ mod tests {
         let mut lying = encode_commit(&txn, &[]);
         lying[TXN_ID_SIZE] = 9;
         assert!(decode_commit(&lying).is_none());
+    }
+
+    /// Every bracket record must leave the next entry 8-byte aligned, or the
+    /// entry after it cannot be decoded -- which takes out the rest of the
+    /// segment, not just the record.
+    #[test]
+    fn every_bracket_record_is_eight_byte_aligned() {
+        let txn = test_hlc(11, 12);
+        let align = crate::ram::entry::ENTRY_HEAD_SIZE;
+        assert_eq!(encode_begin(&txn).len() % align, 0, "BEGIN");
+        assert_eq!(encode_txn_cont(&txn, 5).len() % align, 0, "TXN_CONT");
+        for members in 0..8usize {
+            let manifest: Vec<_> = (0..members)
+                .map(|i| ManifestEntry { chunk_id: i as u16, seq_id: i as u64 })
+                .collect();
+            let encoded = encode_commit(&txn, &manifest);
+            assert_eq!(
+                encoded.len() % align,
+                0,
+                "COMMIT with {} manifest member(s)",
+                members
+            );
+            // Padding must not corrupt what it pads.
+            let (decoded_txn, decoded) = decode_commit(&encoded).unwrap();
+            assert_eq!(decoded_txn, txn);
+            assert_eq!(decoded, manifest);
+        }
     }
 
     /// The whole point of the fixed tail: the entry is exactly 24 bytes, so

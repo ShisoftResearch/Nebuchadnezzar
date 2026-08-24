@@ -1201,8 +1201,24 @@ impl DataManager {
         // on the promise that commit would sync them. Both halves of that
         // promise were broken. The list now comes from the write path
         // itself, recorded at the point where the sync was skipped.
+        // ENTRIES FIRST, then the COMMIT records, then those.
+        //
+        // The order is the whole cross-chunk rule. A transaction spanning
+        // several chunks writes a bracket in each, and N fsyncs cannot be made
+        // atomic -- so a crash can leave one chunk's COMMIT durable and
+        // another's not. That is survivable only if every ENTRY was already
+        // durable before any COMMIT was written: then a single surviving
+        // COMMIT, plus the manifest naming every member, is enough to apply
+        // the whole transaction, and recovery needs no agreement between
+        // chunks about which COMMIT it found.
+        //
+        // Syncing entries and COMMITs together instead -- which is what this
+        // did first -- makes a surviving COMMIT prove nothing about the other
+        // chunks, and the fuzzer's transaction lane found exactly that: a
+        // four-cell transaction spread over four chunks came back 3/4.
         let mut sync_failure = None;
-        for segment in crate::ram::chunk::take_transactional_segments() {
+        let entry_segments = crate::ram::chunk::take_transactional_segments();
+        for segment in &entry_segments {
             if let Err(error) = segment.force_wal_sync() {
                 error!(
                     "Failed to sync WAL for segment {} (chunk {}) during commit: {:?}",
@@ -1214,6 +1230,37 @@ impl DataManager {
                     "Synced segment {} (chunk {}) WAL to disk for transaction commit",
                     segment.id, segment.chunk_id
                 );
+            }
+        }
+        // Entries are durable; now the brackets that commit them.
+        if sync_failure.is_none() {
+            crate::ram::chunk::set_transaction_id(Some(tid.clone()));
+            let bracket_result = self.chunks().commit_transaction_brackets(tid);
+            crate::ram::chunk::set_transaction_id(None);
+            match bracket_result {
+                Ok(()) => {
+                    // The COMMIT records themselves, and only then the ack.
+                    for segment in crate::ram::chunk::take_transactional_segments() {
+                        if let Err(error) = segment.force_wal_sync() {
+                            error!(
+                                "Failed to sync the COMMIT bracket for segment {} (chunk {}): {:?}",
+                                segment.id, segment.chunk_id, error
+                            );
+                            sync_failure.get_or_insert(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    // An unclosed bracket recovers as uncommitted, so a
+                    // caller told "committed" would be told a lie the next
+                    // restart corrects.
+                    error!(
+                        "transaction {:?} could not close its bracket: {:?}; refusing the commit",
+                        tid, error
+                    );
+                    drop(crate::ram::chunk::take_transactional_segments());
+                    return Self::map_commit_write_error(&txn, Id::unit_id(), error);
+                }
             }
         }
         if let Some(error) = sync_failure {

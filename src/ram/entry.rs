@@ -579,12 +579,18 @@ mod checksum_tests {
                 accepted += 1;
             }
         }
-        // 3 valid types out of 256 low-bit patterns; the checksum must then
-        // match 24 more bits, which no garbage word will do by luck.
+        // A word parses if its low byte names a type, so the floor is set by
+        // how many types exist -- derived here rather than written down, so
+        // adding one cannot silently loosen the bound it was checked against.
+        // Parsing is not accepting: the checksum must then match 24 more
+        // bits, which no garbage word does by luck.
+        let valid_types = (0..256u32).filter(|bits| EntryType::from_bits(*bits).is_some()).count();
+        let floor = valid_types as f64 / 256.0;
         let rate = accepted as f64 / TRIALS as f64;
         assert!(
-            rate < 0.02,
-            "garbage acceptance rate {rate} is too high ({accepted}/{TRIALS})"
+            rate < floor * 1.5,
+            "garbage acceptance rate {rate} is too high for {valid_types} entry types \
+             (floor {floor}, {accepted}/{TRIALS})"
         );
     }
 
