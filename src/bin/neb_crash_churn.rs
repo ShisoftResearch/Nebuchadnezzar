@@ -166,6 +166,10 @@ fn parent_main(args: &[String]) -> ExitCode {
         let mut deleted_high: u64 = state.deleted;
         let mut exhausted_this_cycle = false;
         let mut failed: Option<String> = None;
+        // A regression is HELD, not acted on, until the load-time scrub that
+        // follows it has reported -- see the SCANNED arm.
+        let mut pending_regression: Option<String> = None;
+        let mut regression_at: Option<Instant> = None;
 
         // Reader thread streams child lines; main thread enforces deadline.
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -233,6 +237,21 @@ fn parent_main(args: &[String]) -> ExitCode {
                     break;
                 }
             }
+            // A held regression cannot wait forever: the scrub may be off, or
+            // may itself fail. Bounded, and it SAYS the witness never came
+            // rather than reporting the bare shortfall as if nothing was
+            // missing from the diagnosis.
+            if let Some(at) = regression_at {
+                if at.elapsed() > Duration::from_secs(300) {
+                    failed = Some(format!(
+                        "{} -- and no scrub reported within 300s, so whether the entries are \
+                         gone or merely unscanned is UNKNOWN (is NEB_CHURN_SCRUB off?)",
+                        pending_regression.take().unwrap_or_default()
+                    ));
+                    unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                    break;
+                }
+            }
             if scanned.is_none() && started.elapsed() > deadline {
                 failed = Some(format!(
                     "child did not report SCANNED within {:?} (hang or refused load)",
@@ -248,7 +267,21 @@ fn parent_main(args: &[String]) -> ExitCode {
                         scanned = Some(n);
                         // The two invariants that define the corpse class.
                         if n < state.best_verified {
-                            failed = Some(format!(
+                            // HELD, not acted on yet.
+                            //
+                            // Killing the child here is what this used to do,
+                            // and it destroyed the one measurement that makes
+                            // the failure readable. The load-time scrub runs
+                            // moments after SCANNED and answers the only
+                            // question that matters about a shortfall: are the
+                            // entries actually GONE (scrub reports them
+                            // missing, derivable from cells that are still
+                            // there), or did the SCAN just under-report them
+                            // (scrub finds nothing missing)? Those are
+                            // opposite bugs -- one in durability, one in the
+                            // scan -- and the corpse could not tell them apart
+                            // because the harness shot the witness.
+                            pending_regression = Some(format!(
                                 "REGRESSION: scanned {} < best verified {}{}",
                                 n,
                                 state.best_verified,
@@ -261,8 +294,32 @@ fn parent_main(args: &[String]) -> ExitCode {
                                     ""
                                 }
                             ));
-                            unsafe { libc::kill(child_pid, libc::SIGKILL) };
-                            break;
+                            // Only worth holding if a scrub is actually
+                            // coming. With scrubbing off there is no witness
+                            // to wait for, and the failure says so rather than
+                            // stalling 300s to discover it.
+                            if std::env::var("NEB_CHURN_SCRUB").as_deref() == Ok("0")
+                                || std::env::var("NEB_CHURN_SCRUB").is_err()
+                            {
+                                failed = Some(format!(
+                                    "{} -- NO SCRUB CONFIGURED, so whether those entries are \
+                                     gone or merely unscanned is UNKNOWN. Re-run with \
+                                     NEB_CHURN_SCRUB=verify to find out which.",
+                                    pending_regression.take().unwrap_or_default()
+                                ));
+                                unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                                break;
+                            }
+                            regression_at = Some(Instant::now());
+                            println!(
+                                "    REGRESSION HELD: scanned {} < best verified {} (short by \
+                                 {}); waiting for the scrub to say whether they are gone or \
+                                 merely unscanned",
+                                n,
+                                state.best_verified,
+                                state.best_verified - n
+                            );
+                            continue;
                         }
                         state.best_verified = n;
                         println!("    scanned n={} (best={})", n, state.best_verified);
@@ -292,6 +349,12 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // kill caught in flight are allowed to be missing.
                         // The number's SIZE is the signal.
                         println!("    scrub: {}", rest.trim());
+                        // The witness a held regression was waiting for.
+                        if let Some(reason) = pending_regression.take() {
+                            failed = Some(format!("{} -- scrub at this load: {}", reason, rest.trim()));
+                            unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                            break;
+                        }
                     } else if let Some(rest) = line.strip_prefix("PRESHUTDOWN_SCRUB ") {
                         println!("    scrub BEFORE shutdown: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("SCRUB_REPAIRED ") {
