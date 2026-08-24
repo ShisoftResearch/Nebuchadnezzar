@@ -152,6 +152,7 @@ pub async fn scrub_ranged_index(
     indexers: &Arc<IndexerClients>,
     mode: ScrubMode,
 ) -> ScrubReport {
+    UNREACHABLE_LOGGED.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut total = ScrubReport::default();
     for chunk in &chunks.list {
         for segment in chunk.segments() {
@@ -208,6 +209,38 @@ fn derive_into(
 /// Ask the index about each key, and in `Repair` mode insert the ones it
 /// does not hold.
 ///
+/// Examples logged this pass. Reset when a pass starts rather than left to
+/// run for the life of the process -- an operator who runs the scrub a
+/// second time is entitled to see examples again, and a counter that only
+/// ever counts up would silently stop explaining itself after the first run.
+static UNREACHABLE_LOGGED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Log the first few unreachable keys and then stop.
+///
+/// One line per key is right for a handful and catastrophic for the case
+/// that matters: a whole dead tree makes EVERY key under it unreachable, so
+/// unthrottled this would emit millions of lines describing one fault --
+/// burying, in the operator's log, the report that actually says what
+/// happened. The count in the report is the measurement; these lines are
+/// only there to name examples.
+fn report_unreachable(key: &EntryKey, error: &impl std::fmt::Debug) {
+    const EXAMPLES: usize = 8;
+    let n = UNREACHABLE_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < EXAMPLES {
+        warn!(
+            "Index scrub could not reach {:?}: {:?}{}",
+            key.id(),
+            error,
+            if n + 1 == EXAMPLES {
+                " (further unreachable keys will not be logged; see the report counts)"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
 /// Repair inserts unconditionally rather than checking first: `insert`
 /// already returns whether the key was absent, so a check would double the
 /// RPCs to learn what the insert reports anyway -- and worse, it would open
@@ -284,7 +317,7 @@ async fn check_one(
             Ok(true) => KeyOutcome::Repaired,
             Ok(false) => KeyOutcome::Present,
             Err(error) => {
-                warn!("Index scrub could not repair {:?}: {:?}", key.id(), error);
+                report_unreachable(key, &error);
                 KeyOutcome::Unreachable
             }
         }
@@ -296,7 +329,7 @@ async fn check_one(
                 // The tree covering this key is absent or unreadable --
                 // exactly the condition this tool is for. Not a missing
                 // entry: we do not know what the tree holds.
-                debug!("Index scrub could not reach {:?}: {:?}", key.id(), error);
+                report_unreachable(key, &error);
                 KeyOutcome::Unreachable
             }
         }
