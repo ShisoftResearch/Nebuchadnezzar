@@ -66,9 +66,9 @@ const ENTRY_TYPE_MASK: u32 = (1 << ENTRY_TYPE_BITS) - 1;
 const ENTRY_CHECKSUM_MASK: u32 = !ENTRY_TYPE_MASK;
 
 /// Checksum of `content_len` bytes at `content_pos`, folded to 24 bits and
-/// never zero: zero means "this entry predates checksums" (see
-/// [`unpack_type_word`]), so a computed zero is mapped to one rather than
-/// being mistaken for an unchecked entry.
+/// never zero: a zero checksum field makes the whole word bare, which only
+/// PADDING and UNDECIDED may be (see [`unpack_type_word`]), so a computed
+/// zero is mapped to one rather than turning a cell into a bare word.
 fn content_checksum(content_pos: usize, content_len: u32) -> u32 {
     let bytes = unsafe { std::slice::from_raw_parts(content_pos as *const u8, content_len as usize) };
     let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
@@ -176,10 +176,16 @@ pub fn stamp_reservation_padding(addr: usize, span: u32) {
 
 /// What a type word says about its entry.
 pub enum TypeWord {
-    /// Written before checksums existed: the word is the bare type, which is
-    /// exactly as discriminating as it always was (only 0, 1 and 2 are
-    /// valid out of 2^32).
-    Unchecked(EntryType),
+    /// A bare type word carrying no checksum. Valid ONLY for the two entry
+    /// kinds that have no content to vouch for: PADDING, whose bytes are
+    /// meaningless by definition and whose header declares only a span, and
+    /// UNDECIDED, a reservation that was never filled.
+    ///
+    /// A bare CELL or TOMBSTONE word is corruption. There is no format to
+    /// stay compatible with, so every entry that carries data carries a
+    /// checksum -- and accepting a bare one meant that zeroing a header's
+    /// checksum bits promoted damaged data to trusted data.
+    Bare(EntryType),
     /// Type plus the checksum the writer recorded.
     Checked(EntryType, u32),
     /// Not a valid entry header.
@@ -188,14 +194,17 @@ pub enum TypeWord {
 
 /// Split a type word into its type and checksum.
 ///
-/// A bare 0, 1 or 2 is a legacy entry and stays unchecked -- treating its
-/// zero checksum field as a real checksum would reject every entry ever
-/// written by an older build. Anything else must carry a valid type in its
-/// low bits AND a non-zero checksum, so the pair is exactly as unlikely to
-/// arise from garbage as the old 32-bit check was.
+/// A bare word (the whole u32 is 0, 1, 2 or 3) carries no checksum, which
+/// only PADDING and UNDECIDED are entitled to: neither has content to
+/// vouch for. A bare CELL or TOMBSTONE is damage wearing a valid type.
+/// Everything else must carry a valid type in its low bits AND a non-zero
+/// checksum.
 pub fn unpack_type_word(word: u32) -> TypeWord {
     if let Some(entry_type) = EntryType::from_bits(word) {
-        return TypeWord::Unchecked(entry_type);
+        return match entry_type {
+            EntryType::PADDING | EntryType::UNDECIDED => TypeWord::Bare(entry_type),
+            _ => TypeWord::Invalid,
+        };
     }
     let checksum = (word & ENTRY_CHECKSUM_MASK) >> ENTRY_TYPE_BITS;
     match EntryType::from_bits(word & ENTRY_TYPE_MASK) {
@@ -208,11 +217,12 @@ fn pack_type_word(entry_type: EntryType, checksum: u32) -> u32 {
     (checksum << ENTRY_TYPE_BITS) | entry_type.bits()
 }
 
-/// Verify the entry at `pos`, if it carries a checksum.
+/// Verify the entry at `pos`, if it has content to verify.
 ///
 /// `Some(false)` means the content does not match what the writer recorded;
-/// `Some(true)` that it does; `None` that the entry predates checksums and
-/// nothing can be said either way.
+/// `Some(true)` that it does; `None` that the entry carries no content to
+/// vouch for -- padding, or a reservation never filled. Every entry that
+/// holds data answers `Some`.
 pub fn verify_entry_at(pos: usize) -> Option<bool> {
     if pos % 8 != 0 {
         return Some(false);
@@ -225,7 +235,9 @@ pub fn verify_entry_at(pos: usize) -> Option<bool> {
         )
     };
     match unpack_type_word(word) {
-        TypeWord::Unchecked(_) => None,
+        // Nothing to check: padding bytes are meaningless and an
+        // unfilled reservation has no content at all.
+        TypeWord::Bare(_) => None,
         TypeWord::Invalid => Some(false),
         TypeWord::Checked(_, checksum) => {
             Some(checksum == content_checksum(pos + ENTRY_HEAD_SIZE, content_length))
@@ -266,9 +278,8 @@ impl Entry {
     {
         // PUBLISH LAST, in one store. The old order -- bare type word, then
         // length, then content, then the checksummed word -- opened a
-        // window where the span read as a LEGACY entry (bare words carry no
-        // checksum, so nothing questions them) over content that was not
-        // written yet. A panic inside `write_content` froze that state, and
+        // window where the span read as a bare CELL over content that was
+        // not written yet. A panic inside `write_content` froze that state, and
         // the unwind still journals the span (`PendingEntry::drop`), so
         // recovery would install garbage it had every reason to trust.
         //
@@ -319,7 +330,7 @@ impl Entry {
         let content_length = cursor.read_u32::<Endian>().unwrap();
         release_cursor(cursor);
         let entry_type = match unpack_type_word(entry_type_bits) {
-            TypeWord::Unchecked(entry_type) | TypeWord::Checked(entry_type, _) => entry_type,
+            TypeWord::Bare(entry_type) | TypeWord::Checked(entry_type, _) => entry_type,
             TypeWord::Invalid => return None,
         };
         let entry = EntryHeader {
@@ -349,7 +360,7 @@ impl Entry {
         let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut [u8; 8] as *mut [u8]) });
         let entry_type_bits = cursor.read_u32::<Endian>().unwrap();
         let content_length = cursor.read_u32::<Endian>().unwrap();
-        if let TypeWord::Unchecked(entry_type) | TypeWord::Checked(entry_type, _) =
+        if let TypeWord::Bare(entry_type) | TypeWord::Checked(entry_type, _) =
             unpack_type_word(entry_type_bits)
         {
             let entry = EntryHeader {
@@ -415,7 +426,7 @@ mod checksum_tests {
             // Mid-write: the reservation's padding must still be standing.
             let word = unsafe { *(base as *const u32) };
             match unpack_type_word(word) {
-                TypeWord::Unchecked(entry_type) => assert_eq!(
+                TypeWord::Bare(entry_type) => assert_eq!(
                     entry_type,
                     EntryType::PADDING,
                     "the header changed before the content was complete"
@@ -478,20 +489,27 @@ mod checksum_tests {
         assert_eq!(verify_entry_at(base), Some(true));
     }
 
-    /// Backwards compatibility is the whole reason the type word is split
-    /// the way it is: every entry ever written by an older build carries a
-    /// bare 0, 1 or 2 and must keep decoding.
+    /// Only the entry kinds with nothing to vouch for may go unchecked.
+    ///
+    /// A bare word is how a reservation stamp and an unfilled reservation
+    /// describe themselves, and it must stay readable. A bare CELL or
+    /// TOMBSTONE is a different thing entirely: a data entry whose checksum
+    /// bits were lost. Accepting it -- which the old backwards-compatible
+    /// rule did -- promoted damaged data to trusted data, so damage that
+    /// zeroed a header read back as a perfectly good cell.
     #[test]
-    fn a_legacy_type_word_still_decodes_and_claims_no_checksum() {
-        for (bits, expected) in [
-            (0u32, EntryType::UNDECIDED),
-            (1, EntryType::CELL),
-            (2, EntryType::TOMBSTONE),
-        ] {
+    fn only_contentless_entries_may_go_unchecked() {
+        for (bits, expected) in [(0u32, EntryType::UNDECIDED), (3, EntryType::PADDING)] {
             match unpack_type_word(bits) {
-                TypeWord::Unchecked(entry_type) => assert_eq!(entry_type, expected),
-                _ => panic!("legacy word {bits} must decode as unchecked"),
+                TypeWord::Bare(entry_type) => assert_eq!(entry_type, expected),
+                _ => panic!("bare word {bits} must decode as Bare({expected:?})"),
             }
+        }
+        for bits in [1u32, 2] {
+            assert!(
+                matches!(unpack_type_word(bits), TypeWord::Invalid),
+                "a bare data-entry word ({bits}) is a header that lost its checksum, not an entry"
+            );
         }
     }
 
@@ -567,13 +585,14 @@ mod checksum_tests {
     fn an_entry_written_before_checksums_verifies_as_unknown() {
         let mut buffer = vec![0u8; 64];
         let pos = buffer.as_mut_ptr() as usize;
-        // Exactly what the pre-checksum writer produced: a bare type word.
+        // A bare CELL word: a data entry whose checksum bits are gone. It is
+        // not an entry at all any more, and must not verify.
         buffer[..4].copy_from_slice(&EntryType::CELL.bits().to_le_bytes());
         buffer[4..8].copy_from_slice(&16u32.to_le_bytes());
         assert_eq!(
             verify_entry_at(pos),
-            None,
-            "a legacy entry carries no checksum, so nothing can be said"
+            Some(false),
+            "a bare CELL word is damage, not an unchecked entry"
         );
     }
 }

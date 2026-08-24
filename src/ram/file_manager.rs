@@ -111,7 +111,7 @@ impl SegmentFileManager {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "WAL {} predates record framing; it cannot be appended to. Its \
+                            "WAL {} is not a framed log, so it cannot be appended to. Its \
                              segment must be archived (or recovered and left sealed) rather \
                              than resumed.",
                             wal_path
@@ -277,15 +277,25 @@ impl SegmentFileManager {
             create_dir_all(parent)?;
         }
 
-        // Read WAL file
+        // Read the WAL and rebuild the SEGMENT IMAGE it describes.
+        //
+        // Copying the log's bytes into the backup was right when a WAL was a
+        // raw image, offset for offset. It is not a raw image: it is framed
+        // records, each carrying the offset it belongs at, behind a file
+        // header. Copied verbatim, the "backup" is a log wearing a backup's
+        // name, and every cold read of that segment decodes record framing as
+        // entries -- which surfaces as StaleCellPointer on a cell that is
+        // perfectly intact in the log.
         let mut wal_file = File::open(&wal_path)?;
         let mut wal_data = Vec::new();
         wal_file.read_to_end(&mut wal_data)?;
-        let wal_size = wal_data.len();
+        let outcome = crate::ram::wal_format::scan_framed(&wal_data, crate::ram::segs::SEGMENT_SIZE)?;
+        let image = outcome.image;
+        let wal_size = image.len();
 
         // Create backup file and write data
         let mut backup_file = File::create(&backup_path)?;
-        backup_file.write_all(&wal_data)?;
+        backup_file.write_all(&image)?;
 
         // Pad if requested
         if let Some(target_size) = pad_to_size {
@@ -324,12 +334,13 @@ impl SegmentFileManager {
             }
         }
 
-        // A framed log is decoded into the segment image it describes, with
-        // every record CRC-verified and the scan stopping at the first torn
-        // one. Unlike an unframed log it can also declare its live extent,
-        // so recovery can tell "nothing was written here" from "the tail is
-        // damaged" -- the distinction an unframed log could never make.
-        if crate::ram::wal_format::is_framed(&buffer) {
+        // Every WAL is framed: each record CRC-verified, the scan stopping at
+        // the first torn one, and the live extent declared so recovery can
+        // tell "nothing was written here" from "the tail is damaged". A file
+        // that is not framed is not a WAL this build wrote, and reading it as
+        // a raw segment image -- which is what the unframed path did -- means
+        // replaying bytes nothing can verify.
+        {
             let outcome = crate::ram::wal_format::scan_framed(&buffer, crate::ram::segs::SEGMENT_SIZE)?;
             if let crate::ram::wal_format::TailStop::Torn {
                 at_file_offset,
@@ -346,12 +357,8 @@ impl SegmentFileManager {
                 );
             }
             let used_len = outcome.used_len;
-            return Ok((outcome.image, Some(used_len)));
+            Ok((outcome.image, Some(used_len)))
         }
-
-        // Unframed logs predate record framing: the file IS the segment
-        // image, offset for offset. Read as-is, with no way to verify it.
-        Ok((buffer, None))
     }
 
     /// Get file size
@@ -385,9 +392,10 @@ impl SegmentFileManager {
             // backups always carry at least a compression header, and an
             // uncompressed one is a full segment). Letting it into the
             // dedup below would SHADOW the complete WAL at the same seq id
-            // and silently drop every cell in the segment. Newly written
-            // backups are rename-installed and can no longer be torn; this
-            // guard covers stores written before that fix.
+            // and silently drop every cell in the segment. Backups are
+            // rename-installed, so this should be unreachable -- it is kept
+            // as a guard against a torn archive from any cause, not as a
+            // reader for some older format.
             if file.is_backup && file.size == 0 {
                 warn!(
                     "Ignoring zero-byte backup '{}' (chunk {} seg {} seq {}): torn archive; \
@@ -412,10 +420,11 @@ impl SegmentFileManager {
                     // Preferring the backup then silently dropped every write
                     // after the archive.
                     //
-                    // Segments with a backup are sealed now, so a store this
-                    // build wrote cannot produce twins. One still on disk was
-                    // written by an older build: say so, loudly and per pair,
-                    // because the loss is otherwise invisible. Recovery still
+                    // Segments with a backup are sealed, so twins are
+                    // IMPOSSIBLE unless that invariant broke: this is not a
+                    // compatibility path but an alarm on seal-on-archive, and
+                    // it stays because the loss is otherwise invisible.
+                    // Recovery still
                     // takes the backup -- a prefix is the safe half, and the
                     // seam between them is not reliably recoverable (a merge
                     // that guessed it wrong trimmed the WAL to nothing).
@@ -427,10 +436,11 @@ impl SegmentFileManager {
                         };
                         error!(
                             "TWIN SEGMENT FILES for chunk {} seg {} seq {}: backup '{}' ({} bytes) \
-                             and WAL '{}' ({} bytes) share one seq id. This store was written by a \
-                             build that appended to an archived segment; the WAL holds writes made \
-                             after the backup and they CANNOT be recovered. Taking the backup. \
-                             Re-import to get a clean store.",
+                             and WAL '{}' ({} bytes) share one seq id. Something appended to an \
+                             archived segment, which seal-on-archive is supposed to make \
+                             impossible; the WAL holds writes made after the backup and they \
+                             CANNOT be recovered. Taking the backup. This is a bug, not a \
+                             degraded store.",
                             file.chunk_id,
                             file.seg_id,
                             file.seq_id,

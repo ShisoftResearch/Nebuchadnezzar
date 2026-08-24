@@ -977,28 +977,43 @@ impl UndoLogger {
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)?;
 
-            let framed = buffer.len() >= UNDO_FILE_HEADER_SIZE
-                && buffer[..4] == UNDO_FILE_MAGIC;
-            let mut offset = if framed { UNDO_FILE_HEADER_SIZE } else { 0 };
+            // Every undo log is framed. A file without the header is not one
+            // this build wrote, and decoding its bytes in place -- which the
+            // unframed path did -- means trusting a rollback record that
+            // nothing verified, on the one file whose whole job is undoing
+            // half-applied transactions.
+            if buffer.len() < UNDO_FILE_HEADER_SIZE || buffer[..4] != UNDO_FILE_MAGIC {
+                // Refusing to START is the conservative answer here, and this
+                // is the one log where conservative means loud. An undo log
+                // records what a half-applied transaction still owes; a file
+                // we cannot decode means unknown rollback obligations, and
+                // skipping it would leave those cells half-applied forever
+                // with nothing to say so. An operator can move the file aside;
+                // nobody can un-serve a torn transaction.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "undo log {} is not a framed log; refusing to recover with rollback \
+                         obligations that cannot be read",
+                        path.display()
+                    ),
+                ));
+            }
+            let mut offset = UNDO_FILE_HEADER_SIZE;
             while offset < buffer.len() {
-                // A framed record is verified whole before anything inside
-                // it is decoded; an unframed one (legacy log) is decoded in
-                // place, exactly as before, since there is nothing to verify.
-                let (record, next_offset) = if framed {
-                    match read_undo_record(&buffer, offset) {
-                        FramedRecord::Record { payload, next } => (payload, next),
-                        FramedRecord::Stop(reason) => {
-                            warn!(
-                                "Undo log {} has a torn tail at byte {}: {}. Keeping the records                                  before it; anything after is dropped.",
-                                path.display(),
-                                offset,
-                                reason
-                            );
-                            break;
-                        }
+                // Verified whole before anything inside it is decoded.
+                let (record, next_offset) = match read_undo_record(&buffer, offset) {
+                    FramedRecord::Record { payload, next } => (payload, next),
+                    FramedRecord::Stop(reason) => {
+                        warn!(
+                            "Undo log {} has a torn tail at byte {}: {}. Keeping the records \
+                             before it; anything after is dropped.",
+                            path.display(),
+                            offset,
+                            reason
+                        );
+                        break;
                     }
-                } else {
-                    (&buffer[offset..], buffer.len())
                 };
 
                 if record.len() < 5 {
@@ -1020,23 +1035,19 @@ impl UndoLogger {
 
                 match entry_type {
                     ENTRY_TYPE_UNDO => {
-                        if let Ok((entry, size)) = UndoLogEntry::from_bytes(record) {
+                        if let Ok((entry, _size)) = UndoLogEntry::from_bytes(record) {
                             txn_index
                                 .entry(txn_id.clone())
                                 .or_insert_with(Vec::new)
                                 .push(entry);
-                            offset = if framed { next_offset } else { offset + size };
+                            offset = next_offset;
                         } else {
                             break;
                         }
                     }
                     ENTRY_TYPE_COMMIT | ENTRY_TYPE_ABORT => {
                         txn_index.remove(&txn_id);
-                        offset = if framed {
-                            next_offset
-                        } else {
-                            offset + 5 + txn_id_len
-                        };
+                        offset = next_offset;
                     }
                     _ => break,
                 }
@@ -1217,15 +1228,23 @@ mod tests {
         assert!(txn_index.contains_key(&good));
     }
 
-    /// Logs written before framing must still roll back after an upgrade.
+    /// A file that is not a framed log is refused, not decoded.
+    ///
+    /// There is no earlier format to stay compatible with, and the
+    /// alternative -- decoding unverified bytes in place -- is worst
+    /// precisely here: the undo log is what rolls back half-applied
+    /// transactions, so a record it invents is a rollback that corrupts a
+    /// cell rather than repairing one. Refusing keeps the damage to the
+    /// records in that one file, and the rest of the directory still
+    /// recovers.
     #[test]
-    fn a_legacy_unframed_log_still_recovers() {
+    fn an_unframed_file_fails_recovery_rather_than_being_skipped() {
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
-        let legacy_txn = test_hlc(3, 1);
-        let entry = UndoLogEntry::new(
-            legacy_txn.clone(),
+        let stray_txn = test_hlc(3, 1);
+        let stray = UndoLogEntry::new(
+            stray_txn.clone(),
             Id::allocated(1, 0, 7),
             UndoOpType::Update,
             9,
@@ -1233,72 +1252,19 @@ mod tests {
             1234,
             56,
         );
-        // Exactly what the pre-framing writer produced: raw record bytes,
-        // no file header, no frame.
         std::fs::write(
             format!("{}/undo-0.nlog", log_dir),
-            entry.to_bytes().unwrap(),
+            stray.to_bytes().unwrap(),
         )
         .unwrap();
-
-        let undo_log = UndoLogger::new(log_dir).unwrap();
-        let txn_index = undo_log.recover().unwrap();
-        assert_eq!(
-            txn_index.get(&legacy_txn).map(|entries| entries.len()),
-            Some(1),
-            "a pre-framing log must still be readable"
-        );
-    }
-
-    /// The upgrade must not append framed records into a legacy file: one
-    /// file holding two formats cannot be arbitrated at recovery.
-    #[test]
-    fn an_upgrade_rotates_past_a_legacy_log_instead_of_mixing_formats() {
-        let temp_dir = TempDir::new().unwrap();
-        let log_dir = temp_dir.path().to_str().unwrap().to_string();
-
-        let legacy_txn = test_hlc(4, 1);
-        let legacy_bytes = UndoLogEntry::new(
-            legacy_txn.clone(),
-            Id::allocated(1, 0, 7),
-            UndoOpType::Update,
-            9,
-            0,
-            1234,
-            56,
-        )
-        .to_bytes()
-        .unwrap();
-        std::fs::write(format!("{}/undo-0.nlog", log_dir), &legacy_bytes).unwrap();
 
         let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
-        let fresh_txn = test_hlc(4, 2);
-        undo_log
-            .write_undo_entry(UndoLogEntry::new(
-                fresh_txn.clone(),
-                Id::allocated(1, 0, 8),
-                UndoOpType::Update,
-                10,
-                0,
-                4321,
-                65,
-            ))
-            .unwrap();
-
-        assert_eq!(
-            std::fs::read(format!("{}/undo-0.nlog", log_dir)).unwrap(),
-            legacy_bytes,
-            "the legacy log must be left byte-for-byte alone"
-        );
-
-        let txn_index = undo_log.recover().unwrap();
+        let error = undo_log
+            .recover()
+            .expect_err("an undecodable undo log must fail recovery, not be skipped");
         assert!(
-            txn_index.contains_key(&legacy_txn),
-            "the legacy log's transaction must still recover"
-        );
-        assert!(
-            txn_index.contains_key(&fresh_txn),
-            "the framed log's transaction must recover too"
+            error.to_string().contains("not a framed log"),
+            "expected a refusal naming the unframed log, got: {error}"
         );
     }
 
@@ -1650,11 +1616,13 @@ mod tests {
         let recover_err = undo_log
             .recover()
             .expect_err("recovering a pre-HLC undo log must fail, not silently succeed");
+        // Refused at the FILE level now: a pre-HLC log is unframed, and an
+        // unframed file is not decoded at all. Which layer catches it does
+        // not matter; that recovery refuses rather than proceeding with
+        // unreadable rollback obligations does.
         assert!(
-            recover_err
-                .to_string()
-                .contains("undo log transaction id is unreadable"),
-            "expected an unreadable-txn-id error from recover(), got: {}",
+            recover_err.to_string().contains("not a framed log"),
+            "expected a refusal naming the unframed log from recover(), got: {}",
             recover_err
         );
     }

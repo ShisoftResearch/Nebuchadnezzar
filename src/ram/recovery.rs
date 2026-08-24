@@ -1768,6 +1768,22 @@ use crate::ram::types::Id;
         segment
     }
 
+    /// Write a framed WAL holding one entry at segment offset 0 -- the only
+    /// WAL format there is, so fixtures build it the same way the writer does.
+    fn write_wal_segment(
+        wal_dir: &TempDir,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+        entry: &[u8],
+    ) {
+        let dir = wal_dir.path().join(format!("chunk-wal-{}", chunk_id));
+        fs::create_dir_all(&dir).unwrap();
+        let mut bytes = crate::ram::wal_format::wal_file_header(seq_id).to_vec();
+        bytes.extend_from_slice(&crate::ram::wal_format::frame_record(0, entry));
+        fs::write(dir.join(format!("{}-{}-{}.nlog", chunk_id, seg_id, seq_id)), &bytes).unwrap();
+    }
+
     fn write_backup_segment(
         backup_dir: &TempDir,
         chunk_id: usize,
@@ -2326,9 +2342,7 @@ use crate::ram::types::Id;
 
         // The complete WAL for (chunk 0, seg 0, seq 0), in the per-chunk
         // subdirectory the chunk's own file manager uses...
-        let chunk_wal_dir = wal_dir.path().join("chunk-wal-0");
-        fs::create_dir_all(&chunk_wal_dir).unwrap();
-        fs::write(chunk_wal_dir.join("0-0-0.nlog"), &entry).unwrap();
+        write_wal_segment(&wal_dir, 0, 0, 0, &entry);
         // ...shadowed by the torn zero-byte backup at the same seq.
         write_backup_segment(&backup_dir, 0, 0, 0, &[]);
 
@@ -2383,9 +2397,7 @@ use crate::ram::types::Id;
         writer_chunks.write_cell(&mut cell).unwrap();
         let entry = entry_bytes_at(writer_chunks.address_of(&cell_id));
 
-        let chunk_wal_dir = wal_dir.path().join("chunk-wal-0");
-        fs::create_dir_all(&chunk_wal_dir).unwrap();
-        fs::write(chunk_wal_dir.join("0-0-0.nlog"), &entry).unwrap();
+        write_wal_segment(&wal_dir, 0, 0, 0, &entry);
         // A partial backup: bytes that decode as neither a compressed image
         // nor a valid entry stream, as a kill mid-write leaves behind.
         write_backup_segment(&backup_dir, 0, 0, 0, &[0xFF_u8; 64]);
@@ -3324,9 +3336,24 @@ use crate::ram::types::Id;
                 .file_manager
                 .backup_path(chunk.id, blob_segment_id, blob_seq_id)
                 .expect("backup path should be derivable for WAL-only blob recovery test");
+            // A framed log whose LAST record is torn -- the only shape a
+            // truncated WAL can take now that every log is framed. The first
+            // record is whole and must survive; the second is cut mid-record
+            // and must be dropped.
             truncated_wal = {
-                let mut bytes = first_entry;
-                bytes.extend_from_slice(&second_entry[..ENTRY_HEAD_SIZE / 2]);
+                // Records name the offsets they belong at, so the fixture
+                // uses the offsets the writer actually used rather than
+                // assuming the segment starts with this cell.
+                let first_off = (chunks.address_of(&first_id) - blob_segment.addr) as u64;
+                let second_off = (chunks.address_of(&second_id) - blob_segment.addr) as u64;
+                let mut bytes = crate::ram::wal_format::wal_file_header(blob_seq_id).to_vec();
+                bytes.extend_from_slice(&crate::ram::wal_format::frame_record(
+                    first_off,
+                    &first_entry,
+                ));
+                let torn =
+                    crate::ram::wal_format::frame_record(second_off, &second_entry);
+                bytes.extend_from_slice(&torn[..crate::ram::wal_format::RECORD_HEADER_SIZE + 4]);
                 bytes
             };
 

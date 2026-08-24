@@ -49,7 +49,7 @@ fn main() {
         while cursor + ENTRY_HEAD_SIZE <= bound {
             let type_bits =
                 u32::from_le_bytes(unsafe { *((cursor) as *const [u8; 4]) });
-            let (neb::ram::entry::TypeWord::Unchecked(_)
+            let (neb::ram::entry::TypeWord::Bare(_)
             | neb::ram::entry::TypeWord::Checked(_, _)) =
                 neb::ram::entry::unpack_type_word(type_bits)
             else {

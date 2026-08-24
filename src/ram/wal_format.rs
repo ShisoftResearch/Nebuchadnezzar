@@ -300,7 +300,7 @@ mod tests {
                 u32::from_le_bytes(outcome.image[cursor + 4..cursor + 8].try_into().unwrap());
             match crate::ram::entry::unpack_type_word(word) {
                 crate::ram::entry::TypeWord::Checked(entry_type, _)
-                | crate::ram::entry::TypeWord::Unchecked(entry_type) => {
+                | crate::ram::entry::TypeWord::Bare(entry_type) => {
                     assert_eq!(
                         entry_type,
                         crate::ram::entry::EntryType::PADDING,
@@ -364,7 +364,7 @@ mod tests {
                 u32::from_le_bytes(outcome.image[cursor + 4..cursor + 8].try_into().unwrap());
             match crate::ram::entry::unpack_type_word(word) {
                 crate::ram::entry::TypeWord::Checked(t, _)
-                | crate::ram::entry::TypeWord::Unchecked(t)
+                | crate::ram::entry::TypeWord::Bare(t)
                     if t == crate::ram::entry::EntryType::PADDING =>
                 {
                     cursor += crate::ram::entry::ENTRY_HEAD_SIZE + len as usize;
