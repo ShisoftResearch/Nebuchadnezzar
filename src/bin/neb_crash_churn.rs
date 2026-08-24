@@ -322,6 +322,8 @@ fn parent_main(args: &[String]) -> ExitCode {
                             continue;
                         }
                         state.best_verified = n;
+                        // NOTE: the churn timer is armed on CHURN_BEGIN, not
+                        // here -- see the child's comment.
                         // REBASE THE CURSOR TOO, downward included.
                         //
                         // The child rebases its own numbering on this scan
@@ -346,7 +348,6 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // CHILD and left the parent ratcheting.
                         acked_high = n;
                         println!("    scanned n={} (best={})", n, state.best_verified);
-                        kill_at = Some(Instant::now() + Duration::from_secs(churn_secs));
                     } else if let Some(rest) = line.strip_prefix("ACK_TO ") {
                         acked_high = rest.trim().parse().unwrap_or(acked_high);
                     } else if let Some(rest) = line.strip_prefix("DELETED_TO ") {
@@ -366,6 +367,8 @@ fn parent_main(args: &[String]) -> ExitCode {
                         failed = Some(format!("TORN TRANSACTION: {}", line.trim()));
                     } else if let Some(rest) = line.strip_prefix("TXN_ATOMIC ") {
                         println!("    transactions: {}", rest.trim());
+                    } else if line.starts_with("CHURN_BEGIN") {
+                        kill_at = Some(Instant::now() + Duration::from_secs(churn_secs));
                     } else if let Some(rest) = line.strip_prefix("RECONCILE ") {
                         println!("    startup reconcile: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("SCRUB ") {
@@ -1194,6 +1197,17 @@ async fn child_async(
     let pending_acks =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<u64>::new()));
     const WRITERS: usize = 4;
+    // The churn clock starts HERE, not at SCANNED.
+    //
+    // The parent used to arm the kill timer the moment the scan reported,
+    // which put the child's whole diagnostic phase -- scrub, re-scan, cell
+    // sampling, transaction audit -- inside the churn budget. A short cycle
+    // then killed the child mid-scrub, so the run produced no diagnostics for
+    // exactly the cycles that were about to fail. One 2-second cycle in a
+    // 64 GB soak lost the post-repair scrub that would have said whether
+    // 1.16M entries were absent or merely unhydrated.
+    println!("CHURN_BEGIN");
+    flush_stdout();
     let mut writer_handles = Vec::new();
     for _ in 0..WRITERS {
         let client = client.clone();
