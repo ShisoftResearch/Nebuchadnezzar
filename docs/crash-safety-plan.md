@@ -727,6 +727,35 @@ present; otherwise discard, which is safe because the ack had not happened.
 - **Distributed 2PC (Phase 6)** — still needs the termination-protocol
   decision, and the in-doubt timeout in Step 1 is coupled to it.
 
+## The import A/B: the new allocation model costs nothing (2026-08-24)
+
+The house rule was that the binding gate is a full import A/B when the
+implementation lands. It landed; here it is. FlyWire import on .239, base =
+`develop` (one head per chunk, undo log on the write path) vs pool =
+`feat/head-pool` (head pool, transaction leases, brackets, chains, undo log
+retired). Four rounds, arm order ALTERNATED per round.
+
+| round | first | base edges/s | pool edges/s | pool vs base |
+|---|---|---|---|---|
+| 1 | base | 197,922 | 197,962 | +0.0% |
+| 2 | pool | 205,463 | 201,213 | −2.1% |
+| 3 | base | 203,574 | 199,444 | −2.0% |
+| 4 | pool | 201,666 | 205,068 | +1.7% |
+
+Mean **202,156** vs **200,922** edges/s: **pool 0.6% slower, with a paired
+standard deviation of 1.8%** and base alone spanning 3.7% across rounds. The
+difference is inside the noise, and the sign flips by round. Zero journal
+failures and zero truncations in all eight imports.
+
+**The first attempt was void, and how it failed is worth keeping.** A morpheus
+server leaked from round 1 and ran for the whole benchmark, so every later
+import competed with it: base alone decayed 201k → 82k → 47k edges/s, and
+because that script always ran base first, the pool arm inherited a more
+degraded machine every round and looked 26–40% slower. Two lessons, both
+cheap: ALTERNATE the arm order so position bias cancels, and VERIFY teardown
+rather than assuming a kill worked. A monotonic decay across rounds is the
+signature of something accumulating, not of the thing being measured.
+
 ## Phase 6 — distributed 2PC: where it actually stands (2026-08-24)
 
 **The prerequisite bug is fixed** (`beebc711`). The bracket's COMMIT used to
