@@ -349,16 +349,50 @@ fn parent_main(args: &[String]) -> ExitCode {
                         // kill caught in flight are allowed to be missing.
                         // The number's SIZE is the signal.
                         println!("    scrub: {}", rest.trim());
-                        // The witness a held regression was waiting for.
-                        if let Some(reason) = pending_regression.take() {
-                            failed = Some(format!("{} -- scrub at this load: {}", reason, rest.trim()));
-                            unsafe { libc::kill(child_pid, libc::SIGKILL) };
-                            break;
+                        // Part of the witness. The scrub says whether the
+                        // entries EXIST; SCAN_AFTER_SCRUB below says whether a
+                        // reader can SEE them. A held regression needs both,
+                        // so it keeps waiting.
+                        if let Some(reason) = pending_regression.as_mut() {
+                            reason.push_str(&format!(" -- scrub at this load: {}", rest.trim()));
                         }
                     } else if let Some(rest) = line.strip_prefix("PRESHUTDOWN_SCRUB ") {
                         println!("    scrub BEFORE shutdown: {}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("SCRUB_REPAIRED ") {
                         println!("    scrub REPAIRED: {}", rest.trim());
+                    } else if let Some(rest) = line.strip_prefix("SCAN_AFTER_SCRUB n=") {
+                        let again: u64 = rest.trim().parse().unwrap_or(0);
+                        println!("    scan after scrub: n={}", again);
+                        if let Some(reason) = pending_regression.take() {
+                            // THE discriminator. The first scan ran against a
+                            // freshly loaded store; the scrub has since walked
+                            // every cell and asked every tree, forcing the
+                            // lazy hydration the first scan raced. If the
+                            // second scan clears the bar, nothing was lost and
+                            // the bug is that a reader immediately after
+                            // restart is quietly served a short answer -- which
+                            // is a correctness bug of its own, just not a
+                            // durability one. Both fail the cycle; they must
+                            // not be confused for each other.
+                            failed = Some(if again >= state.best_verified {
+                                format!(
+                                    "SCAN VISIBILITY (not durability): {} -- but a re-scan after \
+                                     the scrub found {} >= {}. The entries were THERE; the first \
+                                     scan after load could not see them. A reader querying \
+                                     straight after restart gets a short answer with no error.",
+                                    reason, again, state.best_verified
+                                )
+                            } else {
+                                format!(
+                                    "DURABILITY: {} -- and a re-scan after the scrub still found \
+                                     only {} < {}, so the entries are genuinely absent, not \
+                                     merely unhydrated.",
+                                    reason, again, state.best_verified
+                                )
+                            });
+                            unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                            break;
+                        }
                     } else if let Some(rest) = line.strip_prefix("RESCANNED n=") {
                         println!("    rescan after repair: n={}", rest.trim());
                     } else if let Some(rest) = line.strip_prefix("SCRUB_ERROR ") {
@@ -890,6 +924,39 @@ async fn child_async(
             ),
             Err(e) => println!("SCRUB_ERROR {}", e),
         }
+        flush_stdout();
+
+        // Scan AGAIN, now that the scrub has touched every tree.
+        //
+        // The first scan runs against a store that has just loaded, and the
+        // ranged index hydrates trees lazily -- so a short first scan has two
+        // completely different explanations: the entries are gone, or they
+        // are there and the scan could not see them yet. The scrub walks every
+        // cell and asks every tree, which forces hydration, so a scan after it
+        // answers which. Reported unconditionally: the parent needs the number
+        // whether or not this cycle looks bad, to know what "normal" is.
+        let mut recount: u64 = 0;
+        let val_range = ValueRange {
+            start: ValueRangeTerm::inclusive_from(&OwnedValue::U64(0).shared()),
+            end: ValueRangeTerm::inclusive_from(&OwnedValue::U64(u64::MAX).shared()),
+        };
+        if let Ok(mut cursor) = idx_client
+            .range_index_scan(
+                CHURN_SCHEMA_ID,
+                field_id,
+                val_range,
+                vec![],
+                Expr::nothing(),
+                Expr::nothing(),
+                TreeOrdering::Forward,
+            )
+            .await
+        {
+            while let Ok(Some(_)) = cursor.next().await {
+                recount += 1;
+            }
+        }
+        println!("SCAN_AFTER_SCRUB n={}", recount);
         flush_stdout();
     }
 
