@@ -727,6 +727,58 @@ present; otherwise discard, which is safe because the ack had not happened.
 - **Distributed 2PC (Phase 6)** — still needs the termination-protocol
   decision, and the in-doubt timeout in Step 1 is coupled to it.
 
+## Phase 6 — distributed 2PC: where it actually stands (2026-08-24)
+
+**The prerequisite bug is fixed** (`beebc711`). The bracket's COMMIT used to
+be written in `DataManager::commit`, which is the coordinator's PREPARE phase,
+so a participant became recoverable-as-committed before anyone decided to
+commit it. It now closes at `end`, with the decision. That had to move before
+any termination protocol is worth building, because it is what makes a durable
+COMMIT mean "I was told to commit" rather than "I was asked to prepare".
+
+**What the participant now guarantees on its own.** Prepare makes the entries
+durable. The decision closes the bracket and fsyncs it. So:
+
+| participant crashes... | recovers as | correct? |
+|---|---|---|
+| before prepare finishes | nothing applied | yes |
+| after prepare, before `end` | discarded (no COMMIT) | yes, IF nobody else committed |
+| after `end` | applied | yes |
+
+**The one remaining hole is the classic one**, and it is not a storage
+problem: the coordinator decides COMMIT, tells A, dies before telling B. A has
+a durable COMMIT, B has an unclosed bracket. B alone cannot tell that case
+from "the coordinator died before deciding", and presuming abort tears the
+transaction across nodes.
+
+**Two ways to close it, and a recommendation.**
+
+*Durable coordinator decision.* The coordinator writes commit/abort to a
+raft-backed record before fanning out; a replacement coordinator finishes the
+fan-out. Airtight and simple to reason about, but it puts a raft round-trip on
+every commit — the one place the write path cannot afford one. Batching would
+soften it and complicate the failure analysis.
+
+*Cooperative termination (RECOMMENDED).* An in-doubt participant asks the
+other participants what they know. With brackets, "do you have a durable
+COMMIT for T?" is answerable from disk, which is exactly what this protocol
+needs and exactly what we did not have before. Resolution succeeds unless
+every participant that knew is unreachable, and it costs NOTHING on the commit
+path — only on the rare in-doubt path.
+
+To build it: (1) carry the participant set in the prepare RPC and persist it
+in the BEGIN record, so an in-doubt participant knows whom to ask; (2) add a
+`txn_status(T)` RPC answered from durable state — committed if a COMMIT
+bracket exists, aborted if the span was rewound and the transaction is gone,
+prepared otherwise; (3) drive resolution from the lease-timeout sweeper that
+already exists (`NEB_TXN_LEASE_TIMEOUT_SECS`) and from recovery, adopting a
+COMMIT if any peer has one and aborting only when every peer answers
+"prepared".
+
+DELIBERATELY NOT STARTED: (1) alone would add a field to BEGIN that nothing
+reads, and this campaign has spent a week deleting exactly that. The three
+pieces are worth building together, once the choice above is made.
+
 ## Sequencing and dependencies
 
 Superseded by the implementation plan above, and recorded here for why the
