@@ -932,7 +932,7 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
 /// happens to outrank it.
 pub fn abandon_entry(entry_addr: usize) {
     let (entry, _) = Entry::decode_from(entry_addr, |_, _| {});
-    crate::ram::entry::stamp_reservation_padding(
+    crate::ram::entry::stamp_checked_padding(
         entry_addr,
         ENTRY_HEAD_SIZE as u32 + entry.content_length,
     );

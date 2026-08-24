@@ -416,6 +416,51 @@ fn newer_resident_segment(chunk: &Chunk, seg_id: u64, seq_id: u64) -> Option<AAr
     }
 }
 
+/// Entries a scan stepped over because they failed their own checksum.
+/// Loud on purpose: it is real damage, just damage that no longer costs the
+/// rest of the segment.
+pub static RECOVERY_DAMAGED_ENTRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the entry at `addr` stands on its own: aligned, a well-formed
+/// header, a length that fits inside the scanned extent, and either a
+/// checksum that verifies or a padding stamp.
+///
+/// This is the resync anchor. A damaged entry's own length is still
+/// bounds-checked, so the position of its successor is knowable; if THAT
+/// entry vouches for itself, the damage is one entry wide and the rest of
+/// the segment is still readable. Demanding a positively-good successor is
+/// what keeps this from walking into garbage: a corrupt length lands
+/// somewhere arbitrary, and arbitrary bytes do not pass a checksum.
+fn entry_stands_alone(addr: usize, bound: usize) -> bool {
+    use crate::ram::entry::{unpack_type_word, verify_entry_at, TypeWord};
+    if addr % 8 != 0 || addr + ENTRY_HEAD_SIZE > bound {
+        return false;
+    }
+    let word = unsafe {
+        let head = std::slice::from_raw_parts(addr as *const u8, 4);
+        u32::from_le_bytes(head.try_into().unwrap())
+    };
+    if matches!(unpack_type_word(word), TypeWord::Invalid) {
+        return false;
+    }
+    let (header, _) = Entry::decode_from(addr, |_, _| {});
+    if header.entry_type == EntryType::UNDECIDED || header.content_length == 0 {
+        return false;
+    }
+    let size = ENTRY_HEAD_SIZE + header.content_length as usize;
+    if size > SEGMENT_SIZE || addr + size > bound {
+        return false;
+    }
+    match verify_entry_at(addr) {
+        Some(true) => true,
+        Some(false) => false,
+        // Unchecked: only a reservation stamp, which carries no content to
+        // check, is trusted as an anchor.
+        None => header.entry_type == EntryType::PADDING,
+    }
+}
+
 fn has_only_zero_padding(data: &[u8], start_offset: usize) -> bool {
     data[start_offset..].iter().all(|byte| *byte == 0)
 }
@@ -779,6 +824,33 @@ fn scan_segment_from_data(
         // were never written by any writer. Entries from before checksums
         // report `None` and are taken on trust, as they always were.
         if crate::ram::entry::verify_entry_at(cursor) == Some(false) {
+            // One damaged entry must not cost the rest of the segment.
+            //
+            // Stopping here was the whole loss: a single entry whose content
+            // had been mutated after its header was published truncated its
+            // segment at that offset, and every cell appended after it --
+            // including, in the corpse that found this, a ranged tree's
+            // metadata cell -- was dropped from a store that held every byte
+            // on disk. The mutation itself is fixed (`abandon_entry`), but
+            // the walk should not be that brittle in the first place.
+            //
+            // Resync only onto a successor that vouches for itself; if
+            // nothing there does, the tail really is unreadable and the old
+            // behaviour is the right one.
+            let next = cursor + entry_size;
+            if entry_stands_alone(next, bound) {
+                warn!(
+                    "Recovered segment {} has a damaged entry at offset {} ({} bytes): its content                      does not match its checksum. The entry after it verifies, so it is skipped as                      dead space and the rest of the segment is kept.",
+                    seg_id,
+                    cursor - data_base,
+                    entry_size
+                );
+                RECOVERY_DAMAGED_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                dead_space += entry_size as u64;
+                append_header = cursor + entry_size;
+                cursor = next;
+                continue;
+            }
             if append_header > data_base {
                 warn!(
                     "Recovered segment {} scan stopped at offset {}: the entry's content does \
@@ -2532,6 +2604,131 @@ use crate::ram::types::Id;
             count_recovered_cells(&chunks.list),
             survivor_ids.len(),
             "exactly the survivors, and never the abandoned image, may be recovered"
+        );
+    }
+
+    /// A corrupted entry costs itself, not the segment behind it.
+    ///
+    /// Damage in the MIDDLE of a segment used to end the walk there, so a
+    /// single bad entry took every entry after it. That is the difference
+    /// between losing one cell and losing a ranged tree's metadata cell 66 KB
+    /// downstream, which is what made a whole index unloadable. The scan now
+    /// steps over damage whose successor vouches for itself.
+    #[test]
+    fn damage_in_the_middle_costs_one_entry_not_the_tail() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(217, "recovery_midsegment_damage", false);
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
+
+        let ids: Vec<Id> = (0..4).map(|i| Id::allocated(27, 0, i + 1)).collect();
+        let mut entries = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let mut cell = OwnedCell {
+                header: CellHeader::new(schema.id, id),
+                data: data_map_value!(id: i as i32, data: vec![0x44_u8; DATA_SIZE]),
+            };
+            chunks.write_cell(&mut cell).unwrap();
+            entries.push(entry_bytes_at(chunks.address_of(id)));
+        }
+
+        let mut image = empty_segment_bytes();
+        let mut offsets = Vec::new();
+        let mut at = 0usize;
+        for entry in &entries {
+            offsets.push(at);
+            image[at..at + entry.len()].copy_from_slice(entry);
+            at += entry.len();
+        }
+
+        // Corrupt entry 1's CONTENT, leaving its header (and therefore its
+        // length) intact -- exactly the shape an in-place content mutation
+        // leaves behind.
+        let victim = offsets[1] + ENTRY_HEAD_SIZE + 4;
+        image[victim] ^= 0xFF;
+
+        let scanned = scan_segment_for_recovery_test(chunk, &image)
+            .expect("a damaged entry mid-segment must not fail the scan");
+        assert_eq!(
+            scanned.append_offset, at,
+            "the walk must reach the end of the image, not stop at the damage"
+        );
+
+        // And end to end: every cell except the damaged one comes back.
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+        write_backup_segment(&backup_dir, 0, 0, 0, &image);
+        let reader_schemas = setup_test_schema();
+        reader_schemas.debug_only_new_schema(schema.clone());
+        let recovered = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: reader_schemas,
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+        for (i, id) in ids.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            assert!(
+                recovered.read_cell(id).is_ok(),
+                "cell {} of 4 must survive damage to cell 1",
+                i
+            );
+        }
+    }
+
+    /// Resync is not a licence to guess: a tail that cannot vouch for itself
+    /// still ends the walk, and everything before it is still kept.
+    #[test]
+    fn damage_with_an_unreadable_successor_still_stops_the_walk() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let chunk = &chunks.list[0];
+        let schema = schema_with_id(218, "recovery_unreadable_tail", false);
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
+
+        let ids: Vec<Id> = (0..3).map(|i| Id::allocated(28, 0, i + 1)).collect();
+        let mut entries = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let mut cell = OwnedCell {
+                header: CellHeader::new(schema.id, id),
+                data: data_map_value!(id: i as i32, data: vec![0x55_u8; DATA_SIZE]),
+            };
+            chunks.write_cell(&mut cell).unwrap();
+            entries.push(entry_bytes_at(chunks.address_of(id)));
+        }
+
+        let mut image = empty_segment_bytes();
+        let mut offsets = Vec::new();
+        let mut at = 0usize;
+        for entry in &entries {
+            offsets.push(at);
+            image[at..at + entry.len()].copy_from_slice(entry);
+            at += entry.len();
+        }
+
+        // Damage entry 1 AND shred everything after it: nothing downstream
+        // can anchor a resync.
+        image[offsets[1] + ENTRY_HEAD_SIZE + 4] ^= 0xFF;
+        for byte in image[offsets[2]..at].iter_mut() {
+            *byte = 0xAB;
+        }
+
+        let scanned = scan_segment_for_recovery_test(chunk, &image)
+            .expect("entries before the damage are still readable");
+        assert_eq!(
+            scanned.append_offset, offsets[1],
+            "with no trustworthy successor the walk must stop at the damage"
         );
     }
 

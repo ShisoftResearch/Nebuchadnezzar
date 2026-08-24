@@ -113,6 +113,35 @@ pub fn stamp_padding(buf: &mut [u8], at: usize, span: usize) -> bool {
     true
 }
 
+/// Stamp a CHECKSUMMED padding header over a finished span, in place.
+///
+/// The reservation variant below is deliberately bare, because at
+/// reservation time the content is not written yet and there is nothing to
+/// checksum. When a span's bytes are final -- an image that was appended
+/// and then abandoned -- the padding can and should carry a checksum like
+/// any other entry, so the entry verifies on its own rather than merely
+/// escaping verification.
+///
+/// The header is published as ONE aligned 8-byte store, so a reader sees
+/// the old entry or the padding, never a mixture.
+pub fn stamp_checked_padding(addr: usize, span: u32) {
+    if (span as usize) < ENTRY_HEAD_SIZE || addr % 8 != 0 {
+        return;
+    }
+    let content_len = span - ENTRY_HEAD_SIZE as u32;
+    let checksum = content_checksum(addr + ENTRY_HEAD_SIZE, content_len);
+    let word = pack_type_word(EntryType::PADDING, checksum);
+    let mut header = [0u8; ENTRY_HEAD_SIZE];
+    header[..4].copy_from_slice(&word.to_le_bytes());
+    header[4..].copy_from_slice(&content_len.to_le_bytes());
+    unsafe {
+        (*(addr as *const std::sync::atomic::AtomicU64)).store(
+            u64::from_le_bytes(header),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
 /// Stamp a bare PADDING header over a just-reserved span, in place.
 ///
 /// Called immediately after the append cursor is advanced and before the
