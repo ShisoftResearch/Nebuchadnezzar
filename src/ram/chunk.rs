@@ -2010,10 +2010,24 @@ impl Chunk {
                     continue;
                 }
                 let (cap_segs, free_segs, unbumped) = self.allocator.segment_accounting();
+                let reserve = self.allocator.compaction_reserve();
+                // Name WHICH kind of "no space" this is. A chunk that is
+                // simply full, with its compaction reserve intact, is the
+                // design working; a chunk whose addresses have gone missing is
+                // a bug. Both used to print "the allocator has no segment left
+                // after GC", and reading a full store as a durability failure
+                // cost a day.
+                let cause = if free_segs + unbumped <= reserve && free_segs + unbumped > 0 {
+                    "the chunk is FULL and its remaining segments are the compaction reserve                      (working as intended -- give the store more room)"
+                } else if cap_segs > self.segs.len() + free_segs + unbumped + self.retired_segment_count() {
+                    "addresses are UNACCOUNTED FOR -- neither live, free, retired nor unbumped.                      That is a leak, not a full store"
+                } else {
+                    "the chunk is genuinely out of segments"
+                };
                 error!(
                     "chunk-allocation-failure: chunk={}, segment_class={:?}, live={}, \
                      capacity_segments={}, free_list={}, never_bumped={}, retired_pending={}, \
-                     unaccounted={}, returned_ever={}: the allocator has no segment left after GC",
+                     unaccounted={}, returned_ever={}, reserve={}: {}",
                     self.id,
                     segment_class,
                     self.segs.len(),
@@ -2027,6 +2041,8 @@ impl Chunk {
                         .saturating_sub(unbumped)
                         .saturating_sub(self.retired_segment_count()),
                     self.allocator.segments_returned(),
+                    reserve,
+                    cause,
                 );
                 // COUNTED HERE TOO, and that omission cost a day.
                 //

@@ -3027,6 +3027,18 @@ impl SegmentAllocator {
     /// retired and awaiting quiescence, handed out and still live under a
     /// name the chunk map does not show, or simply bumped past. Those want
     /// different fixes.
+    /// Segments held back from writers so the cleaner always has somewhere to
+    /// compact into. One destination is all a 2-into-1 reclaim needs, so this
+    /// stays proportional and small.
+    pub fn compaction_reserve(&self) -> usize {
+        let capacity = self.capacity_segments();
+        if capacity > 5 {
+            (capacity / 16).clamp(1, 3)
+        } else {
+            0
+        }
+    }
+
     /// How many segment addresses have EVER been returned to this allocator.
     pub fn segments_returned(&self) -> usize {
         self.returned.load(Relaxed)
@@ -3119,12 +3131,7 @@ impl SegmentAllocator {
         // capacity-5 (3 of an 8-segment chunk -- 37.5%) and surfaced
         // CannotAllocateSpace to first-class writes in every small tiered
         // store while the chunk was still mostly free.
-        let capacity = self.capacity_segments();
-        let reserve = if capacity > 5 {
-            (capacity / 16).clamp(1, 3)
-        } else {
-            0
-        };
+        let reserve = self.compaction_reserve();
         if reserve > 0 && self.available_segments() <= reserve {
             debug!(
                 "Chunk {} down to its {}-segment compaction reserve; refusing writer \
