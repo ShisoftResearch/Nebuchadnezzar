@@ -346,7 +346,48 @@ impl MasterTreeSM {
     /// from two places: startup with persisted placements, and recovery, where
     /// the placement map arrives from the plane AFTER `try_initialize` has
     /// already run against an empty map.
+    /// Wait, briefly, until the membership can resolve the servers a placement
+    /// names.
+    ///
+    /// This runs from `recover`, i.e. during startup, and the ring converges in
+    /// its own time: it can already know which member owns a slot while the
+    /// address map behind `try_server_name` is still empty. Loading a tree in
+    /// that window fails with "no address known for server id" and the tree is
+    /// left unloaded -- for the whole life of the process, because nothing
+    /// replays the placement map a second time. Every seek into that range then
+    /// reports an error, which is the entire ranged index for a single-tree
+    /// database.
+    ///
+    /// One wait covers the whole map: the addresses arrive together, so a
+    /// placement that resolves means the rest will too. A member that has
+    /// genuinely departed simply costs this timeout once, after which each tree
+    /// warns and is left unloaded as before.
+    async fn await_placement_membership(&self, deadline: std::time::Duration) {
+        let Some((_, first)) = self.tree.iter().next() else {
+            return;
+        };
+        let slot = first.id.locality() as u64;
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(server_id) = self.conshash.get_server_id_for_slot(slot) {
+                if self.conshash.try_server_name(server_id).is_some() {
+                    return;
+                }
+            }
+            if start.elapsed() >= deadline {
+                warn!(
+                    "[RANGED INDEX LOAD] Membership still cannot resolve the server for slot {}                      after {:?}; loading placements anyway, and the ones that cannot be placed                      will be left unloaded",
+                    slot, deadline
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     async fn load_all_placements(&mut self) {
+        self.await_placement_membership(std::time::Duration::from_secs(10))
+            .await;
         {
             let tree_entries: Vec<_> = self
                 .tree
