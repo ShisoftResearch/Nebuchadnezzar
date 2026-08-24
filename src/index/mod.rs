@@ -7,6 +7,7 @@ pub mod entry;
 pub mod full_text;
 pub mod hash;
 pub mod ranged;
+pub mod scrub;
 pub mod vector;
 
 pub const FEATURE_SIZE: usize = 8;

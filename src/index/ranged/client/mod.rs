@@ -186,6 +186,19 @@ impl RangedIndexerClient {
         .await
     }
 
+    /// Exact, read-only presence of one key. Used by the index scrub to
+    /// tell a hole in the index from a cell that was never indexable.
+    pub async fn contains(&self, key: &EntryKey) -> Result<bool, RPCError> {
+        self.run_on_destinated_tree(
+            key,
+            |key, client, tree_id, epoch| {
+                async move { client.contains(tree_id, key.clone(), epoch).await }.boxed()
+            },
+            |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
+        )
+        .await
+    }
+
     pub async fn tree_stats(&self) -> Result<Vec<TreeStat>, RPCError> {
         let mut res = vec![];
         for tree_placement in self.placement.read().values().map(|(id, _)| id) {

@@ -116,6 +116,7 @@ service! {
     rpc load_tree(id: Id, boundary: Boundary, epoch: u64);
     rpc insert(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
+    rpc contains(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc seek(id: Id, range: Range, pattern: &Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<TreeStat>;
@@ -410,6 +411,18 @@ impl Service for TreeService {
             } else {
                 OpResult::Successful(false)
             }
+        })
+    }
+
+    /// Read-only exact presence, for the index scrub.
+    ///
+    /// `false` for the write flag: this must never hydrate-and-install a
+    /// tree as a side effect of being asked a question. A scrub that
+    /// repaired trees by looking at them would make its own verify pass
+    /// unrepeatable.
+    fn contains(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<'_, OpResult<bool>> {
+        self.apply_in_ranged_tree(id, entry, epoch, false, move |entry, tree, _dist_prop| {
+            OpResult::Successful(tree.contains(&entry))
         })
     }
 

@@ -230,6 +230,20 @@ impl RangedTree {
         Ok(Self { tree })
     }
 
+    /// Whether the tree logically holds this EXACT key.
+    ///
+    /// Read-only, and exact rather than by-id: a cell with an array-valued
+    /// indexed field contributes several keys that share one id, so an
+    /// id-level check would call a missing key present whenever a sibling
+    /// key survived. The scrub exists to find missing keys, so a check that
+    /// can only see missing CELLS would miss the failure it is for.
+    ///
+    /// `seek` (not `seek_raw`) because a key in the deletion set is
+    /// logically absent -- the scrub must agree with what a reader sees.
+    pub fn contains(&self, entry: &EntryKey) -> bool {
+        self.tree.seek(entry, Ordering::Forward).current() == Some(entry)
+    }
+
     /// Insert an entry into the tree
     pub fn insert(&self, entry: &EntryKey) -> bool {
         debug!("Inserting entry: {:?}", entry);

@@ -209,6 +209,19 @@ pub struct IndexRes {
 }
 
 impl IndexRes {
+    /// The RANGED keys this cell contributes, in derivation order.
+    ///
+    /// Exposed for the index scrub, which must derive entries through the
+    /// SAME function the write path uses. A scrub with its own derivation
+    /// logic would drift from the writer and report discrepancies that are
+    /// really disagreements between two copies of the rules.
+    pub fn ranged_keys(&self) -> impl Iterator<Item = &EntryKey> {
+        self.meta.iter().filter_map(|meta| match meta {
+            IndexMeta::Ranged(ranged) => Some(&ranged.key),
+            _ => None,
+        })
+    }
+
     // Convert index metadata into hash-metadata pairs
     fn to_meta_hash_pairs(self) -> Vec<(u64, IndexMeta)> {
         self.meta
