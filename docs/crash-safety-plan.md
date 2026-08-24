@@ -22,7 +22,7 @@ above it is either DONE or the decision record that produced it.
 | 1 Recovery correctness | DONE — framing+CRC, entry checksums, publish-last, ordering |
 | 2 Transaction atomicity (single node) | DONE — commit-point, sync-what-was-appended, framed undo log |
 | 3 Write-path failures | DONE — journal failures loud, seal-race drained, refusals honoured |
-| 4 Integrity of the durable | PARTIAL — per-block CRCs and the reindex/scrub tool NOT built |
+| 4 Integrity of the durable | PARTIAL — per-block CRCs NOT built; the index scrub is BUILT (verify + insert-only repair, cluster-wide); resetting an UNLOADABLE tree is not |
 | 5 Verification | DONE — crash-churn fuzzer with delete + mutilation lanes; the TRANSACTIONAL lane arrives with Step 1 below |
 | 6 Distributed 2PC | DESIGN ONLY, by decision; the in-doubt timeout in Step 1 is coupled to it |
 | 6a Head pool | BUILT — pool, exclusive ownership, gates green |
@@ -66,8 +66,10 @@ soak showed the member check was itself tearing transactions.
 STILL OPEN, deliberately: the undo log has NOT left the write path (abort is
 physical now, so it can — but that retirement needs its own validation);
 blob-class writes are outside the bracket (they are a separate segment class
-with its own pool); and the reindex/scrub tool remains the only failure class
-the fuzzer cannot survive.
+with its own pool); and an UNLOADABLE ranged tree still cannot be repaired --
+the index scrub now finds and fills holes in trees that load, and reports the
+ones that do not, but resetting a dead page chain is a separate and
+destructive step (see "The index scrub" below).
 
 ## The contract (Phase 0 — decide, then everything serves it)
 
@@ -187,6 +189,76 @@ sequencing around it:
    index entries, verifies sidecar family completeness. This is the
    backstop that turns any future index-corruption bug from an outage
    into a maintenance command.
+
+## The index scrub (built 2026-08-24)
+
+`neb::index::scrub`, reachable as `AsyncClient::scrub_ranged_index(repair)`,
+which fans out to every member.
+
+**What it does.** Walks every live cell on each node, re-derives that cell's
+ranged entries through `probe_cell_indices` -- the write path's own function
+-- and asks the index whether it holds them. `Verify` reports; `Repair`
+inserts what is missing.
+
+**Why it derives through the write path's function.** A scrub with its own
+copy of the derivation rules drifts from the writer, and every drift shows up
+as a permanent disagreement indistinguishable from corruption.
+
+**Why it never deletes.** An entry that looks unaccounted-for may belong to a
+cell written after this pass read that segment, or to a cell on a node this
+walk cannot see. Deleting on a partial view turns a diagnostic into an
+outage. The asymmetry is what makes even a single-node pass sound: a cell
+HERE whose entry is missing is a genuine hole regardless of what other nodes
+hold. So the tool can say "the index is missing these entries" and never "the
+index holds entries it should not"; the latter is not attempted.
+
+**Why the client fans out.** A ranged tree covers a key range across the
+whole cluster while a node can only walk its own chunks. One node's pass
+proves entries are missing but never that the index is complete; only the
+union rebuilds a tree in full.
+
+**Why it needed a new `contains` RPC.** `seek`'s cursor yields ids, not keys.
+A cell with an array-valued indexed field contributes several keys sharing
+one id, so an id-level check calls a missing key present whenever a sibling
+survived -- blind to the failure the tool exists for. The RPC is marked
+non-write so asking a question can never hydrate-and-install a tree as a side
+effect, which would make the verify pass unrepeatable.
+
+**Why B-tree pages are not indexed.** They are cells in the same store and
+the walk sees them. Nothing filters them by id: their schemas declare no
+indexed fields, so they derive nothing. Structure, not a blocklist, pinned by
+a test.
+
+### What it does NOT do: resetting an unloadable tree
+
+A tree whose page chain is damaged answers neither `contains` nor `insert`.
+Those entries are counted `entries_unreachable` and `is_clean()` is false --
+the tool reports the range it could not check rather than calling it fine.
+It cannot repair it, because repair inserts into a tree that must first load.
+
+Fixing that means pointing the tree's metadata cell at a fresh empty chain
+and rebuilding from cells. **That is the operation that cost 31 of 40 trees
+on TB14** -- see the `RangedTree::recover` doc comment: a failed load used to
+replace the tree with an empty one, which discarded the only reference to the
+real page chain and turned every transient read failure into permanent loss.
+It is why `recover` now leaves an unreadable tree absent.
+
+So a reset must never be automatic and never triggered by a read failure. It
+needs, and does not yet have:
+
+1. **A way to tell "permanently gone" from "not finished recovering".** There
+   is no recovery-complete signal in the store today; without one, a reset
+   during recovery reproduces TB14 exactly.
+2. **Operator invocation on a named tree**, never a blanket sweep, reporting
+   what it will destroy (head id, pages readable) before doing it.
+3. **Reversibility** — keeping the previous head in the metadata cell rather
+   than overwriting the pointer, so a mistaken reset can be undone.
+4. **A completeness rule for the rebuild.** Cluster-wide repair after the
+   reset is what makes the tree whole; a single-node repair leaves it
+   silently partial, which is the empty-tree failure again in slow motion.
+
+DECISION NEEDED before building it: whether (1) is satisfied by a durable
+recovery-complete marker, or by requiring the operator to assert it.
 
 ## Phase 5 — Verification: make crashes boring
 

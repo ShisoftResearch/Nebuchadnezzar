@@ -62,7 +62,7 @@ impl ScrubMode {
 
 /// What one pass found. Every field is a count of something the pass
 /// actually observed; nothing here is estimated.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ScrubReport {
     /// Live cells walked.
     pub cells_scanned: u64,
@@ -103,7 +103,11 @@ impl ScrubReport {
             && self.repairs_failed == 0
     }
 
-    fn merge(&mut self, other: &ScrubReport) {
+    /// Fold another node's report into this one. Public because a
+    /// cluster-wide scrub is the sum of its nodes': a ranged tree covers a
+    /// key range across the WHOLE cluster, so only the union of every
+    /// node's cells is a complete account of what the index should hold.
+    pub fn merge(&mut self, other: &ScrubReport) {
         self.cells_scanned += other.cells_scanned;
         self.cells_unreadable += other.cells_unreadable;
         self.cells_schema_missing += other.cells_schema_missing;
@@ -347,7 +351,7 @@ mod tests {
         let _ = env_logger::try_init();
         let dir = TempDir::new().unwrap();
         let (server, client) =
-            server_with_indexed_schema("127.0.0.1:6841", "scrub_clean", &dir).await;
+            server_with_indexed_schema(&crate::utils::test_port::unique_localhost_addr(), "scrub_clean", &dir).await;
         write_products(&client, 40).await;
         crate::index::builder::IndexBuilder::await_all_indices().await;
 
@@ -374,7 +378,7 @@ mod tests {
         let _ = env_logger::try_init();
         let dir = TempDir::new().unwrap();
         let (server, client) =
-            server_with_indexed_schema("127.0.0.1:6842", "scrub_repair", &dir).await;
+            server_with_indexed_schema(&crate::utils::test_port::unique_localhost_addr(), "scrub_repair", &dir).await;
         write_products(&client, 40).await;
         crate::index::builder::IndexBuilder::await_all_indices().await;
 
@@ -428,6 +432,63 @@ mod tests {
         assert_eq!(after.entries_present, baseline.entries_present);
     }
 
+    /// The rule that keeps the tool honest about what it could not check.
+    ///
+    /// A tree whose pages are unreadable answers neither `contains` nor
+    /// `insert`, so its entries land in `entries_unreachable` -- and that
+    /// range is exactly the one an operator is investigating. Folding those
+    /// into "clean" would make the scrub agree that a broken range is fine,
+    /// which is worse than having no scrub at all.
+    #[test]
+    fn entries_it_could_not_check_are_never_reported_clean() {
+        let mut report = ScrubReport::default();
+        report.entries_derived = 10;
+        report.entries_present = 9;
+        report.entries_unreachable = 1;
+        assert!(
+            !report.is_clean(),
+            "a range the scrub could not reach was reported clean"
+        );
+
+        report.entries_unreachable = 0;
+        report.entries_present = 10;
+        assert!(report.is_clean());
+
+        // Unreadable cells are equally not-clean: the pass formed no opinion
+        // about the entries they would have contributed.
+        report.cells_unreadable = 1;
+        assert!(!report.is_clean());
+    }
+
+    /// The library function being right is not the same as the command
+    /// being reachable. This drives the whole path an operator uses --
+    /// client fan-out, RPC, server-side walk -- because a scrub nobody can
+    /// invoke fixes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_scrub_is_reachable_over_rpc() {
+        let _ = env_logger::try_init();
+        let dir = TempDir::new().unwrap();
+        let (server, client) =
+            server_with_indexed_schema(&crate::utils::test_port::unique_localhost_addr(), "scrub_rpc", &dir).await;
+        write_products(&client, 20).await;
+        crate::index::builder::IndexBuilder::await_all_indices().await;
+
+        let over_rpc = client.scrub_ranged_index(false).await.unwrap();
+        println!("scrub over rpc: {}", over_rpc);
+        assert!(over_rpc.is_clean(), "rpc scrub not clean: {}", over_rpc);
+        assert!(over_rpc.entries_derived >= 20);
+
+        // The fan-out must agree with what the node itself sees; a
+        // silently-empty report would pass every assertion above.
+        let indexers = &server.indexer().unwrap().clients;
+        let in_process =
+            scrub_ranged_index(server.chunks(), indexers, ScrubMode::Verify).await;
+        assert_eq!(
+            over_rpc.entries_derived, in_process.entries_derived,
+            "rpc scrub disagreed with the in-process walk"
+        );
+    }
+
     /// Repair must be idempotent: running it on a healthy store is a no-op,
     /// not a second copy of every entry. An operator's first instinct on any
     /// suspicion is to run the repair, so "safe to run when nothing is
@@ -437,7 +498,7 @@ mod tests {
         let _ = env_logger::try_init();
         let dir = TempDir::new().unwrap();
         let (server, client) =
-            server_with_indexed_schema("127.0.0.1:6843", "scrub_idempotent", &dir).await;
+            server_with_indexed_schema(&crate::utils::test_port::unique_localhost_addr(), "scrub_idempotent", &dir).await;
         write_products(&client, 25).await;
         crate::index::builder::IndexBuilder::await_all_indices().await;
 

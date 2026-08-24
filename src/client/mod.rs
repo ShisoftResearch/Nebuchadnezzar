@@ -629,6 +629,40 @@ impl AsyncClient {
         }
         Ok(sum)
     }
+    /// Re-derive every node's ranged index entries and report (or fill) the
+    /// holes. The maintenance command for an index that has lost entries
+    /// their cells can still supply.
+    ///
+    /// Fans out to EVERY member and sums, because a ranged tree covers a key
+    /// range across the whole cluster while each node can only walk its own
+    /// chunks. A single node's pass is sound but partial: it can prove an
+    /// entry is missing, never that the index is complete. Only the union
+    /// rebuilds a tree in full.
+    ///
+    /// `repair` inserts what is missing and never deletes, so it is safe to
+    /// run on a healthy store -- on which it is a no-op.
+    pub async fn scrub_ranged_index(
+        &self,
+        repair: bool,
+    ) -> Result<crate::index::scrub::ScrubReport, String> {
+        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
+        let mut member_futs: FuturesUnordered<_> = members
+            .into_iter()
+            .map(|m| async move {
+                let client = self.client_by_server_id(m.id).await?;
+                Ok::<_, RPCError>(client.scrub_ranged_index(repair).await?)
+            })
+            .collect();
+        let mut total = crate::index::scrub::ScrubReport::default();
+        while let Some(res) = member_futs.next().await {
+            match res.map_err(|e| format!("scrub RPC failed: {:?}", e))? {
+                Ok(report) => total.merge(&report),
+                Err(reason) => return Err(reason),
+            }
+        }
+        Ok(total)
+    }
+
     pub async fn compare_version_and_update_cell(
         &self,
         id: Id,
