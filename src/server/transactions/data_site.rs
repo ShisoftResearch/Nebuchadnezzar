@@ -227,6 +227,21 @@ impl PinnedReadSet {
     }
 }
 
+/// How long a transaction may hold its write heads without a decision.
+///
+/// Deliberately generous and deliberately a knob: this is the in-doubt
+/// window, and its right value is coupled to the distributed termination
+/// protocol that is still design-only. Too short steals heads from
+/// transactions that are merely slow; too long is a writer slot held hostage
+/// by a coordinator that is never coming back.
+fn txn_lease_timeout() -> std::time::Duration {
+    std::env::var("NEB_TXN_LEASE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(120))
+}
+
 struct Transaction {
     state: TxnState,
     affected_cells: Vec<Id>,
@@ -339,6 +354,19 @@ impl DataManager {
                 if cleanup_signal.load(Relaxed) {
                     manager_clone.cell_meta_cleanup().await;
                     cleanup_signal.store(false, Relaxed);
+                }
+                // Reclaim write heads from transactions that went silent.
+                //
+                // A participant that aborted keeps its transaction (and its
+                // heads) until `end` arrives; a coordinator that dies never
+                // sends one. Without this the head is held for the life of
+                // the process, and since the pool has no refill path that is
+                // one writer slot gone from that chunk permanently. The
+                // entries themselves stay exactly where they are and are
+                // settled discard-unless-COMMIT, which is the same rule a
+                // crash in the same window already gets.
+                for tid in crate::ram::chunk::expire_transaction_leases(txn_lease_timeout()) {
+                    manager_clone.wipe_out_transaction(&tid);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -568,6 +596,12 @@ impl DataManager {
     }
     #[inline]
     fn wipe_out_transaction(&self, tid: &TxnId) {
+        // Give back the write heads this transaction leased, whatever ended
+        // it. One site rather than one per outcome: a head that outlives its
+        // transaction is a writer slot removed from its chunk's pool with no
+        // refill path, so the release has to be impossible to forget on some
+        // path nobody thought about.
+        crate::ram::chunk::release_transaction_leases(tid);
         let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
     }
@@ -918,7 +952,10 @@ impl DataManager {
             return result;
         }
 
-        crate::ram::chunk::set_transaction_context(true);
+        // Name the transaction, not just "in a transaction": its writes lease
+        // a head per chunk and hold it until the decision, so the write path
+        // has to know WHOSE lease to write behind.
+        crate::ram::chunk::set_transaction_id(Some(tid.clone()));
         let mut write_error: Option<(Id, WriteError)> = None;
         {
             for cell_op in cells {
@@ -1144,7 +1181,7 @@ impl DataManager {
             }
         }
         txn.last_activity = get_time();
-        crate::ram::chunk::set_transaction_context(false);
+        crate::ram::chunk::set_transaction_id(None);
 
         if let Some((id, error)) = write_error {
             // Drop what this attempt recorded: the next transaction on this

@@ -369,9 +369,136 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// One transaction's exclusive hold on a chunk write head.
+///
+/// The pool already gives every writer exclusive ownership of a head; a
+/// transaction differs only in how long it holds one. Plain writes hold for
+/// a cell, batches for a run, transactions until the 2PC decision -- which
+/// is what makes a transaction's entries contiguous in a chunk, and what
+/// will let an abort physically rewind them (Step 4) instead of logging undo
+/// records for them.
+pub struct HeadLease {
+    seg: AArc<Segment>,
+    /// Where this segment's cursor stood before the transaction wrote into
+    /// it. Recorded now, used by abort-by-rewind later: the value has to be
+    /// captured at claim time or it cannot be reconstructed at all.
+    #[allow(dead_code)]
+    pre_cursor: usize,
+}
+
+struct TransactionLeases {
+    /// chunk id -> heads this transaction holds there, oldest first.
+    ///
+    /// A Vec rather than one entry because a write set that outgrows its
+    /// head rotates onto a fresh one, and a rewind has to undo both. Until
+    /// brackets land (Step 2) a rotation is harmless: nothing yet depends on
+    /// a transaction's entries sharing one segment.
+    per_chunk: std::collections::HashMap<usize, Vec<HeadLease>>,
+    opened_at: std::time::Instant,
+}
+
+lazy_static! {
+    /// Leases of in-flight transactions. Global and keyed by transaction id
+    /// because a lease outlives the apply burst: writes land in one
+    /// synchronous region, but the decision that releases them arrives in a
+    /// LATER RPC, on another thread. Thread-locals cannot express that.
+    static ref TXN_LEASES: Mutex<std::collections::HashMap<crate::server::transactions::TxnId, TransactionLeases>> =
+        Mutex::new(std::collections::HashMap::new());
+}
+
+pub static TXN_LEASES_OPENED: AtomicU64 = AtomicU64::new(0);
+pub static TXN_LEASES_RELEASED: AtomicU64 = AtomicU64::new(0);
+pub static TXN_LEASES_EXPIRED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The transaction whose apply burst is running on this thread, if any.
+    /// Thread-local is right HERE -- the burst is synchronous -- while the
+    /// lease registry it indexes must be global.
+    static CURRENT_TXN: std::cell::RefCell<Option<crate::server::transactions::TxnId>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn current_txn() -> Option<crate::server::transactions::TxnId> {
+    CURRENT_TXN.with(|t| t.borrow().clone())
+}
+
 /// Set the transaction context for the current thread
 pub fn set_transaction_context(in_txn: bool) {
     IN_TRANSACTION.with(|flag| flag.set(in_txn));
+    if !in_txn {
+        CURRENT_TXN.with(|t| *t.borrow_mut() = None);
+    }
+}
+
+/// Enter a transaction's apply burst, naming the transaction so its writes
+/// can find (and keep) the head it leases in each chunk.
+pub fn set_transaction_id(txn: Option<crate::server::transactions::TxnId>) {
+    IN_TRANSACTION.with(|flag| flag.set(txn.is_some()));
+    CURRENT_TXN.with(|t| *t.borrow_mut() = txn);
+}
+
+/// Release every head a transaction holds. Called at the decision -- commit
+/// or abort -- and by the expiry sweeper for a coordinator that never came
+/// back.
+pub fn release_transaction_leases(txn: &crate::server::transactions::TxnId) -> usize {
+    let leases = {
+        let mut held = TXN_LEASES.lock();
+        held.remove(txn)
+    };
+    let Some(leases) = leases else {
+        return 0;
+    };
+    let mut released = 0usize;
+    for (_chunk, heads) in leases.per_chunk {
+        for lease in heads {
+            // Ownership first, then the reference: a segment that is still
+            // owned cannot be sealed, so dropping the reference first would
+            // briefly leave a head nobody can reclaim.
+            lease.seg.release_own();
+            lease.seg.decr_references();
+            released += 1;
+        }
+    }
+    TXN_LEASES_RELEASED.fetch_add(released as u64, Ordering::Relaxed);
+    released
+}
+
+/// Release leases whose transaction has been silent longer than `idle`.
+///
+/// Mandatory, not a refinement: a coordinator that vanishes between prepare
+/// and decision otherwise holds its heads forever, and the pool has no
+/// refill path -- one hostage head is one less writer slot in that chunk,
+/// permanently. Returns the transactions whose leases were reclaimed so the
+/// caller can settle them discard-unless-COMMIT.
+pub fn expire_transaction_leases(idle: std::time::Duration) -> Vec<crate::server::transactions::TxnId> {
+    let now = std::time::Instant::now();
+    let expired: Vec<_> = {
+        let held = TXN_LEASES.lock();
+        held.iter()
+            .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
+            .map(|(txn, _)| txn.clone())
+            .collect()
+    };
+    for txn in &expired {
+        let heads = release_transaction_leases(txn);
+        warn!(
+            "transaction {:?} held {} write head(s) for more than {:?} without a decision; \
+             releasing them. Its entries stay where they are and are settled \
+             discard-unless-COMMIT.",
+            txn, heads, idle
+        );
+    }
+    TXN_LEASES_EXPIRED.fetch_add(expired.len() as u64, Ordering::Relaxed);
+    expired
+}
+
+/// How many heads a transaction currently holds; for tests and metrics.
+pub fn transaction_lease_count(txn: &crate::server::transactions::TxnId) -> usize {
+    TXN_LEASES
+        .lock()
+        .get(txn)
+        .map(|leases| leases.per_chunk.values().map(|v| v.len()).sum())
+        .unwrap_or(0)
 }
 
 /// Record a segment whose transactional entry is not yet durable.
@@ -951,6 +1078,110 @@ impl Chunk {
         Ok(None)
     }
 
+    /// Record a freshly claimed head as the current transaction's, keeping it
+    /// owned past this entry. Returns whether a lease was taken.
+    ///
+    /// The extra reference is the point: `PendingEntry::drop` gives back the
+    /// per-entry one, and without a second the segment could be reclaimed
+    /// while the transaction still means to write into it.
+    fn lease_head_for_current_txn(&self, head: &AArc<Segment>, addr: usize) -> bool {
+        let Some(txn) = current_txn() else {
+            return false;
+        };
+        if !head.incr_references() {
+            // Being reclaimed underneath us: do not lease it, and let this
+            // entry finish as an ordinary one.
+            return false;
+        }
+        let mut held = TXN_LEASES.lock();
+        let leases = held
+            .entry(txn)
+            .or_insert_with(|| TransactionLeases {
+                per_chunk: std::collections::HashMap::new(),
+                opened_at: std::time::Instant::now(),
+            });
+        leases
+            .per_chunk
+            .entry(self.id)
+            .or_insert_with(Vec::new)
+            .push(HeadLease {
+                seg: head.clone(),
+                pre_cursor: addr,
+            });
+        TXN_LEASES_OPENED.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether the calling thread's transaction holds a head in this chunk.
+    ///
+    /// Used to refuse a wait that can never end: the acquire loop queues on
+    /// live heads when it cannot grow, and a head held by THIS transaction
+    /// will not be released until a decision that cannot arrive while this
+    /// call is still blocking. Waiting on yourself is the shape that
+    /// livelocked cold reads, and it is worth refusing explicitly rather
+    /// than discovering it as a hang.
+    fn current_txn_holds_head_here(&self) -> bool {
+        let Some(txn) = current_txn() else {
+            return false;
+        };
+        TXN_LEASES
+            .lock()
+            .get(&txn)
+            .and_then(|leases| leases.per_chunk.get(&self.id))
+            .map(|heads| !heads.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Place an entry in the head this transaction already holds in this
+    /// chunk. `None` means "no lease here, or it no longer fits" and the
+    /// caller claims a head the ordinary way.
+    fn try_place_in_leased_head(
+        &self,
+        size: u32,
+        segment_class: SegmentClass,
+    ) -> Option<PendingEntry> {
+        let txn = current_txn()?;
+        let head = {
+            let held = TXN_LEASES.lock();
+            // Newest first: a rotation appended a fresh head, and that is
+            // where the write set continues.
+            held.get(&txn)?.per_chunk.get(&self.id)?.last()?.seg.clone()
+        };
+        if head.segment_class() != segment_class {
+            return None;
+        }
+        // Ownership is NOT re-taken -- this transaction already holds it.
+        // Everything else is exactly the ordinary path: the per-entry
+        // reference and journal claim still bracket this write, because
+        // sealing still has to see it.
+        if !head.incr_references() {
+            return None;
+        }
+        if !head.begin_pending_journal() {
+            head.decr_references();
+            return None;
+        }
+        match head.try_acquire(size) {
+            Some(addr) => {
+                crate::ram::entry::stamp_reservation_padding(addr, size);
+                Some(PendingEntry {
+                    addr,
+                    seg: head,
+                    size,
+                    skip_sync: true,
+                    leased: true,
+                })
+            }
+            None => {
+                // The leased head is full. Give the per-entry claims back and
+                // let the caller take a fresh head, which it will lease too.
+                head.end_pending_journal();
+                head.decr_references();
+                None
+            }
+        }
+    }
+
     pub fn try_acquire_in_class(
         &self,
         size: u32,
@@ -959,6 +1190,11 @@ impl Chunk {
     ) -> Result<PendingEntry, WriteError> {
         if self.writes_closed.load(Ordering::Acquire) {
             return Err(WriteError::ServerShuttingDown);
+        }
+        // A transaction writes behind its own head first, so its entries stay
+        // contiguous and an abort can rewind them.
+        if let Some(entry) = self.try_place_in_leased_head(size, segment_class) {
+            return Ok(entry);
         }
         let mut tried_gc = false;
         let backoff = Backoff::new();
@@ -1064,11 +1300,17 @@ impl Chunk {
                             head.id,
                             segment_class
                         );
+                        // Under a transaction this claim becomes a LEASE:
+                        // the head stays owned past this entry, so the rest
+                        // of the write set lands behind it and nobody else
+                        // appends in between.
+                        let leased = self.lease_head_for_current_txn(&head, addr);
                         return Ok(PendingEntry {
                             addr,
                             seg: head,
                             size,
                             skip_sync: is_in_transaction(),
+                            leased,
                         });
                     }
                     // No space in this segment: give everything back and
@@ -1096,6 +1338,15 @@ impl Chunk {
                 None => match empty_slot {
                     Some(slot) => (slot, HEAD_SEG_ID_EMPTY),
                     None => {
+                        if self.current_txn_holds_head_here() {
+                            error!(
+                                "chunk {} has no head this write can take, and one of them is \
+                                 held by this very transaction: waiting would wait on ourselves. \
+                                 Refusing the write instead of hanging.",
+                                self.id
+                            );
+                            return Err(WriteError::CannotAllocateSpace);
+                        }
                         let t_spin = std::time::Instant::now();
                         backoff.spin();
                         ALLOC_SPIN_NANOS
@@ -1130,6 +1381,15 @@ impl Chunk {
                 })
             };
             if growing && total_space >= reserve_boundary && any_live_head() {
+                if self.current_txn_holds_head_here() {
+                    error!(
+                        "chunk {} is at capacity and the live head(s) this write would queue on \
+                         include one held by this very transaction; refusing rather than waiting \
+                         on ourselves.",
+                        self.id
+                    );
+                    return Err(WriteError::CannotAllocateSpace);
+                }
                 backoff.spin();
                 continue;
             }
@@ -2913,6 +3173,11 @@ pub struct PendingEntry {
     pub addr: usize,
     pub size: u32,
     pub skip_sync: bool, // Skip fsync if part of a transaction (will be synced at commit)
+    /// This entry went into a head its TRANSACTION owns, so finishing the
+    /// entry must not hand the head back: the lease runs to the 2PC
+    /// decision. Releasing here would let another writer append behind the
+    /// transaction, which is exactly what makes an abort unable to rewind.
+    pub leased: bool,
 }
 
 impl Drop for PendingEntry {
@@ -2929,7 +3194,13 @@ impl Drop for PendingEntry {
         // would no longer be offset-ordered: a crash would then leave a gap
         // the "torn tail = end of segment" rule mistakes for the end,
         // silently dropping every later owner's durable entries.
-        self.seg.release_own();
+        //
+        // A leased head is the exception, and for the same reason stated the
+        // other way round: its owner is the TRANSACTION, not this entry, and
+        // it is released at the decision.
+        if !self.leased {
+            self.seg.release_own();
+        }
         if let Err(error) = journal_result {
             // A straggler whose segment was sealed (archived) between its
             // append and this journal write cannot journal -- the recorded
@@ -4073,6 +4344,102 @@ mod tests {
     use env_logger;
 
     const TEST_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+    fn test_txn_id(n: u64) -> crate::server::transactions::TxnId {
+        crate::server::transactions::test_hlc(n, n)
+    }
+
+    /// A transaction's writes go behind ONE head per chunk, and that head
+    /// stays owned between entries.
+    ///
+    /// This is the whole point of the lease: with a head owned across the
+    /// write set, nobody else appends between a transaction's entries, which
+    /// is what makes the entries contiguous (so they can be bracketed) and
+    /// what will let an abort rewind them physically instead of logging undo
+    /// records. Without it every entry claims and releases a head, so two
+    /// transactions interleave freely in one segment.
+    #[test]
+    fn a_transaction_keeps_one_head_across_its_writes() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(41);
+
+        set_transaction_id(Some(txn.clone()));
+        let first = chunk.try_acquire(64, false).expect("first entry");
+        let first_seg = first.seg.id;
+        assert!(first.leased, "a transactional claim must take a lease");
+        assert_eq!(transaction_lease_count(&txn), 1);
+        drop(first);
+
+        // The head is STILL owned after the entry finished, so the next
+        // entry lands in the same segment.
+        let second = chunk.try_acquire(64, false).expect("second entry");
+        assert!(second.leased);
+        assert_eq!(
+            second.seg.id, first_seg,
+            "the second entry must land in the head the transaction already holds"
+        );
+        assert_eq!(
+            transaction_lease_count(&txn),
+            1,
+            "reusing a leased head must not open a second lease"
+        );
+        drop(second);
+        set_transaction_id(None);
+
+        assert_eq!(release_transaction_leases(&txn), 1);
+        assert_eq!(transaction_lease_count(&txn), 0);
+
+        // Released: an ordinary writer can take the head again.
+        let plain = chunk.try_acquire(64, false).expect("plain entry");
+        assert!(!plain.leased, "a non-transactional claim takes no lease");
+        assert_eq!(
+            plain.seg.id, first_seg,
+            "the released head returns to the pool rather than being stranded"
+        );
+    }
+
+    /// A head held past its transaction is a writer slot gone from the pool,
+    /// and the pool has no refill path -- so a transaction that never
+    /// reaches a decision must have its heads reclaimed on a timer.
+    #[test]
+    fn an_undecided_transaction_has_its_heads_reclaimed() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE);
+        let chunk = &chunks.list[0];
+        let txn = test_txn_id(42);
+
+        set_transaction_id(Some(txn.clone()));
+        let entry = chunk.try_acquire(64, false).expect("entry");
+        let seg = entry.seg.id;
+        drop(entry);
+        set_transaction_id(None);
+        assert_eq!(transaction_lease_count(&txn), 1);
+
+        // Not yet: a transaction that is merely slow keeps its heads.
+        let expired = expire_transaction_leases(std::time::Duration::from_secs(3600));
+        assert!(
+            expired.is_empty(),
+            "a lease inside its window must not be reclaimed"
+        );
+        assert_eq!(transaction_lease_count(&txn), 1);
+
+        // Past the window, the head comes back and the caller is told which
+        // transaction to settle.
+        let expired = expire_transaction_leases(std::time::Duration::from_secs(0));
+        assert!(
+            expired.contains(&txn),
+            "an undecided transaction must be reported so it can be settled"
+        );
+        assert_eq!(transaction_lease_count(&txn), 0);
+
+        let plain = chunk.try_acquire(64, false).expect("entry after expiry");
+        assert_eq!(
+            plain.seg.id, seg,
+            "the reclaimed head must be usable again, not stranded"
+        );
+    }
 
     /// Drain until the retired segment is reclaimed, or give up.
     ///
