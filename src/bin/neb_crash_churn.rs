@@ -58,7 +58,15 @@ struct ParentState {
 fn parent_main(args: &[String]) -> ExitCode {
     let base_dir = args.get(0).expect("base_dir").clone();
     let cycles: u64 = args.get(1).expect("cycles").parse().expect("cycles number");
-    let addr_base: u16 = 42200;
+    // Fixed by default, overridable so two arms of an A/B can run at the
+    // same time. They cannot otherwise: the port was hardcoded, so a second
+    // run on the same box collided with the first and the A/B had to be
+    // serialised -- which is the one thing a comparison against a flaky
+    // failure cannot afford.
+    let addr_base: u16 = std::env::var("NEB_CHURN_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(42200);
     let exe = std::env::current_exe().expect("own path");
 
     std::fs::create_dir_all(&base_dir).expect("base dir");
