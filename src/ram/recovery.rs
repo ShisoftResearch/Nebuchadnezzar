@@ -156,6 +156,20 @@ lazy_static::lazy_static! {
     /// computed here because that module is private to the btree.
     static ref TRACED_PAGE_SCHEMA_ID: u32 =
         dovahkiin::types::key_hash("NEB_BTREE_PAGE") as u32;
+    /// Must match `index::ranged::tree::tree::RANGED_TREE_SCHEMA_NAME`: the
+    /// per-tree metadata cell, the single cell whose loss unloads a tree.
+    static ref TRACED_TREE_META_SCHEMA_ID: u32 =
+        dovahkiin::types::key_hash("NEB_RANGED_TREE") as u32;
+}
+
+fn traced_schema(schema: u32) -> Option<&'static str> {
+    if schema == *TRACED_PAGE_SCHEMA_ID {
+        Some("page")
+    } else if schema == *TRACED_TREE_META_SCHEMA_ID {
+        Some("tree-meta")
+    } else {
+        None
+    }
 }
 
 const MIN_RECOVERY_WORD_MAP_CAPACITY: usize = 4_096;
@@ -820,16 +834,20 @@ fn scan_segment_from_data(
             };
             let existing_version = version_map.entry(hash).or_insert(seen).version;
 
-            if trace_pages_enabled() && cell_header.schema == *TRACED_PAGE_SCHEMA_ID {
-                warn!(
-                    "PAGE-TRACE cell id={:?} ver={} seg={} off={} prior_ver={} {}",
-                    cell_header.id,
-                    new_version,
-                    seg_id,
-                    offset,
-                    existing_version,
-                    if new_version >= existing_version { "WIN" } else { "LOSE" }
-                );
+            if trace_pages_enabled() {
+                if let Some(kind) = traced_schema(cell_header.schema) {
+                    warn!(
+                        "PAGE-TRACE {} cell id={:?} ver={} chunk={} seg={} off={} prior_ver={} {}",
+                        kind,
+                        cell_header.id,
+                        new_version,
+                        chunk.id,
+                        seg_id,
+                        offset,
+                        existing_version,
+                        if new_version >= existing_version { "WIN" } else { "LOSE" }
+                    );
+                }
             }
             if new_version >= existing_version {
                 version_map.insert(hash, seen);
@@ -878,6 +896,17 @@ fn scan_segment_from_data(
             };
             let existing_version = version_map.entry(hash).or_insert(seen).version;
 
+            if trace_pages_enabled() {
+                warn!(
+                    "PAGE-TRACE tombstone id={:?} hash={} ver={} seg={} prior_ver={} {}",
+                    tombstone.id,
+                    hash,
+                    tombstone.version,
+                    seg_id,
+                    existing_version,
+                    if tombstone.version >= existing_version { "WIN" } else { "LOSE" }
+                );
+            }
             if tombstone.version >= existing_version {
                 version_map.insert(hash, seen);
 
@@ -1218,6 +1247,17 @@ pub fn recover_chunks(
                         )?;
                         Ok((file_data, declared_used_len, scan_result))
                     };
+                    if trace_pages_enabled() {
+                        warn!(
+                            "FILE-TRACE begin chunk={} seg={} seq={} backup={} size={} path={}",
+                            chunk_id,
+                            file_info.seg_id,
+                            file_info.seq_id,
+                            file_info.is_backup,
+                            file_info.size,
+                            file_info.path.display()
+                        );
+                    }
                     let mut source_is_backup = file_info.is_backup;
                     let (file_data, _declared_used_len, scan_result) =
                         match attempt(&file_info.path, &mut version_map) {
@@ -1302,6 +1342,19 @@ pub fn recover_chunks(
                         ..file_info
                     };
                     let segment_class = scan_result.segment_class;
+                    if trace_pages_enabled() {
+                        warn!(
+                            "FILE-TRACE scanned chunk={} seg={} seq={} backup={} append_offset={} dead={} tombstones={} class={:?}",
+                            chunk_id,
+                            file_info.seg_id,
+                            file_info.seq_id,
+                            file_info.is_backup,
+                            scan_result.append_offset,
+                            scan_result.dead_space,
+                            scan_result.tombstones,
+                            segment_class
+                        );
+                    }
 
                     let existing_hot = chunk
                         .segs
@@ -2335,7 +2388,7 @@ use crate::ram::types::Id;
             let result = writer_chunk
                 .write_cell_to_chunk(&loser, &write_plan, &pending, loser.header.version)
                 .unwrap();
-            crate::ram::cell::abandon_entry_version(result.addr);
+            crate::ram::cell::abandon_entry(result.addr);
             result.addr
         };
         assert_eq!(
@@ -2343,12 +2396,11 @@ use crate::ram::types::Id;
             winner_addr + winner_entry.len(),
             "appends should be sequential in this idle chunk"
         );
-        let ghost_header =
-            cell_header_from_entry_content_addr(Entry::content_pos(ghost_addr));
-        assert_eq!(ghost_header.id, cell_id, "expected the loser's image here");
+        let (ghost_entry_header, _) = Entry::decode_from(ghost_addr, |_, _| {});
         assert_eq!(
-            ghost_header.version, 0,
-            "a failed write must abandon its image at version 0"
+            ghost_entry_header.entry_type,
+            EntryType::PADDING,
+            "a failed write must abandon its image as PADDING, so no walk reads a cell from it"
         );
         let ghost_entry = entry_bytes_at(ghost_addr);
 
@@ -2381,6 +2433,105 @@ use crate::ram::types::Id;
         assert_eq!(
             recovered.data, winner.data,
             "recovery resurrected the failed write's image over the winner"
+        );
+    }
+
+    /// An abandoned image must not take the rest of its segment with it.
+    ///
+    /// THE bug behind "the store came back with 45% of its keys": a failed
+    /// write abandoned its appended image by zeroing the cell version in
+    /// place, which left the entry's published content checksum describing
+    /// bytes that no longer existed. Recovery verifies that checksum, and a
+    /// mismatch means "damaged from here" -- so the walk stopped AT the
+    /// abandoned entry and every cell appended after it in that segment was
+    /// silently dropped. In the fuzzer's corpse the casualty was a ranged
+    /// tree's metadata cell, 66 KB further into the segment: the placement
+    /// map named a tree whose metadata no longer existed, every seek
+    /// retried, and the whole index refused to load.
+    ///
+    /// The winner-then-ghost ordering the older test uses cannot see this --
+    /// with nothing after the ghost, truncating at it costs nothing. The
+    /// cells AFTER the ghost are the entire point.
+    #[test]
+    fn an_abandoned_image_does_not_truncate_its_segment() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
+        let writer_chunk = &writer_chunks.list[0];
+        let schema = schema_with_id(216, "recovery_ghost_truncation", false);
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
+
+        // [ghost][survivor 0][survivor 1][survivor 2] in one segment.
+        let ghost_id = Id::allocated(26, 0, 1);
+        let ghost = OwnedCell {
+            header: CellHeader::new(schema.id, &ghost_id),
+            data: data_map_value!(id: 9_i32, data: vec![0x99_u8; DATA_SIZE]),
+        };
+        let ghost_addr = {
+            let write_plan = ghost.plan_write(writer_chunk).unwrap();
+            let pending = write_plan.allocate(writer_chunk, true).unwrap();
+            let result = writer_chunk
+                .write_cell_to_chunk(&ghost, &write_plan, &pending, ghost.header.version)
+                .unwrap();
+            crate::ram::cell::abandon_entry(result.addr);
+            result.addr
+        };
+        let ghost_entry = entry_bytes_at(ghost_addr);
+
+        let survivor_ids: Vec<Id> = (0..3).map(|i| Id::allocated(26, 1, i + 1)).collect();
+        let mut survivor_entries = Vec::new();
+        for (i, id) in survivor_ids.iter().enumerate() {
+            let mut cell = OwnedCell {
+                header: CellHeader::new(schema.id, id),
+                data: data_map_value!(id: i as i32, data: vec![0x33_u8; DATA_SIZE]),
+            };
+            writer_chunks.write_cell(&mut cell).unwrap();
+            survivor_entries.push(entry_bytes_at(writer_chunks.address_of(id)));
+        }
+
+        let mut image = empty_segment_bytes();
+        let mut at = 0usize;
+        image[at..at + ghost_entry.len()].copy_from_slice(&ghost_entry);
+        at += ghost_entry.len();
+        for entry in &survivor_entries {
+            image[at..at + entry.len()].copy_from_slice(entry);
+            at += entry.len();
+        }
+        write_backup_segment(&backup_dir, 0, 0, 0, &image);
+
+        let reader_schemas = setup_test_schema();
+        reader_schemas.debug_only_new_schema(schema.clone());
+        let chunks = Chunks::new_with_recovery(
+            1,
+            TEST_SEGMENT_SIZE * 4,
+            Arc::new(ServerMeta {
+                schemas: reader_schemas,
+            }),
+            None,
+            Some(backup_dir.path().to_str().unwrap().to_string()),
+            Some(wal_dir.path().to_str().unwrap().to_string()),
+            None,
+            true,
+            Some(raft_path),
+        );
+
+        for id in &survivor_ids {
+            assert!(
+                chunks.read_cell(id).is_ok(),
+                "cell {:?}, appended AFTER an abandoned image, must survive recovery",
+                id
+            );
+        }
+        assert_eq!(
+            count_recovered_cells(&chunks.list),
+            survivor_ids.len(),
+            "exactly the survivors, and never the abandoned image, may be recovered"
         );
     }
 

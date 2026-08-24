@@ -912,11 +912,30 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
 /// and every tombstone. The patch happens while the entry's `PendingEntry`
 /// is still alive, so the WAL append (which runs at its drop) carries the
 /// patched bytes.
-pub fn abandon_entry_version(entry_addr: usize) {
-    let content_addr = Entry::content_pos(entry_addr);
-    let mut cursor = addr_to_header_cursor(content_addr);
-    cursor.write_u64::<Endian>(0).unwrap();
-    release_cursor(cursor);
+/// Abandon an appended image whose write lost its race.
+///
+/// The bytes stay where they are -- the span is claimed and has to remain
+/// filled -- but the entry becomes PADDING, so every walk steps straight
+/// over it and no recovery can read a cell out of it.
+///
+/// This used to zero the cell's version instead, on the theory that version
+/// 0 could never win a version comparison. That mutated the CONTENT after
+/// its header had been published, so the header's content checksum no
+/// longer described the bytes it covered. Recovery reads that as a damaged
+/// entry and stops the segment's walk there, DISCARDING every entry
+/// appended after it: one abandoned image cost the rest of its segment,
+/// which is how a store with every cell intact on disk came back with 45%
+/// of its keys and an unloadable ranged index.
+///
+/// PADDING also settles what version 0 only half-answered: an abandoned
+/// image is not a cell at all, so it cannot resurrect one when no tombstone
+/// happens to outrank it.
+pub fn abandon_entry(entry_addr: usize) {
+    let (entry, _) = Entry::decode_from(entry_addr, |_, _| {});
+    crate::ram::entry::stamp_reservation_padding(
+        entry_addr,
+        ENTRY_HEAD_SIZE as u32 + entry.content_length,
+    );
 }
 
 pub fn cell_version_from_entry_content_addr(addr: usize) -> u64 {

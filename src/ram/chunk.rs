@@ -1700,7 +1700,7 @@ impl Chunk {
             None => {
                 // The cell image is already appended; make sure recovery can
                 // never resurrect it over the write that won the race.
-                abandon_entry_version(pending_entry.addr);
+                abandon_entry(pending_entry.addr);
                 // The write is refused, but this exact path is how a crashed
                 // index heals: a SIGKILL preserves acked cells in the WAL
                 // while the ranged tree loses its un-flushed tail, and the
@@ -1779,7 +1779,7 @@ impl Chunk {
             let new_cell_loc = write_result.addr;
             // The image carries `old_version + 1`: recovery would pick it
             // over the tombstone of a deleted cell and resurrect the data.
-            abandon_entry_version(new_cell_loc);
+            abandon_entry(new_cell_loc);
             self.mark_dead_entry_with_cell(new_cell_loc, cell);
             return Err(WriteError::CellDoesNotExisted);
         }
@@ -1921,7 +1921,16 @@ impl Chunk {
                             // bytes are already in the claimed span, which must
                             // stay filled, so the loser becomes dead space --
                             // the same outcome `write_cell` gives this race.
-                            abandon_entry_version(write_result.addr);
+                            abandon_entry(write_result.addr);
+                            // Re-journal the abandoned span. This entry was
+                            // already journaled as a CELL above, so without a
+                            // second record the log and the resident image
+                            // disagree about it forever -- the image says
+                            // PADDING, the log says live cell, and a recovery
+                            // from the log resurrects a write that was
+                            // refused. Records are applied by declared
+                            // offset, so the later one supersedes.
+                            let _ = run.journal(write_result.addr, sizes[j]);
                             self.mark_dead_entry_with_cell(write_result.addr, &cells[j]);
                             results.push(Err(WriteError::CellAlreadyExisted));
                             continue;
