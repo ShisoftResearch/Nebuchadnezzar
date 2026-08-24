@@ -868,13 +868,19 @@ impl IndexBuilder {
                 let mut failed = 0u64;
                 let mut first_error = None;
                 for result in results {
+                    // Every failure keeps its own line, as before. The summary
+                    // below is ADDITIONAL signal; dropping the detail to make
+                    // room for it would trade a diagnosable failure for a
+                    // countable one.
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
+                            log::warn!("Background index task failed: {:?}", e);
                             failed += 1;
                             first_error.get_or_insert_with(|| format!("{:?}", e));
                         }
                         Err(e) => {
+                            log::warn!("Background index task join failed: {:?}", e);
                             failed += 1;
                             first_error.get_or_insert_with(|| format!("join: {:?}", e));
                         }
@@ -1441,6 +1447,7 @@ mod tests {
     #[test]
     fn a_failed_index_task_is_counted_and_owed() {
         let before = index_entries_owed();
+        let reported_before = INDEX_FAILURES_REPORTED.load(std::sync::atomic::Ordering::Relaxed);
         note_index_failures(3, "unit test");
         assert_eq!(
             index_entries_owed(),
@@ -1453,5 +1460,12 @@ mod tests {
         // A pass with nothing to report must not move it.
         note_index_failures(0, "unit test");
         assert_eq!(index_entries_owed(), before + 4);
+
+        // Put the process-wide debt back. It is shared with every other test
+        // in this binary AND read by the shutdown report, so a test that
+        // inflates it makes the suite tell a lie about itself -- which it did,
+        // in exactly one run, before this line existed.
+        INDEX_TASKS_FAILED.store(before, std::sync::atomic::Ordering::Relaxed);
+        INDEX_FAILURES_REPORTED.store(reported_before, std::sync::atomic::Ordering::Relaxed);
     }
 }
