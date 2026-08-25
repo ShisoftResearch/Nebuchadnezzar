@@ -22,7 +22,6 @@ async fn main() {
         )),
         backup_storage: None,
         wal_storage: None,
-        undo_log_storage: None,
         raft_storage: None,
         services: vec![Service::Cell],
         index_enabled: false,
