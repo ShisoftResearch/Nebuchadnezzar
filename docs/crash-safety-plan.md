@@ -1172,6 +1172,96 @@ difference between them is exactly whether the participant set survived:
 - Do not build step 1 alone. A participant set that nothing reads is exactly
   what this campaign has spent a week deleting.
 
+## Phase 6b OUTCOME (2026-08-25): BUILT, and where the plan was wrong
+
+Landed in `c660d927` (protocol) on top of `9e6f0d74` (a prerequisite bug the
+step-0 gate exposed). Five tests, each verified to FAIL when its own mechanism
+is disabled.
+
+### The gate was met, by a test rather than by a fuzzer lane
+
+Step 0 called for a crash-churn lane. A two-server in-process test turned out
+to be enough and is 20 s instead of a soak:
+`a_coordinator_dying_mid_decision_tears_the_transaction` injects a coordinator
+that stops after telling N participants (`stop_end_fanout_after`) and asserts
+the split on DURABLE state. Asserting on reads proves nothing -- both halves
+read fine before a restart, which is exactly why this is invisible in
+production.
+
+### What the gate found on the way: a tear with NO coordinator failure
+
+Two servers in one process could not commit a transaction at all, and the
+cause was not the test shape. `TXN_LEASES` is process-global; a store is not.
+One process hosts a store per DATABASE, and two can hold leases under the same
+transaction id. Every lease entry point took only the transaction id, so the
+first store to reach the decision removed the map entry and the second found
+nothing to close -- no COMMIT, success returned, and recovery discarded its
+half of a committed transaction. The manifest had the same bug one layer down:
+keyed `(chunk allocator base, chunk id)` and keeping only the chunk id, so a
+store's manifest named another store's chunks.
+
+Every entry point now takes the caller's address window. See
+`deciding_one_store_leaves_another_stores_leases_alone`.
+
+### Corrections to the plan's table
+
+The three-way status reply is right in shape and wrong in one row.
+
+- The plan reads `Committed` from "a COMMIT record in one of my brackets".
+  Correct, but the RPC does NOT scan segments per query: that is O(store) on
+  the answering side. It reads a bounded in-memory decision record written at
+  `end`, plus -- for a site that RESTARTED -- the committed set recovery
+  already collected while walking the segments. Recovery had that set and was
+  throwing it away.
+- `TxnState::Committed` is NOT evidence of a decision. A participant enters it
+  when its entries are made durable, which is during the prepare phase, before
+  anyone has decided. Only a closed bracket means "I was told to commit". A
+  status reply derived from transaction state would answer `Committed` for a
+  transaction about to abort.
+- A fourth reply was needed. "No bracket for T" merges "I aborted it" with "I
+  was never a participant"; both license abort, but only the first is a
+  DECISION. `TxnOutcome` is `Committed | Aborted | InDoubt | Unknown`, and the
+  log says which was the reason for presuming abort.
+
+### The participant set is the WRITE set, not the affected set
+
+`prepare` reaches read-only participants too, and a site that only read writes
+no BEGIN and can answer nothing. Including them adds peers that reply "never
+heard of it" -- indistinguishable from a peer that presumed abort. The set is
+the servers with at least one changed object, i.e. exactly what `sites_commit`
+and `sites_end` address.
+
+### Ordering constraints the plan did not state
+
+Both are load-bearing and neither is obvious from the design:
+
+1. **The sweeper must ask BEFORE it releases.** Resolving to commit means
+   closing a bracket, and closing a bracket needs the leases the release
+   throws away. `transactions_with_idle_leases` is the selection half of
+   `expire_transaction_leases`, split out for this.
+2. **Recovery must resolve BEFORE the cleaner resumes.** An in-doubt
+   bracket's cells are not in the index, so a compaction pass reads them as
+   dead and reclaims the evidence out from under the question.
+
+### Resolution has to be made durable, or it is undone by the next crash
+
+Installing the cells is not enough: the index is rebuilt from segments at
+every start, so the next recovery would find the same open bracket, ask again,
+and by then the peers may have forgotten. A resolved-committed transaction
+gets its own COMMIT record written first (`Chunk::write_resolved_commit`),
+then its cells. One record anywhere in the store decides it store-wide,
+because `settle` collects COMMITs globally and matches pending cells against
+them -- so it does not need to go in the transaction's own (possibly full,
+possibly sealed) segments.
+
+### Residual, unchanged and now explicit in the code
+
+A whole-cluster restart has no reachable peer with an answer: every peer is
+down or itself restarting with no live record, so those transactions are still
+presumed abort. That is the limit of cooperative termination without a durable
+decision, and it is what the code did unconditionally before. The 120 s
+sweeper remains the backstop.
+
 ## Sequencing and dependencies
 
 Superseded by the implementation plan above, and recorded here for why the
