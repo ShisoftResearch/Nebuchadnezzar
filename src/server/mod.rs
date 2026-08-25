@@ -2116,6 +2116,23 @@ impl NebServer {
         // CRITICAL: Index tasks (especially enumeration index inserts) must complete
         // before we flush LSM trees, otherwise the flush will have incomplete data!
         // This fixes the bug where index tasks spawned on different threads were lost.
+        // CLIENT writes stop here, at the very top of shutdown.
+        //
+        // The RPC server serves until step 3 and `close_writes` is not called
+        // until step 1.6, so without this a client write can be ACKED after
+        // the flush below. `with_indices_ensured` completes that write's index
+        // inserts before replying, so its entries are in the in-memory tree --
+        // and they have just missed the only flush. Step 1.6 archives the
+        // cell, so the cell survives and its index entries do not: the exact
+        // "cells fine, scans short" shape this campaign keeps chasing.
+        //
+        // Closing ALL writes here instead is not the fix and was already
+        // tried: the write-back's own tree pages are cells in these same
+        // chunks, a closed store refuses them, and the ranged index died at
+        // shutdown while every data cell survived. Two stages, so the flush
+        // can still write while clients cannot.
+        self.chunks().close_client_writes();
+
         // Taken BEFORE the drain, because that is the position the drain and
         // the flush below are about to make durable. Snapshotting after them
         // would name cells the flush never saw, and the mark would then tell

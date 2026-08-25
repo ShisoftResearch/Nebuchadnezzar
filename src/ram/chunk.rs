@@ -774,6 +774,21 @@ pub struct Chunk {
     /// error instead of accepting a cell that no longer has anywhere durable
     /// to go.
     writes_closed: std::sync::atomic::AtomicBool,
+    /// Set at the START of shutdown, ahead of `writes_closed`.
+    ///
+    /// Shutdown drains index tasks, flushes the LSM and takes the write-back
+    /// barrier BEFORE closing writes at step 1.6, and the RPC server keeps
+    /// serving until step 3. So a client write can be acked in that window --
+    /// `with_indices_ensured` completes its index inserts before replying, so
+    /// the entries reach the in-memory tree, but they have missed the only
+    /// flush. The cell is archived and survives; its index entry does not.
+    ///
+    /// Closing ALL writes earlier is not the fix and was tried: the
+    /// write-back's own tree pages are cells in these same chunks, and a
+    /// closed store refuses them, so the ranged index died at shutdown while
+    /// every data cell survived. Hence two stages -- client writes stop here,
+    /// the flush's own writes keep going until 1.6.
+    client_writes_closed: std::sync::atomic::AtomicBool,
 }
 
 /// A segment unpublished from its chunk, waiting for readers to drain.
@@ -1024,6 +1039,7 @@ impl Chunk {
             cleaner_wake,
             retired_segments: Mutex::new(Vec::new()),
             writes_closed: std::sync::atomic::AtomicBool::new(false),
+            client_writes_closed: std::sync::atomic::AtomicBool::new(false),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -2426,7 +2442,28 @@ impl Chunk {
         }
     }
 
+    /// Whether this write must be refused because shutdown has begun.
+    ///
+    /// The index's own schemas are exempt: the flush that runs during
+    /// shutdown writes its pages and its tree metadata as cells in these very
+    /// chunks, and refusing those is what killed the ranged index the last
+    /// time writes were closed early. Everything else is a client write, and
+    /// a client write acked after that flush loses its index entries -- the
+    /// cell is archived at step 1.6 and survives, its entries are not.
+    fn shutdown_refuses(&self, schema_id: u32) -> Result<(), WriteError> {
+        if !self.client_writes_closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if schema_id == *crate::index::ranged::tree::btree::PAGE_SCHEMA_ID
+            || schema_id == *crate::index::ranged::tree::tree::RANGED_TREE_SCHEMA_ID
+        {
+            return Ok(());
+        }
+        Err(WriteError::ServerShuttingDown)
+    }
+
     fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+        self.shutdown_refuses(cell.header.schema)?;
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         // Per-phase timing. Throughput here is flat against concurrency, which
         // means latency rises to match and some phase is being served at a
@@ -2539,6 +2576,7 @@ impl Chunk {
     }
 
     fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+        self.shutdown_refuses(cell.header.schema)?;
         let hash = cell.header.id.bits();
         let write_plan = cell.plan_write(self)?;
         let pending_entry = write_plan.allocate(self, true)?;
@@ -2757,6 +2795,7 @@ impl Chunk {
     }
 
     pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
+        self.shutdown_refuses(cell.header.schema)?;
         let hash = cell.header.id.bits();
         // Same phase timers as `write_cell`. A migration's recipient goes
         // through here for every cell it receives, and without these the
@@ -4297,6 +4336,24 @@ impl Chunks {
             .and_then(|chunk| chunk.file_manager.backup_storage().map(|s| s.to_string()))
     }
 
+    /// Stop accepting CLIENT writes; the index's own writes continue.
+    ///
+    /// Called first thing in shutdown so that nothing a client is told
+    /// succeeded can land after the flush that was supposed to persist its
+    /// index entries.
+    pub fn close_client_writes(&self) {
+        for chunk in &self.list {
+            chunk
+                .client_writes_closed
+                .store(true, Ordering::Release);
+        }
+        info!(
+            "Client writes closed on {} chunks; index write-back continues until the flush \
+             completes",
+            self.list.len()
+        );
+    }
+
     pub fn close_writes(&self) {
         for chunk in &self.list {
             chunk.writes_closed.store(true, Ordering::Release);
@@ -5196,6 +5253,61 @@ mod tests {
         assert_eq!(
             plain.addr, before,
             "the reclaimed span is reused, so an abort costs no space at all"
+        );
+    }
+
+    /// Shutdown stops CLIENT writes before the flush, and lets the index's
+    /// own writes through.
+    ///
+    /// Both halves matter and they pull opposite ways. Leave client writes
+    /// open and one acked after the flush loses its index entries -- the cell
+    /// is archived and survives, the entries never reach disk. Close
+    /// everything instead and the write-back's own tree pages, which are
+    /// cells in these same chunks, are refused: that killed the ranged index
+    /// at shutdown while every data cell survived, and is why the close sits
+    /// at step 1.6 in the first place.
+    #[test]
+    fn shutdown_stops_client_writes_before_index_writes() {
+        let _ = env_logger::try_init();
+        let chunks = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let chunk = &chunks.list[0];
+
+        // A client schema, and the two the index writes itself.
+        let client_schema = 4242u32;
+        let page_schema = *crate::index::ranged::tree::btree::PAGE_SCHEMA_ID;
+        let tree_schema = *crate::index::ranged::tree::tree::RANGED_TREE_SCHEMA_ID;
+        assert_ne!(client_schema, page_schema);
+        assert_ne!(client_schema, tree_schema);
+
+        // Open for business: everything is allowed.
+        assert!(chunk.shutdown_refuses(client_schema).is_ok());
+        assert!(chunk.shutdown_refuses(page_schema).is_ok());
+
+        chunks.close_client_writes();
+
+        assert!(
+            matches!(
+                chunk.shutdown_refuses(client_schema),
+                Err(WriteError::ServerShuttingDown)
+            ),
+            "a client write must be refused once shutdown starts, so nothing it \
+             is told succeeded can land after the flush"
+        );
+        assert!(
+            chunk.shutdown_refuses(page_schema).is_ok(),
+            "the write-back's own pages must still be placeable, or the flush \
+             this close exists to protect cannot run"
+        );
+        assert!(
+            chunk.shutdown_refuses(tree_schema).is_ok(),
+            "and so must the tree metadata the flush rewrites"
+        );
+
+        // Stage two closes everything, index included.
+        chunks.close_writes();
+        assert!(
+            chunk.try_acquire(64, false).is_err(),
+            "after close_writes nothing may allocate at all"
         );
     }
 
