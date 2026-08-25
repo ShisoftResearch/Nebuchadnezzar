@@ -2,6 +2,7 @@
 mod test {
     use crate::index::entry::EntryKey;
     use crate::index::{Feature, FEATURE_SIZE};
+    use crate::ram::schema::SchemaUid;
     use crate::ram::types::Id;
     use byteorder::{BigEndian, WriteBytesExt};
 
@@ -14,7 +15,7 @@ mod test {
 
     fn create_entry_key(schema_id: u32, field: u64, feature_value: u64, id: Id) -> EntryKey {
         let feature = u64_to_feature(feature_value);
-        EntryKey::from_props(&id, &feature, field, schema_id)
+        EntryKey::from_props(&id, &feature, field, SchemaUid(schema_id))
     }
 
     #[test]
@@ -57,7 +58,7 @@ mod test {
 
         // Create inclusive end key (as done in ValueRange::to_key_range)
         let max_id = Id::from_parts(u64::MAX, u64::MAX);
-        let end_key = EntryKey::from_props(&max_id, &feature, field, schema_id);
+        let end_key = EntryKey::from_props(&max_id, &feature, field, SchemaUid(schema_id));
 
         // Create data keys with same feature value but different IDs
         let data_key1 = create_entry_key(schema_id, field, feature_value, Id::from_parts(1, 10));
@@ -106,7 +107,7 @@ mod test {
         let feature = u64_to_feature(feature_value);
 
         // Create inclusive start key
-        let start_key = EntryKey::for_schema_field_feature(schema_id, field, &feature);
+        let start_key = EntryKey::for_schema_field_feature(SchemaUid(schema_id), field, &feature);
 
         // Create data keys
         let data_key1 = create_entry_key(schema_id, field, 9, Id::from_parts(1, 10));
@@ -141,8 +142,10 @@ mod test {
         let max_id = Id::from_parts(u64::MAX, u64::MAX);
 
         // Create range: [0, 50] inclusive
-        let start_key = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(0));
-        let end_key = EntryKey::from_props(&max_id, &u64_to_feature(50), field, schema_id);
+        let start_key =
+            EntryKey::for_schema_field_feature(SchemaUid(schema_id), field, &u64_to_feature(0));
+        let end_key =
+            EntryKey::from_props(&max_id, &u64_to_feature(50), field, SchemaUid(schema_id));
 
         // Simulate iterating through values 0 to 51
         let mut included = Vec::new();
@@ -184,7 +187,8 @@ mod test {
         let max_id = Id::from_parts(u64::MAX, u64::MAX);
 
         // Create end key for value 50 (inclusive)
-        let end_key = EntryKey::from_props(&max_id, &u64_to_feature(50), field, schema_id);
+        let end_key =
+            EntryKey::from_props(&max_id, &u64_to_feature(50), field, SchemaUid(schema_id));
 
         // Test value 49 (should be included)
         let key49 = create_entry_key(schema_id, field, 49, Id::from_parts(1, 49));
@@ -275,7 +279,8 @@ mod test {
         );
 
         // Try seeking directly to value 50
-        let key50_seek = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(50));
+        let key50_seek =
+            EntryKey::for_schema_field_feature(SchemaUid(schema_id), field, &u64_to_feature(50));
         let cursor50 = tree.seek(&key50_seek, Ordering::Forward);
         println!(
             "Seek to value 50, current: {:?}",
@@ -287,7 +292,8 @@ mod test {
         );
 
         // Try seeking to value 49 and see what's next
-        let key49_seek = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(49));
+        let key49_seek =
+            EntryKey::for_schema_field_feature(SchemaUid(schema_id), field, &u64_to_feature(49));
         let mut cursor49 = tree.seek(&key49_seek, Ordering::Forward);
         println!(
             "Seek to value 49, current: {:?}",
@@ -384,9 +390,11 @@ mod test {
         // to the node containing value 50.
 
         // Create range [0, 50] inclusive
-        let start_key = EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(0));
+        let start_key =
+            EntryKey::for_schema_field_feature(SchemaUid(schema_id), field, &u64_to_feature(0));
         let max_id = Id::from_parts(u64::MAX, u64::MAX);
-        let end_key = EntryKey::from_props(&max_id, &u64_to_feature(50), field, schema_id);
+        let end_key =
+            EntryKey::from_props(&max_id, &u64_to_feature(50), field, SchemaUid(schema_id));
 
         let range = Range {
             start: RangeTerm::Inclusive(start_key.clone()),
@@ -576,10 +584,14 @@ mod test {
 
         // Helper function to perform range query and collect results
         let collect_range = |tree: &RangedTree, start: u64, end: u64| -> Vec<u64> {
-            let start_key =
-                EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(start));
+            let start_key = EntryKey::for_schema_field_feature(
+                SchemaUid(schema_id),
+                field,
+                &u64_to_feature(start),
+            );
             let max_id = Id::from_parts(u64::MAX, u64::MAX);
-            let end_key = EntryKey::from_props(&max_id, &u64_to_feature(end), field, schema_id);
+            let end_key =
+                EntryKey::from_props(&max_id, &u64_to_feature(end), field, SchemaUid(schema_id));
 
             let range = Range {
                 start: RangeTerm::Inclusive(start_key.clone()),
@@ -835,10 +847,14 @@ mod test {
 
         // Helper function to perform backward range query
         let collect_range_backward = |tree: &RangedTree, start: u64, end: u64| -> Vec<u64> {
-            let start_key =
-                EntryKey::for_schema_field_feature(schema_id, field, &u64_to_feature(start));
+            let start_key = EntryKey::for_schema_field_feature(
+                SchemaUid(schema_id),
+                field,
+                &u64_to_feature(start),
+            );
             let max_id = Id::from_parts(u64::MAX, u64::MAX);
-            let end_key = EntryKey::from_props(&max_id, &u64_to_feature(end), field, schema_id);
+            let end_key =
+                EntryKey::from_props(&max_id, &u64_to_feature(end), field, SchemaUid(schema_id));
 
             let range = Range {
                 start: RangeTerm::Inclusive(start_key.clone()),

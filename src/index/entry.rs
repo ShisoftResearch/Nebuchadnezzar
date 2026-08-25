@@ -1,4 +1,5 @@
 use super::{Feature, FEATURE_SIZE, KEY_SIZE};
+use crate::ram::schema::SchemaUid;
 use crate::ram::types::Id;
 use byteorder::{BigEndian, WriteBytesExt};
 use serde::de::{SeqAccess, Visitor};
@@ -24,26 +25,39 @@ pub struct EntryKey {
 }
 
 impl EntryKey {
-    pub fn from_props(id: &Id, feature: &Feature, field: u64, schema_id: u32) -> Self {
+    /// Build a ranged-index key.
+    ///
+    /// The leading four bytes are the schema **family**, not the generation
+    /// that encoded the cell. That is what lets `for_schema` remain a single
+    /// prefix covering a whole schema: were the prefix a generation, a scan
+    /// would have to be repeated once per generation and the results merged,
+    /// and every cell the cleaner migrated would need its index entries
+    /// deleted and reinserted under a new prefix. Neither happens -- migrating
+    /// a cell rewrites its bytes and leaves its keys alone.
+    ///
+    /// The prefix keeps its width and position; only its meaning is pinned.
+    pub fn from_props(id: &Id, feature: &Feature, field: u64, schema_uid: SchemaUid) -> Self {
         let mut key = Self::new();
         let mut cursor = Cursor::new(&mut key.slice[..]);
-        cursor.write_u32::<BigEndian>(schema_id).unwrap();
+        cursor.write_u32::<BigEndian>(schema_uid.get()).unwrap();
         cursor.write_u32::<BigEndian>(field as u32).unwrap();
         cursor.write(feature).unwrap();
         cursor.write_u64::<BigEndian>(id.bits()).unwrap();
         key
     }
 
-    pub fn for_scannable(id: &Id, schema_id: u32) -> Self {
-        Self::from_props(id, &Default::default(), 0, schema_id)
+    pub fn for_scannable(id: &Id, schema_uid: SchemaUid) -> Self {
+        Self::from_props(id, &Default::default(), 0, schema_uid)
     }
 
-    pub fn for_schema(schema_id: u32) -> Self {
-        Self::from_props(&Id::unit_id(), &Default::default(), 0, schema_id)
+    /// The prefix that covers every cell of one schema family, in every
+    /// generation it has ever had.
+    pub fn for_schema(schema_uid: SchemaUid) -> Self {
+        Self::from_props(&Id::unit_id(), &Default::default(), 0, schema_uid)
     }
 
-    pub fn for_schema_field_feature(schema_id: u32, field: u64, feature: &Feature) -> Self {
-        Self::from_props(&Id::unit_id(), feature, field, schema_id)
+    pub fn for_schema_field_feature(schema_uid: SchemaUid, field: u64, feature: &Feature) -> Self {
+        Self::from_props(&Id::unit_id(), feature, field, schema_uid)
     }
 
     #[inline(always)]
@@ -221,5 +235,52 @@ impl PartialOrd for EntryKey {
 impl Ord for EntryKey {
     fn cmp(&self, other: &EntryKey) -> cmp::Ordering {
         self.slice.cmp(&other.slice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ram::schema::SchemaUid;
+
+    /// One prefix must cover a schema family's cells in *every* generation.
+    ///
+    /// This is what keeps the query layer generation-agnostic. A ranged scan
+    /// of a schema seeks `for_schema(uid)` and walks while the 4-byte prefix
+    /// matches; if that prefix were the generation, the scan would see only
+    /// the cells written under whichever generation it happened to name, and
+    /// correctness would depend on fanning out across generations and merging.
+    /// It would also mean the cleaner could not migrate a cell without
+    /// deleting and reinserting every index entry the cell owns.
+    #[test]
+    fn one_prefix_covers_every_generation_of_a_family() {
+        let family = SchemaUid(42);
+        let field = 7u64;
+        let feature: Feature = [1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Two cells of the same family. Nothing here names a generation --
+        // that is the point: the key does not carry one.
+        let older = EntryKey::from_props(&Id::from_parts(1, 100), &feature, field, family);
+        let newer = EntryKey::from_props(&Id::from_parts(1, 200), &feature, field, family);
+
+        let prefix = EntryKey::for_schema(family);
+        assert_eq!(&older.as_slice()[..4], &prefix.as_slice()[..4]);
+        assert_eq!(&newer.as_slice()[..4], &prefix.as_slice()[..4]);
+
+        // And a different family must not fall inside that prefix, or a scan
+        // would leak another schema's rows into this one's results.
+        let stranger =
+            EntryKey::from_props(&Id::from_parts(1, 100), &feature, field, SchemaUid(43));
+        assert_ne!(&stranger.as_slice()[..4], &prefix.as_slice()[..4]);
+    }
+
+    /// The prefix is the family, big-endian, in the first four bytes -- the
+    /// same width and position it has always occupied. The ranged client
+    /// rebuilds this pattern by hand in `schema_pattern`, so the two encodings
+    /// have to agree byte for byte or a schema scan matches nothing.
+    #[test]
+    fn the_family_is_the_first_four_bytes_big_endian() {
+        let key = EntryKey::for_schema(SchemaUid(0x0A0B0C0D));
+        assert_eq!(&key.as_slice()[..4], &[0x0A, 0x0B, 0x0C, 0x0D]);
     }
 }

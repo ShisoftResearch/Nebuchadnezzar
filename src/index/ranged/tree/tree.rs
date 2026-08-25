@@ -2,7 +2,7 @@
 
 use super::btree::level::*;
 use super::btree::*;
-use crate::ram::schema::{Field, Schema, SchemaVid};
+use crate::ram::schema::{Field, Schema, SchemaUid, SchemaVid};
 use crate::ram::types::*;
 use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use lightning::map::HashSet as LFHashSet;
@@ -558,14 +558,14 @@ mod tests {
 
     fn make_key(n: u64) -> EntryKey {
         let feature = make_feature(n);
-        EntryKey::from_props(&Id::from_parts(1, n), &feature, 100, 1)
+        EntryKey::from_props(&Id::from_parts(1, n), &feature, 100, SchemaUid(1))
     }
 
-    fn make_scan_key(schema_id: u32, id: Id) -> EntryKey {
+    fn make_scan_key(schema_id: SchemaUid, id: Id) -> EntryKey {
         EntryKey::for_scannable(&id, schema_id)
     }
 
-    fn make_field_key(schema_id: u32, field: u64, n: u64, id: Id) -> EntryKey {
+    fn make_field_key(schema_id: SchemaUid, field: u64, n: u64, id: Id) -> EntryKey {
         let feature = make_feature(n);
         EntryKey::from_props(&id, &feature, field, schema_id)
     }
@@ -862,7 +862,7 @@ mod tests {
 
         for value in 10..=12 {
             assert!(tree.insert(&make_field_key(
-                schema_id,
+                SchemaUid(schema_id),
                 field,
                 value,
                 Id::from_parts(5, value)
@@ -870,16 +870,17 @@ mod tests {
         }
         assert_eq!(tree.count(), 3);
 
-        let deleted = make_field_key(schema_id, field, 11, Id::from_parts(5, 11));
+        let deleted = make_field_key(SchemaUid(schema_id), field, 11, Id::from_parts(5, 11));
         assert!(tree.delete(&deleted));
         assert_eq!(tree.count(), 2);
 
-        let start_key = EntryKey::for_schema_field_feature(schema_id, field, &make_feature(10));
+        let start_key =
+            EntryKey::for_schema_field_feature(SchemaUid(schema_id), field, &make_feature(10));
         let end_key = EntryKey::from_props(
             &Id::from_parts(u64::MAX, u64::MAX),
             &make_feature(12),
             field,
-            schema_id,
+            SchemaUid(schema_id),
         );
 
         let collect_visible = |tree: &RangedTree| {
@@ -971,7 +972,12 @@ mod tests {
         let tree_id = Id::from_parts(902, 902);
         let tree = RangedTree::create(&client, &tree_id).await;
         for value in 20..=22 {
-            assert!(tree.insert(&make_field_key(1, 778, value, Id::from_parts(6, value))));
+            assert!(tree.insert(&make_field_key(
+                SchemaUid(1),
+                778,
+                value,
+                Id::from_parts(6, value)
+            )));
         }
         storage::wait_until_updated().await;
 
@@ -1075,7 +1081,7 @@ mod tests {
         let n = 300u64;
         for value in 0..n {
             assert!(tree.insert(&make_field_key(
-                schema_id,
+                SchemaUid(schema_id),
                 field,
                 value,
                 Id::from_parts(7, value)
@@ -1118,7 +1124,7 @@ mod tests {
         // before that page — it is provably foreign — and serve the rest.
         let keys_before_last_page = 128 * (page_ids.len() as u64 - 1);
         let upper = make_field_key(
-            schema_id,
+            SchemaUid(schema_id),
             field,
             keys_before_last_page,
             Id::from_parts(7, keys_before_last_page),
@@ -1216,7 +1222,7 @@ mod tests {
         let n = 300u64;
         for value in 0..n {
             assert!(tree.insert(&make_field_key(
-                schema_id,
+                SchemaUid(schema_id),
                 field,
                 value,
                 Id::from_parts(8, value)
@@ -1344,12 +1350,15 @@ mod tests {
 
         for i in 0..n {
             let id = Id::from_parts(1, i);
-            assert!(tree.insert(&make_scan_key(schema_id, id)));
-            assert!(tree.insert(&make_field_key(schema_id, field_id, i, id)));
+            assert!(tree.insert(&make_scan_key(SchemaUid(schema_id), id)));
+            assert!(tree.insert(&make_field_key(SchemaUid(schema_id), field_id, i, id)));
         }
 
-        let prefix = EntryKey::for_schema(schema_id).as_slice()[..16].to_vec();
-        let mut cursor = tree.seek(&EntryKey::for_schema(schema_id), Ordering::Forward);
+        let prefix = EntryKey::for_schema(SchemaUid(schema_id)).as_slice()[..16].to_vec();
+        let mut cursor = tree.seek(
+            &EntryKey::for_schema(SchemaUid(schema_id)),
+            Ordering::Forward,
+        );
         let mut seen = Vec::new();
 
         if let Some(key) = cursor.current() {
@@ -1380,19 +1389,22 @@ mod tests {
 
         for i in 0..n {
             let id = Id::from_parts(1, i);
-            assert!(tree.insert(&make_scan_key(schema_1, id)));
-            assert!(tree.insert(&make_field_key(schema_1, field_id, i, id)));
+            assert!(tree.insert(&make_scan_key(SchemaUid(schema_1), id)));
+            assert!(tree.insert(&make_field_key(SchemaUid(schema_1), field_id, i, id)));
         }
 
         for i in 0..n {
             let id = Id::from_parts(2, i);
-            assert!(tree.insert(&make_scan_key(schema_2, id)));
-            assert!(tree.insert(&make_field_key(schema_2, field_id, i, id)));
+            assert!(tree.insert(&make_scan_key(SchemaUid(schema_2), id)));
+            assert!(tree.insert(&make_field_key(SchemaUid(schema_2), field_id, i, id)));
         }
 
         for (schema_id, higher) in [(schema_1, 1u64), (schema_2, 2u64)] {
-            let prefix = EntryKey::for_schema(schema_id).as_slice()[..16].to_vec();
-            let mut cursor = tree.seek(&EntryKey::for_schema(schema_id), Ordering::Forward);
+            let prefix = EntryKey::for_schema(SchemaUid(schema_id)).as_slice()[..16].to_vec();
+            let mut cursor = tree.seek(
+                &EntryKey::for_schema(SchemaUid(schema_id)),
+                Ordering::Forward,
+            );
             let mut seen = Vec::new();
 
             if let Some(key) = cursor.current() {

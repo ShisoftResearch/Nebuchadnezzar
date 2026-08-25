@@ -1,7 +1,7 @@
 use crate::index::builder::IndexBuilder;
 use crate::ram::schema::Field;
 use crate::ram::schema::Schema;
-use crate::ram::schema::SchemaVid;
+use crate::ram::schema::{SchemaUid, SchemaVid};
 use crate::ram::types::*;
 use crate::server::DatabaseRuntime;
 use crate::server::*;
@@ -2274,7 +2274,7 @@ async fn a_secondary_databases_ranged_index_survives_a_graceful_restart() {
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(schema_id, 64)
+            .scan_schema(SchemaUid(schema_id), 64)
             .await
             .expect("scan should not error")
         {
@@ -2491,7 +2491,7 @@ async fn a_ranged_index_with_tombstone_emptied_pages_survives_a_graceful_restart
         let mut cursor = match runtime
             .neb_client
             .ranged()
-            .scan_schema(schema_id, 64)
+            .scan_schema(SchemaUid(schema_id), 64)
             .await
             .expect("scan should not error")
         {

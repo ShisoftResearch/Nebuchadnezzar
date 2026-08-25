@@ -6,6 +6,7 @@ use crate::index::{
     },
     EntryKey, Feature,
 };
+use crate::ram::schema::SchemaUid;
 use dovahkiin::types::{Id, SharedValue};
 
 #[derive(Clone, Debug)]
@@ -22,7 +23,7 @@ pub enum ValueRangeTerm {
 }
 
 impl ValueRange {
-    pub fn to_key_range(self, schema: u32, field: u64, ordering: Ordering) -> Range {
+    pub fn to_key_range(self, schema: SchemaUid, field: u64, ordering: Ordering) -> Range {
         Range {
             start: match self.start {
                 ValueRangeTerm::Inclusive(v) => {

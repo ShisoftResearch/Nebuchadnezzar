@@ -35,7 +35,7 @@ impl DataSource<Id, CellIdQuery> for CellIds {
         let schema = params.schema;
         let field = params.field;
         let ordering = params.ordering;
-        let range = params.range.to_key_range(schema.get(), field, ordering);
+        let range = params.range.to_key_range(schema, field, ordering);
         let cursor = params
             .index_client
             .range_seek(range, BUFFER_SIZE, None)

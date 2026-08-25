@@ -54,7 +54,7 @@ impl IndexedDataClient {
         proc: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        let key = EntryKey::for_schema(schema.get());
+        let key = EntryKey::for_schema(schema);
         let index_cursor = self
             .index_clients
             .range_seek(
@@ -73,7 +73,7 @@ impl IndexedDataClient {
         schema: SchemaUid,
         _ordering: QueryOrdering,
     ) -> Result<Vec<Id>, RPCError> {
-        let key = EntryKey::for_schema(schema.get());
+        let key = EntryKey::for_schema(schema);
         let Some(mut index_cursor) = self
             .index_clients
             .range_seek(
@@ -116,7 +116,7 @@ impl IndexedDataClient {
         if limit == 0 {
             return Ok(vec![]);
         }
-        let key = EntryKey::for_schema(schema.get());
+        let key = EntryKey::for_schema(schema);
         let Some(mut index_cursor) = self
             .index_clients
             .range_seek(

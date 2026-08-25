@@ -183,7 +183,7 @@ impl IndexedDataClient {
         proc: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        let range = range.to_key_range(schema.get(), field, ordering);
+        let range = range.to_key_range(schema, field, ordering);
         let index_cursor = self
             .index_clients
             .range_seek(range, SCAN_BUFFER_SIZE, None)

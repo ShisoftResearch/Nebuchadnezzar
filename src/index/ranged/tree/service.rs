@@ -4,6 +4,7 @@ pub use super::btree::level::BTREE_NODE_SIZE as MIGRATE_SIZE;
 use super::btree::storage;
 use super::tree::*;
 use crate::client::AsyncClient;
+use crate::ram::schema::SchemaUid;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
 use bifrost::conshash::ConsistentHashing;
@@ -211,10 +212,11 @@ pub struct TreeService {
     balancer_running: Arc<std::sync::atomic::AtomicBool>,
 }
 
-fn trace_schema_from_key(key: &EntryKey) -> u32 {
+/// The family named by a key's prefix. Diagnostics only.
+fn trace_schema_from_key(key: &EntryKey) -> SchemaUid {
     let mut schema = [0u8; 4];
     schema.copy_from_slice(&key.as_slice()[..4]);
-    u32::from_be_bytes(schema)
+    SchemaUid(u32::from_be_bytes(schema))
 }
 
 fn should_trace_range_seek(key: &EntryKey, pattern: Option<&[u8]>) -> bool {
@@ -227,7 +229,7 @@ fn should_trace_range_seek(key: &EntryKey, pattern: Option<&[u8]>) -> bool {
     let Ok(schema_id) = value.parse::<u32>() else {
         return false;
     };
-    if trace_schema_from_key(key) != schema_id {
+    if trace_schema_from_key(key) != SchemaUid(schema_id) {
         return false;
     }
     match pattern {
@@ -286,7 +288,7 @@ fn trace_seek_progress(tree_id: Id, entry: &EntryKey, progress: &[String]) {
     );
 }
 
-fn trace_probe_missing_key(tree_id: Id, tree: &RangedTree, schema_id: u32, gap: (Id, Id)) {
+fn trace_probe_missing_key(tree_id: Id, tree: &RangedTree, schema_id: SchemaUid, gap: (Id, Id)) {
     if gap.1.bits() != gap.0.bits() + 2 {
         return;
     }
@@ -376,22 +378,22 @@ impl Service for TreeService {
             self.reconcile_split_marker(&id, &boundary).await;
             let tree =
                 match RangedTree::recover_bounded(&self.client, &id, Some(&boundary.upper)).await {
-                Ok(tree) => tree,
-                Err(error) => {
-                    // Leave it absent rather than installing an empty tree.
-                    // An empty tree answers every range scan with "no rows",
-                    // which is indistinguishable from a correct answer and is
-                    // how a store that had not finished recovering came to
-                    // look like a store with no data. Absent means the next
-                    // operation on this range tries again.
-                    error!(
-                        "Not loading ranged tree {:?}: {}. The range it covers will report \
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        // Leave it absent rather than installing an empty tree.
+                        // An empty tree answers every range scan with "no rows",
+                        // which is indistinguishable from a correct answer and is
+                        // how a store that had not finished recovering came to
+                        // look like a store with no data. Absent means the next
+                        // operation on this range tries again.
+                        error!(
+                            "Not loading ranged tree {:?}: {}. The range it covers will report \
                          errors until it can be read, which is preferable to reporting empty.",
-                        id, error
-                    );
-                    return;
-                }
-            };
+                            id, error
+                        );
+                        return;
+                    }
+                };
             debug!(
                 "LSM tree loaded with {} keys, capacity {}.",
                 tree.count(),
@@ -765,8 +767,7 @@ impl TreeService {
     /// placement map knows the target) just shed the marker. The decision
     /// key: whoever owns the key at this tree's placement upper bound.
     async fn reconcile_split_marker(&self, id: &Id, boundary: &Boundary) {
-        let Some((head, Some(target))) =
-            super::tree::read_tree_metadata(&self.client, id).await
+        let Some((head, Some(target))) = super::tree::read_tree_metadata(&self.client, id).await
         else {
             return;
         };
@@ -799,8 +800,7 @@ impl TreeService {
         }
         // Uncommitted: the placement never flipped, so this tree still owns
         // the whole range and the split must be undone.
-        if let Some((target_head, _)) =
-            super::tree::read_tree_metadata(&self.client, &target).await
+        if let Some((target_head, _)) = super::tree::read_tree_metadata(&self.client, &target).await
         {
             let chain = super::tree::walk_chain_page_ids(&self.client, head).await;
             if chain.contains(&target_head) {
@@ -1511,7 +1511,10 @@ impl TreeService {
                             dist_prop.migration = None;
                         }
                         if let Err(e) = tree.mark_migration(&dist_tree.id, None, &client).await {
-                            warn!("Failed to publish split source tree {:?}: {:?}", dist_tree.id, e);
+                            warn!(
+                                "Failed to publish split source tree {:?}: {:?}",
+                                dist_tree.id, e
+                            );
                         }
                         pending_migrations.remove(&migration_target_id);
                         debug!(
@@ -1677,4 +1680,3 @@ pub async fn locate_tree_server_from_conshash(
         Err(RPCError::RequestError(RPCRequestError::Other))
     }
 }
-

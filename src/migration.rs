@@ -1310,7 +1310,7 @@ mod tests {
     #[test]
     #[ignore]
     fn codec_share_of_transfer_cost() {
-        use crate::ram::schema::SchemaVid;
+        use crate::ram::schema::{SchemaUid, SchemaVid};
         use crate::ram::types::{Map, OwnedMap, OwnedValue};
 
         const CELLS: usize = 1024;
@@ -1444,6 +1444,7 @@ mod cluster_tests {
     use super::*;
     use crate::client;
     use crate::ram::schema::Schema;
+    use crate::ram::schema::SchemaUid;
     use crate::ram::tests::default_fields;
     use crate::ram::types::{Map, OwnedMap, OwnedValue};
     use crate::server::*;
@@ -2687,7 +2688,7 @@ mod cluster_tests {
         }
         let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
 
-        async fn scan_ids(client: &Arc<AsyncClient>, schema: u32) -> HashSet<Id> {
+        async fn scan_ids(client: &Arc<AsyncClient>, schema: SchemaUid) -> HashSet<Id> {
             let mut found = HashSet::new();
             if let Ok(Some(mut cursor)) = client.ranged().scan_schema(schema, 64).await {
                 loop {
@@ -2702,7 +2703,7 @@ mod cluster_tests {
             found
         }
 
-        let before = scan_ids(&client, SCHEMA).await;
+        let before = scan_ids(&client, SchemaUid(SCHEMA)).await;
         assert!(
             written.is_subset(&before),
             "the scan must find the cells before any migration, or this proves nothing: \
@@ -2725,7 +2726,7 @@ mod cluster_tests {
         }
         let _ = crate::index::builder::IndexBuilder::await_all_indices().await;
 
-        let after = scan_ids(&client, SCHEMA).await;
+        let after = scan_ids(&client, SchemaUid(SCHEMA)).await;
         let lost: Vec<&Id> = written.iter().filter(|id| !after.contains(id)).collect();
         // Is this the residual stale pointer? Ranged index pages ARE cells, so a
         // single zeroed page makes a scan return nothing -- which is exactly what

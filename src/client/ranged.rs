@@ -15,6 +15,7 @@ use crate::index::ranged::client::RangedIndexerClient;
 use crate::index::ranged::tree::btree::Ordering;
 use crate::index::ranged::tree::service::{Range, RangeTerm};
 use crate::index::Feature;
+use crate::ram::schema::SchemaUid;
 use crate::ram::types::Id;
 
 /// Client for distributed ranged index queries
@@ -103,7 +104,7 @@ impl RangedClient {
     /// * `buffer_size` - Number of IDs to fetch per batch
     pub async fn scan_schema(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         buffer_size: u16,
     ) -> Result<Option<RangedCursor>, RPCError> {
         let key = EntryKey::for_schema(schema_id);
@@ -119,7 +120,7 @@ impl RangedClient {
     /// Scan all documents in a schema in specified order
     pub async fn scan_schema_ordered(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         order: ScanOrder,
         buffer_size: u16,
     ) -> Result<Option<RangedCursor>, RPCError> {
@@ -144,7 +145,7 @@ impl RangedClient {
     /// * `buffer_size` - Number of IDs per batch
     pub async fn range_query(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         start_feature: Option<&Feature>,
         end_feature: Option<&Feature>,
@@ -214,13 +215,13 @@ impl RangedClient {
     }
 
     /// Create schema scan pattern
-    fn schema_pattern(&self, schema_id: u32) -> Vec<u8> {
+    fn schema_pattern(&self, schema_id: SchemaUid) -> Vec<u8> {
         use byteorder::{BigEndian, WriteBytesExt};
         use std::io::Cursor;
 
         let mut pattern = vec![0u8; crate::index::SCHEMA_SCAN_PATT_SIZE as usize];
         let mut cursor = Cursor::new(&mut pattern[..]);
-        cursor.write_u32::<BigEndian>(schema_id).unwrap();
+        cursor.write_u32::<BigEndian>(schema_id.get()).unwrap();
         // field_id = 0 for schema scan
         cursor.write_u32::<BigEndian>(0).unwrap();
         // feature = 0 for schema scan

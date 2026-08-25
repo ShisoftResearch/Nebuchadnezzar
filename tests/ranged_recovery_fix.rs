@@ -7,6 +7,7 @@ use neb::index::ranged::tree::btree::{page_schema, storage, Ordering};
 use neb::index::ranged::tree::service::{OpResult, Range, Service as TreeRpcService, TreeService};
 use neb::index::ranged::tree::tree::{RangedTree, RANGED_TREE_HEAD_HASH, RANGED_TREE_SCHEMA};
 use neb::index::EntryKey;
+use neb::ram::schema::SchemaUid;
 use neb::ram::types::Id;
 use neb::server::{database_meta_plane_id, NebServer, ServerOptions, Service as NebService};
 
@@ -55,7 +56,7 @@ async fn lazy_hydration_recovers_missing_active_tree() {
     ));
     let local_service = TreeService::new(&client, &sm_client);
 
-    let entry = EntryKey::for_scannable(&Id::from_parts(7, 7), 0x12_34_56_78);
+    let entry = EntryKey::for_scannable(&Id::from_parts(7, 7), SchemaUid(0x12_34_56_78));
     let (_lower, placement, _upper) = sm_client
         .locate_key(&entry)
         .await

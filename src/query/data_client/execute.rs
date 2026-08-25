@@ -312,7 +312,7 @@ impl IndexedDataClient {
         ordering: Ordering,
     ) -> Result<Vec<Id>, RPCError> {
         let mut ids = vec![];
-        let key_range = range.clone().to_key_range(schema.get(), field, ordering);
+        let key_range = range.clone().to_key_range(schema, field, ordering);
         let Some(mut cursor) = self
             .index_clients
             .range_seek(key_range, super::SCAN_BUFFER_SIZE, None)

@@ -617,10 +617,10 @@ impl IndexBuilder {
                 schema.vid.get(),
                 cell.id()
             );
-            Some(EntryKey::for_scannable(
-                &cell.id(),
-                cell.header.schema.get(),
-            ))
+            // The scannable key is a family key, and the record is right
+            // here -- taking it from `cell.header.schema` would put the
+            // generation in the prefix.
+            Some(EntryKey::for_scannable(&cell.id(), schema.uid))
         } else {
             log::debug!(
                 "Schema {} is NOT scannable for cell {:?}",
@@ -742,15 +742,24 @@ impl IndexBuilder {
     pub fn remove_indices(&self, cell: &SharedCell, schema: &Schema) {
         let indexers = self.clients.clone();
         if schema.is_scannable {
-            self.remove_scannable(cell, &indexers);
+            self.remove_scannable(cell, schema.uid, &indexers);
         }
         let indices = probe_cell_indices(cell, schema);
         new_index_task(async move { Self::remove_indices_(indices, indexers).await });
     }
 
     // Remove scannable indices
-    fn remove_scannable(&self, cell: &SharedCell, indexers: &Arc<IndexerClients>) {
-        let key = EntryKey::for_scannable(&cell.id(), cell.header.schema.get());
+    /// Takes the family explicitly: a cell header names the generation that
+    /// encoded it, which is not what the key is prefixed by, and a removal
+    /// that derived the prefix from the header would miss the entry it meant
+    /// to delete once the cell had been migrated.
+    fn remove_scannable(
+        &self,
+        cell: &SharedCell,
+        schema_uid: SchemaUid,
+        indexers: &Arc<IndexerClients>,
+    ) {
+        let key = EntryKey::for_scannable(&cell.id(), schema_uid);
         let indexers = indexers.clone();
         new_index_task(async move {
             indexers
@@ -1218,8 +1227,7 @@ where
                         metas.push(IndexMeta::Null(NullIndexMeta { hash_id, cell_id }));
                     }
                     IndexComps::Ranged(feat) => {
-                        let key =
-                            EntryKey::from_props(&cell_id, &feat, *field_id, schema.vid.get());
+                        let key = EntryKey::from_props(&cell_id, &feat, *field_id, schema.uid);
                         metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                     }
                     IndexComps::Vector(cell_id, schema_id, field_id, config) => {
