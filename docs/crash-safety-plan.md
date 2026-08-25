@@ -1327,6 +1327,22 @@ refcount half is provable by reading the function.
 it can still tear between data pointer and vtable. The real fix is an atomic
 field, which a fat pointer cannot be without restructuring `NodeRefInner`.
 
+### Full-suite A/B, both arms carrying the `try_clone_speculative` fix
+
+The first comparison was unreadable because BOTH arms carried that race, and
+chance put its two hits on the candidate. With it fixed on both:
+
+| arm | rounds | result |
+|---|---|---|
+| candidate (Phase 6b) | 5 | **5 clean**, 734 passed each |
+| control (`35a3bc43`) | 5 | 4 clean, **1 SIGSEGV** |
+
+The candidate did strictly better than the control, so the termination work
+introduces no suite regression. **The remaining SIGSEGV is pre-existing**: it
+hit the control, with the speculative-clone fix applied, so it is neither the
+Phase 6b work nor the `cell_ref` triple read. It killed the process at 595 of
+731 tests during a ranged-index teardown, with no panic message.
+
 ## OPEN (2026-08-25): `write_targeted` returns a bypass it cannot write
 
 Found by the crash fuzzer, not by a test. **2,978 panics in one 5-cycle run**,
