@@ -52,6 +52,18 @@ pub struct RangedIndexerClient {
     placement: RwLock<BTreeMap<EntryKey, (TreePlacement, EntryKey)>>,
 }
 
+/// The three outcomes of asking for the tree after a key. See
+/// `RangedIndexerClient::next_tree`.
+#[derive(Debug, Clone)]
+pub enum NextTree {
+    Found(EntryKey, TreePlacement),
+    /// The state machine says nothing follows. This, and only this, ends a scan.
+    End,
+    /// Placement could not be resolved right now -- a split or migration in
+    /// flight. Retry; do NOT treat it as the end.
+    Unresolved(&'static str),
+}
+
 impl RangedIndexerClient {
     pub fn new<C>(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<C>) -> Self
     where
@@ -476,11 +488,19 @@ impl RangedIndexerClient {
         return Ok(Some((lower, placement, upper)));
     }
 
+    /// What `next_tree` found.
+    ///
+    /// `End` and `Unresolved` used to be the same answer -- both `None` -- and
+    /// that is what silently truncated scans. A cursor that cannot resolve
+    /// placement mid-migration would clear itself and return success, so a
+    /// scan crossing a boundary while a split committed returned FEWER ROWS
+    /// WITH NO ERROR. Only the state machine saying "nothing follows" ends a
+    /// scan; everything else is a retry.
     pub async fn next_tree(
         &self,
         origin_key: &EntryKey,
         ordering: Ordering,
-    ) -> Result<Option<(EntryKey, TreePlacement)>, ExecError> {
+    ) -> Result<NextTree, ExecError> {
         // Next tree for cursor
         // This function must be able to detect tree changes and ensure consistency
         let (origin_lower, origin_upper) = {
@@ -495,7 +515,7 @@ impl RangedIndexerClient {
                     let Some((lower, _placement, upper)) =
                         self.refresh_key_mapping(origin_key).await?
                     else {
-                        return Ok(None);
+                        return Ok(NextTree::Unresolved("no tree covers the current key"));
                     };
                     (lower, upper)
                 }
@@ -504,7 +524,7 @@ impl RangedIndexerClient {
                 let Some((lower, _placement, upper)) =
                     self.refresh_key_mapping(origin_key).await?
                 else {
-                    return Ok(None);
+                    return Ok(NextTree::Unresolved("no tree covers the current key"));
                 };
                 (lower, upper)
             }
@@ -519,7 +539,9 @@ impl RangedIndexerClient {
                         "Cannot find next tree placement for {:?}. Mapping {:?}",
                         origin_lower, &*placement
                     );
-                    return Ok(None);
+                    return Ok(NextTree::Unresolved(
+                        "placement entry vanished between two reads",
+                    ));
                 }
             };
             let cached_next = match ordering {
@@ -533,7 +555,10 @@ impl RangedIndexerClient {
                     Ordering::Backward => cached_upper == &origin_lower,
                 };
                 if matched_with_origin {
-                    return Ok(Some((cached_lower.clone(), cached_placement.clone())));
+                    return Ok(NextTree::Found(
+                        cached_lower.clone(),
+                        cached_placement.clone(),
+                    ));
                 } else {
                     debug!(
                         "Cached tree does not match. Ordering {:?}, origin lower {:?}, origin upper {:?}, cached lower {:?}, cached upper {:?}",
@@ -547,15 +572,16 @@ impl RangedIndexerClient {
                 );
             }
         }
-        Ok(self
-            .sm
-            .next_tree(&origin_lower, &ordering)
-            .await?
-            .map(|next| {
+        // The state machine is the authority. Only ITS "nothing follows" ends
+        // a scan.
+        Ok(match self.sm.next_tree(&origin_lower, &ordering).await? {
+            Some(next) => {
                 self.placement
                     .write()
                     .insert(next.lower.clone(), (next.placement.clone(), next.upper));
-                (next.lower, next.placement)
-            }))
+                NextTree::Found(next.lower, next.placement)
+            }
+            None => NextTree::End,
+        })
     }
 }

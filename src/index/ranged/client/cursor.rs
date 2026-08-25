@@ -261,12 +261,33 @@ impl ClientCursor {
                 self.range.key(),
                 self.range.ordering
             );
-            if let Some((tree_key, tree)) = self
+            let next = self
                 .query_client
                 .next_tree(current_key, self.range.ordering)
                 .await
-                .unwrap()
-            {
+                .unwrap();
+            if let crate::index::ranged::client::NextTree::Unresolved(reason) = next {
+                // NOT the end of the scan. Placement could not be resolved --
+                // a split or migration is in flight -- and treating that as
+                // "nothing follows" is what returned short answers with no
+                // error. Retry it exactly like a Migrating reply.
+                last_retry_reason = Some(format!("next tree unresolved: {}", reason));
+                self.query_client.placement.write().remove(current_key);
+                let _ = self.query_client.refresh_key_mapping(current_key).await;
+                debug!(
+                    "Ranged cursor retry {} for key {:?}: next tree unresolved ({})",
+                    retried + 1,
+                    current_key,
+                    reason
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    migration_retry_delay_ms(retried, current_key),
+                ))
+                .await;
+                retried += 1;
+                continue;
+            }
+            if let crate::index::ranged::client::NextTree::Found(tree_key, tree) = next {
                 debug!(
                     "Next tree for {:?} returns {:?}, lower key {:?}, ordering {:?}",
                     current_key, tree, tree_key, self.range.ordering
@@ -420,6 +441,8 @@ impl ClientCursor {
                     }
                 }
             } else {
+                // NextTree::End -- the state machine itself says nothing
+                // follows. That, and only that, ends a scan.
                 if trace_refill {
                     debug!(
                         "MIGRATION_REFILL_END current_key={:?} ordering={:?} reason=no_next_tree",
