@@ -3200,130 +3200,221 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
     if in_doubt.is_empty() {
         return;
     }
-    let peers: Vec<u64> = match database_runtime
-        .consh
-        .membership()
-        .all_members(true)
-        .await
-    {
-        Ok((members, _)) => members
-            .into_iter()
-            .map(|member| member.id)
-            .filter(|id| *id != database_runtime.rpc.server_id)
-            .collect(),
-        Err(error) => {
-            warn!(
-                "{} transaction(s) are in doubt after recovery and the membership could not be \
-                 read ({:?}); every one of them is presumed abort",
-                in_doubt.len(),
-                error
-            );
-            Vec::new()
-        }
-    };
-    info!(
-        "asking {} peer(s) about {} transaction(s) left in doubt by recovery",
-        peers.len(),
-        in_doubt.len()
-    );
-    let Some(txn_manager) = database_runtime.txn_manager() else {
+    let me = database_runtime.rpc.server_id;
+    let Some(txn_manager) = database_runtime.txn_manager().cloned() else {
         warn!(
             "{} transaction(s) are in doubt after recovery but this database runs no transaction \
              service, so there is nothing to ask with; all are presumed abort",
             in_doubt.len()
         );
+        for bracket in &in_doubt {
+            discard_in_doubt(bracket, "no transaction service on this database");
+        }
         return;
     };
-    for bracket in in_doubt {
-        let mut committed = false;
-        for peer in &peers {
-            let Ok(site) = txn_manager.data_site_for(*peer).await else {
-                continue;
-            };
-            match site.txn_status(bracket.txn.clone()).await {
-                Ok(response) => {
-                    if response.payload == transactions::TxnOutcome::Committed {
-                        committed = true;
-                        break;
-                    }
+
+    // WAIT for the membership to know its peers before believing it has none.
+    //
+    // Not defensive padding -- this is the bug the first version had. A node
+    // that restarts resolves before its membership view is populated, reads a
+    // roster of just itself, concludes "no peer reports it committed", and
+    // discards a committed transaction's half. It reproduced roughly one run
+    // in four, logging `asking 0 peer(s)`.
+    //
+    // A successful read is NOT enough on its own: membership answers happily
+    // while it is still learning, so the roster has to be given time to grow.
+    // The cost falls only on a store that crashed mid-transaction, which is
+    // the case that can afford it.
+    let settle = resolve_membership_settle();
+    let settle_deadline = std::time::Instant::now() + settle;
+    let mut roster: Vec<u64> = Vec::new();
+    loop {
+        match database_runtime.consh.membership().all_members(false).await {
+            Ok((members, _)) => {
+                let seen: Vec<u64> = members
+                    .into_iter()
+                    .map(|member| member.id)
+                    .filter(|id| *id != me)
+                    .collect();
+                if seen.len() > roster.len() {
+                    roster = seen;
                 }
-                Err(error) => debug!(
-                    "peer {} did not answer about {:?}: {:?}",
-                    peer, bracket.txn, error
-                ),
             }
+            Err(error) => debug!("membership not readable yet while resolving: {:?}", error),
         }
-        if !committed {
-            info!(
-                "transaction {:?} was in doubt after recovery and no peer reports it committed; \
-                 its {} bracketed cell(s) are discarded",
-                bracket.txn,
-                bracket.cells.len()
-            );
-            crate::ram::recovery::BRACKETS_DISCARDED
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            continue;
+        // One peer is enough to ask; a bigger roster only matters for
+        // deciding that abort is safe, and the answer loop below re-checks.
+        if !roster.is_empty() || std::time::Instant::now() >= settle_deadline {
+            break;
         }
-        // The record FIRST. Installing the cells without it would leave a
-        // store that answers reads correctly right now and forgets the
-        // transaction again at the next restart -- the same loss, one crash
-        // later.
-        //
-        // One record per CHUNK THAT HOLDS A PART, not one record store-wide.
-        //
-        // Recovery would honour a single record anywhere -- it collects
-        // COMMITs globally -- but the cleaner would not. Parts are decided
-        // together and compacted INDEPENDENTLY, so a COMMIT sitting in a
-        // chunk this transaction never touched is one compaction can carry
-        // away while the BEGINs it closes are still on disk, putting the
-        // transaction back in doubt at a restart where the peers may no
-        // longer remember it. Same reasoning as the per-part COMMIT rule in
-        // `close_transaction_bracket`, at chunk granularity: that is as
-        // precise as this path can be, since the transaction's own segments
-        // are full or sealed and cannot take another entry.
-        let mut placed = 0usize;
-        for chunk_id in &bracket.chunks {
-            let Some(chunk) = database_runtime.chunks.list.get(*chunk_id) else {
-                continue;
-            };
-            match chunk.write_resolved_commit(&bracket.txn) {
-                Ok(()) => placed += 1,
-                Err(error) => warn!(
-                    "chunk {} holds part of resolved transaction {:?} but could not take its \
-                     COMMIT: {:?}",
-                    chunk_id, bracket.txn, error
-                ),
-            }
-        }
-        if placed == 0 {
-            error!(
-                "transaction {:?} was resolved COMMITTED by a peer but none of its {} chunk(s) \
-                 could hold a COMMIT; leaving it in doubt rather than installing cells this \
-                 store would lose again at the next start",
-                bracket.txn,
-                bracket.chunks.len()
-            );
-            continue;
-        }
-        if placed < bracket.chunks.len() {
-            warn!(
-                "resolved transaction {:?} got a COMMIT in {} of its {} chunk(s); the rest rely \
-                 on those records surviving compaction",
-                bracket.txn,
-                placed,
-                bracket.chunks.len()
-            );
-        }
-        for cell in &bracket.cells {
-            crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell);
-        }
-        warn!(
-            "transaction {:?} was in doubt after recovery and a peer reports it COMMITTED; its {} \
-             cell(s) are installed and its COMMIT is durable here",
-            bracket.txn,
-            bracket.cells.len()
-        );
-        crate::ram::recovery::BRACKETS_APPLIED
-            .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
+    if roster.is_empty() {
+        warn!(
+            "{} transaction(s) are in doubt after recovery and this group reports no other \
+             member after {:?}; all are presumed abort",
+            in_doubt.len(),
+            settle
+        );
+        for bracket in &in_doubt {
+            discard_in_doubt(bracket, "no peer in the group to ask");
+        }
+        return;
+    }
+    info!(
+        "asking {} peer(s) about {} transaction(s) left in doubt by recovery",
+        roster.len(),
+        in_doubt.len()
+    );
+
+    // ABORT ONLY WHEN EVERY PEER HAS ACTUALLY ANSWERED.
+    //
+    // A peer that cannot be reached has not said "not committed" -- it has
+    // said nothing, and treating silence as a vote is what tears a
+    // transaction. So an unanswered roster member means retry, up to a
+    // deadline, and the give-up is loud and names the transaction.
+    let answer_deadline = std::time::Instant::now() + resolve_answer_timeout();
+    let mut unresolved: Vec<crate::ram::recovery::InDoubtBracket> = in_doubt;
+    loop {
+        let mut still_waiting = Vec::new();
+        for bracket in unresolved {
+            let mut committed = false;
+            let mut answered = 0usize;
+            for peer in &roster {
+                let Ok(site) = txn_manager.data_site_for(*peer).await else {
+                    continue;
+                };
+                match site.txn_status(bracket.txn.clone()).await {
+                    Ok(response) => {
+                        answered += 1;
+                        if response.payload == transactions::TxnOutcome::Committed {
+                            committed = true;
+                            break;
+                        }
+                    }
+                    Err(error) => debug!(
+                        "peer {} did not answer about {:?}: {:?}",
+                        peer, bracket.txn, error
+                    ),
+                }
+            }
+            if committed {
+                apply_resolved_commit(database_runtime, &bracket);
+                continue;
+            }
+            if answered == roster.len() {
+                discard_in_doubt(&bracket, "every peer answered and none had committed it");
+                continue;
+            }
+            still_waiting.push(bracket);
+        }
+        unresolved = still_waiting;
+        if unresolved.is_empty() || std::time::Instant::now() >= answer_deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    for bracket in &unresolved {
+        error!(
+            "transaction {:?} stayed in doubt: not every peer answered within {:?}. Presuming \
+             abort, which is the only thing this node can do alone -- if a peer did commit it, \
+             this store has lost its half.",
+            bracket.txn,
+            resolve_answer_timeout()
+        );
+        discard_in_doubt(bracket, "peers did not answer in time");
+    }
+}
+
+/// How long to let the membership roster grow before believing it is final.
+fn resolve_membership_settle() -> std::time::Duration {
+    std::env::var("NEB_TERMINATION_SETTLE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(10))
+}
+
+/// How long to keep asking peers that have not answered.
+fn resolve_answer_timeout() -> std::time::Duration {
+    std::env::var("NEB_TERMINATION_ANSWER_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
+fn discard_in_doubt(bracket: &crate::ram::recovery::InDoubtBracket, why: &str) {
+    info!(
+        "transaction {:?} was in doubt after recovery and is discarded ({}); {} bracketed \
+         cell(s) dropped",
+        bracket.txn,
+        why,
+        bracket.cells.len()
+    );
+    crate::ram::recovery::BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Make a peer-resolved commit durable HERE, then install its cells.
+///
+/// The record first: installing the cells alone leaves a store that answers
+/// reads correctly right now and forgets the transaction again at the next
+/// restart -- the same loss, one crash later.
+///
+/// One record per CHUNK THAT HOLDS A PART, not one record store-wide.
+/// Recovery would honour a single record anywhere -- it collects COMMITs
+/// globally -- but the cleaner would not. Parts are decided together and
+/// compacted INDEPENDENTLY, so a COMMIT sitting in a chunk this transaction
+/// never touched is one compaction can carry away while the BEGINs it closes
+/// are still on disk. Same reasoning as the per-part rule in
+/// `close_transaction_bracket`, at chunk granularity: as precise as this path
+/// can be, since the transaction's own segments are full or sealed.
+fn apply_resolved_commit(
+    database_runtime: &Arc<DatabaseRuntime>,
+    bracket: &crate::ram::recovery::InDoubtBracket,
+) {
+    let mut placed = 0usize;
+    for chunk_id in &bracket.chunks {
+        let Some(chunk) = database_runtime.chunks.list.get(*chunk_id) else {
+            continue;
+        };
+        match chunk.write_resolved_commit(&bracket.txn) {
+            Ok(()) => placed += 1,
+            Err(error) => warn!(
+                "chunk {} holds part of resolved transaction {:?} but could not take its COMMIT: \
+                 {:?}",
+                chunk_id, bracket.txn, error
+            ),
+        }
+    }
+    if placed == 0 {
+        error!(
+            "transaction {:?} was resolved COMMITTED by a peer but none of its {} chunk(s) could \
+             hold a COMMIT; leaving it in doubt rather than installing cells this store would \
+             lose again at the next start",
+            bracket.txn,
+            bracket.chunks.len()
+        );
+        return;
+    }
+    if placed < bracket.chunks.len() {
+        warn!(
+            "resolved transaction {:?} got a COMMIT in {} of its {} chunk(s); the rest rely on \
+             those records surviving compaction",
+            bracket.txn,
+            placed,
+            bracket.chunks.len()
+        );
+    }
+    for cell in &bracket.cells {
+        crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell);
+    }
+    warn!(
+        "transaction {:?} was in doubt after recovery and a peer reports it COMMITTED; its {} \
+         cell(s) are installed and its COMMIT is durable here",
+        bracket.txn,
+        bracket.cells.len()
+    );
+    crate::ram::recovery::BRACKETS_APPLIED
+        .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
 }
