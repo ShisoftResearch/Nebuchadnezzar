@@ -34,16 +34,27 @@ type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
 /// Transactions whose decision fan-out is cut short, and after how many
 /// participants. Test-only: see `sites_end`.
 #[cfg(test)]
-static END_FANOUT_LIMIT: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<TxnId, usize>>> =
+static END_FANOUT_LIMIT: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<TxnId, EndFanoutPlan>>> =
     std::sync::OnceLock::new();
 
+/// Which participants a dying coordinator manages to tell.
 #[cfg(test)]
-fn end_fanout_limits() -> &'static parking_lot::Mutex<BTreeMap<TxnId, usize>> {
+#[derive(Clone, Copy)]
+pub(crate) enum EndFanoutPlan {
+    /// The first N in participant order.
+    First(usize),
+    /// One named server, so a test can choose WHICH participant is left in
+    /// doubt rather than depending on map order.
+    Only(u64),
+}
+
+#[cfg(test)]
+fn end_fanout_limits() -> &'static parking_lot::Mutex<BTreeMap<TxnId, EndFanoutPlan>> {
     END_FANOUT_LIMIT.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
 }
 
 #[cfg(test)]
-fn end_fanout_limit(tid: &TxnId) -> Option<usize> {
+fn end_fanout_limit(tid: &TxnId) -> Option<EndFanoutPlan> {
     end_fanout_limits().lock().get(tid).copied()
 }
 
@@ -61,7 +72,18 @@ impl Drop for EndFanoutLimit {
 
 #[cfg(test)]
 pub(crate) fn stop_end_fanout_after(tid: TxnId, sites: usize) -> EndFanoutLimit {
-    end_fanout_limits().lock().insert(tid.clone(), sites);
+    end_fanout_limits()
+        .lock()
+        .insert(tid.clone(), EndFanoutPlan::First(sites));
+    EndFanoutLimit(tid)
+}
+
+/// Tell exactly one named participant and stop. Everyone else is in doubt.
+#[cfg(test)]
+pub(crate) fn stop_end_fanout_after_server(tid: TxnId, server_id: u64) -> EndFanoutLimit {
+    end_fanout_limits()
+        .lock()
+        .insert(tid.clone(), EndFanoutPlan::Only(server_id));
     EndFanoutLimit(tid)
 }
 type DataSitesMap = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
@@ -857,6 +879,18 @@ impl Service for TransactionManager {
 }
 
 impl TransactionManager {
+    /// A client for another server's data site.
+    ///
+    /// Public to the crate because the PARTICIPANT side needs it too: an
+    /// in-doubt participant resolves its transaction by asking its peers, and
+    /// the client pool that knows how to reach them lives here.
+    pub(crate) async fn data_site_for(
+        &self,
+        server_id: u64,
+    ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
+        self.get_data_site(server_id).await
+    }
+
     async fn get_data_site(
         &self,
         server_id: u64,
@@ -1488,6 +1522,7 @@ impl TransactionManager {
         tid: &TxnId,
         objs: &BTreeMap<Id, DataObject>,
         data_site: &Arc<data_site::AsyncServiceClient>,
+        participants: &[u64],
     ) -> Result<DMPrepareResult, TMError> {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
@@ -1514,7 +1549,13 @@ impl TransactionManager {
                 .collect();
             let deps_for_clock = deps.clone();
             let prepare_payload = data_site
-                .prepare(coordinator_id, deps.hlc.now(), tid.clone(), prepare_ops)
+                .prepare(
+                    coordinator_id,
+                    deps.hlc.now(),
+                    tid.clone(),
+                    prepare_ops,
+                    participants.to_vec(),
+                )
                 .await
                 .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
                 .map(move |prepare_res| -> DMPrepareResult {
@@ -1544,9 +1585,22 @@ impl TransactionManager {
         affected_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
     ) -> Result<DMPrepareResult, TMError> {
+        // Who will hold a bracket. Exactly the servers `sites_commit` and
+        // `sites_end` will address, which is the set an in-doubt participant
+        // has to be able to ask: a server that only READ this transaction
+        // writes no BEGIN and can answer nothing about its outcome, so
+        // including it would only add peers that reply "I never heard of it"
+        // -- indistinguishable from a peer that presumed abort.
+        let participants: Vec<u64> = affected_objs
+            .iter()
+            .filter(|(_, objs)| objs.values().any(|obj| obj.changed))
+            .map(|(server, _)| *server)
+            .collect();
         let prepare_futures: FuturesUnordered<_> = affected_objs
             .iter()
-            .map(|(server, objs)| async move {
+            .map(|(server, objs)| {
+                let participants = participants.clone();
+                async move {
                 let data_site = data_sites.get(server).unwrap().clone();
                 let result = TransactionManager::site_prepare(
                     &self.deps,
@@ -1554,12 +1608,13 @@ impl TransactionManager {
                     &tid,
                     &objs,
                     &data_site,
+                    &participants,
                 )
                 .await;
                 #[cfg(test)]
                 Self::notify_prepare_results_observed(tid, objs);
                 result
-            })
+            }})
             .collect();
         let results: Vec<Result<DMPrepareResult, TMError>> = prepare_futures.collect().await;
         Self::reduce_prepare_results(results)
@@ -1746,7 +1801,14 @@ impl TransactionManager {
         // is a stable set across runs.
         #[cfg(test)]
         if let Some(limit) = end_fanout_limit(tid) {
-            let told: Vec<u64> = changed_objs.keys().take(limit).copied().collect();
+            let told: Vec<u64> = match limit {
+                EndFanoutPlan::First(sites) => changed_objs.keys().take(sites).copied().collect(),
+                EndFanoutPlan::Only(server_id) => changed_objs
+                    .keys()
+                    .copied()
+                    .filter(|id| *id == server_id)
+                    .collect(),
+            };
             for server_id in &told {
                 let data_site = data_sites.get(server_id).unwrap();
                 let _ = data_site.end(self.get_clock(), tid.clone()).await;

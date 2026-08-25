@@ -991,6 +991,16 @@ pub struct DatabaseRuntime {
     /// Lazily-initialized compact-id allocator: first use claims an
     /// origin slot from the database's lease authority.
     id_allocator: tokio::sync::OnceCell<Arc<crate::ram::id_alloc::IdAllocator>>,
+    /// This database's participant side, once its service is registered.
+    ///
+    /// WEAK on purpose: the data site holds the runtime, so a strong link
+    /// back would make a cycle and neither would ever be freed. Every
+    /// database that was ever loaded would then keep its whole store
+    /// resident -- the exact shape of the leak
+    /// `ptr_hash_map_remove_does_not_release_the_value` documents.
+    data_site: std::sync::OnceLock<
+        std::sync::Weak<transactions::data_site::DataManager>,
+    >,
 }
 
 impl DatabaseRuntime {
@@ -1025,6 +1035,7 @@ impl DatabaseRuntime {
             raft_client,
             neb_client,
             id_allocator: tokio::sync::OnceCell::new(),
+            data_site: std::sync::OnceLock::new(),
         }
     }
 
@@ -1112,6 +1123,11 @@ impl DatabaseRuntime {
 
     pub fn txn_manager(&self) -> Option<&Arc<transactions::manager::TransactionManager>> {
         self.txn_manager.as_ref()
+    }
+
+    /// This database's participant side, if its service is registered here.
+    pub fn data_site(&self) -> Option<Arc<transactions::data_site::DataManager>> {
+        self.data_site.get().and_then(|site| site.upgrade())
     }
 
     pub fn indexed_data_client(&self) -> IndexedDataClient {
@@ -1747,6 +1763,10 @@ impl NebServer {
         }
 
         if effective_opts.enable_recovery {
+            // Ask the cluster about transactions recovery could not decide,
+            // BEFORE the cleaner is allowed to touch their evidence.
+            resolve_in_doubt_after_recovery(&database_runtime).await;
+
             // The cleaner was constructed paused so compaction cannot move
             // cells underneath recovery. Recovery is complete at this point
             // (chunk/WAL recovery, undo-log rollback, and service init all
@@ -2865,13 +2885,17 @@ pub async fn init_txn_data_site_service(
     database_runtime: Arc<DatabaseRuntime>,
     hlc: Arc<bifrost::hlc::HlcSource>,
 ) {
+    let data_site = transactions::data_site::DataManager::new(database_runtime.clone(), hlc);
+    let _ = database_runtime
+        .data_site
+        .set(Arc::downgrade(&data_site));
     rpc_server
         .register_service_with_id(
             transactions::data_site::generate_scoped_service_id(
                 database_runtime.group_name(),
                 database_runtime.database_name(),
             ),
-            &transactions::data_site::DataManager::new(database_runtime, hlc),
+            &data_site,
         )
         .await;
 }
@@ -3147,4 +3171,123 @@ fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
     let mut res = res_set.into_iter().collect::<Vec<_>>();
     res.sort(); // Sort by service priority
     res
+}
+
+/// Cooperative termination, recovery side.
+///
+/// A store that restarts mid-transaction finds brackets with no COMMIT. Until
+/// now it discarded them, which is presume-abort: correct only if no other
+/// participant was told to commit, and it cannot see that from here.
+///
+/// So it asks. It has lost the participant set the coordinator sent at
+/// prepare -- that lived in memory -- so it asks EVERY member of the group.
+/// One `Committed` decides the transaction; the record is written before the
+/// cells are installed, so a crash in the middle of resolving replays it
+/// rather than losing it again.
+///
+/// Runs BEFORE the cleaner resumes, and that ordering is load-bearing: an
+/// in-doubt bracket's cells are not in the index, so a compaction pass would
+/// read them as dead and reclaim the evidence out from under the question.
+///
+/// WHAT IT CANNOT DO: resolve a transaction when no peer is reachable, which
+/// is exactly a whole-cluster restart. Every peer answers `Unknown` -- either
+/// down, or itself restarting with no live record -- and the transaction is
+/// presumed abort. That is the limit of cooperative termination without a
+/// durable coordinator decision, and it is the same answer this code gave
+/// unconditionally before.
+async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>) {
+    let in_doubt = database_runtime.chunks.take_in_doubt_brackets();
+    if in_doubt.is_empty() {
+        return;
+    }
+    let peers: Vec<u64> = match database_runtime
+        .consh
+        .membership()
+        .all_members(true)
+        .await
+    {
+        Ok((members, _)) => members
+            .into_iter()
+            .map(|member| member.id)
+            .filter(|id| *id != database_runtime.rpc.server_id)
+            .collect(),
+        Err(error) => {
+            warn!(
+                "{} transaction(s) are in doubt after recovery and the membership could not be \
+                 read ({:?}); every one of them is presumed abort",
+                in_doubt.len(),
+                error
+            );
+            Vec::new()
+        }
+    };
+    info!(
+        "asking {} peer(s) about {} transaction(s) left in doubt by recovery",
+        peers.len(),
+        in_doubt.len()
+    );
+    let Some(txn_manager) = database_runtime.txn_manager() else {
+        warn!(
+            "{} transaction(s) are in doubt after recovery but this database runs no transaction \
+             service, so there is nothing to ask with; all are presumed abort",
+            in_doubt.len()
+        );
+        return;
+    };
+    for bracket in in_doubt {
+        let mut committed = false;
+        for peer in &peers {
+            let Ok(site) = txn_manager.data_site_for(*peer).await else {
+                continue;
+            };
+            match site.txn_status(bracket.txn.clone()).await {
+                Ok(response) => {
+                    if response.payload == transactions::TxnOutcome::Committed {
+                        committed = true;
+                        break;
+                    }
+                }
+                Err(error) => debug!(
+                    "peer {} did not answer about {:?}: {:?}",
+                    peer, bracket.txn, error
+                ),
+            }
+        }
+        if !committed {
+            info!(
+                "transaction {:?} was in doubt after recovery and no peer reports it committed; \
+                 its {} bracketed cell(s) are discarded",
+                bracket.txn,
+                bracket.cells.len()
+            );
+            crate::ram::recovery::BRACKETS_DISCARDED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        // The record FIRST. Installing the cells without it would leave a
+        // store that answers reads correctly right now and forgets the
+        // transaction again at the next restart -- the same loss, one crash
+        // later.
+        let chunk = &database_runtime.chunks.list[0];
+        if let Err(error) = chunk.write_resolved_commit(&bracket.txn) {
+            error!(
+                "transaction {:?} was resolved COMMITTED by a peer but its COMMIT could not be \
+                 written ({:?}); leaving it in doubt rather than installing cells this store \
+                 would lose again at the next start",
+                bracket.txn, error
+            );
+            continue;
+        }
+        for cell in &bracket.cells {
+            crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell);
+        }
+        warn!(
+            "transaction {:?} was in doubt after recovery and a peer reports it COMMITTED; its {} \
+             cell(s) are installed and its COMMIT is durable here",
+            bracket.txn,
+            bracket.cells.len()
+        );
+        crate::ram::recovery::BRACKETS_APPLIED
+            .fetch_add(bracket.cells.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 }

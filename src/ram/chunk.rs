@@ -591,6 +591,26 @@ pub fn release_transaction_leases(
 /// refill path -- one hostage head is one less writer slot in that chunk,
 /// permanently. Returns the transactions whose leases were reclaimed so the
 /// caller can settle them discard-unless-COMMIT.
+/// Transactions whose leases have been idle longer than `idle`, WITHOUT
+/// releasing anything.
+///
+/// The selection half of `expire_transaction_leases`, split out because
+/// cooperative termination has to run BEFORE the release: resolving a
+/// transaction to commit means closing its bracket, and closing a bracket
+/// needs the leases the release would have thrown away.
+pub fn transactions_with_idle_leases(
+    idle: std::time::Duration,
+    store: &StoreRange,
+) -> Vec<crate::server::transactions::TxnId> {
+    let now = std::time::Instant::now();
+    let held = TXN_LEASES.lock();
+    held.iter()
+        .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
+        .filter(|(_, leases)| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
+        .map(|(txn, _)| txn.clone())
+        .collect()
+}
+
 pub fn expire_transaction_leases(
     idle: std::time::Duration,
     store: &StoreRange,
@@ -1478,6 +1498,47 @@ impl Chunk {
             );
             drop(pending);
         }
+        Ok(())
+    }
+
+    /// Write a COMMIT for a transaction this chunk holds no lease for.
+    ///
+    /// The resolution path after a restart. The lease-based close cannot be
+    /// used there -- recovery reset the write heads, so nothing is leased and
+    /// the transaction's own segments may be full or sealed -- but it does
+    /// not need to be: recovery collects COMMIT records store-wide and
+    /// settles pending cells against them, so ONE record anywhere in the
+    /// store decides the transaction everywhere in it.
+    ///
+    /// Synced rather than deferred: this is the record that turns a
+    /// transaction the peers resolved into one this store will still agree is
+    /// committed after the next crash. Leaving it in a buffer would make the
+    /// resolution itself something a crash could undo.
+    pub fn write_resolved_commit(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+    ) -> Result<(), WriteError> {
+        // Empty manifest, deliberately. A manifest lets a reader check that
+        // every part of a bracket is present, and every member it could name
+        // here is one this store already has; naming none says "decide on the
+        // record alone", which is what a missing member already falls back to.
+        let content = crate::ram::bracket::encode_commit(txn, &[]);
+        let size = (crate::ram::entry::ENTRY_HEAD_SIZE + content.len()) as u32;
+        let pending = self.try_acquire(size, false)?;
+        crate::ram::entry::stamp_reservation_padding(pending.addr, size);
+        crate::ram::entry::Entry::encode_to(
+            pending.addr,
+            crate::ram::entry::EntryType::COMMIT,
+            content.len() as u32,
+            |content_addr| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    content.as_ptr(),
+                    content_addr as *mut u8,
+                    content.len(),
+                );
+            },
+        );
+        drop(pending);
         Ok(())
     }
 
@@ -3944,6 +4005,10 @@ pub enum DurableTxnStatus {
     Aborted,
 }
 
+/// How many committed transaction ids a restarted store remembers, so a peer
+/// in doubt can be answered. Same order as the live decision record.
+const RECOVERED_DECISION_MEMORY: usize = 64 * 1024;
+
 pub struct Chunks {
     pub list: Vec<Chunk>,
     /// Live bytes per slot across the whole store; the same instance every
@@ -3963,6 +4028,18 @@ pub struct Chunks {
     pub chunk_size_bits: usize,
     /// Total mapped bytes across all chunks of this instance.
     pub total_size: usize,
+    /// What recovery learned about in-flight transactions, until the store
+    /// can ask its peers about them. Empty on a fresh store and after
+    /// resolution.
+    pub recovered_brackets: Mutex<crate::ram::recovery::RecoveredBrackets>,
+    /// Transactions this store durably COMMITTED, as found by recovery.
+    ///
+    /// A restarted site has no live decision record, so a peer asking "what
+    /// happened to T" would be told "never heard of it" -- presume-abort --
+    /// about a transaction sitting committed in its own segments. Newest
+    /// first, because the only transactions anyone asks about are the ones
+    /// that were in flight when something died.
+    recovered_commits: Mutex<std::collections::BTreeSet<crate::server::transactions::TxnId>>,
     /// Set when the owning server goes away, so the background sweeper exits
     /// without waiting for the store itself to be dropped. The store can
     /// outlive its server -- an RPC service still holds it -- and a thread that
@@ -3980,6 +4057,36 @@ impl Chunks {
     pub fn stop_background(&self) {
         self.background_stopped
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Keep what recovery learned about transactions, for termination.
+    ///
+    /// The committed set is capped and keeps the NEWEST, which is the right
+    /// end to keep: a peer only ever asks about a transaction that was in
+    /// flight when something died, and `TxnId` is an HLC so newest is just
+    /// the back of the set.
+    pub fn remember_recovered_brackets(&self, brackets: crate::ram::recovery::RecoveredBrackets) {
+        {
+            let mut commits = self.recovered_commits.lock();
+            commits.extend(brackets.committed.iter().cloned());
+            while commits.len() > RECOVERED_DECISION_MEMORY {
+                let Some(oldest) = commits.iter().next().cloned() else {
+                    break;
+                };
+                commits.remove(&oldest);
+            }
+        }
+        *self.recovered_brackets.lock() = brackets;
+    }
+
+    /// Whether recovery found a durable COMMIT for this transaction.
+    pub fn committed_at_recovery(&self, txn: &crate::server::transactions::TxnId) -> bool {
+        self.recovered_commits.lock().contains(txn)
+    }
+
+    /// Take the transactions recovery could not decide, for resolution.
+    pub fn take_in_doubt_brackets(&self) -> Vec<crate::ram::recovery::InDoubtBracket> {
+        std::mem::take(&mut self.recovered_brackets.lock().in_doubt)
     }
 
     /// See [`stop_background`]. Observable so a test can assert the teardown
@@ -4178,6 +4285,8 @@ impl Chunks {
                     .map(|_| std::sync::atomic::AtomicU64::new(0))
                     .collect(),
             ),
+            recovered_brackets: Mutex::new(crate::ram::recovery::RecoveredBrackets::empty()),
+            recovered_commits: Mutex::new(std::collections::BTreeSet::new()),
             base_addr: global_base_addr,
             chunk_size_bits,
             total_size,
@@ -4282,8 +4391,14 @@ impl Chunks {
                 &chunks_arc.recovered_origin_floors,
                 Some(recovery_files),
             ) {
-                Ok(()) => {
-                    info!("Recovery completed successfully");
+                Ok(brackets) => {
+                    info!(
+                        "Recovery completed successfully: {} committed and {} in-doubt \
+                         transaction(s) found in brackets",
+                        brackets.committed.len(),
+                        brackets.in_doubt.len()
+                    );
+                    chunks_arc.remember_recovered_brackets(brackets);
                 }
                 Err(e) => {
                     // Refuse to start rather than come up empty on top of a

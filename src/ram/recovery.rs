@@ -440,7 +440,7 @@ pub struct BracketLedger {
     commits: Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
 }
 
-struct PendingBracketCell {
+pub struct PendingBracketCell {
     chunk_id: usize,
     hash: u64,
     /// A transaction can DELETE as well as write, and a committed delete has
@@ -492,16 +492,24 @@ impl BracketLedger {
         self.commits.lock().insert(txn.clone(), manifest);
     }
 
-    /// Apply every committed bracket and drop the rest.
+    /// Apply every committed bracket and report the rest.
     ///
     /// Called once, after every segment has been scanned. Applying here rather
     /// than during the scan is what makes a cross-chunk transaction atomic:
     /// the chunk whose own COMMIT was lost still applies its part, because the
     /// decision came from the transaction, not from that chunk's bytes.
-    pub fn settle(&self, chunks: &[Chunk]) {
+    ///
+    /// It no longer DISCARDS the rest. A bracket with no COMMIT here means
+    /// this store was in flight when it stopped -- which is not the same as
+    /// "this transaction aborted", because another participant may have been
+    /// told to commit. Both halves are handed back so the store can ask its
+    /// peers before deciding: see [`RecoveredBrackets`].
+    pub fn settle(&self, chunks: &[Chunk]) -> RecoveredBrackets {
         let commits = std::mem::take(&mut *self.commits.lock());
         let mut pending = std::mem::take(&mut *self.pending.lock());
+        let mut committed_txns = Vec::with_capacity(commits.len());
         for (txn, manifest) in commits {
+            committed_txns.push(txn.clone());
             let missing: Vec<_> = manifest
                 .iter()
                 .filter(|member| !self.present.contains(&(member.chunk_id, member.seq_id)))
@@ -553,14 +561,51 @@ impl BracketLedger {
         // ordinary entries rather than as a bracket missing its closer. With
         // nothing left for the watermark to decide, deciding on it would be
         // resting correctness on a quantity nothing exercises.
-        for (txn, cells) in pending {
-            info!(
-                "transaction {:?} left {} bracketed cell(s) with no COMMIT; it was in flight when \
-                 the store stopped and is discarded",
-                txn,
-                cells.len()
-            );
-            BRACKETS_DISCARDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let in_doubt: Vec<InDoubtBracket> = pending
+            .into_iter()
+            .map(|(txn, cells)| {
+                info!(
+                    "transaction {:?} left {} bracketed cell(s) with no COMMIT; it was in flight \
+                     when the store stopped and is IN DOUBT until its peers are asked",
+                    txn,
+                    cells.len()
+                );
+                InDoubtBracket { txn, cells }
+            })
+            .collect();
+        RecoveredBrackets {
+            committed: committed_txns,
+            in_doubt,
+        }
+    }
+}
+
+/// A transaction this store cannot decide on its own.
+pub struct InDoubtBracket {
+    pub txn: crate::server::transactions::TxnId,
+    /// Held rather than dropped: if a peer reports the transaction committed,
+    /// these are the cells that must be installed. The entries themselves are
+    /// still in the segments -- only the index placement is deferred.
+    pub cells: Vec<PendingBracketCell>,
+}
+
+/// What recovery learned about transactions, for cooperative termination.
+///
+/// `committed` matters as much as `in_doubt`: a site that RESTARTED has no
+/// live decision record, so without this it would answer "I never heard of
+/// it" about a transaction it durably committed -- and a peer in doubt would
+/// read that as abort and tear the transaction the restart was supposed to
+/// preserve.
+pub struct RecoveredBrackets {
+    pub committed: Vec<crate::server::transactions::TxnId>,
+    pub in_doubt: Vec<InDoubtBracket>,
+}
+
+impl RecoveredBrackets {
+    pub fn empty() -> Self {
+        RecoveredBrackets {
+            committed: Vec::new(),
+            in_doubt: Vec::new(),
         }
     }
 }
@@ -571,7 +616,7 @@ impl BracketLedger {
 /// scan-local version map: the map belongs to a single chunk's pass and is
 /// gone by the time a cross-chunk decision can be made, and the index is the
 /// thing that has to end up right.
-fn apply_bracketed_cell(chunks: &[Chunk], cell: &PendingBracketCell) {
+pub(crate) fn apply_bracketed_cell(chunks: &[Chunk], cell: &PendingBracketCell) {
     let Some(chunk) = chunks.get(cell.chunk_id) else {
         error!(
             "a committed bracket names chunk {} which this store does not have",
@@ -1568,7 +1613,7 @@ pub fn recover_chunks(
     chunks: &[Chunk],
     origin_floors: &[std::sync::atomic::AtomicU64],
     discovered: Option<Vec<SegmentFileInfo>>,
-) -> io::Result<()> {
+) -> io::Result<RecoveredBrackets> {
     info!("=== Starting streamlined recovery from storage directories ===");
 
     // Phase 1: Discover files, unless the caller already did it to size the
@@ -1581,7 +1626,7 @@ pub fn recover_chunks(
         Ok(files) => files,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             info!("No segment files found, starting fresh");
-            return Ok(());
+            return Ok(RecoveredBrackets::empty());
         }
         Err(e) => return Err(e),
     };
@@ -1962,7 +2007,7 @@ pub fn recover_chunks(
     // transactions. This is where a cross-chunk transaction becomes atomic --
     // the chunk whose own COMMIT was lost still applies its part, because the
     // decision came from the transaction rather than from that chunk's bytes.
-    bracket_ledger.settle(chunks);
+    let recovered_brackets = bracket_ledger.settle(chunks);
 
     // Update allocator next_seq_id for each chunk to continue from max recovered seq_id
     for (chunk_id, max_seq) in max_seq_ids.iter().enumerate() {
@@ -2040,7 +2085,7 @@ pub fn recover_chunks(
         total_cells, final_processed, final_hot, final_cold
     );
 
-    Ok(())
+    Ok(recovered_brackets)
 }
 
 /// Create a recovery marker file to indicate recovery is in progress

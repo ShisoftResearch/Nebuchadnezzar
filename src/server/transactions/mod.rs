@@ -115,6 +115,30 @@ pub enum TxnState {
     Cleanup,
 }
 
+/// What one participant can tell another about a transaction's fate.
+///
+/// The answer an in-doubt participant needs is not "what state is your
+/// transaction object in" -- a participant sits in `TxnState::Committed`
+/// from the moment its entries are made durable, which is BEFORE anyone has
+/// decided anything. The only thing that means "I was told to commit" is a
+/// closed bracket, so `Committed` here is reported from the decision record,
+/// never from the transaction's state.
+///
+/// `Aborted` and `Unknown` license the same action. They are kept apart
+/// because they are different evidence: `Aborted` is a peer that decided,
+/// `Unknown` is a peer with nothing to say -- it was never a participant, or
+/// it has forgotten. A resolver that sees only `Unknown` is presuming abort,
+/// which is worth being able to see in a log.
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Copy, Clone)]
+pub enum TxnOutcome {
+    Committed,
+    Aborted,
+    /// This peer is in doubt too: it prepared and is waiting for a decision
+    /// it never received.
+    InDoubt,
+    Unknown,
+}
+
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum DMPrepareResult {
     Wait,

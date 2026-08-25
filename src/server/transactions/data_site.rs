@@ -234,6 +234,13 @@ impl PinnedReadSet {
 /// protocol that is still design-only. Too short steals heads from
 /// transactions that are merely slow; too long is a writer slot held hostage
 /// by a coordinator that is never coming back.
+/// Cooperative termination outcomes, so a soak can tell "nothing was in
+/// doubt" from "everything in doubt was presumed abort".
+pub static TERMINATION_COMMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static TERMINATION_ABORTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn txn_lease_timeout() -> std::time::Duration {
     std::env::var("NEB_TXN_LEASE_TIMEOUT_SECS")
         .ok()
@@ -254,6 +261,16 @@ struct Transaction {
     segment_guards: Vec<SegmentReferenceGuard>,
     /// Pinned versions of LARGE cells read under repeatable-read semantics.
     pinned_reads: PinnedReadSet,
+    /// Every server that will hold a bracket for this transaction, learned
+    /// from the coordinator at prepare.
+    ///
+    /// IN MEMORY ONLY, and deliberately so. A participant that survives to be
+    /// in doubt still has this and can ask its peers directly; one that
+    /// restarts has lost it and must fall back to asking every member of the
+    /// cluster. Persisting it would mean a second durable write in the
+    /// prepare path -- paid by every transaction, to serve a case that is
+    /// already covered by the broadcast.
+    participants: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -306,7 +323,24 @@ pub struct DataManager {
     /// the coordinator-side `TransactionManager`. Stamps every participant
     /// response clock and observes the coordinator's incoming clock.
     hlc: Arc<bifrost::hlc::HlcSource>,
+    /// What this site decided about transactions it has already finished.
+    ///
+    /// The point of keeping it after the transaction object is gone: a peer
+    /// left in doubt asks "what happened to T", and the honest answer lives
+    /// here. Without it every finished transaction reads as `Unknown`, which
+    /// is presume-abort -- exactly the answer that tears a transaction whose
+    /// other half committed.
+    ///
+    /// Bounded and ordered. `TxnId` is an HLC, so oldest-first eviction is
+    /// just the front of the map, and the retention that matters is measured
+    /// against how long a coordinator can be gone before the lease sweeper
+    /// gives up -- seconds, against tens of thousands of entries.
+    decided: Mutex<BTreeMap<TxnId, TxnOutcome>>,
 }
+
+/// How many finished transactions a site remembers the fate of. Sized to
+/// outlast the in-doubt window by orders of magnitude rather than tuned.
+const DECISION_MEMORY: usize = 64 * 1024;
 
 service! {
     rpc read(server_id: u64, clock: Hlc, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
@@ -318,7 +352,7 @@ service! {
     // transaction that merely pinned reads on a server does not linger there.
     rpc release_read_pins(tids: Vec<TxnId>) -> DataSiteResponse<()>;
     // two phase commit
-    rpc prepare(coordinator_id: u64, clock: Hlc, tid: TxnId, ops: Vec<PrepareOp>) -> DataSiteResponse<DMPrepareResult>;
+    rpc prepare(coordinator_id: u64, clock: Hlc, tid: TxnId, ops: Vec<PrepareOp>, participants: Vec<u64>) -> DataSiteResponse<DMPrepareResult>;
     rpc commit(clock: Hlc, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
 
     // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
@@ -327,6 +361,13 @@ service! {
 
     // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
     rpc end(clock: Hlc, tid: TxnId) -> DataSiteResponse<EndResult>;
+
+    // Cooperative termination: what does this site know about T's fate?
+    //
+    // Answered from this site's own decision record, never from a
+    // coordinator. That is the whole point -- the coordinator is the thing
+    // that went away.
+    rpc txn_status(tid: TxnId) -> DataSiteResponse<TxnOutcome>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -346,6 +387,7 @@ impl DataManager {
             txns_sorted: Mutex::new(BTreeSet::new()),
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
+            decided: Mutex::new(BTreeMap::new()),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -365,6 +407,15 @@ impl DataManager {
                 // entries themselves stay exactly where they are and are
                 // settled discard-unless-COMMIT, which is the same rule a
                 // crash in the same window already gets.
+                // Ask the other participants before presuming abort.
+                //
+                // This runs FIRST, and the order is the whole point: the
+                // release below throws away the leases, and closing a
+                // bracket needs them.
+                manager_clone
+                    .terminate_in_doubt_transactions(txn_lease_timeout())
+                    .await;
+
                 for tid in crate::ram::chunk::expire_transaction_leases(
                     txn_lease_timeout(),
                     &manager_clone.chunks().address_range(),
@@ -411,6 +462,7 @@ impl DataManager {
                 history: BTreeMap::new(),
                 segment_guards: Vec::with_capacity(4), // Pre-allocate for common case
                 pinned_reads: PinnedReadSet::default(),
+                participants: Vec::new(),
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -588,6 +640,189 @@ impl DataManager {
         let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
     }
+    /// Cooperative termination, participant side.
+    ///
+    /// A participant whose coordinator went silent knows its entries are
+    /// durable and knows nothing else. Presuming abort -- what this site did
+    /// unconditionally before -- is safe only if no OTHER participant was
+    /// told to commit, and that is precisely what it cannot see on its own.
+    ///
+    /// So it asks. The participant set came from the coordinator at prepare
+    /// and lives in memory; a peer that was told answers `Committed` from its
+    /// decision record, and this site then closes its bracket instead of
+    /// abandoning it.
+    ///
+    /// What this does NOT fix: a site that has RESTARTED has lost both the
+    /// transaction object and the participant set, so it never gets here.
+    /// That case is recovery's, and it broadcasts rather than asks.
+    pub(crate) async fn terminate_in_doubt_transactions(&self, idle: std::time::Duration) {
+        let store = self.chunks().address_range();
+        let idle = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
+        for tid in idle {
+            // The transaction lock is READ and dropped before the network
+            // call. Holding it across the await would also make this future
+            // non-Send, which is how the first version announced itself.
+            let Some((state, participants)) = self.find_transaction(&tid).map(|txn_lock| {
+                let txn = txn_lock.lock();
+                (txn.state, txn.participants.clone())
+            }) else {
+                // No transaction object: this site cannot be the one holding
+                // a decision open, and the sweeper below reclaims the heads.
+                continue;
+            };
+            // `Committed` here means "entries durable", not "decided" -- see
+            // `TxnOutcome`. Both it and `Prepared` are in doubt.
+            if !matches!(state, TxnState::Prepared | TxnState::Committed) {
+                continue;
+            }
+            let outcome = self.ask_participants(&tid, &participants).await;
+            match outcome {
+                TxnOutcome::Committed => {
+                    warn!(
+                        "transaction {:?} was in doubt here and a participant reports it \
+                         COMMITTED; committing rather than presuming abort",
+                        tid
+                    );
+                    // Scoped, not just dropped: `Transaction` is not `Send`,
+                    // and the async capture analysis keeps a `let ... else`
+                    // binding alive across the await that follows even with an
+                    // explicit `drop`.
+                    let still_here = match self.find_transaction(&tid) {
+                        Some(txn_lock) => {
+                            txn_lock.lock().state = TxnState::Committed;
+                            true
+                        }
+                        None => false,
+                    };
+                    if !still_here {
+                        error!(
+                            "transaction {:?} was resolved COMMITTED by its peers but vanished \
+                             from this site before it could be committed",
+                            tid
+                        );
+                        continue;
+                    }
+                    let ended = <DataManager as Service>::end(self, self.hlc.now(), tid.clone())
+                        .await
+                        .payload;
+                    if !matches!(ended, EndResult::Success) {
+                        error!(
+                            "transaction {:?} was resolved COMMITTED by its peers but this site \
+                             could not end it: {:?}. Its bracket stays open and the next start \
+                             will ask again.",
+                            tid, ended
+                        );
+                        continue;
+                    }
+                    TERMINATION_COMMITTED.fetch_add(1, Relaxed);
+                }
+                TxnOutcome::Aborted | TxnOutcome::Unknown | TxnOutcome::InDoubt => {
+                    // Presume abort, which is what happened before -- but now
+                    // it is a conclusion rather than an assumption, and the
+                    // log says which.
+                    warn!(
+                        "transaction {:?} was in doubt here and its {} participant(s) report \
+                         {:?}; presuming abort",
+                        tid,
+                        participants.len(),
+                        outcome
+                    );
+                    TERMINATION_ABORTED.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Ask every other participant what became of `tid`.
+    ///
+    /// Resolution rule, in order: one `Committed` decides the transaction, so
+    /// the first is returned immediately. Failing that an explicit `Aborted`
+    /// is a real decision and is reported as one. Everything else -- peers in
+    /// doubt, peers that never heard of it, peers that cannot be reached --
+    /// is `Unknown`, which the caller presumes abort on.
+    ///
+    /// A `Committed` cannot be wrong: only `end` writes a decision record,
+    /// and only a coordinator that decided commit sends `end`.
+    async fn ask_participants(&self, tid: &TxnId, participants: &[u64]) -> TxnOutcome {
+        let Some(txn_manager) = self.database_runtime.txn_manager() else {
+            return TxnOutcome::Unknown;
+        };
+        let me = self.database_runtime.rpc.server_id;
+        let mut saw_abort = false;
+        for peer in participants.iter().copied().filter(|peer| *peer != me) {
+            let site = match txn_manager.data_site_for(peer).await {
+                Ok(site) => site,
+                Err(error) => {
+                    debug!(
+                        "cannot reach participant {} to resolve {:?}: {}",
+                        peer, tid, error
+                    );
+                    continue;
+                }
+            };
+            match site.txn_status(tid.clone()).await {
+                Ok(response) => {
+                    self.update_clock(response.clock);
+                    match response.payload {
+                        TxnOutcome::Committed => return TxnOutcome::Committed,
+                        TxnOutcome::Aborted => saw_abort = true,
+                        TxnOutcome::InDoubt | TxnOutcome::Unknown => {}
+                    }
+                }
+                Err(error) => debug!(
+                    "participant {} did not answer about {:?}: {:?}",
+                    peer, tid, error
+                ),
+            }
+        }
+        if saw_abort {
+            TxnOutcome::Aborted
+        } else {
+            TxnOutcome::Unknown
+        }
+    }
+
+    /// Remember what this site decided, so a peer in doubt can be told.
+    ///
+    /// Recorded at `end` and at `abort`, which are the only two places a
+    /// decision reaches a participant. NOT at `commit`: that runs in the
+    /// prepare phase and makes entries durable without deciding anything, so
+    /// recording there would answer "committed" for a transaction that is
+    /// about to be aborted.
+    fn record_decision(&self, tid: &TxnId, outcome: TxnOutcome) {
+        let mut decided = self.decided.lock();
+        decided.insert(tid.clone(), outcome);
+        while decided.len() > DECISION_MEMORY {
+            let Some(oldest) = decided.keys().next().cloned() else {
+                break;
+            };
+            decided.remove(&oldest);
+        }
+    }
+
+    /// What this site can say about a transaction, for a peer resolving it.
+    pub(crate) fn txn_outcome(&self, tid: &TxnId) -> TxnOutcome {
+        if let Some(outcome) = self.decided.lock().get(tid) {
+            return *outcome;
+        }
+        // A RESTART empties the live record but not the segments. Without
+        // this a site that durably committed answers "never heard of it"
+        // about its own committed transaction, and the peer asking reads that
+        // as abort -- tearing the transaction the durable COMMIT existed to
+        // preserve.
+        if self.chunks().committed_at_recovery(tid) {
+            return TxnOutcome::Committed;
+        }
+        // Still live here. Anything short of a decision is in doubt --
+        // including `TxnState::Committed`, which only means the entries are
+        // durable.
+        match self.find_transaction(tid).map(|txn| txn.lock().state) {
+            Some(TxnState::Aborted) => TxnOutcome::Aborted,
+            Some(_) => TxnOutcome::InDoubt,
+            None => TxnOutcome::Unknown,
+        }
+    }
+
     async fn cell_meta_cleanup(&self) {
         let oldest_transaction = {
             self.txns_sorted
@@ -1658,7 +1893,7 @@ mod tests {
         tid: &TxnId,
         ops: Vec<PrepareOp>,
     ) -> DMPrepareResult {
-        <DataManager as Service>::prepare(manager, coordinator_id, tid.clone(), tid.clone(), ops)
+        <DataManager as Service>::prepare(manager, coordinator_id, tid.clone(), tid.clone(), ops, vec![])
             .await
             .payload
     }
@@ -1707,6 +1942,7 @@ mod tests {
                     expectation: CellExpectation::Present(version + 1),
                     intent: PrepareIntent::Write,
                 }],
+                vec![],
             )
             .await
             .unwrap()
@@ -1958,6 +2194,7 @@ mod tests {
                     expectation: CellExpectation::Absent,
                     intent: PrepareIntent::Write,
                 }],
+                vec![],
             )
             .await
             .unwrap()
@@ -1989,6 +2226,7 @@ mod tests {
                 expectation: CellExpectation::Present(1),
                 intent: PrepareIntent::Read,
             }],
+            vec![],
         )
         .await
         .payload;
@@ -2029,8 +2267,7 @@ mod tests {
             14,
             tid.clone(),
             tid.clone(),
-            vec![op.clone(), op],
-        )
+            vec![op.clone(), op], vec![])
         .await
         .payload;
 
@@ -2052,7 +2289,7 @@ mod tests {
         assert!(manager.find_transaction(&tid).is_none());
 
         let result =
-            <DataManager as Service>::prepare(&manager, 19, tid.clone(), tid.clone(), vec![])
+            <DataManager as Service>::prepare(&manager, 19, tid.clone(), tid.clone(), vec![], vec![])
                 .await
                 .payload;
 
@@ -2094,8 +2331,7 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op_a.clone()],
-        )
+            vec![op_a.clone()], vec![])
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2105,8 +2341,7 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op_b.clone()],
-        )
+            vec![op_b.clone()], vec![])
         .await
         .payload;
 
@@ -2171,8 +2406,7 @@ mod tests {
             original_coordinator,
             tid.clone(),
             tid.clone(),
-            vec![op.clone()],
-        )
+            vec![op.clone()], vec![])
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2182,8 +2416,7 @@ mod tests {
             99,
             tid.clone(),
             tid.clone(),
-            vec![op.clone()],
-        )
+            vec![op.clone()], vec![])
         .await
         .payload;
 
@@ -2247,8 +2480,7 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op_b.clone(), op_a.clone()],
-        )
+            vec![op_b.clone(), op_a.clone()], vec![])
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2265,8 +2497,7 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op_a.clone(), op_b.clone()],
-        )
+            vec![op_a.clone(), op_b.clone()], vec![])
         .await
         .payload;
 
@@ -2330,8 +2561,7 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op.clone()],
-        )
+            vec![op.clone()], vec![])
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2348,8 +2578,7 @@ mod tests {
             coordinator_id,
             tid.clone(),
             tid.clone(),
-            vec![op.clone()],
-        )
+            vec![op.clone()], vec![])
         .await
         .payload;
 
@@ -2408,12 +2637,12 @@ mod tests {
         };
 
         let first = client
-            .prepare(11, older_tid.clone(), older_tid.clone(), vec![op.clone()])
+            .prepare(11, older_tid.clone(), older_tid.clone(), vec![op.clone()], vec![])
             .await
             .unwrap()
             .payload;
         let second = client
-            .prepare(22, younger_tid.clone(), younger_tid.clone(), vec![op])
+            .prepare(22, younger_tid.clone(), younger_tid.clone(), vec![op], vec![])
             .await
             .unwrap()
             .payload;
@@ -2974,8 +3203,7 @@ mod tests {
             21,
             t1.clone(),
             t1.clone(),
-            vec![prepare_op.clone()],
-        )
+            vec![prepare_op.clone()], vec![])
         .await
         .payload;
         assert_eq!(first, DMPrepareResult::Success);
@@ -2995,8 +3223,7 @@ mod tests {
             22,
             t2.clone(),
             t2.clone(),
-            vec![prepare_op],
-        )
+            vec![prepare_op], vec![])
         .await
         .payload;
         assert_eq!(second, DMPrepareResult::Success);
@@ -3083,8 +3310,7 @@ mod tests {
             23,
             tid.clone(),
             tid.clone(),
-            vec![prepare_op],
-        )
+            vec![prepare_op], vec![])
         .await
         .payload;
         assert_eq!(prepare, DMPrepareResult::Success);
@@ -3177,8 +3403,7 @@ mod tests {
             24,
             t1.clone(),
             t1.clone(),
-            vec![t1_prepare],
-        )
+            vec![t1_prepare], vec![])
         .await
         .payload;
         assert_eq!(prepare_t1, DMPrepareResult::Success);
@@ -3226,6 +3451,7 @@ mod tests {
                 expectation: CellExpectation::Present(committed_version),
                 intent: PrepareIntent::Write,
             }],
+            vec![],
         )
         .await
         .payload;
@@ -3955,6 +4181,7 @@ impl Service for DataManager {
         clock: Hlc,
         tid: TxnId,
         ops: Vec<PrepareOp>,
+        participants: Vec<u64>,
     ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
         debug!("PREPARE FOR {:?}, {} ops", &tid, ops.len());
         async move {
@@ -4053,6 +4280,7 @@ impl Service for DataManager {
                 txn.certified = prepared_ops_by_id;
                 txn.affected_cells = txn.certified.keys().copied().collect();
                 txn.coordinator_id = Some(coordinator_id);
+                txn.participants = participants;
                 txn.state = TxnState::Prepared;
                 txn.last_activity = get_time();
                 debug!("SITE PREPARE SUCCESSFUL FOR {:?}", requester);
@@ -4214,6 +4442,11 @@ impl Service for DataManager {
 
         self.response_with(AbortResult::Success(rollback_failures))
     }
+    fn txn_status(&self, tid: TxnId) -> BoxFuture<'_, DataSiteResponse<TxnOutcome>> {
+        let outcome = self.txn_outcome(&tid);
+        async move { self.response_with(outcome).await }.boxed()
+    }
+
     fn end(
         &self,
         clock: Hlc,
@@ -4363,6 +4596,17 @@ impl Service for DataManager {
                 }
             }
 
+            // Recorded only once the outcome is real: for a commit that means
+            // after the bracket closed, because a failed close is refused
+            // above and this site is then NOT committed.
+            self.record_decision(
+                &tid,
+                if txn_state == TxnState::Committed {
+                    TxnOutcome::Committed
+                } else {
+                    TxnOutcome::Aborted
+                },
+            );
             self.wipe_out_transaction(&tid);
             self.cleanup_signal.store(true, Relaxed);
 

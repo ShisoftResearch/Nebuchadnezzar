@@ -165,9 +165,14 @@ fn id_in_slot(slot: u16, seq: u64) -> Id {
     Id::from_parts(slot as u64, seq)
 }
 
-/// THE BUG, demonstrated. This test asserts the defect EXISTS; when
-/// cooperative termination lands its assertion inverts and it becomes the
-/// regression test.
+/// THE WINDOW, demonstrated: what a torn transaction looks like BEFORE
+/// termination runs.
+///
+/// This is not a bug report any more -- termination resolves it, and
+/// `an_in_doubt_participant_commits_when_a_peer_was_told_to_commit` proves
+/// that. What it pins down is that the tear is real and reachable, so the
+/// resolution test cannot quietly start proving nothing. If this ever fails,
+/// the injection has stopped injecting.
 ///
 /// Asserted on DURABLE state rather than on reads, because a read cannot see
 /// it yet. Both participants wrote their cells during prepare and both serve
@@ -259,6 +264,257 @@ async fn an_undisturbed_transaction_commits_durably_everywhere() {
         );
     }
 
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+/// THE FIX. The same torn transaction, resolved by asking.
+///
+/// The coordinator dies after telling one participant. The one it did not
+/// reach is in doubt: its entries are durable, its bracket is open, and
+/// nothing local can tell it whether the decision was commit or abort.
+/// Before cooperative termination it presumed abort and lost its half.
+///
+/// Now it asks the participant set it learned at prepare, hears `Committed`
+/// from a peer that was told, and closes its own bracket.
+///
+/// Driven directly rather than by waiting out the lease timeout: the sweeper
+/// that calls this runs every second with a 120s idle window, and a test that
+/// waits for it would be a two-minute test that fails as a timeout when the
+/// mechanism breaks.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_doubt_participant_commits_when_a_peer_was_told_to_commit() {
+    let (servers, client, addresses, _temp) = start_txn_cluster("tear_resolved").await;
+    let ids = two_ids_on_distinct_servers(&client, &servers).await;
+
+    let txn = super::new_async_client_for_database(&addresses[0], "tear_resolved", "tear_resolved")
+        .await
+        .unwrap();
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (n, id) in ids.iter().enumerate() {
+        txn.write(tid.clone(), cell_of(*id, 300 + n as u64))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+
+    let limit = super::manager::stop_end_fanout_after(tid.clone(), 1);
+    let _ = txn.commit(tid.clone()).await;
+    drop(limit);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let torn: Vec<DurableTxnStatus> = servers
+        .iter()
+        .map(|s| s.chunks().durable_txn_status(&tid))
+        .collect();
+    assert!(
+        torn.contains(&DurableTxnStatus::Committed) && torn.contains(&DurableTxnStatus::Prepared),
+        "the transaction must be torn before termination runs, or this test \
+         proves nothing about termination: {:?}",
+        torn
+    );
+
+    // Every site sweeps. Only the one in doubt has anything to do.
+    for server in &servers {
+        server
+            .database_runtime()
+            .data_site()
+            .expect("every server in this cluster runs a data site")
+            .terminate_in_doubt_transactions(Duration::ZERO)
+            .await;
+    }
+
+    for server in &servers {
+        assert_eq!(
+            server.chunks().durable_txn_status(&tid),
+            DurableTxnStatus::Committed,
+            "after termination every participant must hold a durable COMMIT; \
+             the one that never heard the decision asked and was told"
+        );
+    }
+
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+/// The other half of the rule: a transaction NO participant was told to
+/// commit still aborts. Termination must not turn presume-abort into
+/// presume-commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_doubt_participant_still_aborts_when_no_peer_committed() {
+    let (servers, client, addresses, _temp) = start_txn_cluster("tear_abort").await;
+    let ids = two_ids_on_distinct_servers(&client, &servers).await;
+
+    let txn = super::new_async_client_for_database(&addresses[0], "tear_abort", "tear_abort")
+        .await
+        .unwrap();
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (n, id) in ids.iter().enumerate() {
+        txn.write(tid.clone(), cell_of(*id, 400 + n as u64))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+
+    // Nobody is told: the coordinator decides and dies before the first
+    // participant hears it.
+    let limit = super::manager::stop_end_fanout_after(tid.clone(), 0);
+    let _ = txn.commit(tid.clone()).await;
+    drop(limit);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for server in &servers {
+        assert_eq!(
+            server.chunks().durable_txn_status(&tid),
+            DurableTxnStatus::Prepared,
+            "no participant may hold a COMMIT when none was told"
+        );
+    }
+
+    for server in &servers {
+        server
+            .database_runtime()
+            .data_site()
+            .expect("every server in this cluster runs a data site")
+            .terminate_in_doubt_transactions(Duration::ZERO)
+            .await;
+    }
+
+    for server in &servers {
+        assert_ne!(
+            server.chunks().durable_txn_status(&tid),
+            DurableTxnStatus::Committed,
+            "a transaction no participant was told to commit must not become \
+             committed by asking around"
+        );
+    }
+
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+/// The restart case: a participant that lost its memory still resolves.
+///
+/// This is the half the lease sweeper cannot reach. A site that restarts in
+/// doubt has no transaction object and no participant set -- both lived in
+/// memory -- so it cannot ask the participants. It asks the whole group
+/// instead, and the peer that was told answers from its own record.
+///
+/// Uses `enable_recovery: true` for both servers, unlike the other tests
+/// here: the resolution runs inside recovery, before the cleaner is allowed
+/// to touch the evidence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_participant_asks_the_group_and_commits() {
+    let _ = env_logger::try_init();
+    let group = "tear_restart";
+    let temp: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::TempDir::new().unwrap()).collect();
+    let addresses: Vec<String> = (0..2)
+        .map(|_| crate::utils::test_port::unique_localhost_addr())
+        .collect();
+    let opts_for = |dir: &tempfile::TempDir| ServerOptions {
+        chunk_size: 64 * 1024 * 1024,
+        db_size: 256 * 1024 * 1024,
+        tiered_config: None,
+        backup_storage: Some(dir.path().join("backup").to_string_lossy().to_string()),
+        wal_storage: Some(dir.path().join("wal").to_string_lossy().to_string()),
+        // Required once recovery is on: schemas live in raft storage, and
+        // recovering cells without them restores data nothing can read.
+        raft_storage: Some(dir.path().join("raft").to_string_lossy().to_string()),
+        index_enabled: false,
+        services: vec![Service::Cell, Service::Transaction],
+        enable_recovery: true,
+        disable_storage_locks: true,
+    };
+    let schema = Schema::new_with_id(
+        SCHEMA_ID,
+        &String::from("termination_schema"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+
+    let mut servers = Vec::new();
+    for (address, dir) in addresses.iter().zip(temp.iter()) {
+        servers.push(
+            NebServer::new_cluster_from_opts(&opts_for(dir), address, &addresses, group, async |_| {})
+                .await
+                .unwrap(),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let client = Arc::new(
+        AsyncClient::new(&servers[0].rpc, &servers[0].membership, &addresses, group)
+            .await
+            .unwrap(),
+    );
+    client.reload_slot_owners().await;
+    for server in &servers {
+        server.meta().schemas.debug_only_new_schema(schema.clone());
+    }
+    let ids = two_ids_on_distinct_servers(&client, &servers).await;
+
+    let txn = super::new_async_client_for_database(&addresses[0], group, group)
+        .await
+        .unwrap();
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (n, id) in ids.iter().enumerate() {
+        txn.write(tid.clone(), cell_of(*id, 500 + n as u64))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+
+    // Tell the SECOND server only. The first is left in doubt, and it is the
+    // one that restarts.
+    let told = client.locate_server_id(&ids[1]).unwrap();
+    let limit = super::manager::stop_end_fanout_after_server(tid.clone(), told);
+    let _ = txn.commit(tid.clone()).await;
+    drop(limit);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        servers[0].chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Prepared,
+        "the server that was not told must be in doubt before it restarts"
+    );
+    assert_eq!(
+        servers[1].chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "the server that was told must hold a durable COMMIT"
+    );
+
+    // Restart the in-doubt one. Its transaction object and participant set go
+    // with the process; only the segments survive.
+    let restarting = servers.remove(0);
+    restarting.shutdown().await;
+    drop(restarting);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let restarted = NebServer::new_cluster_from_opts(
+        &opts_for(&temp[0]),
+        &addresses[0],
+        &addresses,
+        group,
+        async |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        restarted.chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "a restarted participant must ask the group and commit what a peer \
+         was told to commit, rather than discarding its half"
+    );
+
+    restarted.shutdown().await;
     for server in servers {
         server.shutdown().await;
     }
