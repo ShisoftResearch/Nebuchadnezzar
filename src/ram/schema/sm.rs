@@ -132,6 +132,55 @@ impl StateMachineCmds for SchemasSM {
     }
 }
 
+/// Decode a schema snapshot, or refuse the load.
+///
+/// `StateMachineCtl::recover` returns `()`, so there is no way to tell the
+/// caller the snapshot was unreadable. What this used to do instead was log at
+/// `trace!` and return, which left the state machine with an EMPTY schema map
+/// -- and a database that comes up looking like it has no schemas rather than
+/// one this build cannot read. Every cell then fails `SchemaDoesNotExisted`,
+/// and `select_from_chunk_raw` panics on the way there in debug builds. It is
+/// the same shape as the recovery bug that silently wiped the ranged index: an
+/// unreadable input treated as an empty one.
+///
+/// That path was unreachable while the record format only ever grew defaulted
+/// fields. The uid/vid split deliberately broke the format, which makes it the
+/// EXPECTED path for every store written before it -- so refuse loudly instead.
+/// A crash at startup is recoverable by rebuilding; a database that quietly
+/// forgot its schemas is not.
+///
+/// Empty input is a different thing and stays benign: `recover` runs only when
+/// a snapshot exists, and `snapshot()` never yields zero bytes, so an empty
+/// buffer means there was nothing to restore rather than something unreadable.
+fn decode_snapshot(data: &[u8]) -> Vec<Schema> {
+    if data.is_empty() {
+        warn!("Schema snapshot is empty; nothing to recover");
+        return Vec::new();
+    }
+    match utils::serde::deserialize::<Vec<Schema>>(data) {
+        Some(schemas) => {
+            trace!("Successfully deserialized {} schemas", schemas.len());
+            schemas
+        }
+        None => {
+            error!(
+                "Schema snapshot ({} bytes) cannot be decoded by this build. The \
+                 most likely cause is a store written before the schema uid/vid \
+                 split, whose records carry `id` and none of `vid`/`uid`/\
+                 `generation`/`status`. That format is not supported and the \
+                 store must be rebuilt. Refusing to continue, because loading \
+                 zero schemas would leave every cell in this database \
+                 undecodable while looking like an empty database.",
+                data.len()
+            );
+            panic!(
+                "unreadable schema snapshot ({} bytes): incompatible store, rebuild it",
+                data.len()
+            );
+        }
+    }
+}
+
 impl StateMachineCtl for SchemasSM {
     raft_sm_complete!();
     fn id(&self) -> u64 {
@@ -144,16 +193,7 @@ impl StateMachineCtl for SchemasSM {
         trace!("========== SchemasSM::recover() CALLED ==========");
         trace!("Received {} bytes of snapshot data", data.len());
 
-        let schemas: Vec<Schema> = match utils::serde::deserialize::<Vec<Schema>>(&data) {
-            Some(s) => {
-                trace!("Successfully deserialized {} schemas", s.len());
-                s
-            }
-            None => {
-                trace!("Failed to deserialize schemas from snapshot data");
-                return future::ready(()).boxed();
-            }
-        };
+        let schemas: Vec<Schema> = decode_snapshot(&data);
 
         trace!("Loading {} schemas into map...", schemas.len());
         self.map.load_from_list(schemas.clone());
@@ -273,6 +313,58 @@ impl SchemasMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A schema record as it was written BEFORE the uid/vid split: an `id`,
+    /// and none of the identity fields this build requires. Serialized through
+    /// the same helper the state machine uses, so it is a real snapshot in
+    /// whichever format this build speaks (JSON in debug, CBOR in release).
+    #[derive(Serialize)]
+    struct PreSplitSchema {
+        id: u32,
+        name: String,
+    }
+
+    #[test]
+    fn an_empty_snapshot_recovers_to_nothing() {
+        // `recover` runs only when a snapshot exists and `snapshot()` never
+        // yields zero bytes, so this is "there was nothing to restore" -- not
+        // "something was unreadable". It must stay benign.
+        assert!(decode_snapshot(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_well_formed_snapshot_round_trips() {
+        let mut schema = Schema::new(
+            "person",
+            None,
+            Field::new_schema(vec![Field::new_unindexed("age", Type::U32)]),
+            false,
+            false,
+        );
+        schema.assign_identity(7);
+        let data = utils::serde::serialize(&vec![schema]);
+        let recovered = decode_snapshot(&data);
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].vid, SchemaVid(7));
+        assert_eq!(recovered[0].uid, SchemaUid(7));
+        assert_eq!(recovered[0].generation, 0);
+        assert_eq!(recovered[0].status, SchemaVersionStatus::Current);
+    }
+
+    #[test]
+    #[should_panic(expected = "unreadable schema snapshot")]
+    fn an_incompatible_snapshot_refuses_the_load_instead_of_emptying_it() {
+        // The regression this guards: `recover` used to swallow a failed
+        // decode at `trace!` and install an EMPTY map, so a store this build
+        // cannot read came up looking like a database with no schemas -- and
+        // every cell in it undecodable. Refusing loudly is the contract.
+        let data = utils::serde::serialize(&vec![PreSplitSchema {
+            id: 7,
+            name: "person".to_owned(),
+        }]);
+        assert!(!data.is_empty(), "the fixture must be a non-empty snapshot");
+        let _ = decode_snapshot(&data);
+    }
 
     #[test]
     fn scoped_schema_sm_ids_differ_between_databases() {

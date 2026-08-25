@@ -1,5 +1,4 @@
 use super::hash::{get_hash_id, get_null_hash_id};
-use crate::ram::schema::SchemaVid;
 // Import required dependencies
 use super::{EntryKey, Feature, IndexerClients};
 use crate::client::AsyncClient;

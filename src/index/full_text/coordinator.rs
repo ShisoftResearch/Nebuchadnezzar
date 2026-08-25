@@ -5,7 +5,6 @@
 /// 2. Aggregation of results from multiple nodes
 /// 3. Global statistics computation
 /// 4. Transparent routing to appropriate nodes
-use crate::ram::schema::SchemaVid;
 use std::collections::HashMap;
 
 use bifrost::conshash::ConsistentHashing;
@@ -460,6 +459,7 @@ impl Default for CoordinatorBuilder {
 mod tests {
     use super::*;
     use crate::ram::cell::OwnedCell;
+    use crate::ram::schema::SchemaVid;
     use crate::ram::types::{Map, OwnedMap, OwnedValue};
     use bifrost_hasher::hash_str;
     use log::info;

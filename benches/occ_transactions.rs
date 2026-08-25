@@ -13,7 +13,6 @@ use criterion::{
 use neb::ram::types::Id;
 use tokio::runtime::Runtime;
 
-use neb::ram::schema::SchemaVid;
 use occ_support::{
     fixture::{counter_cell, OccFixture, PortPlan},
     metrics::RunReport,
