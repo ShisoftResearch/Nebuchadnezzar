@@ -793,6 +793,13 @@ impl DataManager {
                 }
             }
         }
+        // Anything not held this round is no longer in doubt -- decided, or
+        // gone because its `end` finally arrived. Without this the map keeps
+        // an entry per transaction that was ever waiting on a silent peer,
+        // for the life of the process.
+        self.in_doubt_since
+            .lock()
+            .retain(|tid, _| hold.contains(tid));
         hold
     }
 
