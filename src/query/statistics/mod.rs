@@ -19,7 +19,7 @@ use crate::ram::{
     chunk::Chunk,
     clock::now,
     entry::Entry,
-    schema::{IndexType, SchemaVid},
+    schema::{IndexType, SchemaUid, SchemaVid},
 };
 
 #[derive(Debug, Default)]
@@ -42,7 +42,7 @@ pub struct ChunkStatistics {
     /// concurrently: request handlers starved (edge batches timed out) and
     /// the discarded scan buffers churned >100 GB of allocator free lists.
     refreshing: std::sync::atomic::AtomicBool,
-    pub schemas: PtrHashMap<SchemaVid, Arc<SchemaStatistics>>,
+    pub schemas: PtrHashMap<SchemaUid, Arc<SchemaStatistics>>,
 }
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
@@ -58,10 +58,15 @@ const MORPHEUS_SPARSE_SIDECAR_SCHEMA_ID_END: u32 = 0xF017;
 type HistogramKey = [u8; 8];
 type TargetHistogram = [HistogramKey; HISTOGRAM_TARGET_KEYS];
 
-/// TASK 3: statistics are a per-FAMILY aggregate, so this and the maps it
-/// guards should key by `SchemaUid`. The system schemas it excludes never
-/// evolve, so their two halves hold the same number and the check is exact
-/// either way.
+/// Whether a schema's cells are counted at all.
+///
+/// Takes the GENERATION, deliberately, even though statistics are a per-family
+/// aggregate: this runs once per live cell during a gather, and every schema it
+/// rejects is an internal one that is registered with a fixed hash-derived id
+/// and never evolves. Their family and generation are therefore the same
+/// number and the rejection is exact -- while resolving the record first, just
+/// to reject a b-tree page, would put a map lookup on the hottest path in the
+/// gather.
 #[inline]
 pub fn schema_tracks_statistics(schema_id: SchemaVid) -> bool {
     schema_id != *RANGED_TREE_SCHEMA_ID
@@ -305,10 +310,10 @@ fn build_partitation_statistics(
     partitation: Vec<(usize, usize)>,
     chunk: &Chunk,
 ) -> (
-    HashMap<SchemaVid, usize>,
-    HashMap<SchemaVid, HashSet<usize>>,
-    HashMap<SchemaVid, usize>,
-    HashMap<SchemaVid, HashMap<u64, (Vec<HistogramKey>, usize, usize)>>,
+    HashMap<SchemaUid, usize>,
+    HashMap<SchemaUid, HashSet<usize>>,
+    HashMap<SchemaUid, usize>,
+    HashMap<SchemaUid, HashMap<u64, (Vec<HistogramKey>, usize, usize)>>,
 ) {
     // Build exact histogram for each of the partitation and then approximate overall histogram
     debug!(
@@ -362,6 +367,11 @@ fn build_partitation_statistics(
                     continue;
                 }
                 if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
+                    // Past the cheap reject the record is resolved, so the
+                    // aggregate can be keyed by the family it belongs to --
+                    // which is what keeps one schema's statistics whole across
+                    // an evolution instead of splitting per generation.
+                    let schema_uid = schema.uid;
                     // Filter out fields that only have Fulltext or Vector indices
                     // as these don't support feature() for histogram building
                     let fields: Vec<u64> = schema
@@ -395,7 +405,7 @@ fn build_partitation_statistics(
                                 }
                                 let field_id = fields[i];
                                 exact_accumlators
-                                    .entry(schema_id)
+                                    .entry(schema_uid)
                                     .or_insert_with(|| HashMap::new())
                                     .entry(field_id)
                                     .or_insert_with(|| Vec::with_capacity(partitation_size))
@@ -403,9 +413,9 @@ fn build_partitation_statistics(
                             }
                         }
                     }
-                    *counts.entry(schema_id).or_insert(0) += 1;
-                    *sizes.entry(schema_id).or_insert(0) += cell_size;
-                    segs.entry(schema_id)
+                    *counts.entry(schema_uid).or_insert(0) += 1;
+                    *sizes.entry(schema_uid).or_insert(0) += cell_size;
+                    segs.entry(schema_uid)
                         .or_insert_with(|| HashSet::new())
                         .insert(cell_seg);
                 } else {
@@ -836,7 +846,10 @@ mod tests {
         let schema = Schema::new("dummy", None, fields, false, true);
         let schemas = LocalSchemasCache::new_local("");
         schemas.debug_only_new_schema(schema.clone());
-        let schema_id = schema.vid;
+        // Cells are written under the generation; statistics are read back
+        // under the family.
+        let schema_vid = schema.vid;
+        let schema_uid = schema.uid;
         let chunks = Chunks::new(
             1,
             SEGMENT_SIZE,
@@ -859,14 +872,14 @@ mod tests {
                 OwnedValue::String(String::from("Jack")),
             );
             let data = OwnedValue::Map(data_map);
-            let header = CellHeader::new(schema_id, &Id::rand());
+            let header = CellHeader::new(schema_vid, &Id::rand());
             let mut cell = OwnedCell { data, header };
             chunks.write_cell(&mut cell).unwrap();
         }
         // Writes only RECORD changes now — the refresh itself belongs to the
         // sweeper thread (or an explicit ensure), never the write path.
         chunks.ensure_statistics();
-        let stats = chunks.all_chunk_statistics(schema_id);
+        let stats = chunks.all_chunk_statistics(schema_uid);
         assert_eq!(stats.len(), 1);
         let stat = stats[0].as_ref().unwrap();
         debug!("Stat {:?}", &*stat);
@@ -875,7 +888,7 @@ mod tests {
         assert!(stat.timestamp > 0, "timestamp should not be zero");
         assert!(stat.segs > 0, "Segs should not be zero");
         chunks.ensure_statistics();
-        let stats = chunks.all_chunk_statistics(schema_id);
+        let stats = chunks.all_chunk_statistics(schema_uid);
         let stat = stats[0].as_ref().unwrap();
         info!("Statistics fields: {:?}", stat.histogram.keys());
         assert_eq!(stat.histogram.len(), 2, "Should have 2 statistics fields");

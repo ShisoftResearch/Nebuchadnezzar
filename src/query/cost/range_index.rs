@@ -1,4 +1,4 @@
-use crate::ram::schema::SchemaVid;
+use crate::ram::schema::SchemaUid;
 use std::sync::Arc;
 
 use crate::server::DatabaseRuntime;
@@ -12,17 +12,12 @@ pub struct RangeIndexCost {
 impl CostFunction for RangeIndexCost {
     fn cost(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field: Option<u64>,
         range: Option<&ValueRange>,
         projection: Vec<u64>,
     ) -> Option<CostResult> {
-        // TASK 3: statistics are a per-family aggregate and this selector is
-        // logical, so both sides become `SchemaUid`. One generation today.
-        let stat = self
-            .database_runtime
-            .chunks()
-            .overall_statistics(SchemaVid(schema));
+        let stat = self.database_runtime.chunks().overall_statistics(schema);
         let field = field?;
         let field_histo = stat.histogram.get(&field)?;
         let num_all_rows = stat.count;

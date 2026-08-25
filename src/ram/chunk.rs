@@ -15,7 +15,7 @@ use crate::{
     ram::cleaner::Cleaner,
 };
 
-use super::schema::{Schema, SchemaVid};
+use super::schema::{Schema, SchemaUid, SchemaVid};
 use dovahkiin::types::OwnedValue;
 use lightning::aarc::Arc as AArc;
 use lightning::map::{Map, WordMap, WordMutexGuard};
@@ -4850,7 +4850,7 @@ impl Chunks {
         removed
     }
 
-    pub fn all_chunk_statistics(&self, schema_id: SchemaVid) -> Vec<Option<Arc<SchemaStatistics>>> {
+    pub fn all_chunk_statistics(&self, schema_id: SchemaUid) -> Vec<Option<Arc<SchemaStatistics>>> {
         self.list
             .iter()
             .map(|c| c.statistics.schemas.get(&schema_id))
@@ -4861,10 +4861,10 @@ impl Chunks {
             .iter()
             .for_each(|c| c.statistics.ensured_refresh_chunk(c));
     }
-    pub fn overall_statistics(&self, schema: SchemaVid) -> Arc<SchemaStatistics> {
+    pub fn overall_statistics(&self, schema: SchemaUid) -> Arc<SchemaStatistics> {
         self.statistics
             .get(schema.get() as usize, 5 * 60, |schema| {
-                let schema = SchemaVid(schema as u32);
+                let schema = SchemaUid(schema as u32);
                 let all_stats = self
                     .all_chunk_statistics(schema)
                     .into_iter()

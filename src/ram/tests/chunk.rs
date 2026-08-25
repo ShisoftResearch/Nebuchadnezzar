@@ -266,7 +266,7 @@ pub fn ranged_btree_page_cells_do_not_build_chunk_statistics_when_forced() {
     chunks.ensure_statistics();
 
     assert!(
-        chunks.all_chunk_statistics(page_schema_id)[0].is_none(),
+        chunks.all_chunk_statistics(SchemaUid(page_schema_id.get()))[0].is_none(),
         "forced statistics rebuild should skip internal ranged B-tree page schemas"
     );
 }
@@ -345,7 +345,7 @@ pub fn sparse_sidecar_system_cells_do_not_build_chunk_statistics_when_forced() {
     chunks.ensure_statistics();
 
     assert!(
-        chunks.all_chunk_statistics(SchemaVid(sidecar_schema_id))[0].is_none(),
+        chunks.all_chunk_statistics(SchemaUid(sidecar_schema_id))[0].is_none(),
         "forced statistics rebuild should skip internal sparse sidecar schemas"
     );
 }

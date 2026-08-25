@@ -13,7 +13,7 @@ use crate::index::builder::IndexError;
 use crate::query::statistics::{merge_statistics, SchemaStatistics};
 use crate::ram::cell::{Cell, OwnedCell};
 use crate::ram::chunk::Chunks;
-use crate::ram::schema::{Field, Schema, SchemaVid};
+use crate::ram::schema::{Field, Schema, SchemaUid, SchemaVid};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
 
 use super::{
@@ -591,11 +591,11 @@ impl InvertedIndexer {
     }
 
     pub fn try_overall_schema_statistics(&self, schema_id: u32) -> Option<Arc<SchemaStatistics>> {
-        // TASK 3: statistics key by family; the inverted index passes a bare
-        // number down from its RPC surface. One generation today.
+        // The inverted index names schemas logically all the way down from its
+        // RPC surface, so the bare number it carries is a family.
         let all_stats = self
             .chunks
-            .all_chunk_statistics(SchemaVid(schema_id))
+            .all_chunk_statistics(SchemaUid(schema_id))
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
