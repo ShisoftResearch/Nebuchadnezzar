@@ -241,6 +241,16 @@ pub static TERMINATION_COMMITTED: std::sync::atomic::AtomicU64 =
 pub static TERMINATION_ABORTED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// How long an in-doubt transaction keeps its write heads while a
+/// participant stays silent, before this node gives up and presumes abort.
+fn termination_answer_grace() -> std::time::Duration {
+    std::env::var("NEB_TERMINATION_ANSWER_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30))
+}
+
 fn txn_lease_timeout() -> std::time::Duration {
     std::env::var("NEB_TXN_LEASE_TIMEOUT_SECS")
         .ok()
@@ -336,6 +346,12 @@ pub struct DataManager {
     /// against how long a coordinator can be gone before the lease sweeper
     /// gives up -- seconds, against tens of thousands of entries.
     decided: Mutex<BTreeMap<TxnId, TxnOutcome>>,
+    /// When each in-doubt transaction was first found unresolvable because a
+    /// participant would not answer. Bounds how long its write heads stay
+    /// held: a hostage head is a writer slot gone from its chunk with no
+    /// refill path, so waiting forever trades one wrong answer for a
+    /// different one.
+    in_doubt_since: Mutex<BTreeMap<TxnId, std::time::Instant>>,
 }
 
 /// How many finished transactions a site remembers the fate of. Sized to
@@ -388,6 +404,7 @@ impl DataManager {
             database_runtime,
             cleanup_signal: cleanup_signal.clone(),
             decided: Mutex::new(BTreeMap::new()),
+            in_doubt_since: Mutex::new(BTreeMap::new()),
             hlc,
         });
         let manager_clone = manager.clone();
@@ -412,13 +429,17 @@ impl DataManager {
                 // This runs FIRST, and the order is the whole point: the
                 // release below throws away the leases, and closing a
                 // bracket needs them.
-                manager_clone
-                    .terminate_in_doubt_transactions(txn_lease_timeout())
+                let hold = manager_clone
+                    .terminate_in_doubt_transactions(
+                        txn_lease_timeout(),
+                        termination_answer_grace(),
+                    )
                     .await;
 
                 for tid in crate::ram::chunk::expire_transaction_leases(
                     txn_lease_timeout(),
                     &manager_clone.chunks().address_range(),
+                    &hold,
                 ) {
                     manager_clone.wipe_out_transaction(&tid);
                 }
@@ -655,10 +676,18 @@ impl DataManager {
     /// What this does NOT fix: a site that has RESTARTED has lost both the
     /// transaction object and the participant set, so it never gets here.
     /// That case is recovery's, and it broadcasts rather than asks.
-    pub(crate) async fn terminate_in_doubt_transactions(&self, idle: std::time::Duration) {
+    pub(crate) async fn terminate_in_doubt_transactions(
+        &self,
+        idle: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> std::collections::BTreeSet<TxnId> {
         let store = self.chunks().address_range();
-        let idle = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
-        for tid in idle {
+        let candidates = crate::ram::chunk::transactions_with_idle_leases(idle, &store);
+        // Transactions whose leases must NOT be released this round, because
+        // the question "did anyone commit this?" is still open. Releasing
+        // them would throw away the leases a commit needs.
+        let mut hold = std::collections::BTreeSet::new();
+        for tid in candidates {
             // The transaction lock is READ and dropped before the network
             // call. Holding it across the await would also make this future
             // non-Send, which is how the first version announced itself.
@@ -675,7 +704,7 @@ impl DataManager {
             if !matches!(state, TxnState::Prepared | TxnState::Committed) {
                 continue;
             }
-            let outcome = self.ask_participants(&tid, &participants).await;
+            let (outcome, all_answered) = self.ask_participants(&tid, &participants).await;
             match outcome {
                 TxnOutcome::Committed => {
                     warn!(
@@ -714,23 +743,57 @@ impl DataManager {
                         );
                         continue;
                     }
+                    self.in_doubt_since.lock().remove(&tid);
                     TERMINATION_COMMITTED.fetch_add(1, Relaxed);
                 }
+                _ if !all_answered => {
+                    // SILENCE IS NOT A VOTE. A participant that could not be
+                    // reached has not said "not committed", so the heads stay
+                    // held and this runs again next second -- but not
+                    // forever: a hostage head is a writer slot gone from its
+                    // chunk with no refill path, so the wait is bounded and
+                    // the give-up is loud.
+                    let waited = {
+                        let mut since = self.in_doubt_since.lock();
+                        let first = since.entry(tid.clone()).or_insert_with(std::time::Instant::now);
+                        first.elapsed()
+                    };
+                    if waited < grace {
+                        debug!(
+                            "transaction {:?} is in doubt and not every participant has answered; \
+                             holding its heads ({:?} of {:?})",
+                            tid, waited, grace
+                        );
+                        hold.insert(tid);
+                        continue;
+                    }
+                    error!(
+                        "transaction {:?} stayed in doubt for {:?}: not every participant \
+                         answered. Presuming abort, which is the only thing this node can do \
+                         alone -- if a peer did commit it, this store has lost its half.",
+                        tid, waited
+                    );
+                    self.in_doubt_since.lock().remove(&tid);
+                    TERMINATION_ABORTED.fetch_add(1, Relaxed);
+                }
                 TxnOutcome::Aborted | TxnOutcome::Unknown | TxnOutcome::InDoubt => {
+                    // Every participant answered and none had committed it.
                     // Presume abort, which is what happened before -- but now
                     // it is a conclusion rather than an assumption, and the
                     // log says which.
                     warn!(
-                        "transaction {:?} was in doubt here and its {} participant(s) report \
+                        "transaction {:?} was in doubt here and all {} participant(s) report \
                          {:?}; presuming abort",
                         tid,
                         participants.len(),
                         outcome
                     );
+                    self.in_doubt_since.lock().remove(&tid);
                     TERMINATION_ABORTED.fetch_add(1, Relaxed);
                 }
             }
         }
+        hold
     }
 
     /// Ask every other participant what became of `tid`.
@@ -743,13 +806,23 @@ impl DataManager {
     ///
     /// A `Committed` cannot be wrong: only `end` writes a decision record,
     /// and only a coordinator that decided commit sends `end`.
-    async fn ask_participants(&self, tid: &TxnId, participants: &[u64]) -> TxnOutcome {
+    async fn ask_participants(
+        &self,
+        tid: &TxnId,
+        participants: &[u64],
+    ) -> (TxnOutcome, bool) {
         let Some(txn_manager) = self.database_runtime.txn_manager() else {
-            return TxnOutcome::Unknown;
+            return (TxnOutcome::Unknown, true);
         };
         let me = self.database_runtime.rpc.server_id;
         let mut saw_abort = false;
-        for peer in participants.iter().copied().filter(|peer| *peer != me) {
+        let peers: Vec<u64> = participants
+            .iter()
+            .copied()
+            .filter(|peer| *peer != me)
+            .collect();
+        let mut answered = 0usize;
+        for peer in peers.iter().copied() {
             let site = match txn_manager.data_site_for(peer).await {
                 Ok(site) => site,
                 Err(error) => {
@@ -763,8 +836,9 @@ impl DataManager {
             match site.txn_status(tid.clone()).await {
                 Ok(response) => {
                     self.update_clock(response.clock);
+                    answered += 1;
                     match response.payload {
-                        TxnOutcome::Committed => return TxnOutcome::Committed,
+                        TxnOutcome::Committed => return (TxnOutcome::Committed, true),
                         TxnOutcome::Aborted => saw_abort = true,
                         TxnOutcome::InDoubt | TxnOutcome::Unknown => {}
                     }
@@ -775,10 +849,11 @@ impl DataManager {
                 ),
             }
         }
+        let all_answered = answered == peers.len();
         if saw_abort {
-            TxnOutcome::Aborted
+            (TxnOutcome::Aborted, all_answered)
         } else {
-            TxnOutcome::Unknown
+            (TxnOutcome::Unknown, all_answered)
         }
     }
 

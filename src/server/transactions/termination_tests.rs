@@ -322,7 +322,7 @@ async fn an_in_doubt_participant_commits_when_a_peer_was_told_to_commit() {
             .database_runtime()
             .data_site()
             .expect("every server in this cluster runs a data site")
-            .terminate_in_doubt_transactions(Duration::ZERO)
+            .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
             .await;
     }
 
@@ -380,7 +380,7 @@ async fn an_in_doubt_participant_still_aborts_when_no_peer_committed() {
             .database_runtime()
             .data_site()
             .expect("every server in this cluster runs a data site")
-            .terminate_in_doubt_transactions(Duration::ZERO)
+            .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
             .await;
     }
 
@@ -515,6 +515,97 @@ async fn a_restarted_participant_asks_the_group_and_commits() {
     );
 
     restarted.shutdown().await;
+    for server in servers {
+        server.shutdown().await;
+    }
+}
+
+/// A silent peer must not be counted as a vote to abort.
+///
+/// The participant is in doubt and the peer that knows the answer is DOWN.
+/// Concluding abort here is the tear: the peer holds a durable COMMIT and
+/// will still hold it when it comes back. So the heads stay held and the
+/// question stays open -- but not forever, because a held head is a writer
+/// slot gone from its chunk with no refill path.
+///
+/// Both halves are asserted: it holds while inside the grace window, and it
+/// gives up once past it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_peer_holds_the_transaction_open_but_not_forever() {
+    let (servers, client, addresses, _temp) = start_txn_cluster("tear_silent").await;
+    let ids = two_ids_on_distinct_servers(&client, &servers).await;
+
+    let txn = super::new_async_client_for_database(&addresses[0], "tear_silent", "tear_silent")
+        .await
+        .unwrap();
+    let tid = txn.begin().await.unwrap().unwrap();
+    for (n, id) in ids.iter().enumerate() {
+        txn.write(tid.clone(), cell_of(*id, 600 + n as u64))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    txn.prepare(tid.clone()).await.unwrap().unwrap();
+
+    let told = client.locate_server_id(&ids[1]).unwrap();
+    let limit = super::manager::stop_end_fanout_after_server(tid.clone(), told);
+    let _ = txn.commit(tid.clone()).await;
+    drop(limit);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let in_doubt = &servers[0];
+    assert_eq!(
+        in_doubt.chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Prepared,
+        "the untold server must be in doubt"
+    );
+    let leases_before = crate::ram::chunk::transaction_lease_count(
+        &tid,
+        &in_doubt.chunks().address_range(),
+    );
+    assert!(
+        leases_before > 0,
+        "an in-doubt participant must still hold the heads its bracket needs"
+    );
+
+    // The peer that knows goes away.
+    let knows = servers[1].clone();
+    knows.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Inside the grace window: hold, do not decide.
+    let site = in_doubt
+        .database_runtime()
+        .data_site()
+        .expect("the in-doubt server runs a data site");
+    let hold = site
+        .terminate_in_doubt_transactions(Duration::ZERO, Duration::from_secs(300))
+        .await;
+    assert!(
+        hold.contains(&tid),
+        "a transaction whose peer never answered must be held, not decided"
+    );
+    assert_eq!(
+        crate::ram::chunk::transaction_lease_count(&tid, &in_doubt.chunks().address_range()),
+        leases_before,
+        "holding means KEEPING the leases; a commit still needs them"
+    );
+    assert_ne!(
+        in_doubt.chunks().durable_txn_status(&tid),
+        DurableTxnStatus::Committed,
+        "holding is not deciding"
+    );
+
+    // Past it: give up, so a permanently silent peer cannot cost a writer
+    // slot for the life of the process.
+    let hold = site
+        .terminate_in_doubt_transactions(Duration::ZERO, Duration::ZERO)
+        .await;
+    assert!(
+        !hold.contains(&tid),
+        "past the grace window the transaction must be released to the sweeper"
+    );
+
     for server in servers {
         server.shutdown().await;
     }

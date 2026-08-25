@@ -614,6 +614,7 @@ pub fn transactions_with_idle_leases(
 pub fn expire_transaction_leases(
     idle: std::time::Duration,
     store: &StoreRange,
+    hold: &std::collections::BTreeSet<crate::server::transactions::TxnId>,
 ) -> Vec<crate::server::transactions::TxnId> {
     let now = std::time::Instant::now();
     let expired: Vec<_> = {
@@ -621,6 +622,10 @@ pub fn expire_transaction_leases(
         held.iter()
             .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
             .filter(|(_, leases)| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
+            // Held back by cooperative termination: the question "did anyone
+            // commit this?" is still open, and closing a bracket needs the
+            // leases this release would throw away.
+            .filter(|(txn, _)| !hold.contains(*txn))
             .map(|(txn, _)| txn.clone())
             .collect()
     };
@@ -5779,7 +5784,7 @@ mod tests {
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 1);
 
         // Not yet: a transaction that is merely slow keeps its heads.
-        let expired = expire_transaction_leases(std::time::Duration::from_secs(3600), &chunks.address_range());
+        let expired = expire_transaction_leases(std::time::Duration::from_secs(3600), &chunks.address_range(), &Default::default());
         assert!(
             expired.is_empty(),
             "a lease inside its window must not be reclaimed"
@@ -5788,7 +5793,7 @@ mod tests {
 
         // Past the window, the head comes back and the caller is told which
         // transaction to settle.
-        let expired = expire_transaction_leases(std::time::Duration::from_secs(0), &chunks.address_range());
+        let expired = expire_transaction_leases(std::time::Duration::from_secs(0), &chunks.address_range(), &Default::default());
         assert!(
             expired.contains(&txn),
             "an undecided transaction must be reported so it can be settled"
