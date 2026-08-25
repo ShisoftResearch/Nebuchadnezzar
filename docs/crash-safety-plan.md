@@ -1362,11 +1362,21 @@ hands the bypass back deliberately, "let the caller fail honestly".
 
 ### Reproduction
 
-`neb_crash_churn`, 32 GB store, 64 MB chunks, 5 cycles. Does NOT reproduce at
-4 GB / 4 cycles even though that arm exhausted its store twice, so **store
-exhaustion is not the trigger on its own** -- the earlier note calling this
-"reachable at a level's right edge under exhaustion" had it half right. Depth
-appears to matter.
+`neb_crash_churn`, 64 MB chunks. Three arms:
+
+| store | cycles | hits |
+|---|---|---|
+| 4 GB | 4 | **0** (and it exhausted its store twice) |
+| 32 GB | 5 | 2,978 |
+| 64 GB | 6 | 4,120 |
+
+So **store exhaustion is not the trigger on its own** -- the earlier note
+calling this "reachable at a level's right edge under exhaustion" had it half
+right. All three arms exhausted; only the two large ones panicked, and the
+count scales with size. Tree DEPTH is the likelier variable.
+
+The 64 GB arm also ended `CYCLE 5 FAILED: graceful shutdown hung 120s`, which
+is the known exhaustion livelock and not a separate finding.
 
 ### Why it was not fixed here
 
