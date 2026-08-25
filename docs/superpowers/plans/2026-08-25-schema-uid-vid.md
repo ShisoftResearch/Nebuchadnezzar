@@ -57,38 +57,38 @@ where each change is small enough to argue about.
 - Modify: `src/ram/schema/sm.rs` (`SchemasMap`, `SchemasSM`, state machine block)
 - Modify: every file the compiler names -- expect ~55 files, ~811 sites
 
-- [ ] Add `SchemaUid(pub u32)` and `SchemaVid(pub u32)` in `src/ram/schema/mod.rs`,
+- [x] Add `SchemaUid(pub u32)` and `SchemaVid(pub u32)` in `src/ram/schema/mod.rs`,
       each `#[serde(transparent)]` and deriving
       `Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize`.
       Give each a `pub const fn get(self) -> u32` for the hand-rolled encoders
       that need the raw value.
-- [ ] Add `SchemaVersionStatus { Current, Stale { superseded_by: SchemaVid } }`.
-- [ ] Rename `Schema.id` to `Schema.vid: SchemaVid`. Add `uid: SchemaUid`,
+- [x] Add `SchemaVersionStatus { Current, Stale { superseded_by: SchemaVid } }`.
+- [x] Rename `Schema.id` to `Schema.vid: SchemaVid`. Add `uid: SchemaUid`,
       `generation: u32`, `status: SchemaVersionStatus`. **All required** -- no
       `#[serde(default)]`, no normalization on ingress.
-- [ ] `Schema::new` and `Schema::new_with_id` take one number and set
+- [x] `Schema::new` and `Schema::new_with_id` take one number and set
       `uid = SchemaUid(n)`, `vid = SchemaVid(n)`, `generation = 0`,
       `status = Current`.
-- [ ] `CellHeader.schema` becomes `SchemaVid`. It is hand-encoded with
+- [x] `CellHeader.schema` becomes `SchemaVid`. It is hand-encoded with
       `write_u32` (`src/ram/cell.rs:282`) and hand-decoded in
       `minimal_header_from_chunk_raw` (`cell.rs:965`); use `.get()` / the
       constructor there. **Assert no byte moved**: the header layout test must
       still see `schema` as 4 bytes at its current offset.
-- [ ] `EntryKey::from_props` takes `SchemaVid` for now (Task 3 flips it to
+- [x] `EntryKey::from_props` takes `SchemaVid` for now (Task 3 flips it to
       `SchemaUid`), still writing 4 bytes.
-- [ ] Work outward from `src/ram/schema` until it compiles. At each site the
+- [x] Work outward from `src/ram/schema` until it compiles. At each site the
       mechanical answer is `vid`; if a site looks like it obviously wants `uid`,
       **leave it as `vid` and note the file and line in the commit message** so
       Task 3 has a worklist rather than a rediscovery.
-- [ ] Confirm the Lightning maps accept the newtypes -- `PtrHashMap`'s
+- [x] Confirm the Lightning maps accept the newtypes -- `PtrHashMap`'s
       `SwiftKeyProbe` bound is satisfied by the blanket `impl<K: Eq>`
       (`Lightning/src/map/ptr_map.rs:2210`). Do not add an impl in Lightning;
       if one seems necessary, stop and re-read the bound.
-- [ ] Fix the fallout in `src/ram/tests`, `src/server/tests.rs`,
+- [x] Fix the fallout in `src/ram/tests`, `src/server/tests.rs`,
       `src/client/tests.rs`, and the `#[cfg(test)]` block in
       `src/ram/schema/mod.rs`.
-- [ ] `cargo fmt`, build, full suite locally at `--test-threads=8`.
-- [ ] Commit: `refactor(schema): separate a schema's generation from its family in the type system`.
+- [x] `cargo fmt`, build, full suite locally at `--test-threads=8`.
+- [x] Commit: `refactor(schema): separate a schema's generation from its family in the type system`.
       Include the Task 3 worklist in the message body.
 
 ## Task 2: An unreadable snapshot must fail loudly
@@ -100,22 +100,22 @@ for every pre-existing store.
 
 - Modify: `src/ram/schema/sm.rs` (`SchemasSM::recover`)
 
-- [ ] `SchemasSM::recover` currently matches the deserialize result and, on
+- [x] `SchemasSM::recover` currently matches the deserialize result and, on
       `None`, logs at `trace!` and returns -- installing an **empty schema map**
       (`sm.rs:141-150`). A database then comes up looking schema-less rather
       than unreadable: every cell fails `SchemaDoesNotExisted`, and
       `select_from_chunk_raw` (`cell.rs:1004`) panics in debug builds.
-- [ ] Log at `error!`, and refuse to complete recovery rather than installing an
+- [x] Log at `error!`, and refuse to complete recovery rather than installing an
       empty map. The database must fail to load, not load wrong.
-- [ ] Name the likely cause in the message -- a store written before the
+- [x] Name the likely cause in the message -- a store written before the
       uid/vid split -- and say to rebuild.
-- [ ] Check whether `recover` returning without loading is distinguishable to
+- [x] Check whether `recover` returning without loading is distinguishable to
       its caller at all. If `StateMachineCtl::recover` cannot signal failure,
       say so in the commit message and panic with the diagnostic instead; a
       loud crash beats a silently empty database.
-- [ ] Test: hand-build a snapshot from the pre-split `Schema` shape, feed it to
+- [x] Test: hand-build a snapshot from the pre-split `Schema` shape, feed it to
       `recover`, and assert the SM does not come up with an empty map.
-- [ ] Commit: `fix(schema): an unreadable snapshot fails the load instead of emptying it`.
+- [x] Commit: `fix(schema): an unreadable snapshot fails the load instead of emptying it`.
 
 ## Task 3: Reclassify the logical namespaces to uid
 
@@ -125,44 +125,68 @@ none can be half-done.
 
 **Files (one commit per bullet):**
 
-- [ ] **Cell identity.** `OwnedCell::default_id` / `encode_cell_key`
+- [x] **Cell identity.** `OwnedCell::default_id` / `encode_cell_key`
       (`src/ram/cell.rs:171-191`) derive a keyed cell's `Id` from the schema id;
       that must be the uid, or a cell's identity changes under it on the first
       evolution. `Id::from_obj(&(uid.get(), key_value))`.
       Commit: `refactor(cell): derive a keyed cell id from the schema family`.
-- [ ] **Statistics.** `Statistics::schemas` (`src/query/statistics/mod.rs:45`)
+- [x] **Statistics.** `Statistics::schemas` (`src/query/statistics/mod.rs:45`)
       and `refresh_statistics_for_schema` plus its ~9 callers in
       `src/ram/chunk.rs`. `schema_tracks_statistics`'s hard-coded ids
       (`statistics/mod.rs:55-65`) are internal schemas -- uid and vid are the
       same hash there, but state which one the function takes.
       Commit: `refactor(statistics): key per-schema statistics by family`.
-- [ ] **Hash index.** `get_hash_id`, `get_null_hash_id`,
+- [x] **Hash index.** `get_hash_id`, `get_null_hash_id`,
       `get_hash_id_from_value` (`src/index/hash/mod.rs:426-437`) and callers.
       Commit: `refactor(index): key hash buckets by schema family`.
-- [ ] **Ranged index.** `EntryKey::from_props` and `for_schema` take
+- [x] **Ranged index.** `EntryKey::from_props` and `for_schema` take
       `SchemaUid` (`src/index/entry.rs:27`, `:41`); callers in
       `src/client/ranged.rs`, `src/query/data_client/read.rs`,
       `src/index/ranged/tree/tree.rs:1342`. Add a doc comment on `EntryKey`
       saying its 4-byte prefix is a **uid**, so a prefix scan covers the whole
       family. The key's width and position do not change.
       Commit: `refactor(index): a ranged key prefix names a schema family`.
-- [ ] **Vector, embedding, full-text.** Their `schema_id` namespace parameters
+- [x] **Vector, embedding, full-text.** Their `schema_id` namespace parameters
       (`src/index/vector/mod.rs`, `src/index/embedding/mod.rs`,
       `src/index/full_text/*`).
       Commit: `refactor(index): namespace vector, embedding and full-text by family`.
-- [ ] **Index maintenance.** `ensure_indices`, `probe_cell_indices`,
+- [x] **Index maintenance.** `ensure_indices`, `probe_cell_indices`,
       `remove_indices` (`src/index/builder.rs:601+`) emit keys under
       `schema.uid`.
       Commit: `refactor(index): emit index entries under the schema family`.
-- [ ] **Post-schema hooks.** `post_schema_add` / `post_schema_delete`
+- [x] **Post-schema hooks.** `post_schema_add` / `post_schema_delete`
       (`src/ram/schema/mod.rs:872`, `:945`) create and destroy vector and
       embedding indexes by uid.
       Commit: `refactor(schema): create and destroy indexes by family`.
-- [ ] Leave the decode sites alone -- `cell.rs:533`, `cell.rs:987`,
+- [x] Leave the decode sites alone -- `cell.rs:533`, `cell.rs:987`,
       `plan_write` (`cell.rs:201`). Those take the vid, deliberately. If one of
       them stops compiling during this task, something upstream was
       misclassified; fix that rather than widening the site.
-- [ ] Full suite locally at `--test-threads=8` after the last commit.
+- [x] Full suite locally at `--test-threads=8` after the last commit.
+
+## Progress note (2026-08-25)
+
+Tasks 1-3 are committed on `feat/schema-uid-vid`. Two things went differently
+from the plan and are worth carrying forward:
+
+- **Task 3 landed in five commits, not seven.** Hash buckets and the ranged key
+  prefix are reached through the *same* query-layer functions, so typing one
+  and wrapping the other would have meant wrapping in one commit and unwrapping
+  in the next. The query data client and `CostFunction` were therefore typed
+  once, in the hash commit, which made the ranged commit small. Vector,
+  embedding, full-text, the index metas and the post-schema hooks were likewise
+  one commit, because `IndexComps` carries the id from `probe_cell_indices`
+  straight into every one of them.
+- **`schema_tracks_statistics` deliberately still takes a generation.** It runs
+  once per live cell during a gather, and everything it rejects is an internal
+  schema that never evolves. Resolving a record just to reject a b-tree page
+  would put a map lookup on the hottest path in the gather.
+
+The compiler-propagation premise held: typing a boundary pushed the type back
+to the schema record on its own, and interior plumbing that never reaches a
+boundary correctly stayed `u32`. Two RPC-facing surfaces keep a bare `u32` and
+wrap at the boundary, documented in place -- ids arriving over the wire are
+always logical, so there is nothing to resolve.
 
 ## Task 4: Handle maps in the state machine and the local cache
 
