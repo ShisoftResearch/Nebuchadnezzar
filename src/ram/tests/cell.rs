@@ -131,3 +131,63 @@ pub fn dynamic() {
         assert!(stored_cell.data["major"].string().is_none());
     }
 }
+
+/// A keyed cell's identity must follow its schema FAMILY, not the generation
+/// that happens to encode it.
+///
+/// This is the contract the whole evolution campaign rests on. If a cell id
+/// were derived from the generation, then the first time a schema changed
+/// shape every existing keyed cell would be orphaned -- unreachable by the
+/// only id a caller can compute -- and every subsequent write would address a
+/// different cell than the one already stored. Nothing would report an error;
+/// the data would simply stop being findable.
+#[test]
+pub fn a_keyed_cell_keeps_its_id_when_its_schema_is_evolved() {
+    let key_fields = Some(vec![String::from("id")]);
+    let mut generation_0 = Schema::new_with_id(
+        1,
+        &String::from("keyed"),
+        key_fields.clone(),
+        default_fields(),
+        false,
+        false,
+    );
+
+    // The same family, one evolution later: a new generation, a new vid, and
+    // the old one superseded. Exactly what `evolve_schema` will produce.
+    let mut generation_1 = Schema::new_with_id(
+        1,
+        &String::from("keyed"),
+        key_fields,
+        default_fields(),
+        false,
+        false,
+    );
+    generation_1.vid = SchemaVid(9001);
+    generation_1.generation = 1;
+    generation_0.status = SchemaVersionStatus::Stale {
+        superseded_by: generation_1.vid,
+    };
+
+    assert_eq!(
+        generation_0.uid, generation_1.uid,
+        "an evolution keeps the family it belongs to"
+    );
+    assert_ne!(
+        generation_0.vid, generation_1.vid,
+        "an evolution is a new generation"
+    );
+
+    let data = data_map_value! {
+        id: 100 as i64,
+        score: 70 as u64,
+        name: String::from("Jack")
+    };
+
+    let before = OwnedCell::new(&generation_0, data.clone()).id();
+    let after = OwnedCell::new(&generation_1, data).id();
+    assert_eq!(
+        before, after,
+        "the same key in the same family must name the same cell across an evolution"
+    );
+}

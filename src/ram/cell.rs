@@ -7,7 +7,9 @@ use crate::ram::entry::*;
 use crate::ram::io::align_address;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
-use crate::ram::schema::{CompressedFieldKind, Field, Schema, SchemaCompressionPlan, SchemaVid};
+use crate::ram::schema::{
+    CompressedFieldKind, Field, Schema, SchemaCompressionPlan, SchemaUid, SchemaVid,
+};
 use crate::ram::segs::SegmentClass;
 use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::types::{self, Bytes, Id, Map, OwnedValue, RandValue, SharedValue, Value};
@@ -187,14 +189,25 @@ impl OwnedCell {
         }
     }
 
-    pub fn encode_cell_key<V>(schema_id: u32, value: &V) -> Id
+    /// Derive a keyed cell's id from its schema FAMILY and its key value.
+    ///
+    /// The family, not the generation: a keyed cell's identity has to survive
+    /// its schema being evolved, or every existing cell would be orphaned by
+    /// the first shape change and every later write would address a different
+    /// cell than the one already stored.
+    ///
+    /// `Id::from_obj` serializes and then hashes, so the raw number is passed
+    /// rather than the newtype. `SchemaUid` is `#[serde(transparent)]` and so
+    /// encodes identically today, but cell ids are durable and must not depend
+    /// on that attribute staying put.
+    pub fn encode_cell_key<V>(schema_uid: SchemaUid, value: &V) -> Id
     where
         V: Serialize,
     {
-        Id::from_obj(&(schema_id, value))
+        Id::from_obj(&(schema_uid.get(), value))
     }
 
-    pub fn default_id(schema_id: u32, value: &OwnedValue, schema: &Schema) -> Id {
+    pub fn default_id(schema_uid: SchemaUid, value: &OwnedValue, schema: &Schema) -> Id {
         let key_field = &schema.key_field;
         if let OwnedValue::Map(ref data) = value {
             match key_field {
@@ -202,7 +215,7 @@ impl OwnedCell {
                     let value = data.get_in_by_ids(keys.iter());
                     match value {
                         &OwnedValue::Null => {}
-                        _ => return Self::encode_cell_key(schema_id, value),
+                        _ => return Self::encode_cell_key(schema_uid, value),
                     }
                 }
                 None => {}
@@ -212,11 +225,9 @@ impl OwnedCell {
     }
 
     pub fn new(schema: &Schema, value: OwnedValue) -> Self {
-        // TASK 3: `default_id` must key by `schema.uid` -- a keyed cell's
-        // identity has to survive its schema being evolved. The two hold the
-        // same number until the first evolution, so this is correct today and
-        // wrong the moment Task 7 lands.
-        let id = Self::default_id(schema.vid.get(), &value, schema);
+        // Identity by family, encoding by generation. These are the same
+        // number until the first evolution, and must not be afterwards.
+        let id = Self::default_id(schema.uid, &value, schema);
         Self::new_with_id(schema.vid, &id, value)
     }
 
