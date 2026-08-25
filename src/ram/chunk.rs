@@ -492,16 +492,50 @@ pub fn set_transaction_id(txn: Option<crate::server::transactions::TxnId>) {
 /// TLC found that the cleaner legitimately drops COMMIT records below the
 /// decided watermark, so "no COMMIT present" is not the same question as "not
 /// committed" and deciding an abort on it rolls back committed work.
-pub fn rewind_transaction_writes(txn: &crate::server::transactions::TxnId) -> usize {
-    let leases = {
-        let mut held = TXN_LEASES.lock();
-        held.remove(txn)
+/// A store identifies itself by the address window its chunks live in.
+///
+/// `TXN_LEASES` is process-global while a store is not: one process hosts a
+/// store per DATABASE, and two of them can hold leases under the same
+/// transaction id. Every entry point below therefore takes the caller's
+/// window and touches only the leases inside it. Without that, the first
+/// store to reach the decision removes the map entry and the second finds
+/// nothing to close -- its BEGIN stands with no COMMIT and recovery discards
+/// half of a committed transaction.
+pub type StoreRange = std::ops::Range<usize>;
+
+/// Take one store's leases out of the map, leaving every other store's alone.
+/// The transaction's entry disappears only once no store still holds a head.
+fn take_store_leases(
+    txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
+) -> Vec<((usize, usize), Vec<HeadLease>)> {
+    let mut held = TXN_LEASES.lock();
+    let Some(leases) = held.get_mut(txn) else {
+        return Vec::new();
     };
-    let Some(leases) = leases else {
-        return 0;
-    };
+    let mine: Vec<(usize, usize)> = leases
+        .per_chunk
+        .keys()
+        .filter(|key| store.contains(&key.0))
+        .copied()
+        .collect();
+    let taken: Vec<_> = mine
+        .into_iter()
+        .filter_map(|key| leases.per_chunk.remove(&key).map(|heads| (key, heads)))
+        .collect();
+    if leases.per_chunk.is_empty() {
+        held.remove(txn);
+    }
+    taken
+}
+
+pub fn rewind_transaction_writes(
+    txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
+) -> usize {
+    let leases = take_store_leases(txn, store);
     let mut rewound = 0usize;
-    for (chunk_id, heads) in leases.per_chunk {
+    for (chunk_id, heads) in leases {
         // Newest first: a chain's later parts are rewound before the part
         // that points at them, so no moment exists where a link names a span
         // that has already been disowned.
@@ -530,16 +564,13 @@ pub fn rewind_transaction_writes(txn: &crate::server::transactions::TxnId) -> us
 /// Release every head a transaction holds. Called at the decision -- commit
 /// or abort -- and by the expiry sweeper for a coordinator that never came
 /// back.
-pub fn release_transaction_leases(txn: &crate::server::transactions::TxnId) -> usize {
-    let leases = {
-        let mut held = TXN_LEASES.lock();
-        held.remove(txn)
-    };
-    let Some(leases) = leases else {
-        return 0;
-    };
+pub fn release_transaction_leases(
+    txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
+) -> usize {
+    let leases = take_store_leases(txn, store);
     let mut released = 0usize;
-    for (_chunk, heads) in leases.per_chunk {
+    for (_chunk, heads) in leases {
         for lease in heads {
             // Ownership first, then the reference: a segment that is still
             // owned cannot be sealed, so dropping the reference first would
@@ -560,17 +591,21 @@ pub fn release_transaction_leases(txn: &crate::server::transactions::TxnId) -> u
 /// refill path -- one hostage head is one less writer slot in that chunk,
 /// permanently. Returns the transactions whose leases were reclaimed so the
 /// caller can settle them discard-unless-COMMIT.
-pub fn expire_transaction_leases(idle: std::time::Duration) -> Vec<crate::server::transactions::TxnId> {
+pub fn expire_transaction_leases(
+    idle: std::time::Duration,
+    store: &StoreRange,
+) -> Vec<crate::server::transactions::TxnId> {
     let now = std::time::Instant::now();
     let expired: Vec<_> = {
         let held = TXN_LEASES.lock();
         held.iter()
             .filter(|(_, leases)| now.duration_since(leases.opened_at) >= idle)
+            .filter(|(_, leases)| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
             .map(|(txn, _)| txn.clone())
             .collect()
     };
     for txn in &expired {
-        let heads = release_transaction_leases(txn);
+        let heads = release_transaction_leases(txn, store);
         warn!(
             "transaction {:?} held {} write head(s) for more than {:?} without a decision; \
              releasing them. Its entries stay where they are and are settled \
@@ -590,6 +625,7 @@ pub fn expire_transaction_leases(idle: std::time::Duration) -> Vec<crate::server
 /// names is present.
 pub fn transaction_manifest(
     txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
 ) -> Vec<crate::ram::bracket::ManifestEntry> {
     let held = TXN_LEASES.lock();
     let Some(leases) = held.get(txn) else {
@@ -598,6 +634,21 @@ pub fn transaction_manifest(
     let mut manifest: Vec<_> = leases
         .per_chunk
         .iter()
+        // SCOPED TO ONE STORE. `TXN_LEASES` is process-global and its key is
+        // (store base address, chunk id) exactly because a chunk id alone is
+        // not unique across stores. The manifest keeps only the chunk id, so
+        // without this filter a process hosting two stores builds a manifest
+        // naming the OTHER store's chunks -- and `commit_transaction_brackets`
+        // then looks for leases in chunks that never had any and fails the
+        // whole decision with CannotAllocateSpace.
+        //
+        // Invisible in production, where a store is a process. Immediate in
+        // any test that puts two servers in one process, which is what a
+        // cross-node transaction test has to do.
+        // NOTE the key's first element is the CHUNK's allocator base
+        // (store base + i * chunk size), not the store base -- comparing it
+        // to the store base directly matches chunk 0 and nothing else.
+        .filter(|(chunk_id, _)| store.contains(&chunk_id.0))
         .flat_map(|(chunk_id, heads)| {
             heads.iter().map(move |lease| crate::ram::bracket::ManifestEntry {
                 chunk_id: chunk_id.1 as u16,
@@ -615,20 +666,29 @@ pub fn transaction_manifest(
 
 /// Whether this transaction holds any lease at all -- i.e. whether it wrote
 /// anything that needs a bracket closed.
-pub fn transaction_has_leases(txn: &crate::server::transactions::TxnId) -> bool {
-    TXN_LEASES.lock().contains_key(txn)
+pub fn transaction_has_leases(
+    txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
+) -> bool {
+    TXN_LEASES
+        .lock()
+        .get(txn)
+        .is_some_and(|leases| leases.per_chunk.keys().any(|key| store.contains(&key.0)))
 }
 
 /// The segments a transaction holds, for syncing its brackets at the decision.
 pub fn transaction_leased_segments(
     txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
 ) -> Vec<AArc<Segment>> {
     let held = TXN_LEASES.lock();
     held.get(txn)
         .map(|leases| {
             leases
                 .per_chunk
-                .values()
+                .iter()
+                .filter(|(key, _)| store.contains(&key.0))
+                .map(|(_, heads)| heads)
                 .flat_map(|heads| heads.iter().map(|lease| lease.seg.clone()))
                 .collect()
         })
@@ -636,11 +696,21 @@ pub fn transaction_leased_segments(
 }
 
 /// How many heads a transaction currently holds; for tests and metrics.
-pub fn transaction_lease_count(txn: &crate::server::transactions::TxnId) -> usize {
+pub fn transaction_lease_count(
+    txn: &crate::server::transactions::TxnId,
+    store: &StoreRange,
+) -> usize {
     TXN_LEASES
         .lock()
         .get(txn)
-        .map(|leases| leases.per_chunk.values().map(|v| v.len()).sum())
+        .map(|leases| {
+            leases
+                .per_chunk
+                .iter()
+                .filter(|(key, _)| store.contains(&key.0))
+                .map(|(_, v)| v.len())
+                .sum()
+        })
         .unwrap_or(0)
 }
 
@@ -3860,6 +3930,20 @@ impl Drop for PendingEntry {
     }
 }
 
+/// What a store durably knows about a transaction. See
+/// [`Chunks::durable_txn_status`].
+///
+/// `Aborted` merges "I aborted it" with "I never saw it", deliberately: both
+/// license the same action, and neither can be a committed transaction in
+/// disguise. What it must NEVER merge with is a committed one whose records
+/// were compacted -- see the method's doc for why that cannot happen.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DurableTxnStatus {
+    Committed,
+    Prepared,
+    Aborted,
+}
+
 pub struct Chunks {
     pub list: Vec<Chunk>,
     /// Live bytes per slot across the whole store; the same instance every
@@ -4247,16 +4331,23 @@ impl Chunks {
     ///
     /// A failure here is a failed commit, not a warning: the caller must not
     /// acknowledge a transaction whose bracket could not be closed.
+    /// The address window this store's chunks were carved out of. Used to
+    /// tell this store's leases apart from another store's in the same
+    /// process, where the process-global lease map holds both.
+    pub fn address_range(&self) -> std::ops::Range<usize> {
+        self.base_addr..self.base_addr + self.total_size
+    }
+
     pub fn commit_transaction_brackets(
         &self,
         txn: &crate::server::transactions::TxnId,
     ) -> Result<(), WriteError> {
-        if !transaction_has_leases(txn) {
+        if !transaction_has_leases(txn, &self.address_range()) {
             // A read-only transaction, or one whose writes all failed. There
             // is no bracket to close and nothing to commit.
             return Ok(());
         }
-        let manifest = transaction_manifest(txn);
+        let manifest = transaction_manifest(txn, &self.address_range());
         let chunk_ids: Vec<u16> = {
             let mut ids: Vec<u16> = manifest.iter().map(|member| member.chunk_id).collect();
             ids.sort_unstable();
@@ -4277,7 +4368,7 @@ impl Chunks {
         // touched-segment list: this runs at the decision, on whatever thread
         // delivered it, and that list belongs to the thread that applied the
         // writes. Reading it here would sync nothing and report success.
-        let segments = transaction_leased_segments(txn);
+        let segments = transaction_leased_segments(txn, &self.address_range());
         for segment in segments {
             if let Err(error) = segment.force_wal_sync() {
                 error!(
@@ -4341,6 +4432,65 @@ impl Chunks {
     /// Called first thing in shutdown so that nothing a client is told
     /// succeeded can land after the flush that was supposed to persist its
     /// index entries.
+    /// What this store durably knows about a transaction.
+    ///
+    /// Answered ONLY from the segments, never from the in-memory transaction
+    /// map: the caller that needs this most is a participant that restarted
+    /// and has no map. This is the evidence cooperative termination runs on.
+    ///
+    /// The three answers are exhaustive and none of them is a guess:
+    ///
+    /// - a COMMIT record for T exists  => it was TOLD to commit;
+    /// - an open BEGIN and no COMMIT   => it prepared and never heard;
+    /// - nothing at all                => aborted, or never prepared here.
+    ///
+    /// The last one is safe to treat as abort ONLY because of two rules the
+    /// format already keeps: every bracket part carries its own COMMIT, and
+    /// compaction drops a segment's BEGIN and COMMIT together. So a committed
+    /// transaction whose records were compacted comes back as ordinary
+    /// entries -- it is not a transaction this store is holding open, and it
+    /// cannot masquerade as "never decided".
+    pub fn durable_txn_status(
+        &self,
+        txn: &crate::server::transactions::TxnId,
+    ) -> DurableTxnStatus {
+        let mut prepared = false;
+        for chunk in &self.list {
+            for segment in chunk.segments() {
+                for meta in segment.entry_iter() {
+                    let content_len = meta.entry_header.content_length as usize;
+                    let content = unsafe {
+                        std::slice::from_raw_parts(meta.body_pos as *const u8, content_len)
+                    };
+                    match meta.entry_header.entry_type {
+                        crate::ram::entry::EntryType::COMMIT => {
+                            if let Some((committed, _)) =
+                                crate::ram::bracket::decode_commit(content)
+                            {
+                                if &committed == txn {
+                                    return DurableTxnStatus::Committed;
+                                }
+                            }
+                        }
+                        crate::ram::entry::EntryType::BEGIN => {
+                            if let Some(began) = crate::ram::bracket::decode_begin(content) {
+                                if &began == txn {
+                                    prepared = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if prepared {
+            DurableTxnStatus::Prepared
+        } else {
+            DurableTxnStatus::Aborted
+        }
+    }
+
     pub fn close_client_writes(&self) {
         for chunk in &self.list {
             chunk
@@ -5135,6 +5285,68 @@ mod tests {
         crate::server::transactions::test_hlc(n, n)
     }
 
+    /// One process hosts one store per DATABASE, and two of them can hold
+    /// leases under the SAME transaction id. Deciding one must not disturb
+    /// the other.
+    ///
+    /// The lease map is process-global; a store is not. Every entry point
+    /// took only the transaction id, so the first store to reach the
+    /// decision removed the whole map entry -- and the second then found no
+    /// leases, closed no bracket, and returned success. Its BEGIN stood with
+    /// no COMMIT, so recovery discarded its half of a transaction the other
+    /// half had durably committed: a tear inside ONE process, with no
+    /// coordinator failure involved at all.
+    ///
+    /// Found while building the two-participant termination test, where two
+    /// servers necessarily share a process. It is not a test artifact.
+    #[test]
+    fn deciding_one_store_leaves_another_stores_leases_alone() {
+        let _ = env_logger::try_init();
+        let first = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        let second = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
+        assert!(
+            !first.address_range().contains(&second.address_range().start),
+            "the two stores must occupy distinct address windows"
+        );
+        let txn = test_txn_id(77);
+
+        set_transaction_id(Some(txn.clone()));
+        let a = first.list[0].try_acquire(64, false).expect("lease in the first store");
+        let b = second.list[0].try_acquire(64, false).expect("lease in the second store");
+        assert!(a.leased && b.leased);
+        drop(a);
+        drop(b);
+        set_transaction_id(None);
+
+        assert_eq!(transaction_lease_count(&txn, &first.address_range()), 1);
+        assert_eq!(transaction_lease_count(&txn, &second.address_range()), 1);
+
+        // The first store decides. It must release ITS head and nothing else.
+        assert_eq!(release_transaction_leases(&txn, &first.address_range()), 1);
+        assert_eq!(transaction_lease_count(&txn, &first.address_range()), 0);
+        assert_eq!(
+            transaction_lease_count(&txn, &second.address_range()),
+            1,
+            "the second store still holds its head and has a bracket to close"
+        );
+        assert!(
+            transaction_has_leases(&txn, &second.address_range()),
+            "the second store must still see work to do at its own decision"
+        );
+        assert!(
+            !transaction_has_leases(&txn, &first.address_range()),
+            "the store that already decided must not see the other's leases as its own"
+        );
+        assert_eq!(
+            transaction_manifest(&txn, &second.address_range()).len(),
+            1,
+            "the manifest a store writes names only chunks it owns"
+        );
+
+        assert_eq!(release_transaction_leases(&txn, &second.address_range()), 1);
+        assert_eq!(transaction_lease_count(&txn, &second.address_range()), 0);
+    }
+
     /// A transaction's writes go behind ONE head per chunk, and that head
     /// stays owned between entries.
     ///
@@ -5155,7 +5367,7 @@ mod tests {
         let first = chunk.try_acquire(64, false).expect("first entry");
         let first_seg = first.seg.id;
         assert!(first.leased, "a transactional claim must take a lease");
-        assert_eq!(transaction_lease_count(&txn), 1);
+        assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 1);
         drop(first);
 
         // The head is STILL owned after the entry finished, so the next
@@ -5167,15 +5379,15 @@ mod tests {
             "the second entry must land in the head the transaction already holds"
         );
         assert_eq!(
-            transaction_lease_count(&txn),
+            transaction_lease_count(&txn, &chunks.address_range()),
             1,
             "reusing a leased head must not open a second lease"
         );
         drop(second);
         set_transaction_id(None);
 
-        assert_eq!(release_transaction_leases(&txn), 1);
-        assert_eq!(transaction_lease_count(&txn), 0);
+        assert_eq!(release_transaction_leases(&txn, &chunks.address_range()), 1);
+        assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
 
         // Released: an ordinary writer can take the head again.
         let plain = chunk.try_acquire(64, false).expect("plain entry");
@@ -5227,7 +5439,7 @@ mod tests {
         );
         set_transaction_id(None);
 
-        assert_eq!(rewind_transaction_writes(&txn), 1);
+        assert_eq!(rewind_transaction_writes(&txn, &chunks.address_range()), 1);
         assert_eq!(
             seg.append_header.load(Ordering::Acquire),
             before,
@@ -5247,7 +5459,7 @@ mod tests {
             "and that padding must vouch for itself like any other entry"
         );
         // The head is back in circulation.
-        assert_eq!(transaction_lease_count(&txn), 0);
+        assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
         let plain = chunk.try_acquire(64, false).expect("plain entry after abort");
         assert_eq!(plain.seg.id, seg.id);
         assert_eq!(
@@ -5352,7 +5564,7 @@ mod tests {
         let blob_seg_ref = blob.seg.clone();
         drop(blob);
         assert_eq!(
-            transaction_lease_count(&txn),
+            transaction_lease_count(&txn, &chunks.address_range()),
             2,
             "one head per class, not one per chunk"
         );
@@ -5369,14 +5581,14 @@ mod tests {
         );
         drop(regular_again);
         assert_eq!(
-            transaction_lease_count(&txn),
+            transaction_lease_count(&txn, &chunks.address_range()),
             2,
             "and continuing a chain opens no further lease"
         );
 
         // Both parts are named by the manifest, so the transaction is decided
         // as a whole rather than one class at a time.
-        let manifest = transaction_manifest(&txn);
+        let manifest = transaction_manifest(&txn, &chunks.address_range());
         assert_eq!(
             manifest.len(),
             2,
@@ -5413,7 +5625,7 @@ mod tests {
         }
 
         set_transaction_id(None);
-        assert_eq!(release_transaction_leases(&txn), 2);
+        assert_eq!(release_transaction_leases(&txn, &chunks.address_range()), 2);
     }
 
     /// Walk a segment's live extent and report what kind of entry sits where.
@@ -5449,24 +5661,24 @@ mod tests {
         let seg = entry.seg.id;
         drop(entry);
         set_transaction_id(None);
-        assert_eq!(transaction_lease_count(&txn), 1);
+        assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 1);
 
         // Not yet: a transaction that is merely slow keeps its heads.
-        let expired = expire_transaction_leases(std::time::Duration::from_secs(3600));
+        let expired = expire_transaction_leases(std::time::Duration::from_secs(3600), &chunks.address_range());
         assert!(
             expired.is_empty(),
             "a lease inside its window must not be reclaimed"
         );
-        assert_eq!(transaction_lease_count(&txn), 1);
+        assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 1);
 
         // Past the window, the head comes back and the caller is told which
         // transaction to settle.
-        let expired = expire_transaction_leases(std::time::Duration::from_secs(0));
+        let expired = expire_transaction_leases(std::time::Duration::from_secs(0), &chunks.address_range());
         assert!(
             expired.contains(&txn),
             "an undecided transaction must be reported so it can be settled"
         );
-        assert_eq!(transaction_lease_count(&txn), 0);
+        assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
 
         let plain = chunk.try_acquire(64, false).expect("entry after expiry");
         assert_eq!(

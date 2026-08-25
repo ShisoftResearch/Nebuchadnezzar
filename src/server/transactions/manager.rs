@@ -30,6 +30,40 @@ use tokio::sync::Notify;
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
 type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
+
+/// Transactions whose decision fan-out is cut short, and after how many
+/// participants. Test-only: see `sites_end`.
+#[cfg(test)]
+static END_FANOUT_LIMIT: std::sync::OnceLock<parking_lot::Mutex<BTreeMap<TxnId, usize>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn end_fanout_limits() -> &'static parking_lot::Mutex<BTreeMap<TxnId, usize>> {
+    END_FANOUT_LIMIT.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn end_fanout_limit(tid: &TxnId) -> Option<usize> {
+    end_fanout_limits().lock().get(tid).copied()
+}
+
+/// Make the coordinator stop after telling `sites` participants, as if it died
+/// there. Removed when the handle drops.
+#[cfg(test)]
+pub(crate) struct EndFanoutLimit(TxnId);
+
+#[cfg(test)]
+impl Drop for EndFanoutLimit {
+    fn drop(&mut self) {
+        end_fanout_limits().lock().remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn stop_end_fanout_after(tid: TxnId, sites: usize) -> EndFanoutLimit {
+    end_fanout_limits().lock().insert(tid.clone(), sites);
+    EndFanoutLimit(tid)
+}
 type DataSitesMap = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
@@ -1700,6 +1734,31 @@ impl TransactionManager {
         changed_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
     ) -> Result<EndResult, TMError> {
+        // A coordinator that dies mid-decision, on demand.
+        //
+        // This is the one window 2PC cannot survive without a termination
+        // protocol: the decision is made, some participants are told, and the
+        // rest are left holding prepared entries they cannot resolve. It is
+        // invisible from any single node, so without an injection point there
+        // is no way to demonstrate the bug OR to prove a fix.
+        //
+        // `AffectedObjs` is a BTreeMap keyed by server id, so "the first N"
+        // is a stable set across runs.
+        #[cfg(test)]
+        if let Some(limit) = end_fanout_limit(tid) {
+            let told: Vec<u64> = changed_objs.keys().take(limit).copied().collect();
+            for server_id in &told {
+                let data_site = data_sites.get(server_id).unwrap();
+                let _ = data_site.end(self.get_clock(), tid.clone()).await;
+            }
+            warn!(
+                "TEST: coordinator for {:?} stops after telling {} of {} participants",
+                tid,
+                told.len(),
+                changed_objs.len()
+            );
+            return Err(TMError::RPCErrorFromCellServer);
+        }
         let end_futures: FuturesUnordered<_> = changed_objs
             .iter()
             .map(|(ref server_id, _)| {

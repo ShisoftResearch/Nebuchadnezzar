@@ -15,6 +15,8 @@ mod occ_tests;
 #[cfg(feature = "occ_phase_profile")]
 pub mod phase_profile;
 #[cfg(test)]
+mod termination_tests;
+#[cfg(test)]
 mod tests;
 
 pub type TxnId = bifrost::hlc::Hlc;

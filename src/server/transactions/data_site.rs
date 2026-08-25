@@ -365,7 +365,10 @@ impl DataManager {
                 // entries themselves stay exactly where they are and are
                 // settled discard-unless-COMMIT, which is the same rule a
                 // crash in the same window already gets.
-                for tid in crate::ram::chunk::expire_transaction_leases(txn_lease_timeout()) {
+                for tid in crate::ram::chunk::expire_transaction_leases(
+                    txn_lease_timeout(),
+                    &manager_clone.chunks().address_range(),
+                ) {
                     manager_clone.wipe_out_transaction(&tid);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -581,7 +584,7 @@ impl DataManager {
         // transaction is a writer slot removed from its chunk's pool with no
         // refill path, so the release has to be impossible to forget on some
         // path nobody thought about.
-        crate::ram::chunk::release_transaction_leases(tid);
+        crate::ram::chunk::release_transaction_leases(tid, &self.chunks().address_range());
         let _ = self.txns.remove(tid);
         self.txns_sorted.lock().remove(tid);
     }
@@ -4175,7 +4178,7 @@ impl Service for DataManager {
         // nowhere to go. That is a participant deadlocking itself -- found
         // with gdb on a transaction suite stuck for over an hour, one thread
         // spinning for a head its own aborting transaction still held.
-        crate::ram::chunk::release_transaction_leases(&tid);
+        crate::ram::chunk::release_transaction_leases(&tid, &self.chunks().address_range());
 
         let rollback_failures = {
             debug!(
