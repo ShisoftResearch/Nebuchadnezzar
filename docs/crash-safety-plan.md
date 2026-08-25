@@ -1343,6 +1343,53 @@ hit the control, with the speculative-clone fix applied, so it is neither the
 Phase 6b work nor the `cell_ref` triple read. It killed the process at 595 of
 731 tests during a ranged-index teardown, with no panic message.
 
+## The suite's SIGSEGV: an unbounded CRC in recovery (FIXED 2026-08-25)
+
+The crash the A/B above surfaced on the CONTROL arm. `677022ac`.
+
+`verify_entry_at` took `content_length` out of the very bytes it was asked to
+judge and handed it to a CRC. The function exists to judge bytes that may be
+garbage, so the length was garbage too -- and the result was not a wrong
+answer but a **SIGSEGV on a recovery thread with no panic**, ~3 GB read past a
+224-byte buffer.
+
+Identical three frames on two machines and two branches:
+
+```
+read_chain_link (usable_len=224)
+  -> verify_entry_at
+    -> content_checksum (content_len=2,928,353,804)
+```
+
+`read_chain_link` is where it lands because it looks at a FIXED offset near a
+segment's tail and asks "is there an entry here?" -- usually there is not,
+which is exactly the unbounded case. The other three callers already
+bounds-checked first, which is why only this one crashed.
+
+`verify_entry_at(pos, bound)` now takes the bound as a PARAMETER rather than
+adding a check at the one bad call site: every caller has to state where its
+memory ends, and three of them already had the answer in hand. A length that
+does not fit is not a checksum failure to investigate -- these bytes are not
+an entry, so `Some(false)`.
+
+### How it was caught, which is the transferable part
+
+- The A/B is what proved it PRE-EXISTING. On the first comparison it had hit
+  only the candidate, which read as a regression; the control hitting it is
+  what settled that.
+- `gdb -batch -ex run -ex "thread apply all bt"` in a loop, **no root
+  needed**: `core_pattern` pipes to apport and `ulimit -c` was 0, so no core
+  was ever written. Catching SIGSEGV live in gdb sidesteps all of that.
+- `handle SIG32 SIG33 SIG35 SIGPIPE nostop noprint pass` is mandatory or gdb
+  drowns in thread signals and the run never finishes.
+- 11 rounds locally, 5 remotely. Parallel hunt instances made that tolerable.
+
+### The regression test needs no statistics
+
+`a_content_length_past_the_bound_is_refused_rather_than_read` puts the header
+at the very END of its buffer, so any nonzero length is out of bounds. It
+SIGSEGVs without the check and passes with it.
+
 ## OPEN (2026-08-25): `write_targeted` returns a bypass it cannot write
 
 Found by the crash fuzzer, not by a test. **2,978 panics in one 5-cycle run**,
