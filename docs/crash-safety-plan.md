@@ -1290,6 +1290,43 @@ presumed abort. That is the limit of cooperative termination without a durable
 decision, and it is what the code did unconditionally before. The 120 s
 sweeper remains the backstop.
 
+## `try_clone_speculative` read its pointer three times (FIXED 2026-08-25)
+
+Not part of Phase 6b; found because it failed the suite while validating it.
+
+`NodeCellRef::try_clone_speculative` read the `inner` field three separate
+times -- the default check, the deref, and the ref it returned -- on bytes
+that are mid-write BY DEFINITION. Two failures follow from the three reads
+disagreeing:
+
+- The deref saw NULL after the default check saw non-null, so
+  `as_ref().unwrap()` panicked (`cell_ref.rs:174`).
+- Silent and worse: the refcount was incremented through the pointer read at
+  the DEREF while the returned ref carried the pointer read AFTERWARDS. When
+  they differ, a different object owes the reference -- an under-count on one
+  node and an over-count on another, out of one race.
+
+One volatile read now feeds all three, and a torn read landing on null
+returns `None`, which is the case callers already retry.
+
+**A/B, same binary shape, 8 concurrent copies of `level_merge_insertion`:**
+
+| arm | runs | panics | segv |
+|---|---|---|---|
+| before | 1,200 | **1** (`cell_ref.rs:174`) | 0 |
+| before (earlier batch) | 144 | 0 | **1** (core dumped) |
+| after | 1,200 | 0 | 0 |
+| after (earlier batches) | 504 | 0 | 0 |
+
+Two crashes in 1,344 against none in 1,704. At ~1 in 700 that is suggestive
+rather than conclusive on its own -- what makes it convincing is that the
+panic line the A/B reproduces is the exact line the fix deletes, and the
+refcount half is provable by reading the function.
+
+**Not fixed**: the underlying read of a FAT pointer is still non-atomic, so
+it can still tear between data pointer and vtable. The real fix is an atomic
+field, which a fat pointer cannot be without restructuring `NodeRefInner`.
+
 ## OPEN (2026-08-25): `write_targeted` returns a bypass it cannot write
 
 Found by the crash fuzzer, not by a test. **2,978 panics in one 5-cycle run**,
