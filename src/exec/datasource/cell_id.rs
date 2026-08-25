@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::DataSource;
+use crate::ram::schema::SchemaUid;
 
 const BUFFER_SIZE: u16 = 64;
 
@@ -22,7 +23,7 @@ pub struct CellIds {
 }
 
 pub struct CellIdQuery {
-    schema: u32,
+    schema: SchemaUid,
     field: u64,
     range: ValueRange,
     ordering: Ordering,
@@ -34,7 +35,7 @@ impl DataSource<Id, CellIdQuery> for CellIds {
         let schema = params.schema;
         let field = params.field;
         let ordering = params.ordering;
-        let range = params.range.to_key_range(schema, field, ordering);
+        let range = params.range.to_key_range(schema.get(), field, ordering);
         let cursor = params
             .index_client
             .range_seek(range, BUFFER_SIZE, None)

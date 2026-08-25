@@ -23,6 +23,7 @@ use crate::{
 };
 
 use super::{DataCursor, IndexedDataClient, QueryOrdering, SCAN_BUFFER_SIZE};
+use crate::ram::schema::SchemaUid;
 
 const SCHEMA_SCAN_BUFFER_SIZE: u16 = 2048;
 
@@ -47,13 +48,13 @@ pub(crate) fn cells_read_count() -> usize {
 impl IndexedDataClient {
     pub(super) async fn scan_schema_index<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         projection: Vec<u64>,
         selection: Expr,
         proc: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        let key = EntryKey::for_schema(schema);
+        let key = EntryKey::for_schema(schema.get());
         let index_cursor = self
             .index_clients
             .range_seek(
@@ -69,10 +70,10 @@ impl IndexedDataClient {
 
     pub(super) async fn scan_schema_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         _ordering: QueryOrdering,
     ) -> Result<Vec<Id>, RPCError> {
-        let key = EntryKey::for_schema(schema);
+        let key = EntryKey::for_schema(schema.get());
         let Some(mut index_cursor) = self
             .index_clients
             .range_seek(
@@ -108,14 +109,14 @@ impl IndexedDataClient {
     /// correctness comes from sorting the full set.
     pub(super) async fn stream_schema_scan_filtered(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         selection: &Expr,
         limit: usize,
     ) -> Result<Vec<Id>, RPCError> {
         if limit == 0 {
             return Ok(vec![]);
         }
-        let key = EntryKey::for_schema(schema);
+        let key = EntryKey::for_schema(schema.get());
         let Some(mut index_cursor) = self
             .index_clients
             .range_seek(

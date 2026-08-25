@@ -27,7 +27,7 @@
 //         vanished: the corpse class),
 //       - after a graceful SIGTERM cycle, the scanned count must be at
 //         least the last acked high-water (the shutdown flush contract).
-use neb::ram::schema::SchemaVid;
+use neb::ram::schema::{SchemaUid, SchemaVid};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -946,7 +946,7 @@ async fn child_async(
     let mut count: u64 = 0;
     match idx_client
         .range_index_scan(
-            CHURN_SCHEMA_ID,
+            SchemaUid(CHURN_SCHEMA_ID),
             field_id,
             val_range,
             vec![],
@@ -1055,7 +1055,7 @@ async fn child_async(
         };
         if let Ok(mut cursor) = idx_client
             .range_index_scan(
-                CHURN_SCHEMA_ID,
+                SchemaUid(CHURN_SCHEMA_ID),
                 field_id,
                 val_range,
                 vec![],
@@ -1095,7 +1095,7 @@ async fn child_async(
         };
         if let Ok(mut cursor) = idx_client
             .range_index_scan(
-                CHURN_SCHEMA_ID,
+                SchemaUid(CHURN_SCHEMA_ID),
                 field_id,
                 val_range,
                 vec![],

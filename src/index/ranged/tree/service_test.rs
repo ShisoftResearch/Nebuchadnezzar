@@ -957,8 +957,8 @@ mod test {
         use crate::index::ranged::tree::btree::Ordering;
         use crate::query::data_client::{QueryOrdering, ValueRange, ValueRangeTerm};
         use crate::ram::cell::OwnedCell;
-        use crate::ram::schema::SchemaVid;
         use crate::ram::schema::{Field, IndexType, Schema};
+        use crate::ram::schema::{SchemaUid, SchemaVid};
         use crate::ram::types::Type;
         use crate::server::*;
         use bifrost_hasher::hash_str;
@@ -1065,7 +1065,7 @@ mod test {
 
             let mut cursor = idx_client
                 .range_index_scan(
-                    schema_id,
+                    SchemaUid(schema_id),
                     field_id,
                     val_range,
                     vec![],
@@ -1091,7 +1091,7 @@ mod test {
         ) -> (Vec<u64>, Vec<Id>) {
             let mut scan_cursor = idx_client
                 .scan_all(
-                    schema_id,
+                    SchemaUid(schema_id),
                     vec![],
                     Expr::nothing(),
                     Expr::nothing(),
@@ -1515,6 +1515,7 @@ mod test {
         use crate::index::builder::IndexBuilder;
         use crate::query::data_client::QueryOrdering;
         use crate::ram::cell::OwnedCell;
+        use crate::ram::schema::SchemaUid;
         use crate::ram::schema::{Field, IndexType, Schema};
         use crate::ram::types::Type;
         use crate::server::{NebServer, ServerOptions, Service};
@@ -1622,7 +1623,7 @@ mod test {
         loop {
             let mut cursor = idx_client
                 .scan_all(
-                    302,
+                    SchemaUid(302),
                     vec![],
                     Expr::nothing(),
                     Expr::nothing(),

@@ -27,6 +27,7 @@ mod projection;
 mod read;
 mod sort;
 
+use crate::ram::schema::SchemaUid;
 use aggregate::{
     collect_aggregate_required_fields, serialize_group_key, sort_aggregate_rows,
     AggregateGroupState,
@@ -116,7 +117,7 @@ impl IndexedDataClient {
     }
 
     fn hashed_query_invalid_input_error(
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         value: &OwnedValue,
     ) -> RPCError {
@@ -129,7 +130,7 @@ impl IndexedDataClient {
         ))
     }
 
-    fn hashed_query_index_ids(schema: u32, field: u64, value: &OwnedValue) -> Vec<Id> {
+    fn hashed_query_index_ids(schema: SchemaUid, field: u64, value: &OwnedValue) -> Vec<Id> {
         index_query_scalars(value)
             .into_iter()
             .flatten()
@@ -174,7 +175,7 @@ impl IndexedDataClient {
     }
     pub async fn range_index_scan<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         field: u64,
         range: ValueRange,
         projection: Vec<u64>, // Column array
@@ -182,7 +183,7 @@ impl IndexedDataClient {
         proc: Expr,
         ordering: Ordering,
     ) -> Result<DataCursor, RPCError> {
-        let range = range.to_key_range(schema, field, ordering);
+        let range = range.to_key_range(schema.get(), field, ordering);
         let index_cursor = self
             .index_clients
             .range_seek(range, SCAN_BUFFER_SIZE, None)
@@ -193,7 +194,7 @@ impl IndexedDataClient {
     }
     pub async fn scan_all<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         projection: Vec<u64>, // Column array
         selection: Expr,      // Checker expression
         proc: Expr,
@@ -220,7 +221,7 @@ impl IndexedDataClient {
 
     pub async fn query<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         projection: Vec<ProjectionField>,
@@ -233,7 +234,7 @@ impl IndexedDataClient {
 
     pub async fn query_with_options<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
@@ -262,7 +263,7 @@ impl IndexedDataClient {
 
     pub async fn query_with_options_and_hits<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
@@ -303,7 +304,7 @@ impl IndexedDataClient {
 
     pub async fn scan_by_expr<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         projection: Vec<ProjectionField>,
@@ -313,7 +314,7 @@ impl IndexedDataClient {
 
     pub async fn scan_by_expr_with_options<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
@@ -337,7 +338,7 @@ impl IndexedDataClient {
 
     pub async fn scan_by_expr_plan(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         order_by_field: Option<u64>,
         limit: Option<usize>,
@@ -349,7 +350,7 @@ impl IndexedDataClient {
 
     pub async fn aggregate(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         query: AggregateQuery,
         projection: Vec<ProjectionItem>,
     ) -> Result<QueryResultCursor, RPCError> {
@@ -444,7 +445,7 @@ impl IndexedDataClient {
 
     pub async fn query_ids<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
     ) -> Result<IdCursor, RPCError> {
@@ -454,7 +455,7 @@ impl IndexedDataClient {
 
     pub async fn query_ids_and_hits<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
@@ -467,7 +468,7 @@ impl IndexedDataClient {
 
     pub async fn query_ids_with_options<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
@@ -490,7 +491,7 @@ impl IndexedDataClient {
 
     pub async fn query_ids_with_options_and_hits<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
@@ -584,7 +585,7 @@ impl IndexedDataClient {
         };
 
         let ordered_candidate_ids: Vec<Id> = if let Some(field_id) = explicit_order_by_field {
-            self.reorder_ids_by_field(schema, field_id, &candidate_ids, ordering)
+            self.reorder_ids_by_field(schema.get(), field_id, &candidate_ids, ordering)
                 .await?
         } else {
             candidate_ids
@@ -664,7 +665,7 @@ impl IndexedDataClient {
 
     pub async fn scan_by_expr_ids<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
     ) -> Result<IdCursor, RPCError> {
@@ -673,7 +674,7 @@ impl IndexedDataClient {
 
     pub async fn scan_by_expr_ids_with_options<'a>(
         &'a self,
-        schema: u32,
+        schema: SchemaUid,
         selection: Expr,
         ordering: QueryOrdering,
         order_by_field: Option<u64>,
@@ -693,13 +694,13 @@ impl IndexedDataClient {
         .await
     }
 
-    pub fn hashed_index_id(schema: u32, field: u64, value: &OwnedValue) -> Id {
+    pub fn hashed_index_id(schema: SchemaUid, field: u64, value: &OwnedValue) -> Id {
         get_hash_id_from_value(schema, field, value)
     }
 
     pub async fn hashed_query(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         value: &OwnedValue,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
@@ -724,14 +725,14 @@ impl IndexedDataClient {
 
     pub async fn bm25_search(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
         phrase_boost: bool,
     ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
         self.index_clients
-            .bm25_search(schema, field_id, query, limit, phrase_boost)
+            .bm25_search(schema.get(), field_id, query, limit, phrase_boost)
             .await
     }
 }

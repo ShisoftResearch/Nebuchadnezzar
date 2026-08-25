@@ -29,6 +29,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::ram::schema::SchemaUid;
 use crate::ram::types::OwnedPrimArray;
 
 const COMPOUND_MISSING_PLACEHOLDER: &str = "";
@@ -1209,11 +1210,11 @@ where
             for comp in components {
                 match comp {
                     IndexComps::Hashed(feat) => {
-                        let hash_id = get_hash_id(schema.vid.get(), *field_id, feat);
+                        let hash_id = get_hash_id(schema.uid, *field_id, feat);
                         metas.push(IndexMeta::Hashed(HashedIndexMeta { hash_id, cell_id }));
                     }
                     IndexComps::Null => {
-                        let hash_id = get_null_hash_id(schema.vid.get(), *field_id);
+                        let hash_id = get_null_hash_id(schema.uid, *field_id);
                         metas.push(IndexMeta::Null(NullIndexMeta { hash_id, cell_id }));
                     }
                     IndexComps::Ranged(feat) => {

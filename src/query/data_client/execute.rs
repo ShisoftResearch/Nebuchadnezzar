@@ -22,11 +22,12 @@ use super::{
     sort::range_index_order_for_range,
     IndexedDataClient, QueryHitTable, QueryHitType, QueryOrdering, ValueRange,
 };
+use crate::ram::schema::SchemaUid;
 
 impl IndexedDataClient {
     pub(super) async fn execute_clause_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         clause: &IndexedClausePlan,
         _ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
@@ -120,7 +121,7 @@ impl IndexedDataClient {
 
     pub(super) async fn execute_predicate_plan_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         plan: &IndexedPredicatePlan,
         ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
@@ -140,7 +141,7 @@ impl IndexedDataClient {
 
     async fn execute_disjunct_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         disjunct: &IndexedDisjunctPlan,
         ordering: QueryOrdering,
         hit_table: &mut QueryHitTable,
@@ -217,7 +218,7 @@ impl IndexedDataClient {
 
     async fn vector_query_hits(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         query_vector: &[f32],
         limit: usize,
@@ -240,12 +241,12 @@ impl IndexedDataClient {
         {
             self.index_clients
                 .vector_client
-                .search_distributed(schema, field_id, query_vector, limit.max(1), None)
+                .search_distributed(schema.get(), field_id, query_vector, limit.max(1), None)
                 .await
         } else {
             self.index_clients
                 .vector_client
-                .search(schema, field_id, query_vector, limit.max(1), None)
+                .search(schema.get(), field_id, query_vector, limit.max(1), None)
                 .await
         };
         search_result.map_err(|e| {
@@ -258,7 +259,7 @@ impl IndexedDataClient {
 
     async fn embedding_query_hits(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
@@ -275,7 +276,7 @@ impl IndexedDataClient {
         }
         self.index_clients
             .embedding_client
-            .search(schema, field_id, query, limit.max(1))
+            .search(schema.get(), field_id, query, limit.max(1))
             .await
             .map_err(|e| {
                 RPCError::IOError(io::Error::new(
@@ -287,7 +288,7 @@ impl IndexedDataClient {
 
     async fn fulltext_query_hits(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
@@ -305,13 +306,13 @@ impl IndexedDataClient {
 
     async fn range_query_ids(
         &self,
-        schema: u32,
+        schema: SchemaUid,
         field: u64,
         range: &ValueRange,
         ordering: Ordering,
     ) -> Result<Vec<Id>, RPCError> {
         let mut ids = vec![];
-        let key_range = range.clone().to_key_range(schema, field, ordering);
+        let key_range = range.clone().to_key_range(schema.get(), field, ordering);
         let Some(mut cursor) = self
             .index_clients
             .range_seek(key_range, super::SCAN_BUFFER_SIZE, None)
