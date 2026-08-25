@@ -5406,6 +5406,53 @@ mod tests {
         crate::server::transactions::test_hlc(n, n)
     }
 
+    /// Every chunk's lease key must fall inside its own store's address
+    /// window -- the assumption the whole store-scoped lease API rests on.
+    ///
+    /// The key's first element is `allocator.base_addr()`, and the window is
+    /// `base_addr .. base_addr + total_size`. Those agree only because the
+    /// store mmaps ONE contiguous region and hands each chunk a slice of it.
+    /// A chunk that allocated its own memory instead -- which the allocator
+    /// still supports, via `base_addr == 0` -- would sit outside the window,
+    /// and then EVERY lease operation silently becomes a no-op: no bracket
+    /// closed, no head released, no manifest, and `commit_transaction_brackets`
+    /// returning Ok because it found nothing to do.
+    ///
+    /// That failure has no symptom until a restart, which is why it is
+    /// asserted here rather than left to be noticed.
+    #[test]
+    fn every_chunk_lease_key_falls_inside_its_own_store() {
+        let _ = env_logger::try_init();
+        for (count, size) in [(1usize, TEST_CHUNK_SIZE), (4, TEST_CHUNK_SIZE_MULTI)] {
+            let chunks = Chunks::new_dummy(count, size);
+            let range = chunks.address_range();
+            assert!(
+                range.start > 0 && range.end > range.start,
+                "a store must have a real address window, got {:?}",
+                range
+            );
+            for chunk in &chunks.list {
+                let key = chunk.lease_key();
+                assert!(
+                    range.contains(&key.0),
+                    "chunk {} leases under base {:#x}, outside its store's window {:#x}..{:#x}; \
+                     every lease in this chunk would be invisible to its own store",
+                    chunk.id,
+                    key.0,
+                    range.start,
+                    range.end
+                );
+            }
+            // And the window is exactly the chunks, with nothing left over for
+            // a stray address to land in.
+            assert_eq!(
+                range.end - range.start,
+                chunks.list.len() * (size.next_power_of_two()),
+                "the window must be exactly the chunks it covers"
+            );
+        }
+    }
+
     /// One process hosts one store per DATABASE, and two of them can hold
     /// leases under the SAME transaction id. Deciding one must not disturb
     /// the other.
