@@ -92,6 +92,42 @@ where
 //   node this thread latched (self-deadlock), and inserting into a full node
 //   re-acquires the root-versioning latch. If that insert splits the target,
 //   the loop applies the new split the same way.
+/// Follow a bypass `Empty` to the node it stands for.
+///
+/// A split that leaves a level with one child collapses it to a bypass
+/// `Empty`, whose `right` is that child. Traversal already forwards through
+/// it -- `mut_search` and `write_targeted` both do -- but `is_ext()` cannot:
+/// it is a question only External and Internal can answer, and a bypass is
+/// neither. Asking a bypass root directly is what panicked at node.rs:86 on
+/// the first insert that grew a freshly split tree.
+///
+/// Bounded rather than a `while`: a cycle here would hang a write path, and
+/// a bypass chain deeper than this is a corrupt tree, not a slow one.
+fn resolve_bypass<KS, PS>(mut node_ref: NodeCellRef) -> NodeCellRef
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    const MAX_BYPASS_HOPS: usize = 16;
+    for _ in 0..MAX_BYPASS_HOPS {
+        let next = {
+            let node = read_unchecked::<KS, PS>(&node_ref);
+            if !node.is_empty_node() {
+                return node_ref;
+            }
+            match node.right_ref() {
+                Some(right) if !right.is_default() => right.clone(),
+                // A bypass with nowhere to go. Nothing can be resolved, so
+                // hand back what we have and let the caller fail honestly
+                // rather than loop.
+                _ => return node_ref,
+            }
+        };
+        node_ref = next;
+    }
+    node_ref
+}
+
 pub fn apply_top_level_split<KS, PS>(tree: &BPlusTree<KS, PS>, mut split: NodeSplit<KS, PS>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -105,6 +141,11 @@ where
         // both are on the same (bottom) level — possible when a concurrent
         // bulk merge created siblings of a leaf root. A new root above the
         // current one keeps the tree correct through the B-link pointers.
+        // Resolve through any bypass BEFORE asking what kind of node this is.
+        // The bypass stands for its child, so growing the tree above the child
+        // is the same thing as growing it above the bypass -- and the root ref
+        // is replaced below in any case.
+        let current_root = resolve_bypass::<KS, PS>(current_root);
         if left_is_root || read_unchecked::<KS, PS>(&current_root).is_ext() {
             trace!("split root with pivot key {:?}", split.pivot);
             let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(1, max_entry_key());

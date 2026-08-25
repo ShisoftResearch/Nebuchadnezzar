@@ -666,32 +666,27 @@ fn retaining_at_any_pivot_keeps_the_left_side() {
     }
 }
 
-/// A structural split leaves the SOURCE tree unwritable. REPRODUCTION, NOT
-/// A REGRESSION -- this fails on `develop` too, and is `#[ignore]`d so the
-/// suite stays honest about what it is asserting.
+/// A structural split must leave the SOURCE tree writable.
 ///
-/// `split_off` / `split_off_spine` (the production tree-split path, reached
-/// from `RangedTree::split_off` when a tree goes oversized) collapse a root
-/// left with a single child into a bypass `Empty`. That node is neither
-/// External nor Internal, and `apply_top_level_split` calls `is_ext()` on the
-/// root directly on every insert that grows the tree -- so the source tree
-/// reads and writes fine until the first write that splits a leaf, and then
-/// panics at `node.rs:86`. Same shape as the retain bug fixed in `e68a72df`,
-/// reached through a different function.
+/// `split_off` / `split_off_spine` -- the production tree-split path, reached
+/// from `RangedTree::split_off` when a tree goes oversized -- collapse a root
+/// left with a single child into a bypass `Empty`. Traversal forwards through
+/// one happily; `is_ext()` cannot, because it is a question only External and
+/// Internal can answer. `apply_top_level_split` asks the root exactly that on
+/// every insert that grows the tree, so a freshly split source tree read and
+/// wrote fine until the first write that split a leaf, and then panicked at
+/// node.rs:86.
 ///
-/// NOT FIXED HERE, deliberately. Rebuilding the root as a real internal node
-/// with one child makes this test pass -- and makes three audit tests fail,
-/// because `is_tree_in_order` stops descending at an `Empty` root and so had
-/// never checked the levels below it. Underneath sits a second, older defect:
-/// when the root keeps exactly one child (`kept_ptrs.len() == 1`) the kept
-/// child's sibling links are never severed, so they dangle into the subtree
-/// that moved to the new tree. The bypass root was hiding that from the
-/// verifier. Fixing the panic without fixing the links just moves which
-/// invariant is broken, so both want doing together, with the link rules
-/// understood first.
+/// Fixed by resolving the bypass where the question is asked rather than by
+/// restructuring the tree. Rebuilding the root as a real internal node also
+/// makes this pass, and makes three audit tests fail: `is_tree_in_order`
+/// stops descending at an `Empty` root, so promoting one exposes the next
+/// level's head -- a bypass whose `left` points at its child by convention,
+/// which the verifier requires to be Nil for a level's first node. The
+/// bypass is not wrong, so the fix should not move it.
 #[test]
-#[ignore = "reproduces an unfixed defect in split_off; see the comment"]
-fn splitting_off_at_any_pivot_leaves_the_source_writable() {    let _ = env_logger::try_init();
+fn splitting_off_at_any_pivot_leaves_the_source_writable() {
+    let _ = env_logger::try_init();
     let total = PAGE_SIZE as u64 * 4;
     for pivot_at in 2..=total {
         let tree = LevelBPlusTree::new(&deletion_set());
