@@ -16,8 +16,26 @@ use tokio::time::{sleep, Duration};
 const PORT_SLOT_STRIDE: u16 = 10;
 const PORT_CLUSTER_WIDTH: u16 = 3;
 const MIN_IDS_PROBE_BUDGET: usize = 10_000;
-const BENCHMARK_CHUNKS: usize = 4;
-const FULL_CRITERION_SEGMENTS_PER_CHUNK: usize = 32;
+// Four chunks of 32 segments is 1 GiB, and the store is LOG-STRUCTURED: every
+// read-modify-write appends a new version rather than overwriting. Criterion
+// sizes its iteration count from measured warmup throughput, so a fast machine
+// plans MORE iterations and appends more -- `independent_rmw/8` planned 3.9M
+// and aborted with CannotAllocateSpace partway through, which reports as a
+// benchmark failure rather than as the capacity problem it is.
+//
+// More chunks rather than bigger ones. Chunk size sets `chunk_size_bits` and
+// therefore the id-to-chunk mapping, so growing a chunk changes geometry the
+// rest of the store reasons about; adding chunks does not. Nothing in the
+// benchmark depends on how many there are -- the fixture's id probe routes by
+// SERVER, through `locate_server_id`.
+const BENCHMARK_CHUNKS: usize = 16;
+// 64 rather than 32, and this is the axis that matters for the HOT workloads.
+//
+// `hot_rmw` drives every thread at the same cells, so every append lands in
+// the same locality and therefore the SAME chunk. Adding chunks does nothing
+// for it -- 739k appends against one 256 MiB chunk exhausted it while fifteen
+// others sat nearly empty. Only that chunk being larger helps.
+const FULL_CRITERION_SEGMENTS_PER_CHUNK: usize = 64;
 const BENCHMARK_CHUNK_SIZE: usize = SEGMENT_SIZE * FULL_CRITERION_SEGMENTS_PER_CHUNK;
 const BENCHMARK_DB_SIZE: usize = BENCHMARK_CHUNK_SIZE * BENCHMARK_CHUNKS;
 
@@ -288,8 +306,8 @@ fn benchmark_server_options() -> ServerOptions {
 mod tests {
     use super::*;
 
-    const EXPECTED_BENCHMARK_CHUNKS: usize = 4;
-    const MIN_FULL_CRITERION_SEGMENTS_PER_CHUNK: usize = 32;
+    const EXPECTED_BENCHMARK_CHUNKS: usize = 16;
+    const MIN_FULL_CRITERION_SEGMENTS_PER_CHUNK: usize = 64;
 
     #[test]
     fn benchmark_server_options_preserve_topology_and_capacity_for_full_criterion_run() {
@@ -298,7 +316,9 @@ mod tests {
 
         assert_eq!(
             chunk_count, EXPECTED_BENCHMARK_CHUNKS,
-            "OCC benchmark routing requires {EXPECTED_BENCHMARK_CHUNKS} chunks, got {chunk_count}"
+            "OCC benchmark capacity assumes {EXPECTED_BENCHMARK_CHUNKS} chunks, got \
+             {chunk_count}. Nothing routes on this number; it is here so a change to the \
+             fixture's size has to be deliberate."
         );
         assert!(
             options.chunk_size >= SEGMENT_SIZE * MIN_FULL_CRITERION_SEGMENTS_PER_CHUNK,
