@@ -1438,7 +1438,7 @@ a failure message, check which branch actually incremented the counter it
 reports. `env_logger` defaults to `error`, so both messages were already in
 the log with no `RUST_LOG` set -- the hour was spent not looking.
 
-## OPEN (2026-08-25): `write_targeted` returns a bypass it cannot write
+## FIXED (2026-08-25, `31e03fdf`): `write_targeted` returned a bypass it could not write
 
 Found by the crash fuzzer, not by a test. **2,978 panics in one 5-cycle run**,
 each killing an index task:
@@ -1489,25 +1489,46 @@ count scales with size. Tree DEPTH is the likelier variable.
 The 64 GB arm also ended `CYCLE 5 FAILED: graceful shutdown hung 120s`, which
 is the known exhaustion livelock and not a separate finding.
 
-### Why it was not fixed here
+### The invariant, settled by reading the writer
 
-The obvious fixes are all wrong in a way that would corrupt the index:
+**A level IS allowed to end in a bypass, deliberately.** `level.rs`,
+`select_nodes_in_boundary`:
 
-- Forwarding right: there is no right.
-- Walking back left to the last real node: the guard for it was already
-  dropped, and re-latching leftward inverts the walk's lock order.
-- Holding the previous guard while peeking right: two write latches at once,
-  which is not this walk's discipline.
+```rust
+if next_node.right_ref().unwrap().is_default() {
+    return NodeSelection::WholePage(collected, NodeReadHandler::default());
+}
+```
 
-The shape that looks right is to peek at the right node BEFORE shifting onto
-it and stop on the current one if the right is a terminal bypass -- but that
-needs the level invariants confirmed (is a level allowed to END in a bypass at
-all, or is the bug that one was left there?), and getting it wrong writes into
-the wrong node. Left for someone with the invariants in hand.
+At the level's right edge it hands back a DEFAULT right node. That flows into
+`clear_nodes(nodes, right_node.node_ref())` -> `clear_node` ->
+`make_empty_node`, and `clear_node` then sets the bypass's right AND left to
+that same default. So the terminal bypass is isolated on both sides and it is
+this path's design, not debris from another bug.
 
-**What is safe to say now**: the index tasks that hit this die, so their
-entries are lost, and `reconcile_index_before_serving` is what repairs the
-store afterwards.
+That settles where the fix belongs: in the READER. It also rules out walking
+back left -- there is no left link to walk.
+
+### The fix
+
+`write_targeted` remembers the last node it passed that can actually be
+written and returns that instead of the bypass. This is the SAME rule the
+default-right branch already applied ("right node is none, should pick
+current one") -- a key past the end of a level belongs in the rightmost node
+-- just skipping the bypasses standing between, which were never writable.
+
+**No new lock order.** The walk already latches the right node while holding
+the left one (the guard is not dropped until the assignment), so this only
+holds the left latch longer. At most two are live, because each new
+`previous` drops the old.
+
+### Verified
+
+- `write_targeted_never_returns_a_bypass_it_cannot_write` builds the exact
+  shape `clear_node` produces and fails without the fix. Milliseconds, where
+  reproducing this before took a 20-minute 32 GB churn run.
+- The 64 GB / 6-cycle churn that produced **4,120** panics now produces
+  **0**, with `torn=0` in every cycle.
 
 ## Sequencing and dependencies
 
