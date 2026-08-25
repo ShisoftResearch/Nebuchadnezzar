@@ -7,7 +7,7 @@ use crate::ram::entry::*;
 use crate::ram::io::align_address;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
-use crate::ram::schema::{CompressedFieldKind, Field, Schema, SchemaCompressionPlan};
+use crate::ram::schema::{CompressedFieldKind, Field, Schema, SchemaCompressionPlan, SchemaVid};
 use crate::ram::segs::SegmentClass;
 use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::types::{self, Bytes, Id, Map, OwnedValue, RandValue, SharedValue, Value};
@@ -32,7 +32,9 @@ pub type OwnedCellRef = ARef<OwnedCell>;
 pub struct CellHeader {
     pub version: u64,
     pub timestamp: u32,
-    pub schema: u32,
+    /// The exact generation that encoded these bytes. A decode must use this
+    /// one, never whatever generation is current now.
+    pub schema: SchemaVid,
     pub id: Id,
 }
 
@@ -81,7 +83,10 @@ pub enum WriteError {
     /// Carries the owner and the Raft log index that established it so a client
     /// can retry immediately without letting a late refusal roll back newer
     /// placement knowledge.
-    NotSlotOwner { owner: u64, applied_index: u64 },
+    NotSlotOwner {
+        owner: u64,
+        applied_index: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -101,7 +106,10 @@ pub enum ReadError {
     /// Raised only when the read would otherwise MISS: a member holding the
     /// cell still serves it, so this costs nothing on the deferred-drop path it
     /// is protecting.
-    NotSlotOwner { owner: u64, applied_index: u64 },
+    NotSlotOwner {
+        owner: u64,
+        applied_index: u64,
+    },
     NetworkingError,
     CellTypeIsNotMapForSelect,
     CellIdIsUnitId,
@@ -123,7 +131,7 @@ pub enum ReadError {
 }
 
 impl CellHeader {
-    pub fn new(schema: u32, id: &Id) -> CellHeader {
+    pub fn new(schema: SchemaVid, id: &Id) -> CellHeader {
         let now = clock::now();
         CellHeader {
             version: 1,
@@ -142,6 +150,17 @@ impl CellHeader {
 }
 
 pub const CELL_HEADER_SIZE: usize = std::mem::size_of::<CellHeader>();
+
+// The cell header is DURABLE, and `CELL_HEADER_SIZE` is derived from the
+// struct's layout -- so naming the schema field with a newtype rather than a
+// bare u32 must not move a single byte. A `#[repr(Rust)]` newtype over one
+// integer is layout-identical to that integer, which makes the whole header
+// identical; this refuses to compile the day that stops being true, rather
+// than silently re-laying-out every cell ever written.
+const _: () = {
+    assert!(std::mem::size_of::<SchemaVid>() == std::mem::size_of::<u32>());
+    assert!(std::mem::align_of::<SchemaVid>() == std::mem::align_of::<u32>());
+};
 pub const CELL_HEADER_SIZE_U32: u32 = CELL_HEADER_SIZE as u32;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -161,7 +180,7 @@ pub struct WritePlan<'a> {
 def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor);
 
 impl OwnedCell {
-    pub fn new_with_id(schema_id: u32, id: &Id, value: OwnedValue) -> Self {
+    pub fn new_with_id(schema_id: SchemaVid, id: &Id, value: OwnedValue) -> Self {
         Self {
             header: CellHeader::new(schema_id, id),
             data: value,
@@ -193,9 +212,12 @@ impl OwnedCell {
     }
 
     pub fn new(schema: &Schema, value: OwnedValue) -> Self {
-        let schema_id = schema.id;
-        let id = Self::default_id(schema_id, &value, schema);
-        Self::new_with_id(schema_id, &id, value)
+        // TASK 3: `default_id` must key by `schema.uid` -- a keyed cell's
+        // identity has to survive its schema being evolved. The two hold the
+        // same number until the first evolution, so this is correct today and
+        // wrong the moment Task 7 lands.
+        let id = Self::default_id(schema.vid.get(), &value, schema);
+        Self::new_with_id(schema.vid, &id, value)
     }
 
     pub fn plan_write(&self, chunk: &Chunk) -> Result<WritePlan, WriteError> {
@@ -203,7 +225,7 @@ impl OwnedCell {
         let schema = if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
             schema
         } else {
-            return Err(WriteError::SchemaDoesNotExisted(schema_id));
+            return Err(WriteError::SchemaDoesNotExisted(schema_id.get()));
         };
         let mut tail_offset: usize = schema.static_bound;
         let mut instructions = WriteInstructions::new();
@@ -279,7 +301,7 @@ impl OwnedCell {
                 let mut cursor = addr_to_header_cursor(content_addr);
                 cursor.write_u64::<Endian>(new_version).unwrap();
                 cursor.write_u32::<Endian>(new_timestamp).unwrap();
-                cursor.write_u32::<Endian>(header.schema).unwrap();
+                cursor.write_u32::<Endian>(header.schema.get()).unwrap();
                 cursor.write_u64::<Endian>(header.id.bits()).unwrap();
                 release_cursor(cursor);
                 let data_base_addr = content_addr + CELL_HEADER_SIZE;
@@ -580,7 +602,7 @@ impl<'v> SharedCellData<'v> {
                 // This shall never happen, need to debug and fix it in testing
                 panic!("{}", msg);
             }
-            return Err(ReadError::SchemaDoesNotExisted(*schema_id));
+            return Err(ReadError::SchemaDoesNotExisted(schema_id.get()));
         }
     }
     pub fn from_data(header: CellHeader, data: SharedValue<'v>) -> Self {
@@ -884,7 +906,7 @@ pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
     let header = CellHeader {
         version: cursor.read_u64::<Endian>().unwrap(),
         timestamp: cursor.read_u32::<Endian>().unwrap(),
-        schema: cursor.read_u32::<Endian>().unwrap(),
+        schema: SchemaVid(cursor.read_u32::<Endian>().unwrap()),
         id: Id::from_bits(cursor.read_u64::<Endian>().unwrap()),
     };
     release_cursor(cursor);
@@ -969,7 +991,7 @@ pub fn minimal_header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), 
     let mut header = CellHeader::default();
     let addr = Entry::content_pos(ptr);
     let schema = unsafe { ptr::read((addr + 8 + 4) as *const u32) };
-    header.schema = schema;
+    header.schema = SchemaVid(schema);
     Ok((header, addr + CELL_HEADER_SIZE))
 }
 
@@ -1004,6 +1026,6 @@ pub fn select_from_chunk_raw<'v>(
             // This shall never happen, need to debug and fix it in testing
             panic!("{}", msg);
         }
-        return Err(ReadError::SchemaDoesNotExisted(*schema_id));
+        return Err(ReadError::SchemaDoesNotExisted(schema_id.get()));
     }
 }

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::ram::schema::SchemaVid;
 use crate::server::ServerMeta;
 
 use super::{planner::ValueRange, statistics::SchemaStatistics};
@@ -63,6 +64,12 @@ fn row_bytes(
         }
         Some(((stat.bytes as f64) / (stat.count as f64)) as usize)
     } else {
-        Some(meta.schemas.fields_size(&schema, projection.as_slice())?)
+        // TASK 3: the query layer selects a schema by FAMILY. Until it does,
+        // the number it carries is the sole generation, so the record lookup
+        // is exact.
+        Some(
+            meta.schemas
+                .fields_size(&SchemaVid(schema), projection.as_slice())?,
+        )
     }
 }

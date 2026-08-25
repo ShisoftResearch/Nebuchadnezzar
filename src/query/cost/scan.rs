@@ -1,3 +1,4 @@
+use crate::ram::schema::SchemaVid;
 use std::sync::Arc;
 
 use crate::server::DatabaseRuntime;
@@ -16,7 +17,12 @@ impl CostFunction for ScanIndexCost {
         _range: Option<&ValueRange>,
         projection: Vec<u64>,
     ) -> Option<CostResult> {
-        let stat = self.database_runtime.chunks().overall_statistics(schema);
+        // TASK 3: statistics are a per-family aggregate and this selector is
+        // logical, so both sides become `SchemaUid`. One generation today.
+        let stat = self
+            .database_runtime
+            .chunks()
+            .overall_statistics(SchemaVid(schema));
         let row_count = stat.count;
         let row_bytes = row_bytes(schema, &projection, self.database_runtime.meta(), &stat)?;
         Some(CostResult {

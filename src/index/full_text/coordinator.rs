@@ -5,6 +5,7 @@
 /// 2. Aggregation of results from multiple nodes
 /// 3. Global statistics computation
 /// 4. Transparent routing to appropriate nodes
+use crate::ram::schema::SchemaVid;
 use std::collections::HashMap;
 
 use bifrost::conshash::ConsistentHashing;
@@ -588,16 +589,22 @@ mod tests {
             content_field,
             OwnedValue::String("rust programming language guide".to_string()),
         );
-        let mut cell1 =
-            OwnedCell::new_with_id(schema_id, &shard1_docs[0], OwnedValue::Map(cell1_data));
+        let mut cell1 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &shard1_docs[0],
+            OwnedValue::Map(cell1_data),
+        );
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
             content_field,
             OwnedValue::String("database storage systems".to_string()),
         );
-        let mut cell2 =
-            OwnedCell::new_with_id(schema_id, &shard1_docs[1], OwnedValue::Map(cell2_data));
+        let mut cell2 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &shard1_docs[1],
+            OwnedValue::Map(cell2_data),
+        );
 
         shard1.chunks().write_cell(&mut cell1).unwrap();
         shard1.chunks().write_cell(&mut cell2).unwrap();
@@ -612,16 +619,22 @@ mod tests {
             content_field,
             OwnedValue::String("rust async programming tokio".to_string()),
         );
-        let mut cell3 =
-            OwnedCell::new_with_id(schema_id, &shard2_docs[0], OwnedValue::Map(cell3_data));
+        let mut cell3 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &shard2_docs[0],
+            OwnedValue::Map(cell3_data),
+        );
 
         let mut cell4_data = OwnedMap::new();
         cell4_data.insert(
             content_field,
             OwnedValue::String("search engine architecture".to_string()),
         );
-        let mut cell4 =
-            OwnedCell::new_with_id(schema_id, &shard2_docs[1], OwnedValue::Map(cell4_data));
+        let mut cell4 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &shard2_docs[1],
+            OwnedValue::Map(cell4_data),
+        );
 
         shard2.chunks().write_cell(&mut cell3).unwrap();
         shard2.chunks().write_cell(&mut cell4).unwrap();
@@ -704,7 +717,10 @@ mod tests {
             "Merged results should have 2 unique documents"
         );
         // Score for id (1000,1) should be 1.5 + 0.5 = 2.0
-        let hit_1_1 = merged.iter().find(|h| h.id == Id::from_parts(1000, 1)).unwrap();
+        let hit_1_1 = merged
+            .iter()
+            .find(|h| h.id == Id::from_parts(1000, 1))
+            .unwrap();
         assert!(
             (hit_1_1.score - 2.0).abs() < 0.001,
             "Scores should be aggregated"
@@ -821,7 +837,8 @@ mod tests {
             content_field,
             OwnedValue::String("hello world from single shard".to_string()),
         );
-        let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+        let mut cell =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc_id, OwnedValue::Map(cell_data));
 
         server.chunks().write_cell(&mut cell).unwrap();
         if let Some(index_builder) = server.indexer() {

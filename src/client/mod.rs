@@ -230,12 +230,8 @@ impl AsyncClient {
     /// already knows, which is both authoritative and cheaper than pulling all
     /// 32768 entries.
     pub fn note_slot_owner(&self, slot: u32, owner: u64, applied_index: u64) -> bool {
-        self.conshash.note_slot_owner(
-            slot as u64,
-            owner,
-            crate::slots::SLOT_COUNT,
-            applied_index,
-        )
+        self.conshash
+            .note_slot_owner(slot as u64, owner, crate::slots::SLOT_COUNT, applied_index)
     }
 
     #[cfg(test)]
@@ -316,7 +312,9 @@ impl AsyncClient {
                 owner,
                 applied_index,
             }) => {
-                let owner_client = self.redirect_to_slot_owner(&id, owner, applied_index).await?;
+                let owner_client = self
+                    .redirect_to_slot_owner(&id, owner, applied_index)
+                    .await?;
                 owner_client.read_cell(id).await
             }
             other => Ok(other),
@@ -335,7 +333,9 @@ impl AsyncClient {
                 owner,
                 applied_index,
             }) => {
-                let owner_client = self.redirect_to_slot_owner(&id, owner, applied_index).await?;
+                let owner_client = self
+                    .redirect_to_slot_owner(&id, owner, applied_index)
+                    .await?;
                 owner_client.read_cell_select(id, fields, need_header).await
             }
             other => Ok(other),
@@ -585,7 +585,8 @@ impl AsyncClient {
                 Ok::<_, RPCError>((indices, results))
             })
             .collect::<FuturesUnordered<_>>();
-        let mut out: Vec<Option<Result<CellHeader, WriteError>>> = (0..total).map(|_| None).collect();
+        let mut out: Vec<Option<Result<CellHeader, WriteError>>> =
+            (0..total).map(|_| None).collect();
         while let Some(res) = batches.next().await {
             let (indices, results) = res?;
             for (idx, r) in indices.into_iter().zip(results) {
@@ -849,7 +850,7 @@ impl AsyncClient {
             return Ok(Err(err));
         }
         let res = self.schema_client.new_schema(&schema).await;
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
         match res {
             Ok(Ok(_)) => {
                 if schema.index_fields.is_empty() && schema.compound_index_fields.is_empty() {
@@ -859,7 +860,7 @@ impl AsyncClient {
                 if let Some(server_id) = self.conshash.rand_server_id() {
                     match self.client_by_server_id(server_id).await {
                         Ok(client) => {
-                            if let Err(e) = client.post_schema_add(schema_id).await {
+                            if let Err(e) = client.post_schema_add(schema_id.get()).await {
                                 return Ok(Err(NewSchemaError::PostProcessError(format!(
                                     "Post process error: {:?}",
                                     e
@@ -889,7 +890,7 @@ impl AsyncClient {
         mut schema: Schema,
     ) -> Result<Result<u32, NewSchemaError>, ExecError> {
         let schema_id = self.schema_client.next_id().await?;
-        schema.id = schema_id;
+        schema.assign_identity(schema_id);
         self.new_schema_with_id(schema)
             .await
             .map(|r| r.map(|_| schema_id))
@@ -900,7 +901,7 @@ impl AsyncClient {
         let schema_id = if let Some(schema) = schema {
             has_index_fields =
                 !schema.index_fields.is_empty() || !schema.compound_index_fields.is_empty();
-            schema.id
+            schema.vid
         } else {
             return Ok(Err(DelSchemaError::SchemaDoesNotExisted));
         };
@@ -908,7 +909,7 @@ impl AsyncClient {
             if let Some(server_id) = self.conshash.rand_server_id() {
                 match self.client_by_server_id(server_id).await {
                     Ok(client) => {
-                        if let Err(e) = client.post_schema_delete(schema_id).await {
+                        if let Err(e) = client.post_schema_delete(schema_id.get()).await {
                             return Ok(Err(DelSchemaError::PostProcessError(format!(
                                 "Post process error: {:?}",
                                 e

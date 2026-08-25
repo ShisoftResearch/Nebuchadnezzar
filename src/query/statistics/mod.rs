@@ -19,7 +19,7 @@ use crate::ram::{
     chunk::Chunk,
     clock::now,
     entry::Entry,
-    schema::IndexType,
+    schema::{IndexType, SchemaVid},
 };
 
 #[derive(Debug, Default)]
@@ -42,7 +42,7 @@ pub struct ChunkStatistics {
     /// concurrently: request handlers starved (edge batches timed out) and
     /// the discarded scan buffers churned >100 GB of allocator free lists.
     refreshing: std::sync::atomic::AtomicBool,
-    pub schemas: PtrHashMap<u32, Arc<SchemaStatistics>>,
+    pub schemas: PtrHashMap<SchemaVid, Arc<SchemaStatistics>>,
 }
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
@@ -58,12 +58,16 @@ const MORPHEUS_SPARSE_SIDECAR_SCHEMA_ID_END: u32 = 0xF017;
 type HistogramKey = [u8; 8];
 type TargetHistogram = [HistogramKey; HISTOGRAM_TARGET_KEYS];
 
+/// TASK 3: statistics are a per-FAMILY aggregate, so this and the maps it
+/// guards should key by `SchemaUid`. The system schemas it excludes never
+/// evolve, so their two halves hold the same number and the check is exact
+/// either way.
 #[inline]
-pub fn schema_tracks_statistics(schema_id: u32) -> bool {
+pub fn schema_tracks_statistics(schema_id: SchemaVid) -> bool {
     schema_id != *RANGED_TREE_SCHEMA_ID
         && schema_id != *PAGE_SCHEMA_ID
         && !(MORPHEUS_SPARSE_SIDECAR_SCHEMA_ID_START..=MORPHEUS_SPARSE_SIDECAR_SCHEMA_ID_END)
-            .contains(&schema_id)
+            .contains(&schema_id.get())
 }
 
 /// At most this many statistics refreshes run process-wide. Refresh cost
@@ -135,8 +139,7 @@ impl ChunkStatistics {
             )
             .is_err()
         {
-            self.changes
-                .fetch_add(claimed_changes, Ordering::Relaxed);
+            self.changes.fetch_add(claimed_changes, Ordering::Relaxed);
             return;
         }
         let done = ResetOnDrop(&self.refreshing);
@@ -146,8 +149,7 @@ impl ChunkStatistics {
             >= MAX_CONCURRENT_REFRESHES
         {
             ACTIVE_REFRESHES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            self.changes
-                .fetch_add(claimed_changes, Ordering::Relaxed);
+            self.changes.fetch_add(claimed_changes, Ordering::Relaxed);
             return;
         }
         // Guarded like the flag: a panicking scan must not leak a slot.
@@ -303,10 +305,10 @@ fn build_partitation_statistics(
     partitation: Vec<(usize, usize)>,
     chunk: &Chunk,
 ) -> (
-    HashMap<u32, usize>,
-    HashMap<u32, HashSet<usize>>,
-    HashMap<u32, usize>,
-    HashMap<u32, HashMap<u64, (Vec<HistogramKey>, usize, usize)>>,
+    HashMap<SchemaVid, usize>,
+    HashMap<SchemaVid, HashSet<usize>>,
+    HashMap<SchemaVid, usize>,
+    HashMap<SchemaVid, HashMap<u64, (Vec<HistogramKey>, usize, usize)>>,
 ) {
     // Build exact histogram for each of the partitation and then approximate overall histogram
     debug!(
@@ -834,7 +836,7 @@ mod tests {
         let schema = Schema::new("dummy", None, fields, false, true);
         let schemas = LocalSchemasCache::new_local("");
         schemas.debug_only_new_schema(schema.clone());
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
         let chunks = Chunks::new(
             1,
             SEGMENT_SIZE,

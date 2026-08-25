@@ -15,7 +15,7 @@ use crate::{
     ram::cleaner::Cleaner,
 };
 
-use super::schema::Schema;
+use super::schema::{Schema, SchemaVid};
 use dovahkiin::types::OwnedValue;
 use lightning::aarc::Arc as AArc;
 use lightning::map::{Map, WordMap, WordMutexGuard};
@@ -616,10 +616,12 @@ pub fn transaction_manifest(
         // to the store base directly matches chunk 0 and nothing else.
         .filter(|(chunk_id, _)| store.contains(&chunk_id.0))
         .flat_map(|(chunk_id, heads)| {
-            heads.iter().map(move |lease| crate::ram::bracket::ManifestEntry {
-                chunk_id: chunk_id.1 as u16,
-                seq_id: lease.seg.seq_id,
-            })
+            heads
+                .iter()
+                .map(move |lease| crate::ram::bracket::ManifestEntry {
+                    chunk_id: chunk_id.1 as u16,
+                    seq_id: lease.seg.seq_id,
+                })
         })
         .collect();
     // Sorted so the same transaction produces the same manifest bytes in
@@ -686,10 +688,11 @@ fn note_transactional_write(segment: &AArc<Segment>) {
         let mut segments = segments.borrow_mut();
         // Runs are common and land in one segment; a linear scan over a
         // handful of entries beats hashing them.
-        if !segments.iter().any(|held| held.id == segment.id
-            && held.chunk_id == segment.chunk_id
-            && held.seq_id == segment.seq_id)
-        {
+        if !segments.iter().any(|held| {
+            held.id == segment.id
+                && held.chunk_id == segment.chunk_id
+                && held.seq_id == segment.seq_id
+        }) {
             segments.push(segment.clone());
         }
     });
@@ -839,7 +842,7 @@ pub struct RetiredSegment {
 
 impl Chunk {
     #[inline]
-    fn refresh_statistics_for_schema(&self, schema_id: u32) {
+    fn refresh_statistics_for_schema(&self, schema_id: SchemaVid) {
         if schema_tracks_statistics(schema_id) {
             self.refresh_statistics();
         }
@@ -1346,12 +1349,10 @@ impl Chunk {
             return false;
         }
         let mut held = TXN_LEASES.lock();
-        let leases = held
-            .entry(txn)
-            .or_insert_with(|| TransactionLeases {
-                per_chunk: std::collections::HashMap::new(),
-                opened_at: std::time::Instant::now(),
-            });
+        let leases = held.entry(txn).or_insert_with(|| TransactionLeases {
+            per_chunk: std::collections::HashMap::new(),
+            opened_at: std::time::Instant::now(),
+        });
         leases
             .per_chunk
             .entry(self.lease_key())
@@ -1391,7 +1392,10 @@ impl Chunk {
         let heads: Vec<AArc<Segment>> = {
             let txn_now = current_txn();
             let held = TXN_LEASES.lock();
-            match txn_now.as_ref().and_then(|t| held.get(t)).and_then(|l| l.per_chunk.get(&self.lease_key()))
+            match txn_now
+                .as_ref()
+                .and_then(|t| held.get(t))
+                .and_then(|l| l.per_chunk.get(&self.lease_key()))
             {
                 Some(heads) => heads.iter().map(|lease| lease.seg.clone()).collect(),
                 None => Vec::new(),
@@ -1546,11 +1550,7 @@ impl Chunk {
     /// Place an entry in the head this transaction already holds in this
     /// chunk. `None` means "no lease here, or it no longer fits" and the
     /// caller claims a head the ordinary way.
-    fn try_place_in_leased_head(
-        &self,
-        size: u32,
-        segment_class: SegmentClass,
-    ) -> LeasedPlacement {
+    fn try_place_in_leased_head(&self, size: u32, segment_class: SegmentClass) -> LeasedPlacement {
         let Some(txn) = current_txn() else {
             return LeasedPlacement::NoLease;
         };
@@ -1566,8 +1566,7 @@ impl Chunk {
                         .iter()
                         .rev()
                         .find(|lease| lease.seg.segment_class() == segment_class)
-                })
-            {
+                }) {
                 Some(lease) => lease.seg.clone(),
                 None => return LeasedPlacement::NoLease,
             }
@@ -1658,9 +1657,7 @@ impl Chunk {
                     );
                     return Err(WriteError::CannotAllocateSpace);
                 }
-                LeasedPlacement::Unusable
-                | LeasedPlacement::NoLease
-                | LeasedPlacement::Full => {
+                LeasedPlacement::Unusable | LeasedPlacement::NoLease | LeasedPlacement::Full => {
                     // Either the head is merely busy, or this chunk cannot
                     // spare one to hold. Both take the ordinary path: a
                     // transaction that cannot be given a head of its own
@@ -1695,7 +1692,8 @@ impl Chunk {
         // by this transaction, and stamping a tail link into it would zero
         // space the segment still owns.
         if let Some(previous) = self.newest_leased_head(segment_class).filter(|head| {
-            head.bound().saturating_sub(head.append_header.load(Ordering::Acquire))
+            head.bound()
+                .saturating_sub(head.append_header.load(Ordering::Acquire))
                 < crate::ram::bracket::TXN_CONT_ENTRY_SIZE * 2
         }) {
             let link = crate::ram::bracket::encode_txn_cont(&txn, previous.seq_id);
@@ -2112,7 +2110,9 @@ impl Chunk {
                 // cost a day.
                 let cause = if free_segs + unbumped <= reserve && free_segs + unbumped > 0 {
                     "the chunk is FULL and its remaining segments are the compaction reserve                      (working as intended -- give the store more room)"
-                } else if cap_segs > self.segs.len() + free_segs + unbumped + self.retired_segment_count() {
+                } else if cap_segs
+                    > self.segs.len() + free_segs + unbumped + self.retired_segment_count()
+                {
                     "addresses are UNACCOUNTED FOR -- neither live, free, retired nor unbumped.                      That is a leak, not a full store"
                 } else {
                     "the chunk is genuinely out of segments"
@@ -2201,107 +2201,106 @@ impl Chunk {
     /// NEB_SYNC_SEAL_ARCHIVE toggle) or on the background sealer; the sequence
     /// is identical either way.
     pub(crate) fn finish_rotated_head(&self, head_seg_id: u64) {
-            if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
-                // Let the writers that acquired from this segment finish
-                // before it stops being writable.
-                //
-                // Rotation only publishes a new head; entries acquired from
-                // the old one moments earlier are still in flight, and each
-                // holds a reference until its `PendingEntry` drops (which is
-                // where the WAL write happens). Closing its WAL and
-                // archiving underneath them is what made the twin: the late
-                // write found no WAL and re-created one beside a backup that
-                // did not contain it. Sealing turned that silent corruption
-                // into a refused write -- 3,958 failed batches in one import
-                // -- which is the same race being reported instead of
-                // hidden. Draining first is the actual fix.
-                //
-                // Bounded, because a reference can also be a long-lived read
-                // guard and rotation runs on the write path. If it does not
-                // drain, the archive is simply skipped: the segment stays
-                // dirty and unsealed, so late writes still land in its WAL
-                // and eviction, shutdown or recovery archive it later.
-                let t_drain = std::time::Instant::now();
-                let drain = Backoff::new();
-                let mut drained = old_head.no_references();
-                for _ in 0..512 {
-                    if drained {
-                        break;
-                    }
-                    // We are waiting on other threads to finish their
-                    // writes; the head slot already points at the new
-                    // segment, so nothing is blocked behind this. Yield
-                    // periodically rather than burning a core on a wait
-                    // that is normally over in microseconds.
-                    drain.spin();
-                    std::thread::yield_now();
-                    drained = old_head.no_references();
+        if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
+            // Let the writers that acquired from this segment finish
+            // before it stops being writable.
+            //
+            // Rotation only publishes a new head; entries acquired from
+            // the old one moments earlier are still in flight, and each
+            // holds a reference until its `PendingEntry` drops (which is
+            // where the WAL write happens). Closing its WAL and
+            // archiving underneath them is what made the twin: the late
+            // write found no WAL and re-created one beside a backup that
+            // did not contain it. Sealing turned that silent corruption
+            // into a refused write -- 3,958 failed batches in one import
+            // -- which is the same race being reported instead of
+            // hidden. Draining first is the actual fix.
+            //
+            // Bounded, because a reference can also be a long-lived read
+            // guard and rotation runs on the write path. If it does not
+            // drain, the archive is simply skipped: the segment stays
+            // dirty and unsealed, so late writes still land in its WAL
+            // and eviction, shutdown or recovery archive it later.
+            let t_drain = std::time::Instant::now();
+            let drain = Backoff::new();
+            let mut drained = old_head.no_references();
+            for _ in 0..512 {
+                if drained {
+                    break;
                 }
-                ROTATE_DRAIN_NANOS
-                    .fetch_add(t_drain.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                if !drained {
-                    debug!(
-                        "Segment {} (chunk {}) still has {} references at rotation; leaving it \
+                // We are waiting on other threads to finish their
+                // writes; the head slot already points at the new
+                // segment, so nothing is blocked behind this. Yield
+                // periodically rather than burning a core on a wait
+                // that is normally over in microseconds.
+                drain.spin();
+                std::thread::yield_now();
+                drained = old_head.no_references();
+            }
+            ROTATE_DRAIN_NANOS.fetch_add(t_drain.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if !drained {
+                debug!(
+                    "Segment {} (chunk {}) still has {} references at rotation; leaving it \
                          dirty and unsealed rather than archiving under an active writer",
-                        head_seg_id,
-                        self.id,
-                        old_head.references_count()
-                    );
-                    return;
-                }
-                if let Err(e) = old_head.force_wal_sync() {
+                    head_seg_id,
+                    self.id,
+                    old_head.references_count()
+                );
+                return;
+            }
+            if let Err(e) = old_head.force_wal_sync() {
+                warn!(
+                    "Failed to sync WAL for old head segment {}: {}",
+                    head_seg_id, e
+                );
+            }
+            let mut state = old_head.file_state.lock();
+            if let Some(wal) = state.wal.take() {
+                if let Err(e) = wal.sync_all() {
                     warn!(
-                        "Failed to sync WAL for old head segment {}: {}",
+                        "Failed to sync WAL during close for old head segment {}: {}",
                         head_seg_id, e
                     );
                 }
-                let mut state = old_head.file_state.lock();
-                if let Some(wal) = state.wal.take() {
-                    if let Err(e) = wal.sync_all() {
-                        warn!(
-                            "Failed to sync WAL during close for old head segment {}: {}",
-                            head_seg_id, e
-                        );
-                    }
-                    drop(wal);
-                    debug!(
-                        "Closed WAL file for old head segment {} (freed file descriptor)",
-                        head_seg_id
-                    );
-                }
-                drop(state);
+                drop(wal);
+                debug!(
+                    "Closed WAL file for old head segment {} (freed file descriptor)",
+                    head_seg_id
+                );
+            }
+            drop(state);
 
-                // Seal-time archive. A segment stops being head exactly
-                // once, and from then on it is immutable, so this is the
-                // one place its durable copy should be written -- and the
-                // only place that makes "sealed implies archived" an
-                // invariant the rest of the system can rely on.
-                //
-                // Without it, archiving only happened incidentally: from
-                // eviction, from combine, or from archive_all at
-                // shutdown. A sealed segment that was never evicted stayed
-                // durable only in its WAL, so a restart restored it from
-                // WAL with no backup at all -- and everything downstream
-                // (the tier believing it droppable, the cleaner freeing
-                // it, the archiver later writing a zero-filled image over
-                // it) followed from that. The 2016 boundary snapshot shows
-                // 977 such segments against 20,697 archived ones; TB13
-                // carried 18,336 of them into the restart that lost data.
-                let t_archive = std::time::Instant::now();
-                let archive_result = old_head.archive();
-                ROTATE_ARCHIVE_NANOS
-                    .fetch_add(t_archive.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                match archive_result {
-                    Ok(true) => debug!("Sealed and archived segment {}", head_seg_id),
-                    // Already archived: re-sealing must never rewrite an
-                    // immutable segment.
-                    Ok(false) => {}
-                    Err(e) => error!(
-                        "SEAL ARCHIVE FAILED for segment {} (chunk {}): {}. It stays dirty \
+            // Seal-time archive. A segment stops being head exactly
+            // once, and from then on it is immutable, so this is the
+            // one place its durable copy should be written -- and the
+            // only place that makes "sealed implies archived" an
+            // invariant the rest of the system can rely on.
+            //
+            // Without it, archiving only happened incidentally: from
+            // eviction, from combine, or from archive_all at
+            // shutdown. A sealed segment that was never evicted stayed
+            // durable only in its WAL, so a restart restored it from
+            // WAL with no backup at all -- and everything downstream
+            // (the tier believing it droppable, the cleaner freeing
+            // it, the archiver later writing a zero-filled image over
+            // it) followed from that. The 2016 boundary snapshot shows
+            // 977 such segments against 20,697 archived ones; TB13
+            // carried 18,336 of them into the restart that lost data.
+            let t_archive = std::time::Instant::now();
+            let archive_result = old_head.archive();
+            ROTATE_ARCHIVE_NANOS
+                .fetch_add(t_archive.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            match archive_result {
+                Ok(true) => debug!("Sealed and archived segment {}", head_seg_id),
+                // Already archived: re-sealing must never rewrite an
+                // immutable segment.
+                Ok(false) => {}
+                Err(e) => error!(
+                    "SEAL ARCHIVE FAILED for segment {} (chunk {}): {}. It stays dirty \
                          and resident; its only durable copy is its WAL.",
-                        head_seg_id, self.id, e
-                    ),
-                }
+                    head_seg_id, self.id, e
+                ),
+            }
         }
     }
 
@@ -2310,9 +2309,8 @@ impl Chunk {
     /// an ordinary state now, not just a blob one: recovery leaves both
     /// empty, and the first write of each class allocates a fresh segment.
     pub fn head_seg_ids_for_test(&self) -> (Option<u64>, Option<u64>) {
-        let head_or_none = |id: u64| {
-            (id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING).then_some(id)
-        };
+        let head_or_none =
+            |id: u64| (id != HEAD_SEG_ID_EMPTY && id != HEAD_SEG_ID_ALLOCATING).then_some(id);
         let first_blob = self
             .blob_head_pool
             .iter()
@@ -2527,7 +2525,7 @@ impl Chunk {
     /// time writes were closed early. Everything else is a client write, and
     /// a client write acked after that flush loses its index entries -- the
     /// cell is archived at step 1.6 and survives, its entries are not.
-    fn shutdown_refuses(&self, schema_id: u32) -> Result<(), WriteError> {
+    fn shutdown_refuses(&self, schema_id: SchemaVid) -> Result<(), WriteError> {
         if !self.client_writes_closed.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -2597,12 +2595,18 @@ impl Chunk {
         }
 
         let t_index = std::time::Instant::now();
-        let insert = self.cell_index.try_insert_locked(cell.header.id.bits() as usize);
+        let insert = self
+            .cell_index
+            .try_insert_locked(cell.header.id.bits() as usize);
         WRITE_INDEX_NANOS.fetch_add(t_index.elapsed().as_nanos() as u64, Ordering::Relaxed);
         match insert {
             Some(mut guard) => {
                 #[cfg(debug_assertions)]
-                self.assert_address_aligned_for_write(cell_loc, "write_cell", cell.header.id.bits());
+                self.assert_address_aligned_for_write(
+                    cell_loc,
+                    "write_cell",
+                    cell.header.id.bits(),
+                );
 
                 *guard = cell_loc;
                 drop(guard);
@@ -2610,9 +2614,10 @@ impl Chunk {
                     .add(cell.header.id.bits(), write_result.content_length);
                 let t_sec = std::time::Instant::now();
                 self.ensure_indices(cell, None, &*write_plan.schema);
-                WRITE_SECONDARY_NANOS.fetch_add(t_sec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                WRITE_SECONDARY_NANOS
+                    .fetch_add(t_sec.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 let t_stats = std::time::Instant::now();
-                self.refresh_statistics_for_schema(write_plan.schema.id);
+                self.refresh_statistics_for_schema(write_plan.schema.vid);
                 WRITE_STATS_NANOS.fetch_add(t_stats.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             None => {
@@ -2633,10 +2638,8 @@ impl Chunk {
                         CellGuard::for_write(cell.header.id.bits(), true, self)
                     {
                         if let Ok(existing) = cell_guard.read_cell_owned() {
-                            if let Some(schema) = self.meta.schemas.get(&existing.header.schema)
-                            {
-                                let old_indices =
-                                    Some(probe_cell_indices(&existing, &*schema));
+                            if let Some(schema) = self.meta.schemas.get(&existing.header.schema) {
+                                let old_indices = Some(probe_cell_indices(&existing, &*schema));
                                 drop(cell_guard);
                                 self.ensure_indices_with_res(&existing, old_indices, &*schema);
                             }
@@ -2677,7 +2680,9 @@ impl Chunk {
             // Old entry length, read under the cell lock while the address is
             // still guaranteed live; used below to keep the slot counter exact.
             let old_content_length = if cell_location != 0 {
-                Entry::decode_from(cell_location, |_, _| {}).0.content_length
+                Entry::decode_from(cell_location, |_, _| {})
+                    .0
+                    .content_length
             } else {
                 0
             };
@@ -2687,7 +2692,7 @@ impl Chunk {
             self.slot_bytes.sub(hash, old_content_length);
             self.ensure_indices_with_res(cell, old_indices, schema);
             self.mark_dead_entry_with_cell(cell_location, cell);
-            self.refresh_statistics_for_schema(schema.id);
+            self.refresh_statistics_for_schema(schema.vid);
             drop(write_plan);
             cell.header.version = write_result.new_version;
             cell.header.timestamp = write_result.new_timestamp;
@@ -2748,7 +2753,7 @@ impl Chunk {
             }
         }
         let sizes: Vec<u32> = plans.iter().map(|p| p.total_size()).collect();
-        let schema_id = plans[0].schema.id;
+        let schema_id = plans[0].schema.vid;
 
         let mut i = 0usize;
         while i < cells.len() {
@@ -2910,7 +2915,9 @@ impl Chunk {
 
                 let old_indices = cell_guard.old_index_res(&*write_plan.schema)?;
                 let old_content_length = if cell_location != 0 {
-                    Entry::decode_from(cell_location, |_, _| {}).0.content_length
+                    Entry::decode_from(cell_location, |_, _| {})
+                        .0
+                        .content_length
                 } else {
                     0
                 };
@@ -2920,7 +2927,7 @@ impl Chunk {
                 self.slot_bytes.sub(hash, old_content_length);
                 self.ensure_indices_with_res(cell, old_indices, &*write_plan.schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
-                self.refresh_statistics_for_schema(write_plan.schema.id);
+                self.refresh_statistics_for_schema(write_plan.schema.vid);
                 drop(write_plan);
                 cell.header.version = write_result.new_version;
                 cell.header.timestamp = write_result.new_timestamp;
@@ -2938,7 +2945,8 @@ impl Chunk {
                         &pending_entry,
                         cell.header.version,
                     )?;
-                    WRITE_COPY_NANOS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    WRITE_COPY_NANOS
+                        .fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let new_cell_loc = write_result.addr;
                     #[cfg(debug_assertions)]
                     self.assert_address_aligned_for_write(
@@ -2955,7 +2963,7 @@ impl Chunk {
                     WRITE_SECONDARY_NANOS
                         .fetch_add(t_sec.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let t_stats = std::time::Instant::now();
-                    self.refresh_statistics_for_schema(write_plan.schema.id);
+                    self.refresh_statistics_for_schema(write_plan.schema.vid);
                     WRITE_STATS_NANOS
                         .fetch_add(t_stats.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     WRITE_CELLS.fetch_add(1, Ordering::Relaxed);
@@ -3023,7 +3031,7 @@ impl Chunk {
                             self.mark_dead_entry_with_size(old_loc, size, &seg);
                         }
 
-                        self.refresh_statistics_for_schema(write_plan.schema.id);
+                        self.refresh_statistics_for_schema(write_plan.schema.vid);
                         drop(write_plan);
                         new_cell.header.version = write_result.new_version;
                         new_cell.header.timestamp = write_result.new_timestamp;
@@ -3520,8 +3528,8 @@ impl Chunk {
                 // there on its own, and combining it later halves the live
                 // cells relocated (and the foreground conflicts relocation
                 // causes). Under pressure, fall back to the eager bar.
-                let fill_x8 = (self.segs.len() * SEGMENT_SIZE).saturating_mul(8)
-                    / self.capacity.max(1);
+                let fill_x8 =
+                    (self.segs.len() * SEGMENT_SIZE).saturating_mul(8) / self.capacity.max(1);
                 let dead_bar = if fill_x8 >= 6 {
                     DEAD_RATE_FOR_COMBINE_CLEANER
                 } else {
@@ -3845,10 +3853,7 @@ impl Drop for PendingRun {
         // exist in no log must not walk like data.
         if self.consumed.get() < self.size {
             let from = self.base + self.consumed.get() as usize;
-            crate::ram::entry::stamp_reservation_padding(
-                from,
-                self.size - self.consumed.get(),
-            );
+            crate::ram::entry::stamp_reservation_padding(from, self.size - self.consumed.get());
         }
         self.seg.end_pending_journal();
         // Same ordering as PendingEntry::drop: the run's journal writes all
@@ -4184,7 +4189,8 @@ impl Chunks {
         } else {
             Vec::new()
         };
-        let estimated_cells = crate::ram::recovery::estimate_cells_per_chunk(&recovery_files, count);
+        let estimated_cells =
+            crate::ram::recovery::estimate_cells_per_chunk(&recovery_files, count);
         if !recovery_files.is_empty() {
             info!(
                 "Discovered {} segment files; sizing cell indexes for ~{} cells",
@@ -4508,10 +4514,7 @@ impl Chunks {
     /// transaction whose records were compacted comes back as ordinary
     /// entries -- it is not a transaction this store is holding open, and it
     /// cannot masquerade as "never decided".
-    pub fn durable_txn_status(
-        &self,
-        txn: &crate::server::transactions::TxnId,
-    ) -> DurableTxnStatus {
+    pub fn durable_txn_status(&self, txn: &crate::server::transactions::TxnId) -> DurableTxnStatus {
         let mut prepared = false;
         for chunk in &self.list {
             for segment in chunk.segments() {
@@ -4551,9 +4554,7 @@ impl Chunks {
 
     pub fn close_client_writes(&self) {
         for chunk in &self.list {
-            chunk
-                .client_writes_closed
-                .store(true, Ordering::Release);
+            chunk.client_writes_closed.store(true, Ordering::Release);
         }
         info!(
             "Client writes closed on {} chunks; index write-back continues until the flush \
@@ -4566,7 +4567,10 @@ impl Chunks {
         for chunk in &self.list {
             chunk.writes_closed.store(true, Ordering::Release);
         }
-        info!("Entry allocation closed on {} chunks for shutdown", self.list.len());
+        info!(
+            "Entry allocation closed on {} chunks for shutdown",
+            self.list.len()
+        );
     }
 
     /// Archive all dirty segments to backup storage across all chunks
@@ -4579,7 +4583,10 @@ impl Chunks {
     }
 
     pub fn slot_live_bytes(&self, slots: &[u32]) -> Vec<u64> {
-        slots.iter().map(|slot| self.slot_bytes.get(*slot)).collect()
+        slots
+            .iter()
+            .map(|slot| self.slot_bytes.get(*slot))
+            .collect()
     }
 
     /// Total live bytes this store holds across all slots.
@@ -4669,7 +4676,10 @@ impl Chunks {
         return &self.list[chunk_id];
     }
     fn locate_chunk_by_key(&self, key: &Id) -> (&Chunk, u64) {
-        return (self.locate_chunk_by_partition(key.locality() as u64), key.bits());
+        return (
+            self.locate_chunk_by_partition(key.locality() as u64),
+            key.bits(),
+        );
     }
     pub fn read_cell(&self, key: &Id) -> Result<SharedCell<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
@@ -4840,7 +4850,7 @@ impl Chunks {
         removed
     }
 
-    pub fn all_chunk_statistics(&self, schema_id: u32) -> Vec<Option<Arc<SchemaStatistics>>> {
+    pub fn all_chunk_statistics(&self, schema_id: SchemaVid) -> Vec<Option<Arc<SchemaStatistics>>> {
         self.list
             .iter()
             .map(|c| c.statistics.schemas.get(&schema_id))
@@ -4851,10 +4861,10 @@ impl Chunks {
             .iter()
             .for_each(|c| c.statistics.ensured_refresh_chunk(c));
     }
-    pub fn overall_statistics(&self, schema: u32) -> Arc<SchemaStatistics> {
+    pub fn overall_statistics(&self, schema: SchemaVid) -> Arc<SchemaStatistics> {
         self.statistics
-            .get(schema as usize, 5 * 60, |schema| {
-                let schema = schema as u32;
+            .get(schema.get() as usize, 5 * 60, |schema| {
+                let schema = SchemaVid(schema as u32);
                 let all_stats = self
                     .all_chunk_statistics(schema)
                     .into_iter()
@@ -5222,7 +5232,7 @@ impl<'a> CellGuard<'a> {
         self.chunk
             .ensure_indices_with_res(cell, old_indices, schema);
         self.chunk.mark_dead_entry_with_cell(old_cell_loc, cell);
-        self.chunk.refresh_statistics_for_schema(schema.id);
+        self.chunk.refresh_statistics_for_schema(schema.vid);
         drop(write_plan);
         cell.header.version = write_result.new_version;
         cell.header.timestamp = write_result.new_timestamp;
@@ -5247,7 +5257,7 @@ impl<'a> CellGuard<'a> {
         )?;
         let new_cell_loc = write_result.addr;
         let schema = &*write_plan.schema;
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
         if old_cell_loc != 0 {
             // Update case - cell already exists
             let old_indices = self.old_index_res(&*schema)?;
@@ -5411,14 +5421,20 @@ mod tests {
         let first = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
         let second = Chunks::new_dummy(1, TEST_CHUNK_SIZE_MULTI);
         assert!(
-            !first.address_range().contains(&second.address_range().start),
+            !first
+                .address_range()
+                .contains(&second.address_range().start),
             "the two stores must occupy distinct address windows"
         );
         let txn = test_txn_id(77);
 
         set_transaction_id(Some(txn.clone()));
-        let a = first.list[0].try_acquire(64, false).expect("lease in the first store");
-        let b = second.list[0].try_acquire(64, false).expect("lease in the second store");
+        let a = first.list[0]
+            .try_acquire(64, false)
+            .expect("lease in the first store");
+        let b = second.list[0]
+            .try_acquire(64, false)
+            .expect("lease in the second store");
         assert!(a.leased && b.leased);
         drop(a);
         drop(b);
@@ -5566,7 +5582,9 @@ mod tests {
         );
         // The head is back in circulation.
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 0);
-        let plain = chunk.try_acquire(64, false).expect("plain entry after abort");
+        let plain = chunk
+            .try_acquire(64, false)
+            .expect("plain entry after abort");
         assert_eq!(plain.seg.id, seg.id);
         assert_eq!(
             plain.addr, before,
@@ -5591,7 +5609,7 @@ mod tests {
         let chunk = &chunks.list[0];
 
         // A client schema, and the two the index writes itself.
-        let client_schema = 4242u32;
+        let client_schema = SchemaVid(4242);
         let page_schema = *crate::index::ranged::tree::btree::PAGE_SCHEMA_ID;
         let tree_schema = *crate::index::ranged::tree::tree::RANGED_TREE_SCHEMA_ID;
         assert_ne!(client_schema, page_schema);
@@ -5650,7 +5668,10 @@ mod tests {
         let regular = chunk
             .try_acquire_in_class(64, false, SegmentClass::Regular)
             .expect("regular entry");
-        assert!(regular.leased, "a transactional regular claim takes a lease");
+        assert!(
+            regular.leased,
+            "a transactional regular claim takes a lease"
+        );
         let regular_seg = regular.seg.id;
         let regular_seg_ref = regular.seg.clone();
         drop(regular);
@@ -5770,7 +5791,11 @@ mod tests {
         assert_eq!(transaction_lease_count(&txn, &chunks.address_range()), 1);
 
         // Not yet: a transaction that is merely slow keeps its heads.
-        let expired = expire_transaction_leases(std::time::Duration::from_secs(3600), &chunks.address_range(), &Default::default());
+        let expired = expire_transaction_leases(
+            std::time::Duration::from_secs(3600),
+            &chunks.address_range(),
+            &Default::default(),
+        );
         assert!(
             expired.is_empty(),
             "a lease inside its window must not be reclaimed"
@@ -5779,7 +5804,11 @@ mod tests {
 
         // Past the window, the head comes back and the caller is told which
         // transaction to settle.
-        let expired = expire_transaction_leases(std::time::Duration::from_secs(0), &chunks.address_range(), &Default::default());
+        let expired = expire_transaction_leases(
+            std::time::Duration::from_secs(0),
+            &chunks.address_range(),
+            &Default::default(),
+        );
         assert!(
             expired.contains(&txn),
             "an undecided transaction must be reported so it can be settled"
@@ -5858,8 +5887,10 @@ mod tests {
         let chunk_b = &chunks_b.list[0];
 
         let id = Id::allocated(1, 0, 11);
-        let mut cell = payload_cell(schema_a.id, &id, 32);
-        chunks_a.write_cell(&mut cell).expect("write a cell to read");
+        let mut cell = payload_cell(schema_a.vid.get(), &id, 32);
+        chunks_a
+            .write_cell(&mut cell)
+            .expect("write a cell to read");
 
         // A read in progress in database A: the guard is the open section.
         let reading = CellGuard::for_read(id.bits(), chunk_a).expect("read guard");
@@ -5979,14 +6010,17 @@ mod tests {
         while let Some(seg) = chunk.allocator.alloc_seg(&chunk.file_manager) {
             hoarded.push(seg);
         }
-        assert!(!hoarded.is_empty(), "the allocator should have had segments");
+        assert!(
+            !hoarded.is_empty(),
+            "the allocator should have had segments"
+        );
 
         // Fill the published head. The write that overflows it is the one that
         // has to allocate, and the allocator has nothing left to give.
         let mut refusal = None;
         for i in 0..5_000u64 {
             let id = Id::allocated(1, 0, i + 1);
-            let mut cell = payload_cell(schema.id, &id, 4096);
+            let mut cell = payload_cell(schema.vid.get(), &id, 4096);
             if let Err(error) = chunks.write_cell(&mut cell) {
                 refusal = Some(error);
                 break;
@@ -6007,10 +6041,10 @@ mod tests {
         // And the chunk still answers instead of spinning.
         let (tx, rx) = std::sync::mpsc::channel();
         let chunks_for_probe = chunks.clone();
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
         std::thread::spawn(move || {
             let id = Id::allocated(1, 0, 9_999_999);
-            let mut cell = payload_cell(schema_id, &id, 4096);
+            let mut cell = payload_cell(schema_id.get(), &id, 4096);
             let _ = tx.send(chunks_for_probe.write_cell(&mut cell).is_ok());
         });
         assert!(
@@ -6034,8 +6068,10 @@ mod tests {
         let chunk = &chunks.list[0];
 
         let id = Id::allocated(1, 0, 7);
-        let mut cell = payload_cell(schema.id, &id, 64);
-        chunks.write_cell(&mut cell).expect("write the cell to read back");
+        let mut cell = payload_cell(schema.vid.get(), &id, 64);
+        chunks
+            .write_cell(&mut cell)
+            .expect("write the cell to read back");
 
         let addr = {
             let stored = chunks.read_cell(&id).expect("read the cell");
@@ -6052,8 +6088,7 @@ mod tests {
         );
 
         // What the reader can see before the segment is taken away.
-        let before =
-            unsafe { std::slice::from_raw_parts(addr as *const u8, 64) }.to_vec();
+        let before = unsafe { std::slice::from_raw_parts(addr as *const u8, 64) }.to_vec();
         assert!(
             before.iter().any(|b| *b != 0),
             "precondition: the cell has non-zero bytes to lose"
@@ -6236,9 +6271,11 @@ mod tests {
     }
 
     fn payload_cell(schema_id: u32, id: &Id, payload_len: usize) -> OwnedCell {
-        let data: Vec<u8> = std::iter::repeat(id.bits() as u8).take(payload_len).collect();
+        let data: Vec<u8> = std::iter::repeat(id.bits() as u8)
+            .take(payload_len)
+            .collect();
         OwnedCell {
-            header: CellHeader::new(schema_id, id),
+            header: CellHeader::new(SchemaVid(schema_id), id),
             data: data_map_value!(id: id.bits() as i32, data: data),
         }
     }
@@ -6249,7 +6286,7 @@ mod tests {
         let (chunks, schema) = setup_test_chunks();
 
         let id = Id::allocated(1, 0, 42);
-        let mut cell = payload_cell(schema.id, &id, 16);
+        let mut cell = payload_cell(schema.vid.get(), &id, 16);
         chunks.write_cell(&mut cell).unwrap();
 
         // Capture version A's raw address and its full/selected contents.
@@ -6265,7 +6302,7 @@ mod tests {
 
         // Update the cell in place: the cell index now serves version B at a
         // different address.
-        let mut updated = payload_cell(schema.id, &id, 32);
+        let mut updated = payload_cell(schema.vid.get(), &id, 32);
         chunks.update_cell(&mut updated).unwrap();
 
         // Sanity check: by-id reads now observe the new version.

@@ -19,6 +19,7 @@ use dovahkiin::data_map_value;
 use dovahkiin::types::{Map, Type};
 use neb::ram::cell::{CellHeader, OwnedCell};
 use neb::ram::chunk::Chunks;
+use neb::ram::schema::SchemaVid;
 use neb::ram::schema::{Field, LocalSchemasCache, Schema};
 use neb::ram::types::Id;
 use neb::server::ServerMeta;
@@ -55,7 +56,7 @@ fn write_cells(chunks: &Arc<Chunks>, schema_id: u32) -> Vec<Id> {
         let id = Id::allocated(1, 0, i as u64 + 1);
         let data: Vec<u8> = std::iter::repeat(i as u8).take(64).collect();
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema_id, &id),
+            header: CellHeader::new(SchemaVid(schema_id), &id),
             data: data_map_value!(id: i as i32, data: data),
         };
         chunks.write_cell(&mut cell).expect("write bench cell");
@@ -66,7 +67,7 @@ fn write_cells(chunks: &Arc<Chunks>, schema_id: u32) -> Vec<Id> {
 
 fn run(threads: usize) {
     let (chunks, schema) = setup();
-    let ids = Arc::new(write_cells(&chunks, schema.id));
+    let ids = Arc::new(write_cells(&chunks, schema.vid.get()));
 
     // Warm the index and the pages before timing.
     for id in ids.iter().take(1000) {
@@ -109,7 +110,9 @@ fn read_path_cost() {
     // meaningful: above one thread, `incr_references` backs off under
     // contention and the spin dominates any difference being measured.
     if let Ok(only) = std::env::var("READ_PATH_BENCH_THREADS") {
-        let threads: usize = only.parse().expect("READ_PATH_BENCH_THREADS must be a number");
+        let threads: usize = only
+            .parse()
+            .expect("READ_PATH_BENCH_THREADS must be a number");
         run(threads);
         return;
     }

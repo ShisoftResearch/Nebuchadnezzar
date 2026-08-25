@@ -30,9 +30,86 @@ pub type FieldPtr = u32;
 
 pub const PTR_ALIGN: usize = mem::align_of::<u32>();
 
+/// A schema's **logical family**: what a durable reference means when it says
+/// "person". Immutable, and stable across both rename and shape change.
+///
+/// Everything that names a schema as a concept keys by this: cell identity,
+/// every index namespace, statistics. Never stored in a cell header.
+#[derive(
+    Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct SchemaUid(pub u32);
+
+/// A schema's **physical generation**: one exact field layout. Immutable.
+///
+/// This is what a cell header stores, and what a decode must use -- the exact
+/// generation that produced those bytes, not whatever is current now.
+#[derive(
+    Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct SchemaVid(pub u32);
+
+impl SchemaUid {
+    /// The raw number, for the hand-rolled encoders and the numeric-keyed
+    /// caches. Prefer passing the newtype wherever a signature can take it.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl SchemaVid {
+    /// The raw number. See [`SchemaUid::get`].
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SchemaUid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Display for SchemaVid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Where a generation sits in its family's history.
+///
+/// Exactly one generation of a [`SchemaUid`] is `Current` at any instant; it is
+/// the only one new writes may land in. A `Stale` generation stays readable for
+/// as long as any cell still names it, which is forever until something
+/// rewrites those cells.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchemaVersionStatus {
+    #[default]
+    Current,
+    Stale {
+        superseded_by: SchemaVid,
+    },
+}
+
+impl SchemaVersionStatus {
+    pub fn is_current(&self) -> bool {
+        matches!(self, SchemaVersionStatus::Current)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
-    pub id: u32,
+    /// The physical generation this record describes. Cell headers name this.
+    pub vid: SchemaVid,
+    /// The logical family this generation belongs to. Durable references and
+    /// index namespaces name this.
+    pub uid: SchemaUid,
+    /// How many times this family has been evolved; 0 for a fresh schema.
+    pub generation: u32,
+    /// Whether new writes may still land in this generation.
+    pub status: SchemaVersionStatus,
     pub name: String,
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
@@ -131,7 +208,10 @@ impl Schema {
         bound = align_address(8, bound);
         trace!("Schema {:?} has bound {} (8-byte aligned)", fields, bound);
         let mut schema = Schema {
-            id: 0,
+            vid: SchemaVid(0),
+            uid: SchemaUid(0),
+            generation: 0,
+            status: SchemaVersionStatus::Current,
             name: name.to_string(),
             key_field: match key_field {
                 None => None,
@@ -161,8 +241,22 @@ impl Schema {
         scannable: bool,
     ) -> Schema {
         let mut schema = Schema::new(name, key_field, fields, dynamic, scannable);
-        schema.id = id;
+        schema.assign_identity(id);
         schema
+    }
+
+    /// Stamp a freshly-created schema with the number the shared counter handed
+    /// out.
+    ///
+    /// A new schema draws ONE number and uses it for both its family and its
+    /// first generation. That is what keeps a value from ever being both a live
+    /// uid and some unrelated schema's vid: the types stop a mix-up in code,
+    /// and one allocator stops it in durable data, where there is no compiler.
+    pub fn assign_identity(&mut self, id: u32) {
+        self.vid = SchemaVid(id);
+        self.uid = SchemaUid(id);
+        self.generation = 0;
+        self.status = SchemaVersionStatus::Current;
     }
 
     pub fn with_blobs(mut self, blobs: bool) -> Schema {
@@ -597,8 +691,8 @@ impl SchemaCompressionPlan {
 }
 
 pub struct LocalSchemasMap {
-    schema_map: LFHashMap<u32, SchemaRef>,
-    name_map: LFHashMap<String, u32>,
+    schema_map: LFHashMap<SchemaVid, SchemaRef>,
+    name_map: LFHashMap<String, SchemaVid>,
 }
 
 pub struct LocalSchemasCache {
@@ -653,7 +747,7 @@ impl LocalSchemasCache {
             .on_schema_added(move |schema| {
                 info!(
                     "Received schema_added event: schema {} ({})",
-                    schema.id, schema.name
+                    schema.vid, schema.name
                 );
                 m1.new_schema(schema);
                 future::ready(()).boxed()
@@ -681,8 +775,8 @@ impl LocalSchemasCache {
         let map = Arc::new(LocalSchemasMap::new());
         LocalSchemasCache { map }
     }
-    pub fn get(&self, id: &u32) -> Option<SchemaRef> {
-        self.map.get(id)
+    pub fn get(&self, vid: &SchemaVid) -> Option<SchemaRef> {
+        self.map.get(vid)
     }
     /// Resident bytes of the schema maps behind this cache.
     pub fn resident_bytes(&self) -> usize {
@@ -713,7 +807,7 @@ impl LocalSchemasCache {
         let m = &self.map;
         m.new_schema(schema)
     }
-    pub fn name_to_id(&self, name: &str) -> Option<u32> {
+    pub fn name_to_id(&self, name: &str) -> Option<SchemaVid> {
         let m = &self.map;
         m.name_to_id(name)
     }
@@ -725,7 +819,7 @@ impl LocalSchemasCache {
     pub fn get_all(&self) -> Vec<Schema> {
         self.map.get_all()
     }
-    pub fn fields_size(&self, schema_id: &u32, fields: &[u64]) -> Option<usize> {
+    pub fn fields_size(&self, schema_id: &SchemaVid, fields: &[u64]) -> Option<usize> {
         const DEFAULT_FIELD_SIZE: usize = 32; // Large default number for unknown field
         const DEFAULT_ARRAY_SIZE: usize = 32;
         self.get(schema_id).map(|schema| {
@@ -790,66 +884,66 @@ impl LocalSchemasMap {
         return None;
     }
 
-    pub fn get(&self, id: &u32) -> Option<SchemaRef> {
-        let res = self.schema_map.get(id);
+    pub fn get(&self, vid: &SchemaVid) -> Option<SchemaRef> {
+        let res = self.schema_map.get(vid);
         debug!(
             "Gettting from schema map for {}, return res {}",
-            id,
+            vid,
             res.is_some()
         );
         return res;
     }
 
-    pub fn name_to_id(&self, name: &str) -> Option<u32> {
-        self.name_map.get(&name.to_string()).map(|id| id as u32)
+    pub fn name_to_id(&self, name: &str) -> Option<SchemaVid> {
+        self.name_map.get(&name.to_string())
     }
 
     fn new_schema(&self, mut schema: Schema) {
         let name = schema.name.clone();
-        let id = schema.id;
+        let vid = schema.vid;
         schema.refresh_compression_plan();
 
         // Check if schema already exists (could happen during subscription race)
-        if let Some(existing_id) = self.name_map.get(&name) {
-            if existing_id != id {
+        if let Some(existing_vid) = self.name_map.get(&name) {
+            if existing_vid != vid {
                 error!(
                     "Schema name collision: name '{}' already mapped to ID {} but new schema has ID {}",
-                    name, existing_id, id
+                    name, existing_vid, vid
                 );
                 // Don't overwrite - keep the existing mapping
                 return;
             } else {
                 // Same ID, just update the schema (may have been modified)
-                debug!("Updating existing schema {} ({})", id, name);
+                debug!("Updating existing schema {} ({})", vid, name);
             }
         }
 
-        self.name_map.insert(name.clone(), id);
-        self.schema_map.insert(id, Arc::new(schema));
-        info!("Added schema to local cache: {} ({})", id, name);
+        self.name_map.insert(name.clone(), vid);
+        self.schema_map.insert(vid, Arc::new(schema));
+        info!("Added schema to local cache: {} ({})", vid, name);
     }
 
     fn get_all(&self) -> Vec<Schema> {
         let entries = self.schema_map.entries();
         entries
             .into_iter()
-            .map(|(id, s_ref)| {
+            .map(|(vid, s_ref)| {
                 debug!(
                     "Get all local schema listed {}({}), tid {}",
-                    id,
-                    s_ref.id,
+                    vid,
+                    s_ref.vid,
                     thread_id()
                 );
-                debug_assert_eq!(id, s_ref.id);
+                debug_assert_eq!(vid, s_ref.vid);
                 (&*s_ref).clone()
             })
             .collect::<Vec<_>>()
     }
 
     fn del_schema(&self, name: &str) {
-        if let Some(id) = self.name_map.remove(&(name.to_owned())) {
-            self.schema_map.remove(&id);
-            debug!("Deleted local schema {} with id {}", name, id);
+        if let Some(vid) = self.name_map.remove(&(name.to_owned())) {
+            self.schema_map.remove(&vid);
+            debug!("Deleted local schema {} with vid {}", name, vid);
         }
     }
 }
@@ -876,7 +970,7 @@ pub async fn post_schema_add(
     for (field, indices) in &schema.index_fields {
         for index in indices {
             let field_id = *field;
-            let schema_id = schema.id;
+            let schema_id = schema.vid.get();
             match index {
                 IndexType::Vector(config) => {
                     if let Some(indexer) = database_runtime.indexer() {
@@ -909,7 +1003,7 @@ pub async fn post_schema_add(
     for (compound_id, compound) in &schema.compound_index_fields {
         for index in &compound.indices {
             let field_id = *compound_id;
-            let schema_id = schema.id;
+            let schema_id = schema.vid.get();
             match index {
                 IndexType::Vector(config) => {
                     if let Some(indexer) = database_runtime.indexer() {
@@ -949,7 +1043,7 @@ pub async fn post_schema_delete(
     for (field, indices) in &schema.index_fields {
         for index in indices {
             let field_id = *field;
-            let schema_id = schema.id;
+            let schema_id = schema.vid.get();
             match index {
                 IndexType::Vector(_) => {
                     if let Some(indexer) = database_runtime.indexer() {
@@ -982,7 +1076,7 @@ pub async fn post_schema_delete(
     for (compound_id, compound) in &schema.compound_index_fields {
         for index in &compound.indices {
             let field_id = *compound_id;
-            let schema_id = schema.id;
+            let schema_id = schema.vid.get();
             match index {
                 IndexType::Vector(_) => {
                     if let Some(indexer) = database_runtime.indexer() {

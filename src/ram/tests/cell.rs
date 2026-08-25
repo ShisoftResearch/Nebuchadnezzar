@@ -22,7 +22,7 @@ pub fn cell_rw() {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.debug_only_new_schema(schema.clone());
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     let write_plan = cell.plan_write(chunk).unwrap();
@@ -50,7 +50,7 @@ pub fn cell_rw() {
         name: "John"
     };
     cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id2),
+        header: CellHeader::new(schema.vid, &id2),
         data,
     };
     let write_plan = cell.plan_write(chunk).unwrap();
@@ -94,7 +94,7 @@ pub fn dynamic() {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id1),
+        header: CellHeader::new(schema.vid, &id1),
         data,
     };
     let mut loc = chunk.write_cell_to_chunk(&mut cell);
@@ -116,7 +116,7 @@ pub fn dynamic() {
     data_map.insert("name", OwnedValue::String(String::from("John")));
     data = OwnedValue::Map(data_map);
     cell = OwnedCell {
-        header: CellHeader::new(schema.id, &id2),
+        header: CellHeader::new(schema.vid, &id2),
         data,
     };
     loc = chunk.write_cell_to_chunk(&mut cell);

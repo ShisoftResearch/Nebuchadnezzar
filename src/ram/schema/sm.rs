@@ -19,8 +19,8 @@ pub fn generate_scoped_sm_id(group: &str, database_name: &str) -> u64 {
 }
 
 struct SchemasMap {
-    schema_map: HashMap<u32, Schema>,
-    name_map: HashMap<String, u32>,
+    schema_map: HashMap<SchemaVid, Schema>,
+    name_map: HashMap<String, SchemaVid>,
 }
 
 pub struct SchemasSM {
@@ -51,19 +51,19 @@ impl StateMachineCmds for SchemasSM {
         future::ready(self.map.get_all()).boxed()
     }
     fn get(&self, id: u32) -> BoxFuture<'_, Option<Schema>> {
-        future::ready(self.map.schema_map.get(&id).map(|r| -> Schema {
+        future::ready(self.map.schema_map.get(&SchemaVid(id)).map(|r| -> Schema {
             let borrow: &Schema = r;
             borrow.clone()
         }))
         .boxed()
     }
     fn id_of_name(&self, name: String) -> BoxFuture<'_, Option<u32>> {
-        future::ready(self.map.id_of_name(&name)).boxed()
+        future::ready(self.map.id_of_name(&name).map(|vid| vid.get())).boxed()
     }
     fn get_by_name(&self, name: String) -> BoxFuture<'_, Option<Schema>> {
         let id = self.map.id_of_name(&name);
         if let Some(id) = id {
-            self.get(id)
+            self.get(id.get())
         } else {
             future::ready(None).boxed()
         }
@@ -113,13 +113,19 @@ impl StateMachineCmds for SchemasSM {
     fn next_id(&mut self) -> BoxFuture<'_, u32> {
         // Always start from max existing ID to handle WAL replay scenarios
         // where schemas were added with explicit IDs
-        let max_existing = self.map.schema_map.keys().max().copied().unwrap_or(0);
+        let max_existing = self
+            .map
+            .schema_map
+            .keys()
+            .map(|vid| vid.get())
+            .max()
+            .unwrap_or(0);
         if self.id_count < max_existing {
             self.id_count = max_existing;
         }
 
         self.id_count += 1;
-        while self.map.schema_map.contains_key(&self.id_count) {
+        while self.map.schema_map.contains_key(&SchemaVid(self.id_count)) {
             self.id_count += 1;
         }
         future::ready(self.id_count).boxed()
@@ -154,7 +160,7 @@ impl StateMachineCtl for SchemasSM {
         trace!("Schemas loaded into map");
 
         // Calculate id_count from max schema ID to prevent duplicate IDs after recovery
-        self.id_count = schemas.iter().map(|s| s.id).max().unwrap_or(0);
+        self.id_count = schemas.iter().map(|s| s.vid.get()).max().unwrap_or(0);
         trace!("Set id_count to {}", self.id_count);
         trace!("========== SchemasSM::recover() COMPLETE ==========");
 
@@ -225,23 +231,23 @@ impl SchemasMap {
 
     fn new_schema(&mut self, schema: Schema) -> Result<(), NewSchemaError> {
         let name = &schema.name;
-        let id = schema.id;
+        let vid = schema.vid;
         if self.name_map.contains_key(name) {
             return Err(NewSchemaError::NameExists(name.clone()));
         }
-        self.name_map.insert(name.clone(), id);
-        if self.schema_map.contains_key(&id) {
-            return Err(NewSchemaError::IdExists(id));
+        self.name_map.insert(name.clone(), vid);
+        if self.schema_map.contains_key(&vid) {
+            return Err(NewSchemaError::IdExists(vid.get()));
         }
-        self.schema_map.insert(id, schema.clone());
-        info!("Schema created in SchemasSM: {} ({})", id, name);
-        debug!("Schema map inserted with id {}, tid {}", id, thread_id());
+        self.schema_map.insert(vid, schema.clone());
+        info!("Schema created in SchemasSM: {} ({})", vid, name);
+        debug!("Schema map inserted with vid {}, tid {}", vid, thread_id());
         return Ok(());
     }
     fn del_schema(&mut self, name: &str) -> Result<(), DelSchemaError> {
-        if let Some(id) = self.name_map.remove(&(name.to_owned())) {
-            self.schema_map.remove(&id);
-            debug!("Schema map removed {}", id);
+        if let Some(vid) = self.name_map.remove(&(name.to_owned())) {
+            self.schema_map.remove(&vid);
+            debug!("Schema map removed {}", vid);
             Ok(())
         } else {
             Err(DelSchemaError::SchemaDoesNotExisted)
@@ -250,16 +256,16 @@ impl SchemasMap {
     fn load_from_list(&mut self, data: Vec<Schema>) {
         error!("load_from_list: Loading {} schemas", data.len());
         for (idx, schema) in data.into_iter().enumerate() {
-            let id = schema.id;
-            self.name_map.insert(schema.name.clone(), id);
-            self.schema_map.insert(id, schema);
+            let vid = schema.vid;
+            self.name_map.insert(schema.name.clone(), vid);
+            self.schema_map.insert(vid, schema);
             if idx % 100 == 0 {
                 error!("load_from_list: Loaded {} schemas so far", idx);
             }
         }
         error!("load_from_list: All schemas loaded");
     }
-    fn id_of_name(&self, name: &str) -> Option<u32> {
+    fn id_of_name(&self, name: &str) -> Option<SchemaVid> {
         self.name_map.get(name).cloned()
     }
 }

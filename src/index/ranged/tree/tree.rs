@@ -2,7 +2,7 @@
 
 use super::btree::level::*;
 use super::btree::*;
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{Field, Schema, SchemaVid};
 use crate::ram::types::*;
 use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use lightning::map::HashSet as LFHashSet;
@@ -17,7 +17,8 @@ pub const RANGED_TREE_HEAD_NAME: &'static str = "head";
 pub const RANGED_TREE_MIGRATION_NAME: &'static str = "migration";
 pub const INITIAL_TREE_EPOCH: u64 = 0;
 lazy_static! {
-    pub static ref RANGED_TREE_SCHEMA_ID: u32 = key_hash(RANGED_TREE_SCHEMA_NAME) as u32;
+    pub static ref RANGED_TREE_SCHEMA_ID: SchemaVid =
+        SchemaVid(key_hash(RANGED_TREE_SCHEMA_NAME) as u32);
     pub static ref RANGED_TREE_HEAD_HASH: u64 = key_hash(RANGED_TREE_HEAD_NAME);
     pub static ref RANGED_TREE_MIGRATION_HASH: u64 = key_hash(RANGED_TREE_MIGRATION_NAME);
     pub static ref RANGED_TREE_SCHEMA: Schema = ranged_tree_schema();
@@ -65,7 +66,11 @@ impl std::fmt::Display for TreeRecoverError {
                 tree_id, reason
             ),
             TreeRecoverError::RootHeadMissing { tree_id } => {
-                write!(f, "ranged tree {:?}: metadata cell has no head pointer", tree_id)
+                write!(
+                    f,
+                    "ranged tree {:?}: metadata cell has no head pointer",
+                    tree_id
+                )
             }
             TreeRecoverError::PagesUnreadable {
                 tree_id,
@@ -363,7 +368,11 @@ impl RangedTree {
     /// split. Returns the new tree and how many keys moved, or None if nothing
     /// moves. The new tree shares this tree's deletion set: the key ranges are
     /// disjoint, so a tombstone only affects the one tree that holds its key.
-    pub fn split_off(&self, pivot: &EntryKey, client: &Arc<AsyncClient>) -> Option<(RangedTree, usize)> {
+    pub fn split_off(
+        &self,
+        pivot: &EntryKey,
+        client: &Arc<AsyncClient>,
+    ) -> Option<(RangedTree, usize)> {
         let so = super::btree::split_off::split_off_spine(&self.tree, pivot)?;
         let mut new_tree = DiskTree::from_root(
             so.new_root,
@@ -487,7 +496,7 @@ pub async fn relink_page_next(client: &Arc<AsyncClient>, page: Id, next: Id) -> 
 /// Schema for ranged tree persistence
 fn ranged_tree_schema() -> Schema {
     Schema::new_with_id(
-        *RANGED_TREE_SCHEMA_ID,
+        RANGED_TREE_SCHEMA_ID.get(),
         &String::from(RANGED_TREE_SCHEMA_NAME),
         None,
         Field::new_schema(vec![
@@ -852,7 +861,12 @@ mod tests {
         let tree = RangedTree::create(&client, &tree_id).await;
 
         for value in 10..=12 {
-            assert!(tree.insert(&make_field_key(schema_id, field, value, Id::from_parts(5, value))));
+            assert!(tree.insert(&make_field_key(
+                schema_id,
+                field,
+                value,
+                Id::from_parts(5, value)
+            )));
         }
         assert_eq!(tree.count(), 3);
 
@@ -885,7 +899,8 @@ mod tests {
         storage::wait_until_updated().await;
         drop(tree);
 
-        let recovered = RangedTree::recover(&client, &tree_id).await
+        let recovered = RangedTree::recover(&client, &tree_id)
+            .await
             .expect("the tree should load back from storage");
         assert_eq!(recovered.count(), 2);
         assert_eq!(collect_visible(&recovered), vec![10, 12]);
@@ -960,12 +975,8 @@ mod tests {
         }
         storage::wait_until_updated().await;
 
-        let head_before = client
-            .read_cell(tree_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .data[*RANGED_TREE_HEAD_HASH]
+        let head_before = client.read_cell(tree_id).await.unwrap().unwrap().data
+            [*RANGED_TREE_HEAD_HASH]
             .id()
             .copied()
             .expect("the tree metadata should carry a head pointer");
@@ -980,12 +991,8 @@ mod tests {
             "a tree whose pages cannot be read must not load as an empty tree"
         );
 
-        let head_after = client
-            .read_cell(tree_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .data[*RANGED_TREE_HEAD_HASH]
+        let head_after = client.read_cell(tree_id).await.unwrap().unwrap().data
+            [*RANGED_TREE_HEAD_HASH]
             .id()
             .copied()
             .expect("the metadata cell must still carry a head pointer");
@@ -1067,18 +1074,19 @@ mod tests {
         // Three pages at BTREE_NODE_SIZE=128 for monotone inserts.
         let n = 300u64;
         for value in 0..n {
-            assert!(tree.insert(&make_field_key(schema_id, field, value, Id::from_parts(7, value))));
+            assert!(tree.insert(&make_field_key(
+                schema_id,
+                field,
+                value,
+                Id::from_parts(7, value)
+            )));
         }
         storage::wait_until_updated().await;
         drop(tree);
 
         // Walk the persisted chain to find the page ids.
-        let head_id = client
-            .read_cell(tree_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .data[*RANGED_TREE_HEAD_HASH]
+        let head_id = client.read_cell(tree_id).await.unwrap().unwrap().data
+            [*RANGED_TREE_HEAD_HASH]
             .id()
             .copied()
             .expect("the tree metadata should carry a head pointer");
@@ -1207,17 +1215,18 @@ mod tests {
         let tree = RangedTree::create(&client, &tree_id).await;
         let n = 300u64;
         for value in 0..n {
-            assert!(tree.insert(&make_field_key(schema_id, field, value, Id::from_parts(8, value))));
+            assert!(tree.insert(&make_field_key(
+                schema_id,
+                field,
+                value,
+                Id::from_parts(8, value)
+            )));
         }
         storage::wait_until_updated().await;
         drop(tree);
 
-        let head_id = client
-            .read_cell(tree_id)
-            .await
-            .unwrap()
-            .unwrap()
-            .data[*RANGED_TREE_HEAD_HASH]
+        let head_id = client.read_cell(tree_id).await.unwrap().unwrap().data
+            [*RANGED_TREE_HEAD_HASH]
             .id()
             .copied()
             .unwrap();

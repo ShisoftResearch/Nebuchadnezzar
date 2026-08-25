@@ -13,7 +13,7 @@ use crate::index::builder::IndexError;
 use crate::query::statistics::{merge_statistics, SchemaStatistics};
 use crate::ram::cell::{Cell, OwnedCell};
 use crate::ram::chunk::Chunks;
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{Field, Schema, SchemaVid};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue};
 
 use super::{
@@ -32,7 +32,8 @@ const SEGMENT_DOC_LENGTHS_FIELD: &str = "doc_lengths";
 const SEGMENT_NEXT_FIELD: &str = "_next";
 
 lazy_static! {
-    pub static ref INVERTED_SEGMENT_SCHEMA_ID: u32 = hash_str(INVERTED_SEGMENT_SCHEMA) as u32;
+    pub static ref INVERTED_SEGMENT_SCHEMA_ID: SchemaVid =
+        SchemaVid(hash_str(INVERTED_SEGMENT_SCHEMA) as u32);
     static ref SEGMENT_DOC_IDS_FIELD_ID: u64 = hash_str(SEGMENT_DOC_IDS_FIELD);
     static ref SEGMENT_VERSIONS_FIELD_ID: u64 = hash_str(SEGMENT_VERSIONS_FIELD);
     static ref SEGMENT_TERM_FREQS_FIELD_ID: u64 = hash_str(SEGMENT_TERM_FREQS_FIELD);
@@ -42,7 +43,7 @@ lazy_static! {
 
 pub fn inverted_segment_schema() -> Schema {
     Schema::new_with_id(
-        *INVERTED_SEGMENT_SCHEMA_ID,
+        INVERTED_SEGMENT_SCHEMA_ID.get(),
         &INVERTED_SEGMENT_SCHEMA.to_string(),
         None,
         Field::new_schema(vec![
@@ -169,7 +170,6 @@ struct SegmentedPostingList {
     term_hash: u64,
 }
 
-
 /// Hashed-class id composition for full-text internals: the locality
 /// bits carry the document partition so posting lists stay
 /// chunk-co-located with their documents across recovery.
@@ -248,8 +248,8 @@ impl SegmentedPostingList {
         // locality carries the partition (matches document partition for
         // proper recovery); low bits hash (schema_id, field_id, term_hash,
         // segment_idx).
-        let hash = Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, segment_idx))
-            .bits();
+        let hash =
+            Id::from_obj(&(self.schema_id, self.field_id, self.term_hash, segment_idx)).bits();
         compose_partitioned_hash_id(partition, hash)
     }
 
@@ -591,9 +591,11 @@ impl InvertedIndexer {
     }
 
     pub fn try_overall_schema_statistics(&self, schema_id: u32) -> Option<Arc<SchemaStatistics>> {
+        // TASK 3: statistics key by family; the inverted index passes a bare
+        // number down from its RPC surface. One generation today.
         let all_stats = self
             .chunks
-            .all_chunk_statistics(schema_id)
+            .all_chunk_statistics(SchemaVid(schema_id))
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
@@ -1439,16 +1441,22 @@ mod tests {
             content_field,
             OwnedValue::String("hello world test document".to_string()),
         );
-        let mut cell1 =
-            OwnedCell::new_with_id(schema_id, &owned_doc_ids[0], OwnedValue::Map(cell1_data));
+        let mut cell1 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &owned_doc_ids[0],
+            OwnedValue::Map(cell1_data),
+        );
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
             content_field,
             OwnedValue::String("hello rust programming language".to_string()),
         );
-        let mut cell2 =
-            OwnedCell::new_with_id(schema_id, &owned_doc_ids[1], OwnedValue::Map(cell2_data));
+        let mut cell2 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &owned_doc_ids[1],
+            OwnedValue::Map(cell2_data),
+        );
 
         server.chunks().write_cell(&mut cell1).unwrap();
         server.chunks().write_cell(&mut cell2).unwrap();
@@ -1581,8 +1589,11 @@ mod tests {
                         i
                     )),
                 );
-                let mut cell =
-                    OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+                let mut cell = OwnedCell::new_with_id(
+                    SchemaVid(schema_id),
+                    &doc_id,
+                    OwnedValue::Map(cell_data),
+                );
 
                 // Write cell
                 server_clone.chunks().write_cell(&mut cell).unwrap();
@@ -1751,8 +1762,11 @@ mod tests {
                         content_field,
                         OwnedValue::String(format!("overflow stress test document {}", i)),
                     );
-                    let mut cell =
-                        OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+                    let mut cell = OwnedCell::new_with_id(
+                        SchemaVid(schema_id),
+                        &doc_id,
+                        OwnedValue::Map(cell_data),
+                    );
 
                     server_clone.chunks().write_cell(&mut cell).unwrap();
 
@@ -1936,7 +1950,8 @@ mod tests {
         for (i, doc_id) in owned_doc_ids.iter().enumerate() {
             let mut cell_data = OwnedMap::new();
             cell_data.insert(content_field, OwnedValue::String(texts[i].to_string()));
-            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema_id), doc_id, OwnedValue::Map(cell_data));
 
             server.chunks().write_cell(&mut cell).unwrap();
 
@@ -2483,16 +2498,22 @@ mod tests {
             content_field,
             OwnedValue::String("rust programming language tutorial".to_string()),
         );
-        let mut cell1 =
-            OwnedCell::new_with_id(schema_id, &owned_doc_ids[0], OwnedValue::Map(cell1_data));
+        let mut cell1 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &owned_doc_ids[0],
+            OwnedValue::Map(cell1_data),
+        );
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
             content_field,
             OwnedValue::String("database storage engine design".to_string()),
         );
-        let mut cell2 =
-            OwnedCell::new_with_id(schema_id, &owned_doc_ids[1], OwnedValue::Map(cell2_data));
+        let mut cell2 = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &owned_doc_ids[1],
+            OwnedValue::Map(cell2_data),
+        );
 
         let mut cell3_data = OwnedMap::new();
         cell3_data.insert(
@@ -2500,7 +2521,7 @@ mod tests {
             OwnedValue::String("rust async programming with tokio".to_string()),
         );
         let mut cell3 = OwnedCell::new_with_id(
-            schema_id,
+            SchemaVid(schema_id),
             &owned_doc_ids[2 % owned_doc_ids.len()],
             OwnedValue::Map(cell3_data),
         );
@@ -2679,7 +2700,8 @@ mod tests {
             content_field,
             OwnedValue::String("initial content about testing".to_string()),
         );
-        let mut cell = OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(cell_data));
+        let mut cell =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc_id, OwnedValue::Map(cell_data));
 
         // Write and index
         info!("Writing initial cell...");
@@ -2717,8 +2739,11 @@ mod tests {
             content_field,
             OwnedValue::String("updated content about rust".to_string()),
         );
-        let mut updated_cell =
-            OwnedCell::new_with_id(schema_id, &doc_id, OwnedValue::Map(updated_cell_data));
+        let mut updated_cell = OwnedCell::new_with_id(
+            SchemaVid(schema_id),
+            &doc_id,
+            OwnedValue::Map(updated_cell_data),
+        );
 
         // Update cell and ensure indices
         info!("Updating cell...");
@@ -2920,7 +2945,8 @@ mod tests {
                 content_field,
                 OwnedValue::String(texts[i % texts.len()].to_string()),
             );
-            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema_id), doc_id, OwnedValue::Map(cell_data));
 
             server1.chunks().write_cell(&mut cell).unwrap();
 
@@ -3048,7 +3074,8 @@ mod tests {
         info!("Stats cell ID to recover: {:?}", stats_id);
         info!(
             "Stats cell partition: {}, hash: {}",
-            stats_id.locality() as u64, stats_id.bits()
+            stats_id.locality() as u64,
+            stats_id.bits()
         );
 
         // Try to read stats cell before archiving to verify it exists
@@ -3395,7 +3422,8 @@ mod tests {
                 content_field,
                 OwnedValue::String(format!("initial document {}", i)),
             );
-            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema_id), doc_id, OwnedValue::Map(cell_data));
 
             server1.chunks().write_cell(&mut cell).unwrap();
 
@@ -3500,7 +3528,8 @@ mod tests {
                 content_field,
                 OwnedValue::String(format!("new document after recovery {}", i)),
             );
-            let mut cell = OwnedCell::new_with_id(schema_id, doc_id, OwnedValue::Map(cell_data));
+            let mut cell =
+                OwnedCell::new_with_id(SchemaVid(schema_id), doc_id, OwnedValue::Map(cell_data));
 
             server2.chunks().write_cell(&mut cell).unwrap();
 
@@ -3618,14 +3647,16 @@ mod tests {
             content_field,
             OwnedValue::String("Bill Gates founded Microsoft".to_string()),
         );
-        let mut cell1 = OwnedCell::new_with_id(schema_id, &doc1_id, OwnedValue::Map(cell1_data));
+        let mut cell1 =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc1_id, OwnedValue::Map(cell1_data));
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
             content_field,
             OwnedValue::String("The gates are open for Bill".to_string()),
         );
-        let mut cell2 = OwnedCell::new_with_id(schema_id, &doc2_id, OwnedValue::Map(cell2_data));
+        let mut cell2 =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc2_id, OwnedValue::Map(cell2_data));
 
         // Index documents
         server.chunks().write_cell(&mut cell1).unwrap();
@@ -3778,7 +3809,8 @@ mod tests {
                 "William Gates".to_string(),
             ])),
         );
-        let mut cell1 = OwnedCell::new_with_id(schema_id, &doc1_id, OwnedValue::Map(cell1_data));
+        let mut cell1 =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc1_id, OwnedValue::Map(cell1_data));
 
         let mut cell2_data = OwnedMap::new();
         cell2_data.insert(
@@ -3788,7 +3820,8 @@ mod tests {
                 "Open Gates".to_string(),
             ])),
         );
-        let mut cell2 = OwnedCell::new_with_id(schema_id, &doc2_id, OwnedValue::Map(cell2_data));
+        let mut cell2 =
+            OwnedCell::new_with_id(SchemaVid(schema_id), &doc2_id, OwnedValue::Map(cell2_data));
 
         server.chunks().write_cell(&mut cell1).unwrap();
         server.chunks().write_cell(&mut cell2).unwrap();

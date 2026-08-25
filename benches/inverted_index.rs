@@ -76,7 +76,7 @@ fn register_schema(schemas: &LocalSchemasCache, schema: neb::ram::schema::Schema
         let internal: &LocalSchemasCacheInternal = unsafe { mem::transmute(schemas) };
 
         let name = schema.name.clone();
-        let id = schema.id;
+        let id = schema.vid;
 
         // Check if schema already exists
         if let Some(existing_id) = internal.map.name_map.get(&name) {
@@ -458,7 +458,13 @@ fn bench_search_limit(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(limit), limit, |b, limit| {
             b.to_async(&rt).iter(|| async {
                 let hits = indexer
-                    .bm25_search(schema_id, field_id, black_box("rust programming"), *limit, false)
+                    .bm25_search(
+                        schema_id,
+                        field_id,
+                        black_box("rust programming"),
+                        *limit,
+                        false,
+                    )
                     .await
                     .unwrap();
                 black_box(hits);

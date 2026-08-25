@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub static HASH_BUCKET_LEN_SUM: AtomicU64 = AtomicU64::new(0);
 pub static HASH_BUCKET_SAMPLES: AtomicU64 = AtomicU64::new(0);
 pub static HASH_BUCKET_MAX: AtomicU64 = AtomicU64::new(0);
-use crate::ram::schema::{Field, Schema};
+use crate::ram::schema::{Field, Schema, SchemaVid};
 use crate::ram::types::*;
 use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use bifrost::rpc::RPCError;
@@ -20,7 +20,7 @@ const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 const HASH_INDEX_FIELD: &'static str = "CELL_ID";
 
 lazy_static! {
-    pub static ref HASH_INDEX_SCHEMA_ID: u32 = key_hash(HASH_SCHEMA) as u32;
+    pub static ref HASH_INDEX_SCHEMA_ID: SchemaVid = SchemaVid(key_hash(HASH_SCHEMA) as u32);
     pub static ref HASH_INDEX_FIELD_ID: u64 = hash_str(HASH_INDEX_FIELD);
 }
 
@@ -386,7 +386,7 @@ impl HashIndexer {
 
 pub fn hash_index_schema() -> Schema {
     Schema::new_with_id(
-        *HASH_INDEX_SCHEMA_ID,
+        HASH_INDEX_SCHEMA_ID.get(),
         &HASH_SCHEMA.to_string(),
         None,
         Field::new_schema(vec![Field::new_unindexed_array(HASH_INDEX_FIELD, Type::Id)]),

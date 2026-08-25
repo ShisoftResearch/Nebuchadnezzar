@@ -1,3 +1,4 @@
+use crate::ram::schema::SchemaVid;
 use std::sync::Arc;
 
 use crate::server::DatabaseRuntime;
@@ -16,7 +17,12 @@ impl CostFunction for RangeIndexCost {
         range: Option<&ValueRange>,
         projection: Vec<u64>,
     ) -> Option<CostResult> {
-        let stat = self.database_runtime.chunks().overall_statistics(schema);
+        // TASK 3: statistics are a per-family aggregate and this selector is
+        // logical, so both sides become `SchemaUid`. One generation today.
+        let stat = self
+            .database_runtime
+            .chunks()
+            .overall_statistics(SchemaVid(schema));
         let field = field?;
         let field_histo = stat.histogram.get(&field)?;
         let num_all_rows = stat.count;

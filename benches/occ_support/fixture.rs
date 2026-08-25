@@ -1,3 +1,4 @@
+use neb::ram::schema::SchemaVid;
 use std::sync::Arc;
 
 use dovahkiin::types::{Map as _, Type};
@@ -146,11 +147,13 @@ impl OccFixture {
             false,
             false,
         );
-        schema.id = client
-            .new_schema(schema.clone())
-            .await
-            .expect("register OCC benchmark schema via RPC")
-            .expect("create OCC benchmark schema");
+        schema.assign_identity(
+            client
+                .new_schema(schema.clone())
+                .await
+                .expect("register OCC benchmark schema via RPC")
+                .expect("create OCC benchmark schema"),
+        );
 
         let txn = transactions::new_async_client_for_database(&addresses[0], &group, &group)
             .await
@@ -168,7 +171,7 @@ impl OccFixture {
 
     pub async fn seed_counter(&self, id: Id, score: u64) {
         self.client
-            .write_cell(counter_cell(self.schema.id, id, score, 0))
+            .write_cell(counter_cell(self.schema.vid, id, score, 0))
             .await
             .expect("seed OCC benchmark counter via RPC")
             .expect("write OCC benchmark counter");
@@ -261,11 +264,13 @@ pub(crate) fn ids_probe_budget(count: usize) -> usize {
     count.saturating_mul(1024).max(MIN_IDS_PROBE_BUDGET)
 }
 
-pub fn counter_cell(schema: u32, id: Id, score: u64, payload_bytes: usize) -> OwnedCell {
+pub fn counter_cell(schema: SchemaVid, id: Id, score: u64, payload_bytes: usize) -> OwnedCell {
     let mut data = OwnedMap::new();
     data.insert(
         &String::from("id"),
-        OwnedValue::I64(i64::try_from(id.bits() & ((1 << 48) - 1)).expect("counter cell id must fit in i64")),
+        OwnedValue::I64(
+            i64::try_from(id.bits() & ((1 << 48) - 1)).expect("counter cell id must fit in i64"),
+        ),
     );
     data.insert(&String::from("score"), OwnedValue::U64(score));
     data.insert(

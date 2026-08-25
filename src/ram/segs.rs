@@ -281,8 +281,7 @@ impl BackupFdCache {
 
     fn shard_of(&self, key: &FdKey) -> &parking_lot::Mutex<FdShard> {
         // seq_id alone would cluster; mixing all three spreads segments evenly.
-        let h = (key.0 as u64)
-            .wrapping_mul(0xA24B_AED4_963E_E407)
+        let h = (key.0 as u64).wrapping_mul(0xA24B_AED4_963E_E407)
             ^ (key.1 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ key.2
             ^ key.3.rotate_left(17);
@@ -314,7 +313,11 @@ impl BackupFdCache {
             shard.hand = shard.hand.wrapping_add(1);
             match &mut shard.slots[idx] {
                 None => {
-                    shard.slots[idx] = Some(FdSlot { key, file, used: true });
+                    shard.slots[idx] = Some(FdSlot {
+                        key,
+                        file,
+                        used: true,
+                    });
                     COLD_BACKUP_FDS.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -324,7 +327,11 @@ impl BackupFdCache {
                 }
                 Some(_) => {
                     // Evicting drops the handle, closing the descriptor.
-                    shard.slots[idx] = Some(FdSlot { key, file, used: true });
+                    shard.slots[idx] = Some(FdSlot {
+                        key,
+                        file,
+                        used: true,
+                    });
                     COLD_BACKUP_EVICTIONS.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -933,8 +940,10 @@ impl Segment {
             },
         );
         // Nothing may follow the link, so the segment is full from here.
-        self.append_header
-            .store(self.addr + tail_offset + crate::ram::bracket::TXN_CONT_ENTRY_SIZE, Ordering::Release);
+        self.append_header.store(
+            self.addr + tail_offset + crate::ram::bracket::TXN_CONT_ENTRY_SIZE,
+            Ordering::Release,
+        );
         true
     }
 
@@ -1080,7 +1089,6 @@ impl Segment {
         residency.clear();
         released
     }
-
 
     /// Drop the blocks faulted into this cold segment, reporting the bytes
     /// released, or `None` if the segment is busy or holds nothing.
@@ -1303,7 +1311,9 @@ impl Segment {
         residency.mark_present(block_idx, plain.len());
         // Caller does the accounting: it holds the tiered manager, and a
         // segment has no route to one.
-        Ok(Some(newly_accounted + (residency.resident_bytes() - before)))
+        Ok(Some(
+            newly_accounted + (residency.resident_bytes() - before),
+        ))
     }
 
     /// This segment's backup handle, opening it if it is not already cached.
@@ -1460,12 +1470,9 @@ impl Segment {
     #[inline]
     pub fn is_dead_at(&self, addr: usize) -> bool {
         let offset = (addr - self.addr) / 8;
-        self.dead_bits
-            .read()
-            .as_ref()
-            .map_or(false, |bits| {
-                bits[offset / 64].load(Ordering::Acquire) & (1u64 << (offset % 64)) != 0
-            })
+        self.dead_bits.read().as_ref().map_or(false, |bits| {
+            bits[offset / 64].load(Ordering::Acquire) & (1u64 << (offset % 64)) != 0
+        })
     }
 
     /// Drop the dead-entry bitmap, returning its heap to the allocator.
@@ -1526,8 +1533,8 @@ impl Segment {
         // head; counting the payload alone under-reports each tombstone by
         // ENTRY_HEAD_SIZE, which starves utilization-driven segment selection
         // on tombstone-heavy segments.
-        let tombstones_space = self.tombstones.load(Ordering::Relaxed)
-            * (TOMBSTONE_SIZE_U32 + ENTRY_HEAD_SIZE as u32);
+        let tombstones_space =
+            self.tombstones.load(Ordering::Relaxed) * (TOMBSTONE_SIZE_U32 + ENTRY_HEAD_SIZE as u32);
         let dead_cells_space = self.dead_space();
         return tombstones_space + dead_cells_space;
     }
@@ -2169,9 +2176,8 @@ image, not an empty segment; archiving it would persist the damage.",
                         // archived and re-used -- a log and an image for one
                         // seq id, which is the twin-file state recovery
                         // cannot arbitrate.
-                        if let Some(parent) = wal_path
-                            .as_ref()
-                            .and_then(|path| Path::new(path).parent())
+                        if let Some(parent) =
+                            wal_path.as_ref().and_then(|path| Path::new(path).parent())
                         {
                             match File::open(parent).and_then(|dir| dir.sync_all()) {
                                 Ok(()) => {}
@@ -2207,8 +2213,7 @@ image, not an empty segment; archiving it would persist the damage.",
             None => {
                 WAL_LOCK_CONTENDED.fetch_add(1, Relaxed);
                 let g = self.file_state.lock();
-                WAL_LOCK_WAIT_NANOS
-                    .fetch_add(acquire_start.elapsed().as_nanos() as u64, Relaxed);
+                WAL_LOCK_WAIT_NANOS.fetch_add(acquire_start.elapsed().as_nanos() as u64, Relaxed);
                 g
             }
         };
@@ -2392,7 +2397,8 @@ image, not an empty segment; archiving it would persist the damage.",
     /// journaled happens-before the next owner's acquire.
     #[inline]
     pub fn release_own(&self) {
-        self.pending_journals.fetch_and(!HEAD_OWNED, Ordering::Release);
+        self.pending_journals
+            .fetch_and(!HEAD_OWNED, Ordering::Release);
     }
 
     /// Wait for in-flight journal writes to land, briefly.
@@ -3007,10 +3013,7 @@ impl SegmentAllocator {
     /// Approximate under concurrency, which is fine -- it feeds a headroom
     /// heuristic, not an invariant.
     pub fn available_segments(&self) -> usize {
-        let bump_left = self
-            .limit
-            .saturating_sub(self.offset.load(Relaxed))
-            >> SEGMENT_BITS_SHIFT;
+        let bump_left = self.limit.saturating_sub(self.offset.load(Relaxed)) >> SEGMENT_BITS_SHIFT;
         self.free_count.load(Relaxed) + bump_left
     }
 
@@ -3086,10 +3089,7 @@ impl SegmentAllocator {
     }
 
     pub fn segment_accounting(&self) -> (usize, usize, usize) {
-        let bump_left = self
-            .limit
-            .saturating_sub(self.offset.load(Relaxed))
-            >> SEGMENT_BITS_SHIFT;
+        let bump_left = self.limit.saturating_sub(self.offset.load(Relaxed)) >> SEGMENT_BITS_SHIFT;
         (
             self.capacity_segments(),
             self.free_count.load(Relaxed),
@@ -3838,7 +3838,7 @@ mod head_pool_tests {
                         value["DATA"] = OwnedValue::U64(t * 1_000_000 + i);
                         let mut cell = OwnedCell {
                             header: CellHeader::new(
-                                schema.id,
+                                schema.vid,
                                 &Id::allocated(31, 0, t * 1_000_000 + i + 1),
                             ),
                             data: value,
@@ -3859,16 +3859,14 @@ mod head_pool_tests {
             let mut cursor = crate::ram::wal_format::FILE_HEADER_SIZE;
             let mut last_offset: Option<u64> = None;
             while cursor + crate::ram::wal_format::RECORD_HEADER_SIZE <= bytes.len() {
-                let magic =
-                    u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+                let magic = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
                 if magic != crate::ram::wal_format::RECORD_MAGIC {
                     break;
                 }
                 let seg_offset =
                     u64::from_le_bytes(bytes[cursor + 4..cursor + 12].try_into().unwrap());
-                let len =
-                    u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap())
-                        as usize;
+                let len = u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().unwrap())
+                    as usize;
                 if let Some(last) = last_offset {
                     assert!(
                         seg_offset > last,
@@ -3894,7 +3892,9 @@ mod head_pool_tests {
         for t in 0..16u64 {
             for i in (0..2_000u64).step_by(199) {
                 let id = Id::allocated(31, 0, t * 1_000_000 + i + 1);
-                chunks.read_cell(&id).expect("every written cell reads back");
+                chunks
+                    .read_cell(&id)
+                    .expect("every written cell reads back");
             }
         }
     }
@@ -3936,7 +3936,7 @@ mod head_pool_tests {
                         value["DATA"] = OwnedValue::U64(i);
                         let mut cell = OwnedCell {
                             header: CellHeader::new(
-                                schema.id,
+                                schema.vid,
                                 &Id::allocated(32, 0, t * 1_000_000 + i + 1),
                             ),
                             data: value,
@@ -3968,8 +3968,8 @@ mod seal_race_tests {
     use crate::ram::cell::{CellHeader, OwnedCell};
     use crate::ram::chunk::{Chunks, WAL_JOURNAL_FAILURES};
     use crate::ram::schema::{Field, LocalSchemasCache, Schema};
-    use crate::ram::types::*;
     use crate::ram::types::Id;
+    use crate::ram::types::*;
     use crate::server::ServerMeta;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -4037,10 +4037,12 @@ mod seal_race_tests {
                 let mut value = OwnedValue::Map(OwnedMap::new());
                 value["DATA"] = OwnedValue::U64(index);
                 let mut cell = OwnedCell {
-                    header: CellHeader::new(schema.id, &Id::allocated(21, 0, index + 1)),
+                    header: CellHeader::new(schema.vid, &Id::allocated(21, 0, index + 1)),
                     data: value,
                 };
-                chunks.write_cell(&mut cell).expect("write during archiving");
+                chunks
+                    .write_cell(&mut cell)
+                    .expect("write during archiving");
             }
             stop.store(true, Ordering::Relaxed);
         });
@@ -4138,7 +4140,9 @@ mod skipped_slot_tests {
             "every slot except the live one comes back exactly once"
         );
         assert!(
-            alloc.alloc_seg_with_class(&fm, SegmentClass::Regular).is_none(),
+            alloc
+                .alloc_seg_with_class(&fm, SegmentClass::Regular)
+                .is_none(),
             "and the chunk is genuinely full afterwards -- reclaiming must not \
              invent capacity"
         );

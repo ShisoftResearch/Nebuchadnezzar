@@ -697,7 +697,8 @@ mod test {
         println!("=== Recovering LSM tree from storage ===");
 
         // Recover the tree
-        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id).await
+        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id)
+            .await
             .expect("the tree should load back from storage");
 
         println!("=== Recovered tree state ===");
@@ -911,7 +912,8 @@ mod test {
         drop(tree);
 
         println!("=== Recovering tree ===");
-        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id).await
+        let recovered_tree = RangedTree::recover(&client, &lsm_tree_id)
+            .await
             .expect("the tree should load back from storage");
         println!("Recovered tree count: {}", recovered_tree.count());
 
@@ -955,6 +957,7 @@ mod test {
         use crate::index::ranged::tree::btree::Ordering;
         use crate::query::data_client::{QueryOrdering, ValueRange, ValueRangeTerm};
         use crate::ram::cell::OwnedCell;
+        use crate::ram::schema::SchemaVid;
         use crate::ram::schema::{Field, IndexType, Schema};
         use crate::ram::types::Type;
         use crate::server::*;
@@ -1041,7 +1044,7 @@ mod test {
             value[NAME_FIELD] = OwnedValue::String(format!("Product {}", _i));
             value[QUANTITY_FIELD] = OwnedValue::U32((_i * 5) as u32);
 
-            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            let cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
 
@@ -1371,7 +1374,8 @@ mod test {
             .await
             .expect("target tree head should be published before routing");
 
-        let recovered_target = RangedTree::recover(&client, &target_tree_id).await
+        let recovered_target = RangedTree::recover(&client, &target_tree_id)
+            .await
             .expect("the target tree should load back from storage");
         assert_eq!(
             recovered_target.count(),
@@ -1583,7 +1587,11 @@ mod test {
                     let mut value = OwnedValue::Map(OwnedMap::new());
                     value[SCORE_FIELD] = OwnedValue::U64(ordinal as u64);
                     value[PAYLOAD_FIELD] = OwnedValue::U32(worker as u32);
-                    let cell = OwnedCell::new_with_id(302, &Id::from_parts(1, ordinal as u64), value);
+                    let cell = OwnedCell::new_with_id(
+                        crate::ram::schema::SchemaVid(302),
+                        &Id::from_parts(1, ordinal as u64),
+                        value,
+                    );
                     client.upsert_cell(cell).await.unwrap().unwrap();
                     if offset % 128 == 0 {
                         tokio::task::yield_now().await;

@@ -129,7 +129,11 @@ pub async fn general() {
         &String::from("name"),
         OwnedValue::String(String::from("Jack")),
     );
-    let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    let cell_1 = OwnedCell::new_with_id(
+        SchemaVid(schema_id),
+        &Id::rand(),
+        OwnedValue::Map(data_map.clone()),
+    );
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
     let read_cell = client
         .read_cell(cell_1.clone().id())
@@ -160,7 +164,7 @@ pub async fn general() {
         .transaction(move |trans| {
             async move {
                 let empty_cell = OwnedCell::new_with_id(
-                    schema_id,
+                    SchemaVid(schema_id),
                     &Id::rand(),
                     OwnedValue::Map(OwnedMap::new()),
                 );
@@ -274,7 +278,7 @@ pub async fn multi_cell_update() {
         .unwrap(),
     );
     let thread_count = 100;
-    let schema_id = schema.id;
+    let schema_id = schema.vid;
     let _ = client.new_schema_with_id(schema).await.unwrap();
     let all_schemas = client.get_all_schema().await.unwrap();
     assert!(!all_schemas.is_empty());
@@ -344,7 +348,7 @@ pub async fn read_all_cells_selected_returns_requested_fields_in_input_order() {
         false,
         false,
     );
-    let schema_id = schema.id;
+    let schema_id = schema.vid;
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     let mut first = OwnedMap::new();
@@ -808,7 +812,11 @@ pub async fn write_skew() {
         &String::from("name"),
         OwnedValue::String(String::from("Jack")),
     );
-    let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    let cell_1 = OwnedCell::new_with_id(
+        SchemaVid(schema_id),
+        &Id::rand(),
+        OwnedValue::Map(data_map.clone()),
+    );
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
     client.read_cell(cell_1.id()).await.unwrap().unwrap();
     let cell_1_id = cell_1.id();
@@ -964,7 +972,7 @@ pub async fn server_isolation() {
         .first()
         .unwrap()
         .clone();
-    assert_eq!(schema_1_got.id, 1);
+    assert_eq!(schema_1_got.vid, SchemaVid(1));
     let schema_1_fields = schema1.fields;
     assert_eq!(
         schema_1_fields
@@ -1004,7 +1012,7 @@ pub async fn server_isolation() {
         .first()
         .unwrap()
         .clone();
-    assert_eq!(schema_2_got.id, 2);
+    assert_eq!(schema_2_got.vid, SchemaVid(2));
     let schema_2_fields = schema2.fields;
     assert_eq!(
         schema_2_fields
@@ -1124,8 +1132,6 @@ pub async fn slot_table_is_seeded_to_agree_with_the_ring() {
         "adoption must be idempotent; claiming slots again would move data"
     );
 }
-
-
 
 /// Routing through the table must agree with routing through the ring, and must
 /// still work when there is no table.
@@ -1315,7 +1321,7 @@ pub async fn slot_enumeration_finds_exactly_the_requested_slots() {
                 &String::from("name"),
                 OwnedValue::String(format!("slot{slot}-{seq}")),
             );
-            let cell = OwnedCell::new_with_id(1200, &id, OwnedValue::Map(value));
+            let cell = OwnedCell::new_with_id(SchemaVid(1200), &id, OwnedValue::Map(value));
             client.write_cell(cell).await.unwrap().unwrap();
             expected.entry(slot).or_default().insert(id);
         }
@@ -1457,7 +1463,7 @@ pub async fn cells_stay_addressable_when_a_member_joins_a_running_cluster() {
         );
         client
             .write_cell(OwnedCell::new_with_id(
-                1400,
+                SchemaVid(1400),
                 id,
                 OwnedValue::Map(value),
             ))
@@ -1501,9 +1507,7 @@ pub async fn cells_stay_addressable_when_a_member_joins_a_running_cluster() {
     // still computed, this many cells would have become unreachable.
     let reassigned_by_ring = ids
         .iter()
-        .filter(|id| {
-            first.conshash().get_server_id(id.locality() as u64) != Some(first.server_id)
-        })
+        .filter(|id| first.conshash().get_server_id(id.locality() as u64) != Some(first.server_id))
         .count();
     assert!(
         reassigned_by_ring > 0,
@@ -1645,7 +1649,11 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
             OwnedValue::String(format!("fill-{seq}")),
         );
         client
-            .write_cell(OwnedCell::new_with_id(1401, id, OwnedValue::Map(value)))
+            .write_cell(OwnedCell::new_with_id(
+                SchemaVid(1401),
+                id,
+                OwnedValue::Map(value),
+            ))
             .await
             .unwrap()
             .unwrap();
@@ -1680,7 +1688,12 @@ pub async fn a_joining_member_is_filled_toward_the_mean() {
     // fill, not the race.
     let mut schema_synced = false;
     for _ in 0..300 {
-        if second.chunks().list[0].meta.schemas.get(&1401).is_some() {
+        if second.chunks().list[0]
+            .meta
+            .schemas
+            .get(&SchemaVid(1401))
+            .is_some()
+        {
             schema_synced = true;
             break;
         }
@@ -1880,7 +1893,11 @@ pub async fn a_joining_member_is_filled_automatically() {
             OwnedValue::String(format!("auto-{seq}")),
         );
         client
-            .write_cell(OwnedCell::new_with_id(1402, id, OwnedValue::Map(value)))
+            .write_cell(OwnedCell::new_with_id(
+                SchemaVid(1402),
+                id,
+                OwnedValue::Map(value),
+            ))
             .await
             .unwrap()
             .unwrap();

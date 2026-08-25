@@ -2,6 +2,7 @@ use super::cell::cell_header_from_entry_content_addr;
 use super::chunk::Chunk;
 use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::file_manager::{SegmentFileInfo, SegmentFileManager};
+use super::schema::SchemaVid;
 use super::segs::{
     estimated_cells_per_segment, Segment, SegmentClass, DEFAULT_ESTIMATED_CELL_BYTES, SEGMENT_SIZE,
 };
@@ -157,15 +158,15 @@ fn trace_pages_enabled() -> bool {
 lazy_static::lazy_static! {
     /// Must match `index::ranged::tree::btree::external::PAGE_SCHEMA_ID`,
     /// computed here because that module is private to the btree.
-    static ref TRACED_PAGE_SCHEMA_ID: u32 =
-        dovahkiin::types::key_hash("NEB_BTREE_PAGE") as u32;
+    static ref TRACED_PAGE_SCHEMA_ID: SchemaVid =
+        SchemaVid(dovahkiin::types::key_hash("NEB_BTREE_PAGE") as u32);
     /// Must match `index::ranged::tree::tree::RANGED_TREE_SCHEMA_NAME`: the
     /// per-tree metadata cell, the single cell whose loss unloads a tree.
-    static ref TRACED_TREE_META_SCHEMA_ID: u32 =
-        dovahkiin::types::key_hash("NEB_RANGED_TREE") as u32;
+    static ref TRACED_TREE_META_SCHEMA_ID: SchemaVid =
+        SchemaVid(dovahkiin::types::key_hash("NEB_RANGED_TREE") as u32);
 }
 
-fn traced_schema(schema: u32) -> Option<&'static str> {
+fn traced_schema(schema: SchemaVid) -> Option<&'static str> {
     if schema == *TRACED_PAGE_SCHEMA_ID {
         Some("page")
     } else if schema == *TRACED_TREE_META_SCHEMA_ID {
@@ -437,7 +438,8 @@ pub struct BracketLedger {
     /// as present iff it is here.
     present: std::collections::HashSet<(u16, u64)>,
     pending: Mutex<HashMap<crate::server::transactions::TxnId, Vec<PendingBracketCell>>>,
-    commits: Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
+    commits:
+        Mutex<HashMap<crate::server::transactions::TxnId, Vec<crate::ram::bracket::ManifestEntry>>>,
 }
 
 pub struct PendingBracketCell {
@@ -459,10 +461,8 @@ pub struct PendingBracketCell {
 /// Transactions discarded because they were never committed, and cells
 /// applied from committed brackets. Loud on purpose: both are normal, and
 /// both are things an operator will want to see after a crash.
-pub static BRACKETS_DISCARDED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-pub static BRACKETS_APPLIED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static BRACKETS_DISCARDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BRACKETS_APPLIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl BracketLedger {
     pub fn new(files: &[SegmentFileInfo]) -> Self {
@@ -769,7 +769,7 @@ fn has_only_zero_padding(data: &[u8], start_offset: usize) -> bool {
 fn observe_recovered_segment_class(
     chunk: &Chunk,
     seg_id: u64,
-    schema_id: u32,
+    schema_id: SchemaVid,
     detected_class: &mut Option<SegmentClass>,
     mixed_class_warning_emitted: &mut bool,
     missing_schema_entries: &mut usize,
@@ -800,7 +800,7 @@ fn observe_recovered_segment_class(
         }
     } else {
         *missing_schema_entries += 1;
-        first_missing_schema_id.get_or_insert(schema_id);
+        first_missing_schema_id.get_or_insert(schema_id.get());
     }
 
     Ok(())
@@ -1296,8 +1296,7 @@ fn scan_segment_from_data(
         // transaction, and that is a decision no single segment can make.
         if let Some((_, txn)) = &open_bracket {
             if entry_header.entry_type == EntryType::CELL {
-                let cell_header =
-                    cell_header_from_entry_content_addr(Entry::content_pos(cursor));
+                let cell_header = cell_header_from_entry_content_addr(Entry::content_pos(cursor));
                 observe_recovered_segment_class(
                     chunk,
                     seg_id,
@@ -1391,7 +1390,11 @@ fn scan_segment_from_data(
                         seg_id,
                         offset,
                         existing_version,
-                        if new_version >= existing_version { "WIN" } else { "LOSE" }
+                        if new_version >= existing_version {
+                            "WIN"
+                        } else {
+                            "LOSE"
+                        }
                     );
                 }
             }
@@ -1450,7 +1453,11 @@ fn scan_segment_from_data(
                     tombstone.version,
                     seg_id,
                     existing_version,
-                    if tombstone.version >= existing_version { "WIN" } else { "LOSE" }
+                    if tombstone.version >= existing_version {
+                        "WIN"
+                    } else {
+                        "LOSE"
+                    }
                 );
             }
             if tombstone.version >= existing_version {
@@ -1582,17 +1589,14 @@ fn apply_stashed_tombstones(
                 let removed = Id::from_bits(tombstone.hash);
                 if !removed.is_hashed() {
                     if let Some(floor) = origin_floors.get(removed.origin() as usize) {
-                        floor.fetch_max(
-                            removed.sequence(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        floor.fetch_max(removed.sequence(), std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 *guard = 0; // Delete cell
-                // The header at this address was already read just above, so
-                // decoding the entry touches nothing new. The slot counter was
-                // seeded with this cell counted (its scan saw no newer
-                // tombstone), so the deletion must be reflected there too.
+                            // The header at this address was already read just above, so
+                            // decoding the entry touches nothing new. The slot counter was
+                            // seeded with this cell counted (its scan saw no newer
+                            // tombstone), so the deletion must be reflected there too.
                 let (removed_entry, _) = Entry::decode_from(existing_addr, |_, _| {});
                 chunk
                     .slot_bytes
@@ -2132,11 +2136,11 @@ mod tests {
     use super::*;
     use crate::dovahkiin::types::Map;
     use crate::ram::cell::*;
-use crate::ram::types::Id;
     use crate::ram::chunk::Chunks;
     use crate::ram::schema::{Field, LocalSchemasCache, Schema};
     use crate::ram::segs::{SegmentClass, SEGMENT_SIZE};
     use crate::ram::tiered::{manager::TieredMemoryManager, SharedMemoryPool, TieredConfig};
+    use crate::ram::types::Id;
     use crate::server::ServerMeta;
     use dovahkiin::types::Type;
     use lightning::map::WordMap;
@@ -2220,7 +2224,7 @@ use crate::ram::types::Id;
     fn default_cell(id: &Id) -> OwnedCell {
         let data: Vec<_> = std::iter::repeat(id.bits() as u8).take(DATA_SIZE).collect();
         OwnedCell {
-            header: CellHeader::new(0, id),
+            header: CellHeader::new(SchemaVid(0), id),
             data: data_map_value!(id: id.bits() as i32, data: data),
         }
     }
@@ -2271,7 +2275,12 @@ use crate::ram::types::Id;
 
     fn tombstone_only_segment_bytes() -> Vec<u8> {
         let mut segment = empty_segment_bytes();
-        Tombstone::put(segment.as_mut_ptr() as usize, 41, 7, Id::from_parts(3, 9_999));
+        Tombstone::put(
+            segment.as_mut_ptr() as usize,
+            41,
+            7,
+            Id::from_parts(3, 9_999),
+        );
         segment
     }
 
@@ -2288,7 +2297,11 @@ use crate::ram::types::Id;
         fs::create_dir_all(&dir).unwrap();
         let mut bytes = crate::ram::wal_format::wal_file_header(seq_id).to_vec();
         bytes.extend_from_slice(&crate::ram::wal_format::frame_record(0, entry));
-        fs::write(dir.join(format!("{}-{}-{}.nlog", chunk_id, seg_id, seq_id)), &bytes).unwrap();
+        fs::write(
+            dir.join(format!("{}-{}-{}.nlog", chunk_id, seg_id, seq_id)),
+            &bytes,
+        )
+        .unwrap();
     }
 
     fn write_backup_segment(
@@ -2342,8 +2355,9 @@ use crate::ram::types::Id;
         data: &[u8],
     ) -> io::Result<RecoveryScanResult> {
         let mut version_map = new_version_map(&[]);
-        let floors: Vec<std::sync::atomic::AtomicU64> =
-            (0..4096).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let floors: Vec<std::sync::atomic::AtomicU64> = (0..4096)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         scan_segment_from_data(
             chunk,
             1,
@@ -2363,8 +2377,9 @@ use crate::ram::types::Id;
         used_len: usize,
     ) -> io::Result<RecoveryScanResult> {
         let mut version_map = new_version_map(&[]);
-        let floors: Vec<std::sync::atomic::AtomicU64> =
-            (0..4096).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let floors: Vec<std::sync::atomic::AtomicU64> = (0..4096)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         scan_segment_from_data(
             chunk,
             1,
@@ -2425,11 +2440,11 @@ use crate::ram::types::Id;
         let regular_id = Id::allocated(10, 0, 1);
         let blob_id = Id::allocated(10, 0, 2);
         let mut regular_cell = OwnedCell {
-            header: CellHeader::new(regular_schema.id, &regular_id),
+            header: CellHeader::new(regular_schema.vid, &regular_id),
             data: data_map_value!(id: 1_i32, data: vec![0x11_u8; DATA_SIZE]),
         };
         let mut blob_cell = OwnedCell {
-            header: CellHeader::new(blob_schema.id, &blob_id),
+            header: CellHeader::new(blob_schema.vid, &blob_id),
             data: data_map_value!(id: 2_i32, data: vec![0x22_u8; DATA_SIZE]),
         };
 
@@ -2481,11 +2496,11 @@ use crate::ram::types::Id;
         let first_id = Id::allocated(12, 0, 1);
         let second_id = Id::allocated(12, 0, 2);
         let mut first_cell = OwnedCell {
-            header: CellHeader::new(blob_schema.id, &first_id),
+            header: CellHeader::new(blob_schema.vid, &first_id),
             data: data_map_value!(id: 1_i32, data: vec![0x55_u8; DATA_SIZE]),
         };
         let mut second_cell = OwnedCell {
-            header: CellHeader::new(blob_schema.id, &second_id),
+            header: CellHeader::new(blob_schema.vid, &second_id),
             data: data_map_value!(id: 2_i32, data: vec![0x66_u8; DATA_SIZE]),
         };
 
@@ -2514,7 +2529,7 @@ use crate::ram::types::Id;
 
         let cell_id = Id::allocated(13, 0, 1);
         let mut cell = OwnedCell {
-            header: CellHeader::new(regular_schema.id, &cell_id),
+            header: CellHeader::new(regular_schema.vid, &cell_id),
             data: data_map_value!(id: 3_i32, data: vec![0x99_u8; DATA_SIZE]),
         };
         writer_chunks.write_cell(&mut cell).unwrap();
@@ -2613,17 +2628,14 @@ use crate::ram::types::Id;
         );
         let chunk = &chunks.list[0];
         let schema = schema_with_id(214, "old_backup_cleanup", false);
-        chunk
-            .meta
-            .schemas
-            .debug_only_new_schema(schema.clone());
+        chunk.meta.schemas.debug_only_new_schema(schema.clone());
 
         // Real content: archiving an empty segment over a non-empty backup is
         // refused by design, so the segment has to hold decodable entries for
         // the rewrite to be legitimate.
         let id = Id::allocated(24, 0, 1);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data: data_map_value!(id: 13_i32, data: vec![0x4D_u8; DATA_SIZE]),
         };
         chunks.write_cell(&mut cell).expect("write a cell");
@@ -2638,12 +2650,18 @@ use crate::ram::types::Id;
             .expect("backup path");
 
         segment.archive().expect("first archive");
-        assert!(Path::new(&backup_file).exists(), "first archive wrote nothing");
+        assert!(
+            Path::new(&backup_file).exists(),
+            "first archive wrote nothing"
+        );
 
         segment.set_dirty();
         segment.archive().expect("second archive");
 
-        assert!(Path::new(&backup_file).exists(), "the rewrite lost the backup");
+        assert!(
+            Path::new(&backup_file).exists(),
+            "the rewrite lost the backup"
+        );
         assert!(
             !Path::new(&format!("{}.old", backup_file)).exists(),
             "the superseded backup was left on disk"
@@ -2685,7 +2703,7 @@ use crate::ram::types::Id;
 
         let id = Id::allocated(25, 0, 1);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data: data_map_value!(id: 13_i32, data: vec![0x5E_u8; DATA_SIZE]),
         };
         chunks.write_cell(&mut cell).expect("write a cell");
@@ -2738,7 +2756,7 @@ use crate::ram::types::Id;
         // id, which is where the retired tail goes.
         let id2 = Id::allocated(25, 0, 2);
         let mut cell2 = OwnedCell {
-            header: CellHeader::new(schema.id, &id2),
+            header: CellHeader::new(schema.vid, &id2),
             data: data_map_value!(id: 14_i32, data: vec![0x5F_u8; DATA_SIZE]),
         };
         chunks
@@ -2774,7 +2792,7 @@ use crate::ram::types::Id;
             .debug_only_new_schema(schema.clone());
         let good_id = Id::allocated(23, 0, 1);
         let mut good_cell = OwnedCell {
-            header: CellHeader::new(schema.id, &good_id),
+            header: CellHeader::new(schema.vid, &good_id),
             data: data_map_value!(id: 11_i32, data: vec![0x2B_u8; DATA_SIZE]),
         };
         writer_chunks.write_cell(&mut good_cell).unwrap();
@@ -2843,7 +2861,7 @@ use crate::ram::types::Id;
             .debug_only_new_schema(schema.clone());
         let cell_id = Id::allocated(23, 0, 1);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &cell_id),
+            header: CellHeader::new(schema.vid, &cell_id),
             data: data_map_value!(id: 11_i32, data: vec![0x77_u8; DATA_SIZE]),
         };
         writer_chunks.write_cell(&mut cell).unwrap();
@@ -2900,7 +2918,7 @@ use crate::ram::types::Id;
             .debug_only_new_schema(schema.clone());
         let cell_id = Id::allocated(24, 0, 1);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &cell_id),
+            header: CellHeader::new(schema.vid, &cell_id),
             data: data_map_value!(id: 12_i32, data: vec![0x66_u8; DATA_SIZE]),
         };
         writer_chunks.write_cell(&mut cell).unwrap();
@@ -2958,7 +2976,7 @@ use crate::ram::types::Id;
             .debug_only_new_schema(schema.clone());
         let cell_id = Id::allocated(25, 0, 1);
         let mut winner = OwnedCell {
-            header: CellHeader::new(schema.id, &cell_id),
+            header: CellHeader::new(schema.vid, &cell_id),
             data: data_map_value!(id: 1_i32, data: vec![0x11_u8; DATA_SIZE]),
         };
         writer_chunks.write_cell(&mut winner).unwrap();
@@ -2972,7 +2990,7 @@ use crate::ram::types::Id;
         // mechanics here: append the full image, then abandon it as the race
         // arm does.
         let loser = OwnedCell {
-            header: CellHeader::new(schema.id, &cell_id),
+            header: CellHeader::new(schema.vid, &cell_id),
             data: data_map_value!(id: 2_i32, data: vec![0x22_u8; DATA_SIZE]),
         };
         let ghost_addr = {
@@ -3034,9 +3052,18 @@ use crate::ram::types::Id;
     fn bracket_entry_bytes(entry_type: EntryType, content: &[u8]) -> Vec<u8> {
         let mut buffer = vec![0u8; ENTRY_HEAD_SIZE + content.len()];
         let base = buffer.as_mut_ptr() as usize;
-        Entry::encode_to(base, entry_type, content.len() as u32, |content_addr| unsafe {
-            std::ptr::copy_nonoverlapping(content.as_ptr(), content_addr as *mut u8, content.len());
-        });
+        Entry::encode_to(
+            base,
+            entry_type,
+            content.len() as u32,
+            |content_addr| unsafe {
+                std::ptr::copy_nonoverlapping(
+                    content.as_ptr(),
+                    content_addr as *mut u8,
+                    content.len(),
+                );
+            },
+        );
         buffer
     }
 
@@ -3061,7 +3088,7 @@ use crate::ram::types::Id;
         let mut entries = Vec::new();
         for (i, id) in ids.iter().enumerate() {
             let mut cell = OwnedCell {
-                header: CellHeader::new(schema.id, id),
+                header: CellHeader::new(schema.vid, id),
                 data: data_map_value!(id: i as i32, data: vec![0x66_u8; DATA_SIZE]),
             };
             chunks.write_cell(&mut cell).unwrap();
@@ -3069,11 +3096,11 @@ use crate::ram::types::Id;
         }
 
         let txn = crate::server::transactions::test_hlc(4242, 7);
-        let begin = bracket_entry_bytes(
-            EntryType::BEGIN,
-            &crate::ram::bracket::encode_begin(&txn),
-        );
-        let manifest = vec![crate::ram::bracket::ManifestEntry { chunk_id: 0, seq_id: 0 }];
+        let begin = bracket_entry_bytes(EntryType::BEGIN, &crate::ram::bracket::encode_begin(&txn));
+        let manifest = vec![crate::ram::bracket::ManifestEntry {
+            chunk_id: 0,
+            seq_id: 0,
+        }];
         let commit = bracket_entry_bytes(
             EntryType::COMMIT,
             &crate::ram::bracket::encode_commit(&txn, &manifest),
@@ -3175,13 +3202,10 @@ use crate::ram::types::Id;
         chunk.meta.schemas.debug_only_new_schema(schema.clone());
 
         let txn = crate::server::transactions::test_hlc(909, 3);
-        let begin = bracket_entry_bytes(
-            EntryType::BEGIN,
-            &crate::ram::bracket::encode_begin(&txn),
-        );
+        let begin = bracket_entry_bytes(EntryType::BEGIN, &crate::ram::bracket::encode_begin(&txn));
         let id = Id::allocated(30, 0, 1);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data: data_map_value!(id: 1_i32, data: vec![0x77_u8; DATA_SIZE]),
         };
         chunks.write_cell(&mut cell).unwrap();
@@ -3275,7 +3299,7 @@ use crate::ram::types::Id;
         // [ghost][survivor 0][survivor 1][survivor 2] in one segment.
         let ghost_id = Id::allocated(26, 0, 1);
         let ghost = OwnedCell {
-            header: CellHeader::new(schema.id, &ghost_id),
+            header: CellHeader::new(schema.vid, &ghost_id),
             data: data_map_value!(id: 9_i32, data: vec![0x99_u8; DATA_SIZE]),
         };
         let ghost_addr = {
@@ -3293,7 +3317,7 @@ use crate::ram::types::Id;
         let mut survivor_entries = Vec::new();
         for (i, id) in survivor_ids.iter().enumerate() {
             let mut cell = OwnedCell {
-                header: CellHeader::new(schema.id, id),
+                header: CellHeader::new(schema.vid, id),
                 data: data_map_value!(id: i as i32, data: vec![0x33_u8; DATA_SIZE]),
             };
             writer_chunks.write_cell(&mut cell).unwrap();
@@ -3359,7 +3383,7 @@ use crate::ram::types::Id;
         let mut entries = Vec::new();
         for (i, id) in ids.iter().enumerate() {
             let mut cell = OwnedCell {
-                header: CellHeader::new(schema.id, id),
+                header: CellHeader::new(schema.vid, id),
                 data: data_map_value!(id: i as i32, data: vec![0x44_u8; DATA_SIZE]),
             };
             chunks.write_cell(&mut cell).unwrap();
@@ -3434,7 +3458,7 @@ use crate::ram::types::Id;
         let mut entries = Vec::new();
         for (i, id) in ids.iter().enumerate() {
             let mut cell = OwnedCell {
-                header: CellHeader::new(schema.id, id),
+                header: CellHeader::new(schema.vid, id),
                 data: data_map_value!(id: i as i32, data: vec![0x55_u8; DATA_SIZE]),
             };
             chunks.write_cell(&mut cell).unwrap();
@@ -3511,7 +3535,7 @@ use crate::ram::types::Id;
             .debug_only_new_schema(schema.clone());
         let cell_id = Id::allocated(22, 0, 1);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &cell_id),
+            header: CellHeader::new(schema.vid, &cell_id),
             data: data_map_value!(id: 9_i32, data: vec![0x33_u8; DATA_SIZE]),
         };
         writer_chunks.write_cell(&mut cell).unwrap();
@@ -3546,7 +3570,7 @@ use crate::ram::types::Id;
             .debug_only_new_schema(schema.clone());
         let good_id = Id::allocated(21, 0, 1);
         let mut good_cell = OwnedCell {
-            header: CellHeader::new(schema.id, &good_id),
+            header: CellHeader::new(schema.vid, &good_id),
             data: data_map_value!(id: 7_i32, data: vec![0x5A_u8; DATA_SIZE]),
         };
         writer_chunks.write_cell(&mut good_cell).unwrap();
@@ -3658,7 +3682,7 @@ use crate::ram::types::Id;
             );
 
             let mut cell = OwnedCell {
-                header: CellHeader::new(regular_schema.id, &cell_id),
+                header: CellHeader::new(regular_schema.vid, &cell_id),
                 data: data_map_value!(id: 7_i32, data: vec![0x5A_u8; DATA_SIZE]),
             };
             chunks.write_cell(&mut cell).unwrap();
@@ -3726,11 +3750,11 @@ use crate::ram::types::Id;
             );
 
             let mut regular_cell = OwnedCell {
-                header: CellHeader::new(regular_schema.id, &regular_id),
+                header: CellHeader::new(regular_schema.vid, &regular_id),
                 data: data_map_value!(id: 1_i32, data: vec![0x33_u8; DATA_SIZE]),
             };
             let mut blob_cell = OwnedCell {
-                header: CellHeader::new(blob_schema.id, &blob_id),
+                header: CellHeader::new(blob_schema.vid, &blob_id),
                 data: data_map_value!(id: 2_i32, data: vec![0x44_u8; DATA_SIZE]),
             };
 
@@ -3853,11 +3877,11 @@ use crate::ram::types::Id;
                 Some(raft_path.clone()),
             );
             let mut durable = OwnedCell {
-                header: CellHeader::new(schema.id, &durable_id),
+                header: CellHeader::new(schema.vid, &durable_id),
                 data: data_map_value!(id: 1_i32, data: vec![0x41_u8; 64]),
             };
             let mut torn = OwnedCell {
-                header: CellHeader::new(schema.id, &torn_id),
+                header: CellHeader::new(schema.vid, &torn_id),
                 data: data_map_value!(id: 2_i32, data: vec![0x42_u8; 64]),
             };
             chunks.write_cell(&mut durable).unwrap();
@@ -3941,11 +3965,11 @@ use crate::ram::types::Id;
                 Some(raft_path.clone()),
             );
             let mut durable = OwnedCell {
-                header: CellHeader::new(schema.id, &durable_id),
+                header: CellHeader::new(schema.vid, &durable_id),
                 data: data_map_value!(id: 1_i32, data: vec![0x41_u8; 64]),
             };
             let mut scribbled = OwnedCell {
-                header: CellHeader::new(schema.id, &scribbled_id),
+                header: CellHeader::new(schema.vid, &scribbled_id),
                 data: data_map_value!(id: 2_i32, data: vec![0x42_u8; 64]),
             };
             chunks.write_cell(&mut durable).unwrap();
@@ -4028,11 +4052,11 @@ use crate::ram::types::Id;
             );
 
             let mut first_cell = OwnedCell {
-                header: CellHeader::new(blob_schema.id, &first_id),
+                header: CellHeader::new(blob_schema.vid, &first_id),
                 data: data_map_value!(id: 1_i32, data: vec![0x77_u8; DATA_SIZE]),
             };
             let mut second_cell = OwnedCell {
-                header: CellHeader::new(blob_schema.id, &second_id),
+                header: CellHeader::new(blob_schema.vid, &second_id),
                 data: data_map_value!(id: 2_i32, data: vec![0x88_u8; DATA_SIZE]),
             };
 
@@ -4072,8 +4096,7 @@ use crate::ram::types::Id;
                     first_off,
                     &first_entry,
                 ));
-                let torn =
-                    crate::ram::wal_format::frame_record(second_off, &second_entry);
+                let torn = crate::ram::wal_format::frame_record(second_off, &second_entry);
                 bytes.extend_from_slice(&torn[..crate::ram::wal_format::RECORD_HEADER_SIZE + 4]);
                 bytes
             };
@@ -4155,7 +4178,7 @@ use crate::ram::types::Id;
             // writes records that describe the wrong offsets -- unnoticeably,
             // until the next crash tries to replay them.
             let mut fresh = OwnedCell {
-                header: CellHeader::new(blob_schema.id, &Id::allocated(12, 0, 3)),
+                header: CellHeader::new(blob_schema.vid, &Id::allocated(12, 0, 3)),
                 data: data_map_value!(id: 3_i32, data: vec![0x99_u8; DATA_SIZE]),
             };
             chunks.write_cell(&mut fresh).expect("post-recovery write");
@@ -4500,7 +4523,7 @@ use crate::ram::types::Id;
                 header: CellHeader {
                     version: 2,
                     timestamp: 200,
-                    schema: 0,
+                    schema: SchemaVid(0),
                     id: cell_id,
                 },
                 data: data_map_value!(id: 999 as i32, data: updated_data),
@@ -4579,7 +4602,8 @@ use crate::ram::types::Id;
             );
             println!(
                 "Trying to read cell with id {:?}, hash {}",
-                cell_id, cell_id.bits()
+                cell_id,
+                cell_id.bits()
             );
 
             println!("Reading cell...");
@@ -4648,7 +4672,7 @@ use crate::ram::types::Id;
             while chunk.get_head_seg_id() == initial_head {
                 let filler_id = Id::allocated(0, 0, *filler_counter as u64);
                 let mut filler = OwnedCell {
-                    header: CellHeader::new(0, &filler_id),
+                    header: CellHeader::new(SchemaVid(0), &filler_id),
                     data: data_map_value!(id: *filler_counter, data: vec![0xEEu8; payload_size]),
                 };
                 chunks.write_cell(&mut filler).unwrap();
@@ -4687,7 +4711,7 @@ use crate::ram::types::Id;
 
             // Version 1
             let mut v1_cell = OwnedCell {
-                header: CellHeader::new(0, &cell_id),
+                header: CellHeader::new(SchemaVid(0), &cell_id),
                 data: data_map_value!(id: 101i32, data: vec![0x11u8; payload_size]),
             };
             v1_cell.header.version = current_version;
@@ -4697,7 +4721,7 @@ use crate::ram::types::Id;
             // Version 2 in a new segment
             force_new_segment(&chunks, chunk, &mut filler_counter, payload_size);
             let mut v2_cell = OwnedCell {
-                header: CellHeader::new(0, &cell_id),
+                header: CellHeader::new(SchemaVid(0), &cell_id),
                 data: data_map_value!(id: 202i32, data: vec![0x22u8; payload_size]),
             };
             v2_cell.header.version = current_version;
@@ -4707,7 +4731,7 @@ use crate::ram::types::Id;
             // Version 3 in yet another segment
             force_new_segment(&chunks, chunk, &mut filler_counter, payload_size);
             let mut v3_cell = OwnedCell {
-                header: CellHeader::new(0, &cell_id),
+                header: CellHeader::new(SchemaVid(0), &cell_id),
                 data: data_map_value!(id: 303i32, data: vec![0x33u8; payload_size]),
             };
             v3_cell.header.version = current_version;
@@ -5339,7 +5363,7 @@ use crate::ram::types::Id;
                 header: CellHeader {
                     version: 2,
                     timestamp: 200,
-                    schema: 0,
+                    schema: SchemaVid(0),
                     id: cell_id,
                 },
                 data: data_map_value!(id: 42 as i32, data: updated_data),
@@ -5374,7 +5398,7 @@ use crate::ram::types::Id;
                 header: CellHeader {
                     version: 3,
                     timestamp: 300,
-                    schema: 0,
+                    schema: SchemaVid(0),
                     id: cell_id,
                 },
                 data: data_map_value!(id: 999 as i32, data: updated_data),
@@ -5728,16 +5752,20 @@ use crate::ram::types::Id;
         let c = Id::allocated(51, 0, 1);
 
         let mut cell_a = OwnedCell {
-            header: CellHeader::new(schema.id, &a),
+            header: CellHeader::new(schema.vid, &a),
             data: data_map_value!(id: 1_i32, data: vec![0x11_u8; DATA_SIZE]),
         };
         chunks.write_cell(&mut cell_a).unwrap();
         let len_a = len_at(&a);
         assert!(len_a > 0);
-        assert_eq!(chunks.slot_bytes.get(50), len_a, "insert must add the entry length");
+        assert_eq!(
+            chunks.slot_bytes.get(50),
+            len_a,
+            "insert must add the entry length"
+        );
 
         let mut cell_b = OwnedCell {
-            header: CellHeader::new(schema.id, &b),
+            header: CellHeader::new(schema.vid, &b),
             data: data_map_value!(id: 2_i32, data: vec![0x22_u8; DATA_SIZE]),
         };
         chunks.write_cell(&mut cell_b).unwrap();
@@ -5746,7 +5774,7 @@ use crate::ram::types::Id;
 
         // Update A to a larger body: the counter moves by the delta.
         let mut cell_a2 = OwnedCell {
-            header: CellHeader::new(schema.id, &a),
+            header: CellHeader::new(schema.vid, &a),
             data: data_map_value!(id: 1_i32, data: vec![0x33_u8; DATA_SIZE * 3]),
         };
         chunks.update_cell(&mut cell_a2).unwrap();
@@ -5756,7 +5784,7 @@ use crate::ram::types::Id;
 
         // Upsert into another slot counts there, not here.
         let mut cell_c = OwnedCell {
-            header: CellHeader::new(schema.id, &c),
+            header: CellHeader::new(schema.vid, &c),
             data: data_map_value!(id: 3_i32, data: vec![0x44_u8; DATA_SIZE]),
         };
         chunks.upsert_cell(&mut cell_c).unwrap();
@@ -5766,7 +5794,7 @@ use crate::ram::types::Id;
 
         // Upsert over an existing cell behaves as the update it is.
         let mut cell_c2 = OwnedCell {
-            header: CellHeader::new(schema.id, &c),
+            header: CellHeader::new(schema.vid, &c),
             data: data_map_value!(id: 3_i32, data: vec![0x55_u8; DATA_SIZE * 2]),
         };
         chunks.upsert_cell(&mut cell_c2).unwrap();
@@ -5774,7 +5802,11 @@ use crate::ram::types::Id;
         assert_eq!(chunks.slot_bytes.get(51), len_c2);
 
         chunks.remove_cell(&b).unwrap();
-        assert_eq!(chunks.slot_bytes.get(50), len_a2, "remove must subtract what it removed");
+        assert_eq!(
+            chunks.slot_bytes.get(50),
+            len_a2,
+            "remove must subtract what it removed"
+        );
         chunks.remove_cell(&a).unwrap();
         assert_eq!(chunks.slot_bytes.get(50), 0);
         assert_eq!(
@@ -5798,7 +5830,10 @@ use crate::ram::types::Id;
         let writer_chunks = Chunks::new_dummy(1, TEST_SEGMENT_SIZE * 4);
         let writer_chunk = &writer_chunks.list[0];
         let schema = schema_with_id(215, "slot_bytes_recovery", false);
-        writer_chunk.meta.schemas.debug_only_new_schema(schema.clone());
+        writer_chunk
+            .meta
+            .schemas
+            .debug_only_new_schema(schema.clone());
 
         for (locality, seq, fill) in [
             (40_u16, 1_u64, 0x0A_u8),
@@ -5809,7 +5844,7 @@ use crate::ram::types::Id;
         ] {
             let id = Id::allocated(locality, 0, seq);
             let mut cell = OwnedCell {
-                header: CellHeader::new(schema.id, &id),
+                header: CellHeader::new(schema.vid, &id),
                 data: data_map_value!(id: seq as i32, data: vec![fill; DATA_SIZE]),
             };
             writer_chunks.write_cell(&mut cell).unwrap();
@@ -5866,4 +5901,3 @@ use crate::ram::types::Id;
         assert_eq!(recovered.total_live_bytes(), expected_40 + expected_41);
     }
 }
-

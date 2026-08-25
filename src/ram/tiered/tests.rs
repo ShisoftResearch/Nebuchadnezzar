@@ -13,11 +13,11 @@ use crate::ram::types::*;
 use crate::server::transactions;
 use crate::server::ServerMeta;
 use crate::server::{NebServer, ServerOptions, Service};
+use crate::utils::test_temp::temp_path;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::utils::test_temp::temp_path;
 
 // Global mutex to prevent test interference
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -33,7 +33,6 @@ static TEST_MUTEX: Mutex<()> = Mutex::new(());
 fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
-
 
 async fn tiered_txn_client(
     address: &String,
@@ -87,7 +86,7 @@ fn write_cells_for_partition(
             OwnedValue::String(payload.to_string()),
         );
 
-        let mut cell = OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(data_map));
         chunks
             .write_cell(&mut cell)
             .expect("direct write for eviction test should succeed");
@@ -108,7 +107,7 @@ fn large_string_cell(schema_id: u32, id: Id, payload_len: usize, prefix: &str) -
         ),
     );
 
-    OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(data_map))
+    OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(data_map))
 }
 
 fn segment_id_for_cell(chunks: &Arc<Chunks>, id: &Id) -> u64 {
@@ -281,7 +280,7 @@ fn test_eviction_on_memory_overflow() {
     info!("Filling with {} cells to exceed 3-segment limit", num_cells);
 
     for i in 0..num_cells {
-        let id = Id::from_parts(schema.id as u64, i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(
@@ -295,7 +294,7 @@ fn test_eviction_on_memory_overflow() {
 
         let data = OwnedValue::Map(data_map);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data,
         };
 
@@ -383,7 +382,7 @@ fn test_eviction_on_memory_overflow() {
     // Test that we can still read data from cold segments (promotion)
     // Read a few cells to trigger promotion
     for i in 0..(num_cells.min(10)) {
-        let id = Id::from_parts(schema.id as u64, i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, i as u64);
         match chunks.read_cell(&id) {
             Ok(cell) => {
                 assert_eq!(cell.data["id"].i64().unwrap(), &(i as i64));
@@ -454,7 +453,7 @@ fn test_cold_segment_promotion() {
 
     let mut written_ids = Vec::new();
     for i in 0..num_cells {
-        let id = Id::from_parts(schema.id as u64, 1000 + i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, 1000 + i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(1000 + i as i64));
         data_map.insert(
@@ -468,7 +467,7 @@ fn test_cold_segment_promotion() {
 
         let data = OwnedValue::Map(data_map);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data,
         };
 
@@ -590,7 +589,7 @@ fn test_metrics_and_churn_counters() {
     let num_cells = cells_per_segment * 3;
 
     for i in 0..num_cells {
-        let id = Id::from_parts(schema.id as u64, i as u64);
+        let id = Id::from_parts(schema.vid.get() as u64, i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(
@@ -604,7 +603,7 @@ fn test_metrics_and_churn_counters() {
 
         let data = OwnedValue::Map(data_map);
         let mut cell = OwnedCell {
-            header: CellHeader::new(schema.id, &id),
+            header: CellHeader::new(schema.vid, &id),
             data,
         };
 
@@ -678,7 +677,11 @@ fn test_active_blob_head_is_not_evicted_by_clock() {
         "CLOCK must not evict an active blob head when only heads exist"
     );
 
-    assert!(chunk.segs.get(&(regular_head.unwrap() as usize)).unwrap().is_hot());
+    assert!(chunk
+        .segs
+        .get(&(regular_head.unwrap() as usize))
+        .unwrap()
+        .is_hot());
     assert!(chunk.segs.get(&(blob_head as usize)).unwrap().is_hot());
 }
 
@@ -725,7 +728,11 @@ fn test_blob_segments_evict_before_regular_segments_without_blob_head() {
             .segment_class(),
         SegmentClass::Blob
     );
-    assert!(chunk.segs.get(&(regular_head.unwrap() as usize)).unwrap().is_hot());
+    assert!(chunk
+        .segs
+        .get(&(regular_head.unwrap() as usize))
+        .unwrap()
+        .is_hot());
     assert!(chunk
         .segs
         .get(&(regular_candidate_id as usize))
@@ -792,7 +799,7 @@ fn test_blob_segments_evict_before_regular_segments() {
     let mut regular_segments = BTreeSet::new();
     for index in 0..64_u64 {
         let id = Id::from_parts(9_100, 10_000 + index);
-        let mut cell = large_string_cell(regular.id, id, 512_000, "regular-evict");
+        let mut cell = large_string_cell(regular.vid.get(), id, 512_000, "regular-evict");
         chunks.write_cell(&mut cell).unwrap();
         regular_segments.insert(segment_id_for_cell(&chunks, &id));
         if regular_segments.len() >= 2 {
@@ -803,7 +810,7 @@ fn test_blob_segments_evict_before_regular_segments() {
     let mut blob_segments = BTreeSet::new();
     for index in 0..64_u64 {
         let id = Id::from_parts(9_200, 20_000 + index);
-        let mut cell = large_string_cell(blob.id, id, 1_500_000, "blob-evict");
+        let mut cell = large_string_cell(blob.vid.get(), id, 1_500_000, "blob-evict");
         chunks.write_cell(&mut cell).unwrap();
         blob_segments.insert(segment_id_for_cell(&chunks, &id));
         if blob_segments.len() >= 2 {
@@ -885,7 +892,11 @@ fn test_blob_segments_evict_before_regular_segments() {
             .is_hot(),
         "regular hot segments should remain hot while a blob victim exists"
     );
-    assert!(chunk.segs.get(&(regular_head.unwrap() as usize)).unwrap().is_hot());
+    assert!(chunk
+        .segs
+        .get(&(regular_head.unwrap() as usize))
+        .unwrap()
+        .is_hot());
     assert!(chunk.segs.get(&(blob_head as usize)).unwrap().is_hot());
 
     let _ = std::fs::remove_dir_all(&schema_dir);
@@ -935,7 +946,7 @@ fn test_blob_segments_promote_on_read_after_eviction() {
     let mut blob_segments = BTreeSet::new();
     for index in 0..64_u64 {
         let id = Id::allocated(93, 0, index);
-        let mut cell = large_string_cell(blob.id, id, 1_500_000, "blob-promote");
+        let mut cell = large_string_cell(blob.vid.get(), id, 1_500_000, "blob-promote");
         chunks.write_cell(&mut cell).unwrap();
         let segment_id = segment_id_for_cell(&chunks, &id);
         blob_segments.insert(segment_id);
@@ -1042,10 +1053,17 @@ fn test_global_eviction_across_chunks_in_single_database() {
 
     let payload = "x".repeat(1024);
     let cells_per_segment = SEGMENT_SIZE / 2048;
-    write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment * 2, &payload);
     write_cells_for_partition(
         &chunks,
-        schema.id,
+        schema.vid.get(),
+        0,
+        0,
+        cells_per_segment * 2,
+        &payload,
+    );
+    write_cells_for_partition(
+        &chunks,
+        schema.vid.get(),
         1,
         cells_per_segment * 2,
         cells_per_segment * 2,
@@ -1134,7 +1152,7 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
     let mut next_indices = [0_usize, 0_usize];
     append_round_robin_until_reconciled_hot_segments(
         &chunks,
-        schema.id,
+        schema.vid.get(),
         &partitions,
         &mut next_indices,
         &manager,
@@ -1163,7 +1181,7 @@ fn test_single_database_eviction_waits_until_threshold_is_exceeded() {
 
     append_round_robin_until_reconciled_hot_segments(
         &chunks,
-        schema.id,
+        schema.vid.get(),
         &partitions,
         &mut next_indices,
         &manager,
@@ -1236,7 +1254,7 @@ fn test_reconciled_background_eviction_ignores_stale_shared_counter_drift() {
 
     let payload = "s".repeat(2048);
     let cells_per_segment = SEGMENT_SIZE / 2048;
-    write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment, &payload);
+    write_cells_for_partition(&chunks, schema.vid.get(), 0, 0, cells_per_segment, &payload);
 
     let scanned_hot_segments = total_hot_segments(&chunks);
     assert!(
@@ -1336,7 +1354,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_single_database_churn()
     for round in 0..8 {
         write_cells_for_partition(
             server.chunks(),
-            schema.id,
+            schema.vid.get(),
             (round % 2) as u64,
             round * (cells_per_segment / 2),
             cells_per_segment / 2,
@@ -1434,7 +1452,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
     for round in 0..8 {
         write_cells_for_partition(
             server.chunks(),
-            default_schema.id,
+            default_schema.vid.get(),
             (round % 2) as u64,
             round * (cells_per_segment / 3),
             cells_per_segment / 3,
@@ -1442,7 +1460,7 @@ async fn test_cleaner_keeps_shared_counter_aligned_under_multi_database_churn() 
         );
         write_cells_for_partition(
             analytics.chunks(),
-            analytics_schema.id,
+            analytics_schema.vid.get(),
             (round % 2) as u64,
             round * (cells_per_segment / 3),
             cells_per_segment / 3,
@@ -1557,7 +1575,7 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
     let cells_per_segment = SEGMENT_SIZE / 2048;
     write_cells_for_partition(
         server.chunks(),
-        default_schema.id,
+        default_schema.vid.get(),
         0,
         0,
         cells_per_segment,
@@ -1565,7 +1583,7 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
     );
     write_cells_for_partition(
         analytics.chunks(),
-        analytics_schema.id,
+        analytics_schema.vid.get(),
         0,
         0,
         cells_per_segment,
@@ -1604,7 +1622,7 @@ async fn test_unload_reload_recovery_preserves_shared_counter_alignment() {
 
     write_cells_for_partition(
         analytics_reloaded.chunks(),
-        analytics_schema.id,
+        analytics_schema.vid.get(),
         1,
         cells_per_segment,
         cells_per_segment / 2,
@@ -1717,7 +1735,7 @@ async fn test_global_eviction_across_multiple_databases() {
     let cells_per_segment = SEGMENT_SIZE / 2048;
     write_cells_for_partition(
         server.chunks(),
-        default_schema.id,
+        default_schema.vid.get(),
         0,
         0,
         cells_per_segment,
@@ -1739,7 +1757,7 @@ async fn test_global_eviction_across_multiple_databases() {
 
     write_cells_for_partition(
         analytics.chunks(),
-        analytics_schema.id,
+        analytics_schema.vid.get(),
         0,
         cells_per_segment,
         cells_per_segment * 2,
@@ -1851,7 +1869,7 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
     let mut analytics_next_indices = [0_usize];
     append_round_robin_until_reconciled_hot_segments(
         server.chunks(),
-        default_schema.id,
+        default_schema.vid.get(),
         &[0_u64],
         &mut default_next_indices,
         &manager,
@@ -1861,7 +1879,7 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
     );
     append_round_robin_until_reconciled_hot_segments(
         analytics.chunks(),
-        analytics_schema.id,
+        analytics_schema.vid.get(),
         &[0_u64],
         &mut analytics_next_indices,
         &manager,
@@ -1892,7 +1910,7 @@ async fn test_multi_database_eviction_waits_until_combined_threshold_is_exceeded
 
     append_round_robin_until_reconciled_hot_segments(
         analytics.chunks(),
-        analytics_schema.id,
+        analytics_schema.vid.get(),
         &[0_u64],
         &mut analytics_next_indices,
         &manager,
@@ -1976,7 +1994,14 @@ fn test_equal_sized_databases_evict_down_to_shared_limit() {
             Some(manager.clone()),
         );
 
-        write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment * 2, &payload);
+        write_cells_for_partition(
+            &chunks,
+            schema.vid.get(),
+            0,
+            0,
+            cells_per_segment * 2,
+            &payload,
+        );
 
         databases.push((chunks, schema_dir, backup_dir, wal_dir));
     }
@@ -2082,7 +2107,7 @@ fn test_global_eviction_ignores_unregistered_database() {
     let cells_per_segment = SEGMENT_SIZE / 2048;
     write_cells_for_partition(
         &chunks_a,
-        schema_a.id,
+        schema_a.vid.get(),
         0,
         0,
         cells_per_segment / 2,
@@ -2090,7 +2115,7 @@ fn test_global_eviction_ignores_unregistered_database() {
     );
     write_cells_for_partition(
         &chunks_b,
-        schema_b.id,
+        schema_b.vid.get(),
         0,
         0,
         cells_per_segment * 2,
@@ -2255,7 +2280,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         let mut batch_ids = Vec::with_capacity(end_idx - start_idx);
 
         for i in start_idx..end_idx {
-            let id = Id::from_parts(schema.id as u64, i as u64 + 1);
+            let id = Id::from_parts(schema.vid.get() as u64, i as u64 + 1);
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(
@@ -2267,7 +2292,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
                 OwnedValue::String(large_blob.clone()),
             );
             m.insert(&String::from("score"), OwnedValue::U64(0));
-            let cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(m));
+            let cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(m));
 
             match client.write(tx.clone(), cell).await {
                 Ok(Ok(transactions::TxnExecResult::Accepted(_))) => {
@@ -2371,7 +2396,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         let server_addr = server_addr.clone();
         let all_ids = all_ids.clone();
         let success_counters = success_counters.clone();
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
 
         update_handles.push(tokio::spawn(async move {
             let client = tiered_txn_client(&server_addr, "large_scale_test").await;
@@ -2599,7 +2624,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     for batch in 0..(num_keys / batch_size) {
         let tx = client.begin().await.unwrap().unwrap();
         for i in (batch * batch_size)..((batch + 1) * batch_size) {
-            let id = Id::from_parts(schema.id as u64, i as u64 + 1);
+            let id = Id::from_parts(schema.vid.get() as u64, i as u64 + 1);
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(
@@ -2608,7 +2633,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
             );
             m.insert(&String::from("data"), OwnedValue::String("D".repeat(1024))); // Reduced from 4KB to 1KB
             m.insert(&String::from("score"), OwnedValue::U64(0));
-            let cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(m));
+            let cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(m));
             let _ = client.write(tx.clone(), cell).await.unwrap().unwrap();
             ids.push(id);
         }
@@ -2664,7 +2689,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
         let server_addr = server_addr.clone();
         let ids = ids.clone();
         let success_counters = success_counters.clone();
-        let schema_id = schema.id;
+        let schema_id = schema.vid;
 
         handles.push(tokio::spawn(async move {
             let client = tiered_txn_client(&server_addr, "stress_test").await;
@@ -2820,7 +2845,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
             m.insert(&String::from("data"), OwnedValue::String("x".repeat(100)));
             m.insert(&String::from("score"), OwnedValue::U64(0));
 
-            let mut cell = OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(m));
+            let mut cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(m));
 
             match server.chunks().write_cell(&mut cell) {
                 Ok(_) => ids.push(id),
@@ -2911,7 +2936,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
                         m.insert(&String::from("score"), OwnedValue::U64(*curr_score + 1));
 
                         let mut updated_cell =
-                            OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(m));
+                            OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(m));
 
                         // Update
                         let chunks_clone_update = chunks.clone();
@@ -3109,7 +3134,7 @@ async fn test_direct_writes_with_tiered_memory() {
             m.insert(&String::from("data"), OwnedValue::String("x".repeat(100)));
             m.insert(&String::from("score"), OwnedValue::U64(0));
 
-            let mut cell = OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(m));
+            let mut cell = OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(m));
 
             match server.chunks().write_cell(&mut cell) {
                 Ok(_) => ids.push(id),
@@ -3200,7 +3225,7 @@ async fn test_direct_writes_with_tiered_memory() {
                         m.insert(&String::from("score"), OwnedValue::U64(*curr_score + 1));
 
                         let mut updated_cell =
-                            OwnedCell::new_with_id(schema_id, &id, OwnedValue::Map(m));
+                            OwnedCell::new_with_id(SchemaVid(schema_id), &id, OwnedValue::Map(m));
 
                         // Update
                         let chunks_clone_update = chunks.clone();
@@ -3413,7 +3438,13 @@ fn test_concurrent_allocation_eviction_stops_at_lower_watermark() {
         }),
     ));
 
-    let schema = Schema::new("concurrent_evict_watermark", None, default_fields(), false, false);
+    let schema = Schema::new(
+        "concurrent_evict_watermark",
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     let schema_dir = temp_path("neb_concurrent_evict_schema");
     let backup_dir = temp_path("neb_concurrent_evict_bk");
     let wal_dir = temp_path("neb_concurrent_evict_wal");
@@ -3437,7 +3468,7 @@ fn test_concurrent_allocation_eviction_stops_at_lower_watermark() {
     let cells_per_segment = SEGMENT_SIZE / 2048;
     write_cells_for_partition(
         &chunks,
-        schema.id,
+        schema.vid.get(),
         0,
         0,
         cells_per_segment * HOT_SEGMENTS,
@@ -3532,7 +3563,14 @@ fn cold_cell_reads_are_served_from_one_block_without_promotion() {
     // Fill a couple of segments so there is something to evict.
     let payload = "z".repeat(2048);
     let cells_per_segment = SEGMENT_SIZE / 2048;
-    write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment * 2, &payload);
+    write_cells_for_partition(
+        &chunks,
+        schema.vid.get(),
+        0,
+        0,
+        cells_per_segment * 2,
+        &payload,
+    );
 
     let chunk = &chunks.list[0];
     // Evict everything evictable so the reads below land on cold segments.
@@ -3626,7 +3664,14 @@ fn blocks_faulted_into_cold_segments_are_accounted_and_released() {
 
     let payload = "y".repeat(2048);
     let cells_per_segment = SEGMENT_SIZE / 2048;
-    write_cells_for_partition(&chunks, schema.id, 0, 0, cells_per_segment * 2, &payload);
+    write_cells_for_partition(
+        &chunks,
+        schema.vid.get(),
+        0,
+        0,
+        cells_per_segment * 2,
+        &payload,
+    );
 
     let chunk = &chunks.list[0];
     assert!(manager.explicit_evict(chunk, 4).expect("evict") > 0);
@@ -3721,18 +3766,14 @@ fn cells_survive_archive_evict_and_cold_read_intact() {
     for i in 0..900usize {
         let len = sizes[i % sizes.len()];
         // Content derived from the index so a mismatch identifies the cell.
-        let body: String = format!("cell-{}-", i)
-            .chars()
-            .cycle()
-            .take(len)
-            .collect();
+        let body: String = format!("cell-{}-", i).chars().cycle().take(len).collect();
         let id = Id::allocated(0, 0, 900_000 + i as u64);
 
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
         data_map.insert(&String::from("data"), OwnedValue::String(body.clone()));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             expected.push((id, body));
         }
@@ -3749,7 +3790,10 @@ fn cells_survive_archive_evict_and_cold_read_intact() {
         .flat_map(|c| c.segments().into_iter())
         .filter(|s| s.is_cold())
         .count();
-    assert!(cold > 0, "test needs cold segments to exercise the block path");
+    assert!(
+        cold > 0,
+        "test needs cold segments to exercise the block path"
+    );
 
     // Every cell must come back exactly as written.
     let mut checked = 0usize;
@@ -3835,11 +3879,8 @@ fn reading_a_cold_segment_while_holding_a_guard_on_it_completes() {
             let mut data_map = OwnedMap::new();
             data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
             data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
-            data_map.insert(
-                &String::from("data"),
-                OwnedValue::String("x".repeat(4_000)),
-            );
-            let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+            data_map.insert(&String::from("data"), OwnedValue::String("x".repeat(4_000)));
+            let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
             if chunks.write_cell(&mut cell).is_ok() {
                 ids.push(id);
             }
@@ -3855,7 +3896,10 @@ fn reading_a_cold_segment_while_holding_a_guard_on_it_completes() {
             .flat_map(|c| c.segments().into_iter())
             .filter(|s| s.is_cold())
             .count();
-        assert!(cold > 0, "test needs cold segments to exercise the block path");
+        assert!(
+            cold > 0,
+            "test needs cold segments to exercise the block path"
+        );
 
         // Hold a guard obtained through the block path, then keep reading the
         // same segment through it.
@@ -3881,12 +3925,10 @@ fn reading_a_cold_segment_while_holding_a_guard_on_it_completes() {
         // The sender is dropped on panic too, so a disconnect means the body
         // failed for some other reason -- surface that rather than reporting it
         // as a deadlock.
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            match worker.join() {
-                Err(payload) => std::panic::resume_unwind(payload),
-                Ok(()) => panic!("worker exited without signalling"),
-            }
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!("worker exited without signalling"),
+        },
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
             "reads of a cold segment did not finish while a guard was held on it: the read path \
              is waiting for a reference the caller itself holds"
@@ -3949,7 +3991,7 @@ fn reading_cold_segments_alone_must_not_grow_past_the_limit() {
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
         data_map.insert(&String::from("data"), OwnedValue::String("z".repeat(4_000)));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             ids.push(id);
         }
@@ -4035,7 +4077,7 @@ fn cold_block_residency_is_reclaimed_under_pressure() {
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
         data_map.insert(&String::from("data"), OwnedValue::String("y".repeat(4_000)));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             ids.push(id);
         }
@@ -4156,12 +4198,14 @@ fn cold_read_amplification() {
         let mut body = String::with_capacity(CELL_PAYLOAD);
         let mut w = i as u64;
         while body.len() < CELL_PAYLOAD {
-            w = w.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            w = w
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             body.push_str(&format!("{:016x}-{}-", w, i));
         }
         body.truncate(CELL_PAYLOAD);
         data_map.insert(&String::from("data"), OwnedValue::String(body));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             ids.push(id);
         }
@@ -4247,17 +4291,32 @@ fn cold_read_amplification() {
 
     println!("\n=== cold read amplification ===");
     println!("cells read              : {}", read);
-    println!("wall                    : {:?} ({:.0} reads/s)", elapsed,
-             read as f64 / elapsed.as_secs_f64().max(1e-9));
-    println!("block serves            : {} (hit {} / miss {})", serves, hits, misses);
+    println!(
+        "wall                    : {:?} ({:.0} reads/s)",
+        elapsed,
+        read as f64 / elapsed.as_secs_f64().max(1e-9)
+    );
+    println!(
+        "block serves            : {} (hit {} / miss {})",
+        serves, hits, misses
+    );
     println!("index loads             : {}", idx_loads);
     println!("--- bytes per cell read (payload = {} B) ---", CELL_PAYLOAD);
-    println!("disk read               : {:>10.1} B  ({:.1}x payload)",
-             per(file_bytes), file_bytes as f64 / served_payload);
-    println!("decompressed            : {:>10.1} B  ({:.1}x payload)",
-             per(plain_bytes), plain_bytes as f64 / served_payload);
-    println!("index copied in lookup  : {:>10.1} B  ({:.1}x payload)",
-             per(copy_bytes), copy_bytes as f64 / served_payload);
+    println!(
+        "disk read               : {:>10.1} B  ({:.1}x payload)",
+        per(file_bytes),
+        file_bytes as f64 / served_payload
+    );
+    println!(
+        "decompressed            : {:>10.1} B  ({:.1}x payload)",
+        per(plain_bytes),
+        plain_bytes as f64 / served_payload
+    );
+    println!(
+        "index copied in lookup  : {:>10.1} B  ({:.1}x payload)",
+        per(copy_bytes),
+        copy_bytes as f64 / served_payload
+    );
     println!("file opens              : {:>10.3} per read", per(opens));
     println!();
 
@@ -4328,26 +4387,50 @@ fn cold_read_amplification() {
     let spay = (sread * CELL_PAYLOAD) as f64;
 
     println!("=== sparse (one cell per block, nothing amortised) ===");
-    println!("cells read              : {} (stride {})", sread, sparse_stride);
-    println!("wall                    : {:?} ({:.0} reads/s)", selapsed,
-             sread as f64 / selapsed.as_secs_f64().max(1e-9));
-    println!("block serves            : {} (hit {} / miss {})", sserves, shits, smiss);
-    println!("disk read               : {:>10.1} B  ({:.1}x payload)",
-             sper(sfile), sfile as f64 / spay);
-    println!("decompressed            : {:>10.1} B  ({:.1}x payload)",
-             sper(splain), splain as f64 / spay);
-    println!("index copied in lookup  : {:>10.1} B  ({:.1}x payload)",
-             sper(scopy), scopy as f64 / spay);
+    println!(
+        "cells read              : {} (stride {})",
+        sread, sparse_stride
+    );
+    println!(
+        "wall                    : {:?} ({:.0} reads/s)",
+        selapsed,
+        sread as f64 / selapsed.as_secs_f64().max(1e-9)
+    );
+    println!(
+        "block serves            : {} (hit {} / miss {})",
+        sserves, shits, smiss
+    );
+    println!(
+        "disk read               : {:>10.1} B  ({:.1}x payload)",
+        sper(sfile),
+        sfile as f64 / spay
+    );
+    println!(
+        "decompressed            : {:>10.1} B  ({:.1}x payload)",
+        sper(splain),
+        splain as f64 / spay
+    );
+    println!(
+        "index copied in lookup  : {:>10.1} B  ({:.1}x payload)",
+        sper(scopy),
+        scopy as f64 / spay
+    );
     println!("file opens              : {:>10.3} per read", sper(sopens));
     println!();
 
     println!("=== warm (blocks already resident) ===");
     println!("cells read              : {}", wread);
-    println!("wall                    : {:?} ({:.0} reads/s)", welapsed,
-             wread as f64 / welapsed.as_secs_f64().max(1e-9));
+    println!(
+        "wall                    : {:?} ({:.0} reads/s)",
+        welapsed,
+        wread as f64 / welapsed.as_secs_f64().max(1e-9)
+    );
     println!("block serves            : {} (hit {})", wserves, whits);
     println!("disk read               : {:>10.1} B per read", wper(wfile));
-    println!("decompressed            : {:>10.1} B per read", wper(wplain));
+    println!(
+        "decompressed            : {:>10.1} B per read",
+        wper(wplain)
+    );
     println!("index copied in lookup  : {:>10.1} B per read", wper(wcopy));
     println!();
 
@@ -4411,12 +4494,14 @@ fn cold_read_concurrency() {
         let mut body = String::with_capacity(CELL_PAYLOAD);
         let mut w = i as u64;
         while body.len() < CELL_PAYLOAD {
-            w = w.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            w = w
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             body.push_str(&format!("{:016x}-{}-", w, i));
         }
         body.truncate(CELL_PAYLOAD);
         data_map.insert(&String::from("data"), OwnedValue::String(body));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             ids.push(id);
         }
@@ -4450,56 +4535,63 @@ fn cold_read_concurrency() {
             "\n=== concurrent cold reads, {} segments (reclaimed each round) ===",
             if shared { "SHARED" } else { "disjoint" }
         );
-        println!("{:>8}  {:>12}  {:>12}  {:>9}", "threads", "reads/s", "vs 1 thread", "misses");
-
-    let mut single = 0f64;
-    for threads in [1usize, 2, 4, 8, 16, 32] {
-        reclaim_all();
-        let before_miss = crate::ram::segs::COLD_BLOCK_MISSES.load(O::Relaxed);
-        let per = ids.len() / threads;
-        let start = std::time::Instant::now();
-        std::thread::scope(|s| {
-            for t in 0..threads {
-                let chunks = &chunks;
-                let ids = &ids;
-                s.spawn(move || {
-                    if shared {
-                        // Same narrow range for every thread, offset so they
-                        // interleave rather than march in lockstep.
-                        let window = (ids.len() / 16).max(1);
-                        let off = t * 37;
-                        for j in 0..window {
-                            let _ = chunks.read_cell(&ids[(off + j) % window]);
-                        }
-                    } else {
-                        let lo = t * per;
-                        let hi = if t == threads - 1 { ids.len() } else { lo + per };
-                        for id in &ids[lo..hi] {
-                            let _ = chunks.read_cell(id);
-                        }
-                    }
-                });
-            }
-        });
-        let elapsed = start.elapsed();
-        let misses = crate::ram::segs::COLD_BLOCK_MISSES.load(O::Relaxed) - before_miss;
-        let done = if shared {
-            (ids.len() / 16).max(1) * threads
-        } else {
-            ids.len()
-        };
-        let rate = done as f64 / elapsed.as_secs_f64().max(1e-9);
-        if threads == 1 {
-            single = rate;
-        }
         println!(
-            "{:>8}  {:>12.0}  {:>11.2}x  {:>9}",
-            threads,
-            rate,
-            rate / single.max(1e-9),
-            misses
+            "{:>8}  {:>12}  {:>12}  {:>9}",
+            "threads", "reads/s", "vs 1 thread", "misses"
         );
-    }
+
+        let mut single = 0f64;
+        for threads in [1usize, 2, 4, 8, 16, 32] {
+            reclaim_all();
+            let before_miss = crate::ram::segs::COLD_BLOCK_MISSES.load(O::Relaxed);
+            let per = ids.len() / threads;
+            let start = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    let chunks = &chunks;
+                    let ids = &ids;
+                    s.spawn(move || {
+                        if shared {
+                            // Same narrow range for every thread, offset so they
+                            // interleave rather than march in lockstep.
+                            let window = (ids.len() / 16).max(1);
+                            let off = t * 37;
+                            for j in 0..window {
+                                let _ = chunks.read_cell(&ids[(off + j) % window]);
+                            }
+                        } else {
+                            let lo = t * per;
+                            let hi = if t == threads - 1 {
+                                ids.len()
+                            } else {
+                                lo + per
+                            };
+                            for id in &ids[lo..hi] {
+                                let _ = chunks.read_cell(id);
+                            }
+                        }
+                    });
+                }
+            });
+            let elapsed = start.elapsed();
+            let misses = crate::ram::segs::COLD_BLOCK_MISSES.load(O::Relaxed) - before_miss;
+            let done = if shared {
+                (ids.len() / 16).max(1) * threads
+            } else {
+                ids.len()
+            };
+            let rate = done as f64 / elapsed.as_secs_f64().max(1e-9);
+            if threads == 1 {
+                single = rate;
+            }
+            println!(
+                "{:>8}  {:>12.0}  {:>11.2}x  {:>9}",
+                threads,
+                rate,
+                rate / single.max(1e-9),
+                misses
+            );
+        }
     }
     println!();
 
@@ -4579,12 +4671,14 @@ fn write_path_phases() {
         let mut body = String::with_capacity(600);
         let mut w = i as u64;
         while body.len() < 600 {
-            w = w.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            w = w
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             body.push_str(&format!("{:016x}-", w));
         }
         body.truncate(600);
         data_map.insert(&String::from("data"), OwnedValue::String(body));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         let _ = chunks.write_cell(&mut cell);
     }
     let elapsed = start.elapsed();
@@ -4593,14 +4687,35 @@ fn write_path_phases() {
     let us = |now: u64, before: u64| (now - before) as f64 / 1000.0 / n as f64;
 
     println!("\n=== write path, {} cells ===", n);
-    println!("wall            : {:?} ({:.0} cells/s)", elapsed,
-             n as f64 / elapsed.as_secs_f64().max(1e-9));
-    println!("  plan          : {:7.2} us/cell", us(base(&WRITE_PLAN_NANOS), b_plan));
-    println!("  alloc         : {:7.2} us/cell", us(base(&WRITE_ALLOC_NANOS), b_alloc));
-    println!("  copy          : {:7.2} us/cell", us(base(&WRITE_COPY_NANOS), b_copy));
-    println!("  index         : {:7.2} us/cell", us(base(&WRITE_INDEX_NANOS), b_index));
-    println!("  secondary     : {:7.2} us/cell", us(base(&WRITE_SECONDARY_NANOS), b_sec));
-    println!("  stats         : {:7.2} us/cell", us(base(&WRITE_STATS_NANOS), b_stats));
+    println!(
+        "wall            : {:?} ({:.0} cells/s)",
+        elapsed,
+        n as f64 / elapsed.as_secs_f64().max(1e-9)
+    );
+    println!(
+        "  plan          : {:7.2} us/cell",
+        us(base(&WRITE_PLAN_NANOS), b_plan)
+    );
+    println!(
+        "  alloc         : {:7.2} us/cell",
+        us(base(&WRITE_ALLOC_NANOS), b_alloc)
+    );
+    println!(
+        "  copy          : {:7.2} us/cell",
+        us(base(&WRITE_COPY_NANOS), b_copy)
+    );
+    println!(
+        "  index         : {:7.2} us/cell",
+        us(base(&WRITE_INDEX_NANOS), b_index)
+    );
+    println!(
+        "  secondary     : {:7.2} us/cell",
+        us(base(&WRITE_SECONDARY_NANOS), b_sec)
+    );
+    println!(
+        "  stats         : {:7.2} us/cell",
+        us(base(&WRITE_STATS_NANOS), b_stats)
+    );
     println!();
 
     for d in [&schema_dir, &backup_dir, &wal_dir] {
@@ -4662,7 +4777,7 @@ fn cached_backup_handles_stay_bounded() {
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
         data_map.insert(&String::from("data"), OwnedValue::String("q".repeat(2_000)));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             ids.push(id);
         }
@@ -4876,7 +4991,10 @@ async fn every_cell_survives_being_written_past_the_tier_limit() {
     // pacing is entirely different under a debug build, so a debug-only run
     // would be measuring a store that nobody ships. The id is fixed, which is
     // what that entry point requires.
-    server.meta().schemas.register_internal_schema(schema.clone());
+    server
+        .meta()
+        .schemas
+        .register_internal_schema(schema.clone());
 
     let mut written: Vec<Id> = Vec::with_capacity(cells);
     for index in 0..cells {
@@ -5107,11 +5225,14 @@ async fn a_read_racing_eviction_never_sees_a_stale_pointer() {
     );
     let (recorded, verdict) = crate::ram::cell::stale_pointer_record::snapshot();
     assert_eq!(
-        stale, 0,
+        stale,
+        0,
         "{stale} reads of {reads} found the index pointing at memory that does not hold the \
          cell, while the tier was evicting under a concurrent writer.\n\
          VERDICT (process-wide count {recorded}, most recent): {}",
-        verdict.as_deref().unwrap_or("none recorded -- the mismatch branch did not run here")
+        verdict
+            .as_deref()
+            .unwrap_or("none recorded -- the mismatch branch did not run here")
     );
     assert_eq!(
         absent, 0,
@@ -5174,7 +5295,7 @@ fn a_promoting_segment_is_not_archived_or_reclaimed_from_underneath_it() {
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
         data_map.insert(&String::from("data"), OwnedValue::String("y".repeat(4_000)));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             ids.push(id);
         }
@@ -5206,7 +5327,9 @@ fn a_promoting_segment_is_not_archived_or_reclaimed_from_underneath_it() {
         .file_manager
         .backup_path(target.chunk_id, target.id, target.seq_id)
         .expect("cold segment must have a backup");
-    let before = std::fs::metadata(&backup_path).expect("backup exists").len();
+    let before = std::fs::metadata(&backup_path)
+        .expect("backup exists")
+        .len();
 
     // Stand where `promote_segment` stands after `lock_cold`.
     assert!(
@@ -5229,7 +5352,9 @@ fn a_promoting_segment_is_not_archived_or_reclaimed_from_underneath_it() {
         "a patchwork image must never be written over an authoritative backup"
     );
     assert_eq!(
-        std::fs::metadata(&backup_path).expect("backup still exists").len(),
+        std::fs::metadata(&backup_path)
+            .expect("backup still exists")
+            .len(),
         before,
         "the refusal must leave the backup byte-for-byte intact"
     );
@@ -5286,7 +5411,7 @@ fn a_promotion_restores_the_whole_image_and_returns_its_residency() {
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
         data_map.insert(&String::from("data"), OwnedValue::String("y".repeat(4_000)));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             ids.push(id);
         }
@@ -5393,7 +5518,7 @@ fn nothing_can_reach_into_the_promotion_window() {
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("name"), OwnedValue::String(format!("n{}", i)));
         data_map.insert(&String::from("data"), OwnedValue::String("y".repeat(4_000)));
-        let mut cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(data_map));
+        let mut cell = OwnedCell::new_with_id(schema.vid, &id, OwnedValue::Map(data_map));
         if chunks.write_cell(&mut cell).is_ok() {
             ids.push(id);
         }
@@ -5418,7 +5543,9 @@ fn nothing_can_reach_into_the_promotion_window() {
         .file_manager
         .backup_path(target.chunk_id, target.id, target.seq_id)
         .expect("cold segment must have a backup");
-    let backup_len_before = std::fs::metadata(&backup_path).expect("backup exists").len();
+    let backup_len_before = std::fs::metadata(&backup_path)
+        .expect("backup exists")
+        .len();
 
     test_hooks::PAUSE_AFTER_LOCK_COLD.store(true, AtomicOrdering::Release);
     let promoter = {
@@ -5455,7 +5582,9 @@ fn nothing_can_reach_into_the_promotion_window() {
         "a patchwork image must never be written over an authoritative backup"
     );
     assert_eq!(
-        std::fs::metadata(&backup_path).expect("backup still exists").len(),
+        std::fs::metadata(&backup_path)
+            .expect("backup still exists")
+            .len(),
         backup_len_before,
         "the refusal must leave the backup byte-for-byte intact"
     );
