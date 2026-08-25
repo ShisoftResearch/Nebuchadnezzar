@@ -1390,6 +1390,16 @@ an entry, so `Some(false)`.
 at the very END of its buffer, so any nonzero length is out of bounds. It
 SIGSEGVs without the check and passes with it.
 
+### End to end
+
+`neb_crash_churn`, 64 GB store, 64 MB chunks, 5 cycles, with the fix:
+**ALL 5 CYCLES PASSED**, `torn=0` in every cycle, zero segfaults, 3,346,707
+cells verified at the final graceful boundary. The first fully clean churn run
+of this campaign -- earlier ones ended on store exhaustion or a shutdown hang.
+Whether the bounds fix contributed to that or the difference is the fuzzer's
+own variance is NOT established; what the run does show is the recovery path
+surviving five kill-and-recover cycles with no crash.
+
 ## OPEN (2026-08-25): `write_targeted` returns a bypass it cannot write
 
 Found by the crash fuzzer, not by a test. **2,978 panics in one 5-cycle run**,
