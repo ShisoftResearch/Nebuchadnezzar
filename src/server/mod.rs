@@ -2133,23 +2133,12 @@ impl NebServer {
         // can still write while clients cannot.
         self.chunks().close_client_writes();
 
-        // Filled once index tasks have drained; see the snapshot below.
-        let mut index_mark: Option<crate::index::index_mark::IndexMark> = None;
-
         info!("Waiting for all pending index tasks to complete...");
         if self.indexer().is_some() {
             use crate::index::builder::IndexBuilder;
             let _ = IndexBuilder::await_all_indices().await;
             info!("All pending index tasks completed");
 
-            // Snapshot AFTER the drain, not before.
-            //
-            // Before it, a cell below the cursor may still have its index
-            // insert in flight, so the mark would claim durability for entries
-            // that had not been written yet. After it, every cell in the store
-            // has had its insert completed -- or failed, which the check below
-            // catches.
-            index_mark = Some(crate::index::index_mark::IndexMark::snapshot(&self.chunks()));
 
             // "Completed" is not "succeeded". A task that could not place its
             // entries still completes, and the cell it belonged to was acked
@@ -2203,57 +2192,22 @@ impl NebServer {
                     "B-tree write-back barrier NOT established at shutdown; the archive \
                      below may miss index pages and recovery will refuse affected trees"
                 );
-                // The mark is a claim that everything below those cursors is
-                // durably indexed. The barrier just said it is not, so the
-                // claim would be a lie -- and a lie in exactly the direction
-                // that makes the next start SKIP the cells it most needs to
-                // re-derive. Clear it and pay for a full reconcile instead.
-                if let Some(backup) = self.chunks().file_manager_backup_path() {
-                    crate::index::index_mark::IndexMark::clear(&backup);
-                }
             } else {
                 info!("B-tree nodes write-back completed");
-                // EVERY link of the chain, or no mark at all.
-                //
-                // The mark claims "verified complete to here, then made
-                // durable". That holds only if a startup reconciliation
-                // established agreement with the cells, NOTHING has failed to
-                // index since, the drain completed, and the barrier just
-                // confirmed. A missing mark costs the next start a full pass;
-                // a wrong one costs it the holes it was supposed to fill, and
-                // buries them deeper every time.
-                let owed_now = crate::index::builder::index_entries_owed();
-                let verified = self.chunks().index_still_verified(owed_now);
-                if let Some(backup) = self.chunks().file_manager_backup_path() {
-                    match (verified, index_mark.as_ref()) {
-                        (true, Some(mark)) => match mark.save(&backup) {
-                            Ok(()) => info!(
-                                "Index durability mark written: {} segment position(s). The \
-                                 next start re-derives only what was written after them.",
-                                mark.len()
-                            ),
-                            Err(e) => {
-                                warn!("Could not write the index durability mark: {e}");
-                                crate::index::index_mark::IndexMark::clear(&backup);
-                            }
-                        },
-                        (false, _) => {
-                            info!(
-                                "Not writing an index durability mark: this session never \
-                                 proved the index agrees with its cells (or something failed \
-                                 to index since it did). The next start reconciles everything."
-                            );
-                            crate::index::index_mark::IndexMark::clear(&backup);
-                        }
-                        (true, None) => {
-                            warn!(
-                                "Index verified but no cursor snapshot was taken; not writing \
-                                 a mark"
-                            );
-                            crate::index::index_mark::IndexMark::clear(&backup);
-                        }
-                    }
-                }
+            }
+
+            // What this session could not index, said once where someone is
+            // looking. Both are debts the next start pays off by reconciling
+            // against the cells; neither is silent.
+            let abandoned = crate::index::ranged::tree::btree::storage::INDEX_PAGES_ABANDONED
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if abandoned > 0 {
+                error!(
+                    "{} index page image(s) were abandoned this session -- entries they carried \
+                     never reached disk, with no index task reporting failure. The next start \
+                     rebuilds them from the cells.",
+                    abandoned
+                );
             }
             // The hub itself is stopped inside flush_all_trees (service
             // side, where the owning client handle lives) so no worker

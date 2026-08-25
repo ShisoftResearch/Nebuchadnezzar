@@ -1053,6 +1053,101 @@ DELIBERATELY NOT STARTED: (1) alone would add a field to BEGIN that nothing
 reads, and this campaign has spent a week deleting exactly that. The three
 pieces are worth building together, once the choice above is made.
 
+## Phase 6b PLAN (2026-08-25): cooperative termination
+
+Decided with the user. Supersedes the "two ways to close it" fork above.
+
+### The hole, stated once
+
+The coordinator decides COMMIT, tells A, dies before telling B. A has a durable
+COMMIT; B has an open bracket and no COMMIT. B cannot distinguish that from
+"the coordinator died before deciding", and today's answer is the lease
+sweeper: after `NEB_TXN_LEASE_TIMEOUT_SECS` (120 s) `wipe_out_transaction`
+releases the heads and recovery settles discard-unless-COMMIT. That is
+presume-abort, and in the first world it TEARS the transaction across nodes.
+
+Not corruption, not a stranded resource: silent partial commitment. Durability
+is done; atomicity across nodes is not.
+
+### Why cooperative, and why it fits THIS system
+
+Any node can coordinate, so there is no distinguished coordinator to fail over
+to. A durable-decision protocol needs an owner or an election to finish the
+fan-out; cooperative termination needs neither, because the in-doubt
+participant asks its PEERS and coordinator identity never enters the protocol.
+It also costs nothing on the commit path — only on the rare in-doubt path.
+
+### The status reply is THREE-WAY, and that is already sound
+
+The obvious worry is a reply that merges "I never heard of T" with "I aborted
+T" with "I committed T and the record was cleaned". The third would make abort
+wrong, and it is the same shape as `next_tree` returning `Ok(None)` for three
+different situations (see `NextTree`, `8790c001`).
+
+**It cannot arise here**, because of two decisions already in the format:
+every bracket part carries its OWN COMMIT (`b9bd13c4`), and compaction drops a
+segment's BEGIN and COMMIT together, so a compacted transaction's cells return
+as ordinary entries rather than as a bracket missing its closer. Recovery
+already states the consequence: a bracket with no COMMIT means exactly one
+thing, in flight when the store stopped.
+
+So `txn_status(T)` answers from local durable state:
+
+| reply | evidence | meaning |
+|---|---|---|
+| `Committed` | a COMMIT record for T in one of my brackets | decided commit |
+| `Aborted` | no bracket for T at all | aborted, or never prepared — both safe to abort |
+| `Prepared` | open bracket for T, no COMMIT | I am in doubt too |
+
+Resolution: any `Committed` ⇒ commit. All `Prepared`/`Aborted` ⇒ abort. Any
+peer unreachable ⇒ keep blocking and let the existing sweeper be the backstop.
+
+**This needs no watermark.** Step 5's decided-watermark is written into the
+file header and read by nothing, deliberately — the ambiguity it existed to
+resolve was removed by the two rules above. Do not revive it for this.
+
+### Build order
+
+Each step has a gate, and step 0 exists because we currently cannot
+demonstrate the bug at all.
+
+**0. Make the tear observable.** Crash-churn lane: kill the coordinator
+between decision and fan-out, then cross-check every participant's parts.
+GATE: the lane reports a torn transaction on today's code. Without this the
+rest is unfalsifiable.
+
+**1. Participant set into BEGIN.** `prepare` already carries
+`coordinator_id`; add the participant set, and persist it in the BEGIN record
+(`encode_begin`, currently the 16-byte txn id alone — becomes variable
+length). GATE: recovery reads the set back; a bracket written by this build
+and read by it round-trips the participants.
+
+**2. `txn_status(T)` RPC.** In the `data_site` service beside `prepare` /
+`commit` / `abort` / `end`. Answered ONLY from durable state, never from the
+in-memory transaction map — an in-doubt peer that restarted has no map.
+GATE: a unit test per row of the table above.
+
+**3. Resolution, from two triggers.** They cover different failures and
+neither subsumes the other:
+   - the lease sweeper (`expire_transaction_leases` → `wipe_out_transaction`)
+     asks BEFORE wiping — participant up, coordinator dead;
+   - recovery asks before discarding an open bracket — participant restarted.
+   Optionally start earlier when a coordinator RPC fails; a false positive
+   there is harmless, so it is an optimisation and not a correctness
+   dependency.
+   GATE: step 0's lane goes green.
+
+### Residual, stated up front
+
+- **Blocking is still possible**: if every participant is in doubt and peers
+  are unreachable, resolution cannot conclude. The 120 s sweeper remains the
+  backstop, so the timeout does not go away — cooperative termination shrinks
+  the window in which the timeout is the answer.
+- **BEGIN grows** by the participant set, on every bracket, forever, to serve
+  a rare path. That is the price and it should be paid knowingly.
+- Do not build step 1 alone. A field in BEGIN that nothing reads is exactly
+  what this campaign has spent a week deleting.
+
 ## Sequencing and dependencies
 
 Superseded by the implementation plan above, and recorded here for why the

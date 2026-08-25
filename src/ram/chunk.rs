@@ -3884,29 +3884,6 @@ pub struct Chunks {
     /// outlive its server -- an RPC service still holds it -- and a thread that
     /// only notices a dropped store would then never exit at all.
     background_stopped: Arc<std::sync::atomic::AtomicBool>,
-    /// Set when a startup reconciliation proved this store's index agrees
-    /// with its cells, together with the index-failure count at that moment.
-    ///
-    /// This is what lets a durability mark mean "VERIFIED complete to here"
-    /// rather than merely "written before the last flush". The second claim is
-    /// false for exactly the cells a reconcile exists to fix -- a cell whose
-    /// index task died in a crash is OLD, so it sits below any later cursor
-    /// and a position-only mark declares it covered forever.
-    index_verified_complete: std::sync::atomic::AtomicBool,
-    index_failures_at_verify: std::sync::atomic::AtomicU64,
-    /// Abandoned index pages at the moment the index was verified.
-    ///
-    /// An index entry can go missing WITHOUT any index task failing: the task
-    /// succeeds by inserting into the in-memory tree, and the PAGE holding
-    /// that entry is later abandoned by write-back, so it never reaches disk
-    /// while every task counter reads clean.
-    ///
-    /// Deliberately NOT the allocation-refusal counter, which was the first
-    /// thing tried. Most refusals are the compaction reserve doing its job on
-    /// a full-but-healthy chunk -- 2,092 of them in one soak, every single one
-    /// the reserve -- and gating on those refuses the mark forever on a store
-    /// that is working perfectly.
-    index_abandoned_at_verify: std::sync::atomic::AtomicU64,
 }
 
 impl Chunks {
@@ -4121,9 +4098,6 @@ impl Chunks {
             chunk_size_bits,
             total_size,
             background_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            index_verified_complete: std::sync::atomic::AtomicBool::new(false),
-            index_failures_at_verify: std::sync::atomic::AtomicU64::new(0),
-            index_abandoned_at_verify: std::sync::atomic::AtomicU64::new(0),
         });
 
         if let Some(ref manager) = chunks_arc.tiered_manager {
@@ -4367,40 +4341,6 @@ impl Chunks {
     /// Called first thing in shutdown so that nothing a client is told
     /// succeeded can land after the flush that was supposed to persist its
     /// index entries.
-    /// Record that a reconciliation proved the index agrees with the cells.
-    ///
-    /// Pairs the fact with the index-failure count at that instant, because
-    /// the claim only survives while nothing fails afterwards: an index task
-    /// that fails later leaves a cell whose entries are missing, and a mark
-    /// written after that would bury it.
-    pub fn note_index_verified_complete(&self, failures_now: u64) {
-        self.index_failures_at_verify
-            .store(failures_now, Ordering::Release);
-        self.index_abandoned_at_verify.store(
-            crate::index::ranged::tree::btree::storage::INDEX_PAGES_ABANDONED
-                .load(Ordering::Relaxed),
-            Ordering::Release,
-        );
-        self.index_verified_complete.store(true, Ordering::Release);
-    }
-
-    /// Whether the index is STILL provably in agreement with the cells.
-    ///
-    /// Requires both that a reconciliation established it and that no index
-    /// task has failed since. Either alone is not enough.
-    pub fn index_still_verified(&self, failures_now: u64) -> bool {
-        self.index_verified_complete.load(Ordering::Acquire)
-            && failures_now == self.index_failures_at_verify.load(Ordering::Acquire)
-            // An abandoned index page is an entry that never reached disk
-            // with every task counter reading clean. Measured: a bounded pass
-            // skipped 3,434,589 cells on a store whose write-back had
-            // abandoned pages mid-session, and an independent scrub then found
-            // 75,085 entries missing among them.
-            && crate::index::ranged::tree::btree::storage::INDEX_PAGES_ABANDONED
-                .load(Ordering::Relaxed)
-                == self.index_abandoned_at_verify.load(Ordering::Acquire)
-    }
-
     pub fn close_client_writes(&self) {
         for chunk in &self.list {
             chunk

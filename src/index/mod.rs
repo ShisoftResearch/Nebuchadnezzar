@@ -6,7 +6,6 @@ pub mod embedding;
 pub mod entry;
 pub mod full_text;
 pub mod hash;
-pub mod index_mark;
 pub mod ranged;
 pub mod scrub;
 pub mod vector;

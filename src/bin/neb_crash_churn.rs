@@ -969,13 +969,13 @@ async fn child_async(
     // the startup path is a price, and a price nobody measures is one that
     // grows.
     println!(
-        "RECONCILE ms={} scanned={} skipped={} noidx={} repaired={} bounded={}",
+        "RECONCILE ms={} scanned={} noidx={} repaired={} abandoned_pages={}",
         neb::index::scrub::LAST_RECONCILE_MS.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_SCANNED.load(std::sync::atomic::Ordering::Relaxed),
-        neb::index::scrub::LAST_RECONCILE_SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_NOIDX.load(std::sync::atomic::Ordering::Relaxed),
         neb::index::scrub::LAST_RECONCILE_REPAIRED.load(std::sync::atomic::Ordering::Relaxed),
-        neb::index::scrub::LAST_RECONCILE_BOUNDED.load(std::sync::atomic::Ordering::Relaxed),
+        neb::index::ranged::tree::btree::storage::INDEX_PAGES_ABANDONED
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
     flush_stdout();
 
