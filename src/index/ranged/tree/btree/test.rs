@@ -583,6 +583,80 @@ fn reconstruct() {
     }
 }
 
+/// A level is ALLOWED to end in a bypass, and `write_targeted` must still
+/// hand back something writable.
+///
+/// `select_nodes_in_boundary` returns `NodeSelection::WholePage(collected,
+/// NodeReadHandler::default())` when the walk reaches a level's right edge
+/// (`level.rs`, the `next_node.right_ref().unwrap().is_default()` arm). That
+/// default flows into `clear_nodes` -> `clear_node` -> `make_empty_node`,
+/// which produces a bypass whose right AND left are both the default ref --
+/// isolated on both sides, forwarding nowhere. So this shape is DELIBERATE,
+/// not debris from another bug, and the reader is what has to cope.
+///
+/// `write_targeted` walked onto it (a bypass reports `is_empty()`), found its
+/// right ref default, and returned it. The caller then asked it to be an
+/// internal node: `unreachable!("empty")` at node.rs, from `insert.rs:41` and
+/// `insert.rs:176`. 2,978 panics in one 32 GB churn run and 4,120 in a 64 GB
+/// one, each killing an index task; zero at 4 GB, so store exhaustion was
+/// never the trigger -- depth was.
+///
+/// The guard that knew about this was a `debug_assert!`, compiled out in
+/// release, which is exactly where the fuzzer runs.
+#[test]
+fn write_targeted_never_returns_a_bypass_it_cannot_write() {
+    let _ = env_logger::try_init();
+
+    let low = EntryKey::from_id(&Id::from_parts(1, 1));
+    let past_the_end = EntryKey::from_id(&Id::from_parts(9, 9));
+
+    // The terminal bypass: an internal node with no right sibling, emptied
+    // the way `clear_node` empties one.
+    let tail_ref = NodeCellRef::new(Node::with_internal(
+        InNode::<TinyKeySlice, TinyPtrSlice>::new(0, EntryKey::max()),
+    ));
+    {
+        let mut tail = write_node::<TinyKeySlice, TinyPtrSlice>(&tail_ref);
+        tail.make_empty_node(false);
+        assert!(tail.is_empty_node(), "the tail must be a bypass");
+        assert!(
+            tail.right_ref().unwrap().is_default(),
+            "and it must forward nowhere, which is what makes it terminal"
+        );
+    }
+
+    // The last REAL node of the level, whose right bound is below the key so
+    // the walk shifts onto the bypass.
+    let head_ref = NodeCellRef::new(Node::with_internal(
+        InNode::<TinyKeySlice, TinyPtrSlice>::new(0, low.clone()),
+    ));
+    {
+        let mut head = write_node::<TinyKeySlice, TinyPtrSlice>(&head_ref);
+        let innode = head.innode_mut();
+        innode.right = tail_ref.clone();
+        innode.right_bound = low.clone();
+    }
+
+    let target = write_targeted(
+        write_node::<TinyKeySlice, TinyPtrSlice>(&head_ref),
+        &past_the_end,
+    );
+    assert!(
+        !target.is_empty_node(),
+        "write_targeted returned a bypass; its caller's next move is \
+         innode_mut(), which panics with `unreachable!(\"empty\")`"
+    );
+    assert!(
+        target.node_ref().ptr_eq(&head_ref),
+        "a key past the end of the level belongs in the rightmost REAL node"
+    );
+
+    // The contract the callers actually rely on, exercised rather than
+    // implied: this is the call that used to panic.
+    let mut target = target;
+    let _ = target.innode_mut();
+}
+
 /// Retaining everything away must not leave the tree unwritable.
 ///
 /// `retain` cuts a level at a pivot. When the pivot falls at or before the

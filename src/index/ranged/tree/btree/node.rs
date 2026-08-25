@@ -274,14 +274,43 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    // The last node passed that a caller can actually WRITE.
+    //
+    // A level is allowed to end in a bypass. `select_nodes_in_boundary`
+    // hands back a default right node at the level's edge, and
+    // `clear_node` turns the nodes behind it into bypasses whose right AND
+    // left are both default -- isolated, forwarding nowhere. That shape is
+    // deliberate, so the reader is what has to cope with it.
+    //
+    // Bypasses report `is_empty()`, so the walk steps onto one, finds its
+    // right ref default, and used to RETURN it. Every caller's next move is
+    // `innode_mut()`, which panics `unreachable!("empty")` -- 2,978 times in
+    // one 32 GB churn run, 4,120 in a 64 GB one, each killing an index task.
+    // The guard was a `debug_assert!`, compiled out in release, which is
+    // where the fuzzer runs.
+    //
+    // Holding this costs no new lock order: the walk ALREADY latches the
+    // right node while still holding the left one, so this only holds the
+    // left latch longer. At most two are ever live, because each new
+    // `previous` drops the old one.
+    let mut last_writable: Option<NodeWriteGuard<KS, PS>> = None;
     loop {
         // check if node empty or key out of bound
         if search_page.is_empty() || search_page.right_bound() <= key {
             let right_node_ref = search_page.right_ref().unwrap();
             if right_node_ref.is_default() {
                 // right node is none, should pick current one if not empty node
-                debug_assert!(!search_page.is_empty_node());
-                return search_page;
+                if !search_page.is_empty_node() {
+                    return search_page;
+                }
+                // A terminal bypass stands for nothing. The same rule the
+                // branch above applies -- a key past the end of the level
+                // belongs in the rightmost node -- just skipping the
+                // bypasses standing between, which were never writable.
+                return last_writable.expect(
+                    "write_targeted walked a level that is nothing but bypasses; \
+                     there is no node here to write and the level is malformed",
+                );
             }
             assert!(!right_node_ref.ptr_eq(search_page.node_ref()));
             let right_node = write_node(right_node_ref);
@@ -295,7 +324,10 @@ where
                     None
                 }
             );
-            search_page = right_node;
+            let previous = std::mem::replace(&mut search_page, right_node);
+            if !previous.is_empty_node() {
+                last_writable = Some(previous);
+            }
         } else {
             return search_page;
         }
