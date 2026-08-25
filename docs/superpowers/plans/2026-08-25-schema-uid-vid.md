@@ -27,11 +27,20 @@ uid, and the cleaner later migrates stale cells opportunistically.
 
 **Upstream design:** `../Morpheus/agents_docs/TODO_SCHEMA_UID_VID_EVOLUTION_DESIGN.md`
 
-**Verification note:** run focused tests locally. Run the full Neb suite on
-`.239`, not on the workstation, and never `stash`/`checkout` in the user's
-working tree -- use a worktree. The recorded suite baseline is 2956 pass /
-1 fail / 121 ignored in ~630s; every full-suite gate below means "no worse than
-that", not "byte-identical behaviour".
+**Verification note:** Neb's own `cargo test --lib` runs locally at
+`--test-threads=8`, which is the protocol its recorded flake set was measured
+under. (The 2956/1/121-in-630s figure and the "run it on .239" rule belong to
+the *Morpheus* suite, whose 302 Neb servers and ~9100 threads thrash a 29 GB
+box -- they are not Neb's baseline and must not be cited as one.) Neb has no
+single pass/fail baseline number; dispose of a failure by the verify-alone
+protocol against the known load flakes: the `migration::cluster_tests` family
+(~2-3/11 rounds on clean develop, including the ranged-scan-vanish signature),
+`occ_tests::shape_gated_reads_defer_full_cell_fetch`, and
+`mem_shim::tests::buckets_split_by_size_class`. All pass in isolation.
+
+Never `stash`/`checkout` in the user's working tree -- use a worktree. Build
+with `CARGO_TARGET_DIR` on real disk; the scratchpad is tmpfs, and so is any
+log written there.
 
 ---
 
@@ -78,7 +87,7 @@ where each change is small enough to argue about.
 - [ ] Fix the fallout in `src/ram/tests`, `src/server/tests.rs`,
       `src/client/tests.rs`, and the `#[cfg(test)]` block in
       `src/ram/schema/mod.rs`.
-- [ ] `cargo fmt`, build, full suite on `.239`.
+- [ ] `cargo fmt`, build, full suite locally at `--test-threads=8`.
 - [ ] Commit: `refactor(schema): separate a schema's generation from its family in the type system`.
       Include the Task 3 worklist in the message body.
 
@@ -153,7 +162,7 @@ none can be half-done.
       `plan_write` (`cell.rs:201`). Those take the vid, deliberately. If one of
       them stops compiling during this task, something upstream was
       misclassified; fix that rather than widening the site.
-- [ ] Full suite on `.239` after the last commit.
+- [ ] Full suite locally at `--test-threads=8` after the last commit.
 
 ## Task 4: Handle maps in the state machine and the local cache
 
@@ -231,7 +240,7 @@ none can be half-done.
       naming the stale vid, assert the persisted header names the current vid.
 - [ ] Test: a write naming `SchemaVid(uid.get())` -- the generation-0 vid --
       lands in the current generation once generation 0 is stale.
-- [ ] Full suite on `.239`.
+- [ ] Full suite locally at `--test-threads=8`.
 - [ ] Commit: `feat(schema): every write resolves to the current generation`.
 
 ## Task 7: Evolution, identity-transform tier
@@ -280,7 +289,7 @@ none can be half-done.
         generation-1 cell with the same `Id` and a bumped version
       - a ranged scan by schema returns cells of both generations from one
         `EntryKey::for_schema(uid)` prefix, with no fanout
-- [ ] Full suite on `.239`.
+- [ ] Full suite locally at `--test-threads=8`.
 - [ ] Commit: `feat(schema): evolve a schema into a new generation`.
 
 ## Task 8: Cleaner-driven lazy migration
@@ -318,7 +327,7 @@ without being touched.
       destination-overrun probe never fires (assert the error log is empty --
       the probe is a `break`, not a panic).
 - [ ] Run the crash-churn fuzzer over a store with a mid-flight evolution.
-- [ ] Full suite on `.239`.
+- [ ] Full suite locally at `--test-threads=8`.
 - [ ] Commit: `feat(cleaner): migrate stale cells while combining`.
 
 ## Task 9: Transform engine
