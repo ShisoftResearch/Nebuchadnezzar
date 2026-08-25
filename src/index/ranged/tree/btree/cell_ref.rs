@@ -167,11 +167,37 @@ impl NodeCellRef {
     // pointee's memory is still valid to probe. Modeled in
     // docs/tla/SeqlockReclaim.tla.
     pub fn try_clone_speculative(&self) -> Option<Self> {
-        if self.is_default() {
+        // ONE read of the pointer, used for all three decisions.
+        //
+        // The bytes here may be mid-write by definition -- that is what
+        // "speculative" means -- and reading the field three times (the
+        // default check, the deref, the returned ref) let the three
+        // disagree. Two ways that went wrong:
+        //
+        //   - The deref saw NULL after the default check saw non-null, and
+        //     `as_ref().unwrap()` panicked. Caught under an 8-way `cargo
+        //     test` on a 192-core box in `level_merge_insertion`; it does not
+        //     reproduce on one thread (0 in 40 runs), so the window is
+        //     narrow, not absent.
+        //   - Worse and silent: the refcount was incremented through the
+        //     pointer read at the deref while the ref RETURNED carried the
+        //     pointer read afterwards. A different object then owed the
+        //     reference -- an under-count on one node and an over-count on
+        //     another, which is a use-after-free and a leak from one race.
+        //
+        // A volatile read is the seqlock idiom this file already relies on;
+        // it does not make the underlying non-atomic read of a fat pointer
+        // sound, and the real fix is for the field to be atomic. It does
+        // stop the compiler from re-materialising the load, which is what
+        // turned one torn read into three.
+        let inner_ptr = unsafe { std::ptr::read_volatile(&self.inner) };
+        if (inner_ptr as *const NodeRefInner<DefaultNodeType>).is_null() {
             return Some(Self::default());
         }
         unsafe {
-            let inner = self.inner.as_ref().unwrap();
+            // Not `unwrap`: a torn read that lands on null is exactly the
+            // case callers retry, so it is a None, never a panic.
+            let inner = inner_ptr.as_ref()?;
             inner
                 .counter
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
@@ -182,7 +208,7 @@ impl NodeCellRef {
                     }
                 })
                 .ok()
-                .map(|_| NodeCellRef { inner: self.inner })
+                .map(|_| NodeCellRef { inner: inner_ptr })
         }
     }
 
