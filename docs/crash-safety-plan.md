@@ -1254,6 +1254,34 @@ because `settle` collects COMMITs globally and matches pending cells against
 them -- so it does not need to go in the transaction's own (possibly full,
 possibly sealed) segments.
 
+### The bug the fix itself had, twice: silence read as a vote
+
+Both resolvers concluded "no peer reports it committed" from an answer nobody
+gave, and both would have discarded a committed transaction's half — the exact
+failure the protocol exists to prevent.
+
+**Recovery side.** A node that restarts resolves before its membership view is
+populated. It read a roster of just itself and discarded. Reproduced roughly
+one run in four, logging `asking 0 peer(s)`. **A successful membership read is
+not enough**: membership answers happily while it is still learning, so the
+roster has to be given time to GROW (`NEB_TERMINATION_SETTLE_SECS`, 10 s). The
+cost falls only on a store that crashed mid-transaction.
+
+**Sweeper side.** `ask_participants` returned `Unknown` whether every
+participant said "not committed" or nobody answered at all. It now reports
+`(outcome, all_answered)`, and an unanswered participant HOLDS the
+transaction: the sweeper returns a hold set that `expire_transaction_leases`
+skips.
+
+**Why holding is the only option there.** Releasing the leases makes a later
+commit impossible, so an early release IS the decision — there is no "decide
+later" once the heads are gone. Bounded at `NEB_TERMINATION_ANSWER_SECS`
+(30 s) because a held head is a writer slot gone from its chunk with no refill
+path; past it the give-up is at error level and names the transaction.
+
+Found by running the module repeatedly rather than once. A single green run
+was the first evidence, and it was wrong.
+
 ### Residual, unchanged and now explicit in the code
 
 A whole-cluster restart has no reachable peer with an answer: every peer is
