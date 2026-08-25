@@ -299,62 +299,62 @@ where
         };
         let snap = loop {
             let attempt = read_node(&page_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
-            &NodeData::External(ref n) => {
-                let filtering = self.filter_deleted && self.deletion.len() > 0;
-                let snap = |range: std::ops::Range<usize>| -> SnapKeys {
-                    if filtering {
-                        SnapKeys::Full(
-                            n.keys
-                                .to_vec(range)
-                                .into_iter()
-                                .filter(|k| !self.deletion.contains(k))
-                                .collect(),
-                        )
-                    } else {
-                        SnapKeys::Packed(n.keys.packed_snapshot(range))
-                    }
-                };
-                match self.ordering {
-                    Ordering::Forward => {
-                        // First key strictly greater than the current one.
-                        let lb = n.keys.search(n.len, &cur);
-                        let pos = if lb < n.len
-                            && n.keys.cmp_at(lb, &cur) == std::cmp::Ordering::Equal
-                        {
-                            lb + 1
+                &NodeData::External(ref n) => {
+                    let filtering = self.filter_deleted && self.deletion.len() > 0;
+                    let snap = |range: std::ops::Range<usize>| -> SnapKeys {
+                        if filtering {
+                            SnapKeys::Full(
+                                n.keys
+                                    .to_vec(range)
+                                    .into_iter()
+                                    .filter(|k| !self.deletion.contains(k))
+                                    .collect(),
+                            )
                         } else {
-                            lb
-                        };
-                        match n.next.try_clone_speculative() {
-                            Some(follow) => PageSnap::Page(snap(pos..n.len), follow),
-                            None => PageSnap::Retry,
+                            SnapKeys::Packed(n.keys.packed_snapshot(range))
                         }
-                    }
-                    Ordering::Backward => {
-                        // Keys strictly smaller than the current one.
-                        let pos = n.keys.search(n.len, &cur);
-                        match n.prev.try_clone_speculative() {
-                            Some(follow) => PageSnap::Page(snap(0..pos), follow),
-                            None => PageSnap::Retry,
+                    };
+                    match self.ordering {
+                        Ordering::Forward => {
+                            // First key strictly greater than the current one.
+                            let lb = n.keys.search(n.len, &cur);
+                            let pos = if lb < n.len
+                                && n.keys.cmp_at(lb, &cur) == std::cmp::Ordering::Equal
+                            {
+                                lb + 1
+                            } else {
+                                lb
+                            };
+                            match n.next.try_clone_speculative() {
+                                Some(follow) => PageSnap::Page(snap(pos..n.len), follow),
+                                None => PageSnap::Retry,
+                            }
+                        }
+                        Ordering::Backward => {
+                            // Keys strictly smaller than the current one.
+                            let pos = n.keys.search(n.len, &cur);
+                            match n.prev.try_clone_speculative() {
+                                Some(follow) => PageSnap::Page(snap(0..pos), follow),
+                                None => PageSnap::Retry,
+                            }
                         }
                     }
                 }
-            }
-            &NodeData::Empty(ref e) => {
-                let next = match self.ordering {
-                    Ordering::Forward => e.right.try_clone_speculative(),
-                    Ordering::Backward => match e.left.as_ref() {
-                        Some(l) => l.try_clone_speculative(),
-                        None => Some(NodeCellRef::default()),
-                    },
-                };
-                match next {
-                    Some(next) => PageSnap::Skip(next),
-                    None => PageSnap::Retry,
+                &NodeData::Empty(ref e) => {
+                    let next = match self.ordering {
+                        Ordering::Forward => e.right.try_clone_speculative(),
+                        Ordering::Backward => match e.left.as_ref() {
+                            Some(l) => l.try_clone_speculative(),
+                            None => Some(NodeCellRef::default()),
+                        },
+                    };
+                    match next {
+                        Some(next) => PageSnap::Skip(next),
+                        None => PageSnap::Retry,
+                    }
                 }
-            }
-            &NodeData::None => PageSnap::End,
-            &NodeData::Internal(_) => unreachable!("cursor reached an internal node"),
+                &NodeData::None => PageSnap::End,
+                &NodeData::Internal(_) => unreachable!("cursor reached an internal node"),
             });
             match attempt {
                 PageSnap::Retry => continue,

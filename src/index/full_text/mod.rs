@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::builder::IndexError;
 use crate::ram::cell::{OwnedCell, ReadError};
-use crate::ram::schema::{Field, Schema, SchemaVid};
+use crate::ram::schema::{Field, Schema, SchemaUid, SchemaVid};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue, SharedValue};
 
 // Submodules
@@ -71,7 +71,7 @@ pub struct TokenStat {
 pub struct FullTextIndexMeta {
     pub cell_id: Id,
     pub version: u64, // Cell version for filtering stale entries
-    pub schema_id: u32,
+    pub schema_id: SchemaUid,
     pub field_id: u64,
     pub doc_length: u32,
     pub tokens: Vec<TokenStat>,
@@ -153,7 +153,7 @@ pub fn inverted_doc_schema() -> Schema {
 pub fn build_index_meta(
     cell_id: Id,
     version: u64,
-    schema_id: u32,
+    schema_id: SchemaUid,
     field_id: u64,
     value: OwnedValue,
 ) -> Option<FullTextIndexMeta> {

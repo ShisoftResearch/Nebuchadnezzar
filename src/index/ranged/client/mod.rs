@@ -276,12 +276,11 @@ impl RangedIndexerClient {
                 // transient routing state; the loop's own bound turns a
                 // permanent absence into an error instead of a hang.
                 retried += 1;
-                last_retry_reason =
-                    Some("no ranged placement covers the key yet".to_string());
+                last_retry_reason = Some("no ranged placement covers the key yet".to_string());
                 ensure_updated = true;
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    migration_retry_delay_ms(retried, &key),
-                ))
+                tokio::time::sleep(std::time::Duration::from_millis(migration_retry_delay_ms(
+                    retried, &key,
+                )))
                 .await;
                 continue;
             };
@@ -430,7 +429,8 @@ impl RangedIndexerClient {
         &self,
         key: &EntryKey,
         ensure_updated: bool,
-    ) -> Result<Option<(TreePlacement, Arc<AsyncServiceClient>, EntryKey, EntryKey)>, RPCError> {
+    ) -> Result<Option<(TreePlacement, Arc<AsyncServiceClient>, EntryKey, EntryKey)>, RPCError>
+    {
         let mut tree_prop = None;
         if !ensure_updated {
             if let Some((lower, (placement, upper))) =
@@ -521,8 +521,7 @@ impl RangedIndexerClient {
                 }
             } else {
                 drop(placement);
-                let Some((lower, _placement, upper)) =
-                    self.refresh_key_mapping(origin_key).await?
+                let Some((lower, _placement, upper)) = self.refresh_key_mapping(origin_key).await?
                 else {
                     return Ok(NextTree::Unresolved("no tree covers the current key"));
                 };

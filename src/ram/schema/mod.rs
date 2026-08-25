@@ -970,7 +970,7 @@ pub async fn post_schema_add(
     for (field, indices) in &schema.index_fields {
         for index in indices {
             let field_id = *field;
-            let schema_id = schema.vid.get();
+            let schema_id = schema.uid;
             match index {
                 IndexType::Vector(config) => {
                     if let Some(indexer) = database_runtime.indexer() {
@@ -1003,7 +1003,7 @@ pub async fn post_schema_add(
     for (compound_id, compound) in &schema.compound_index_fields {
         for index in &compound.indices {
             let field_id = *compound_id;
-            let schema_id = schema.vid.get();
+            let schema_id = schema.uid;
             match index {
                 IndexType::Vector(config) => {
                     if let Some(indexer) = database_runtime.indexer() {
@@ -1043,7 +1043,7 @@ pub async fn post_schema_delete(
     for (field, indices) in &schema.index_fields {
         for index in indices {
             let field_id = *field;
-            let schema_id = schema.vid.get();
+            let schema_id = schema.uid;
             match index {
                 IndexType::Vector(_) => {
                     if let Some(indexer) = database_runtime.indexer() {
@@ -1076,7 +1076,7 @@ pub async fn post_schema_delete(
     for (compound_id, compound) in &schema.compound_index_fields {
         for index in &compound.indices {
             let field_id = *compound_id;
-            let schema_id = schema.vid.get();
+            let schema_id = schema.uid;
             match index {
                 IndexType::Vector(_) => {
                     if let Some(indexer) = database_runtime.indexer() {
@@ -1153,9 +1153,9 @@ mod tests {
         .unwrap()
     }
 
-    fn cagra_vector_schema(schema_id: u32) -> Schema {
+    fn cagra_vector_schema(schema_id: SchemaUid) -> Schema {
         Schema::new_with_id(
-            schema_id,
+            schema_id.get(),
             "cagra_schema",
             None,
             Field::new_schema(vec![Field::new_indexed_vector(
@@ -1172,9 +1172,9 @@ mod tests {
         )
     }
 
-    fn cagra_embedding_schema(schema_id: u32) -> Schema {
+    fn cagra_embedding_schema(schema_id: SchemaUid) -> Schema {
         Schema::new_with_id(
-            schema_id,
+            schema_id.get(),
             "cagra_embedding_schema",
             None,
             Field::new_schema(vec![Field::new_indexed(
@@ -1193,12 +1193,12 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum VectorCoreCall {
         NewIndex {
-            schema_id: u32,
+            schema_id: SchemaUid,
             field_id: u64,
             config: VectorIndexConfig,
         },
         DeleteIndex {
-            schema_id: u32,
+            schema_id: SchemaUid,
             field_id: u64,
         },
     }
@@ -1206,7 +1206,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum EmbeddingCoreCall {
         NewIndex {
-            schema_id: u32,
+            schema_id: SchemaUid,
             field_id: u64,
             model: EmbeddingModel,
             vector_config: VectorIndexConfig,
@@ -1239,7 +1239,7 @@ mod tests {
         fn insert(
             &self,
             _cell_id: &Id,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             _metric_encoding: MetricEncoding,
             _config: VectorIndexConfig,
@@ -1250,7 +1250,7 @@ mod tests {
         fn remove(
             &self,
             _cell_id: &Id,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             async { Ok(()) }.boxed()
@@ -1258,7 +1258,7 @@ mod tests {
 
         fn search(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             _query_vector: &[f32],
             _limit: usize,
@@ -1269,7 +1269,7 @@ mod tests {
 
         fn new_index_with_config(
             &self,
-            schema_id: u32,
+            schema_id: SchemaUid,
             field_id: u64,
             config: VectorIndexConfig,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
@@ -1287,7 +1287,7 @@ mod tests {
 
         fn delete_index(
             &self,
-            schema_id: u32,
+            schema_id: SchemaUid,
             field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             let calls = self.calls.clone();
@@ -1310,7 +1310,7 @@ mod tests {
         fn insert(
             &self,
             _cell_id: &Id,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             _model: &EmbeddingModel,
             _text: &str,
@@ -1321,7 +1321,7 @@ mod tests {
         fn remove(
             &self,
             _cell_id: &Id,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             async { Ok(()) }.boxed()
@@ -1329,7 +1329,7 @@ mod tests {
 
         fn search(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             _query: &str,
             _limit: usize,
@@ -1339,7 +1339,7 @@ mod tests {
 
         fn new_index(
             &self,
-            schema_id: u32,
+            schema_id: SchemaUid,
             field_id: u64,
             model: &EmbeddingModel,
             vector_config: VectorIndexConfig,
@@ -1360,7 +1360,7 @@ mod tests {
 
         fn delete_index(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             async { Ok(()) }.boxed()
@@ -1404,7 +1404,7 @@ mod tests {
             post_schema_hook_server("post_schema_add_passes_cagra_config_to_vector_core", 5481)
                 .await;
         let vector_core = install_recording_vector_core(&server);
-        let schema = cagra_vector_schema(77);
+        let schema = cagra_vector_schema(SchemaUid(77));
         let field_id = *schema
             .index_fields
             .keys()
@@ -1419,7 +1419,7 @@ mod tests {
         assert_eq!(
             vector_core.recorded_calls(),
             vec![VectorCoreCall::NewIndex {
-                schema_id: 77,
+                schema_id: SchemaUid(77),
                 field_id,
                 config,
             }]
@@ -1437,7 +1437,7 @@ mod tests {
         )
         .await;
         let embedding_core = install_recording_embedding_core(&server);
-        let schema = cagra_embedding_schema(79);
+        let schema = cagra_embedding_schema(SchemaUid(79));
         let field_id = *schema
             .index_fields
             .keys()
@@ -1452,7 +1452,7 @@ mod tests {
         assert_eq!(
             embedding_core.recorded_calls(),
             vec![EmbeddingCoreCall::NewIndex {
-                schema_id: 79,
+                schema_id: SchemaUid(79),
                 field_id,
                 model: EmbeddingModel::from("test-model"),
                 vector_config,
@@ -1471,7 +1471,7 @@ mod tests {
         )
         .await;
         let vector_core = install_recording_vector_core(&server);
-        let schema = cagra_vector_schema(78);
+        let schema = cagra_vector_schema(SchemaUid(78));
         let field_id = *schema
             .index_fields
             .keys()
@@ -1485,7 +1485,7 @@ mod tests {
         assert_eq!(
             vector_core.recorded_calls(),
             vec![VectorCoreCall::DeleteIndex {
-                schema_id: 78,
+                schema_id: SchemaUid(78),
                 field_id,
             }]
         );

@@ -284,13 +284,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn general() {
         let _ = env_logger::try_init();
-        run_insert_pressure_test("ranged_index_test", &crate::utils::test_port::unique_localhost_addr(), 3).await;
+        run_insert_pressure_test(
+            "ranged_index_test",
+            &crate::utils::test_port::unique_localhost_addr(),
+            3,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn migration_stress_insert_only() {
         let _ = env_logger::try_init();
-        run_insert_pressure_test("ranged_index_migration_stress", &crate::utils::test_port::unique_localhost_addr(), 6).await;
+        run_insert_pressure_test(
+            "ranged_index_migration_stress",
+            &crate::utils::test_port::unique_localhost_addr(),
+            6,
+        )
+        .await;
     }
 
     #[ignore]

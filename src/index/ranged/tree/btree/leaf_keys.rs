@@ -119,9 +119,8 @@ impl PackedKeys {
         debug_assert!(index < self.len);
         let mut key = self.template.clone();
         if self.width > 0 {
-            key.as_mut_slice()[self.prefix_len..].copy_from_slice(
-                &self.suffixes[index * self.width..(index + 1) * self.width],
-            );
+            key.as_mut_slice()[self.prefix_len..]
+                .copy_from_slice(&self.suffixes[index * self.width..(index + 1) * self.width]);
         }
         key
     }
@@ -255,7 +254,11 @@ impl LeafKeys {
             prefix_len: pl,
             width: w,
             suffixes: b.data[start..end].to_vec(),
-            len: if w == 0 { range.len() } else { (end - start) / w },
+            len: if w == 0 {
+                range.len()
+            } else {
+                (end - start) / w
+            },
         }
     }
 
@@ -290,8 +293,8 @@ impl LeafKeys {
         let b = self.load();
         let kb = key.as_slice();
         match b.prefix[..b.prefix_len].cmp(&kb[..b.prefix_len]) {
-            std::cmp::Ordering::Greater => return 0,   // all keys > key
-            std::cmp::Ordering::Less => return len,    // all keys < key
+            std::cmp::Ordering::Greater => return 0, // all keys > key
+            std::cmp::Ordering::Less => return len,  // all keys < key
             std::cmp::Ordering::Equal => {}
         }
         let suffix = &kb[b.prefix_len..];

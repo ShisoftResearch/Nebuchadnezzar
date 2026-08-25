@@ -680,7 +680,10 @@ fn retaining_every_key_away_leaves_a_writable_tree() {
     // The tree is now empty, which is fine. What must still hold is that it
     // takes a write -- a retained-to-nothing tree is reused, not discarded.
     let key = EntryKey::from_id(&Id::from_parts(2, 1));
-    assert!(tree.insert(&key), "a retained-to-nothing tree must accept a key");
+    assert!(
+        tree.insert(&key),
+        "a retained-to-nothing tree must accept a key"
+    );
     assert_eq!(
         tree.seek(&key, Ordering::Forward).current(),
         Some(&key),

@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use crate::index::builder::IndexError;
+use crate::ram::schema::SchemaUid;
 
 pub const NO_VECTOR_CORE_ERROR: &str =
     "Vector indexer core is not set. Should call `set_vector_index_core` to set it.";
@@ -145,7 +146,7 @@ pub struct VectorHit {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VectorPayloadInsert {
     pub cell_id: Id,
-    pub schema_id: u32,
+    pub schema_id: SchemaUid,
     pub field_id: u64,
     pub metric: MetricEncoding,
     pub config: VectorIndexConfig,
@@ -176,7 +177,7 @@ pub trait VectorIndexerCore: Send + Sync {
     fn insert(
         &self,
         cell_id: &Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         metric_encoding: MetricEncoding,
         config: VectorIndexConfig,
@@ -216,7 +217,7 @@ pub trait VectorIndexerCore: Send + Sync {
     fn remove(
         &self,
         cell_id: &Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
@@ -231,7 +232,7 @@ pub trait VectorIndexerCore: Send + Sync {
     /// * `limit` - Maximum number of results to return
     fn search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query_vector: &[f32],
         limit: usize,
@@ -244,7 +245,7 @@ pub trait VectorIndexerCore: Send + Sync {
     /// forwarding each batch entry through `search` sequentially.
     fn search_batch(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query_vectors: Vec<Vec<f32>>,
         limit: usize,
@@ -272,7 +273,11 @@ pub trait VectorIndexerCore: Send + Sync {
     /// Create a new vector index for a schema/field combination.
     ///
     /// Called when a new schema with vector index is created.
-    fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>> {
+    fn new_index(
+        &self,
+        schema_id: SchemaUid,
+        field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.new_index_with_config(
             schema_id,
             field_id,
@@ -282,7 +287,7 @@ pub trait VectorIndexerCore: Send + Sync {
 
     fn new_index_with_config(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
@@ -290,13 +295,17 @@ pub trait VectorIndexerCore: Send + Sync {
     /// Delete a vector index for a schema/field combination.
     ///
     /// Called when a schema with vector index is deleted.
-    fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>>;
+    fn delete_index(
+        &self,
+        schema_id: SchemaUid,
+        field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>>;
 }
 
 pub trait VectorSearchCoordinator: Send + Sync {
     fn search_distributed(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query_vector: &[f32],
         limit: usize,
@@ -305,7 +314,7 @@ pub trait VectorSearchCoordinator: Send + Sync {
 
     fn search_distributed_batch(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query_vectors: Vec<Vec<f32>>,
         limit: usize,
@@ -400,7 +409,7 @@ impl VectorIndexClient {
 
     pub fn search_distributed<'a>(
         &'a self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query_vector: &'a [f32],
         limit: usize,
@@ -417,7 +426,7 @@ impl VectorIndexClient {
 
     pub fn search_distributed_batch<'a>(
         &'a self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query_vectors: Vec<Vec<f32>>,
         limit: usize,
@@ -431,7 +440,7 @@ impl VectorIndexClient {
     pub fn insert<'a>(
         &'a self,
         cell_id: &Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         metric_encoding: MetricEncoding,
         config: VectorIndexConfig,
@@ -451,7 +460,7 @@ impl VectorIndexClient {
     pub fn remove<'a>(
         &'a self,
         cell_id: &Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
         self.get_vector_index_core()
@@ -467,7 +476,7 @@ impl VectorIndexClient {
     /// * `limit` - Maximum number of results to return
     pub fn search<'a>(
         &'a self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query_vector: &'a [f32],
         limit: usize,
@@ -479,7 +488,7 @@ impl VectorIndexClient {
 
     pub fn search_batch<'a>(
         &'a self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query_vectors: Vec<Vec<f32>>,
         limit: usize,
@@ -497,7 +506,7 @@ impl VectorIndexClient {
     /// Create a new vector index.
     pub fn new_index(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.new_index_with_config(
@@ -509,7 +518,7 @@ impl VectorIndexClient {
 
     pub fn new_index_with_config(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
@@ -520,7 +529,7 @@ impl VectorIndexClient {
     /// Delete a vector index.
     pub fn delete_index(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_vector_index_core()
@@ -542,7 +551,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq)]
     struct RecordedInsertCall {
         cell_id: Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         metric: MetricEncoding,
         config: VectorIndexConfig,
@@ -576,7 +585,7 @@ mod tests {
         fn insert(
             &self,
             cell_id: &Id,
-            schema_id: u32,
+            schema_id: SchemaUid,
             field_id: u64,
             metric_encoding: MetricEncoding,
             config: VectorIndexConfig,
@@ -599,7 +608,7 @@ mod tests {
         fn remove(
             &self,
             _cell_id: &Id,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             Box::pin(async { panic!("remove should not be called in this test") })
@@ -607,7 +616,7 @@ mod tests {
 
         fn search(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             query_vector: &[f32],
             _limit: usize,
@@ -631,7 +640,7 @@ mod tests {
 
         fn new_index_with_config(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             _config: VectorIndexConfig,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
@@ -640,7 +649,7 @@ mod tests {
 
         fn delete_index(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             Box::pin(async { panic!("delete_index should not be called in this test") })
@@ -662,7 +671,7 @@ mod tests {
     impl VectorSearchCoordinator for RecordingVectorSearchCoordinator {
         fn search_distributed(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             query_vector: &[f32],
             _limit: usize,
@@ -728,7 +737,7 @@ mod tests {
         let _new_index_with_config = VectorIndexClient::new_index_with_config
             as for<'a> fn(
                 &'a VectorIndexClient,
-                u32,
+                SchemaUid,
                 u64,
                 VectorIndexConfig,
             ) -> BoxFuture<'a, Result<(), IndexError>>;
@@ -736,7 +745,7 @@ mod tests {
             as for<'a, 'b> fn(
                 &'a VectorIndexClient,
                 &'b Id,
-                u32,
+                SchemaUid,
                 u64,
                 MetricEncoding,
                 VectorIndexConfig,
@@ -755,7 +764,7 @@ mod tests {
 
         let request = VectorPayloadInsert {
             cell_id: Id::from_parts(11, 12),
-            schema_id: 13,
+            schema_id: SchemaUid(13),
             field_id: 14,
             metric: MetricEncoding::Chebyshev,
             config: VectorIndexConfig::cagra(
@@ -781,7 +790,7 @@ mod tests {
             calls,
             vec![RecordedInsertCall {
                 cell_id: Id::from_parts(11, 12),
-                schema_id: 13,
+                schema_id: SchemaUid(13),
                 field_id: 14,
                 metric: MetricEncoding::Chebyshev,
                 config: VectorIndexConfig::cagra(
@@ -807,7 +816,13 @@ mod tests {
         );
 
         let results = core
-            .search_batch(7, 8, vec![vec![3.0], vec![1.0], vec![2.0]], 4, Some(32))
+            .search_batch(
+                SchemaUid(7),
+                8,
+                vec![vec![3.0], vec![1.0], vec![2.0]],
+                4,
+                Some(32),
+            )
             .await
             .expect("batch search should succeed");
 
@@ -824,7 +839,7 @@ mod tests {
         let core = RecordingVectorCore::new(Arc::new(Mutex::new(Vec::new())));
 
         let error = core
-            .search_batch(7, 8, Vec::new(), 4, Some(32))
+            .search_batch(SchemaUid(7), 8, Vec::new(), 4, Some(32))
             .await
             .expect_err("empty batch should fail");
 
@@ -844,7 +859,13 @@ mod tests {
         let coordinator =
             RecordingVectorSearchCoordinator::new(Arc::clone(&distributed_search_queries));
         let distributed_results = coordinator
-            .search_distributed_batch(9, 10, vec![vec![3.0], vec![1.0], vec![2.0]], 5, Some(24))
+            .search_distributed_batch(
+                SchemaUid(9),
+                10,
+                vec![vec![3.0], vec![1.0], vec![2.0]],
+                5,
+                Some(24),
+            )
             .await
             .expect("distributed batch search should succeed");
         let distributed_scores: Vec<f32> =
@@ -865,14 +886,26 @@ mod tests {
         );
 
         let client_results = client
-            .search_batch(11, 12, vec![vec![3.0], vec![1.0], vec![2.0]], 6, Some(16))
+            .search_batch(
+                SchemaUid(11),
+                12,
+                vec![vec![3.0], vec![1.0], vec![2.0]],
+                6,
+                Some(16),
+            )
             .await
             .expect("client batch search should succeed");
         let client_scores: Vec<f32> = client_results.iter().map(|row| row[0].score).collect();
         assert_eq!(client_scores, vec![3.0, 1.0, 2.0]);
 
         let client_distributed_results = client
-            .search_distributed_batch(13, 14, vec![vec![3.0], vec![1.0], vec![2.0]], 7, Some(8))
+            .search_distributed_batch(
+                SchemaUid(13),
+                14,
+                vec![vec![3.0], vec![1.0], vec![2.0]],
+                7,
+                Some(8),
+            )
             .await
             .expect("client distributed batch search should succeed");
         let client_distributed_scores: Vec<f32> = client_distributed_results
@@ -902,7 +935,7 @@ mod tests {
     fn vector_payload_insert_round_trips_through_serde() {
         let request = VectorPayloadInsert {
             cell_id: Id::from_parts(1, 2),
-            schema_id: 3,
+            schema_id: SchemaUid(3),
             field_id: 4,
             metric: MetricEncoding::L2,
             config: VectorIndexConfig::cagra(MetricEncoding::L2, CagraConfig::default()),

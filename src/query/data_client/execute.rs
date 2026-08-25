@@ -241,12 +241,12 @@ impl IndexedDataClient {
         {
             self.index_clients
                 .vector_client
-                .search_distributed(schema.get(), field_id, query_vector, limit.max(1), None)
+                .search_distributed(schema, field_id, query_vector, limit.max(1), None)
                 .await
         } else {
             self.index_clients
                 .vector_client
-                .search(schema.get(), field_id, query_vector, limit.max(1), None)
+                .search(schema, field_id, query_vector, limit.max(1), None)
                 .await
         };
         search_result.map_err(|e| {
@@ -276,7 +276,7 @@ impl IndexedDataClient {
         }
         self.index_clients
             .embedding_client
-            .search(schema.get(), field_id, query, limit.max(1))
+            .search(schema, field_id, query, limit.max(1))
             .await
             .map_err(|e| {
                 RPCError::IOError(io::Error::new(

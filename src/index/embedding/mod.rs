@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::builder::IndexError;
 use crate::index::vector::{HnswConfig, MetricEncoding, VectorIndexConfig};
+use crate::ram::schema::SchemaUid;
 
 pub const NO_EMBEDDING_CORE_ERROR: &str =
     "Embedding indexer core is not set. Should call `set_embedding_index_core` to set it.";
@@ -160,7 +161,7 @@ pub trait EmbeddingIndexerCore: Send + Sync {
     fn insert(
         &self,
         cell_id: &Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         model: &EmbeddingModel,
         text: &str,
@@ -175,7 +176,7 @@ pub trait EmbeddingIndexerCore: Send + Sync {
     fn remove(
         &self,
         cell_id: &Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>>;
 
@@ -193,7 +194,7 @@ pub trait EmbeddingIndexerCore: Send + Sync {
     /// * `limit` - Maximum number of results to return
     fn search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
@@ -205,7 +206,7 @@ pub trait EmbeddingIndexerCore: Send + Sync {
     /// forwarding each batch entry through `search` sequentially.
     fn search_batch(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         queries: Vec<String>,
         limit: usize,
@@ -237,7 +238,7 @@ pub trait EmbeddingIndexerCore: Send + Sync {
     /// * `vector_config` - Backing vector engine configuration.
     fn new_index(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         model: &EmbeddingModel,
         vector_config: VectorIndexConfig,
@@ -246,7 +247,11 @@ pub trait EmbeddingIndexerCore: Send + Sync {
     /// Delete an embedding index for a schema/field combination.
     ///
     /// Called when a schema with embedding index is deleted.
-    fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>>;
+    fn delete_index(
+        &self,
+        schema_id: SchemaUid,
+        field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>>;
 }
 
 /// Client for embedding index operations.
@@ -313,7 +318,7 @@ impl EmbeddingIndexClient {
     pub fn insert<'a>(
         &'a self,
         cell_id: &Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         model: &'a EmbeddingModel,
         text: &'a str,
@@ -326,7 +331,7 @@ impl EmbeddingIndexClient {
     pub fn remove<'a>(
         &'a self,
         cell_id: &Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
         self.get_embedding_index_core()
@@ -336,7 +341,7 @@ impl EmbeddingIndexClient {
     /// Search for similar documents.
     pub fn search<'a>(
         &'a self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query: &'a str,
         limit: usize,
@@ -348,7 +353,7 @@ impl EmbeddingIndexClient {
     /// Search for similar documents with multiple text queries.
     pub fn search_batch<'a>(
         &'a self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         queries: Vec<String>,
         limit: usize,
@@ -360,7 +365,7 @@ impl EmbeddingIndexClient {
     /// Create a new embedding index with the specified model.
     pub fn new_index<'a>(
         &'a self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         model: &'a EmbeddingModel,
         vector_config: VectorIndexConfig,
@@ -372,7 +377,7 @@ impl EmbeddingIndexClient {
     /// Delete an embedding index.
     pub fn delete_index(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_embedding_index_core()
@@ -413,7 +418,7 @@ mod tests {
         fn insert(
             &self,
             _cell_id: &Id,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             _model: &EmbeddingModel,
             _text: &str,
@@ -424,7 +429,7 @@ mod tests {
         fn remove(
             &self,
             _cell_id: &Id,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             async move { Ok(()) }.boxed()
@@ -432,7 +437,7 @@ mod tests {
 
         fn search(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             query: &str,
             _limit: usize,
@@ -450,7 +455,7 @@ mod tests {
 
         fn new_index(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
             _model: &EmbeddingModel,
             _vector_config: VectorIndexConfig,
@@ -460,7 +465,7 @@ mod tests {
 
         fn delete_index(
             &self,
-            _schema_id: u32,
+            _schema_id: SchemaUid,
             _field_id: u64,
         ) -> BoxFuture<'_, Result<(), IndexError>> {
             async move { Ok(()) }.boxed()
@@ -472,7 +477,12 @@ mod tests {
         let core = RecordingEmbeddingCore::default();
 
         let hits = core
-            .search_batch(7, 11, vec!["third".to_string(), "one".to_string()], 3)
+            .search_batch(
+                SchemaUid(7),
+                11,
+                vec!["third".to_string(), "one".to_string()],
+                3,
+            )
             .await
             .expect("batch search should succeed");
 
@@ -490,7 +500,7 @@ mod tests {
         let core = RecordingEmbeddingCore::default();
 
         let error = core
-            .search_batch(7, 11, Vec::new(), 3)
+            .search_batch(SchemaUid(7), 11, Vec::new(), 3)
             .await
             .expect_err("empty batch should fail");
 
@@ -508,7 +518,12 @@ mod tests {
         let core: Arc<dyn EmbeddingIndexerCore> = Arc::new(RecordingEmbeddingCore::default());
 
         let hits = core
-            .search_batch(7, 11, vec!["third".to_string(), "one".to_string()], 3)
+            .search_batch(
+                SchemaUid(7),
+                11,
+                vec!["third".to_string(), "one".to_string()],
+                3,
+            )
             .await
             .expect("trait object batch search should succeed");
 
@@ -523,7 +538,12 @@ mod tests {
         assert!(client.set_embedding_index_core(RecordingEmbeddingCore::default()));
 
         let hits = client
-            .search_batch(7, 11, vec!["third".to_string(), "one".to_string()], 3)
+            .search_batch(
+                SchemaUid(7),
+                11,
+                vec!["third".to_string(), "one".to_string()],
+                3,
+            )
             .await
             .expect("client batch search should succeed");
 

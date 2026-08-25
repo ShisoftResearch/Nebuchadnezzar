@@ -12,6 +12,7 @@ use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::{shard::InvertedIndexer, BM25Hit};
+use crate::ram::schema::SchemaUid;
 use crate::ram::types::Id;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_INVERTED_INDEX_RPC_SERVICE) as u64;
@@ -37,7 +38,7 @@ pub enum InvertedIndexError {
 /// Request to search a specific field for a query
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvertedSearchRequest {
-    pub schema_id: u32,
+    pub schema_id: SchemaUid,
     pub field_id: u64,
     pub query: String,
     pub limit: usize,
@@ -55,7 +56,7 @@ pub struct InvertedSearchResponse {
 /// Request for field statistics (for distributed BM25)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldStatsRequest {
-    pub schema_id: u32,
+    pub schema_id: SchemaUid,
     pub field_id: u64,
 }
 
@@ -69,7 +70,7 @@ pub struct FieldStatsResponse {
 /// Request for posting list of a specific term (for distributed queries)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TermPostingsRequest {
-    pub schema_id: u32,
+    pub schema_id: SchemaUid,
     pub field_id: u64,
     pub term_hash: u64,
 }

@@ -22,6 +22,7 @@ use super::rpc::{
     TermPostingsResponse,
 };
 use super::{bm25_score, compute_idf, tokenize_query, BM25Hit};
+use crate::ram::schema::SchemaUid;
 
 /// Distributed inverted index coordinator
 ///
@@ -96,7 +97,7 @@ impl DistributedInvertedIndexCoordinator {
     /// 4. Returns top K results globally
     pub async fn distributed_search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query: &str,
         limit: usize,
@@ -203,7 +204,7 @@ impl DistributedInvertedIndexCoordinator {
     /// and recomputes BM25 scores with global IDF values.
     async fn rerank_with_global_stats(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         query: &str,
         hits: Vec<BM25Hit>,
@@ -312,7 +313,7 @@ impl DistributedInvertedIndexCoordinator {
     /// Get global field statistics across all partitions
     pub async fn get_global_stats(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
     ) -> Result<FieldStatsResponse, RPCError> {
         let server_ids = self.get_all_server_ids().await;
@@ -655,14 +656,21 @@ mod tests {
         );
 
         let stats1 = coord1
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         info!("Shard1 stats: doc_count={}", stats1.doc_count);
         assert_eq!(stats1.doc_count, 2, "Shard1 should have 2 documents");
 
         let hits1 = coord1
-            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "rust",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -680,14 +688,21 @@ mod tests {
         );
 
         let stats2 = coord2
-            .get_global_stats(schema_id, content_field_id)
+            .get_global_stats(SchemaUid(schema_id), content_field_id)
             .await
             .unwrap();
         info!("Shard2 stats: doc_count={}", stats2.doc_count);
         assert_eq!(stats2.doc_count, 2, "Shard2 should have 2 documents");
 
         let hits2 = coord2
-            .distributed_search(schema_id, content_field_id, "rust", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "rust",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -737,7 +752,14 @@ mod tests {
 
         // Test 5: Each shard finds its unique content
         let db_hits = coord1
-            .distributed_search(schema_id, content_field_id, "database", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "database",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -746,7 +768,7 @@ mod tests {
 
         let search_hits = coord2
             .distributed_search(
-                schema_id,
+                SchemaUid(schema_id),
                 content_field_id,
                 "search engine",
                 10,
@@ -857,7 +879,14 @@ mod tests {
 
         // Search
         let hits_result = coordinator
-            .distributed_search(schema_id, content_field_id, "hello world", 10, false, false)
+            .distributed_search(
+                SchemaUid(schema_id),
+                content_field_id,
+                "hello world",
+                10,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -902,7 +931,7 @@ mod tests {
 
         // Empty query should return empty results
         let hits_result = coordinator
-            .distributed_search(100, 1, "", 10, false, false)
+            .distributed_search(SchemaUid(100), 1, "", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();
@@ -910,7 +939,7 @@ mod tests {
 
         // Whitespace-only query should return empty results
         let hits_result = coordinator
-            .distributed_search(100, 1, "   ", 10, false, false)
+            .distributed_search(SchemaUid(100), 1, "   ", 10, false, false)
             .await
             .unwrap();
         let hits = hits_result.unwrap();

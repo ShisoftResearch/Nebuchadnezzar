@@ -38,7 +38,7 @@ const COMPOUND_MISSING_PLACEHOLDER: &str = "";
 /// Extracts text content from String or String array values.
 fn build_embedding_index_meta(
     cell_id: Id,
-    schema_id: u32,
+    schema_id: SchemaUid,
     field_id: u64,
     model: EmbeddingModel,
     value: crate::ram::types::OwnedValue,
@@ -150,7 +150,7 @@ pub struct NullIndexMeta {
 #[derive(Hash, Debug)]
 pub struct VectorIndexMeta {
     cell_id: Id,
-    schema_id: u32,
+    schema_id: SchemaUid,
     field_id: u64,
     config: VectorIndexConfig,
 }
@@ -160,7 +160,7 @@ pub struct VectorIndexMeta {
 #[derive(Debug)]
 pub struct EmbeddingIndexMeta {
     pub cell_id: Id,
-    pub schema_id: u32,
+    pub schema_id: SchemaUid,
     pub field_id: u64,
     pub model: EmbeddingModel,
     pub text: String,
@@ -193,7 +193,7 @@ pub enum IndexComps {
     Ranged(Feature),
     Hashed(Feature),
     Null,
-    Vector(Id, u32, u64, VectorIndexConfig),
+    Vector(Id, SchemaUid, u64, VectorIndexConfig),
 }
 
 #[derive(Debug)]
@@ -603,9 +603,9 @@ impl IndexBuilder {
         old_indices: Option<Vec<IndexRes>>,
     ) {
         log::debug!(
-            "ensure_indices: cell_id={:?}, schema_id={}, schema_name={}, is_scannable={}",
+            "ensure_indices: cell_id={:?}, schema_uid={}, schema_name={}, is_scannable={}",
             cell.id(),
-            schema.vid.get(),
+            schema.uid,
             schema.name,
             schema.is_scannable
         );
@@ -614,7 +614,7 @@ impl IndexBuilder {
         let scannable_key = if schema.is_scannable {
             log::debug!(
                 "Schema {} is scannable, scheduling scannable insert for cell {:?}",
-                schema.vid.get(),
+                schema.uid,
                 cell.id()
             );
             // The scannable key is a family key, and the record is right
@@ -624,7 +624,7 @@ impl IndexBuilder {
         } else {
             log::debug!(
                 "Schema {} is NOT scannable for cell {:?}",
-                schema.vid.get(),
+                schema.uid,
                 cell.id()
             );
             None
@@ -644,11 +644,14 @@ impl IndexBuilder {
         if scannable_key.is_some() || !new_indices.is_empty() {
             debug!("New indices: {:?}", new_indices);
             let cell_id = cell.id();
-            let schema_id = cell.header.schema.get();
+            // The scannable insert names a namespace, so it takes the family.
+            // The header would have given the generation that encoded this
+            // cell, which is not what the key is prefixed by.
+            let schema_uid = schema.uid;
             let t_spawn = std::time::Instant::now();
             new_index_task(async move {
                 if let Some(key) = scannable_key {
-                    Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_id)
+                    Self::ensure_scannable_insert(indexers.clone(), key, cell_id, schema_uid)
                         .await?;
                 }
                 let res = Self::ensure_indices_(new_indices, old_indices, indexers).await;
@@ -666,7 +669,7 @@ impl IndexBuilder {
         indexers: Arc<IndexerClients>,
         key: EntryKey,
         cell_id: Id,
-        schema_id: u32,
+        schema_id: SchemaUid,
     ) -> Result<(), IndexError> {
         log::debug!(
             "ensure_scannable: Inserting key for cell_id={:?}, schema_id={}",
@@ -1134,7 +1137,7 @@ where
                         // For vector, only provide its property
                         &IndexType::Vector(config) => components.push(IndexComps::Vector(
                             cell.id(),
-                            schema.vid.get(),
+                            schema.uid,
                             *field_id,
                             config,
                         )),
@@ -1142,7 +1145,7 @@ where
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
                                 cell.header().version,
-                                schema.vid.get(),
+                                schema.uid,
                                 *field_id,
                                 owned_value.clone(),
                             ) {
@@ -1152,7 +1155,7 @@ where
                         &IndexType::Embedding(ref config) => {
                             if let Some(meta) = build_embedding_index_meta(
                                 cell.id(),
-                                schema.vid.get(),
+                                schema.uid,
                                 *field_id,
                                 config.model.clone(),
                                 owned_value.clone(),
@@ -1191,7 +1194,7 @@ where
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
                                 cell.header().version,
-                                schema.vid.get(),
+                                schema.uid,
                                 *field_id,
                                 owned_value.clone(),
                             ) {
@@ -1201,7 +1204,7 @@ where
                         &IndexType::Embedding(ref config) => {
                             if let Some(meta) = build_embedding_index_meta(
                                 cell.id(),
-                                schema.vid.get(),
+                                schema.uid,
                                 *field_id,
                                 config.model.clone(),
                                 owned_value.clone(),
@@ -1255,7 +1258,7 @@ where
                         if let Some(text) = build_compound_embedding_text(cell, schema, compound) {
                             metas.push(IndexMeta::Embedding(EmbeddingIndexMeta {
                                 cell_id: cell.id(),
-                                schema_id: schema.vid.get(),
+                                schema_id: schema.uid,
                                 field_id: *compound_id,
                                 model: config.model.clone(),
                                 text,

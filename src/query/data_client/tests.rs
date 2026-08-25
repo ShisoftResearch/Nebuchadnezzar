@@ -50,7 +50,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
     fn insert(
         &self,
         _cell_id: &Id,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
         _metric_encoding: MetricEncoding,
         _config: VectorIndexConfig,
@@ -61,7 +61,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
     fn remove(
         &self,
         _cell_id: &Id,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
@@ -69,7 +69,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
 
     fn search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         _query_vector: &[f32],
         limit: usize,
@@ -78,7 +78,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
         let should_fail = self.fail_search;
         let hits = self
             .hits_by_field
-            .get(&(schema_id, field_id))
+            .get(&(schema_id.get(), field_id))
             .cloned()
             .unwrap_or_default();
         async move {
@@ -93,7 +93,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
 
     fn new_index_with_config(
         &self,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
         _config: VectorIndexConfig,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
@@ -102,7 +102,7 @@ impl VectorIndexerCore for MockVectorIndexerCore {
 
     fn delete_index(
         &self,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
@@ -147,7 +147,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
     fn insert(
         &self,
         _cell_id: &Id,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
         _model: &EmbeddingModel,
         _text: &str,
@@ -158,7 +158,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
     fn remove(
         &self,
         _cell_id: &Id,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
@@ -166,7 +166,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
 
     fn search(
         &self,
-        schema_id: u32,
+        schema_id: SchemaUid,
         field_id: u64,
         _query: &str,
         limit: usize,
@@ -181,7 +181,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
         }
         let hits = self
             .hits_by_field
-            .get(&(schema_id, field_id))
+            .get(&(schema_id.get(), field_id))
             .cloned()
             .unwrap_or_default();
         async move { Ok(hits.into_iter().take(limit).collect()) }.boxed()
@@ -189,7 +189,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
 
     fn new_index(
         &self,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
         _model: &EmbeddingModel,
         _vector_config: VectorIndexConfig,
@@ -199,7 +199,7 @@ impl EmbeddingIndexerCore for MockEmbeddingIndexerCore {
 
     fn delete_index(
         &self,
-        _schema_id: u32,
+        _schema_id: SchemaUid,
         _field_id: u64,
     ) -> BoxFuture<'_, Result<(), IndexError>> {
         async { Ok(()) }.boxed()
