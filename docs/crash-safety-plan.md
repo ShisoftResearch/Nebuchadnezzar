@@ -1337,6 +1337,13 @@ chance put its two hits on the candidate. With it fixed on both:
 | candidate (Phase 6b) | 5 | **5 clean**, 734 passed each |
 | control (`35a3bc43`) | 5 | 4 clean, **1 SIGSEGV** |
 
+Repeated once more at the end of the work, with BOTH arms carrying every
+non-termination fix so the trees differed only by Phase 6b: **candidate 9/10,
+control 10/10**, `bracket_close_failures=0` in all 20 rounds. The single
+candidate-side failure was `client::tests::write_skew` -- one occurrence in 46
+full-suite logs, with the Phase 6b code provably not executing in that round.
+See `docs/known-residuals.md`.
+
 The candidate did strictly better than the control, so the termination work
 introduces no suite regression. **The remaining SIGSEGV is pre-existing**: it
 hit the control, with the speculative-clone fix applied, so it is neither the

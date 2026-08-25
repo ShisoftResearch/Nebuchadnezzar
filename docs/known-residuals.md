@@ -78,7 +78,10 @@ The last two mean the Phase 6b code never ran in that round at all.
 
 **Rate.** One occurrence across 46 full-suite logs spanning both the
 candidate and control arms. `CheckFailed(CannotEnd)` appears in that one log
-and nowhere else.
+and nowhere else. The controlled comparison that caught it -- 10 full-suite
+rounds per arm, the two trees differing ONLY by the Phase 6b work -- finished
+**candidate 9/10, control 10/10**, with `bracket_close_failures=0` in all 20
+rounds. One event on one arm is not a difference between the arms.
 
 **The remaining lead.** The only production path that clears a cell's owner
 is `attempt_lock_release` during `end`, and it clears only when the owner
