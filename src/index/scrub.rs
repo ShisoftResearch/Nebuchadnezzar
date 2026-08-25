@@ -88,6 +88,12 @@ pub struct ScrubReport {
     pub entries_derived: u64,
     /// Derived keys the index confirmed it holds.
     pub entries_present: u64,
+    /// Repairs the index accepted and then did not hold when read straight
+    /// back. A nonzero count means the reconcile cannot be trusted to have
+    /// fixed what it reported fixing, which invalidates the whole
+    /// reconcile-before-serving contract -- so it is reported separately from
+    /// a repair that outright failed.
+    pub repairs_not_stuck: u64,
     /// Derived keys the index confirmed it does NOT hold.
     pub entries_missing: u64,
     /// Derived keys inserted by a repair pass. In `Verify` this is 0.
@@ -116,7 +122,8 @@ impl ScrubReport {
     /// unreadable cell, a failed repair -- because each of those is a cell
     /// whose entries this pass cannot vouch for.
     pub fn verified_complete(&self) -> bool {
-        self.entries_unreachable == 0
+        self.repairs_not_stuck == 0
+            && self.entries_unreachable == 0
             && self.cells_unreadable == 0
             && self.repairs_failed == 0
             && self.cells_schema_missing == 0
@@ -146,6 +153,7 @@ impl ScrubReport {
         self.entries_repaired += other.entries_repaired;
         self.entries_unreachable += other.entries_unreachable;
         self.repairs_failed += other.repairs_failed;
+        self.repairs_not_stuck += other.repairs_not_stuck;
     }
 }
 
@@ -154,7 +162,8 @@ impl std::fmt::Display for ScrubReport {
         write!(
             f,
             "cells={} (skipped={}, no-indices={}, unreadable={}, schema-missing={}) entries={} \
-             present={} missing={} repaired={} unreachable={} repair-failed={}",
+             present={} missing={} repaired={} not-stuck={} unreachable={} \
+             repair-failed={}",
             self.cells_scanned,
             self.cells_skipped,
             self.cells_no_indices,
@@ -164,6 +173,7 @@ impl std::fmt::Display for ScrubReport {
             self.entries_present,
             self.entries_missing,
             self.entries_repaired,
+            self.repairs_not_stuck,
             self.entries_unreachable,
             self.repairs_failed,
         )
@@ -514,6 +524,17 @@ static MISSING_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 /// every recovery -- it stops being a durability window and becomes a set of
 /// specific cells to go and look at, and then their ids are the whole
 /// investigation. Capped like the unreachable examples, for the same reason.
+/// A repair the index took and then did not have. Always logged, never
+/// sampled: this should be impossible, so every instance is worth a line.
+fn report_not_stuck(key: &EntryKey) {
+    error!(
+        "Index scrub: repaired entry for {:?} was NOT PRESENT when read straight back. The \
+         insert was accepted by a tree that is not the one this key resolves to -- placement \
+         moving underneath the repair. Reconciliation cannot be trusted while this happens.",
+        key.id()
+    );
+}
+
 fn report_missing(key: &EntryKey) {
     const EXAMPLES: usize = 12;
     let n = MISSING_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -584,6 +605,10 @@ async fn reconcile(
                 report.entries_repaired += 1;
             }
             KeyOutcome::Unreachable => report.entries_unreachable += 1,
+            KeyOutcome::RepairNotStuck => {
+                report.entries_missing += 1;
+                report.repairs_not_stuck += 1;
+            }
         }
         if let Some(key) = pending.next() {
             in_flight.push(check_one(indexers, key, mode));
@@ -593,6 +618,8 @@ async fn reconcile(
 }
 
 enum KeyOutcome {
+    /// Inserted, and then not there when read straight back.
+    RepairNotStuck,
     Present,
     Missing,
     Repaired,
@@ -641,7 +668,29 @@ async fn check_one(
         Ok(false) if mode.repairs() => match indexers.ranged_client.insert(key).await {
             Ok(true) => {
                 report_missing(key);
-                KeyOutcome::Repaired
+                // READ IT BACK. An insert that returns true has been applied
+                // to a tree; it has not necessarily been applied to the tree
+                // this key will be looked up in a moment from now. Placement
+                // settles during startup, and an insert into an object that is
+                // then superseded -- re-hydrated from disk, replaced by a
+                // split -- is silently discarded.
+                //
+                // That is not hypothetical. A reconcile repaired 8,537 entries
+                // and a scrub minutes later, with no writer running in
+                // between, found 136 of them still missing. The whole
+                // reconcile-before-serving design rests on repairs sticking,
+                // so it must not be assumed.
+                match indexers.ranged_client.contains(key).await {
+                    Ok(true) => KeyOutcome::Repaired,
+                    Ok(false) => {
+                        report_not_stuck(key);
+                        KeyOutcome::RepairNotStuck
+                    }
+                    // Could not confirm either way; count it as repaired
+                    // rather than invent a failure, and let the unreachable
+                    // accounting speak for the tree.
+                    Err(_) => KeyOutcome::Repaired,
+                }
             }
             // Someone else inserted it in between; it is present now.
             Ok(false) => KeyOutcome::Present,
