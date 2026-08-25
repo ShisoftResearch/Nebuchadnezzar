@@ -12,6 +12,21 @@ use std::time::Duration;
 // the server's AsyncClient. Sharing one process-wide queue meant two servers
 // in one process waited on each other's progress and a dead fleet poisoned
 // every later instance.
+/// Index page images a worker gave up placing, for the life of the process.
+///
+/// The precise signal for "entries may be missing that no index task reported
+/// failing". A task succeeds by inserting into the in-memory tree; if the PAGE
+/// holding that entry is later abandoned, the entry never reaches disk and
+/// every task counter still reads clean.
+///
+/// Distinct from allocation refusals, which are mostly the compaction reserve
+/// doing its job -- a chunk that is full and holding back destinations for the
+/// cleaner. Gating index durability on those refuses the mark on a perfectly
+/// healthy store: measured at 2,092 refusals in one soak, every one of them
+/// the reserve.
+pub static INDEX_PAGES_ABANDONED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub struct WriteBackHub {
     // Page upserts. Drained in batches by any worker.
     queue: SegQueue<(usize, external::ChangingNode)>,
@@ -469,6 +484,8 @@ impl WriteBackHub {
                                     attempt
                                 );
                                 hub.barrier_failed.store(true, Ordering::SeqCst);
+                                INDEX_PAGES_ABANDONED
+                                    .fetch_add(retry.len() as u64, Ordering::Relaxed);
                                 if permanently_lost {
                                     hub.permanent_loss.store(true, Ordering::SeqCst);
                                 } else {

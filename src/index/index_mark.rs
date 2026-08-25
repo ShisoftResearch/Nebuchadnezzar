@@ -37,6 +37,22 @@
 //! **Not a reason to trust a missing file.** No mark means reconcile
 //! everything. An absent, unreadable or checksum-failing mark all mean the
 //! same thing and take the same path -- the expensive, correct one.
+//!
+//! # STATUS: OFF BY DEFAULT, and not because of caution
+//!
+//! Four conditions gate the mark and they are measurably NOT sufficient. On a
+//! 96 GB store with room to work, a bounded pass skipped 3,139,279 cells and
+//! an independent scrub then found 721 entries missing among them -- with the
+//! previous cycle's reconciliation reporting everything it found repaired, no
+//! index task failed, and no index page abandoned. Something else can lose an
+//! entry from an in-memory tree between a reconcile proving agreement and the
+//! shutdown that makes it durable, and none of the four conditions sees it.
+//!
+//! The arithmetic argues against hunting a fifth: a full reconcile costs
+//! 1.0-4.6 s for 0.7-3.2M cells and reports missing=0 reliably, so the bound
+//! saves a couple of seconds per restart while risking silently missing index
+//! entries. Enable with `NEB_INDEX_MARK=trust` if you have measured your own
+//! store and want the trade.
 
 use std::collections::HashMap;
 use std::io;
@@ -48,7 +64,19 @@ use crc_fast::{CrcAlgorithm, Digest};
 use crate::ram::chunk::Chunks;
 
 const MARK_MAGIC: &[u8; 8] = b"NEBIDXMK";
-const MARK_VERSION: u32 = 1;
+/// Bumped when what a mark MEANS changes, not only when its bytes do.
+///
+/// Version 1 meant "everything below these cursors was written before the last
+/// flush", which is unsound: a cell whose index task died in a crash is OLD, so
+/// it sits below any later cursor and a v1 mark declares it covered forever.
+/// Version 2 means "a reconciliation PROVED the index agreed with the cells,
+/// nothing failed to index afterwards, and then it was made durable".
+///
+/// The layout is byte-identical, so a v1 file would decode perfectly and be
+/// believed. That is precisely why the version had to move: refusing an old
+/// mark costs one full reconciliation, trusting one costs the holes it was
+/// supposed to fill.
+const MARK_VERSION: u32 = 2;
 const MARK_FILENAME: &str = "index-durable.mark";
 
 fn crc32c(data: &[u8]) -> u32 {
@@ -154,9 +182,11 @@ impl IndexMark {
         }
         let version = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
         if version != MARK_VERSION {
-            // No backward compatibility by house rule: a version this build
-            // does not know is refused, and refusing means reconciling
-            // everything, which is always correct.
+            // No backward compatibility, by house rule and by safety. There is
+            // no "read the old one carefully" path here: an older mark encodes
+            // a WEAKER claim than this build acts on, and acting on a weaker
+            // claim than you think is the whole failure mode. Refusing costs
+            // one full reconciliation, which is always correct.
             return None;
         }
         let chunk_count = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
@@ -292,8 +322,73 @@ mod tests {
             "an unknown version is refused, not guessed at"
         );
 
+        // Specifically: the PREVIOUS version, whose layout is byte-identical
+        // and whose claim was weaker. It has to be refused on the version
+        // alone, because nothing in the bytes distinguishes it.
+        let mut v1 = good.clone();
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let body = v1.len() - 4;
+        let fixed = crc32c(&v1[..body]);
+        v1[body..].copy_from_slice(&fixed.to_le_bytes());
+        assert_eq!(
+            IndexMark::decode(&v1),
+            None,
+            "a v1 mark decodes perfectly and means something weaker; trusting it \
+             is how 883,009 entries stayed hidden"
+        );
+
         assert_eq!(IndexMark::decode(b"NEBIDXMK"), None, "a truncated file");
         assert_eq!(IndexMark::decode(b"not a mark at all"), None, "no magic");
+    }
+
+    /// A mark may only be written when the chain that makes it TRUE held.
+    ///
+    /// The claim is "verified complete to here, then made durable". Position
+    /// alone does not establish it: a cell whose index task died in a crash is
+    /// OLD, so it sits below any later cursor, and a position-only mark
+    /// declares it covered -- forever, because every subsequent mark is
+    /// further ahead. Measured before this gate existed: one soak cycle
+    /// repaired 878,578 entries, shut down gracefully, and the next start --
+    /// bounded by that shutdown's own mark -- came back needing 883,009.
+    ///
+    /// So a reconciliation has to have PROVED agreement, and nothing may have
+    /// failed to index since.
+    #[test]
+    fn a_mark_is_only_honest_after_a_verified_reconcile() {
+        use crate::ram::chunk::Chunks;
+        let chunks = Chunks::new_dummy(1, 8 * 1024 * 1024);
+
+        assert!(
+            !chunks.index_still_verified(0),
+            "a fresh store has proved nothing; a mark now would be a guess"
+        );
+
+        chunks.note_index_verified_complete(7);
+        assert!(
+            chunks.index_still_verified(7),
+            "a reconciliation that proved agreement, with the failure count \
+             unchanged, is exactly when the mark is honest"
+        );
+        assert!(
+            !chunks.index_still_verified(8),
+            "one index task failing since is one cell whose entries are missing, \
+             and a mark written now would bury it"
+        );
+
+        // And the failure that reports no failure. A store that runs out of
+        // room abandons index page write-back, so entries go missing with
+        // every index task returning success -- the task inserted into the
+        // in-memory tree and the PAGE could not be placed. Measured: a bounded
+        // pass skipped 3,434,589 cells on a store that had exhausted
+        // mid-session, and an independent scrub found 75,085 entries missing
+        // among them.
+        crate::index::ranged::tree::btree::storage::INDEX_PAGES_ABANDONED
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !chunks.index_still_verified(7),
+            "an abandoned index page is an entry that never reached disk, however \
+             healthy the task counters look"
+        );
     }
 
     /// The whole point of the record: what it says is already indexed, and

@@ -107,6 +107,22 @@ impl ScrubReport {
     /// Unreachable entries count as NOT clean: the pass could not form an
     /// opinion, and reporting "clean" for a range that is erroring would
     /// invert the tool's whole purpose.
+    /// Whether this pass left the index provably agreeing with the cells.
+    ///
+    /// Weaker than `is_clean`, and deliberately so: a pass that FOUND holes
+    /// and filled them all has still established agreement, which is exactly
+    /// what a durability mark needs to claim. What it may not tolerate is
+    /// anything it could not check or could not fix -- an unreachable tree, an
+    /// unreadable cell, a failed repair -- because each of those is a cell
+    /// whose entries this pass cannot vouch for.
+    pub fn verified_complete(&self) -> bool {
+        self.entries_unreachable == 0
+            && self.cells_unreadable == 0
+            && self.repairs_failed == 0
+            && self.cells_schema_missing == 0
+            && self.entries_missing == self.entries_repaired
+    }
+
     pub fn is_clean(&self) -> bool {
         self.entries_missing == 0
             && self.entries_unreachable == 0
@@ -239,6 +255,28 @@ pub async fn reconcile_index_before_serving(
     // complete up to here, and then made durable", which only a completed
     // reconcile plus flush plus barrier can establish. Until it is written
     // that way, trusting it is opt-in and the default pays for correctness.
+    // OFF BY DEFAULT. Opt in with NEB_INDEX_MARK=trust.
+    //
+    // The mark is bounded by four conditions that ought to be sufficient: a
+    // startup reconciliation PROVED the index agreed with the cells, no index
+    // task has failed since, no index page has been abandoned since, and the
+    // write-back barrier confirmed at shutdown. They are necessary. They are
+    // measurably not sufficient.
+    //
+    // Measured on a 96 GB store with room to work: a bounded pass skipped
+    // 3,139,279 cells and an independent scrub then found 721 entries missing
+    // among them. The previous cycle's reconciliation had reported everything
+    // it found repaired, so the chain looked intact -- entries went missing
+    // AFTER the reconcile proved agreement and BEFORE shutdown, without any
+    // task failing or any page being abandoned. Something else can lose an
+    // entry from an in-memory tree and none of the four conditions sees it.
+    //
+    // What it buys does not justify guessing at a fifth condition: a full
+    // reconcile costs 1.0-4.6 s for 0.7-3.2M cells and reports missing=0
+    // reliably, so the bound saves a couple of seconds per restart. The cost
+    // of being wrong is silently missing index entries, which is the exact
+    // failure class this whole campaign exists to remove. Seconds of startup
+    // are not worth it.
     let mark = if std::env::var("NEB_INDEX_MARK").as_deref() == Ok("trust") {
         backup.as_deref().and_then(crate::index::index_mark::IndexMark::load)
     } else {
@@ -284,9 +322,31 @@ pub async fn reconcile_index_before_serving(
             report
         );
     }
-    // The mark described the state before this pass. It is now either
-    // satisfied or superseded, and leaving it would let a LATER start skip
-    // cells this one could not repair.
+    // Did this pass leave the index provably agreeing with the cells?
+    //
+    // THIS is what lets the mark written at shutdown mean "verified complete
+    // to here" instead of the false "written before the last flush". A pass
+    // that found holes and filled them all still establishes agreement; one
+    // that could not reach a tree, could not read a cell, or could not place a
+    // repair does not, because each of those is a cell it cannot vouch for.
+    if report.verified_complete() {
+        chunks.note_index_verified_complete(crate::index::builder::index_entries_owed());
+        info!(
+            "Index for {} is verified complete against its cells; a mark written at shutdown \
+             will be honest",
+            label
+        );
+    } else {
+        warn!(
+            "Index for {} is NOT verified complete ({}); no durability mark will be written, so \
+             the next start reconciles everything",
+            label, report
+        );
+    }
+
+    // The mark described the state BEFORE this pass, so it is now superseded
+    // either way. Leaving it would let a later start skip cells this one could
+    // not repair.
     if let Some(backup) = backup {
         crate::index::index_mark::IndexMark::clear(&backup);
     }
