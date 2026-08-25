@@ -1290,6 +1290,67 @@ presumed abort. That is the limit of cooperative termination without a durable
 decision, and it is what the code did unconditionally before. The 120 s
 sweeper remains the backstop.
 
+## OPEN (2026-08-25): `write_targeted` returns a bypass it cannot write
+
+Found by the crash fuzzer, not by a test. **2,978 panics in one 5-cycle run**,
+each killing an index task:
+
+```
+panicked at src/index/ranged/tree/btree/node.rs:158:
+internal error: entered unreachable code: empty
+```
+
+`node.rs:158` is `innode_mut()`, reached from `insert.rs:41` and
+`insert.rs:176` -- both do `write_targeted(...)` then `innode_mut()`.
+
+### The mechanism
+
+`write_targeted` walks right while the node is empty or the key is past its
+right bound. A bypass `Empty` is `is_empty()`, so the walk enters that branch,
+asks for `right_ref()`, and finds it DEFAULT -- a bypass at the right edge
+with nowhere to forward. It then does:
+
+```rust
+debug_assert!(!search_page.is_empty_node());
+return search_page;
+```
+
+**`debug_assert!` is compiled out in release**, which is where the fuzzer
+runs. So the bypass is returned, and the caller immediately asks it to be an
+internal node.
+
+`resolve_bypass` (`insert.rs`, added in `35a3bc43`) does not help: it forwards
+through `right_ref()`, and this is exactly the case where there is none -- it
+hands the bypass back deliberately, "let the caller fail honestly".
+
+### Reproduction
+
+`neb_crash_churn`, 32 GB store, 64 MB chunks, 5 cycles. Does NOT reproduce at
+4 GB / 4 cycles even though that arm exhausted its store twice, so **store
+exhaustion is not the trigger on its own** -- the earlier note calling this
+"reachable at a level's right edge under exhaustion" had it half right. Depth
+appears to matter.
+
+### Why it was not fixed here
+
+The obvious fixes are all wrong in a way that would corrupt the index:
+
+- Forwarding right: there is no right.
+- Walking back left to the last real node: the guard for it was already
+  dropped, and re-latching leftward inverts the walk's lock order.
+- Holding the previous guard while peeking right: two write latches at once,
+  which is not this walk's discipline.
+
+The shape that looks right is to peek at the right node BEFORE shifting onto
+it and stop on the current one if the right is a terminal bypass -- but that
+needs the level invariants confirmed (is a level allowed to END in a bypass at
+all, or is the bug that one was left there?), and getting it wrong writes into
+the wrong node. Left for someone with the invariants in hand.
+
+**What is safe to say now**: the index tasks that hit this die, so their
+entries are lost, and `reconcile_index_before_serving` is what repairs the
+store afterwards.
+
 ## Sequencing and dependencies
 
 Superseded by the implementation plan above, and recorded here for why the
