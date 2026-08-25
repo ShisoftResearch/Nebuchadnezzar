@@ -1530,6 +1530,46 @@ holds the left latch longer. At most two are live, because each new
 - The 64 GB / 6-cycle churn that produced **4,120** panics now produces
   **0**, with `torn=0` in every cycle.
 
+## OPEN (2026-08-25): `write_skew` commit refused with `CannotEnd`, once in 46
+
+A full-suite round failed:
+
+```
+client::tests::write_skew
+  PrepareError(DMCommitError(CheckFailed(CannotEnd)))
+```
+
+`DMCommitResult::CheckFailed(CannotEnd)` in the COMMIT phase comes from
+`data_site.rs`: at commit, one of the transaction's cells no longer has this
+transaction as its lock `owner`.
+
+### What it is NOT
+
+Ruled out from the failing round's own log, not by argument:
+
+| candidate | evidence |
+|---|---|
+| stale-lock reclaim by another prepare | `Reclaiming stale lock` count: **0** |
+| `commit_transaction_brackets` failing | `bracket_close_failures`: **0** |
+| the lease sweeper expiring a live transaction | `without a decision` count: **0** |
+| cooperative termination deciding it | `presuming abort` count: **0** |
+
+The last two mean **the Phase 6b code never ran in that round at all**.
+
+### Rate
+
+One occurrence across **46 full-suite logs** this session, spanning both the
+candidate and control arms. `CheckFailed(CannotEnd)` appears in that one log
+and nowhere else.
+
+### The remaining lead
+
+The only production path that clears a cell's owner is `attempt_lock_release`
+during `end`, and it clears only when the owner MATCHES. So either an `end`
+ran for this transaction before its commit, or a concurrent `prepare` took
+the lock through a window that is not the stale reclaim. Narrow, real, and
+not reproduced on demand -- so recorded rather than guessed at.
+
 ## Sequencing and dependencies
 
 Superseded by the implementation plan above, and recorded here for why the
