@@ -1116,26 +1116,47 @@ between decision and fan-out, then cross-check every participant's parts.
 GATE: the lane reports a torn transaction on today's code. Without this the
 rest is unfalsifiable.
 
-**1. Participant set into BEGIN.** `prepare` already carries
-`coordinator_id`; add the participant set, and persist it in the BEGIN record
-(`encode_begin`, currently the 16-byte txn id alone — becomes variable
-length). GATE: recovery reads the set back; a bracket written by this build
-and read by it round-trips the participants.
+**1. Participant set on the WIRE ONLY, never persisted.** `prepare` already
+carries `coordinator_id`; add `participants: Vec<u64>` beside it. The
+coordinator has the set already (`affected_objs` is computed before the
+fan-out). Each participant keeps it in its in-memory `Transaction`.
+
+**Do NOT put it in BEGIN.** That was the first draft and it is the worst
+option: every bracket part would pay N x 8 bytes forever -- and chains write a
+BEGIN PER PART -- to serve a path that almost never runs. The set is only
+needed while a transaction is in doubt, which is exactly when it is still in
+memory.
+
+The case where memory is gone is the participant having restarted, and that
+case has its own answer in step 3. GATE: a participant can name its peers
+after prepare; nothing on disk changed.
 
 **2. `txn_status(T)` RPC.** In the `data_site` service beside `prepare` /
 `commit` / `abort` / `end`. Answered ONLY from durable state, never from the
 in-memory transaction map — an in-doubt peer that restarted has no map.
 GATE: a unit test per row of the table above.
 
-**3. Resolution, from two triggers.** They cover different failures and
-neither subsumes the other:
-   - the lease sweeper (`expire_transaction_leases` → `wipe_out_transaction`)
-     asks BEFORE wiping — participant up, coordinator dead;
-   - recovery asks before discarding an open bracket — participant restarted.
-   Optionally start earlier when a coordinator RPC fails; a false positive
-   there is harmless, so it is an optimisation and not a correctness
-   dependency.
-   GATE: step 0's lane goes green.
+**3. Resolution, from two triggers, with two different ways to find peers.**
+The triggers cover different failures and neither subsumes the other, and the
+difference between them is exactly whether the participant set survived:
+
+   - **Lease sweeper** (`expire_transaction_leases` → `wipe_out_transaction`),
+     asking BEFORE wiping. Participant up, coordinator dead — the common
+     in-doubt case. The set is in memory from step 1, so this contacts only
+     the real participants and concludes as soon as they answer.
+   - **Recovery**, asking before discarding an open bracket. The participant
+     itself restarted, so the in-memory set is gone. Fall back to a
+     BROADCAST: ask every member (conshash tracks membership) "do you hold a
+     COMMIT for T?". Non-participants answer "no bracket", which lands in the
+     Aborted bucket harmlessly. Costs O(cluster) messages and requires every
+     member to answer before concluding abort — acceptable only because this
+     is the rarer of two already-rare cases.
+
+   Optionally start the first one earlier when a coordinator RPC fails; a
+   false positive there is harmless, so it is an optimisation and not a
+   correctness dependency.
+   GATE: step 0's lane goes green, with the participant restarted in at least
+   one variant so the broadcast path is exercised too.
 
 ### Residual, stated up front
 
@@ -1143,9 +1164,12 @@ neither subsumes the other:
   are unreachable, resolution cannot conclude. The 120 s sweeper remains the
   backstop, so the timeout does not go away — cooperative termination shrinks
   the window in which the timeout is the answer.
-- **BEGIN grows** by the participant set, on every bracket, forever, to serve
-  a rare path. That is the price and it should be paid knowingly.
-- Do not build step 1 alone. A field in BEGIN that nothing reads is exactly
+- **The broadcast blocks more readily than a targeted ask.** Concluding abort
+  needs every member to answer, so in a large cluster one unreachable node
+  keeps a restarted participant in doubt until the sweeper backstops it. That
+  is the price of not persisting the set, and it is the right way round: the
+  cost falls on the rarer case and the happy path pays nothing durable.
+- Do not build step 1 alone. A participant set that nothing reads is exactly
   what this campaign has spent a week deleting.
 
 ## Sequencing and dependencies
