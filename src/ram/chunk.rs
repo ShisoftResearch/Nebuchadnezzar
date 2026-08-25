@@ -159,7 +159,6 @@ static GLOBAL_CHUNK_BASE: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_CHUNK_SIZE_BITS: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_ALLOCATED_SIZE: AtomicUsize = AtomicUsize::new(0);
-static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
@@ -301,64 +300,6 @@ fn decode_chunk_addr(
     let segment_id = offset_in_chunk >> SEGMENT_BITS_SHIFT;
     Some((chunk_id, segment_id))
 }
-
-/// Set the global Chunks pointer (called by Chunks::new_with_recovery)
-pub fn set_global_chunks(chunks: &Arc<Chunks>) {
-    let ptr = Arc::as_ptr(chunks) as usize;
-    GLOBAL_CHUNKS_PTR.store(ptr, Ordering::Release);
-}
-
-/// Get a reference to the global Chunks instance
-/// SAFETY: Only safe to call if Chunks instance is still alive
-pub unsafe fn get_global_chunks() -> Option<&'static Chunks> {
-    let ptr = GLOBAL_CHUNKS_PTR.load(Ordering::Acquire);
-    if ptr == 0 {
-        None
-    } else {
-        Some(&*(ptr as *const Chunks))
-    }
-}
-
-/// Access a segment by chunk_id and segment_id from the global Chunks
-/// Used by signal handler to flip reference bits
-pub fn get_segment_for_fault(
-    chunk_id: usize,
-    segment_id: usize,
-) -> Option<AArc<crate::ram::segs::Segment>> {
-    unsafe {
-        get_global_chunks().and_then(|chunks| {
-            chunks
-                .list
-                .get(chunk_id)
-                .and_then(|chunk| chunk.segs.get(&segment_id))
-        })
-    }
-}
-
-// /// Reset global chunk allocation (for tests)
-// ///
-// /// IMPORTANT: Reset GLOBAL_CHUNKS_PTR BEFORE unmapping memory to prevent
-// /// the signal handler from accessing unmapped memory during cleanup.
-// pub fn reset_global_chunk_allocation() {
-//     // Reset GLOBAL_CHUNKS_PTR first to prevent signal handler from accessing chunks
-//     // This must happen BEFORE unmapping memory to avoid SIGSEGV in signal handler
-//     GLOBAL_CHUNKS_PTR.store(0, Ordering::Release);
-
-//     let base = GLOBAL_CHUNK_BASE.swap(0, Ordering::AcqRel);
-//     let size = GLOBAL_ALLOCATED_SIZE.swap(0, Ordering::AcqRel);
-
-//     // Reset other globals before unmapping
-//     GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
-//     GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
-
-//     // Now safe to unmap memory - signal handler won't try to access it
-//     if base != 0 && size != 0 {
-//         unsafe {
-//             println!("unmapping memory from {}", base);
-//             libc::munmap(base as *mut libc::c_void, size);
-//         }
-//     }
-// }
 
 // Thread-local flag to indicate if we're currently in a transaction
 // When true, WAL writes will skip fsync (will be synced at commit instead)
@@ -4373,9 +4314,6 @@ impl Chunks {
                 })
                 .expect("spawn stats-sweeper");
         }
-
-        // Store global pointer for signal handler access
-        set_global_chunks(&chunks_arc);
 
         // Attempt recovery if enabled
         if enable_recovery {
