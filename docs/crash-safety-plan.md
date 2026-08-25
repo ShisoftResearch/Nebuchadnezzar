@@ -1400,6 +1400,44 @@ Whether the bounds fix contributed to that or the difference is the fuzzer's
 own variance is NOT established; what the run does show is the recovery path
 surviving five kill-and-recover cycles with no crash.
 
+## The "serializability violation" that was not one (FIXED 2026-08-25)
+
+One full-suite round in six failed with
+`Serializability check failed: 15 mismatches found` in
+`test_large_scale_transactions_with_natural_tiered_memory`. Chased as a
+transaction bug for an hour. It was neither a violation nor a transaction bug.
+
+The verification loop increments `mismatches` from TWO branches and only one
+is a score mismatch. The counts settled it instantly once asked:
+
+| branch | count |
+|---|---|
+| `Serializability violation ... expected X, got Y` | **0** |
+| `Failed to read cell N: CellDoesNotExisted` | **15** |
+
+The cells were never committed. `all_ids.push(id)` ran when a write was
+accepted INTO the transaction, before the batch committed; a failed batch
+broke the loop but left its ids in `all_ids`, so Phase 3 verified cells that
+did not exist. Fixed by staging ids per batch and merging them only after the
+batch commits (`bcc94cfa`).
+
+### What made it look like a regression
+
+Nothing in the failure was new. Under a full 8-way suite, EVERY round --
+passing ones included -- shows ~2,100 `could not place a NNNN-byte
+transactional entry` on chunk 0 and 14-32 `archive returned false before
+eviction - aborting`. The test drives 512 MB through a 64 MB tier. A batch
+failing is a normal outcome there; round 3 was simply the round where one did.
+`bracket_close_failures=0` in every round, which also refutes the first
+hypothesis (a leased head evicted out from under `close_transaction_bracket`).
+
+### Lesson
+
+**The assertion named the one thing that had not happened.** Before believing
+a failure message, check which branch actually incremented the counter it
+reports. `env_logger` defaults to `error`, so both messages were already in
+the log with no `RUST_LOG` set -- the hour was spent not looking.
+
 ## OPEN (2026-08-25): `write_targeted` returns a bypass it cannot write
 
 Found by the crash fuzzer, not by a test. **2,978 panics in one 5-cycle run**,
