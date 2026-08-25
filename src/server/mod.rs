@@ -3269,30 +3269,50 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
         // transaction again at the next restart -- the same loss, one crash
         // later.
         //
-        // Any chunk will do -- recovery collects COMMITs store-wide -- so a
-        // full one is a reason to try the next, not to give up.
-        let written = database_runtime
-            .chunks
-            .list
-            .iter()
-            .find_map(|chunk| match chunk.write_resolved_commit(&bracket.txn) {
-                Ok(()) => Some(()),
-                Err(error) => {
-                    debug!(
-                        "chunk {} could not hold the resolved COMMIT for {:?}: {:?}",
-                        chunk.id, bracket.txn, error
-                    );
-                    None
-                }
-            });
-        if written.is_none() {
+        // One record per CHUNK THAT HOLDS A PART, not one record store-wide.
+        //
+        // Recovery would honour a single record anywhere -- it collects
+        // COMMITs globally -- but the cleaner would not. Parts are decided
+        // together and compacted INDEPENDENTLY, so a COMMIT sitting in a
+        // chunk this transaction never touched is one compaction can carry
+        // away while the BEGINs it closes are still on disk, putting the
+        // transaction back in doubt at a restart where the peers may no
+        // longer remember it. Same reasoning as the per-part COMMIT rule in
+        // `close_transaction_bracket`, at chunk granularity: that is as
+        // precise as this path can be, since the transaction's own segments
+        // are full or sealed and cannot take another entry.
+        let mut placed = 0usize;
+        for chunk_id in &bracket.chunks {
+            let Some(chunk) = database_runtime.chunks.list.get(*chunk_id) else {
+                continue;
+            };
+            match chunk.write_resolved_commit(&bracket.txn) {
+                Ok(()) => placed += 1,
+                Err(error) => warn!(
+                    "chunk {} holds part of resolved transaction {:?} but could not take its \
+                     COMMIT: {:?}",
+                    chunk_id, bracket.txn, error
+                ),
+            }
+        }
+        if placed == 0 {
             error!(
-                "transaction {:?} was resolved COMMITTED by a peer but no chunk could hold its \
-                 COMMIT; leaving it in doubt rather than installing cells this store would lose \
-                 again at the next start",
-                bracket.txn
+                "transaction {:?} was resolved COMMITTED by a peer but none of its {} chunk(s) \
+                 could hold a COMMIT; leaving it in doubt rather than installing cells this \
+                 store would lose again at the next start",
+                bracket.txn,
+                bracket.chunks.len()
             );
             continue;
+        }
+        if placed < bracket.chunks.len() {
+            warn!(
+                "resolved transaction {:?} got a COMMIT in {} of its {} chunk(s); the rest rely \
+                 on those records surviving compaction",
+                bracket.txn,
+                placed,
+                bracket.chunks.len()
+            );
         }
         for cell in &bracket.cells {
             crate::ram::recovery::apply_bracketed_cell(&database_runtime.chunks.list, cell);

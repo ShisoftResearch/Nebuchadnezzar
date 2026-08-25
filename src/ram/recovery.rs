@@ -570,7 +570,10 @@ impl BracketLedger {
                     txn,
                     cells.len()
                 );
-                InDoubtBracket { txn, cells }
+                let mut chunks: Vec<usize> = cells.iter().map(|cell| cell.chunk_id).collect();
+                chunks.sort_unstable();
+                chunks.dedup();
+                InDoubtBracket { txn, cells, chunks }
             })
             .collect();
         RecoveredBrackets {
@@ -583,6 +586,12 @@ impl BracketLedger {
 /// A transaction this store cannot decide on its own.
 pub struct InDoubtBracket {
     pub txn: crate::server::transactions::TxnId,
+    /// Which chunks hold a part of this transaction. A resolved COMMIT is
+    /// written into each of them rather than into one: parts are decided
+    /// together but COMPACTED independently, so a COMMIT that lives in a
+    /// chunk this transaction never touched is one the cleaner can carry away
+    /// while the BEGINs it closes are still on disk.
+    pub chunks: Vec<usize>,
     /// Held rather than dropped: if a peer reports the transaction committed,
     /// these are the cells that must be installed. The entries themselves are
     /// still in the segments -- only the index placement is deferred.
