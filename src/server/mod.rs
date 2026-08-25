@@ -3268,13 +3268,29 @@ async fn resolve_in_doubt_after_recovery(database_runtime: &Arc<DatabaseRuntime>
         // store that answers reads correctly right now and forgets the
         // transaction again at the next restart -- the same loss, one crash
         // later.
-        let chunk = &database_runtime.chunks.list[0];
-        if let Err(error) = chunk.write_resolved_commit(&bracket.txn) {
+        //
+        // Any chunk will do -- recovery collects COMMITs store-wide -- so a
+        // full one is a reason to try the next, not to give up.
+        let written = database_runtime
+            .chunks
+            .list
+            .iter()
+            .find_map(|chunk| match chunk.write_resolved_commit(&bracket.txn) {
+                Ok(()) => Some(()),
+                Err(error) => {
+                    debug!(
+                        "chunk {} could not hold the resolved COMMIT for {:?}: {:?}",
+                        chunk.id, bracket.txn, error
+                    );
+                    None
+                }
+            });
+        if written.is_none() {
             error!(
-                "transaction {:?} was resolved COMMITTED by a peer but its COMMIT could not be \
-                 written ({:?}); leaving it in doubt rather than installing cells this store \
-                 would lose again at the next start",
-                bracket.txn, error
+                "transaction {:?} was resolved COMMITTED by a peer but no chunk could hold its \
+                 COMMIT; leaving it in doubt rather than installing cells this store would lose \
+                 again at the next start",
+                bracket.txn
             );
             continue;
         }

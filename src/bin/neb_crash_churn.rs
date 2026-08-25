@@ -955,11 +955,21 @@ async fn child_async(
     // existed but nothing read them, which is the same as not having them:
     // the torn-transaction hunt would have been far shorter with this line.
     println!(
-        "RECOVERY brackets_applied={} brackets_discarded={} damaged_entries={} leases_expired={}",
+        "RECOVERY brackets_applied={} brackets_discarded={} damaged_entries={} \
+         leases_expired={} termination_committed={} termination_aborted={}",
         neb::ram::recovery::BRACKETS_APPLIED.load(std::sync::atomic::Ordering::Relaxed),
         neb::ram::recovery::BRACKETS_DISCARDED.load(std::sync::atomic::Ordering::Relaxed),
         neb::ram::recovery::RECOVERY_DAMAGED_ENTRIES.load(std::sync::atomic::Ordering::Relaxed),
         neb::ram::chunk::TXN_LEASES_EXPIRED.load(std::sync::atomic::Ordering::Relaxed),
+        // Cooperative termination, so a soak can tell "nothing was in doubt"
+        // from "everything in doubt was presumed abort". The second is not an
+        // error -- it is the correct answer when no peer committed -- but a
+        // run where it climbs is a run where transactions are being decided
+        // by timeout rather than by evidence.
+        neb::server::transactions::data_site::TERMINATION_COMMITTED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        neb::server::transactions::data_site::TERMINATION_ABORTED
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
     flush_stdout();
     println!("SCANNED n={}", count);
