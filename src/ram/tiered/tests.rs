@@ -2241,6 +2241,18 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         let tx = client.begin().await.unwrap().unwrap();
         let start_idx = batch_idx * batch_size;
         let end_idx = ((batch_idx + 1) * batch_size).min(num_cells);
+        // Staged, and only merged into `all_ids` once the batch COMMITS.
+        //
+        // These ids used to be recorded as soon as the write was accepted
+        // into the transaction, which is before anyone knows whether the
+        // batch lands. When a batch failed -- this test runs permanently at
+        // the edge of its 64 MB tier, ~2,100 allocation refusals per run even
+        // when it passes -- the loop broke out, but the doomed batch's ids
+        // were already in `all_ids`. Phase 3 then read cells that were never
+        // committed, got `CellDoesNotExisted`, and reported them under
+        // "Serializability check failed", which is the one thing they were
+        // not. Cost an hour of hunting a transaction bug that did not exist.
+        let mut batch_ids = Vec::with_capacity(end_idx - start_idx);
 
         for i in start_idx..end_idx {
             let id = Id::from_parts(schema.id as u64, i as u64 + 1);
@@ -2259,7 +2271,7 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
 
             match client.write(tx.clone(), cell).await {
                 Ok(Ok(transactions::TxnExecResult::Accepted(_))) => {
-                    all_ids.push(id);
+                    batch_ids.push(id);
                 }
                 Ok(Ok(other)) => {
                     warn!("Unexpected write result: {:?}", other);
@@ -2279,6 +2291,8 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
         match client.prepare(tx.clone()).await {
             Ok(Ok(transactions::TMPrepareResult::Success)) => match client.commit(tx).await {
                 Ok(Ok(transactions::EndResult::Success)) => {
+                    // Committed: NOW these cells exist to be verified.
+                    all_ids.extend(batch_ids);
                     if (batch_idx + 1) % 10 == 0 {
                         info!(
                             "Inserted batch {}/{} ({} cells total)",
@@ -2289,12 +2303,22 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
                     }
                 }
                 other => {
-                    error!("Commit failed for batch {}: {:?}", batch_idx, other);
+                    error!(
+                        "Commit failed for batch {}: {:?}; its {} cell(s) are NOT verified",
+                        batch_idx,
+                        other,
+                        batch_ids.len()
+                    );
                     break;
                 }
             },
             other => {
-                error!("Prepare failed for batch {}: {:?}", batch_idx, other);
+                error!(
+                    "Prepare failed for batch {}: {:?}; its {} cell(s) are NOT verified",
+                    batch_idx,
+                    other,
+                    batch_ids.len()
+                );
                 break;
             }
         }
