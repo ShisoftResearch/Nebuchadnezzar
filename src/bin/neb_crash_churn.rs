@@ -151,6 +151,16 @@ fn parent_main(args: &[String]) -> ExitCode {
                 &state.txn_committed_high.to_string(),
                 &state.txn_verify_from.to_string(),
             ])
+            // This fuzzer is a SINGLE node, so there is never a peer to ask
+            // about an in-doubt transaction -- and every cycle has some,
+            // because crashing mid-transaction is the point. Without this the
+            // recovery-side resolver spends its full settle window each start
+            // waiting for a membership roster that will never grow.
+            //
+            // Correct only because the cluster really is one node. Do not
+            // copy it into a multi-node harness: there the wait is what stops
+            // a restarted node from discarding a committed transaction.
+            .env("NEB_TERMINATION_SETTLE_SECS", "0")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
