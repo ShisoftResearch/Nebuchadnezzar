@@ -254,8 +254,21 @@ fn pack_type_word(entry_type: EntryType, checksum: u32) -> u32 {
 /// `Some(true)` that it does; `None` that the entry carries no content to
 /// vouch for -- padding, or a reservation never filled. Every entry that
 /// holds data answers `Some`.
-pub fn verify_entry_at(pos: usize) -> Option<bool> {
-    if pos % 8 != 0 {
+/// `bound` is one past the last byte the caller may read. It is not optional
+/// and it is not a nicety.
+///
+/// This function is asked to judge bytes that MAY BE GARBAGE -- that is the
+/// entire reason it exists -- and the length it uses to checksum comes out of
+/// those same bytes. Without a bound, a word that happens to decode as a
+/// checked entry with a length of 3 GB makes the CRC read 3 GB past the
+/// buffer: not a wrong answer, a SIGSEGV, with recovery's own thread taking
+/// the process down. Caught on two machines and two branches, always as
+/// `read_chain_link` -> here -> `content_checksum(content_len ~3e9)`.
+///
+/// A length that does not fit is not a checksum failure to be investigated;
+/// it means these bytes are not an entry, which is `Some(false)`.
+pub fn verify_entry_at(pos: usize, bound: usize) -> Option<bool> {
+    if pos % 8 != 0 || pos.checked_add(ENTRY_HEAD_SIZE).is_none_or(|end| end > bound) {
         return Some(false);
     }
     let (word, content_length) = unsafe {
@@ -271,7 +284,14 @@ pub fn verify_entry_at(pos: usize) -> Option<bool> {
         TypeWord::Bare(_) => None,
         TypeWord::Invalid => Some(false),
         TypeWord::Checked(_, checksum) => {
-            Some(checksum == content_checksum(pos + ENTRY_HEAD_SIZE, content_length))
+            let content_pos = pos + ENTRY_HEAD_SIZE;
+            if content_pos
+                .checked_add(content_length as usize)
+                .is_none_or(|end| end > bound)
+            {
+                return Some(false);
+            }
+            Some(checksum == content_checksum(content_pos, content_length))
         }
     }
 }
@@ -474,7 +494,7 @@ mod checksum_tests {
 
         let (header, _) = Entry::decode_from(base, |_, header| header);
         assert_eq!(header.entry_type, EntryType::CELL);
-        assert_eq!(verify_entry_at(base), Some(true));
+        assert_eq!(verify_entry_at(base, base + buffer.len()), Some(true));
     }
 
     /// A reservation that is never filled must still be walkable.
@@ -517,7 +537,7 @@ mod checksum_tests {
         let (header, _) = Entry::decode_from(base, |_, header| header);
         assert_eq!(header.entry_type, EntryType::CELL);
         assert_eq!(header.content_length as usize, content.len());
-        assert_eq!(verify_entry_at(base), Some(true));
+        assert_eq!(verify_entry_at(base, base + buffer.len()), Some(true));
     }
 
     /// Only the entry kinds with nothing to vouch for may go unchecked.
@@ -608,13 +628,74 @@ mod checksum_tests {
             std::ptr::copy_nonoverlapping(content.as_ptr(), content_pos as *mut u8, content.len());
         });
 
-        assert_eq!(verify_entry_at(pos), Some(true), "a fresh entry must verify");
+        assert_eq!(
+            verify_entry_at(pos, pos + buffer.len()),
+            Some(true),
+            "a fresh entry must verify"
+        );
 
         buffer[ENTRY_HEAD_SIZE + 5] ^= 0xFF;
         assert_eq!(
-            verify_entry_at(pos),
+            verify_entry_at(pos, pos + buffer.len()),
             Some(false),
             "a flipped content byte must fail verification"
+        );
+    }
+
+    /// A length that runs off the end is NOT a checksum failure to
+    /// investigate -- it means these bytes are not an entry.
+    ///
+    /// This is the crash, reproduced. Recovery's `read_chain_link` looks at a
+    /// fixed offset near a segment's tail and asks whether an entry vouches
+    /// for itself there. The bytes at that offset are often not an entry at
+    /// all, and a word that happens to decode as `Checked` carries a length
+    /// that is garbage too. Before the bound, that length went straight into
+    /// a CRC: ~3 GB read past a 224-byte buffer, SIGSEGV on a recovery
+    /// thread, no panic, process gone. Caught on two machines and two
+    /// branches with the same three frames.
+    ///
+    /// Deliberately places the entry at the very END of the buffer so any
+    /// nonzero content length is out of bounds -- ASAN or a guard page is not
+    /// needed for this to be a real read past the end.
+    #[test]
+    fn a_content_length_past_the_bound_is_refused_rather_than_read() {
+        let mut buffer = vec![0u8; 64];
+        let base = buffer.as_mut_ptr() as usize;
+        assert_eq!(base % 8, 0, "test buffer must be 8-byte aligned");
+        let pos = base + 64 - ENTRY_HEAD_SIZE;
+        let bound = base + buffer.len();
+
+        // A well-formed CHECKED word -- exactly what garbage can look like --
+        // with a length no buffer could hold.
+        let word = pack_type_word(EntryType::CELL, 0x5AA5);
+        buffer[64 - ENTRY_HEAD_SIZE..64 - ENTRY_HEAD_SIZE + 4]
+            .copy_from_slice(&word.to_le_bytes());
+        buffer[64 - ENTRY_HEAD_SIZE + 4..64].copy_from_slice(&3_000_000_000u32.to_le_bytes());
+
+        assert_eq!(
+            verify_entry_at(pos, bound),
+            Some(false),
+            "a length that does not fit inside the bound must be refused, not checksummed"
+        );
+
+        // And the ordinary in-bounds refusals still behave: one byte too far
+        // is still too far.
+        let mut small = vec![0u8; 32];
+        let small_base = small.as_mut_ptr() as usize;
+        let word = pack_type_word(EntryType::CELL, 0x1234);
+        small[..4].copy_from_slice(&word.to_le_bytes());
+        small[4..8].copy_from_slice(&(32u32 - ENTRY_HEAD_SIZE as u32 + 1).to_le_bytes());
+        assert_eq!(
+            verify_entry_at(small_base, small_base + small.len()),
+            Some(false),
+            "one byte past the bound is past the bound"
+        );
+
+        // A header that does not even fit is refused before it is read.
+        assert_eq!(
+            verify_entry_at(small_base + 28, small_base + small.len()),
+            Some(false),
+            "a header straddling the bound must be refused without reading it"
         );
     }
 
@@ -627,7 +708,7 @@ mod checksum_tests {
         buffer[..4].copy_from_slice(&EntryType::CELL.bits().to_le_bytes());
         buffer[4..8].copy_from_slice(&16u32.to_le_bytes());
         assert_eq!(
-            verify_entry_at(pos),
+            verify_entry_at(pos, pos + buffer.len()),
             Some(false),
             "a bare CELL word is damage, not an unchecked entry"
         );

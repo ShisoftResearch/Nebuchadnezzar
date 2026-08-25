@@ -698,7 +698,13 @@ fn read_chain_link(data: &[u8], usable_len: usize) -> Option<(usize, u64, u64)> 
     }
     // A link is only a link if it vouches for itself; anything else at that
     // offset is ordinary data that happens to sit there.
-    if crate::ram::entry::verify_entry_at(addr) != Some(true) {
+    //
+    // Bounded by the BUFFER, which is the whole point: the type word above
+    // can be matched by garbage, and the length that follows it is garbage
+    // too. Unbounded, this checksummed ~3 GB past the end and took the
+    // process down from a recovery thread -- reproduced on two machines.
+    let data_end = data.as_ptr() as usize + data.len();
+    if crate::ram::entry::verify_entry_at(addr, data_end) != Some(true) {
         return None;
     }
     let (header, _) = Entry::decode_from(addr, |_, _| {});
@@ -742,7 +748,7 @@ fn entry_stands_alone(addr: usize, bound: usize) -> bool {
     if size > SEGMENT_SIZE || addr + size > bound {
         return false;
     }
-    match verify_entry_at(addr) {
+    match verify_entry_at(addr, bound) {
         Some(true) => true,
         Some(false) => false,
         // Unchecked: only a reservation stamp, which carries no content to
@@ -1134,7 +1140,7 @@ fn scan_segment_from_data(
         // whose header is perfectly well-formed can still hold bytes that
         // were never written by any writer. Entries from before checksums
         // report `None` and are taken on trust, as they always were.
-        if crate::ram::entry::verify_entry_at(cursor) == Some(false) {
+        if crate::ram::entry::verify_entry_at(cursor, bound) == Some(false) {
             // One damaged entry must not cost the rest of the segment.
             //
             // Stopping here was the whole loss: a single entry whose content

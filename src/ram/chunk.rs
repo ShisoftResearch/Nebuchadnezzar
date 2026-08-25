@@ -5052,7 +5052,8 @@ impl<'a> CellGuard<'a> {
                                 // without promoting anything, so the retry
                                 // lands on the same cold block and fails the
                                 // same way, forever.
-                                let verdict = crate::ram::entry::verify_entry_at(*guard);
+                                let verdict =
+                                    crate::ram::entry::verify_entry_at(*guard, seg.bound());
                                 if verdict == Some(true) {
                                     seg.mark_referenced();
                                     if let Some(ref tiered) = chunk.tiered_manager {
@@ -5574,7 +5575,7 @@ mod tests {
             "the disowned span must read as padding, not as the entries it used to hold"
         );
         assert_eq!(
-            crate::ram::entry::verify_entry_at(before),
+            crate::ram::entry::verify_entry_at(before, seg.bound()),
             Some(true),
             "and that padding must vouch for itself like any other entry"
         );
